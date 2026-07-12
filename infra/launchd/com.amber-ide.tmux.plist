@@ -8,7 +8,7 @@
     <array>
         <string>/bin/sh</string>
         <string>-c</string>
-        <string>PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"; tmux has-session 2>/dev/null || exec tmux new-session -d -s main</string>
+        <string>PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"; tmux has-session 2>/dev/null || exec tmux new-session -d -s _amber-boot</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
