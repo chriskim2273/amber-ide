@@ -1,0 +1,14 @@
+[Unit]
+Description=amber-ide tmux server (persistence spine)
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Start the tmux server on the default socket if it is not already running.
+# Sourcing tmux.conf on server start triggers tmux-continuum's restore, which
+# recreates all saved sessions; "main" is only a bootstrap session so the
+# server stays alive while the restore runs.
+ExecStart=/bin/sh -c 'tmux has-session 2>/dev/null || exec tmux new-session -d -s main'
+
+[Install]
+WantedBy=default.target
