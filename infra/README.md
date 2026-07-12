@@ -66,8 +66,10 @@ Known limitation (fixed in Phase 6): `claude --continue` resumes the most
 recent conversation *per directory*, so two Claude panes in the same directory
 would resume the same conversation after a reboot.
 
-Resurrect save files live in `~/.tmux/resurrect/` (default; `last` symlink
-points at the newest snapshot).
+Resurrect save files live in `~/.local/share/tmux/resurrect/` (the XDG
+default in the pinned resurrect version; `last` symlink points at the newest
+snapshot). Upstream docs still mention `~/.tmux/resurrect` — that path is only
+used when it already exists.
 
 Continuum's autosave timer piggybacks on tmux's `status-right`; the status
 line must stay on (tmux default) and nothing may later overwrite
@@ -113,5 +115,5 @@ launchctl unload ~/Library/LaunchAgents/com.amber-ide.tmux.plist
 rm ~/Library/LaunchAgents/com.amber-ide.tmux.plist
 # both
 rm ~/.config/tmux/tmux.conf          # or restore the .bak
-rm -rf ~/.local/share/amber-ide/plugins ~/.tmux/resurrect
+rm -rf ~/.local/share/amber-ide/plugins ~/.local/share/tmux/resurrect
 ```
