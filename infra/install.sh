@@ -52,6 +52,12 @@ mkdir -p "$PLUGIN_DIR"
 clone_pinned "$RESURRECT_REPO" "$PLUGIN_DIR/tmux-resurrect" "$RESURRECT_PIN"
 clone_pinned "$CONTINUUM_REPO" "$PLUGIN_DIR/tmux-continuum" "$CONTINUUM_PIN"
 
+# --- 2b. Bootstrap holder script ----------------------------------------------
+BIN_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/amber-ide/bin"
+mkdir -p "$BIN_DIR"
+install -m 0755 "$INFRA_DIR/boot-hold.sh" "$BIN_DIR/boot-hold.sh"
+info "Installed $BIN_DIR/boot-hold.sh"
+
 # --- 3. tmux.conf -------------------------------------------------------------
 mkdir -p "$CONF_DIR"
 if [ -f "$CONF_TARGET" ] && ! cmp -s "$INFRA_DIR/tmux.conf" "$CONF_TARGET"; then
@@ -92,7 +98,7 @@ if tmux has-session 2>/dev/null; then
   info "Running tmux server detected: config sourced in place, sessions untouched."
   info "Continuum's autosave timer is now active in the running server."
 else
-  tmux new-session -d -s _amber-boot
+  tmux new-session -d -s _amber-boot "$BIN_DIR/boot-hold.sh"
   info "Started tmux server with bootstrap session '_amber-boot'."
 fi
 

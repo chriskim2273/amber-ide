@@ -49,10 +49,13 @@ Idempotent, and it never kills or restarts a running tmux server. It:
 The boot units must create *some* session or the tmux server exits
 immediately, but resurrect **merges** restored panes into any session that
 already has the same name (corrupting it with an extra pane). So the
-bootstrap session gets a reserved name no real session will ever use, and a
-`@resurrect-hook-post-restore-all` hook kills it as soon as a restore
-completes. If there was nothing to restore, it stays behind to keep the
-server alive — that is expected.
+bootstrap session gets a reserved name no real session will ever use, and its
+pane runs `boot-hold.sh`, which exits — dissolving the session — as soon as
+any real session exists (restored or newly created). A
+`@resurrect-hook-post-restore-all` kill hook remains as a fallback; the hook
+alone is racy because a fast restore can finish before the bootstrap session
+is even registered. If there is nothing to restore, the bootstrap session
+stays to keep the server alive — that is expected.
 
 ### Design note: boot start
 
@@ -89,7 +92,13 @@ used when it already exists.
 
 Continuum's autosave timer piggybacks on tmux's `status-right`; the status
 line must stay on (tmux default) and nothing may later overwrite
-`status-right`, or autosaving silently stops.
+`status-right`, or autosaving silently stops. The timer also only ticks
+**while at least one client is attached** — a fully detached server saves
+nothing. To close the resulting pre-reboot gap, the Linux unit runs a final
+resurrect save in `ExecStop`, which systemd triggers on every clean shutdown
+or reboot (skipped when only `_amber-boot` exists). macOS has no launchd
+equivalent, so there the last autosave from an attached minute is what a
+reboot restores.
 
 ## Torture test (Phase 1 exit test)
 
