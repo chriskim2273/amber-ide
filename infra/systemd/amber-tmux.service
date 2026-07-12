@@ -6,10 +6,18 @@ Type=oneshot
 RemainAfterExit=yes
 # Start the tmux server on the default socket if it is not already running.
 # Sourcing tmux.conf on server start triggers tmux-continuum's restore, which
-# recreates all saved sessions; "_amber-boot" is a throwaway bootstrap session
-# that keeps the server alive while the restore runs (a post-restore hook in
-# tmux.conf removes it).
-ExecStart=/bin/sh -c 'tmux has-session 2>/dev/null || exec tmux new-session -d -s _amber-boot'
+# recreates all saved sessions. "_amber-boot" is a throwaway bootstrap session
+# that keeps the server alive while the restore runs; its pane runs
+# boot-hold.sh, which exits (dissolving the session) as soon as any real
+# session exists.
+ExecStart=/bin/sh -c 'tmux has-session 2>/dev/null || exec tmux new-session -d -s _amber-boot %h/.local/share/amber-ide/bin/boot-hold.sh'
+# Save one final snapshot at shutdown/stop, before systemd kills the server.
+# Continuum's timer only ticks while a client is attached, so without this a
+# reboot can lose everything done since the last attached minute. Skip the
+# save when only the bootstrap session exists — nothing real to snapshot, and
+# snapshotting _amber-boot would make resurrect merge into it on the next
+# boot.
+ExecStop=/bin/sh -c 'tmux list-sessions -F "#{session_name}" 2>/dev/null | grep -qv "^_amber-boot$" && %h/.local/share/amber-ide/plugins/tmux-resurrect/scripts/save.sh || true'
 
 [Install]
 WantedBy=default.target
