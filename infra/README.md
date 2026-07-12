@@ -42,7 +42,17 @@ Idempotent, and it never kills or restarts a running tmux server. It:
    - macOS: `com.amber-ide.tmux` launchd agent (`RunAtLoad`).
 6. If a tmux server is already running, sources the config into it (activates
    the autosave timer; existing sessions untouched). Otherwise starts the
-   server with a bootstrap session `main`.
+   server with a throwaway bootstrap session `_amber-boot`.
+
+### Design note: the `_amber-boot` session
+
+The boot units must create *some* session or the tmux server exits
+immediately, but resurrect **merges** restored panes into any session that
+already has the same name (corrupting it with an extra pane). So the
+bootstrap session gets a reserved name no real session will ever use, and a
+`@resurrect-hook-post-restore-all` hook kills it as soon as a restore
+completes. If there was nothing to restore, it stays behind to keep the
+server alive — that is expected.
 
 ### Design note: boot start
 
@@ -59,12 +69,18 @@ of who started the server.
 | Crash survival | tmux server outlives any client/app |
 | Reboot survival | continuum autosave (1 min) + restore on server start |
 | Scrollback | `history-limit 50000` + `@resurrect-capture-pane-contents 'on'` |
-| Claude resume | `@resurrect-processes '"~claude->claude --continue"'` — any pane whose command matches `claude` is relaunched as `claude --continue` in its saved cwd |
+| Claude resume | `@resurrect-processes '"~claude->claude --dangerously-skip-permissions --continue"'` — any pane whose command matches `claude` is relaunched with those exact flags in its saved cwd (saved arguments are not preserved; every wanted flag must appear in the rule) |
 | Boot start | systemd user unit (Linux) / launchd agent (macOS) |
 
 Known limitation (fixed in Phase 6): `claude --continue` resumes the most
 recent conversation *per directory*, so two Claude panes in the same directory
-would resume the same conversation after a reboot.
+would resume the same conversation after a reboot — and a restored pane in a
+directory where you also run Claude outside the test will resume whatever
+conversation was most recent there.
+
+Pane cwds only restore if the directory still exists at boot; otherwise tmux
+silently falls back to `$HOME` (this is why the torture dirs are not in
+`/tmp`, which is wiped at boot).
 
 Resurrect save files live in `~/.local/share/tmux/resurrect/` (the XDG
 default in the pinned resurrect version; `last` symlink points at the newest
@@ -82,9 +98,12 @@ Setup — `infra/torture-setup.sh` builds the layout for you (2 sessions,
 
 1. Run `infra/torture-setup.sh`. It creates sessions `torture-a`
    (windows `edit` + `build`, 3 panes in `edit` with distinct cwds) and
-   `torture-b` (window `misc`, 2 panes), each pane in a different directory.
-2. In **two panes in different directories**, start `claude` and have a real
-   conversation in each (a few exchanges, so history is unmistakable).
+   `torture-b` (window `misc`, 2 panes), each pane in a different
+   reboot-safe directory under `~/.local/share/amber-ide/torture/`.
+2. In **two of those panes, as-is** (already distinct directories), start
+   `claude` and have a real conversation in each (a few exchanges, so history
+   is unmistakable). Don't cd into a real project directory first — a busy
+   directory makes `--continue` resume the wrong conversation.
 3. Wait >= 1 minute for a continuum autosave (or force one:
    `~/.local/share/amber-ide/plugins/tmux-resurrect/scripts/save.sh`).
 

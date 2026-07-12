@@ -92,8 +92,8 @@ if tmux has-session 2>/dev/null; then
   info "Running tmux server detected: config sourced in place, sessions untouched."
   info "Continuum's autosave timer is now active in the running server."
 else
-  tmux new-session -d -s main
-  info "Started tmux server with bootstrap session 'main'."
+  tmux new-session -d -s _amber-boot
+  info "Started tmux server with bootstrap session '_amber-boot'."
 fi
 
 info "Done. Torture test procedure: infra/README.md"
