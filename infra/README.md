@@ -102,15 +102,16 @@ reboot restores.
 
 ## Torture test (Phase 1 exit test)
 
-Setup — `infra/torture-setup.sh` builds the layout for you (3 sessions,
-3 windows, 6 panes with distinct cwds — one window per session, matching the
-one-window-per-session workflow; the constitution's "2 sessions / 3 windows /
-4+ panes" coverage is preserved), or build it by hand:
+Setup — `infra/torture-setup.sh` builds the layout for you (4 sessions,
+each exactly one window with one pane, distinct cwds — mirroring the
+one-session-per-terminal-pane workflow; that covers the constitution's
+"2 sessions / 4+ panes with distinct cwds", while multi-window and
+split-pane restore are deliberately not exercised because that workflow
+never creates them), or build it by hand:
 
-1. Run `infra/torture-setup.sh`. It creates single-window sessions
-   `torture-a` (`edit`, 3 panes), `torture-b` (`misc`, 2 panes) and
-   `torture-c` (`solo`, 1 pane), each pane in a different reboot-safe
-   directory under `~/.local/share/amber-ide/torture/`.
+1. Run `infra/torture-setup.sh`. It creates single-pane sessions
+   `torture-a` … `torture-d`, each in its own reboot-safe directory under
+   `~/.local/share/amber-ide/torture/`.
 2. In **two of those panes, as-is** (already distinct directories), start
    `claude` and have a real conversation in each (a few exchanges, so history
    is unmistakable). Don't cd into a real project directory first — a busy
