@@ -259,6 +259,15 @@ same way and rewrites config. Portable across machines and shells.
 **Slice 0 exit test:** shell + a detached TUI both survive a daemon restart and reattach
 losslessly, with scrollback, zero manual steps.
 
+**Slice 0 status: DONE (2026-07-13).** 41 tests green, clippy clean. Delivered: Cargo
+workspace; `ring` (9), `proto` codec (7), `state` store (16), `pty` (5), `manager`
+save/restore (2 integration), socket `daemon` + `attach`/`ls`/`create` CLI (2 integration).
+Proven end-to-end via the real binary: `daemon → create → SIGTERM final-snapshot → restart →
+sessions restored from disk`. Detached pty is 24×80 (never 0×0). Known best-effort gaps in
+`amber attach`: SIGWINCH not wired; socket-close only observed on next keystroke. Real TUI
+(vs shell) respawn is covered by the deterministic size proof + the Slice 3 reboot torture
+test with actual claude.
+
 Then, only after Slice 0 passes:
 - Slice 1: protocol hardening, multi-client fan-out, `ls/new/kill/rename`.
 - Slice 2: claude supervision (§6.2) + `amber hook` + claude-resolution (§8), with a **fake
