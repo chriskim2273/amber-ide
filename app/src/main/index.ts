@@ -98,6 +98,8 @@ async function main(): Promise<void> {
   port1.on('message', (e) => win.webContents.send('daemon-event', e.data))
   port1.start()
 
+  ipcMain.on('daemon-command', (_e, cmd: unknown) => port1.postMessage(cmd))
+
   ipcMain.on('open-pane', (_e, session: string) => {
     const { port1: rPort, port2: uPort } = new MessageChannelMain()
     child.postMessage({ kind: 'pane', session }, [uPort])

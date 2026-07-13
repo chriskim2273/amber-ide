@@ -18,6 +18,16 @@ process.parentPort.on('message', (event) => {
   if (!port) return
   if (msg.kind === 'control') {
     controlPort = port
+    port.on('message', (e) => {
+      const cmd = e.data as
+        | { cmd: 'create'; name: string; cwd: string; sessionKind: string }
+        | { cmd: 'kill'; name: string }
+      if (cmd.cmd === 'create') {
+        conn.send({ type: 'control', msg: { kind: 'Create', name: cmd.name, cwd: cmd.cwd, sessionKind: cmd.sessionKind } })
+      } else if (cmd.cmd === 'kill') {
+        conn.send({ type: 'control', msg: { kind: 'Kill', name: cmd.name } })
+      }
+    })
     port.start()
     conn.connect()
     conn.send({ type: 'control', msg: { kind: 'WatchSessions' } })
