@@ -282,9 +282,17 @@ Then, only after Slice 0 passes:
   `infra/daemon/` ships the systemd user unit, launchd agent template, idempotent `install.sh`,
   and the reboot torture-test procedure. The reboot torture test itself is manual (needs a real
   reboot); the daemon-restart path is already proven through the binary in Slice 0.
-- Slice 4: backpressure + batching perf gate (§9); cross-compile matrix (musl/universal). TODO.
-- Slice 5: rewrite `CLAUDE.md` as the new constitution; delete old tmux `infra/`; `amber ctl`
-  (`install`/`doctor`/`snapshot-now`); app integration is a separate spec. TODO.
+- Slice 4: backpressure + batching perf gate (§9); cross-compile matrix (musl/universal).
+  **DONE (2026-07-13)** except batching. Bounded per-subscriber queues → a stalled client
+  backpressures the pty (flat memory under a fast producer; 2 tests). Release profile
+  (lto/strip); static musl build verified (`statically linked`); `scripts/dist.sh` for
+  musl-static + macOS-universal. TODO: true ~16 ms output batching (throughput, not the memory
+  gate).
+- Slice 5: rewrite `CLAUDE.md`; delete old tmux `infra/`; `amber ctl`. **MOSTLY DONE
+  (2026-07-13).** `CLAUDE.md` rewritten as the daemon constitution; old tmux infra deleted;
+  `amber ctl doctor` (login-shell claude resolution → config — closes the original bug) +
+  `amber ctl status`. TODO: `amber ctl install`/`snapshot-now`. App (Electron) integration is a
+  separate spec that consumes the daemon socket.
 
 ---
 
