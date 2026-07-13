@@ -71,9 +71,18 @@ impl PtySession {
                         Ok(0) => break,
                         Ok(n) => {
                             let chunk = &buf[..n];
-                            ring.lock().unwrap().push(chunk);
-                            let senders: Subscribers =
-                                subs.lock().unwrap().clone();
+                            // Push to the ring and snapshot the subscriber
+                            // list while STILL holding the ring lock —
+                            // subscribe() takes ring-then-subs in the same
+                            // order, so a subscriber can never slip in
+                            // between the push and the snapshot (which would
+                            // hand it this chunk both in its backlog and via
+                            // its channel).
+                            let senders: Subscribers = {
+                                let mut ring_guard = ring.lock().unwrap();
+                                ring_guard.push(chunk);
+                                subs.lock().unwrap().clone()
+                            };
                             let mut dead = Vec::new();
                             for (id, tx) in &senders {
                                 // Blocking send == backpressure when the bounded
@@ -285,6 +294,52 @@ mod tests {
         drop(rx); // subscriber goes away
         sess.write(b"AFTER_DROP\n").unwrap();
         wait_for(&sess, b"AFTER_DROP");
+    }
+
+    #[test]
+    fn subscribe_backlog_and_live_never_duplicate_or_lose_bytes() {
+        // Invariant: for any subscriber, backlog + live bytes must be an
+        // exact suffix of the session's final stream — a subscriber added
+        // between the ring push and the fan-out must not receive the same
+        // chunk twice (once in backlog, once live) or miss it entirely.
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.arg("-c");
+        cmd.arg("seq 1 20000");
+        let sess = Arc::new(PtySession::spawn(cmd, 24, 80, 8 * 1024 * 1024).unwrap());
+
+        let mut handles = Vec::new();
+        for i in 0..16 {
+            let sess = Arc::clone(&sess);
+            handles.push(std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(3 * i as u64));
+                let (backlog, rx) = sess.subscribe();
+                let mut acc = backlog;
+                while let Ok(chunk) = rx.recv_timeout(Duration::from_millis(500)) {
+                    acc.extend_from_slice(&chunk);
+                }
+                acc
+            }));
+        }
+
+        // Wait for the child to finish and output to settle.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while sess.is_alive() {
+            assert!(Instant::now() < deadline, "producer never finished");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let streams: Vec<Vec<u8>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let full = sess.scrollback();
+        for (i, s) in streams.iter().enumerate() {
+            assert!(
+                full.ends_with(s),
+                "subscriber {i}: backlog+live is not a suffix of the final stream \
+                 (duplicated or lost bytes at the subscribe boundary); \
+                 got {} bytes vs full {} bytes",
+                s.len(),
+                full.len()
+            );
+        }
     }
 
     #[test]
