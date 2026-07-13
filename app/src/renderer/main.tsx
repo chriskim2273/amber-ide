@@ -1,4 +1,4 @@
-import { StrictMode, useEffect, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { Pane } from './Pane'
 
@@ -38,4 +38,6 @@ function App(): JSX.Element {
 }
 
 const root = document.getElementById('root')
-if (root) createRoot(root).render(<StrictMode><App /></StrictMode>)
+// No StrictMode: its dev double-mount re-runs the pane effect, spawning
+// duplicate MessagePorts/openPane calls that multiply keystrokes.
+if (root) createRoot(root).render(<App />)

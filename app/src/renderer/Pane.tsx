@@ -4,20 +4,6 @@ import { FitAddon } from '@xterm/addon-fit'
 import { WebglAddon } from '@xterm/addon-webgl'
 import '@xterm/xterm/css/xterm.css'
 
-// Wait for the preload bridge to hand us this session's MessagePort.
-function awaitPort(session: string): Promise<MessagePort> {
-  return new Promise((resolve) => {
-    const onMsg = (e: MessageEvent) => {
-      const d = e.data as { amberPanePort?: boolean; session?: string }
-      if (d?.amberPanePort && d.session === session && e.ports[0]) {
-        window.removeEventListener('message', onMsg)
-        resolve(e.ports[0])
-      }
-    }
-    window.addEventListener('message', onMsg)
-  })
-}
-
 export function Pane({ session }: { session: string }): JSX.Element {
   const hostRef = useRef<HTMLDivElement>(null)
 
@@ -34,34 +20,44 @@ export function Pane({ session }: { session: string }): JSX.Element {
     fit.fit()
 
     let port: MessagePort | null = null
-    let disposed = false
+    let wired = false
 
-    void awaitPort(session).then((p) => {
-      if (disposed) { p.close(); return }
-      port = p
-      p.onmessage = (e) => {
-        const d = e.data as { data?: Uint8Array }
-        if (d.data) term.write(d.data) // xterm.write accepts Uint8Array (UTF-8)
+    const sendResize = (): void => {
+      fit.fit()
+      port?.postMessage({ resize: { cols: term.cols, rows: term.rows } })
+    }
+    const focus = (): void => term.focus()
+
+    // The preload bridge re-dispatches this session's MessagePort via
+    // window.postMessage. Wire exactly one port (guard against StrictMode /
+    // repeat dispatches) and remove this listener as soon as it lands.
+    const onPortMsg = (e: MessageEvent): void => {
+      const d = e.data as { amberPanePort?: boolean; session?: string }
+      if (!d?.amberPanePort || d.session !== session || !e.ports[0]) return
+      window.removeEventListener('message', onPortMsg)
+      if (wired) { e.ports[0].close(); return }
+      wired = true
+      port = e.ports[0]
+      port.onmessage = (ev) => {
+        const m = ev.data as { data?: Uint8Array }
+        if (m.data) term.write(m.data) // xterm.write accepts Uint8Array (UTF-8)
       }
-      p.start()
-      term.onData((s) => {
-        console.log('[pane] input', JSON.stringify(s))
-        p.postMessage({ data: new TextEncoder().encode(s) })
-      })
-      const sendResize = () => { fit.fit(); p!.postMessage({ resize: { cols: term.cols, rows: term.rows } }) }
+      port.start()
+      term.onData((s) => port?.postMessage({ data: new TextEncoder().encode(s) }))
       sendResize()
-      window.addEventListener('resize', sendResize)
       term.focus()
-    })
+    }
 
-    // xterm only emits keystrokes while focused; grab focus now and on click.
+    window.addEventListener('message', onPortMsg)
+    window.addEventListener('resize', sendResize)
+    host.addEventListener('click', focus)
     term.focus()
-    host.addEventListener('click', () => term.focus())
-
     window.amber.openPane(session)
 
     return () => {
-      disposed = true
+      window.removeEventListener('message', onPortMsg)
+      window.removeEventListener('resize', sendResize)
+      host.removeEventListener('click', focus)
       port?.close()
       term.dispose()
     }
