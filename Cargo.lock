@@ -11,6 +11,7 @@ dependencies = [
  "clap",
  "nix 0.31.3",
  "portable-pty",
+ "serde_json",
  "signal-hook",
  "tempfile",
  "terminal_size",

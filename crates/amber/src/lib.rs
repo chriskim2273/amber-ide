@@ -2,6 +2,7 @@
 //! socket server + attach client. Kept as a lib so the pieces are testable.
 
 pub mod attach;
+pub mod claude;
 pub mod daemon;
 pub mod manager;
 pub mod pty;
