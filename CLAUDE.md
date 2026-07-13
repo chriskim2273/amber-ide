@@ -127,9 +127,16 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   `docs/superpowers/plans/2026-07-13-amber-ide-app-slices-1-3.md`. (Headless
   proof: `app/test/realDaemon.test.ts`. Env note: kernel 6.17 needs
   `AMBER_NO_SANDBOX=1 AMBER_SOFTWARE_GL=1` — see the design spec / env memory.)
-- [ ] App Slices 4–7 — reducer + tabs, split tree + geometry sidecar,
-  workspaces + claude panes + reconnect banner, packaging. It consumes the
-  daemon socket, it does not reimplement it.
+- [x] App Slice 4 — reducer (`store`) + `names`; tabbed multi-pane UI; create/kill.
+- [x] App Slice 5 — binary split tree (`layout`) + geometry sidecar
+  (`layoutFile`, atomic IO); interactive split/resize/close; persist + restore.
+- [x] App Slice 6 — workspace switcher; claude panes (`kind=claude`); reconnect
+  (auto-backoff, re-subscribe + reattach, banner). **Full IDE surface working on
+  a live GUI** (kernel-6.17 box needs `AMBER_SOFTWARE_GL=1 AMBER_NO_SANDBOX=1`).
+  Fixes shipped: claude fresh-start for new sessions; deferred split placement;
+  per-pane ResizeObserver; DOM renderer under software GL; layout-load gate.
+- [ ] App Slice 7 — packaging (electron-builder dmg/AppImage, bundle the `amber`
+  binary, first-run install). Consumes the daemon socket; does not reimplement it.
 
 ## Gotchas (learned)
 
