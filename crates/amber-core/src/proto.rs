@@ -10,6 +10,14 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionInfo {
+    pub name: String,
+    pub cwd: String,
+    pub kind: String,
+    pub alive: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlMsg {
     Hello,
     ListSessions,
@@ -23,6 +31,15 @@ pub enum ControlMsg {
     Snapshot,
     /// Daemon reply: the snapshot completed successfully.
     SnapshotOk,
+    /// Client -> daemon: opt this connection in to pushed session-change events.
+    WatchSessions,
+    /// Client -> daemon: request the full session set with metadata.
+    ListSessionsDetailed,
+    /// Daemon -> client: the full session set (reply to ListSessionsDetailed
+    /// and sent once after WatchSessions).
+    Sessions { sessions: Vec<SessionInfo> },
+    /// Daemon -> watchers: an incremental session-set delta.
+    SessionsChanged { added: Vec<SessionInfo>, removed: Vec<String> },
     SessionList { names: Vec<String> },
     Created { name: String },
     Killed { name: String },
@@ -218,6 +235,43 @@ mod tests {
         let mut d = Decoder::new();
         d.feed(&encode(&f));
         assert_eq!(d.next_frame().unwrap(), Some(f));
+    }
+
+    #[test]
+    fn session_info_variants_roundtrip() {
+        let info = SessionInfo {
+            name: "amber-1-1-0-abc".into(),
+            cwd: "/home/u/proj".into(),
+            kind: "claude".into(),
+            alive: true,
+        };
+        let full = Frame::Control(ControlMsg::Sessions { sessions: vec![info.clone()] });
+        assert_eq!(roundtrip(&full), full);
+
+        let delta = Frame::Control(ControlMsg::SessionsChanged {
+            added: vec![info],
+            removed: vec!["amber-1-1-1-def".into()],
+        });
+        assert_eq!(roundtrip(&delta), delta);
+
+        for unit in [ControlMsg::WatchSessions, ControlMsg::ListSessionsDetailed] {
+            let f = Frame::Control(unit);
+            assert_eq!(roundtrip(&f), f);
+        }
+    }
+
+    #[test]
+    fn control_enum_is_externally_tagged() {
+        // The TS client mirrors this exact JSON. Lock the shape so a serde
+        // change that breaks the wire is caught here.
+        let json = serde_json::to_string(&ControlMsg::WatchSessions).unwrap();
+        assert_eq!(json, "\"WatchSessions\"");
+        let json = serde_json::to_string(&ControlMsg::SessionsChanged {
+            added: vec![],
+            removed: vec!["x".into()],
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"SessionsChanged":{"added":[],"removed":["x"]}}"#);
     }
 
     #[test]
