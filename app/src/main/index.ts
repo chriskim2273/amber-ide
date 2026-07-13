@@ -20,6 +20,9 @@ if (process.env['AMBER_SOFTWARE_GL']) {
 }
 if (process.env['AMBER_NO_SANDBOX']) {
   app.commandLine.appendSwitch('no-sandbox')
+  // Sandboxed /dev/shm is often tiny or inaccessible; fall back to /tmp so
+  // Chromium's shared-memory allocation doesn't fatally crash.
+  app.commandLine.appendSwitch('disable-dev-shm-usage')
 }
 
 function amberBinary(): string {
