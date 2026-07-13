@@ -39,6 +39,10 @@ pub struct PtySession {
     writer: Mutex<Box<dyn Write + Send>>,
     ring: Arc<Mutex<Ring>>,
     subs: Arc<Mutex<Subscribers>>,
+    /// Set by the reader thread (under the `subs` lock) once the pty hits
+    /// EOF. After that nobody will ever clear a newly-registered sender, so
+    /// `subscribe` must hand out an already-closed channel instead.
+    reader_done: Arc<std::sync::atomic::AtomicBool>,
     next_sub_id: AtomicU64,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     exit: Arc<Mutex<Option<i32>>>,
@@ -116,19 +120,20 @@ impl PtySession {
             Ok(r) => r,
             Err(e) => {
                 let _ = child.kill();
-                return Err(e.into());
+                return Err(e);
             }
         };
         let writer = match pair.master.take_writer() {
             Ok(w) => w,
             Err(e) => {
                 let _ = child.kill();
-                return Err(e.into());
+                return Err(e);
             }
         };
 
         let ring = Arc::new(Mutex::new(Ring::new(cap)));
         let subs: Arc<Mutex<Subscribers>> = Arc::new(Mutex::new(Vec::new()));
+        let reader_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Reader thread: append to ring, fan out to live subscribers. Senders
         // are snapshotted (subs lock released) BEFORE the blocking send, so a
@@ -137,6 +142,7 @@ impl PtySession {
         {
             let ring = Arc::clone(&ring);
             let subs = Arc::clone(&subs);
+            let reader_done = Arc::clone(&reader_done);
             thread::spawn(move || {
                 let mut buf = [0u8; 8192];
                 loop {
@@ -166,8 +172,13 @@ impl PtySession {
                 }
                 // Pty EOF/read error: the child is gone. Drop every
                 // subscriber's sender so their channels close — attached
-                // clients must observe the pane ending, not silence.
-                subs.lock().unwrap().clear();
+                // clients must observe the pane ending, not silence. The
+                // done-flag is set under the same lock `subscribe` takes, so
+                // a late subscriber can never register a sender that nobody
+                // will clear.
+                let mut subs = subs.lock().unwrap();
+                reader_done.store(true, Ordering::SeqCst);
+                subs.clear();
             });
         }
 
@@ -187,6 +198,7 @@ impl PtySession {
             writer: Mutex::new(writer),
             ring,
             subs,
+            reader_done,
             next_sub_id: AtomicU64::new(0),
             killer: Mutex::new(killer),
             exit,
@@ -231,7 +243,15 @@ impl PtySession {
         let backlog = ring.snapshot();
         let (tx, rx) = sync_channel(SUBSCRIBER_QUEUE_DEPTH);
         let id = self.next_sub_id.fetch_add(1, Ordering::Relaxed);
-        self.subs.lock().unwrap().push((id, tx));
+        {
+            let mut subs = self.subs.lock().unwrap();
+            // If the pty already hit EOF the reader will never clear this
+            // sender; drop it now so the subscriber sees a closed channel
+            // (backlog still delivered above).
+            if !self.reader_done.load(Ordering::SeqCst) {
+                subs.push((id, tx));
+            }
+        }
         drop(ring);
         (id, backlog, rx)
     }
@@ -500,6 +520,37 @@ mod tests {
                         "channel never closed after child exit"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn subscribe_after_child_exit_yields_closed_channel() {
+        // Attaching to a session whose child already died must yield an
+        // immediately-closed channel (backlog still readable), not a sender
+        // that nothing will ever clear — the reader thread has already
+        // exited, so nobody else can close it.
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.arg("-c");
+        cmd.arg("printf gone");
+        let sess = PtySession::spawn(cmd, 24, 80, 4096).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while sess.is_alive() {
+            assert!(Instant::now() < deadline, "child never exited");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        wait_for(&sess, b"gone"); // reader has drained the output
+        let (_id, backlog, rx) = sess.subscribe();
+        assert!(backlog.windows(4).any(|w| w == b"gone"));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(_) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => assert!(
+                    Instant::now() < deadline,
+                    "channel from a post-exit subscribe never closed"
+                ),
             }
         }
     }
