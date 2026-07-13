@@ -3,6 +3,7 @@
 
 use amber::daemon::Daemon;
 use amber::manager::SessionManager;
+use amber::watchers::Watchers;
 use amber_core::proto::{self, ControlMsg, Decoder, Frame};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -22,7 +23,7 @@ fn start_daemon() -> (PathBuf, tempfile::TempDir) {
 
     let manager = Arc::new(SessionManager::new(&root).unwrap());
     let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
-    let daemon = Daemon::new(manager);
+    let daemon = Daemon::new(manager, std::sync::Arc::new(Watchers::new()));
     thread::spawn(move || {
         let _ = daemon.serve(listener);
     });
@@ -87,7 +88,7 @@ fn disconnecting_client_releases_its_subscription() {
 
     let manager = Arc::new(SessionManager::new(&root).unwrap());
     let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
-    let daemon = Daemon::new(Arc::clone(&manager));
+    let daemon = Daemon::new(Arc::clone(&manager), std::sync::Arc::new(Watchers::new()));
     thread::spawn(move || {
         let _ = daemon.serve(listener);
     });
