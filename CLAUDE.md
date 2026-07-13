@@ -114,8 +114,22 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   release on client disconnect + `Detach`; live-socket steal guard; frame
   length cap; session-name validation; spawn-error child cleanup. `Rename`
   returns an explicit error (unsupported until supervisor rebind exists).
-- [ ] App — the Electron walking skeleton onward. **Separate spec required**
-  before starting; it consumes the daemon socket, it does not reimplement it.
+- [x] App Slice 1 — daemon protocol extension: `SessionInfo`,
+  `WatchSessions`/`ListSessionsDetailed`/`Sessions`/`SessionsChanged`, watcher
+  registry + create/kill/reap broadcast. Spec:
+  `docs/superpowers/specs/2026-07-13-amber-ide-app-design.md`.
+- [x] App Slices 2–3 — Electron walking skeleton: electron-vite + TS strict +
+  React scaffold, byte-compatible `proto.ts`, self-healing daemon boot,
+  multiplexed utilityProcess (`connection`/`router`), per-pane MessagePort
+  brokered main→preload→renderer, `Pane.tsx` xterm+webgl. **Proven end-to-end on
+  a live GUI**: real daemon → utilityProcess → MessagePort → xterm render, and
+  keystrokes → daemon → pty, 1× each direction. Plan:
+  `docs/superpowers/plans/2026-07-13-amber-ide-app-slices-1-3.md`. (Headless
+  proof: `app/test/realDaemon.test.ts`. Env note: kernel 6.17 needs
+  `AMBER_NO_SANDBOX=1 AMBER_SOFTWARE_GL=1` — see the design spec / env memory.)
+- [ ] App Slices 4–7 — reducer + tabs, split tree + geometry sidecar,
+  workspaces + claude panes + reconnect banner, packaging. It consumes the
+  daemon socket, it does not reimplement it.
 
 ## Gotchas (learned)
 
