@@ -13,7 +13,7 @@ use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, Pt
 /// ring, and the subscriber list. Reader and waiter run on dedicated threads
 /// (portable-pty's reader is a blocking `std::io::Read`).
 pub struct PtySession {
-    master: Box<dyn MasterPty + Send>,
+    master: Mutex<Box<dyn MasterPty + Send>>,
     writer: Mutex<Box<dyn Write + Send>>,
     ring: Arc<Mutex<Ring>>,
     subs: Arc<Mutex<Vec<Sender<Vec<u8>>>>>,
@@ -77,7 +77,7 @@ impl PtySession {
         }
 
         Ok(PtySession {
-            master: pair.master,
+            master: Mutex::new(pair.master),
             writer: Mutex::new(writer),
             ring,
             subs,
@@ -96,7 +96,7 @@ impl PtySession {
 
     /// Resize the pty (delivers SIGWINCH to the child).
     pub fn resize(&self, rows: u16, cols: u16) -> anyhow::Result<()> {
-        self.master.resize(PtySize {
+        self.master.lock().unwrap().resize(PtySize {
             rows,
             cols,
             pixel_width: 0,
@@ -148,7 +148,7 @@ mod tests {
     use portable_pty::CommandBuilder;
     use std::time::{Duration, Instant};
 
-    fn wait_for<'a>(sess: &PtySession, needle: &[u8]) -> Vec<u8> {
+    fn wait_for(sess: &PtySession, needle: &[u8]) -> Vec<u8> {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let sb = sess.scrollback();
