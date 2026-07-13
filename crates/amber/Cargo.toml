@@ -11,3 +11,8 @@ path = "src/main.rs"
 [dependencies]
 amber-core = { path = "../amber-core" }
 anyhow = { workspace = true }
+portable-pty = "0.9"
+
+[lib]
+name = "amber"
+path = "src/lib.rs"
