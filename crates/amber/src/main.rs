@@ -91,6 +91,13 @@ enum CtlAction {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
+    /// Build + install the amber binary and boot unit (systemd user unit on
+    /// Linux, launchd agent on macOS) by running the repo's install script.
+    Install {
+        /// Resolve and print what would run, without running it.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// `$XDG_STATE_HOME/amber-ide`, falling back to `$HOME/.local/state/amber-ide`.
@@ -133,6 +140,7 @@ fn main() -> anyhow::Result<()> {
             CtlAction::Doctor { root } => run_doctor(root),
             CtlAction::Status { socket } => run_status(&resolve_socket(socket)),
             CtlAction::SnapshotNow { socket } => run_snapshot_now(&resolve_socket(socket)),
+            CtlAction::Install { dry_run } => run_install(dry_run),
         },
     }
 }
@@ -185,6 +193,48 @@ fn run_status(socket: &Path) -> anyhow::Result<()> {
             std::process::exit(1);
         }
     }
+}
+
+/// Locate the repo's `infra/daemon/install.sh`: walk up from the running
+/// binary (covers `target/{debug,release}/amber` in a checkout) and from this
+/// crate's manifest dir (covers `cargo run` / test builds).
+fn find_install_script() -> Option<PathBuf> {
+    let mut starts: Vec<PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        starts.push(exe);
+    }
+    starts.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+    for start in starts {
+        for dir in start.ancestors() {
+            let candidate = dir.join("infra/daemon/install.sh");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// `ctl install`: thin wrapper over `infra/daemon/install.sh` (which builds
+/// the release binary, installs it, and enables the boot unit).
+fn run_install(dry_run: bool) -> anyhow::Result<()> {
+    let Some(script) = find_install_script() else {
+        eprintln!(
+            "amber ctl install: could not locate infra/daemon/install.sh \
+             relative to this binary.\nRun it from a checkout instead:\n\n    \
+             bash <amber-repo>/infra/daemon/install.sh\n"
+        );
+        anyhow::bail!("install script not found");
+    };
+    if dry_run {
+        println!("would run: bash {}", script.display());
+        return Ok(());
+    }
+    let status = std::process::Command::new("bash").arg(&script).status()?;
+    if !status.success() {
+        anyhow::bail!("install script failed with {status}");
+    }
+    Ok(())
 }
 
 /// Ask the daemon for an immediate snapshot and wait for the ack.
