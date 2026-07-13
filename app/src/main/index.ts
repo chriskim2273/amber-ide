@@ -1,4 +1,5 @@
 import { app, BrowserWindow, utilityProcess, MessageChannelMain } from 'electron'
+import { ipcMain } from 'electron'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 import { spawn } from 'node:child_process'
@@ -48,6 +49,12 @@ async function main(): Promise<void> {
   // Forward daemon control events to the renderer for logging (slice 2 proof).
   port1.on('message', (e) => win.webContents.send('daemon-event', e.data))
   port1.start()
+
+  ipcMain.on('open-pane', (_e, session: string) => {
+    const { port1: rPort, port2: uPort } = new MessageChannelMain()
+    child.postMessage({ kind: 'pane', session }, [uPort])
+    win.webContents.postMessage('pane-port', { session }, [rPort])
+  })
 }
 
 app.whenReady().then(main).catch((e) => {
