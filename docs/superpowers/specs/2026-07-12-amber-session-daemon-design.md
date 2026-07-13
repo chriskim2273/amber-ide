@@ -269,12 +269,22 @@ sessions restored from disk`. Detached pty is 24×80 (never 0×0). Known best-ef
 test with actual claude.
 
 Then, only after Slice 0 passes:
-- Slice 1: protocol hardening, multi-client fan-out, `ls/new/kill/rename`.
-- Slice 2: claude supervision (§6.2) + `amber hook` + claude-resolution (§8), with a **fake
-  `claude` stub** honoring `--resume`/`--continue` + firing the hook.
-- Slice 3: snapshot cadence + SIGTERM final snapshot + boot units (§10); reboot torture test.
-- Slice 4: backpressure + batching perf gate (§9); cross-compile matrix.
-- Slice 5: rewrite `CLAUDE.md` as the new constitution; app integration is a separate spec.
+- Slice 1: protocol hardening, multi-client fan-out, `ls/new/kill/rename`. **DONE** (folded
+  into Slice 0's socket daemon: `Create`/`Attach`/`Input`/`Resize`/`Kill`/`ListSessions`,
+  multi-client fan-out, `ls`/`create` CLI).
+- Slice 2: claude supervision (§6.2) + `amber hook` + claude-resolution (§8). **DONE
+  (2026-07-13).** `claude.rs` (7 tests) + `supervisor.rs` bounded-retry loop + `amber run`/
+  `amber hook` subcommands + SessionManager Claude arm spawns `amber run <name>`. Proven with a
+  fake `claude` stub: `--continue` first run → hook records id → `--resume <id>` next run;
+  crash exhausts to shell fallback after 3 tries; `amber hook` records the id end-to-end.
+- Slice 3: snapshot cadence + SIGTERM final snapshot + boot units (§10). **DONE (2026-07-13).**
+  Daemon has a config-driven snapshot timer + SIGTERM/SIGINT final-snapshot handler;
+  `infra/daemon/` ships the systemd user unit, launchd agent template, idempotent `install.sh`,
+  and the reboot torture-test procedure. The reboot torture test itself is manual (needs a real
+  reboot); the daemon-restart path is already proven through the binary in Slice 0.
+- Slice 4: backpressure + batching perf gate (§9); cross-compile matrix (musl/universal). TODO.
+- Slice 5: rewrite `CLAUDE.md` as the new constitution; delete old tmux `infra/`; `amber ctl`
+  (`install`/`doctor`/`snapshot-now`); app integration is a separate spec. TODO.
 
 ---
 
