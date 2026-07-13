@@ -2,12 +2,24 @@
 //! capped scrollback [`Ring`] and to any live subscribers.
 
 use std::io::{Read, Write};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use amber_core::ring::Ring;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
+
+/// Bounded per-subscriber output queue depth (in chunks). When a subscriber
+/// falls this far behind, the reader thread blocks on it — backpressuring the
+/// pty and thus the child — so memory stays flat (spec §9, e.g. `cat` of a
+/// huge file). Caveat: a fully-stalled subscriber backpressures the whole
+/// session; per-subscriber isolation (drop only the laggard) is a refinement.
+const SUBSCRIBER_QUEUE_DEPTH: usize = 256;
+
+/// Live subscribers: `(id, bounded sender)`. The id lets the reader prune a
+/// specific dead subscriber after a snapshot-then-send.
+type Subscribers = Vec<(u64, SyncSender<Vec<u8>>)>;
 
 /// A live session: owns the pty master, the child's writer, the scrollback
 /// ring, and the subscriber list. Reader and waiter run on dedicated threads
@@ -16,7 +28,8 @@ pub struct PtySession {
     master: Mutex<Box<dyn MasterPty + Send>>,
     writer: Mutex<Box<dyn Write + Send>>,
     ring: Arc<Mutex<Ring>>,
-    subs: Arc<Mutex<Vec<Sender<Vec<u8>>>>>,
+    subs: Arc<Mutex<Subscribers>>,
+    next_sub_id: AtomicU64,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     exit: Arc<Mutex<Option<i32>>>,
 }
@@ -42,9 +55,12 @@ impl PtySession {
         let writer = pair.master.take_writer()?;
 
         let ring = Arc::new(Mutex::new(Ring::new(cap)));
-        let subs: Arc<Mutex<Vec<Sender<Vec<u8>>>>> = Arc::new(Mutex::new(Vec::new()));
+        let subs: Arc<Mutex<Subscribers>> = Arc::new(Mutex::new(Vec::new()));
 
-        // Reader thread: append to ring, fan out to live subscribers, drop dead ones.
+        // Reader thread: append to ring, fan out to live subscribers. Senders
+        // are snapshotted (subs lock released) BEFORE the blocking send, so a
+        // backpressured send never wedges subscribe(); dead subscribers
+        // (receiver dropped) are pruned afterward.
         {
             let ring = Arc::clone(&ring);
             let subs = Arc::clone(&subs);
@@ -55,9 +71,20 @@ impl PtySession {
                         Ok(0) => break,
                         Ok(n) => {
                             let chunk = &buf[..n];
-                            // Lock order (ring then subs) matches subscribe() to avoid deadlock.
                             ring.lock().unwrap().push(chunk);
-                            subs.lock().unwrap().retain(|tx| tx.send(chunk.to_vec()).is_ok());
+                            let senders: Subscribers =
+                                subs.lock().unwrap().clone();
+                            let mut dead = Vec::new();
+                            for (id, tx) in &senders {
+                                // Blocking send == backpressure when the bounded
+                                // queue is full.
+                                if tx.send(chunk.to_vec()).is_err() {
+                                    dead.push(*id);
+                                }
+                            }
+                            if !dead.is_empty() {
+                                subs.lock().unwrap().retain(|(id, _)| !dead.contains(id));
+                            }
                         }
                         Err(_) => break,
                     }
@@ -81,6 +108,7 @@ impl PtySession {
             writer: Mutex::new(writer),
             ring,
             subs,
+            next_sub_id: AtomicU64::new(0),
             killer: Mutex::new(killer),
             exit,
         })
@@ -120,8 +148,9 @@ impl PtySession {
     pub fn subscribe(&self) -> (Vec<u8>, Receiver<Vec<u8>>) {
         let ring = self.ring.lock().unwrap();
         let backlog = ring.snapshot();
-        let (tx, rx) = channel();
-        self.subs.lock().unwrap().push(tx);
+        let (tx, rx) = sync_channel(SUBSCRIBER_QUEUE_DEPTH);
+        let id = self.next_sub_id.fetch_add(1, Ordering::Relaxed);
+        self.subs.lock().unwrap().push((id, tx));
         drop(ring);
         (backlog, rx)
     }
@@ -220,6 +249,42 @@ mod tests {
             .scrollback()
             .windows(16)
             .any(|w| w == b"RESTORED-HISTORY"));
+    }
+
+    #[test]
+    fn slow_subscriber_backpressures_producer() {
+        // A subscriber that never drains must throttle the child: the reader
+        // blocks on the full bounded queue, the pty fills, and the producer
+        // can't finish. With an UNBOUNDED queue the reader would drain forever
+        // (memory ballooning) and the producer would reach the sentinel.
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = dir.path().join("done");
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.arg("-c");
+        cmd.arg(format!(
+            "yes PADDING_LINE_TO_FILL_THE_PIPE | head -n 400000; : > '{}'",
+            sentinel.display()
+        ));
+        let sess = PtySession::spawn(cmd, 24, 80, 4096).unwrap();
+        // Subscribe but NEVER read from rx — hold it so the channel fills.
+        let (_backlog, _rx) = sess.subscribe();
+        std::thread::sleep(Duration::from_millis(700));
+        assert!(
+            !sentinel.exists(),
+            "producer finished despite a stalled subscriber — no backpressure"
+        );
+    }
+
+    #[test]
+    fn dead_subscriber_does_not_wedge_reader() {
+        // Dropping a subscriber's receiver must not stall the reader: output
+        // keeps flowing to the ring after the dead one is pruned.
+        let cmd = CommandBuilder::new("cat");
+        let sess = PtySession::spawn(cmd, 24, 80, 4096).unwrap();
+        let (_backlog, rx) = sess.subscribe();
+        drop(rx); // subscriber goes away
+        sess.write(b"AFTER_DROP\n").unwrap();
+        wait_for(&sess, b"AFTER_DROP");
     }
 
     #[test]
