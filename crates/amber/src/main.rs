@@ -66,6 +66,26 @@ enum Command {
     /// rotating session id from stdin (`AMBER_SESSION`/`AMBER_STATE_DIR`
     /// env, spec §6.2).
     Hook,
+    /// Diagnostics + lifecycle helpers.
+    Ctl {
+        #[command(subcommand)]
+        action: CtlAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum CtlAction {
+    /// Resolve the claude binary via your login shell and record it in config
+    /// (the distribution-safe path — never the daemon's own PATH; spec §8).
+    Doctor {
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
+    /// Report whether the daemon is reachable and how many sessions it holds.
+    Status {
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
 }
 
 /// `$XDG_STATE_HOME/amber-ide`, falling back to `$HOME/.local/state/amber-ide`.
@@ -104,6 +124,60 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Run { name } => run_supervisor(&name),
         Command::Hook => run_hook(),
+        Command::Ctl { action } => match action {
+            CtlAction::Doctor { root } => run_doctor(root),
+            CtlAction::Status { socket } => run_status(&resolve_socket(socket)),
+        },
+    }
+}
+
+/// Resolve claude via the login shell and persist the path in config, so the
+/// daemon (whose own PATH is stripped) always finds it. Fixes the exact class
+/// of bug that motivated this rearchitecture.
+fn run_doctor(root: Option<PathBuf>) -> anyhow::Result<()> {
+    let root = root.unwrap_or_else(default_root);
+    std::fs::create_dir_all(&root)?;
+    let store = StateStore::new(&root);
+    match claude::resolve_claude() {
+        Some(path) => {
+            let mut cfg = store.load_config()?;
+            cfg.claude_path = Some(path.clone());
+            store.save_config(&cfg)?;
+            println!("claude: {} (recorded in config)", path.display());
+            Ok(())
+        }
+        None => {
+            println!("claude: NOT FOUND via your login shell — install it or add it to PATH");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Connect to the daemon and report liveness + session count.
+fn run_status(socket: &Path) -> anyhow::Result<()> {
+    match UnixStream::connect(socket) {
+        Ok(mut stream) => {
+            stream.write_all(&proto::encode(&Frame::Control(ControlMsg::ListSessions)))?;
+            let mut decoder = Decoder::new();
+            let mut buf = [0u8; 8192];
+            loop {
+                if let Some(Frame::Control(ControlMsg::SessionList { names })) =
+                    decoder.next_frame()?
+                {
+                    println!("daemon: up ({}) — {} session(s)", socket.display(), names.len());
+                    return Ok(());
+                }
+                let n = stream.read(&mut buf)?;
+                if n == 0 {
+                    anyhow::bail!("daemon closed the connection before replying");
+                }
+                decoder.feed(&buf[..n]);
+            }
+        }
+        Err(_) => {
+            println!("daemon: unreachable at {}", socket.display());
+            std::process::exit(1);
+        }
     }
 }
 
