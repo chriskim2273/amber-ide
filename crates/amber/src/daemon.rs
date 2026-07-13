@@ -10,11 +10,18 @@ use amber_core::proto::{self, ControlMsg, Decoder, Frame};
 use amber_core::state::SessionKind;
 
 use crate::manager::SessionManager;
+use crate::pty::PtySession;
 
 /// Shared handle to a connection's write half — both the control-reply path
 /// and a per-attach output-forwarder thread write to it, so it must be
 /// mutex-guarded.
 type SharedWriter = Arc<Mutex<UnixStream>>;
+
+/// Subscriptions this connection holds: `(session name, session, sub id)`.
+/// Released on `Detach` and when the connection ends, so a vanished client
+/// never leaves a subscriber (and its forwarder thread) behind on an idle
+/// session.
+type Subscriptions = Vec<(String, Arc<PtySession>, u64)>;
 
 /// Owns the session table and serves the unix socket. Each accepted
 /// connection is handled on its own thread; a single connection erroring out
@@ -71,13 +78,27 @@ fn parse_kind(kind: &str) -> anyhow::Result<SessionKind> {
 /// and reply/forward via the shared write half.
 fn handle_connection(manager: Arc<SessionManager>, stream: UnixStream) -> anyhow::Result<()> {
     let writer: SharedWriter = Arc::new(Mutex::new(stream.try_clone()?));
-    let mut read_half = stream;
+    let mut subscriptions: Subscriptions = Vec::new();
+    let result = connection_loop(&manager, &writer, stream, &mut subscriptions);
+    // However the connection ended, release every subscription it held.
+    for (_, sess, id) in subscriptions {
+        sess.unsubscribe(id);
+    }
+    result
+}
+
+fn connection_loop(
+    manager: &Arc<SessionManager>,
+    writer: &SharedWriter,
+    mut read_half: UnixStream,
+    subscriptions: &mut Subscriptions,
+) -> anyhow::Result<()> {
     let mut decoder = Decoder::new();
     let mut buf = [0u8; 8192];
 
     loop {
         while let Some(frame) = decoder.next_frame()? {
-            handle_frame(&manager, &writer, frame);
+            handle_frame(manager, writer, frame, subscriptions);
         }
         let n = read_half.read(&mut buf)?;
         if n == 0 {
@@ -87,9 +108,14 @@ fn handle_connection(manager: Arc<SessionManager>, stream: UnixStream) -> anyhow
     }
 }
 
-fn handle_frame(manager: &Arc<SessionManager>, writer: &SharedWriter, frame: Frame) {
+fn handle_frame(
+    manager: &Arc<SessionManager>,
+    writer: &SharedWriter,
+    frame: Frame,
+    subscriptions: &mut Subscriptions,
+) {
     match frame {
-        Frame::Control(msg) => handle_control(manager, writer, msg),
+        Frame::Control(msg) => handle_control(manager, writer, msg, subscriptions),
         Frame::Data { session, bytes } => {
             // Input from the client: forward to the child's stdin. A stale
             // session name is not fatal to the connection.
@@ -98,7 +124,12 @@ fn handle_frame(manager: &Arc<SessionManager>, writer: &SharedWriter, frame: Fra
     }
 }
 
-fn handle_control(manager: &Arc<SessionManager>, writer: &SharedWriter, msg: ControlMsg) {
+fn handle_control(
+    manager: &Arc<SessionManager>,
+    writer: &SharedWriter,
+    msg: ControlMsg,
+    subscriptions: &mut Subscriptions,
+) {
     match msg {
         ControlMsg::Create { name, cwd, kind } => {
             let result = parse_kind(&kind).and_then(|k| manager.create(&name, cwd, k));
@@ -122,15 +153,17 @@ fn handle_control(manager: &Arc<SessionManager>, writer: &SharedWriter, msg: Con
                 );
                 return;
             };
-            let (backlog, rx) = sess.subscribe();
+            let (sub_id, backlog, rx) = sess.subscribe();
             if write_frame(
                 writer,
                 &Frame::Data { session: name.clone(), bytes: backlog },
             )
             .is_err()
             {
+                sess.unsubscribe(sub_id);
                 return;
             }
+            subscriptions.push((name.clone(), Arc::clone(&sess), sub_id));
             let writer = Arc::clone(writer);
             // `sess` moves into the forwarder so it can report the exit code.
             thread::spawn(move || {
@@ -174,9 +207,21 @@ fn handle_control(manager: &Arc<SessionManager>, writer: &SharedWriter, msg: Con
         ControlMsg::Kill { name } => {
             let _ = manager.remove(&name);
         }
-        // Detach/Rename/Hello and daemon->client-only variants: no-op for
-        // Slice 1. Unknown to us but well-formed; ignore rather than tear
-        // down the connection.
+        ControlMsg::Detach { name } => {
+            // Release this connection's subscriptions to that session; the
+            // forwarder thread exits once its channel drains.
+            subscriptions.retain(|(sess_name, sess, id)| {
+                if *sess_name == name {
+                    sess.unsubscribe(*id);
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        // Rename/Hello and daemon->client-only variants: no-op for now.
+        // Unknown to us but well-formed; ignore rather than tear down the
+        // connection.
         _ => {}
     }
 }

@@ -77,6 +77,49 @@ fn read_frame_until<F: Fn(&Frame) -> bool>(
 }
 
 #[test]
+fn disconnecting_client_releases_its_subscription() {
+    // A client that attaches and then drops its connection must not leave a
+    // subscriber (and its blocked forwarder) behind on an idle session.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("state");
+    std::fs::create_dir_all(&root).unwrap();
+    let socket_path = dir.path().join("amberd.sock");
+
+    let manager = Arc::new(SessionManager::new(&root).unwrap());
+    let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+    let daemon = Daemon::new(Arc::clone(&manager));
+    thread::spawn(move || {
+        let _ = daemon.serve(listener);
+    });
+
+    // `cat` idles forever: no output, so nothing ever prunes a dead sender.
+    manager
+        .create("idle", "/tmp", amber_core::state::SessionKind::Shell)
+        .unwrap();
+    let sess = manager.session("idle").unwrap();
+
+    let mut stream = connect_with_retry(&socket_path);
+    send(&mut stream, &Frame::Control(ControlMsg::Attach { name: "idle".into() }));
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while sess.subscriber_count() != 1 {
+        assert!(Instant::now() < deadline, "attach never registered a subscriber");
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    drop(stream); // client goes away with NO further session output
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while sess.subscriber_count() != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "subscription leaked after client disconnect"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
 fn socket_roundtrip_create_attach_write_read() {
     let (socket_path, _dir) = start_daemon();
     let mut stream = connect_with_retry(&socket_path);

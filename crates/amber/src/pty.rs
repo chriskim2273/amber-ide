@@ -210,15 +210,25 @@ impl PtySession {
     }
 
     /// Atomically capture the current scrollback and start receiving live
-    /// output — no bytes lost or duplicated across the handoff.
-    pub fn subscribe(&self) -> (Vec<u8>, Receiver<Vec<u8>>) {
+    /// output — no bytes lost or duplicated across the handoff. Returns the
+    /// subscriber id (for [`unsubscribe`](Self::unsubscribe)), the backlog,
+    /// and the live receiver.
+    pub fn subscribe(&self) -> (u64, Vec<u8>, Receiver<Vec<u8>>) {
         let ring = self.ring.lock().unwrap();
         let backlog = ring.snapshot();
         let (tx, rx) = sync_channel(SUBSCRIBER_QUEUE_DEPTH);
         let id = self.next_sub_id.fetch_add(1, Ordering::Relaxed);
         self.subs.lock().unwrap().push((id, tx));
         drop(ring);
-        (backlog, rx)
+        (id, backlog, rx)
+    }
+
+    /// Drop a subscriber's sender so its channel closes and it stops
+    /// receiving output. Used when a client detaches or its connection dies;
+    /// without this an idle session (no output to flush the dead sender out)
+    /// would keep the subscription and its forwarder thread alive forever.
+    pub fn unsubscribe(&self, id: u64) {
+        self.subs.lock().unwrap().retain(|(sid, _)| *sid != id);
     }
 
     /// Number of live subscribers (dead/laggard ones are pruned by the
@@ -292,7 +302,7 @@ mod tests {
         let sess = PtySession::spawn(cmd, 24, 80, 4096).unwrap();
         // give "first-" time to land in the ring
         wait_for(&sess, b"first-");
-        let (backlog, rx) = sess.subscribe();
+        let (_id, backlog, rx) = sess.subscribe();
         assert!(
             backlog.windows(6).any(|w| w == b"first-"),
             "backlog should contain already-produced bytes"
@@ -339,7 +349,7 @@ mod tests {
         ));
         let sess = PtySession::spawn(cmd, 24, 80, 4096).unwrap();
         // Subscribe but NEVER read from rx — hold it so the channel fills.
-        let (_backlog, _rx) = sess.subscribe();
+        let (_id, _backlog, _rx) = sess.subscribe();
         std::thread::sleep(Duration::from_millis(700));
         assert!(
             !sentinel.exists(),
@@ -364,9 +374,9 @@ mod tests {
         let sess = Arc::new(PtySession::spawn(cmd, 24, 80, 4096).unwrap());
 
         // Stalled: subscribed but NEVER drained (receiver kept alive).
-        let (_b1, rx_stalled) = sess.subscribe();
+        let (_id1, _b1, rx_stalled) = sess.subscribe();
         // Healthy: drained continuously on its own thread.
-        let (_b2, rx_healthy) = sess.subscribe();
+        let (_id2, _b2, rx_healthy) = sess.subscribe();
         let drained = Arc::new(AtomicU64::new(0));
         {
             let drained = Arc::clone(&drained);
@@ -404,7 +414,7 @@ mod tests {
         // keeps flowing to the ring after the dead one is pruned.
         let cmd = CommandBuilder::new("cat");
         let sess = PtySession::spawn(cmd, 24, 80, 4096).unwrap();
-        let (_backlog, rx) = sess.subscribe();
+        let (_id, _backlog, rx) = sess.subscribe();
         drop(rx); // subscriber goes away
         sess.write(b"AFTER_DROP\n").unwrap();
         wait_for(&sess, b"AFTER_DROP");
@@ -426,7 +436,7 @@ mod tests {
             let sess = Arc::clone(&sess);
             handles.push(std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(3 * i as u64));
-                let (backlog, rx) = sess.subscribe();
+                let (_id, backlog, rx) = sess.subscribe();
                 let mut acc = backlog;
                 while let Ok(chunk) = rx.recv_timeout(Duration::from_millis(500)) {
                     acc.extend_from_slice(&chunk);
@@ -465,7 +475,7 @@ mod tests {
         cmd.arg("-c");
         cmd.arg("printf bye");
         let sess = PtySession::spawn(cmd, 24, 80, 4096).unwrap();
-        let (_backlog, rx) = sess.subscribe();
+        let (_id, _backlog, rx) = sess.subscribe();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             match rx.recv_timeout(Duration::from_millis(100)) {
