@@ -53,4 +53,20 @@ describe('Connection', () => {
     await waitFor(() => (closed ? true : null))
     expect(closed).toBe(true)
   })
+
+  it('reconnects and re-opens after the daemon drops and returns', async () => {
+    daemon = new FakeDaemon()
+    const path = await daemon.listen()
+    let opens = 0
+    const conn = new Connection(path)
+    conn.on('open', () => { opens += 1 })
+    conn.connect()
+    await waitFor(() => (opens >= 1 ? true : null))
+    await daemon.close()                 // daemon drops
+    daemon = new FakeDaemon()
+    await daemon.listen(path)             // returns on the same socket path
+    await waitFor(() => (opens >= 2 ? true : null), 5000)
+    expect(opens).toBeGreaterThanOrEqual(2)
+    conn.close()
+  })
 })

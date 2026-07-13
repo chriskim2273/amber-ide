@@ -17,9 +17,9 @@ export class FakeDaemon {
     this.clientCb = cb
   }
 
-  listen(): Promise<string> {
+  listen(fixedPath?: string): Promise<string> {
     counter += 1
-    const path = join(tmpdir(), `amber-fake-${process.pid}-${counter}.sock`)
+    const path = fixedPath ?? join(tmpdir(), `amber-fake-${process.pid}-${counter}.sock`)
     this.server.on('connection', (sock) => {
       this.clients.add(sock)
       const dec = new Decoder()
