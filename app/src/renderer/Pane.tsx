@@ -48,9 +48,20 @@ export function Pane({ session }: { session: string }): JSX.Element {
       if (wired) { e.ports[0].close(); return }
       wired = true
       port = e.ports[0]
+      let sawBacklog = false
       port.onmessage = (ev) => {
         const m = ev.data as { data?: Uint8Array }
-        if (m.data) term.write(m.data) // xterm.write accepts Uint8Array (UTF-8)
+        if (!m.data) return
+        term.write(m.data) // xterm.write accepts Uint8Array (UTF-8)
+        if (!sawBacklog) {
+          sawBacklog = true
+          // Replaying raw scrollback re-executes its escape codes, including any
+          // mouse-tracking enable from a prior program (e.g. a claude session
+          // that's since exited). That leaves a shell echoing mouse reports on
+          // click. Reset all mouse modes after the backlog; a live program that
+          // wants the mouse re-asserts it on its next redraw (we send a resize).
+          term.write('\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l')
+        }
       }
       port.start()
       term.onData((s) => port?.postMessage({ data: new TextEncoder().encode(s) }))
