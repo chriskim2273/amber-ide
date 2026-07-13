@@ -39,6 +39,11 @@ function App(): JSX.Element {
   const [activeWs, setActiveWs] = useState(1)
   const [kind, setKind] = useState<'shell' | 'claude'>('shell')
   const [connected, setConnected] = useState(true)
+  // Gate ALL layout persistence until the sidecar has loaded. Otherwise a
+  // Sessions event arriving before loadLayout resolves would reconcile against
+  // an empty layout (equal-columns 'h' fallback) and overwrite the real,
+  // possibly-vertical saved tree before we ever read it.
+  const [loaded, setLoaded] = useState(false)
   // Splits whose session was requested but hasn't materialized yet. Held out of
   // reconcile so it can't prune/re-append them as columns; placed with the
   // requested direction once the daemon confirms the session exists.
@@ -54,15 +59,18 @@ function App(): JSX.Element {
       else if (st === 'disconnected') setConnected(false)
       const ev = toEvent(d); if (ev) dispatch(ev)
     })
-    void window.amber.loadLayout().then((text) => { if (text) setLayout(parseLayout(text)) })
+    void window.amber.loadLayout().then((text) => {
+      if (text) setLayout(parseLayout(text))
+      setLoaded(true)
+    })
   }, [bridgeReady])
 
-  // Debounced persist whenever the layout changes.
+  // Debounced persist whenever the layout changes — only after the sidecar loaded.
   useEffect(() => {
-    if (!bridgeReady) return
+    if (!bridgeReady || !loaded) return
     const id = setTimeout(() => void window.amber.saveLayout(serializeLayout(layoutRef.current)), 300)
     return () => clearTimeout(id)
-  }, [layout, bridgeReady])
+  }, [layout, bridgeReady, loaded])
 
   const workspaces = groupSessions(state)
   const ws = workspaces.find((w) => w.ws === activeWs) ?? workspaces[0]
@@ -87,11 +95,15 @@ function App(): JSX.Element {
     })
   }, [wsKey, tabKey, activeTab])
 
-  useEffect(() => { if (tree && JSON.stringify(tree) !== JSON.stringify(storedTree)) putTree(tree) }, [tree, storedTree, putTree])
+  useEffect(() => {
+    if (!loaded) return
+    if (tree && JSON.stringify(tree) !== JSON.stringify(storedTree)) putTree(tree)
+  }, [tree, storedTree, putTree, loaded])
 
   // Place pending splits once their session exists, preserving H/V direction.
   const liveKey = allLive.join(',')
   useEffect(() => {
+    if (!loaded) return
     const ready = Object.entries(pending).filter(([name]) => allLive.includes(name))
     if (ready.length === 0) return
     let next = reconcile(storedTree, liveIds)
@@ -101,7 +113,7 @@ function App(): JSX.Element {
     putTree(next)
     setPending((p) => { const c = { ...p }; for (const [n] of ready) delete c[n]; return c })
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pending, liveKey, storedTree, putTree])
+  }, [pending, liveKey, storedTree, putTree, loaded])
 
   if (!bridgeReady) return <p style={{ color: 'crimson', padding: 16 }}>preload bridge missing.</p>
 
