@@ -35,6 +35,13 @@ pub enum Frame {
 const TAG_CONTROL: u8 = 0;
 const TAG_DATA: u8 = 1;
 
+/// Maximum accepted frame body length. Generously above the largest
+/// legitimate frame (a full 2 MiB scrollback backlog in one `Data` frame);
+/// anything bigger is treated as a corrupt/hostile length prefix so the
+/// decoder can never be made to buffer gigabytes. Also keeps `4 + len` from
+/// overflowing `usize` on 32-bit targets.
+pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
+
 /// Serialize a frame to its length-prefixed wire form.
 pub fn encode(frame: &Frame) -> Vec<u8> {
     let mut body = Vec::new();
@@ -82,6 +89,9 @@ impl Decoder {
             return Ok(None);
         }
         let len = u32::from_be_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]]) as usize;
+        if len > MAX_FRAME_LEN {
+            anyhow::bail!("frame length {len} exceeds maximum {MAX_FRAME_LEN}");
+        }
         if self.buf.len() < 4 + len {
             return Ok(None);
         }
@@ -175,6 +185,27 @@ mod tests {
         assert_eq!(d.next_frame().unwrap(), Some(a));
         assert_eq!(d.next_frame().unwrap(), Some(b));
         assert_eq!(d.next_frame().unwrap(), None);
+    }
+
+    #[test]
+    fn decoder_rejects_oversized_frame_length() {
+        // A corrupt/malicious length prefix must error out instead of making
+        // the decoder buffer up to 4 GiB.
+        let mut d = Decoder::new();
+        let mut bytes = ((MAX_FRAME_LEN as u32) + 1).to_be_bytes().to_vec();
+        bytes.push(TAG_CONTROL);
+        d.feed(&bytes);
+        assert!(d.next_frame().is_err());
+    }
+
+    #[test]
+    fn decoder_accepts_frame_at_exact_max_len() {
+        // A Data frame whose body is exactly MAX_FRAME_LEN must still decode.
+        let payload = vec![7u8; MAX_FRAME_LEN - 1 /*tag*/ - 2 /*name len*/ - 1 /*name*/];
+        let f = Frame::Data { session: "s".into(), bytes: payload };
+        let mut d = Decoder::new();
+        d.feed(&encode(&f));
+        assert_eq!(d.next_frame().unwrap(), Some(f));
     }
 
     #[test]
