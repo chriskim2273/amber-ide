@@ -111,8 +111,21 @@ impl PtySession {
         drop(pair.slave);
 
         let killer = child.clone_killer();
-        let mut reader = pair.master.try_clone_reader()?;
-        let writer = pair.master.take_writer()?;
+        // If pty plumbing fails after the spawn, don't leak the child.
+        let mut reader = match pair.master.try_clone_reader() {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = child.kill();
+                return Err(e.into());
+            }
+        };
+        let writer = match pair.master.take_writer() {
+            Ok(w) => w,
+            Err(e) => {
+                let _ = child.kill();
+                return Err(e.into());
+            }
+        };
 
         let ring = Arc::new(Mutex::new(Ring::new(cap)));
         let subs: Arc<Mutex<Subscribers>> = Arc::new(Mutex::new(Vec::new()));

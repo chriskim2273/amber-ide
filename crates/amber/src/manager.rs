@@ -120,7 +120,11 @@ impl SessionManager {
             kind,
             updated: Self::now(),
         };
-        self.store.write_session(&meta)?;
+        if let Err(e) = self.store.write_session(&meta) {
+            // Don't leak the freshly-spawned child if persisting fails.
+            let _ = sess.kill();
+            return Err(e);
+        }
         self.sessions
             .lock()
             .unwrap()
@@ -249,6 +253,21 @@ mod tests {
         assert_eq!(mgr.names(), vec!["lives".to_string()]);
         assert!(!dir.path().join("sessions/dies.json").exists());
         assert!(dir.path().join("sessions/lives.json").exists());
+    }
+
+    #[test]
+    fn create_fails_cleanly_when_metadata_cannot_be_persisted() {
+        // If the state store is unwritable, create must error, track nothing,
+        // and kill the just-spawned child rather than leaking it.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let result = mgr.create("orphan", "/tmp", SessionKind::Shell);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(result.is_err(), "create must fail when the store is unwritable");
+        assert!(mgr.names().is_empty(), "failed create must not be tracked");
+        assert!(!dir.path().join("sessions/orphan.json").exists());
     }
 
     #[test]
