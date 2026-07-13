@@ -146,8 +146,10 @@ enum ControlMsg {
 
 **Push mechanism (`daemon` + `manager`):**
 - Per-connection `watching: bool`, flipped by `WatchSessions`. A watcher's `SharedWriter` is registered in a daemon-owned `Watchers` registry (`Vec<Weak<Mutex<UnixStream>>>`, pruned on send failure — the same laggard discipline as pty subscribers).
-- The manager emits an event on exactly the three transitions it already owns: `create` (added), `remove`/`Kill` (removed), child-exit reaper (removed, alongside the existing `Exit`). Each fans a `SessionsChanged` to all live watchers.
-- **No polling.** The app connects → `WatchSessions` + `ListSessionsDetailed` → full set once, then deltas forever. On reconnect it re-requests the full set (authoritative resync).
+- **Prompt (synchronous) transitions** — fan out immediately from the manager methods that already own the table mutation: `create` → `SessionsChanged{added}`; `remove`/`Kill` (`manager.remove`, `crates/amber/src/manager.rs:201`) → `SessionsChanged{removed}`.
+- **Child-death removal is periodic, not synchronous** (verified against the source). A dead session leaves the table only when the daemon's `reap()` runs — and `reap()` is called **only** from the periodic snapshot thread (`crates/amber/src/main.rs:323`, cadence = `snapshot_interval_secs`, default 10 s), not on child exit. Hook the broadcast there: after `reap()` returns the reaped names, fan `SessionsChanged{removed: reaped}`. Consequence: an **attached** pane learns of its child's exit immediately via the existing `Exit` frame (the daemon's forwarder polls `exit_code()`); a **background** (unattached) pane's removal can lag up to one snapshot interval. Acceptable for v1 — the visible pane the user is watching is always prompt. If snappier background removal is wanted later, add a reap-on-exit trigger (out of scope for this slice).
+- Each fan-out reuses the watcher registry above.
+- **No polling on the app side.** The app connects → `WatchSessions` + `ListSessionsDetailed` → full set once, then deltas forever. On reconnect it re-requests the full set (authoritative resync), which also papers over any delta missed during the disconnect.
 
 **Metadata source:** `SessionMeta` already stores `name`, `cwd`, `kind`; `SessionInfo` is a direct projection, `alive` = child not yet reaped. Zero new persistence.
 
