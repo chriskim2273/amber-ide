@@ -9,6 +9,19 @@ import clientPath from '../client/index?modulePath'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
+// Headless / no-GPU environments (CI, sandboxed dev boxes) can't load the
+// hardware GL driver (Mesa DRI). Opt into software GL via ANGLE+SwiftShader so
+// xterm still gets a real WebGL context instead of failing. Must run before
+// app is ready. Production desktops leave AMBER_SOFTWARE_GL unset.
+if (process.env['AMBER_SOFTWARE_GL']) {
+  app.commandLine.appendSwitch('use-gl', 'angle')
+  app.commandLine.appendSwitch('use-angle', 'swiftshader')
+  app.commandLine.appendSwitch('enable-unsafe-swiftshader')
+}
+if (process.env['AMBER_NO_SANDBOX']) {
+  app.commandLine.appendSwitch('no-sandbox')
+}
+
 function amberBinary(): string {
   // Dev: rely on PATH. Packaging (slice 7) swaps this for the bundled binary.
   return process.env['AMBER_BIN'] ?? 'amber'
