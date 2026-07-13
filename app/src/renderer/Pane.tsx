@@ -44,11 +44,19 @@ export function Pane({ session }: { session: string }): JSX.Element {
         if (d.data) term.write(d.data) // xterm.write accepts Uint8Array (UTF-8)
       }
       p.start()
-      term.onData((s) => p.postMessage({ data: new TextEncoder().encode(s) }))
+      term.onData((s) => {
+        console.log('[pane] input', JSON.stringify(s))
+        p.postMessage({ data: new TextEncoder().encode(s) })
+      })
       const sendResize = () => { fit.fit(); p!.postMessage({ resize: { cols: term.cols, rows: term.rows } }) }
       sendResize()
       window.addEventListener('resize', sendResize)
+      term.focus()
     })
+
+    // xterm only emits keystrokes while focused; grab focus now and on click.
+    term.focus()
+    host.addEventListener('click', () => term.focus())
 
     window.amber.openPane(session)
 
