@@ -17,6 +17,12 @@ if (process.env['AMBER_SOFTWARE_GL']) {
   app.commandLine.appendSwitch('use-gl', 'angle')
   app.commandLine.appendSwitch('use-angle', 'swiftshader')
   app.commandLine.appendSwitch('enable-unsafe-swiftshader')
+  // Under software GL, waiting on the compositor vsync adds a frame (~16ms+) of
+  // input-echo latency. Disable it so keystrokes paint immediately. (The
+  // renderer also drops xterm's WebGL addon for the DOM renderer here — WebGL
+  // on SwiftShader is the actual lag source; socket round-trip is <1ms.)
+  app.commandLine.appendSwitch('disable-gpu-vsync')
+  app.commandLine.appendSwitch('disable-frame-rate-limit')
 }
 if (process.env['AMBER_NO_SANDBOX']) {
   app.commandLine.appendSwitch('no-sandbox')

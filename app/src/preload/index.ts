@@ -1,6 +1,9 @@
 import { ipcRenderer, contextBridge } from 'electron'
 
 contextBridge.exposeInMainWorld('amber', {
+  // True when the app was launched with software GL (SwiftShader); the renderer
+  // uses this to skip xterm's WebGL addon, which is slow on software GL.
+  softwareGl: !!process.env['AMBER_SOFTWARE_GL'],
   onDaemonEvent: (cb: (data: unknown) => void) =>
     ipcRenderer.on('daemon-event', (_e, data) => cb(data)),
   openPane: (session: string) => ipcRenderer.send('open-pane', session),

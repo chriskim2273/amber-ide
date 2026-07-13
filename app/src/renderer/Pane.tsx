@@ -14,9 +14,14 @@ export function Pane({ session }: { session: string }): JSX.Element {
     const fit = new FitAddon()
     term.open(host)
     term.loadAddon(fit)
-    const webgl = new WebglAddon()
-    webgl.onContextLoss(() => webgl.dispose())
-    term.loadAddon(webgl)
+    // WebGL is the fast path on hardware GL, but pathologically slow on
+    // SwiftShader — under software GL, use xterm's default DOM renderer so
+    // keystrokes paint without a frame of software-rasterization lag.
+    if (!window.amber.softwareGl) {
+      const webgl = new WebglAddon()
+      webgl.onContextLoss(() => webgl.dispose())
+      term.loadAddon(webgl)
+    }
     fit.fit()
 
     let port: MessagePort | null = null

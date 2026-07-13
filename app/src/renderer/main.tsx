@@ -7,6 +7,7 @@ import { formatName, makeId } from '../shared/names'
 declare global {
   interface Window {
     amber: {
+      softwareGl: boolean
       onDaemonEvent: (cb: (d: unknown) => void) => void
       openPane: (session: string) => void
       createSession: (name: string, cwd: string, sessionKind: string) => void
