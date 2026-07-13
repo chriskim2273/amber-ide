@@ -19,6 +19,10 @@ pub enum ControlMsg {
     Resize { name: String, cols: u16, rows: u16 },
     Kill { name: String },
     Rename { from: String, to: String },
+    /// Ask the daemon to flush a snapshot to the state store now.
+    Snapshot,
+    /// Daemon reply: the snapshot completed successfully.
+    SnapshotOk,
     SessionList { names: Vec<String> },
     Created { name: String },
     Killed { name: String },
@@ -135,6 +139,14 @@ mod tests {
     fn control_frame_roundtrips() {
         let f = Frame::Control(ControlMsg::Attach { name: "a".into() });
         assert_eq!(roundtrip(&f), f);
+    }
+
+    #[test]
+    fn snapshot_control_roundtrips() {
+        let req = Frame::Control(ControlMsg::Snapshot);
+        assert_eq!(roundtrip(&req), req);
+        let ack = Frame::Control(ControlMsg::SnapshotOk);
+        assert_eq!(roundtrip(&ack), ack);
     }
 
     #[test]

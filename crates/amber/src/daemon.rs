@@ -141,6 +141,13 @@ fn handle_control(manager: &Arc<SessionManager>, writer: &SharedWriter, msg: Con
                 }
             });
         }
+        ControlMsg::Snapshot => {
+            let reply = match manager.snapshot() {
+                Ok(()) => ControlMsg::SnapshotOk,
+                Err(e) => ControlMsg::Error { msg: e.to_string() },
+            };
+            let _ = write_frame(writer, &Frame::Control(reply));
+        }
         ControlMsg::Resize { name, cols, rows } => {
             let _ = manager.resize(&name, rows, cols);
         }

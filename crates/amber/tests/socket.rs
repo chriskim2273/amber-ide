@@ -137,6 +137,40 @@ fn socket_roundtrip_create_attach_write_read() {
 }
 
 #[test]
+fn snapshot_control_flushes_scrollback_and_acks() {
+    let (socket_path, dir) = start_daemon();
+    let mut stream = connect_with_retry(&socket_path);
+    let mut decoder = Decoder::new();
+
+    send(
+        &mut stream,
+        &Frame::Control(ControlMsg::Create {
+            name: "snap".into(),
+            cwd: "/tmp".into(),
+            kind: "shell".into(),
+        }),
+    );
+    read_frame_until(
+        &mut stream,
+        &mut decoder,
+        |f| matches!(f, Frame::Control(ControlMsg::Created { .. })),
+        Duration::from_secs(5),
+    );
+
+    send(&mut stream, &Frame::Control(ControlMsg::Snapshot));
+    read_frame_until(
+        &mut stream,
+        &mut decoder,
+        |f| matches!(f, Frame::Control(ControlMsg::SnapshotOk)),
+        Duration::from_secs(5),
+    );
+
+    // The ack must mean the flush actually happened.
+    let scrollback = dir.path().join("state/scrollback/snap.bin");
+    assert!(scrollback.exists(), "snapshot did not write {scrollback:?}");
+}
+
+#[test]
 fn list_sessions_returns_all_created_names() {
     let (socket_path, _dir) = start_daemon();
     let mut stream = connect_with_retry(&socket_path);

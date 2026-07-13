@@ -86,6 +86,11 @@ enum CtlAction {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
+    /// Ask the running daemon to flush a snapshot to the state store now.
+    SnapshotNow {
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
 }
 
 /// `$XDG_STATE_HOME/amber-ide`, falling back to `$HOME/.local/state/amber-ide`.
@@ -127,6 +132,7 @@ fn main() -> anyhow::Result<()> {
         Command::Ctl { action } => match action {
             CtlAction::Doctor { root } => run_doctor(root),
             CtlAction::Status { socket } => run_status(&resolve_socket(socket)),
+            CtlAction::SnapshotNow { socket } => run_snapshot_now(&resolve_socket(socket)),
         },
     }
 }
@@ -178,6 +184,33 @@ fn run_status(socket: &Path) -> anyhow::Result<()> {
             println!("daemon: unreachable at {}", socket.display());
             std::process::exit(1);
         }
+    }
+}
+
+/// Ask the daemon for an immediate snapshot and wait for the ack.
+fn run_snapshot_now(socket: &Path) -> anyhow::Result<()> {
+    let mut stream = UnixStream::connect(socket)
+        .map_err(|e| anyhow::anyhow!("daemon unreachable at {}: {e}", socket.display()))?;
+    stream.write_all(&proto::encode(&Frame::Control(ControlMsg::Snapshot)))?;
+
+    let mut decoder = Decoder::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match decoder.next_frame()? {
+            Some(Frame::Control(ControlMsg::SnapshotOk)) => {
+                println!("snapshot written");
+                return Ok(());
+            }
+            Some(Frame::Control(ControlMsg::Error { msg })) => {
+                anyhow::bail!("snapshot failed: {msg}");
+            }
+            _ => {}
+        }
+        let n = stream.read(&mut buf)?;
+        if n == 0 {
+            anyhow::bail!("daemon closed the connection before replying");
+        }
+        decoder.feed(&buf[..n]);
     }
 }
 
