@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 import { spawn } from 'node:child_process'
 import { readFile, writeFile, rename, mkdir, copyFile, chmod } from 'node:fs/promises'
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { resolveSocketPath } from '../shared/socketPath'
 import { ensureDaemon, probeSocket } from './daemonBoot'
 import { resolveAmberBinary } from './amberBin'
@@ -11,37 +12,44 @@ import clientPath from '../client/index?modulePath'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
-// Headless / no-GPU environments (CI, sandboxed dev boxes) can't load the
-// hardware GL driver (Mesa DRI). Opt into software GL via ANGLE+SwiftShader so
-// xterm still gets a real WebGL context instead of failing. Must run before
-// app is ready. Production desktops leave AMBER_SOFTWARE_GL unset.
-if (process.env['AMBER_SOFTWARE_GL']) {
+function stateRoot(): string {
+  const stateHome = process.env['XDG_STATE_HOME']
+  return stateHome && stateHome.length > 0 ? join(stateHome, 'amber-ide')
+    : join(process.env['HOME'] ?? '.', '.local', 'state', 'amber-ide')
+}
+// Persisted marker: written after a detected GPU/renderer crash so the next
+// launch starts in compat mode directly (no crash-relaunch cycle).
+const compatFlagPath = join(stateRoot(), 'render-compat')
+
+// Compat mode = software GL + relaxed sandbox + kernel-shm workarounds. Needed
+// where Electron 43's Chromium can't do multi-process GPU/shm (e.g. kernel 6.17,
+// which traps faccessat2() in the child seccomp policy → bogus ESRCH on
+// /dev/shm and /tmp → renderer never paints). Triggered by an env override or
+// the persisted flag; on healthy machines it stays off (hardware GL + sandbox).
+// main() auto-detects a first-run crash, writes the flag, and relaunches.
+const compat =
+  !!process.env['AMBER_SOFTWARE_GL'] ||
+  !!process.env['AMBER_NO_SANDBOX'] ||
+  existsSync(compatFlagPath)
+
+if (compat) {
+  // Software GL via ANGLE+SwiftShader (xterm still gets a real GL context), and
+  // disable vsync so keystrokes paint without a compositor-frame of latency.
   app.commandLine.appendSwitch('use-gl', 'angle')
   app.commandLine.appendSwitch('use-angle', 'swiftshader')
   app.commandLine.appendSwitch('enable-unsafe-swiftshader')
-  // Under software GL, waiting on the compositor vsync adds a frame (~16ms+) of
-  // input-echo latency. Disable it so keystrokes paint immediately. (The
-  // renderer also drops xterm's WebGL addon for the DOM renderer here — WebGL
-  // on SwiftShader is the actual lag source; socket round-trip is <1ms.)
   app.commandLine.appendSwitch('disable-gpu-vsync')
   app.commandLine.appendSwitch('disable-frame-rate-limit')
-}
-if (process.env['AMBER_NO_SANDBOX']) {
+  // Sandbox/shm/kernel workarounds (the faccessat2 seccomp trap lives in the
+  // zygote-set-up child namespace; --no-zygote is the one that actually fixes
+  // shm allocation on kernel 6.17).
   app.commandLine.appendSwitch('no-sandbox')
-  // Sandboxed /dev/shm is often tiny or inaccessible; fall back to /tmp so
-  // Chromium's shared-memory allocation doesn't fatally crash.
   app.commandLine.appendSwitch('disable-dev-shm-usage')
-  // On bleeding-edge kernels (e.g. 6.17), glibc routes access() through the
-  // faccessat2() syscall; Electron 43's older Chromium seccomp-bpf policy
-  // traps it, surfacing as bogus ESRCH ("No such process") on /dev/shm and
-  // /tmp and preventing shared-memory allocation (renderer never paints).
-  // Disabling the seccomp filter avoids the trap on such kernels.
   app.commandLine.appendSwitch('disable-seccomp-filter-sandbox')
-  // The zygote sets up child-process namespaces; on kernel 6.17 that context
-  // is where Chromium's shared-memory access() returns a bogus ESRCH (all shm
-  // primitives work at top level). Spawn children without the zygote so they
-  // inherit the browser process's working context.
   app.commandLine.appendSwitch('no-zygote')
+  // The renderer reads this to pick xterm's DOM renderer over WebGL (WebGL on
+  // SwiftShader is the input-lag source).
+  process.env['AMBER_SOFTWARE_GL'] = '1'
 }
 
 function amberBinary(): string {
@@ -132,6 +140,29 @@ async function main(): Promise<void> {
       nodeIntegration: false,
     },
   })
+
+  // Auto-detect the kernel-6.17/Chromium GPU-shm failure. If we're NOT already
+  // in compat mode and the GPU crashes / the renderer dies / the page never
+  // finishes loading, persist the compat flag and relaunch — the next start
+  // applies the software-GL + sandbox workarounds. On healthy machines the page
+  // loads, the timer clears, and this never fires.
+  if (!compat) {
+    let switching = false
+    const enterCompat = (): void => {
+      if (switching) return
+      switching = true
+      try { mkdirSync(stateRoot(), { recursive: true }); writeFileSync(compatFlagPath, '1') } catch { /* ignore */ }
+      app.relaunch()
+      app.exit(0)
+    }
+    const loadTimer = setTimeout(enterCompat, 10000)
+    win.webContents.once('did-finish-load', () => clearTimeout(loadTimer))
+    win.webContents.on('render-process-gone', enterCompat)
+    app.on('child-process-gone', (_e, d) => {
+      if (d.type === 'GPU' && d.reason !== 'clean-exit') enterCompat()
+    })
+  }
+
   // CSP from the main process, not a static meta tag: dev needs Vite's HMR
   // (inline preamble + eval for React refresh + the ws: socket), production
   // stays strict. Set before the initial load so it applies immediately.
