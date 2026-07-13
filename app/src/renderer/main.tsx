@@ -36,6 +36,9 @@ function App(): JSX.Element {
   const [state, dispatch] = useReducer(reduce, undefined, initialState)
   const [layout, setLayout] = useState<LayoutFile>(emptyLayout)
   const [activeTab, setActiveTab] = useState(1)
+  const [activeWs, setActiveWs] = useState(1)
+  const [kind, setKind] = useState<'shell' | 'claude'>('shell')
+  const [connected, setConnected] = useState(true)
   // Splits whose session was requested but hasn't materialized yet. Held out of
   // reconcile so it can't prune/re-append them as columns; placed with the
   // requested direction once the daemon confirms the session exists.
@@ -45,7 +48,12 @@ function App(): JSX.Element {
 
   useEffect(() => {
     if (!bridgeReady) return
-    window.amber.onDaemonEvent((d) => { const ev = toEvent(d); if (ev) dispatch(ev) })
+    window.amber.onDaemonEvent((d) => {
+      const st = (d as { status?: string }).status
+      if (st === 'connected') setConnected(true)
+      else if (st === 'disconnected') setConnected(false)
+      const ev = toEvent(d); if (ev) dispatch(ev)
+    })
     void window.amber.loadLayout().then((text) => { if (text) setLayout(parseLayout(text)) })
   }, [bridgeReady])
 
@@ -56,7 +64,8 @@ function App(): JSX.Element {
     return () => clearTimeout(id)
   }, [layout, bridgeReady])
 
-  const ws = groupSessions(state)[0]
+  const workspaces = groupSessions(state)
+  const ws = workspaces.find((w) => w.ws === activeWs) ?? workspaces[0]
   const tabs = ws?.tabs ?? []
   const tab = tabs.find((t) => t.tab === activeTab) ?? tabs[0]
   const deadCodes: Record<string, number> = {}
@@ -66,7 +75,7 @@ function App(): JSX.Element {
   // split targets are excluded until placed, so reconcile won't append them.
   const allLive = tab?.panes.map((p) => p.name) ?? []
   const liveIds = allLive.filter((n) => !(n in pending))
-  const wsKey = String(ws?.ws ?? 1)
+  const wsKey = String(ws?.ws ?? activeWs)
   const tabKey = String(tab?.tab ?? activeTab)
   const storedTree = layout.workspaces[wsKey]?.tabs[tabKey]?.tree ?? null
   const tree = reconcile(storedTree, liveIds)
@@ -99,10 +108,25 @@ function App(): JSX.Element {
   const nextOrd = (tab?.panes.reduce((m, p) => Math.max(m, p.ord), -1) ?? -1) + 1
   const nextTab = (tabs.reduce((m, t) => Math.max(m, t.tab), 0)) + 1
   const newPane = (tabId: number, ord: number): void =>
-    window.amber.createSession(formatName({ ws: 1, tab: tabId, ord, id: makeId() }), '.', 'shell')
+    window.amber.createSession(formatName({ ws: activeWs, tab: tabId, ord, id: makeId() }), '.', kind)
+
+  const nextWs = (workspaces.reduce((m, w) => Math.max(m, w.ws), 0)) + 1
 
   return (
-    <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', background: '#000' }}>
+    <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', background: '#000', color: '#ddd' }}>
+      {!connected && <div style={{ background: '#822', color: '#fff', padding: '4px 8px' }}>daemon disconnected — reconnecting…</div>}
+      <div style={{ display: 'flex', gap: 4, padding: 4, background: '#111', alignItems: 'center' }}>
+        <span>ws:</span>
+        {workspaces.map((w) => (
+          <button key={w.ws} onClick={() => setActiveWs(w.ws)} style={{ fontWeight: w.ws === (ws?.ws ?? -1) ? 'bold' : 'normal' }}>{w.ws}</button>
+        ))}
+        <button onClick={() => { setActiveWs(nextWs); window.amber.createSession(formatName({ ws: nextWs, tab: 1, ord: 0, id: makeId() }), '.', kind); setActiveTab(1) }}>+ ws</button>
+        <span style={{ marginLeft: 12 }}>new:</span>
+        <select value={kind} onChange={(e) => setKind(e.target.value as 'shell' | 'claude')}>
+          <option value="shell">shell</option>
+          <option value="claude">claude</option>
+        </select>
+      </div>
       <div style={{ display: 'flex', gap: 4, padding: 4, background: '#222' }}>
         {tabs.map((t) => (
           <button key={t.tab} onClick={() => setActiveTab(t.tab)}
@@ -116,8 +140,8 @@ function App(): JSX.Element {
           ? <SplitView tree={tree} deadCodes={deadCodes}
               onSetRatio={(path, r) => putTree(setRatio(tree, path, r))}
               onSplit={(paneId, dir) => {
-                const name = formatName({ ws: 1, tab: tab!.tab, ord: nextOrd, id: makeId() })
-                window.amber.createSession(name, '.', 'shell')
+                const name = formatName({ ws: activeWs, tab: tab!.tab, ord: nextOrd, id: makeId() })
+                window.amber.createSession(name, '.', kind)
                 setPending((p) => ({ ...p, [name]: { paneId, dir } }))
               }}
               onClose={(paneId) => { window.amber.killSession(paneId); putTree(removeLeaf(tree, paneId)) }} />
