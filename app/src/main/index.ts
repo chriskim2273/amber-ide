@@ -3,6 +3,7 @@ import { ipcMain } from 'electron'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 import { spawn } from 'node:child_process'
+import { readFile, writeFile, rename, mkdir } from 'node:fs/promises'
 import { resolveSocketPath } from '../shared/socketPath'
 import { ensureDaemon, probeSocket } from './daemonBoot'
 import clientPath from '../client/index?modulePath'
@@ -45,6 +46,13 @@ if (process.env['AMBER_NO_SANDBOX']) {
 function amberBinary(): string {
   // Dev: rely on PATH. Packaging (slice 7) swaps this for the bundled binary.
   return process.env['AMBER_BIN'] ?? 'amber'
+}
+
+function layoutPath(): string {
+  const stateHome = process.env['XDG_STATE_HOME']
+  const root = stateHome && stateHome.length > 0 ? stateHome + '/amber-ide'
+    : (process.env['HOME'] ?? '.') + '/.local/state/amber-ide'
+  return root + '/ui-layout.json'
 }
 
 async function installDaemon(): Promise<void> {
@@ -110,6 +118,17 @@ async function main(): Promise<void> {
     const { port1: rPort, port2: uPort } = new MessageChannelMain()
     child.postMessage({ kind: 'pane', session }, [uPort])
     win.webContents.postMessage('pane-port', { session }, [rPort])
+  })
+
+  ipcMain.handle('layout-load', async () => {
+    try { return await readFile(layoutPath(), 'utf8') } catch { return null }
+  })
+  ipcMain.handle('layout-save', async (_e, text: string) => {
+    const p = layoutPath()
+    await mkdir(dirname(p), { recursive: true })
+    const tmp = p + '.tmp'
+    await writeFile(tmp, text)
+    await rename(tmp, p)
   })
 }
 

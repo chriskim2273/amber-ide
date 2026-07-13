@@ -10,6 +10,8 @@ contextBridge.exposeInMainWorld('amber', {
   createSession: (name: string, cwd: string, sessionKind: string) =>
     ipcRenderer.send('daemon-command', { cmd: 'create', name, cwd, sessionKind }),
   killSession: (name: string) => ipcRenderer.send('daemon-command', { cmd: 'kill', name }),
+  loadLayout: (): Promise<string | null> => ipcRenderer.invoke('layout-load'),
+  saveLayout: (text: string): Promise<void> => ipcRenderer.invoke('layout-save', text),
 })
 
 // A transferred MessagePort cannot cross contextBridge; re-dispatch the live
