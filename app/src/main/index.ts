@@ -23,6 +23,12 @@ if (process.env['AMBER_NO_SANDBOX']) {
   // Sandboxed /dev/shm is often tiny or inaccessible; fall back to /tmp so
   // Chromium's shared-memory allocation doesn't fatally crash.
   app.commandLine.appendSwitch('disable-dev-shm-usage')
+  // On bleeding-edge kernels (e.g. 6.17), glibc routes access() through the
+  // faccessat2() syscall; Electron 43's older Chromium seccomp-bpf policy
+  // traps it, surfacing as bogus ESRCH ("No such process") on /dev/shm and
+  // /tmp and preventing shared-memory allocation (renderer never paints).
+  // Disabling the seccomp filter avoids the trap on such kernels.
+  app.commandLine.appendSwitch('disable-seccomp-filter-sandbox')
 }
 
 function amberBinary(): string {
