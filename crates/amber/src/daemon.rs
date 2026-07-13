@@ -282,12 +282,18 @@ mod tests {
 
     #[test]
     fn prepare_socket_replaces_stale_socket_file() {
-        // A crashed daemon leaves the file behind with nobody accepting:
-        // connect() is refused, so the stale file is removed and rebound.
+        // A crashed daemon leaves a socket file behind with nobody accepting:
+        // connect() cannot succeed, so prepare_socket removes it and rebinds.
+        // We simulate the leftover with a plain file rather than drop()ing a
+        // live listener in-process — the latter races the kernel's socket
+        // teardown and can make connect() transiently succeed (false "already
+        // listening"). A crashed daemon's fds are fully closed before restart,
+        // so this deterministic form matches production.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("stale.sock");
-        drop(UnixListener::bind(&path).unwrap()); // file survives the drop
+        std::fs::write(&path, b"").unwrap();
         assert!(path.exists(), "precondition: stale file present");
         assert!(prepare_socket(&path).is_ok());
+        assert!(path.exists(), "rebound socket present");
     }
 }

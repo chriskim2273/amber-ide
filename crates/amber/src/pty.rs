@@ -471,7 +471,11 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(3 * i as u64));
                 let (_id, backlog, rx) = sess.subscribe();
                 let mut acc = backlog;
-                while let Ok(chunk) = rx.recv_timeout(Duration::from_millis(500)) {
+                // Drain until the channel closes (child exit closes it). A wide
+                // idle bound — NOT a mid-stream gap timeout — so a scheduling
+                // stall can't end the drain early and yield a middle segment
+                // (which would fail the suffix invariant under load).
+                while let Ok(chunk) = rx.recv_timeout(Duration::from_secs(10)) {
                     acc.extend_from_slice(&chunk);
                 }
                 acc

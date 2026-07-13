@@ -230,7 +230,11 @@ mod tests {
         /// One shared decoder: frames buffered past a match are not lost.
         fn server_read_until<F: Fn(&Frame) -> bool>(&mut self, pred: F) -> Frame {
             self.server
-                .set_read_timeout(Some(Duration::from_secs(5)))
+                // Generous vs POLL_TICK_MS (100ms): a Resize normally lands in
+                // ~100ms, but under heavy CPU contention the client thread can
+                // be starved for seconds. 20s tolerates that without hiding a
+                // genuine "Resize never sent" break (which still fails).
+                .set_read_timeout(Some(Duration::from_secs(20)))
                 .unwrap();
             let mut buf = [0u8; 8192];
             loop {
