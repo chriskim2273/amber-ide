@@ -10,12 +10,22 @@ use std::thread;
 use amber_core::ring::Ring;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 
-/// Bounded per-subscriber output queue depth (in chunks). When a subscriber
-/// falls this far behind, the reader thread blocks on it — backpressuring the
-/// pty and thus the child — so memory stays flat (spec §9, e.g. `cat` of a
-/// huge file). Caveat: a fully-stalled subscriber backpressures the whole
-/// session; per-subscriber isolation (drop only the laggard) is a refinement.
+/// Bounded per-subscriber output queue depth (in chunks). Memory per
+/// subscriber stays flat at `depth * read-chunk` (spec §9, e.g. `cat` of a
+/// huge file).
 const SUBSCRIBER_QUEUE_DEPTH: usize = 256;
+
+/// Retry cadence while at least one subscriber's queue is full.
+const STALL_POLL: std::time::Duration = std::time::Duration::from_millis(2);
+
+/// Rounds of [`STALL_POLL`] a full subscriber is tolerated for WHILE other
+/// subscribers are making progress (~300 ms). Spec §9 isolation: when every
+/// subscriber is saturated the reader blocks (true backpressure — the child
+/// throttles, memory stays flat); but a lone laggard holding back healthy
+/// subscribers is disconnected after this bound instead of freezing the
+/// session. A disconnected laggard's byte stream simply ends — bytes are
+/// never skipped for a live subscriber.
+const STALL_ROUND_LIMIT: u32 = 150;
 
 /// Live subscribers: `(id, bounded sender)`. The id lets the reader prune a
 /// specific dead subscriber after a snapshot-then-send.
@@ -32,6 +42,56 @@ pub struct PtySession {
     next_sub_id: AtomicU64,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     exit: Arc<Mutex<Option<i32>>>,
+}
+
+/// Fan one chunk out to every subscriber, returning the ids to prune.
+///
+/// Every live subscriber receives every chunk in order (no skips, no
+/// corruption). A subscriber whose queue stays full is handled per spec §9:
+/// - all subscribers saturated -> retry forever (backpressure: the reader
+///   stops draining the pty, the child blocks, memory stays flat);
+/// - some subscribers progressing -> the full one is a laggard; after
+///   [`STALL_ROUND_LIMIT`] rounds it is disconnected so it cannot freeze the
+///   healthy ones.
+fn deliver_chunk(chunk: &[u8], senders: Subscribers) -> Vec<u64> {
+    use std::sync::mpsc::TrySendError;
+
+    let mut dead: Vec<u64> = Vec::new();
+    let mut pending: Vec<(u64, SyncSender<Vec<u8>>, Vec<u8>)> = senders
+        .into_iter()
+        .map(|(id, tx)| (id, tx, chunk.to_vec()))
+        .collect();
+    let mut delivered_any = false;
+    let mut stall_rounds = 0u32;
+
+    loop {
+        pending = pending
+            .into_iter()
+            .filter_map(|(id, tx, payload)| match tx.try_send(payload) {
+                Ok(()) => {
+                    delivered_any = true;
+                    None
+                }
+                Err(TrySendError::Full(payload)) => Some((id, tx, payload)),
+                Err(TrySendError::Disconnected(_)) => {
+                    dead.push(id);
+                    None
+                }
+            })
+            .collect();
+        if pending.is_empty() {
+            break;
+        }
+        if delivered_any {
+            stall_rounds += 1;
+            if stall_rounds >= STALL_ROUND_LIMIT {
+                dead.extend(pending.iter().map(|(id, _, _)| *id));
+                break;
+            }
+        }
+        thread::sleep(STALL_POLL);
+    }
+    dead
 }
 
 impl PtySession {
@@ -83,14 +143,7 @@ impl PtySession {
                                 ring_guard.push(chunk);
                                 subs.lock().unwrap().clone()
                             };
-                            let mut dead = Vec::new();
-                            for (id, tx) in &senders {
-                                // Blocking send == backpressure when the bounded
-                                // queue is full.
-                                if tx.send(chunk.to_vec()).is_err() {
-                                    dead.push(*id);
-                                }
-                            }
+                            let dead = deliver_chunk(chunk, senders);
                             if !dead.is_empty() {
                                 subs.lock().unwrap().retain(|(id, _)| !dead.contains(id));
                             }
@@ -162,6 +215,12 @@ impl PtySession {
         self.subs.lock().unwrap().push((id, tx));
         drop(ring);
         (backlog, rx)
+    }
+
+    /// Number of live subscribers (dead/laggard ones are pruned by the
+    /// reader thread).
+    pub fn subscriber_count(&self) -> usize {
+        self.subs.lock().unwrap().len()
     }
 
     /// Exit code if the child has exited, else `None`.
@@ -282,6 +341,57 @@ mod tests {
             !sentinel.exists(),
             "producer finished despite a stalled subscriber — no backpressure"
         );
+    }
+
+    #[test]
+    fn stalled_subscriber_does_not_freeze_healthy_subscriber() {
+        // Spec §9 isolation: one fully-stalled subscriber must not
+        // backpressure the whole session when another subscriber is healthy.
+        // The laggard is disconnected after a bounded grace; the healthy one
+        // keeps receiving and the producer completes.
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = dir.path().join("done");
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.arg("-c");
+        cmd.arg(format!(
+            "yes PADDING_LINE_TO_FILL_THE_PIPE | head -n 400000; : > '{}'",
+            sentinel.display()
+        ));
+        let sess = Arc::new(PtySession::spawn(cmd, 24, 80, 4096).unwrap());
+
+        // Stalled: subscribed but NEVER drained (receiver kept alive).
+        let (_b1, rx_stalled) = sess.subscribe();
+        // Healthy: drained continuously on its own thread.
+        let (_b2, rx_healthy) = sess.subscribe();
+        let drained = Arc::new(AtomicU64::new(0));
+        {
+            let drained = Arc::clone(&drained);
+            std::thread::spawn(move || {
+                while let Ok(chunk) = rx_healthy.recv_timeout(Duration::from_secs(5)) {
+                    drained.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                }
+            });
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !sentinel.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "producer never finished: the stalled subscriber froze the session \
+                 (healthy subscriber drained {} bytes)",
+                drained.load(Ordering::Relaxed)
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        // The laggard must have been disconnected; the healthy one survives.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while sess.subscriber_count() > 1 {
+            assert!(Instant::now() < deadline, "stalled subscriber was never pruned");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(drained.load(Ordering::Relaxed) > 0, "healthy subscriber got nothing");
+        drop(rx_stalled);
     }
 
     #[test]
