@@ -18,19 +18,28 @@ const DEFAULT_COLS: u16 = 80;
 pub struct SessionManager {
     store: StateStore,
     cfg: Config,
+    root: PathBuf,
     sessions: Mutex<HashMap<String, Arc<PtySession>>>,
 }
 
 impl SessionManager {
     /// Open a manager rooted at `root`, loading config (defaults if absent).
     pub fn new(root: impl Into<PathBuf>) -> anyhow::Result<Self> {
-        let store = StateStore::new(root);
+        let root = root.into();
+        let store = StateStore::new(root.clone());
         let cfg = store.load_config()?;
         Ok(SessionManager {
             store,
             cfg,
+            root,
             sessions: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// The state directory this manager (and its spawned supervisors) is
+    /// rooted at.
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     fn now() -> u64 {
@@ -40,19 +49,31 @@ impl SessionManager {
             .unwrap_or(0)
     }
 
-    /// The command a session of `kind` runs. Slice 2 replaces the Claude arm
-    /// with the real `claude --resume/--continue` supervisor; for now it spawns
-    /// a shell so the session exists.
-    fn command_for(kind: SessionKind, cwd: &Path) -> CommandBuilder {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        let mut cmd = CommandBuilder::new(shell);
-        cmd.cwd(cwd);
-        let _ = kind; // both kinds spawn a shell in Slice 0
-        cmd
+    /// The command a session of `kind` runs. `Shell` spawns the user's shell
+    /// directly; `Claude` spawns this same binary as `amber run <name>`,
+    /// which supervises the real `claude --resume/--continue` process (and
+    /// falls back to a shell) inside the pty (spec §6.2).
+    fn command_for(&self, kind: SessionKind, name: &str, cwd: &Path) -> anyhow::Result<CommandBuilder> {
+        match kind {
+            SessionKind::Shell => {
+                let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+                let mut cmd = CommandBuilder::new(shell);
+                cmd.cwd(cwd);
+                Ok(cmd)
+            }
+            SessionKind::Claude => {
+                let exe = std::env::current_exe()?;
+                let mut cmd = CommandBuilder::new(exe);
+                cmd.args(["run", name]);
+                cmd.cwd(cwd);
+                cmd.env("AMBER_STATE_DIR", self.root.to_string_lossy().to_string());
+                Ok(cmd)
+            }
+        }
     }
 
-    fn spawn(&self, kind: SessionKind, cwd: &Path) -> anyhow::Result<Arc<PtySession>> {
-        let cmd = Self::command_for(kind, cwd);
+    fn spawn(&self, kind: SessionKind, name: &str, cwd: &Path) -> anyhow::Result<Arc<PtySession>> {
+        let cmd = self.command_for(kind, name, cwd)?;
         Ok(Arc::new(PtySession::spawn(
             cmd,
             DEFAULT_ROWS,
@@ -69,7 +90,7 @@ impl SessionManager {
         kind: SessionKind,
     ) -> anyhow::Result<Arc<PtySession>> {
         let cwd = cwd.into();
-        let sess = self.spawn(kind, &cwd)?;
+        let sess = self.spawn(kind, name, &cwd)?;
         let meta = SessionMeta {
             name: name.to_string(),
             cwd,
@@ -98,7 +119,7 @@ impl SessionManager {
         let metas = self.store.list_sessions()?;
         let mut sessions = self.sessions.lock().unwrap();
         for meta in metas {
-            let sess = self.spawn(meta.kind, &meta.cwd)?;
+            let sess = self.spawn(meta.kind, &meta.name, &meta.cwd)?;
             if let Some(bytes) = self.store.read_scrollback(&meta.name)? {
                 sess.preload(&bytes);
             }

@@ -9,9 +9,12 @@ use std::thread;
 use std::time::Duration;
 
 use amber::attach;
+use amber::claude;
 use amber::daemon::Daemon;
 use amber::manager::SessionManager;
+use amber::supervisor;
 use amber_core::proto::{self, ControlMsg, Decoder, Frame};
+use amber_core::state::StateStore;
 use clap::{Parser, Subcommand};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
@@ -53,6 +56,16 @@ enum Command {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
+    /// Supervise a claude/shell session inside its pty (spawned by the
+    /// daemon as the Claude session's child process; not meant to be run
+    /// directly by users).
+    Run {
+        name: String,
+    },
+    /// `SessionStart` hook target invoked by claude itself; records the
+    /// rotating session id from stdin (`AMBER_SESSION`/`AMBER_STATE_DIR`
+    /// env, spec §6.2).
+    Hook,
 }
 
 /// `$XDG_STATE_HOME/amber-ide`, falling back to `$HOME/.local/state/amber-ide`.
@@ -89,7 +102,42 @@ fn main() -> anyhow::Result<()> {
         Command::Create { name, cwd, kind, socket } => {
             run_create(&resolve_socket(socket), &name, &cwd, &kind)
         }
+        Command::Run { name } => run_supervisor(&name),
+        Command::Hook => run_hook(),
     }
+}
+
+/// Root used by `run`/`hook`: `AMBER_STATE_DIR` if set (the daemon sets it
+/// when spawning this binary as a session's supervisor), else the same
+/// default the daemon itself uses.
+fn supervisor_root() -> PathBuf {
+    std::env::var("AMBER_STATE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| default_root())
+}
+
+fn run_supervisor(name: &str) -> anyhow::Result<()> {
+    supervisor::run_session(&supervisor_root(), name)
+}
+
+/// `SessionStart` hook: read the hook JSON from stdin and record the
+/// rotating session id. A hook failure must never crash claude, so errors
+/// are reported to stderr and swallowed (always exit 0).
+fn run_hook() -> anyhow::Result<()> {
+    let name = std::env::var("AMBER_SESSION").unwrap_or_default();
+    let root = supervisor_root();
+
+    let mut input = String::new();
+    if let Err(e) = std::io::stdin().read_to_string(&mut input) {
+        eprintln!("amber hook: failed to read stdin: {e}");
+        return Ok(());
+    }
+
+    let store = StateStore::new(root);
+    if let Err(e) = claude::record_session(&store, &name, &input) {
+        eprintln!("amber hook: failed to record session: {e}");
+    }
+    Ok(())
 }
 
 fn run_daemon(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Result<()> {

@@ -6,3 +6,4 @@ pub mod claude;
 pub mod daemon;
 pub mod manager;
 pub mod pty;
+pub mod supervisor;
