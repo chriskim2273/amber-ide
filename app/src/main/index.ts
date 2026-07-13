@@ -67,6 +67,24 @@ async function main(): Promise<void> {
       nodeIntegration: false,
     },
   })
+  // CSP from the main process, not a static meta tag: dev needs Vite's HMR
+  // (inline preamble + eval for React refresh + the ws: socket), production
+  // stays strict. Set before the initial load so it applies immediately.
+  const isDev = !!process.env['ELECTRON_RENDERER_URL']
+  win.webContents.session.webRequest.onHeadersReceived((details, cb) => {
+    const csp = isDev
+      ? "default-src 'self' 'unsafe-inline' 'unsafe-eval' ws: wss: data: blob: http://localhost:*"
+      : "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; worker-src 'self' blob:"
+    cb({ responseHeaders: { ...details.responseHeaders, 'Content-Security-Policy': [csp] } })
+  })
+  // Surface renderer console + load failures in the terminal (dev diagnosis).
+  win.webContents.on('console-message', (e) => {
+    console.log(`[renderer:${e.level}] ${e.message} (${e.sourceId}:${e.lineNumber})`)
+  })
+  win.webContents.on('did-fail-load', (_e, code, desc, url) => {
+    console.log(`[did-fail-load] ${code} ${desc} ${url}`)
+  })
+
   if (process.env['ELECTRON_RENDERER_URL']) await win.loadURL(process.env['ELECTRON_RENDERER_URL'])
   else await win.loadFile(join(__dirname, '../renderer/index.html'))
 
