@@ -1,0 +1,1 @@
+/home/poyto/Projects/amber-ide-daemon/target/debug/libamber_core.rlib: /home/poyto/Projects/amber-ide-daemon/crates/amber-core/src/lib.rs /home/poyto/Projects/amber-ide-daemon/crates/amber-core/src/proto.rs /home/poyto/Projects/amber-ide-daemon/crates/amber-core/src/ring.rs /home/poyto/Projects/amber-ide-daemon/crates/amber-core/src/state.rs
