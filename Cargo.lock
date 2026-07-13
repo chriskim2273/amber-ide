@@ -9,6 +9,7 @@ dependencies = [
  "amber-core",
  "anyhow",
  "portable-pty",
+ "tempfile",
 ]
 
 [[package]]
