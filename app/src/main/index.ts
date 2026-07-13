@@ -3,7 +3,7 @@ import { ipcMain } from 'electron'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 import { spawn } from 'node:child_process'
-import { readFile, writeFile, rename, mkdir } from 'node:fs/promises'
+import { readFile, writeFile, rename, mkdir, copyFile, chmod } from 'node:fs/promises'
 import { resolveSocketPath } from '../shared/socketPath'
 import { ensureDaemon, probeSocket } from './daemonBoot'
 import { resolveAmberBinary } from './amberBin'
@@ -55,12 +55,63 @@ function layoutPath(): string {
   return root + '/ui-layout.json'
 }
 
-async function installDaemon(): Promise<void> {
-  await new Promise<void>((resolve, reject) => {
-    const p = spawn(amberBinary(), ['ctl', 'install'], { stdio: 'ignore' })
-    p.on('exit', (code) => (code === 0 ? resolve() : reject(new Error(`ctl install exit ${code}`))))
+// systemd user unit, mirroring infra/daemon/amber.service. ExecStart uses the
+// STABLE ~/.local/bin/amber path (%h), never the ephemeral bundle mount.
+const AMBER_SYSTEMD_UNIT = `[Unit]
+Description=amber session daemon (persistent terminal workspace)
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/amber daemon
+Restart=on-failure
+RestartSec=1
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target
+`
+
+function spawnOk(cmd: string, args: string[]): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const p = spawn(cmd, args, { stdio: 'ignore' })
+    p.on('exit', (code) => (code === 0 ? resolve() : reject(new Error(`${cmd} exit ${code}`))))
     p.on('error', reject)
   })
+}
+
+async function installDaemon(): Promise<void> {
+  const home = process.env['HOME'] ?? '.'
+
+  if (app.isPackaged) {
+    // A packaged app has no repo/toolchain, so `amber ctl install` (which runs
+    // cargo from a source checkout) can't work. Do a cargo-free install: place
+    // the bundled amber at a STABLE path and write the boot unit directly — the
+    // ephemeral AppImage/dmg mount path would break reboot survival.
+    const stable = join(home, '.local', 'bin', 'amber')
+    await mkdir(dirname(stable), { recursive: true })
+    await copyFile(amberBinary(), stable)
+    await chmod(stable, 0o755)
+
+    if (process.platform === 'linux') {
+      const unitDir = join(home, '.config', 'systemd', 'user')
+      await mkdir(unitDir, { recursive: true })
+      await writeFile(join(unitDir, 'amber.service'), AMBER_SYSTEMD_UNIT)
+      await spawnOk('systemctl', ['--user', 'daemon-reload'])
+      // enable-linger lets the user daemon run at boot before login (reboot
+      // survival). Best-effort: don't fail the whole install if it's denied.
+      await spawnOk('loginctl', ['enable-linger', process.env['USER'] ?? '']).catch(() => {})
+      await spawnOk('systemctl', ['--user', 'enable', '--now', 'amber.service'])
+      return
+    }
+    // macOS packaged: launchd-agent install is a follow-up; start the daemon
+    // for this session so the app is usable now (reboot survival TODO on mac).
+    spawn(stable, ['daemon'], { detached: true, stdio: 'ignore' }).unref()
+    return
+  }
+
+  // Dev (repo checkout): `amber ctl install` builds + installs from source.
+  await spawnOk(amberBinary(), ['ctl', 'install'])
 }
 
 async function main(): Promise<void> {
