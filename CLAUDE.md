@@ -106,8 +106,14 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   units + `install.sh` + reboot torture doc.
 - [x] Slice 4 — subscriber backpressure (flat memory under fast producers);
   static musl / universal release builds. (True ~16 ms output batching: TODO.)
-- [~] Slice 5 — `amber ctl doctor`/`status`; old tmux infra deleted; this
-  constitution rewritten. Remaining: `amber ctl install`/`snapshot-now`.
+- [x] Slice 5 — `amber ctl doctor`/`status`/`install`/`snapshot-now`; old tmux
+  infra deleted; this constitution rewritten.
+- [x] Hardening pass (2026-07-13) — attach SIGWINCH + socket-close/Exit
+  teardown (poll loop); per-subscriber backpressure isolation; child-exit
+  lifecycle (Exit frames, subscriber close, session reaping); subscription
+  release on client disconnect + `Detach`; live-socket steal guard; frame
+  length cap; session-name validation; spawn-error child cleanup. `Rename`
+  returns an explicit error (unsupported until supervisor rebind exists).
 - [ ] App — the Electron walking skeleton onward. **Separate spec required**
   before starting; it consumes the daemon socket, it does not reimplement it.
 
@@ -120,9 +126,10 @@ connection manager; AI chat UI; themes/settings beyond minimal.
 - A TUI (claude) respawned **detached at boot** must get a real pty size (never
   0×0) and the reader must drain even with zero subscribers — else it can exit.
   This is the failure mode that plausibly broke the old tmux relaunch.
-- Subscriber queues are **bounded** — a stalled client backpressures the pty
-  (flat memory), but currently backpressures the whole session; per-subscriber
-  isolation is a refinement.
+- Subscriber queues are **bounded** — when ALL subscribers are saturated the
+  pty is backpressured (flat memory); a lone laggard among healthy subscribers
+  is disconnected after a bounded grace instead of freezing the session. Bytes
+  are never skipped for a live subscriber.
 - Restored pane cwds fall back to `$HOME` if the dir no longer exists — keep
   torture dirs out of `/tmp` (wiped at boot).
 - `PtySession` must stay `Send + Sync` (all fields mutex/atomic-guarded) — the

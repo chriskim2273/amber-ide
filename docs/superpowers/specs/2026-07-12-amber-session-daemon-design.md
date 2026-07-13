@@ -263,8 +263,10 @@ losslessly, with scrollback, zero manual steps.
 workspace; `ring` (9), `proto` codec (7), `state` store (16), `pty` (5), `manager`
 save/restore (2 integration), socket `daemon` + `attach`/`ls`/`create` CLI (2 integration).
 Proven end-to-end via the real binary: `daemon → create → SIGTERM final-snapshot → restart →
-sessions restored from disk`. Detached pty is 24×80 (never 0×0). Known best-effort gaps in
-`amber attach`: SIGWINCH not wired; socket-close only observed on next keystroke. Real TUI
+sessions restored from disk`. Detached pty is 24×80 (never 0×0). Former best-effort gaps in
+`amber attach` (SIGWINCH not wired; socket-close only observed on next keystroke) were
+closed in the 2026-07-13 hardening pass: the client is now a single-threaded poll(2)
+loop that forwards SIGWINCH as `Resize` and exits on socket close or a session `Exit`. Real TUI
 (vs shell) respawn is covered by the deterministic size proof + the Slice 3 reboot torture
 test with actual claude.
 
@@ -291,8 +293,10 @@ Then, only after Slice 0 passes:
 - Slice 5: rewrite `CLAUDE.md`; delete old tmux `infra/`; `amber ctl`. **MOSTLY DONE
   (2026-07-13).** `CLAUDE.md` rewritten as the daemon constitution; old tmux infra deleted;
   `amber ctl doctor` (login-shell claude resolution → config — closes the original bug) +
-  `amber ctl status`. TODO: `amber ctl install`/`snapshot-now`. App (Electron) integration is a
-  separate spec that consumes the daemon socket.
+  `amber ctl status`. `amber ctl install` (wrapper over `infra/daemon/install.sh`, with `--dry-run`)
+  and `ctl snapshot-now` (new `Snapshot`/`SnapshotOk` control messages) landed in the
+  2026-07-13 hardening pass. App (Electron) integration is a separate spec that consumes
+  the daemon socket.
 
 ---
 
