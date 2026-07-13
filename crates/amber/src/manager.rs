@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use amber_core::proto::SessionInfo;
 use amber_core::state::{Config, SessionKind, SessionMeta, StateStore};
 use portable_pty::CommandBuilder;
 
@@ -165,6 +166,30 @@ impl SessionManager {
         v
     }
 
+    /// One [`SessionInfo`] per live session, joining the live table (existence
+    /// + liveness) with the persisted metadata (cwd/kind). Sorted by name.
+    pub fn session_infos(&self) -> anyhow::Result<Vec<SessionInfo>> {
+        let sessions = self.sessions.lock().unwrap();
+        let mut infos: Vec<SessionInfo> = self
+            .store
+            .list_sessions()?
+            .into_iter()
+            .filter_map(|meta| {
+                sessions.get(&meta.name).map(|sess| SessionInfo {
+                    name: meta.name.clone(),
+                    cwd: meta.cwd.to_string_lossy().into_owned(),
+                    kind: match meta.kind {
+                        SessionKind::Shell => "shell".to_string(),
+                        SessionKind::Claude => "claude".to_string(),
+                    },
+                    alive: sess.is_alive(),
+                })
+            })
+            .collect();
+        infos.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(infos)
+    }
+
     pub fn write(&self, name: &str, bytes: &[u8]) -> anyhow::Result<()> {
         let sess = self
             .session(name)
@@ -210,6 +235,23 @@ impl SessionManager {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn session_infos_projects_metadata_for_live_sessions() {
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        mgr.create("amber-1-1-0-a", "/tmp", SessionKind::Shell).unwrap();
+        mgr.create("amber-1-1-1-b", dir.path(), SessionKind::Claude).unwrap();
+
+        let mut infos = mgr.session_infos().unwrap();
+        infos.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(infos.len(), 2);
+        assert_eq!(infos[0].name, "amber-1-1-0-a");
+        assert_eq!(infos[0].kind, "shell");
+        assert_eq!(infos[0].cwd, "/tmp");
+        assert!(infos[0].alive);
+        assert_eq!(infos[1].kind, "claude");
+    }
 
     #[test]
     fn create_rejects_names_that_escape_the_state_dir() {
