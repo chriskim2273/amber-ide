@@ -276,6 +276,43 @@ fn rename_gets_an_explicit_unsupported_error() {
 }
 
 #[test]
+fn malformed_frame_kills_only_that_connection_not_the_daemon() {
+    let (socket_path, _dir) = start_daemon();
+
+    // Connection A sends garbage: an unknown tag inside a valid length
+    // prefix. Its connection is torn down...
+    let mut bad = connect_with_retry(&socket_path);
+    bad.write_all(&[0, 0, 0, 1, 99]).unwrap(); // len=1, tag=99
+    bad.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut buf = [0u8; 64];
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match bad.read(&mut buf) {
+            Ok(0) => break, // daemon dropped the bad connection
+            Ok(_) => {}
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                assert!(Instant::now() < deadline, "bad connection never dropped");
+            }
+            Err(_) => break,
+        }
+    }
+
+    // ...but the daemon keeps serving fresh connections.
+    let mut good = connect_with_retry(&socket_path);
+    let mut decoder = Decoder::new();
+    send(&mut good, &Frame::Control(ControlMsg::ListSessions));
+    read_frame_until(
+        &mut good,
+        &mut decoder,
+        |f| matches!(f, Frame::Control(ControlMsg::SessionList { .. })),
+        Duration::from_secs(5),
+    );
+}
+
+#[test]
 fn list_sessions_returns_all_created_names() {
     let (socket_path, _dir) = start_daemon();
     let mut stream = connect_with_retry(&socket_path);
