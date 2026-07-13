@@ -29,6 +29,11 @@ if (process.env['AMBER_NO_SANDBOX']) {
   // /tmp and preventing shared-memory allocation (renderer never paints).
   // Disabling the seccomp filter avoids the trap on such kernels.
   app.commandLine.appendSwitch('disable-seccomp-filter-sandbox')
+  // The zygote sets up child-process namespaces; on kernel 6.17 that context
+  // is where Chromium's shared-memory access() returns a bogus ESRCH (all shm
+  // primitives work at top level). Spawn children without the zygote so they
+  // inherit the browser process's working context.
+  app.commandLine.appendSwitch('no-zygote')
 }
 
 function amberBinary(): string {
