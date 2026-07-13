@@ -175,6 +175,23 @@ impl SessionManager {
         sess.resize(rows, cols)
     }
 
+    /// Remove sessions whose child has exited ("child exits -> session
+    /// ends", spec §6.1), deleting their persisted artifacts so they are not
+    /// respawned on the next daemon start. Returns the reaped names.
+    pub fn reap(&self) -> anyhow::Result<Vec<String>> {
+        let mut sessions = self.sessions.lock().unwrap();
+        let dead: Vec<String> = sessions
+            .iter()
+            .filter(|(_, s)| !s.is_alive())
+            .map(|(n, _)| n.clone())
+            .collect();
+        for name in &dead {
+            sessions.remove(name);
+            self.store.remove_session(name)?;
+        }
+        Ok(dead)
+    }
+
     /// Kill and forget a session, removing its persisted artifacts.
     pub fn remove(&self, name: &str) -> anyhow::Result<()> {
         if let Some(sess) = self.sessions.lock().unwrap().remove(name) {
@@ -208,6 +225,30 @@ mod tests {
             !dir.path().parent().unwrap().join("evil.json").exists(),
             "traversal name escaped the state dir"
         );
+    }
+
+    #[test]
+    fn reap_removes_dead_sessions_and_their_persisted_state() {
+        // "Child exits -> session ends" (spec §6.1): a dead session must
+        // leave the live table and the state store, while live ones stay.
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        mgr.create("dies", "/tmp", SessionKind::Shell).unwrap();
+        mgr.create("lives", "/tmp", SessionKind::Shell).unwrap();
+
+        mgr.write("dies", b"exit\n").unwrap();
+        let sess = mgr.session("dies").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while sess.is_alive() {
+            assert!(std::time::Instant::now() < deadline, "shell never exited");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        let reaped = mgr.reap().unwrap();
+        assert_eq!(reaped, vec!["dies".to_string()]);
+        assert_eq!(mgr.names(), vec!["lives".to_string()]);
+        assert!(!dir.path().join("sessions/dies.json").exists());
+        assert!(dir.path().join("sessions/lives.json").exists());
     }
 
     #[test]

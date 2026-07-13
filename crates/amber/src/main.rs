@@ -271,6 +271,16 @@ fn run_daemon(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Result<
         let interval = manager.snapshot_interval_secs().max(1);
         thread::spawn(move || loop {
             thread::sleep(Duration::from_secs(interval));
+            // Reap ended sessions first so the snapshot never re-persists a
+            // dead pane ("child exits -> session ends", spec §6.1).
+            match manager.reap() {
+                Ok(reaped) => {
+                    for name in reaped {
+                        eprintln!("amber daemon: session {name} ended; reaped");
+                    }
+                }
+                Err(e) => eprintln!("amber daemon: reap failed: {e}"),
+            }
             if let Err(e) = manager.snapshot() {
                 eprintln!("amber daemon: periodic snapshot failed: {e}");
             }

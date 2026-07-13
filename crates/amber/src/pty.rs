@@ -151,6 +151,10 @@ impl PtySession {
                         Err(_) => break,
                     }
                 }
+                // Pty EOF/read error: the child is gone. Drop every
+                // subscriber's sender so their channels close — attached
+                // clients must observe the pane ending, not silence.
+                subs.lock().unwrap().clear();
             });
         }
 
@@ -449,6 +453,31 @@ mod tests {
                 s.len(),
                 full.len()
             );
+        }
+    }
+
+    #[test]
+    fn subscriber_channel_closes_when_child_exits() {
+        // When the child exits, subscribers must see their channel close
+        // (sender dropped) instead of blocking forever on a silent session —
+        // this is what lets the daemon tell attached clients the pane ended.
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.arg("-c");
+        cmd.arg("printf bye");
+        let sess = PtySession::spawn(cmd, 24, 80, 4096).unwrap();
+        let (_backlog, rx) = sess.subscribe();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(_) => {}                                      // live bytes
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return, // closed: pass
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "channel never closed after child exit"
+                    );
+                }
+            }
         }
     }
 

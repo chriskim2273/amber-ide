@@ -171,6 +171,41 @@ fn snapshot_control_flushes_scrollback_and_acks() {
 }
 
 #[test]
+fn attached_client_receives_exit_when_child_dies() {
+    let (socket_path, _dir) = start_daemon();
+    let mut stream = connect_with_retry(&socket_path);
+    let mut decoder = Decoder::new();
+
+    send(
+        &mut stream,
+        &Frame::Control(ControlMsg::Create {
+            name: "mortal".into(),
+            cwd: "/tmp".into(),
+            kind: "shell".into(),
+        }),
+    );
+    read_frame_until(
+        &mut stream,
+        &mut decoder,
+        |f| matches!(f, Frame::Control(ControlMsg::Created { .. })),
+        Duration::from_secs(5),
+    );
+
+    send(&mut stream, &Frame::Control(ControlMsg::Attach { name: "mortal".into() }));
+    send(
+        &mut stream,
+        &Frame::Data { session: "mortal".into(), bytes: b"exit\n".to_vec() },
+    );
+
+    read_frame_until(
+        &mut stream,
+        &mut decoder,
+        |f| matches!(f, Frame::Control(ControlMsg::Exit { name, .. }) if name == "mortal"),
+        Duration::from_secs(10),
+    );
+}
+
+#[test]
 fn list_sessions_returns_all_created_names() {
     let (socket_path, _dir) = start_daemon();
     let mut stream = connect_with_retry(&socket_path);

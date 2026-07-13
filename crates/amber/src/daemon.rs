@@ -132,12 +132,32 @@ fn handle_control(manager: &Arc<SessionManager>, writer: &SharedWriter, msg: Con
                 return;
             }
             let writer = Arc::clone(writer);
+            // `sess` moves into the forwarder so it can report the exit code.
             thread::spawn(move || {
                 while let Ok(chunk) = rx.recv() {
                     let frame = Frame::Data { session: name.clone(), bytes: chunk };
                     if write_frame(&writer, &frame).is_err() {
-                        break;
+                        return;
                     }
+                }
+                // Channel closed: either the child exited (the pty reader
+                // clears all subscribers) or this subscriber was pruned as a
+                // laggard. If the child is gone, tell the client the pane
+                // ended. The exit code is recorded by a separate waiter
+                // thread, so give it a moment to land.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                loop {
+                    if let Some(code) = sess.exit_code() {
+                        let _ = write_frame(
+                            &writer,
+                            &Frame::Control(ControlMsg::Exit { name, code }),
+                        );
+                        return;
+                    }
+                    if std::time::Instant::now() > deadline {
+                        return; // pruned while the child is still alive
+                    }
+                    thread::sleep(std::time::Duration::from_millis(20));
                 }
             });
         }
