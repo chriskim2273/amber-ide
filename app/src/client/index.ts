@@ -10,7 +10,13 @@ let controlPort: Electron.MessagePortMain | null = null
 conn.on('frame', (f: Frame) => {
   if (f.type === 'control') controlPort?.postMessage({ frame: f })
 })
-conn.on('close', () => controlPort?.postMessage({ closed: true }))
+conn.on('open', () => {
+  controlPort?.postMessage({ status: 'connected' })
+  conn.send({ type: 'control', msg: { kind: 'WatchSessions' } })
+  conn.send({ type: 'control', msg: { kind: 'ListSessionsDetailed' } })
+  router.reattachAll()
+})
+conn.on('close', () => controlPort?.postMessage({ status: 'disconnected' }))
 
 process.parentPort.on('message', (event) => {
   const msg = event.data as { kind: 'control' } | { kind: 'pane'; session: string }
@@ -30,8 +36,6 @@ process.parentPort.on('message', (event) => {
     })
     port.start()
     conn.connect()
-    conn.send({ type: 'control', msg: { kind: 'WatchSessions' } })
-    conn.send({ type: 'control', msg: { kind: 'ListSessionsDetailed' } })
   } else {
     // MessagePortMain matches PortLike structurally (postMessage/on/start).
     router.attach(msg.session, port as unknown as PortLike)

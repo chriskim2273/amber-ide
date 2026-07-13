@@ -39,6 +39,12 @@ export class Router {
     this.conn.send({ type: 'control', msg: { kind: 'Attach', name: session } })
   }
 
+  reattachAll(): void {
+    for (const session of this.ports.keys()) {
+      this.conn.send({ type: 'control', msg: { kind: 'Attach', name: session } })
+    }
+  }
+
   detach(session: string): void {
     this.ports.delete(session)
     this.conn.send({ type: 'control', msg: { kind: 'Detach', name: session } })

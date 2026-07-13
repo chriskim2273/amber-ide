@@ -50,4 +50,15 @@ describe('Router', () => {
       { type: 'control', msg: { kind: 'Resize', name: 's', cols: 100, rows: 40 } },
     ])
   })
+
+  it('reattachAll re-sends Attach for every attached session', () => {
+    const conn = new FakeConn()
+    const router = new Router(conn)
+    router.attach('sA', new FakePort())
+    router.attach('sB', new FakePort())
+    conn.sent.length = 0
+    router.reattachAll()
+    const attaches = conn.sent.filter((f) => f.type === 'control' && f.msg.kind === 'Attach')
+    expect(attaches).toHaveLength(2)
+  })
 })
