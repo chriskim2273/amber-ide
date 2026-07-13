@@ -58,6 +58,25 @@ impl Daemon {
     }
 }
 
+/// Bind the daemon's unix socket at `path`, handling leftovers safely:
+/// - nothing there -> bind;
+/// - a live socket (another daemon answers a connect) -> error, NEVER unlink
+///   a running daemon's socket out from under it;
+/// - a stale socket file (connect refused: previous daemon crashed/was
+///   SIGKILLed) -> remove it and bind.
+pub fn prepare_socket(path: &std::path::Path) -> anyhow::Result<UnixListener> {
+    if path.exists() {
+        match UnixStream::connect(path) {
+            Ok(_) => anyhow::bail!(
+                "another daemon is already listening on {}",
+                path.display()
+            ),
+            Err(_) => std::fs::remove_file(path)?,
+        }
+    }
+    Ok(UnixListener::bind(path)?)
+}
+
 fn write_frame(writer: &SharedWriter, frame: &Frame) -> anyhow::Result<()> {
     let bytes = proto::encode(frame);
     let mut w = writer.lock().unwrap();
@@ -223,5 +242,41 @@ fn handle_control(
         // Unknown to us but well-formed; ignore rather than tear down the
         // connection.
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prepare_socket_binds_fresh_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fresh.sock");
+        assert!(prepare_socket(&path).is_ok());
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn prepare_socket_refuses_to_steal_a_live_socket() {
+        // A second daemon instance must fail loudly, not silently unbind the
+        // first one's socket (killing every client's connection path).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live.sock");
+        let _live = UnixListener::bind(&path).unwrap();
+        let err = prepare_socket(&path).expect_err("stole a live socket");
+        assert!(err.to_string().contains("already listening"), "{err}");
+        assert!(path.exists(), "live socket file must be left alone");
+    }
+
+    #[test]
+    fn prepare_socket_replaces_stale_socket_file() {
+        // A crashed daemon leaves the file behind with nobody accepting:
+        // connect() is refused, so the stale file is removed and rebound.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stale.sock");
+        drop(UnixListener::bind(&path).unwrap()); // file survives the drop
+        assert!(path.exists(), "precondition: stale file present");
+        assert!(prepare_socket(&path).is_ok());
     }
 }

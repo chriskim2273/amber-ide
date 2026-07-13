@@ -2,7 +2,7 @@
 //! (spec §2).
 
 use std::io::{Read, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
@@ -259,11 +259,8 @@ fn run_daemon(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Result<
     manager.restore()?;
 
     // A stale socket file from a previous (crashed/killed) daemon run must
-    // not block bind().
-    if socket_path.exists() {
-        std::fs::remove_file(&socket_path)?;
-    }
-    let listener = UnixListener::bind(&socket_path)?;
+    // not block bind() — but a LIVE daemon's socket must never be stolen.
+    let listener = amber::daemon::prepare_socket(&socket_path)?;
 
     // Periodic snapshot thread (cadence from config, spec §7).
     {
