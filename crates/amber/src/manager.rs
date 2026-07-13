@@ -42,6 +42,11 @@ impl SessionManager {
         &self.root
     }
 
+    /// Configured snapshot cadence in seconds (daemon's periodic-flush timer).
+    pub fn snapshot_interval_secs(&self) -> u64 {
+        self.cfg.snapshot_interval_secs
+    }
+
     fn now() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)

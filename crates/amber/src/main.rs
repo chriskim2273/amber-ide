@@ -158,14 +158,12 @@ fn run_daemon(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Result<
     }
     let listener = UnixListener::bind(&socket_path)?;
 
-    // Periodic snapshot thread.
-    // TODO Slice 3: read the interval from config.snapshot_interval_secs via
-    // a manager getter instead of hardcoding; manager.rs is frozen for this
-    // packet so 10s (the spec's own default) is inlined here.
+    // Periodic snapshot thread (cadence from config, spec §7).
     {
         let manager = Arc::clone(&manager);
+        let interval = manager.snapshot_interval_secs().max(1);
         thread::spawn(move || loop {
-            thread::sleep(Duration::from_secs(10));
+            thread::sleep(Duration::from_secs(interval));
             if let Err(e) = manager.snapshot() {
                 eprintln!("amber daemon: periodic snapshot failed: {e}");
             }
