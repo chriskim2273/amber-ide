@@ -14,7 +14,15 @@ export default defineConfig({
       },
     },
   },
-  preload: { plugins: [externalizeDepsPlugin()] },
+  preload: {
+    plugins: [externalizeDepsPlugin()],
+    // Electron loads preload in a sandboxed CommonJS context — it cannot use an
+    // ESM (.mjs) preload. package.json is "type": "module", so force CJS output
+    // with a .cjs extension so Node treats it as CommonJS.
+    build: {
+      rollupOptions: { output: { format: 'cjs', entryFileNames: '[name].cjs' } },
+    },
+  },
   renderer: {
     plugins: [react()],
     build: { rollupOptions: { input: resolve('src/renderer/index.html') } },
