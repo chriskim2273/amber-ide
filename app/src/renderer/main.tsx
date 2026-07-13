@@ -36,6 +36,10 @@ function App(): JSX.Element {
   const [state, dispatch] = useReducer(reduce, undefined, initialState)
   const [layout, setLayout] = useState<LayoutFile>(emptyLayout)
   const [activeTab, setActiveTab] = useState(1)
+  // Splits whose session was requested but hasn't materialized yet. Held out of
+  // reconcile so it can't prune/re-append them as columns; placed with the
+  // requested direction once the daemon confirms the session exists.
+  const [pending, setPending] = useState<Record<string, { paneId: string; dir: 'h' | 'v' }>>({})
   const layoutRef = useRef(layout)
   layoutRef.current = layout
 
@@ -58,8 +62,10 @@ function App(): JSX.Element {
   const deadCodes: Record<string, number> = {}
   tab?.panes.forEach((p) => { if (p.deadCode !== null) deadCodes[p.name] = p.deadCode })
 
-  // Reconcile the persisted tree for this tab with its live pane set.
-  const liveIds = tab?.panes.map((p) => p.name) ?? []
+  // Reconcile the persisted tree for this tab with its live pane set. Pending
+  // split targets are excluded until placed, so reconcile won't append them.
+  const allLive = tab?.panes.map((p) => p.name) ?? []
+  const liveIds = allLive.filter((n) => !(n in pending))
   const wsKey = String(ws?.ws ?? 1)
   const tabKey = String(tab?.tab ?? activeTab)
   const storedTree = layout.workspaces[wsKey]?.tabs[tabKey]?.tree ?? null
@@ -73,6 +79,20 @@ function App(): JSX.Element {
   }, [wsKey, tabKey, activeTab])
 
   useEffect(() => { if (tree && JSON.stringify(tree) !== JSON.stringify(storedTree)) putTree(tree) }, [tree, storedTree, putTree])
+
+  // Place pending splits once their session exists, preserving H/V direction.
+  const liveKey = allLive.join(',')
+  useEffect(() => {
+    const ready = Object.entries(pending).filter(([name]) => allLive.includes(name))
+    if (ready.length === 0) return
+    let next = reconcile(storedTree, liveIds)
+    for (const [name, { paneId, dir }] of ready) {
+      next = next ? splitLeaf(next, paneId, dir, name) : { kind: 'leaf', paneId: name }
+    }
+    putTree(next)
+    setPending((p) => { const c = { ...p }; for (const [n] of ready) delete c[n]; return c })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pending, liveKey, storedTree, putTree])
 
   if (!bridgeReady) return <p style={{ color: 'crimson', padding: 16 }}>preload bridge missing.</p>
 
@@ -96,10 +116,9 @@ function App(): JSX.Element {
           ? <SplitView tree={tree} deadCodes={deadCodes}
               onSetRatio={(path, r) => putTree(setRatio(tree, path, r))}
               onSplit={(paneId, dir) => {
-                const id = makeId()
-                const p = tab!
-                window.amber.createSession(formatName({ ws: 1, tab: p.tab, ord: nextOrd, id }), '.', 'shell')
-                putTree(splitLeaf(tree, paneId, dir, formatName({ ws: 1, tab: p.tab, ord: nextOrd, id })))
+                const name = formatName({ ws: 1, tab: tab!.tab, ord: nextOrd, id: makeId() })
+                window.amber.createSession(name, '.', 'shell')
+                setPending((p) => ({ ...p, [name]: { paneId, dir } }))
               }}
               onClose={(paneId) => { window.amber.killSession(paneId); putTree(removeLeaf(tree, paneId)) }} />
           : <p style={{ padding: 16 }}>No panes. Click “+ Pane”.</p>}
