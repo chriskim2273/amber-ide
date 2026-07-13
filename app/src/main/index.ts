@@ -77,10 +77,13 @@ async function main(): Promise<void> {
       : "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; worker-src 'self' blob:"
     cb({ responseHeaders: { ...details.responseHeaders, 'Content-Security-Policy': [csp] } })
   })
-  // Surface renderer console + load failures in the terminal (dev diagnosis).
-  win.webContents.on('console-message', (e) => {
-    console.log(`[renderer:${e.level}] ${e.message} (${e.sourceId}:${e.lineNumber})`)
-  })
+  // Surface renderer console in the terminal for DEV diagnosis only — never in
+  // production, where it could pipe sensitive page/terminal data to stdout.
+  if (isDev) {
+    win.webContents.on('console-message', (e) => {
+      console.log(`[renderer:${e.level}] ${e.message} (${e.sourceId}:${e.lineNumber})`)
+    })
+  }
   win.webContents.on('did-fail-load', (_e, code, desc, url) => {
     console.log(`[did-fail-load] ${code} ${desc} ${url}`)
   })
