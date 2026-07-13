@@ -135,8 +135,13 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   a live GUI** (kernel-6.17 box needs `AMBER_SOFTWARE_GL=1 AMBER_NO_SANDBOX=1`).
   Fixes shipped: claude fresh-start for new sessions; deferred split placement;
   per-pane ResizeObserver; DOM renderer under software GL; layout-load gate.
-- [ ] App Slice 7 — packaging (electron-builder dmg/AppImage, bundle the `amber`
-  binary, first-run install). Consumes the daemon socket; does not reimplement it.
+- [x] App Slice 7 — packaging: electron-builder (AppImage/dmg), bundled `amber`
+  resolver, `scripts/dist.sh`. **AppImage built with amber bundled.** Packaged
+  first-run does a cargo-free install (copies amber to `~/.local/bin/amber` +
+  writes the systemd user unit directly — the ephemeral AppImage mount can't
+  back a boot unit). macOS launchd-agent install + running the installed app
+  end-to-end (needs the user's normal-hardware machine; this box's kernel 6.17
+  forces the software-GL flags) remain to verify.
 
 ## Gotchas (learned)
 
