@@ -7,3 +7,4 @@ pub mod daemon;
 pub mod manager;
 pub mod pty;
 pub mod supervisor;
+pub mod watchers;
