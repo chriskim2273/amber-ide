@@ -9,17 +9,28 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use amber_core::state::{ClaudeMeta, StateStore};
 
-/// Build claude's argument vector (excluding the program itself). Resumes a
-/// recorded conversation when `session_id` is known, else continues the most
-/// recent one in the cwd.
-pub fn claude_argv(session_id: Option<&str>, settings_path: &Path) -> Vec<String> {
+/// How to start `claude`: resume a specific recorded conversation, continue the
+/// most recent one in the cwd, or start a brand-new one. A never-run session
+/// must start `Fresh` — `--continue` on it prints "No conversation to continue"
+/// and exits, which would burn the supervisor's retry budget.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaudeStart {
+    Resume(String),
+    Continue,
+    Fresh,
+}
+
+/// Build claude's argument vector (excluding the program itself) for the given
+/// start mode.
+pub fn claude_argv(start: &ClaudeStart, settings_path: &Path) -> Vec<String> {
     let mut argv = vec!["--dangerously-skip-permissions".to_string()];
-    match session_id {
-        Some(id) => {
+    match start {
+        ClaudeStart::Resume(id) => {
             argv.push("--resume".to_string());
-            argv.push(id.to_string());
+            argv.push(id.clone());
         }
-        None => argv.push("--continue".to_string()),
+        ClaudeStart::Continue => argv.push("--continue".to_string()),
+        ClaudeStart::Fresh => {}
     }
     argv.push("--settings".to_string());
     argv.push(settings_path.to_string_lossy().to_string());
@@ -116,8 +127,8 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn argv_resumes_when_session_id_present() {
-        let argv = claude_argv(Some("sid-123"), Path::new("/s/set.json"));
+    fn argv_resumes_a_recorded_id() {
+        let argv = claude_argv(&ClaudeStart::Resume("sid-123".into()), Path::new("/s/set.json"));
         assert_eq!(argv[0], "--dangerously-skip-permissions");
         assert!(argv.iter().any(|a| a == "--resume"));
         assert!(argv.iter().any(|a| a == "sid-123"));
@@ -127,10 +138,19 @@ mod tests {
     }
 
     #[test]
-    fn argv_continues_when_no_session_id() {
-        let argv = claude_argv(None, Path::new("/s/set.json"));
+    fn argv_continue_mode() {
+        let argv = claude_argv(&ClaudeStart::Continue, Path::new("/s/set.json"));
         assert!(argv.iter().any(|a| a == "--continue"));
         assert!(!argv.iter().any(|a| a == "--resume"));
+    }
+
+    #[test]
+    fn argv_fresh_has_no_resume_or_continue() {
+        // A brand-new session must start clean: no --resume and no --continue.
+        let argv = claude_argv(&ClaudeStart::Fresh, Path::new("/s/set.json"));
+        assert!(!argv.iter().any(|a| a == "--continue"));
+        assert!(!argv.iter().any(|a| a == "--resume"));
+        assert!(argv.iter().any(|a| a == "--settings"));
     }
 
     #[test]

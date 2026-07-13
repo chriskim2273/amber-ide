@@ -32,9 +32,26 @@ pub fn supervise_claude(
 ) -> anyhow::Result<SuperviseOutcome> {
     let store = StateStore::new(root);
     let mut attempts = 0u32;
+    // Escalation within a run of the SAME recorded id: Resume -> Continue ->
+    // Fresh. Reset whenever the recorded id changes (e.g. the hook records a
+    // new id after a fresh start), so a crash then resumes the new id rather
+    // than continuing to escalate.
+    let mut escalation = 0u32;
+    let mut prev_id: Option<String> = None;
     loop {
         let session_id = store.read_claude(name)?.map(|m| m.session_id);
-        let argv = claude::claude_argv(session_id.as_deref(), settings);
+        if session_id != prev_id {
+            escalation = 0;
+            prev_id = session_id.clone();
+        }
+        let start = match (&session_id, escalation) {
+            // A never-run session (no recorded id) starts Fresh — never --continue.
+            (None, _) => claude::ClaudeStart::Fresh,
+            (Some(id), 0) => claude::ClaudeStart::Resume(id.clone()),
+            (Some(_), 1) => claude::ClaudeStart::Continue,
+            (Some(_), _) => claude::ClaudeStart::Fresh,
+        };
+        let argv = claude::claude_argv(&start, settings);
 
         // A failure to even launch the child (e.g. a transient ETXTBSY while
         // the binary is being replaced) is treated the same as a crash: it
@@ -54,6 +71,7 @@ pub fn supervise_claude(
         }
 
         attempts += 1;
+        escalation += 1;
         if attempts >= max_attempts {
             return Ok(SuperviseOutcome::Exhausted);
         }
