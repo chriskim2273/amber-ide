@@ -47,6 +47,23 @@ impl SessionManager {
         self.cfg.snapshot_interval_secs
     }
 
+    /// Session names become file names in the state store and travel in
+    /// data-frame headers, so they must be non-empty, contain no path
+    /// separators/NULs, not be `.`/`..`, and stay short enough for any
+    /// filesystem (NAME_MAX) and the u16 wire header.
+    fn validate_name(name: &str) -> anyhow::Result<()> {
+        if name.is_empty() {
+            anyhow::bail!("session name must not be empty");
+        }
+        if name.len() > 200 {
+            anyhow::bail!("session name too long ({} bytes, max 200)", name.len());
+        }
+        if name == "." || name == ".." || name.contains('/') || name.contains('\0') {
+            anyhow::bail!("invalid session name: {name:?}");
+        }
+        Ok(())
+    }
+
     fn now() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -94,6 +111,7 @@ impl SessionManager {
         cwd: impl Into<PathBuf>,
         kind: SessionKind,
     ) -> anyhow::Result<Arc<PtySession>> {
+        Self::validate_name(name)?;
         let cwd = cwd.into();
         let sess = self.spawn(kind, name, &cwd)?;
         let meta = SessionMeta {
@@ -164,5 +182,40 @@ impl SessionManager {
         }
         self.store.remove_session(name)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn create_rejects_names_that_escape_the_state_dir() {
+        // Session names become file paths (`sessions/<name>.json`,
+        // `scrollback/<name>.bin`); a hostile name must never write outside
+        // the state root or spawn anything.
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        for bad in ["../evil", "a/b", "/abs", "", ".", "..", "nul\0byte"] {
+            assert!(
+                mgr.create(bad, "/tmp", SessionKind::Shell).is_err(),
+                "name {bad:?} should be rejected"
+            );
+        }
+        assert!(mgr.names().is_empty(), "no session may be tracked");
+        assert!(
+            !dir.path().parent().unwrap().join("evil.json").exists(),
+            "traversal name escaped the state dir"
+        );
+    }
+
+    #[test]
+    fn create_rejects_absurdly_long_names() {
+        // Data-frame headers carry the name length as u16; cap well below it.
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        let long = "x".repeat(256);
+        assert!(mgr.create(&long, "/tmp", SessionKind::Shell).is_err());
     }
 }
