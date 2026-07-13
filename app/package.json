@@ -9,7 +9,21 @@
     "build": "electron-vite build",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json",
     "lint": "eslint . --ext .ts,.tsx",
-    "test": "vitest run"
+    "test": "vitest run",
+    "package": "electron-vite build && electron-builder",
+    "dist": "bash scripts/dist.sh"
+  },
+  "build": {
+    "appId": "com.amber-ide.app",
+    "productName": "amber-ide",
+    "directories": { "output": "release" },
+    "files": ["out/**/*", "package.json"],
+    "extraResources": [{ "from": "resources/bin", "to": "bin", "filter": ["**/*"] }],
+    "linux": { "target": ["AppImage"], "category": "Development" },
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "target": [{ "target": "dmg", "arch": ["arm64", "x64"] }]
+    }
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
@@ -19,6 +33,7 @@
     "@typescript-eslint/parser": "^8.0.0",
     "@vitejs/plugin-react": "^4.3.0",
     "electron": "^43.1.0",
+    "electron-builder": "^25.0.0",
     "electron-vite": "^5.0.0",
     "eslint": "^9.0.0",
     "typescript": "^5.6.0",

@@ -6,6 +6,7 @@ import { spawn } from 'node:child_process'
 import { readFile, writeFile, rename, mkdir } from 'node:fs/promises'
 import { resolveSocketPath } from '../shared/socketPath'
 import { ensureDaemon, probeSocket } from './daemonBoot'
+import { resolveAmberBinary } from './amberBin'
 import clientPath from '../client/index?modulePath'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -44,8 +45,7 @@ if (process.env['AMBER_NO_SANDBOX']) {
 }
 
 function amberBinary(): string {
-  // Dev: rely on PATH. Packaging (slice 7) swaps this for the bundled binary.
-  return process.env['AMBER_BIN'] ?? 'amber'
+  return resolveAmberBinary(process.env, app.isPackaged, process.resourcesPath)
 }
 
 function layoutPath(): string {
