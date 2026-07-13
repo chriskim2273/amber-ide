@@ -102,7 +102,7 @@ function App(): JSX.Element {
     window.amber.createSession(formatName({ ws: 1, tab: tabId, ord, id: makeId() }), '.', 'shell')
 
   return (
-    <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column' }}>
+    <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', background: '#000' }}>
       <div style={{ display: 'flex', gap: 4, padding: 4, background: '#222' }}>
         {tabs.map((t) => (
           <button key={t.tab} onClick={() => setActiveTab(t.tab)}

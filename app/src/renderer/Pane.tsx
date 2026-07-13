@@ -28,9 +28,14 @@ export function Pane({ session }: { session: string }): JSX.Element {
     let wired = false
 
     const sendResize = (): void => {
-      fit.fit()
+      try { fit.fit() } catch { /* host has zero size mid-layout; ignore */ }
       port?.postMessage({ resize: { cols: term.cols, rows: term.rows } })
     }
+    // Refit to the pane's own box on ANY size change (window resize, divider
+    // drag, split) — not just window 'resize' — so xterm always fills its
+    // container and never leaves an unpainted gap.
+    const ro = new ResizeObserver(() => sendResize())
+    ro.observe(host)
     const focus = (): void => term.focus()
 
     // The preload bridge re-dispatches this session's MessagePort via
@@ -54,19 +59,18 @@ export function Pane({ session }: { session: string }): JSX.Element {
     }
 
     window.addEventListener('message', onPortMsg)
-    window.addEventListener('resize', sendResize)
     host.addEventListener('click', focus)
     term.focus()
     window.amber.openPane(session)
 
     return () => {
       window.removeEventListener('message', onPortMsg)
-      window.removeEventListener('resize', sendResize)
       host.removeEventListener('click', focus)
+      ro.disconnect()
       port?.close()
       term.dispose()
     }
   }, [session])
 
-  return <div ref={hostRef} style={{ width: '100%', height: '100%' }} />
+  return <div ref={hostRef} style={{ width: '100%', height: '100%', background: '#000' }} />
 }

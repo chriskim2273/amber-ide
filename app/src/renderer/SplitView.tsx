@@ -34,9 +34,9 @@ export function SplitView(props: {
   }
 
   return (
-    <div ref={ref} style={{ position: 'absolute', inset: 0 }}>
+    <div ref={ref} style={{ position: 'absolute', inset: 0, background: '#000' }}>
       {panes.map(({ paneId, rect }) => (
-        <div key={paneId} style={{ position: 'absolute', left: rect.x, top: rect.y, width: rect.w, height: rect.h, overflow: 'hidden' }}>
+        <div key={paneId} style={{ position: 'absolute', left: rect.x, top: rect.y, width: rect.w, height: rect.h, overflow: 'hidden', background: '#000' }}>
           <div style={{ position: 'absolute', top: 2, right: 2, zIndex: 3, display: 'flex', gap: 2 }}>
             <button title="split right" onClick={() => props.onSplit(paneId, 'h')}>⬌</button>
             <button title="split down" onClick={() => props.onSplit(paneId, 'v')}>⬍</button>
