@@ -249,6 +249,33 @@ fn attached_client_receives_exit_when_child_dies() {
 }
 
 #[test]
+fn rename_gets_an_explicit_unsupported_error() {
+    // Rename is deliberately unimplemented (a live claude session's
+    // supervisor is bound to its name); the daemon must say so instead of
+    // silently ignoring the request.
+    let (socket_path, _dir) = start_daemon();
+    let mut stream = connect_with_retry(&socket_path);
+    let mut decoder = Decoder::new();
+
+    send(
+        &mut stream,
+        &Frame::Control(ControlMsg::Rename { from: "a".into(), to: "b".into() }),
+    );
+    let frame = read_frame_until(
+        &mut stream,
+        &mut decoder,
+        |f| matches!(f, Frame::Control(ControlMsg::Error { .. })),
+        Duration::from_secs(5),
+    );
+    match frame {
+        Frame::Control(ControlMsg::Error { msg }) => {
+            assert!(msg.contains("rename"), "unexpected error: {msg}");
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[test]
 fn list_sessions_returns_all_created_names() {
     let (socket_path, _dir) = start_daemon();
     let mut stream = connect_with_retry(&socket_path);

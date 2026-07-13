@@ -238,9 +238,20 @@ fn handle_control(
                 }
             });
         }
-        // Rename/Hello and daemon->client-only variants: no-op for now.
-        // Unknown to us but well-formed; ignore rather than tear down the
-        // connection.
+        ControlMsg::Rename { .. } => {
+            // Deliberately unsupported (not silently ignored): a live claude
+            // session's supervisor is env-bound to its name (`amber run
+            // <name>` / AMBER_SESSION), so renaming would break precise
+            // resume until a supervisor-rebind mechanism exists.
+            let _ = write_frame(
+                writer,
+                &Frame::Control(ControlMsg::Error {
+                    msg: "rename is not supported yet".to_string(),
+                }),
+            );
+        }
+        // Hello and daemon->client-only variants: no-op. Well-formed but
+        // meaningless here; ignore rather than tear down the connection.
         _ => {}
     }
 }
