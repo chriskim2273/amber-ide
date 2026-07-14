@@ -161,9 +161,10 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   (window-listener, mirroring the divider drag), a highlight overlay marks the
   drop zone, edge zones re-split the target (`layout::moveLeaf`) and the center
   zone swaps two panes; `Pane` memoized so drag re-renders don't reconcile
-  terminals. Claude user-quit now drops to a shell: a clean exit OR a ^C
-  (SIGINT) classifies as a user quit in `supervisor.rs`, falling through to the
-  shell fallback instead of closing the pane (only genuine crashes retry).
+  terminals. Claude user-quit now drops to a shell: a clean exit, exit code 130
+  (claude's raw-mode ^C path), OR death by SIGINT all classify as a user quit in
+  `supervisor.rs`, falling through to the shell fallback instead of closing the
+  pane (only genuine crashes retry).
   `moveLeaf` + SIGINT classification unit-tested; renderer typechecks and the
   bundle builds. Still open: the live drag gesture + claude ^C→shell need
   manual verification in the running GUI (renderer-component UI still deferred).

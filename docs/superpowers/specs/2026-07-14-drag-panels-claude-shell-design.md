@@ -27,9 +27,11 @@ closes the pane normally.
 
 ### Behavior
 
-- A **user quit** of claude — clean exit (code 0) **or** death by SIGINT
-  (the terminal delivering ^C when claude is not absorbing it) — must NOT retry
-  and must fall through to `shell_fallback`.
+- A **user quit** of claude — clean exit (code 0), exit **code 130** (claude
+  catches ^C in raw mode with ISIG off, so it exits normally by the shell "^C"
+  convention rather than dying by signal), **or** death by SIGINT — must NOT
+  retry and must fall through to `shell_fallback`. All three are covered so the
+  fix is correct regardless of which one ^C actually produces.
 - A **genuine crash** — other non-zero exit, other signals, or launch failure —
   keeps the existing bounded 3-attempt resume ladder, then falls to shell when
   exhausted (unchanged).
@@ -41,10 +43,11 @@ SIGINT route straight to the shell, so we never relaunch claude on a user quit.
 
 ### Changes (`supervisor.rs`)
 
-- `RunClass`: add a `UserInterrupt` variant for death by signal `SIGINT` (2),
-  distinct from the generic `Signaled`.
-- `classify_run`: when a run is signal-terminated, return `UserInterrupt` for
-  SIGINT, else `Signaled`.
+- `RunClass`: add a `UserInterrupt` variant for a ^C quit — death by signal
+  `SIGINT` (2) or a normal exit with code `130` — distinct from generic
+  `Signaled`/`Nonzero`.
+- `classify_run`: return `UserInterrupt` for SIGINT-signal death and for exit
+  code 130; other signals → `Signaled`, other non-zero → `Nonzero`.
 - Add `RunClass::is_user_quit(self) -> bool` = `Success | UserInterrupt`.
 - `supervise_claude` loop: `if class.is_user_quit() { return Ok(CleanExit) }`
   (replaces `if class.is_success()`). Everything else counts against the retry
@@ -56,7 +59,7 @@ SIGINT route straight to the shell, so we never relaunch claude on a user quit.
 ### Tests (`supervisor.rs` unit tests)
 
 - `classify_run` on a SIGINT wait-status (`ExitStatus::from_raw(2)`) →
-  `UserInterrupt`.
+  `UserInterrupt`; on a code-130 exit (`from_raw(130 << 8)`) → `UserInterrupt`.
 - `classify_run` on another signal (e.g. 9) → `Signaled` (unchanged).
 - `is_user_quit` true for `Success` and `UserInterrupt`, false otherwise.
 - Existing classify/select_start/retry/backoff tests stay green.

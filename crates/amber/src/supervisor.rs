@@ -96,9 +96,11 @@ fn select_start(session_id: Option<&str>, escalation: u32) -> claude::ClaudeStar
 enum RunClass {
     /// Exited 0 (clean exit / user quit).
     Success,
-    /// Killed by SIGINT — the terminal delivered ^C and claude did not absorb
-    /// it. Treated as a deliberate user quit, NOT a crash: no retry, straight
-    /// to the shell fallback (spec §6.2).
+    /// A ^C quit — either death by SIGINT, or (the common case) a normal exit
+    /// with code 130: claude runs in raw mode with ISIG off, so ^C reaches it
+    /// as a byte, not a signal; it handles the quit itself and exits 130 by the
+    /// shell convention. Either way it's a deliberate user quit, NOT a crash:
+    /// no retry, straight to the shell fallback (spec §6.2).
     UserInterrupt,
     /// Exited with a non-zero status code.
     Nonzero,
@@ -120,15 +122,20 @@ impl RunClass {
 fn classify_run(outcome: &std::io::Result<std::process::ExitStatus>) -> RunClass {
     match outcome {
         Ok(status) if status.success() => RunClass::Success,
-        Ok(_status) => {
+        Ok(status) => {
             #[cfg(unix)]
             {
                 use std::os::unix::process::ExitStatusExt;
-                match _status.signal() {
+                match status.signal() {
                     Some(sig) if sig == nix::libc::SIGINT => return RunClass::UserInterrupt,
                     Some(_) => return RunClass::Signaled,
                     None => {}
                 }
+            }
+            // Not signal-terminated, so a real exit code is present. 130 is the
+            // shell convention for "terminated by ^C" — claude's own quit path.
+            if matches!(status.code(), Some(130)) {
+                return RunClass::UserInterrupt;
             }
             RunClass::Nonzero
         }
@@ -288,6 +295,17 @@ mod tests {
         let interrupted: std::io::Result<ExitStatus> =
             Ok(ExitStatus::from_raw(nix::libc::SIGINT));
         assert_eq!(classify_run(&interrupted), RunClass::UserInterrupt);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_exit_130_is_user_interrupt() {
+        use std::os::unix::process::ExitStatusExt;
+        // The common ^C path: claude catches ^C in raw mode and exits normally
+        // with code 130 (no signal). Must count as a user quit, not a crash, so
+        // it drops straight to a shell instead of relaunching claude.
+        let code_130: std::io::Result<ExitStatus> = Ok(ExitStatus::from_raw(130 << 8));
+        assert_eq!(classify_run(&code_130), RunClass::UserInterrupt);
     }
 
     #[test]
