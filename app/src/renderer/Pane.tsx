@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { memo, useEffect, useRef } from 'react'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { WebglAddon } from '@xterm/addon-webgl'
@@ -10,7 +10,10 @@ import '@xterm/xterm/css/xterm.css'
 // after each backlog; a live program re-asserts what it needs on redraw.
 const MOUSE_RESET = '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l'
 
-export function Pane({ session, epoch }: { session: string; epoch: number }): JSX.Element {
+// Memoized: SplitView re-renders on every drag-hover mousemove. `session`/
+// `epoch` are primitives, so memo keeps a drag from reconciling every terminal
+// (honors "xterm instances live outside React reconciliation").
+export const Pane = memo(function Pane({ session, epoch }: { session: string; epoch: number }): JSX.Element {
   const hostRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<Terminal | null>(null)
   const fitRef = useRef<FitAddon | null>(null)
@@ -111,4 +114,4 @@ export function Pane({ session, epoch }: { session: string; epoch: number }): JS
   }, [epoch])
 
   return <div ref={hostRef} style={{ width: '100%', height: '100%', background: '#000' }} />
-}
+})

@@ -33,6 +33,43 @@ export function setRatio(n: Node, path: Array<'a' | 'b'>, ratio: number): Node {
     : { ...n, b: setRatio(n.b, rest, ratio) }
 }
 
+export type Zone = 'left' | 'right' | 'top' | 'bottom' | 'center'
+
+/** Move `sourceId` next to (or onto) `targetId` per drop `zone`. The leaf set
+ *  is invariant, so `reconcile` stays a no-op afterward. Edge zones re-split the
+ *  target; `center` swaps the two panes; dropping on itself is a no-op. */
+export function moveLeaf(n: Node, sourceId: string, targetId: string, zone: Zone): Node {
+  if (sourceId === targetId) return n
+  if (zone === 'center') return swapLeaves(n, sourceId, targetId)
+  // Remove the source first, then graft it beside the target (found by paneId,
+  // so the path shift from removal is irrelevant). If the source was the whole
+  // tree there is nothing to move — leave it be.
+  const without = removeLeaf(n, sourceId)
+  if (without === null) return n
+  return graftBeside(without, targetId, sourceId, zone)
+}
+
+function swapLeaves(n: Node, a: string, b: string): Node {
+  if (n.kind === 'leaf') {
+    if (n.paneId === a) return { kind: 'leaf', paneId: b }
+    if (n.paneId === b) return { kind: 'leaf', paneId: a }
+    return n
+  }
+  return { ...n, a: swapLeaves(n.a, a, b), b: swapLeaves(n.b, a, b) }
+}
+
+function graftBeside(n: Node, targetId: string, sourceId: string, zone: Zone): Node {
+  if (n.kind === 'leaf') {
+    if (n.paneId !== targetId) return n
+    const dir: 'h' | 'v' = zone === 'left' || zone === 'right' ? 'h' : 'v'
+    const src: Node = { kind: 'leaf', paneId: sourceId }
+    const tgt: Node = { kind: 'leaf', paneId: targetId }
+    const near = zone === 'left' || zone === 'top' // source on the near side
+    return { kind: 'split', dir, ratio: 0.5, a: near ? src : tgt, b: near ? tgt : src }
+  }
+  return { ...n, a: graftBeside(n.a, targetId, sourceId, zone), b: graftBeside(n.b, targetId, sourceId, zone) }
+}
+
 export function paneRects(n: Node, area: Rect): Array<{ paneId: string; rect: Rect }> {
   if (n.kind === 'leaf') return [{ paneId: n.paneId, rect: area }]
   const [ra, rb] = splitRect(area, n.dir, n.ratio)
