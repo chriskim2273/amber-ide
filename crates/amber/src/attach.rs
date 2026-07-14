@@ -165,6 +165,143 @@ fn scan_prefix(chunk: &[u8], prefix: u8, armed: bool) -> ScanResult {
     out
 }
 
+// ---- session indicator: title + best-effort bottom bar -----------------
+
+/// Terminal decoration for an interactive attach. Both fields are inert off a
+/// tty; the headless tests use [`StatusUi::none`].
+#[derive(Debug, Clone)]
+pub struct StatusUi {
+    /// Set the terminal title (`amber: <name>`) via OSC 2 (push/pop).
+    pub title: bool,
+    /// Reserve the last row for the tmux-style status bar.
+    pub bar: bool,
+    /// Detach-key label shown in the bar (e.g. `Ctrl-b`); `None` omits the hint.
+    pub hint: Option<String>,
+}
+
+impl StatusUi {
+    /// No decoration — raw passthrough, used off a tty and in tests.
+    pub fn none() -> Self {
+        StatusUi { title: false, bar: false, hint: None }
+    }
+}
+
+/// OSC 2 set-title, preceded by XTPUSHTITLE so [`TITLE_POP`] can restore it.
+fn title_set(name: &str) -> String {
+    format!("\x1b[22;2t\x1b]2;amber: {name}\x07")
+}
+/// XTPOPTITLE — restore the title saved by [`title_set`] (ignored if unsupported).
+const TITLE_POP: &str = "\x1b[23;2t";
+
+/// DECSTBM: confine scrolling to rows `1..=bottom`, keeping the bar row clear.
+fn set_scroll_region(bottom: u16) -> String {
+    format!("\x1b[1;{bottom}r")
+}
+/// DECSTBM reset to the full screen.
+const SCROLL_RESET: &str = "\x1b[r";
+
+/// Draw `line` on physical row `row`, preserving the child's cursor (DECSC/DECRC).
+fn draw_bar(row: u16, line: &str) -> String {
+    format!("\x1b7\x1b[{row};1H\x1b[7m{line}\x1b[0m\x1b8")
+}
+/// Erase physical row `row` (used on cleanup), preserving the cursor.
+fn clear_row(row: u16) -> String {
+    format!("\x1b7\x1b[{row};1H\x1b[2K\x1b8")
+}
+
+/// The visible status-bar text: `amber: <name>` plus an optional detach hint,
+/// truncated to `cols` and padded with spaces to exactly `cols` columns (no
+/// escape sequences — the caller wraps it in positioning + SGR). Assumes
+/// single-width ASCII, which the fixed content is.
+fn render_status_line(name: &str, cols: u16, hint: Option<&str>) -> String {
+    let cols = cols as usize;
+    let mut s = format!("amber: {name}");
+    if let Some(h) = hint {
+        s.push_str(&format!(" · {h} d detach"));
+    }
+    let width = s.chars().count();
+    if width > cols {
+        s = s.chars().take(cols).collect();
+    } else {
+        s.push_str(&" ".repeat(cols - width));
+    }
+    s
+}
+
+/// Tracks whether the child is on the alternate screen, by parsing DEC
+/// private-mode set/reset (`ESC [ ? … h|l`) in the *output* stream. Modes
+/// 47 / 1047 / 1049 toggle the alt screen. This is a bounded state machine
+/// (split-safe across `feed` calls), NOT a general terminal emulator — it only
+/// gates whether the bar may draw, so it never paints over a full-screen TUI.
+#[derive(Debug)]
+struct AltScreenTracker {
+    alt: bool,
+    state: AltState,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AltState {
+    Normal,
+    Esc,           // saw ESC
+    Csi,           // saw ESC [
+    Priv(String),  // saw ESC [ ? … , collecting parameter bytes
+}
+
+impl AltScreenTracker {
+    fn new() -> Self {
+        AltScreenTracker { alt: false, state: AltState::Normal }
+    }
+
+    fn is_alt(&self) -> bool {
+        self.alt
+    }
+
+    /// Feed output bytes; returns the alt-screen state after consuming them.
+    fn feed(&mut self, bytes: &[u8]) -> bool {
+        for &b in bytes {
+            self.state = match std::mem::replace(&mut self.state, AltState::Normal) {
+                AltState::Normal if b == 0x1b => AltState::Esc,
+                AltState::Normal => AltState::Normal,
+                AltState::Esc if b == b'[' => AltState::Csi,
+                AltState::Esc if b == 0x1b => AltState::Esc,
+                AltState::Esc => AltState::Normal,
+                AltState::Csi if b == b'?' => AltState::Priv(String::new()),
+                AltState::Csi if b == 0x1b => AltState::Esc,
+                AltState::Csi => AltState::Normal,
+                AltState::Priv(mut params) => {
+                    if b == b'h' || b == b'l' {
+                        if params.split(';').any(|p| matches!(p, "47" | "1047" | "1049")) {
+                            self.alt = b == b'h';
+                        }
+                        AltState::Normal
+                    } else if b.is_ascii_digit() || b == b';' {
+                        params.push(b as char);
+                        AltState::Priv(params)
+                    } else if b == 0x1b {
+                        AltState::Esc
+                    } else {
+                        AltState::Normal
+                    }
+                }
+            };
+        }
+        self.alt
+    }
+}
+
+/// Whether attaching from inside an amber pane should be refused. `Some(msg)`
+/// means refuse (and print `msg`); `None` means proceed. Nesting is refused
+/// when `AMBER_SESSION` is set unless `force` (—force / `AMBER_ALLOW_NEST`).
+pub fn nest_refusal(amber_session: Option<&str>, force: bool) -> Option<String> {
+    match amber_session {
+        Some(s) if !force => Some(format!(
+            "already inside amber session '{s}'; refusing to nest \
+             (use --force or AMBER_ALLOW_NEST=1 to override)"
+        )),
+        _ => None,
+    }
+}
+
 /// Restores the original terminal settings when dropped, even on error or
 /// panic unwind, so a crashing client never leaves the user's shell in raw
 /// mode.
@@ -209,13 +346,22 @@ fn send_control(stream: &UnixStream, msg: ControlMsg) -> anyhow::Result<()> {
 /// Connect to `socket`, attach session `name`, and proxy the terminal until
 /// stdin hits EOF, the socket closes, or the daemon reports the session's
 /// child exited.
-pub fn attach(socket: &Path, name: &str, prefix: Option<u8>) -> anyhow::Result<()> {
+pub fn attach(socket: &Path, name: &str, prefix: Option<u8>, no_status: bool) -> anyhow::Result<()> {
     let stream = UnixStream::connect(socket)?;
 
     let winch = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGWINCH, Arc::clone(&winch))?;
 
     let is_tty = io::stdin().is_terminal();
+
+    // Decoration is meaningful only on a real terminal. Off a tty (pipes,
+    // tests) everything stays raw. The title is always on; the bar is on
+    // unless suppressed with --no-status.
+    let ui = if is_tty {
+        StatusUi { title: true, bar: !no_status, hint: prefix.map(prefix_key_name) }
+    } else {
+        StatusUi::none()
+    };
 
     // Announce the detach key on a real terminal, before entering raw mode so
     // the line renders normally. To stderr, so it never mixes with the
@@ -233,7 +379,7 @@ pub fn attach(socket: &Path, name: &str, prefix: Option<u8>) -> anyhow::Result<(
     // via RAII regardless of how this function returns).
     let raw_guard = if is_tty { Some(RawModeGuard::enable()?) } else { None };
 
-    let end = run_client(&stream, name, io::stdin(), io::stdout(), &winch, prefix);
+    let end = run_client(&stream, name, io::stdin(), io::stdout(), &winch, prefix, &ui);
 
     drop(raw_guard); // leave raw mode before printing any trailer
     match end? {
@@ -256,28 +402,58 @@ pub fn run_client(
     mut stdout: impl Write,
     winch: &AtomicBool,
     prefix: Option<u8>,
+    ui: &StatusUi,
 ) -> anyhow::Result<ClientEnd> {
     send_control(stream, ControlMsg::Attach { name: name.to_string(), raw_client: true })?;
-    let (cols, rows) = current_size();
-    send_control(stream, ControlMsg::Resize { name: name.to_string(), cols, rows })?;
+
+    // Whether the bar can be shown at a given height: it needs the physical
+    // last row plus at least one row for the child.
+    let bar_at = |rows: u16| ui.bar && rows >= 2;
+    let child_rows = |rows: u16| if bar_at(rows) { rows - 1 } else { rows };
+    let bar_line = |cols: u16| render_status_line(name, cols, ui.hint.as_deref());
+
+    let (mut cols, mut rows) = current_size();
+    send_control(
+        stream,
+        ControlMsg::Resize { name: name.to_string(), cols, rows: child_rows(rows) },
+    )?;
 
     // Prefix armed across reads: a prefix byte can be the last byte of one
     // chunk and its command byte the first of the next.
     let mut prefix_armed = false;
+    // Alt-screen state, so the bar never paints over a full-screen TUI.
+    let mut alt = AltScreenTracker::new();
 
     // Reset the local terminal before any replayed backlog can land (spec
     // §5) — see TERM_RESET for the exact sequences and why each is needed.
     stdout.write_all(TERM_RESET)?;
+    if ui.title {
+        stdout.write_all(title_set(name).as_bytes())?;
+    }
+    if bar_at(rows) {
+        stdout.write_all(set_scroll_region(rows - 1).as_bytes())?;
+        stdout.write_all(draw_bar(rows, &bar_line(cols)).as_bytes())?;
+    }
     stdout.flush()?;
 
     let mut decoder = Decoder::new();
     let mut sock_buf = [0u8; 8192];
     let mut stdin_buf = [0u8; 4096];
 
-    loop {
+    let end = 'ev: loop {
         if winch.swap(false, Ordering::Relaxed) {
-            let (cols, rows) = current_size();
-            send_control(stream, ControlMsg::Resize { name: name.to_string(), cols, rows })?;
+            let (c, r) = current_size();
+            cols = c;
+            rows = r;
+            send_control(
+                stream,
+                ControlMsg::Resize { name: name.to_string(), cols, rows: child_rows(rows) },
+            )?;
+            if bar_at(rows) && !alt.is_alt() {
+                stdout.write_all(set_scroll_region(rows - 1).as_bytes())?;
+                stdout.write_all(draw_bar(rows, &bar_line(cols)).as_bytes())?;
+                stdout.flush()?;
+            }
         }
 
         let (stdin_ready, sock_ready) = {
@@ -304,27 +480,44 @@ pub fn run_client(
         if sock_ready {
             let n = { stream }.read(&mut sock_buf)?;
             if n == 0 {
-                return Ok(ClientEnd::SocketClosed);
+                break 'ev ClientEnd::SocketClosed;
             }
             decoder.feed(&sock_buf[..n]);
+            let was_alt = alt.is_alt();
+            let mut exit_code: Option<i32> = None;
             while let Some(frame) = decoder.next_frame()? {
                 match frame {
                     Frame::Data { bytes, .. } => {
+                        alt.feed(&bytes);
                         stdout.write_all(&bytes)?;
-                        stdout.flush()?;
                     }
                     Frame::Control(ControlMsg::Exit { name: ended, code }) if ended == name => {
-                        return Ok(ClientEnd::SessionExit(code));
+                        exit_code = Some(code);
+                        break;
                     }
                     _ => {}
                 }
+            }
+            // Reconcile the bar after this output batch. While the child holds
+            // the alt screen, draw nothing (never paint over a TUI). On
+            // primary, redraw so the bar self-heals if output scrolled it off;
+            // re-assert the scroll region when we've just left the alt screen.
+            if bar_at(rows) && !alt.is_alt() {
+                if was_alt {
+                    stdout.write_all(set_scroll_region(rows - 1).as_bytes())?;
+                }
+                stdout.write_all(draw_bar(rows, &bar_line(cols)).as_bytes())?;
+            }
+            stdout.flush()?;
+            if let Some(code) = exit_code {
+                break 'ev ClientEnd::SessionExit(code);
             }
         }
 
         if stdin_ready {
             let n = stdin.read(&mut stdin_buf)?;
             if n == 0 {
-                return Ok(ClientEnd::StdinEof);
+                break 'ev ClientEnd::StdinEof;
             }
             let chunk = &stdin_buf[..n];
 
@@ -348,10 +541,23 @@ pub fn run_client(
 
             if detach {
                 send_control(stream, ControlMsg::Detach { name: name.to_string() })?;
-                return Ok(ClientEnd::Detached);
+                break 'ev ClientEnd::Detached;
             }
         }
+    };
+
+    // Unwind the terminal decoration on every normal exit path (raw mode is
+    // restored separately by RawModeGuard).
+    if bar_at(rows) {
+        let _ = stdout.write_all(SCROLL_RESET.as_bytes());
+        let _ = stdout.write_all(clear_row(rows).as_bytes());
     }
+    if ui.title {
+        let _ = stdout.write_all(TITLE_POP.as_bytes());
+    }
+    let _ = stdout.flush();
+
+    Ok(end)
 }
 
 #[cfg(test)]
@@ -377,6 +583,10 @@ mod tests {
     }
 
     fn start_client_with(prefix: Option<u8>) -> Harness {
+        start_client_full(prefix, StatusUi::none())
+    }
+
+    fn start_client_full(prefix: Option<u8>, ui: StatusUi) -> Harness {
         let (client_sock, server) = UnixStream::pair().unwrap();
         let (stdin_feeder, stdin_read) = UnixStream::pair().unwrap();
         let winch = Arc::new(AtomicBool::new(false));
@@ -385,7 +595,7 @@ mod tests {
             let winch = Arc::clone(&winch);
             std::thread::spawn(move || {
                 let mut out = Vec::new();
-                let end = run_client(&client_sock, "s", stdin_read, &mut out, &winch, prefix);
+                let end = run_client(&client_sock, "s", stdin_read, &mut out, &winch, prefix, &ui);
                 let _ = tx.send((end, out));
             });
         }
@@ -665,5 +875,96 @@ mod tests {
         drop(h.stdin_feeder);
         let (end, _) = h.done.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(end.unwrap(), ClientEnd::StdinEof);
+    }
+
+    // ---- session indicator: pure helpers --------------------------------
+
+    #[test]
+    fn render_status_line_pads_and_truncates() {
+        // Padded to exactly `cols`.
+        let line = render_status_line("work", 30, Some("Ctrl-b"));
+        assert_eq!(line.chars().count(), 30);
+        assert!(line.starts_with("amber: work · Ctrl-b d detach"));
+        // No hint -> just the name, still padded.
+        let plain = render_status_line("work", 20, None);
+        assert_eq!(plain.chars().count(), 20);
+        assert!(plain.starts_with("amber: work"));
+        // Overflow is truncated to `cols` (never wider).
+        let narrow = render_status_line("a-very-long-session-name", 10, Some("Ctrl-b"));
+        assert_eq!(narrow.chars().count(), 10);
+        assert_eq!(narrow, "amber: a-v");
+    }
+
+    #[test]
+    fn alt_screen_tracker_toggles_on_relevant_modes() {
+        let mut t = AltScreenTracker::new();
+        assert!(!t.is_alt());
+        assert!(t.feed(b"\x1b[?1049h")); // enter alt
+        assert!(t.is_alt());
+        assert!(!t.feed(b"\x1b[?1049l")); // leave alt
+        assert!(!t.is_alt());
+        // Combined params (mode 1049 alongside another) still toggles.
+        assert!(t.feed(b"\x1b[?1;1049h"));
+        // Legacy 47 / 1047 recognized too.
+        assert!(!t.feed(b"\x1b[?1047l"));
+        // An unrelated private mode (cursor visibility 25) does NOT toggle.
+        t.feed(b"\x1b[?25h");
+        assert!(!t.is_alt());
+    }
+
+    #[test]
+    fn alt_screen_tracker_handles_split_sequences() {
+        let mut t = AltScreenTracker::new();
+        // The enter-alt sequence arrives in three separate feeds.
+        t.feed(b"\x1b[?10");
+        t.feed(b"49");
+        assert!(t.feed(b"h"));
+        assert!(t.is_alt());
+    }
+
+    #[test]
+    fn nest_refusal_gates_on_env_and_force() {
+        assert!(nest_refusal(None, false).is_none());
+        assert!(nest_refusal(Some("work"), false).is_some());
+        // --force / AMBER_ALLOW_NEST overrides.
+        assert!(nest_refusal(Some("work"), true).is_none());
+    }
+
+    // ---- session indicator: through the client event loop ---------------
+
+    #[test]
+    fn bar_reserves_a_row_in_the_initial_resize() {
+        // With the bar enabled the child must be sized one row short so the
+        // physical last row is free for the bar. current_size() falls back to
+        // 80x24 off a tty, so the reserved Resize carries rows = 23.
+        let ui = StatusUi { title: true, bar: true, hint: Some("Ctrl-b".into()) };
+        let mut h = start_client_full(Some(DEFAULT_PREFIX), ui);
+        let resize = h.server_read_until(|f| matches!(f, Frame::Control(ControlMsg::Resize { .. })));
+        match resize {
+            Frame::Control(ControlMsg::Resize { rows, .. }) => assert_eq!(rows, 23),
+            other => panic!("expected Resize, got {other:?}"),
+        }
+        drop(h.server);
+        let _ = h.done.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+
+    #[test]
+    fn no_bar_uses_full_height_and_resets_scroll_region_only_when_barred() {
+        // Without the bar the child gets the full height (rows = 24), and the
+        // cleanup on exit must NOT emit a scroll-region reset (nothing to undo).
+        let mut h = start_client_full(Some(DEFAULT_PREFIX), StatusUi::none());
+        let resize = h.server_read_until(|f| matches!(f, Frame::Control(ControlMsg::Resize { .. })));
+        match resize {
+            Frame::Control(ControlMsg::Resize { rows, .. }) => assert_eq!(rows, 24),
+            other => panic!("expected Resize, got {other:?}"),
+        }
+        let exit = Frame::Control(ControlMsg::Exit { name: "s".into(), code: 0 });
+        h.server.write_all(&proto::encode(&exit)).unwrap();
+        let (end, out) = h.done.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(end.unwrap(), ClientEnd::SessionExit(0));
+        assert!(
+            !out.windows(SCROLL_RESET.len()).any(|w| w == SCROLL_RESET.as_bytes()),
+            "no-bar attach must not emit a scroll-region reset"
+        );
     }
 }

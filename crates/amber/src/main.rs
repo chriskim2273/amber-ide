@@ -45,6 +45,12 @@ enum Command {
         /// Disable detach-prefix interception; forward stdin fully raw.
         #[arg(long)]
         no_prefix: bool,
+        /// Disable the bottom status bar (the terminal title still shows).
+        #[arg(long)]
+        no_status: bool,
+        /// Attach even when already inside an amber session (allow nesting).
+        #[arg(long)]
+        force: bool,
         #[arg(long)]
         socket: Option<PathBuf>,
     },
@@ -169,8 +175,8 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Daemon { root, socket } => run_daemon(root, socket),
-        Command::Attach { name, no_prefix, socket } => {
-            run_attach(&resolve_socket(socket), name, no_prefix)
+        Command::Attach { name, no_prefix, no_status, force, socket } => {
+            run_attach(&resolve_socket(socket), name, no_prefix, no_status, force)
         }
         Command::Ls { socket } => run_ls(&resolve_socket(socket)),
         Command::Create { name, cwd, kind, socket } => {
@@ -477,7 +483,22 @@ fn run_ls(socket: &Path) -> anyhow::Result<()> {
 /// `amber attach [name]`: resolve the detach prefix (from `--no-prefix` and
 /// `AMBER_PREFIX`) and the target session (the newest live one when no name is
 /// given), then hand off to the raw-mode client.
-fn run_attach(socket: &Path, name: Option<String>, no_prefix: bool) -> anyhow::Result<()> {
+fn run_attach(
+    socket: &Path,
+    name: Option<String>,
+    no_prefix: bool,
+    no_status: bool,
+    force: bool,
+) -> anyhow::Result<()> {
+    // Refuse to nest inside another amber pane unless forced (--force or
+    // AMBER_ALLOW_NEST): two stacked raw streams collide on the detach prefix.
+    let force = force || std::env::var_os("AMBER_ALLOW_NEST").is_some();
+    let amber_session = std::env::var("AMBER_SESSION").ok();
+    if let Some(msg) = attach::nest_refusal(amber_session.as_deref(), force) {
+        eprintln!("[amber] {msg}");
+        std::process::exit(1);
+    }
+
     let env = std::env::var("AMBER_PREFIX").ok();
     let res = attach::resolve_prefix(no_prefix, env.as_deref());
     if let Some(w) = &res.warning {
@@ -487,7 +508,7 @@ fn run_attach(socket: &Path, name: Option<String>, no_prefix: bool) -> anyhow::R
         Some(n) => n,
         None => newest_session_name(socket)?,
     };
-    attach::attach(socket, &name, res.prefix)
+    attach::attach(socket, &name, res.prefix, no_status)
 }
 
 /// Resolve the target for a no-name `amber attach`: the most-recently-updated
