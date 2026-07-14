@@ -1,10 +1,15 @@
 import { ipcRenderer, contextBridge } from 'electron'
-import { homedir } from 'node:os'
+
+// This preload runs SANDBOXED — no node builtins, no `process.env`. Both would
+// throw/return-empty and kill the bridge. Values come from `additionalArguments`
+// (set in main's webPreferences), read here off `process.argv`.
+const argv = process.argv
+const homeArg = argv.find((a) => a.startsWith('--amber-home='))?.slice('--amber-home='.length)
 
 contextBridge.exposeInMainWorld('amber', {
   // True when the app was launched with software GL (SwiftShader); the renderer
   // uses this to skip xterm's WebGL addon, which is slow on software GL.
-  softwareGl: !!process.env['AMBER_SOFTWARE_GL'],
+  softwareGl: argv.includes('--amber-software-gl'),
   onDaemonEvent: (cb: (data: unknown) => void) =>
     ipcRenderer.on('daemon-event', (_e, data) => cb(data)),
   openPane: (session: string) => ipcRenderer.send('open-pane', session),
@@ -13,7 +18,7 @@ contextBridge.exposeInMainWorld('amber', {
   killSession: (name: string) => ipcRenderer.send('daemon-command', { cmd: 'kill', name }),
   // Absolute home dir (default cwd for new panes) + a native folder picker so
   // panes carry a real absolute cwd, not a relative '.' that drifts on restore.
-  homeDir: homedir() || process.env['HOME'] || '/',
+  homeDir: homeArg || '/',
   pickFolder: (): Promise<string | null> => ipcRenderer.invoke('pick-folder'),
   loadLayout: (): Promise<string | null> => ipcRenderer.invoke('layout-load'),
   saveLayout: (text: string): Promise<void> => ipcRenderer.invoke('layout-save', text),

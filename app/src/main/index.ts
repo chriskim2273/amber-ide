@@ -237,6 +237,15 @@ async function main(): Promise<void> {
       preload: join(__dirname, '../preload/index.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
+      // Keep the preload SANDBOXED (default) for security. A sandboxed preload
+      // has no node builtins and no `process.env`, so the two values it needs
+      // are passed as argv flags (reachable via `process.argv` in sandbox).
+      // Do NOT import `node:os`/read `process.env` in the preload — it throws
+      // before exposeInMainWorld and the whole bridge silently vanishes.
+      additionalArguments: [
+        `--amber-home=${process.env['HOME'] ?? ''}`,
+        ...(process.env['AMBER_SOFTWARE_GL'] ? ['--amber-software-gl'] : []),
+      ],
     },
   })
 
