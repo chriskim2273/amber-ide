@@ -5,6 +5,7 @@ import { paneRects, handles, type Node, type Rect } from './layout'
 export function SplitView(props: {
   tree: Node
   deadCodes: Record<string, number>
+  epoch: number
   onSetRatio: (path: Array<'a' | 'b'>, ratio: number) => void
   onSplit: (paneId: string, dir: 'h' | 'v') => void
   onClose: (paneId: string) => void
@@ -44,7 +45,7 @@ export function SplitView(props: {
           </div>
           {props.deadCodes[paneId] !== undefined &&
             <div style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,.6)', color: '#fff', zIndex: 2, padding: 8 }}>exited {props.deadCodes[paneId]}</div>}
-          <Pane session={paneId} />
+          <Pane session={paneId} epoch={props.epoch} />
         </div>
       ))}
       {hs.map((h, i) => (

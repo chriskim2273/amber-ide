@@ -44,6 +44,10 @@ function App(): JSX.Element {
   // an empty layout (equal-columns 'h' fallback) and overwrite the real,
   // possibly-vertical saved tree before we ever read it.
   const [loaded, setLoaded] = useState(false)
+  // Bumped on each daemon reconnect (disconnected -> connected edge) so panes
+  // can re-run their attach fixups (mouse-mode reset, TUI repaint nudge).
+  const [reconnectEpoch, setReconnectEpoch] = useState(0)
+  const prevConnected = useRef(true)
   // Splits whose session was requested but hasn't materialized yet. Held out of
   // reconcile so it can't prune/re-append them as columns; placed with the
   // requested direction once the daemon confirms the session exists.
@@ -64,6 +68,12 @@ function App(): JSX.Element {
       setLoaded(true)
     })
   }, [bridgeReady])
+
+  // Detect the disconnected -> connected edge and bump the reconnect epoch.
+  useEffect(() => {
+    if (connected && !prevConnected.current) setReconnectEpoch((e) => e + 1)
+    prevConnected.current = connected
+  }, [connected])
 
   // Debounced persist whenever the layout changes — only after the sidecar loaded.
   useEffect(() => {
@@ -149,7 +159,7 @@ function App(): JSX.Element {
       </div>
       <div style={{ flex: 1, position: 'relative' }}>
         {tree
-          ? <SplitView tree={tree} deadCodes={deadCodes}
+          ? <SplitView tree={tree} deadCodes={deadCodes} epoch={reconnectEpoch}
               onSetRatio={(path, r) => putTree(setRatio(tree, path, r))}
               onSplit={(paneId, dir) => {
                 const name = formatName({ ws: activeWs, tab: tab!.tab, ord: nextOrd, id: makeId() })
