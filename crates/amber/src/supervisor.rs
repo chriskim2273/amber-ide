@@ -32,9 +32,27 @@ pub fn supervise_claude(
 ) -> anyhow::Result<SuperviseOutcome> {
     let store = StateStore::new(root);
     let mut attempts = 0u32;
+    // Escalation within a run of the SAME recorded id: Resume -> Continue ->
+    // Fresh. Reset whenever the recorded id changes (e.g. the hook records a
+    // new id after a fresh start), so a crash then resumes the new id rather
+    // than continuing to escalate.
+    let mut escalation = 0u32;
+    let mut prev_id: Option<String> = None;
     loop {
         let session_id = store.read_claude(name)?.map(|m| m.session_id);
-        let argv = claude::claude_argv(session_id.as_deref(), settings);
+        if session_id != prev_id {
+            escalation = 0;
+            prev_id = session_id.clone();
+        }
+        let start = match (&session_id, escalation) {
+            // Recorded id -> Resume it; on failure fall straight to Fresh. NOT
+            // --continue: it resumes the most recent conversation in the cwd,
+            // which can hijack an UNRELATED one (e.g. a separate `claude` run in
+            // the same dir). A stale/empty id should start a clean conversation.
+            (Some(id), 0) => claude::ClaudeStart::Resume(id.clone()),
+            _ => claude::ClaudeStart::Fresh,
+        };
+        let argv = claude::claude_argv(&start, settings);
 
         // A failure to even launch the child (e.g. a transient ETXTBSY while
         // the binary is being replaced) is treated the same as a crash: it
@@ -54,6 +72,7 @@ pub fn supervise_claude(
         }
 
         attempts += 1;
+        escalation += 1;
         if attempts >= max_attempts {
             return Ok(SuperviseOutcome::Exhausted);
         }
@@ -87,6 +106,10 @@ pub fn run_session(root: &Path, name: &str) -> anyhow::Result<()> {
         .unwrap_or(std::env::current_dir()?);
 
     if let Some(claude_path) = claude_path {
+        // A detached claude blocks forever on the interactive folder-trust
+        // prompt for an untrusted cwd (never starting the session / recording
+        // the resume id). Pre-accept trust for this cwd.
+        claude::ensure_cwd_trusted(&cwd);
         let current_exe = std::env::current_exe()?;
         let hook_command = format!("{} hook", current_exe.display());
         let settings = claude::write_settings(root, name, &hook_command)?;

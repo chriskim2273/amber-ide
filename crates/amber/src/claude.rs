@@ -9,17 +9,28 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use amber_core::state::{ClaudeMeta, StateStore};
 
-/// Build claude's argument vector (excluding the program itself). Resumes a
-/// recorded conversation when `session_id` is known, else continues the most
-/// recent one in the cwd.
-pub fn claude_argv(session_id: Option<&str>, settings_path: &Path) -> Vec<String> {
+/// How to start `claude`: resume a specific recorded conversation, continue the
+/// most recent one in the cwd, or start a brand-new one. A never-run session
+/// must start `Fresh` — `--continue` on it prints "No conversation to continue"
+/// and exits, which would burn the supervisor's retry budget.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaudeStart {
+    Resume(String),
+    Continue,
+    Fresh,
+}
+
+/// Build claude's argument vector (excluding the program itself) for the given
+/// start mode.
+pub fn claude_argv(start: &ClaudeStart, settings_path: &Path) -> Vec<String> {
     let mut argv = vec!["--dangerously-skip-permissions".to_string()];
-    match session_id {
-        Some(id) => {
+    match start {
+        ClaudeStart::Resume(id) => {
             argv.push("--resume".to_string());
-            argv.push(id.to_string());
+            argv.push(id.clone());
         }
-        None => argv.push("--continue".to_string()),
+        ClaudeStart::Continue => argv.push("--continue".to_string()),
+        ClaudeStart::Fresh => {}
     }
     argv.push("--settings".to_string());
     argv.push(settings_path.to_string_lossy().to_string());
@@ -108,6 +119,103 @@ pub fn resolve_claude() -> Option<PathBuf> {
     resolve_claude_with(&shell, true, &[])
 }
 
+/// Pre-accept claude's interactive folder-trust dialog for `cwd`. A claude
+/// session runs detached in the daemon's pty with no client necessarily
+/// attached; an untrusted cwd makes claude block forever on the "trust this
+/// folder?" prompt, so the session never starts and its SessionStart hook never
+/// records the resume id. Setting `projects.<cwd>.hasTrustDialogAccepted=true`
+/// in `~/.claude.json` is exactly what accepting the dialog does. Best-effort:
+/// any failure leaves claude to prompt as usual.
+pub fn ensure_cwd_trusted(cwd: &Path) {
+    if let Ok(home) = std::env::var("HOME") {
+        trust_cwd_in(&PathBuf::from(home).join(".claude.json"), cwd);
+    }
+}
+
+/// Ensure a GLOBAL claude `SessionStart` hook running `hook_command` exists in
+/// `~/.claude/settings.json`, so a claude the user starts by hand inside an
+/// amber shell also records its resume id (the per-session `--settings` hook
+/// only covers amber-launched claude). Idempotent and merge-preserving.
+pub fn ensure_global_claude_hook(hook_command: &str) {
+    if let Ok(home) = std::env::var("HOME") {
+        add_global_hook_in(&PathBuf::from(home).join(".claude").join("settings.json"), hook_command);
+    }
+}
+
+fn add_global_hook_in(config: &Path, hook_command: &str) {
+    let mut root: serde_json::Value = std::fs::read_to_string(config)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    let hooks = root
+        .as_object_mut()
+        .unwrap()
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}));
+    if !hooks.is_object() {
+        *hooks = serde_json::json!({});
+    }
+    let ss = hooks
+        .as_object_mut()
+        .unwrap()
+        .entry("SessionStart")
+        .or_insert_with(|| serde_json::json!([]));
+    if !ss.is_array() {
+        *ss = serde_json::json!([]);
+    }
+    let arr = ss.as_array_mut().unwrap();
+
+    // Already installed? Don't duplicate.
+    let present = arr.iter().any(|group| {
+        group
+            .get("hooks")
+            .and_then(|h| h.as_array())
+            .map(|hs| hs.iter().any(|h| h.get("command").and_then(|c| c.as_str()) == Some(hook_command)))
+            .unwrap_or(false)
+    });
+    if present {
+        return;
+    }
+    arr.push(serde_json::json!({ "hooks": [ { "type": "command", "command": hook_command } ] }));
+
+    if let Some(dir) = config.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(out) = serde_json::to_string_pretty(&root) {
+        let tmp = config.with_extension("json.amber-tmp");
+        if std::fs::write(&tmp, out).is_ok() {
+            let _ = std::fs::rename(&tmp, config);
+        }
+    }
+}
+
+fn trust_cwd_in(config: &Path, cwd: &Path) {
+    let Ok(text) = std::fs::read_to_string(config) else { return };
+    let Ok(mut root) = serde_json::from_str::<serde_json::Value>(&text) else { return };
+    if !root.get("projects").map(|p| p.is_object()).unwrap_or(false) {
+        root["projects"] = serde_json::json!({});
+    }
+    let key = cwd.to_string_lossy().to_string();
+    let projects = root["projects"].as_object_mut().expect("projects is an object");
+    let entry = projects.entry(key).or_insert_with(|| serde_json::json!({}));
+    if !entry.is_object() {
+        *entry = serde_json::json!({});
+    }
+    // Already trusted -> don't rewrite (avoids clobbering claude's own writes).
+    if entry.get("hasTrustDialogAccepted").and_then(|v| v.as_bool()) == Some(true) {
+        return;
+    }
+    entry["hasTrustDialogAccepted"] = serde_json::Value::Bool(true);
+    if let Ok(out) = serde_json::to_string(&root) {
+        let tmp = config.with_extension("json.amber-tmp");
+        if std::fs::write(&tmp, &out).is_ok() {
+            let _ = std::fs::rename(&tmp, config);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,8 +224,8 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn argv_resumes_when_session_id_present() {
-        let argv = claude_argv(Some("sid-123"), Path::new("/s/set.json"));
+    fn argv_resumes_a_recorded_id() {
+        let argv = claude_argv(&ClaudeStart::Resume("sid-123".into()), Path::new("/s/set.json"));
         assert_eq!(argv[0], "--dangerously-skip-permissions");
         assert!(argv.iter().any(|a| a == "--resume"));
         assert!(argv.iter().any(|a| a == "sid-123"));
@@ -127,10 +235,19 @@ mod tests {
     }
 
     #[test]
-    fn argv_continues_when_no_session_id() {
-        let argv = claude_argv(None, Path::new("/s/set.json"));
+    fn argv_continue_mode() {
+        let argv = claude_argv(&ClaudeStart::Continue, Path::new("/s/set.json"));
         assert!(argv.iter().any(|a| a == "--continue"));
         assert!(!argv.iter().any(|a| a == "--resume"));
+    }
+
+    #[test]
+    fn argv_fresh_has_no_resume_or_continue() {
+        // A brand-new session must start clean: no --resume and no --continue.
+        let argv = claude_argv(&ClaudeStart::Fresh, Path::new("/s/set.json"));
+        assert!(!argv.iter().any(|a| a == "--continue"));
+        assert!(!argv.iter().any(|a| a == "--resume"));
+        assert!(argv.iter().any(|a| a == "--settings"));
     }
 
     #[test]
@@ -179,6 +296,68 @@ mod tests {
         let resolved =
             resolve_claude_with("sh", false, &[("PATH".to_string(), path_env)]).unwrap();
         assert_eq!(resolved, fake);
+    }
+
+    #[test]
+    fn trust_cwd_sets_flag_and_preserves_other_config() {
+        let dir = tempdir().unwrap();
+        let config = dir.path().join(".claude.json");
+        std::fs::write(
+            &config,
+            r#"{"numStartups":5,"projects":{"/existing":{"hasTrustDialogAccepted":true}}}"#,
+        )
+        .unwrap();
+        trust_cwd_in(&config, Path::new("/home/u/proj"));
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
+        assert_eq!(v["projects"]["/home/u/proj"]["hasTrustDialogAccepted"], serde_json::json!(true));
+        // Unrelated keys and existing projects survive the rewrite.
+        assert_eq!(v["numStartups"], serde_json::json!(5));
+        assert_eq!(v["projects"]["/existing"]["hasTrustDialogAccepted"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn global_hook_merges_preserves_and_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let config = dir.path().join("settings.json");
+        std::fs::write(
+            &config,
+            r#"{"theme":"dark","hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"other"}]}]}}"#,
+        )
+        .unwrap();
+        add_global_hook_in(&config, "/x/amber hook");
+        add_global_hook_in(&config, "/x/amber hook"); // idempotent
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
+        assert_eq!(v["theme"], serde_json::json!("dark")); // unrelated key preserved
+        let arr = v["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(arr.len(), 2, "existing hook group preserved, amber added once");
+        let amber = arr
+            .iter()
+            .filter(|g| g["hooks"][0]["command"] == serde_json::json!("/x/amber hook"))
+            .count();
+        assert_eq!(amber, 1, "amber hook present exactly once");
+    }
+
+    #[test]
+    fn global_hook_creates_missing_config() {
+        let dir = tempdir().unwrap();
+        let config = dir.path().join("nested").join("settings.json");
+        add_global_hook_in(&config, "/x/amber hook");
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
+        assert_eq!(
+            v["hooks"]["SessionStart"][0]["hooks"][0]["command"],
+            serde_json::json!("/x/amber hook")
+        );
+    }
+
+    #[test]
+    fn trust_cwd_missing_config_is_a_noop() {
+        let dir = tempdir().unwrap();
+        let config = dir.path().join("absent.json");
+        trust_cwd_in(&config, Path::new("/x")); // must not panic or create
+        assert!(!config.exists());
     }
 
     #[test]

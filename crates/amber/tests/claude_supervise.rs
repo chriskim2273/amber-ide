@@ -44,14 +44,15 @@ fn resume_after_first_run() {
     let cwd = root;
     let settings = root.join("settings.json");
 
-    // First run: no claude/<name>.json yet -> --continue.
+    // First run: no claude/<name>.json yet -> Fresh (a brand-new conversation).
+    // NOT --continue: that would print "No conversation to continue" and fail.
     let outcome =
         supervise_claude(&claude_path, root, "work", cwd, &settings, 3).unwrap();
     assert!(matches!(outcome, SuperviseOutcome::CleanExit));
 
     let lines = log_lines(root);
     assert_eq!(lines.len(), 1);
-    assert!(lines[0].contains("--continue"));
+    assert!(!lines[0].contains("--continue"), "fresh session must not --continue");
     assert!(!lines[0].contains("--resume"));
 
     // Simulate the SessionStart hook recording a rotated session id.

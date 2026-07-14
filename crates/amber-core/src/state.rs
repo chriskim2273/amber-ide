@@ -31,6 +31,11 @@ pub struct SessionMeta {
     pub cwd: PathBuf,
     pub kind: SessionKind,
     pub updated: u64,
+    /// A `Shell` session that was running a hand-started `claude` at snapshot
+    /// time. On restore it is relaunched as a supervised claude (resuming that
+    /// conversation) instead of a bare shell. Defaulted for older records.
+    #[serde(default)]
+    pub resume_as_claude: bool,
 }
 
 /// Metadata for a Claude sub-session, persisted as `claude/<name>.json`.
@@ -227,6 +232,7 @@ mod tests {
             cwd: PathBuf::from("/tmp/proj"),
             kind: SessionKind::Shell,
             updated: 1_700_000_000,
+            resume_as_claude: false,
         }
     }
 

@@ -282,6 +282,11 @@ fn run_supervisor(name: &str) -> anyhow::Result<()> {
 /// are reported to stderr and swallowed (always exit 0).
 fn run_hook() -> anyhow::Result<()> {
     let name = std::env::var("AMBER_SESSION").unwrap_or_default();
+    // No AMBER_SESSION => a claude run outside an amber pane (the global hook
+    // fires for every claude). Nothing to record; exit cleanly.
+    if name.is_empty() {
+        return Ok(());
+    }
     let root = supervisor_root();
 
     let mut input = String::new();
@@ -306,7 +311,14 @@ fn run_daemon(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Result<
     }
 
     let manager = Arc::new(SessionManager::new(&root)?);
+    // Global claude SessionStart hook: lets a hand-started claude in a shell
+    // record its resume id too (best-effort; the per-session hook covers
+    // amber-launched claude).
+    if let Ok(exe) = std::env::current_exe() {
+        claude::ensure_global_claude_hook(&format!("{} hook", exe.display()));
+    }
     manager.restore()?;
+    let watchers = std::sync::Arc::new(amber::watchers::Watchers::new());
 
     // A stale socket file from a previous (crashed/killed) daemon run must
     // not block bind() — but a LIVE daemon's socket must never be stolen.
@@ -315,6 +327,7 @@ fn run_daemon(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Result<
     // Periodic snapshot thread (cadence from config, spec §7).
     {
         let manager = Arc::clone(&manager);
+        let watchers = Arc::clone(&watchers);
         let interval = manager.snapshot_interval_secs().max(1);
         thread::spawn(move || loop {
             thread::sleep(Duration::from_secs(interval));
@@ -322,8 +335,14 @@ fn run_daemon(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Result<
             // dead pane ("child exits -> session ends", spec §6.1).
             match manager.reap() {
                 Ok(reaped) => {
-                    for name in reaped {
-                        eprintln!("amber daemon: session {name} ended; reaped");
+                    if !reaped.is_empty() {
+                        for name in &reaped {
+                            eprintln!("amber daemon: session {name} ended; reaped");
+                        }
+                        watchers.broadcast(&amber_core::proto::ControlMsg::SessionsChanged {
+                            added: vec![],
+                            removed: reaped,
+                        });
                     }
                 }
                 Err(e) => eprintln!("amber daemon: reap failed: {e}"),
@@ -349,7 +368,7 @@ fn run_daemon(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Result<
     }
 
     eprintln!("amber daemon: listening on {}", socket_path.display());
-    let daemon = Daemon::new(manager);
+    let daemon = Daemon::new(Arc::clone(&manager), Arc::clone(&watchers));
     daemon.serve(listener)
 }
 

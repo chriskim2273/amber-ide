@@ -114,8 +114,34 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   release on client disconnect + `Detach`; live-socket steal guard; frame
   length cap; session-name validation; spawn-error child cleanup. `Rename`
   returns an explicit error (unsupported until supervisor rebind exists).
-- [ ] App — the Electron walking skeleton onward. **Separate spec required**
-  before starting; it consumes the daemon socket, it does not reimplement it.
+- [x] App Slice 1 — daemon protocol extension: `SessionInfo`,
+  `WatchSessions`/`ListSessionsDetailed`/`Sessions`/`SessionsChanged`, watcher
+  registry + create/kill/reap broadcast. Spec:
+  `docs/superpowers/specs/2026-07-13-amber-ide-app-design.md`.
+- [x] App Slices 2–3 — Electron walking skeleton: electron-vite + TS strict +
+  React scaffold, byte-compatible `proto.ts`, self-healing daemon boot,
+  multiplexed utilityProcess (`connection`/`router`), per-pane MessagePort
+  brokered main→preload→renderer, `Pane.tsx` xterm+webgl. **Proven end-to-end on
+  a live GUI**: real daemon → utilityProcess → MessagePort → xterm render, and
+  keystrokes → daemon → pty, 1× each direction. Plan:
+  `docs/superpowers/plans/2026-07-13-amber-ide-app-slices-1-3.md`. (Headless
+  proof: `app/test/realDaemon.test.ts`. Env note: kernel 6.17 needs
+  `AMBER_NO_SANDBOX=1 AMBER_SOFTWARE_GL=1` — see the design spec / env memory.)
+- [x] App Slice 4 — reducer (`store`) + `names`; tabbed multi-pane UI; create/kill.
+- [x] App Slice 5 — binary split tree (`layout`) + geometry sidecar
+  (`layoutFile`, atomic IO); interactive split/resize/close; persist + restore.
+- [x] App Slice 6 — workspace switcher; claude panes (`kind=claude`); reconnect
+  (auto-backoff, re-subscribe + reattach, banner). **Full IDE surface working on
+  a live GUI** (kernel-6.17 box needs `AMBER_SOFTWARE_GL=1 AMBER_NO_SANDBOX=1`).
+  Fixes shipped: claude fresh-start for new sessions; deferred split placement;
+  per-pane ResizeObserver; DOM renderer under software GL; layout-load gate.
+- [x] App Slice 7 — packaging: electron-builder (AppImage/dmg), bundled `amber`
+  resolver, `scripts/dist.sh`. **AppImage built with amber bundled.** Packaged
+  first-run does a cargo-free install (copies amber to `~/.local/bin/amber` +
+  writes the systemd user unit directly — the ephemeral AppImage mount can't
+  back a boot unit). macOS launchd-agent install + running the installed app
+  end-to-end (needs the user's normal-hardware machine; this box's kernel 6.17
+  forces the software-GL flags) remain to verify.
 
 ## Gotchas (learned)
 

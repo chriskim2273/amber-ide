@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use amber_core::proto::SessionInfo;
 use amber_core::state::{Config, SessionKind, SessionMeta, StateStore};
 use portable_pty::CommandBuilder;
 
@@ -14,6 +15,35 @@ use crate::pty::PtySession;
 
 const DEFAULT_ROWS: u16 = 24;
 const DEFAULT_COLS: u16 = 80;
+
+/// The user's login-shell PATH, captured ONCE per process (it doesn't change).
+/// Computing it per-manager would spawn a login shell on every `new()`, which
+/// under the parallel test run overloads fork/exec.
+fn login_path() -> Option<&'static String> {
+    static LOGIN_PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    LOGIN_PATH.get_or_init(capture_login_path).as_ref()
+}
+
+/// Capture the user's login-shell PATH so spawned panes resolve tools (nvm/node,
+/// ~/.local/bin, …) that the daemon's minimal systemd PATH lacks — otherwise a
+/// pane's programs and claude's own hooks (which run `node`) fail.
+fn capture_login_path() -> Option<String> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let out = std::process::Command::new(&shell)
+        .arg("-lic")
+        .arg("printf %s \"$PATH\"")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if path.is_empty() {
+        None
+    } else {
+        Some(path)
+    }
+}
 
 pub struct SessionManager {
     store: StateStore,
@@ -71,6 +101,22 @@ impl SessionManager {
             .unwrap_or(0)
     }
 
+    /// Resolve a session cwd to a STABLE absolute directory. A relative cwd
+    /// (e.g. `.`) would resolve against whatever dir the daemon happened to be
+    /// launched from — which differs between a hand-started daemon and the
+    /// systemd unit — so `claude --resume <id>` (conversations are scoped by
+    /// project cwd) breaks after a reboot. Relative or missing dirs fall back
+    /// to `$HOME` (also the constitution's "dir no longer exists" rule).
+    fn resolve_cwd(cwd: &Path) -> PathBuf {
+        if cwd.is_absolute() && cwd.is_dir() {
+            cwd.to_path_buf()
+        } else {
+            std::env::var("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("/"))
+        }
+    }
+
     /// The command a session of `kind` runs. `Shell` spawns the user's shell
     /// directly; `Claude` spawns this same binary as `amber run <name>`,
     /// which supervises the real `claude --resume/--continue` process (and
@@ -81,6 +127,11 @@ impl SessionManager {
                 let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
                 let mut cmd = CommandBuilder::new(shell);
                 cmd.cwd(cwd);
+                // A claude the user starts by hand in this shell inherits these,
+                // so the global SessionStart hook can record its resume id
+                // against this session name.
+                cmd.env("AMBER_SESSION", name);
+                cmd.env("AMBER_STATE_DIR", self.root.to_string_lossy().to_string());
                 Ok(cmd)
             }
             SessionKind::Claude => {
@@ -95,7 +146,18 @@ impl SessionManager {
     }
 
     fn spawn(&self, kind: SessionKind, name: &str, cwd: &Path) -> anyhow::Result<Arc<PtySession>> {
-        let cmd = self.command_for(kind, name, cwd)?;
+        let cwd = Self::resolve_cwd(cwd);
+        let mut cmd = self.command_for(kind, name, &cwd)?;
+        // The daemon may run under systemd, which has no TERM — without a
+        // color-capable terminal, claude (and any colored program) renders
+        // monochrome. Force one on the pty regardless of the daemon's own env.
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
+        // Give panes the user's login PATH so their tools + claude's hooks
+        // (node) resolve, not just the daemon's minimal systemd PATH.
+        if let Some(path) = login_path() {
+            cmd.env("PATH", path);
+        }
         Ok(Arc::new(PtySession::spawn(
             cmd,
             DEFAULT_ROWS,
@@ -112,13 +174,16 @@ impl SessionManager {
         kind: SessionKind,
     ) -> anyhow::Result<Arc<PtySession>> {
         Self::validate_name(name)?;
-        let cwd = cwd.into();
+        // Store an absolute, stable cwd (not a relative `.`) so claude resume
+        // works across daemon restarts / reboots regardless of launch context.
+        let cwd = Self::resolve_cwd(&cwd.into());
         let sess = self.spawn(kind, name, &cwd)?;
         let meta = SessionMeta {
             name: name.to_string(),
             cwd,
             kind,
             updated: Self::now(),
+            resume_as_claude: false,
         };
         if let Err(e) = self.store.write_session(&meta) {
             // Don't leak the freshly-spawned child if persisting fails.
@@ -137,8 +202,34 @@ impl SessionManager {
         let sessions = self.sessions.lock().unwrap();
         for (name, sess) in sessions.iter() {
             self.store.write_scrollback(name, &sess.scrollback())?;
+            self.persist_live_cwd(name, sess);
         }
         Ok(())
+    }
+
+    /// Persist a Shell session's live working directory so an in-shell `cd`
+    /// survives restart (the shell respawns where the user left it, not its
+    /// original cwd). Read from the child's `/proc/<pid>/cwd`. Claude sessions
+    /// are left alone — their cwd is the authoritative, pre-trusted folder the
+    /// pane was created in, which `amber run` never `cd`s out of.
+    fn persist_live_cwd(&self, name: &str, sess: &PtySession) {
+        let Ok(Some(meta)) = self.store.read_session(name) else { return };
+        if meta.kind != SessionKind::Shell {
+            return;
+        }
+        let new_cwd = sess.live_cwd().filter(|d| d.is_dir()).unwrap_or_else(|| meta.cwd.clone());
+        // Was the user running claude by hand in this shell? If so, restore it as
+        // a resumable claude instead of a bare shell.
+        let new_resume = sess.is_running_claude();
+        if new_cwd != meta.cwd || new_resume != meta.resume_as_claude {
+            let updated = SessionMeta {
+                cwd: new_cwd,
+                resume_as_claude: new_resume,
+                updated: Self::now(),
+                ..meta
+            };
+            let _ = self.store.write_session(&updated);
+        }
     }
 
     /// Recreate every persisted session, seeding its ring with saved scrollback.
@@ -146,7 +237,11 @@ impl SessionManager {
         let metas = self.store.list_sessions()?;
         let mut sessions = self.sessions.lock().unwrap();
         for meta in metas {
-            let sess = self.spawn(meta.kind, &meta.name, &meta.cwd)?;
+            // A shell that was running a hand-started claude comes back as a
+            // supervised, resumable claude (which falls back to a shell when
+            // claude exits — so the pane never regresses).
+            let kind = if meta.resume_as_claude { SessionKind::Claude } else { meta.kind };
+            let sess = self.spawn(kind, &meta.name, &meta.cwd)?;
             if let Some(bytes) = self.store.read_scrollback(&meta.name)? {
                 sess.preload(&bytes);
             }
@@ -163,6 +258,30 @@ impl SessionManager {
         let mut v: Vec<String> = self.sessions.lock().unwrap().keys().cloned().collect();
         v.sort();
         v
+    }
+
+    /// One [`SessionInfo`] per live session, joining the live table (existence
+    /// + liveness) with the persisted metadata (cwd/kind). Sorted by name.
+    pub fn session_infos(&self) -> anyhow::Result<Vec<SessionInfo>> {
+        let sessions = self.sessions.lock().unwrap();
+        let mut infos: Vec<SessionInfo> = self
+            .store
+            .list_sessions()?
+            .into_iter()
+            .filter_map(|meta| {
+                sessions.get(&meta.name).map(|sess| SessionInfo {
+                    name: meta.name.clone(),
+                    cwd: meta.cwd.to_string_lossy().into_owned(),
+                    kind: match meta.kind {
+                        SessionKind::Shell => "shell".to_string(),
+                        SessionKind::Claude => "claude".to_string(),
+                    },
+                    alive: sess.is_alive(),
+                })
+            })
+            .collect();
+        infos.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(infos)
     }
 
     pub fn write(&self, name: &str, bytes: &[u8]) -> anyhow::Result<()> {
@@ -212,6 +331,23 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn session_infos_projects_metadata_for_live_sessions() {
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        mgr.create("amber-1-1-0-a", "/tmp", SessionKind::Shell).unwrap();
+        mgr.create("amber-1-1-1-b", dir.path(), SessionKind::Claude).unwrap();
+
+        let mut infos = mgr.session_infos().unwrap();
+        infos.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(infos.len(), 2);
+        assert_eq!(infos[0].name, "amber-1-1-0-a");
+        assert_eq!(infos[0].kind, "shell");
+        assert_eq!(infos[0].cwd, "/tmp");
+        assert!(infos[0].alive);
+        assert_eq!(infos[1].kind, "claude");
+    }
+
+    #[test]
     fn create_rejects_names_that_escape_the_state_dir() {
         // Session names become file paths (`sessions/<name>.json`,
         // `scrollback/<name>.bin`); a hostile name must never write outside
@@ -229,6 +365,42 @@ mod tests {
             !dir.path().parent().unwrap().join("evil.json").exists(),
             "traversal name escaped the state dir"
         );
+    }
+
+    #[test]
+    fn snapshot_persists_a_shells_live_cwd_after_cd() {
+        // A `cd` inside a shell must survive restart: snapshot reads the child's
+        // live /proc/<pid>/cwd and updates the stored cwd.
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        mgr.create("sh", "/tmp", SessionKind::Shell).unwrap();
+        let sess = mgr.session("sh").unwrap();
+
+        let target = std::fs::canonicalize(dir.path()).unwrap();
+        sess.write(format!("cd '{}'\n", target.display()).as_bytes()).unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while sess.live_cwd() != Some(target.clone()) {
+            assert!(std::time::Instant::now() < deadline, "shell never cd'd");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        mgr.snapshot().unwrap();
+        let meta = mgr.store.read_session("sh").unwrap().unwrap();
+        assert_eq!(meta.cwd, target, "snapshot did not capture the cd'd dir");
+    }
+
+    #[test]
+    fn create_stores_absolute_cwd_for_relative_input() {
+        // A relative `.` would resolve against the daemon's launch dir (which
+        // differs between hand-start and systemd), breaking claude resume.
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        mgr.create("amber-1-1-0-a", ".", SessionKind::Shell).unwrap();
+        let cwd = mgr.session_infos().unwrap()[0].cwd.clone();
+        let home = std::env::var("HOME").unwrap_or_default();
+        assert_eq!(cwd, home, "'.' must resolve to an absolute, stable $HOME");
+        assert!(Path::new(&cwd).is_absolute());
     }
 
     #[test]

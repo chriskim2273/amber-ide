@@ -28,11 +28,12 @@ type Subscriptions = Vec<(String, Arc<PtySession>, u64)>;
 /// never stops the accept loop.
 pub struct Daemon {
     manager: Arc<SessionManager>,
+    watchers: Arc<crate::watchers::Watchers>,
 }
 
 impl Daemon {
-    pub fn new(manager: Arc<SessionManager>) -> Self {
-        Daemon { manager }
+    pub fn new(manager: Arc<SessionManager>, watchers: Arc<crate::watchers::Watchers>) -> Self {
+        Daemon { manager, watchers }
     }
 
     /// Accept loop. Runs until the listener itself errors (e.g. the socket
@@ -43,8 +44,9 @@ impl Daemon {
             match conn {
                 Ok(stream) => {
                     let manager = Arc::clone(&self.manager);
+                    let watchers = Arc::clone(&self.watchers);
                     thread::spawn(move || {
-                        if let Err(e) = handle_connection(manager, stream) {
+                        if let Err(e) = handle_connection(manager, watchers, stream) {
                             eprintln!("amber daemon: connection error: {e}");
                         }
                     });
@@ -95,10 +97,14 @@ fn parse_kind(kind: &str) -> anyhow::Result<SessionKind> {
 
 /// Per-connection loop: decode frames from the read half, dispatch each one,
 /// and reply/forward via the shared write half.
-fn handle_connection(manager: Arc<SessionManager>, stream: UnixStream) -> anyhow::Result<()> {
+fn handle_connection(
+    manager: Arc<SessionManager>,
+    watchers: Arc<crate::watchers::Watchers>,
+    stream: UnixStream,
+) -> anyhow::Result<()> {
     let writer: SharedWriter = Arc::new(Mutex::new(stream.try_clone()?));
     let mut subscriptions: Subscriptions = Vec::new();
-    let result = connection_loop(&manager, &writer, stream, &mut subscriptions);
+    let result = connection_loop(&manager, &watchers, &writer, stream, &mut subscriptions);
     // However the connection ended, release every subscription it held.
     for (_, sess, id) in subscriptions {
         sess.unsubscribe(id);
@@ -108,6 +114,7 @@ fn handle_connection(manager: Arc<SessionManager>, stream: UnixStream) -> anyhow
 
 fn connection_loop(
     manager: &Arc<SessionManager>,
+    watchers: &Arc<crate::watchers::Watchers>,
     writer: &SharedWriter,
     mut read_half: UnixStream,
     subscriptions: &mut Subscriptions,
@@ -117,7 +124,7 @@ fn connection_loop(
 
     loop {
         while let Some(frame) = decoder.next_frame()? {
-            handle_frame(manager, writer, frame, subscriptions);
+            handle_frame(manager, watchers, writer, frame, subscriptions);
         }
         let n = read_half.read(&mut buf)?;
         if n == 0 {
@@ -129,12 +136,13 @@ fn connection_loop(
 
 fn handle_frame(
     manager: &Arc<SessionManager>,
+    watchers: &Arc<crate::watchers::Watchers>,
     writer: &SharedWriter,
     frame: Frame,
     subscriptions: &mut Subscriptions,
 ) {
     match frame {
-        Frame::Control(msg) => handle_control(manager, writer, msg, subscriptions),
+        Frame::Control(msg) => handle_control(manager, watchers, writer, msg, subscriptions),
         Frame::Data { session, bytes } => {
             // Input from the client: forward to the child's stdin. A stale
             // session name is not fatal to the connection.
@@ -145,6 +153,7 @@ fn handle_frame(
 
 fn handle_control(
     manager: &Arc<SessionManager>,
+    watchers: &Arc<crate::watchers::Watchers>,
     writer: &SharedWriter,
     msg: ControlMsg,
     subscriptions: &mut Subscriptions,
@@ -152,11 +161,21 @@ fn handle_control(
     match msg {
         ControlMsg::Create { name, cwd, kind } => {
             let result = parse_kind(&kind).and_then(|k| manager.create(&name, cwd, k));
-            let reply = match result {
-                Ok(_) => ControlMsg::Created { name },
+            let reply = match &result {
+                Ok(_) => ControlMsg::Created { name: name.clone() },
                 Err(e) => ControlMsg::Error { msg: e.to_string() },
             };
             let _ = write_frame(writer, &Frame::Control(reply));
+            if result.is_ok() {
+                if let Ok(infos) = manager.session_infos() {
+                    if let Some(info) = infos.into_iter().find(|i| i.name == name) {
+                        watchers.broadcast(&ControlMsg::SessionsChanged {
+                            added: vec![info],
+                            removed: vec![],
+                        });
+                    }
+                }
+            }
         }
         ControlMsg::ListSessions => {
             let names = manager.names();
@@ -172,6 +191,19 @@ fn handle_control(
                 );
                 return;
             };
+            // Idempotent per connection: a re-Attach (reconnect resubscribe, or a
+            // pane remount on tab/workspace switch) must REPLACE this connection's
+            // prior subscription for the session, not stack a second subscriber —
+            // otherwise every pty byte is delivered twice and reads as duplicated
+            // input. Drop any existing subscription for this name first.
+            subscriptions.retain(|(sess_name, prev, id)| {
+                if *sess_name == name {
+                    prev.unsubscribe(*id);
+                    false
+                } else {
+                    true
+                }
+            });
             let (sub_id, backlog, rx) = sess.subscribe();
             if write_frame(
                 writer,
@@ -224,7 +256,23 @@ fn handle_control(
             let _ = manager.resize(&name, rows, cols);
         }
         ControlMsg::Kill { name } => {
+            let existed = manager.session(&name).is_some();
             let _ = manager.remove(&name);
+            if existed {
+                watchers.broadcast(&ControlMsg::SessionsChanged {
+                    added: vec![],
+                    removed: vec![name],
+                });
+            }
+        }
+        ControlMsg::WatchSessions => {
+            watchers.register(writer);
+            let sessions = manager.session_infos().unwrap_or_default();
+            let _ = write_frame(writer, &Frame::Control(ControlMsg::Sessions { sessions }));
+        }
+        ControlMsg::ListSessionsDetailed => {
+            let sessions = manager.session_infos().unwrap_or_default();
+            let _ = write_frame(writer, &Frame::Control(ControlMsg::Sessions { sessions }));
         }
         ControlMsg::Detach { name } => {
             // Release this connection's subscriptions to that session; the
