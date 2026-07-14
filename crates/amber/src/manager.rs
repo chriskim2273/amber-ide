@@ -16,11 +16,36 @@ use crate::pty::PtySession;
 const DEFAULT_ROWS: u16 = 24;
 const DEFAULT_COLS: u16 = 80;
 
+/// Capture the user's login-shell PATH so spawned panes resolve tools (nvm/node,
+/// ~/.local/bin, …) that the daemon's minimal systemd PATH lacks — otherwise a
+/// pane's programs and claude's own hooks (which run `node`) fail.
+fn capture_login_path() -> Option<String> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let out = std::process::Command::new(&shell)
+        .arg("-lic")
+        .arg("printf %s \"$PATH\"")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if path.is_empty() {
+        None
+    } else {
+        Some(path)
+    }
+}
+
 pub struct SessionManager {
     store: StateStore,
     cfg: Config,
     root: PathBuf,
     sessions: Mutex<HashMap<String, Arc<PtySession>>>,
+    /// The user's login-shell PATH, so spawned panes (and their programs /
+    /// claude hooks, e.g. node) resolve tools the daemon's own systemd PATH
+    /// lacks. Captured once at startup.
+    login_path: Option<String>,
 }
 
 impl SessionManager {
@@ -34,6 +59,7 @@ impl SessionManager {
             cfg,
             root,
             sessions: Mutex::new(HashMap::new()),
+            login_path: capture_login_path(),
         })
     }
 
@@ -124,6 +150,11 @@ impl SessionManager {
         // monochrome. Force one on the pty regardless of the daemon's own env.
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
+        // Give panes the user's login PATH so their tools + claude's hooks
+        // (node) resolve, not just the daemon's minimal systemd PATH.
+        if let Some(path) = &self.login_path {
+            cmd.env("PATH", path);
+        }
         Ok(Arc::new(PtySession::spawn(
             cmd,
             DEFAULT_ROWS,
