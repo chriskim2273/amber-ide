@@ -106,7 +106,8 @@ connection manager; AI chat UI; themes/settings beyond minimal.
 - [x] Slice 3 — snapshot timer + SIGTERM final snapshot + systemd/launchd boot
   units + `install.sh` + reboot torture doc.
 - [x] Slice 4 — subscriber backpressure (flat memory under fast producers);
-  static musl / universal release builds. (True ~16 ms output batching: TODO.)
+  static musl / universal release builds. (True ~16 ms output batching landed
+  in the gap-fix pass below.)
 - [x] Slice 5 — `amber ctl doctor`/`status`/`install`/`snapshot-now`; old tmux
   infra deleted; this constitution rewritten.
 - [x] Hardening pass (2026-07-13) — attach SIGWINCH + socket-close/Exit
@@ -139,10 +140,21 @@ connection manager; AI chat UI; themes/settings beyond minimal.
 - [x] App Slice 7 — packaging: electron-builder (AppImage/dmg), bundled `amber`
   resolver, `scripts/dist.sh`. **AppImage built with amber bundled.** Packaged
   first-run does a cargo-free install (copies amber to `~/.local/bin/amber` +
-  writes the systemd user unit directly — the ephemeral AppImage mount can't
-  back a boot unit). macOS launchd-agent install + running the installed app
-  end-to-end (needs the user's normal-hardware machine; this box's kernel 6.17
-  forces the software-GL flags) remain to verify.
+  writes the boot unit directly — systemd user unit on Linux, launchd agent on
+  macOS — since the ephemeral AppImage mount can't back a boot unit). Running
+  the installed app end-to-end on a real Mac (needs the user's normal-hardware
+  machine; this box's kernel 6.17 forces the software-GL flags) remains to
+  verify.
+- [x] Gap-fix pass (2026-07-13) — closed the review gaps: spec §5 raw-attach
+  semantics (`raw_client` Attach flag, terminal reset, claude backlog skip +
+  repaint nudge); ~16 ms pty output batching (spec §9); packaged-macOS launchd
+  install; app menu "Quit amber daemon" (the only app path that stops it); CLI
+  `kill`/`rename` + `amber ctl uninstall` (spec §2/§10; rename still surfaces
+  the daemon's unsupported error); `claude.rs` warns-and-skips wrong-shaped
+  user JSON instead of clobbering/panicking; supervisor resume-ladder helpers
+  extracted + unit-tested. Still open: renderer component tests (Pane/SplitView
+  — deferred with Playwright E2E), aarch64 static build (needs musl-cross
+  linker), real-Mac + reboot-torture verification (manual).
 
 ## Gotchas (learned)
 
