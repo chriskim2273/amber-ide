@@ -58,8 +58,9 @@ session.
    continuum.
 7. **Claude is supervised, resumed precisely.** A `claude` session's pty runs
    `amber run <name>`, which loops `claude --dangerously-skip-permissions
-   --resume <recorded-id>` (falling back to `--continue`, then to a shell after
-   bounded retries so a pane never silently dies). The recorded id comes from a
+   --resume <recorded-id>` (falling back to a fresh start; on a user quit —
+   Ctrl-C / clean exit — or after bounded retries on crashes it drops to a
+   shell so a pane never silently dies). The recorded id comes from a
    generated per-session `SessionStart` hook (`amber hook`) that rewrites it on
    every fire (ids rotate on resume/clear/compaction). Claude is resolved via
    the **login shell** and cached in config — never the daemon's own PATH (the
@@ -155,6 +156,18 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   extracted + unit-tested. Still open: renderer component tests (Pane/SplitView
   — deferred with Playwright E2E), aarch64 static build (needs musl-cross
   linker), real-Mac + reboot-torture verification (manual).
+- [x] UX pass (2026-07-14) — draggable panels: a grip in each pane's control
+  strip drags the whole pane; the cursor is hit-tested against `paneRects`
+  (window-listener, mirroring the divider drag), a highlight overlay marks the
+  drop zone, edge zones re-split the target (`layout::moveLeaf`) and the center
+  zone swaps two panes; `Pane` memoized so drag re-renders don't reconcile
+  terminals. Claude user-quit now drops to a shell: a clean exit, exit code 130
+  (claude's raw-mode ^C path), OR death by SIGINT all classify as a user quit in
+  `supervisor.rs`, falling through to the shell fallback instead of closing the
+  pane (only genuine crashes retry).
+  `moveLeaf` + SIGINT classification unit-tested; renderer typechecks and the
+  bundle builds. Still open: the live drag gesture + claude ^C→shell need
+  manual verification in the running GUI (renderer-component UI still deferred).
 
 ## Gotchas (learned)
 

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { leaves, splitLeaf, removeLeaf, setRatio, paneRects, equalColumns, reconcile, type Node } from './layout'
+import { leaves, splitLeaf, removeLeaf, setRatio, paneRects, equalColumns, reconcile, moveLeaf, type Node } from './layout'
 
 const leaf = (id: string): Node => ({ kind: 'leaf', paneId: id })
 
@@ -35,5 +35,74 @@ describe('layout', () => {
     expect(leaves(r).sort()).toEqual(['b', 'c'])
     expect(reconcile(t, [])).toBeNull()
     expect(reconcile(null, ['x'])).toEqual(leaf('x'))
+  })
+
+  describe('moveLeaf', () => {
+    // a | (b / c): 'a' beside a vertical split of 'b' over 'c'
+    const tree = (): Node => ({
+      kind: 'split', dir: 'h', ratio: 0.5,
+      a: leaf('a'),
+      b: { kind: 'split', dir: 'v', ratio: 0.5, a: leaf('b'), b: leaf('c') },
+    })
+
+    it('drop on self is a no-op', () => {
+      const t = tree()
+      expect(moveLeaf(t, 'a', 'a', 'right')).toEqual(t)
+      expect(moveLeaf(t, 'b', 'b', 'center')).toEqual(t)
+    })
+
+    it('center swaps the two panes, leaving structure intact', () => {
+      const r = moveLeaf(tree(), 'a', 'c', 'center')
+      expect(r).toEqual({
+        kind: 'split', dir: 'h', ratio: 0.5,
+        a: leaf('c'),
+        b: { kind: 'split', dir: 'v', ratio: 0.5, a: leaf('b'), b: leaf('a') },
+      })
+    })
+
+    it('right zone splits the target h with source on the far side', () => {
+      // move 'a' onto 'b' right: 'a' removed, 'b' becomes (b | a)
+      const r = moveLeaf(tree(), 'a', 'b', 'right')
+      expect(r).toEqual({
+        kind: 'split', dir: 'v', ratio: 0.5,
+        a: { kind: 'split', dir: 'h', ratio: 0.5, a: leaf('b'), b: leaf('a') },
+        b: leaf('c'),
+      })
+    })
+
+    it('left zone splits the target h with source on the near side', () => {
+      const r = moveLeaf(tree(), 'c', 'a', 'left')
+      // 'c' removed (its parent collapses to 'b'), 'a' becomes (c | a)
+      expect(r).toEqual({
+        kind: 'split', dir: 'h', ratio: 0.5,
+        a: { kind: 'split', dir: 'h', ratio: 0.5, a: leaf('c'), b: leaf('a') },
+        b: leaf('b'),
+      })
+    })
+
+    it('top zone splits the target v with source above', () => {
+      const r = moveLeaf(tree(), 'a', 'c', 'top')
+      expect(r).toEqual({
+        kind: 'split', dir: 'v', ratio: 0.5,
+        a: leaf('b'),
+        b: { kind: 'split', dir: 'v', ratio: 0.5, a: leaf('a'), b: leaf('c') },
+      })
+    })
+
+    it('bottom zone splits the target v with source below', () => {
+      const r = moveLeaf(tree(), 'a', 'c', 'bottom')
+      expect(r).toEqual({
+        kind: 'split', dir: 'v', ratio: 0.5,
+        a: leaf('b'),
+        b: { kind: 'split', dir: 'v', ratio: 0.5, a: leaf('c'), b: leaf('a') },
+      })
+    })
+
+    it('preserves the leaf set for every zone (reconcile stays a no-op)', () => {
+      for (const zone of ['left', 'right', 'top', 'bottom', 'center'] as const) {
+        const r = moveLeaf(tree(), 'a', 'c', zone)
+        expect(leaves(r).sort()).toEqual(['a', 'b', 'c'])
+      }
+    })
   })
 })

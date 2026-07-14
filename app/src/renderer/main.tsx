@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client'
 import { SplitView } from './SplitView'
 import { initialState, reduce, groupSessions, type DaemonEvent } from './store'
 import { formatName, makeId } from '../shared/names'
-import { splitLeaf, removeLeaf, setRatio, reconcile, leaves, type Node } from './layout'
+import { splitLeaf, removeLeaf, setRatio, reconcile, leaves, moveLeaf, type Node } from './layout'
 import { emptyLayout, parseLayout, serializeLayout, type LayoutFile } from '../shared/layoutFile'
 
 declare global {
@@ -186,6 +186,7 @@ function App(): JSX.Element {
                 window.amber.createSession(name, cwd, kind)
                 setPending((p) => ({ ...p, [name]: { paneId, dir } }))
               }}
+              onMove={(s, t, z) => putTree(moveLeaf(tree, s, t, z))}
               onClose={(paneId) => { window.amber.killSession(paneId); putTree(removeLeaf(tree, paneId)) }} />
           : <p style={{ padding: 16 }}>No panes. Click “+ Pane”.</p>}
       </div>
