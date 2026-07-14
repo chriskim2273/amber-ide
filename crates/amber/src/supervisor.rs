@@ -45,11 +45,12 @@ pub fn supervise_claude(
             prev_id = session_id.clone();
         }
         let start = match (&session_id, escalation) {
-            // A never-run session (no recorded id) starts Fresh — never --continue.
-            (None, _) => claude::ClaudeStart::Fresh,
+            // Recorded id -> Resume it; on failure fall straight to Fresh. NOT
+            // --continue: it resumes the most recent conversation in the cwd,
+            // which can hijack an UNRELATED one (e.g. a separate `claude` run in
+            // the same dir). A stale/empty id should start a clean conversation.
             (Some(id), 0) => claude::ClaudeStart::Resume(id.clone()),
-            (Some(_), 1) => claude::ClaudeStart::Continue,
-            (Some(_), _) => claude::ClaudeStart::Fresh,
+            _ => claude::ClaudeStart::Fresh,
         };
         let argv = claude::claude_argv(&start, settings);
 
