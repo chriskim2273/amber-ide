@@ -3,6 +3,36 @@ import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { WebglAddon } from '@xterm/addon-webgl'
 import '@xterm/xterm/css/xterm.css'
+import { appChord } from './keys'
+
+// xterm palette — kept in sync with theme.css tokens (Terminal can't read CSS
+// vars at construction). background matches --bg so the pane body blends with
+// the header/chrome; cursor + selection use the violet accent.
+const FONT_STACK =
+  "'JetBrains Mono','SF Mono','Menlo','Monaco','DejaVu Sans Mono','Consolas',monospace"
+const XTERM_THEME = {
+  background: '#0c0c0f',
+  foreground: '#e6e6ec',
+  cursor: '#7c6cff',
+  cursorAccent: '#0c0c0f',
+  selectionBackground: 'rgba(124,108,255,0.30)',
+  black: '#1b1b22',
+  red: '#ff5c5c',
+  green: '#52d273',
+  yellow: '#ffb454',
+  blue: '#4d9fff',
+  magenta: '#7c6cff',
+  cyan: '#4dd6c8',
+  white: '#c8c8d2',
+  brightBlack: '#64646f',
+  brightRed: '#ff7b7b',
+  brightGreen: '#78e094',
+  brightYellow: '#ffc879',
+  brightBlue: '#78b6ff',
+  brightMagenta: '#9d90ff',
+  brightCyan: '#79e2d6',
+  brightWhite: '#f4f4f8',
+}
 
 // Replaying raw scrollback re-executes its escape codes, including any mouse-
 // tracking enable from a prior program (e.g. an exited claude). Left set, a
@@ -11,6 +41,7 @@ import '@xterm/xterm/css/xterm.css'
 const MOUSE_RESET = '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l'
 
 export function Pane({ session, epoch }: { session: string; epoch: number }): JSX.Element {
+  // Focus is tracked by SplitView via `focusin` on the wrapper; nothing here.
   const hostRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<Terminal | null>(null)
   const fitRef = useRef<FitAddon | null>(null)
@@ -22,7 +53,19 @@ export function Pane({ session, epoch }: { session: string; epoch: number }): JS
   useEffect(() => {
     const host = hostRef.current
     if (!host) return
-    const term = new Terminal({ convertEol: false, fontFamily: 'monospace', fontSize: 13 })
+    const term = new Terminal({
+      convertEol: false,
+      fontFamily: FONT_STACK,
+      fontSize: 13,
+      lineHeight: 1.15,
+      theme: XTERM_THEME,
+      cursorBlink: true,
+      allowProposedApi: true,
+    })
+    // App chords (Cmd on mac / Ctrl+Shift on Linux) must not be sent to the
+    // pty — return false so xterm neither renders nor forwards them; the event
+    // still bubbles to the window handlers in App/SplitView.
+    term.attachCustomKeyEventHandler((e) => !(e.type === 'keydown' && appChord(e)))
     const fit = new FitAddon()
     term.open(host)
     term.loadAddon(fit)
@@ -110,5 +153,5 @@ export function Pane({ session, epoch }: { session: string; epoch: number }): JS
     return () => { clearTimeout(t1); clearTimeout(t2) }
   }, [epoch])
 
-  return <div ref={hostRef} style={{ width: '100%', height: '100%', background: '#000' }} />
+  return <div ref={hostRef} style={{ width: '100%', height: '100%', background: '#0c0c0f' }} />
 }

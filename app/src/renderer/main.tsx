@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useReducer, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
-import { SplitView } from './SplitView'
+import { SplitView, type PaneMeta } from './SplitView'
 import { initialState, reduce, groupSessions, type DaemonEvent } from './store'
 import { formatName, makeId } from '../shared/names'
-import { splitLeaf, removeLeaf, setRatio, reconcile, leaves, type Node } from './layout'
+import { splitLeaf, removeLeaf, setRatio, reconcile, type Node } from './layout'
 import { emptyLayout, parseLayout, serializeLayout, type LayoutFile } from '../shared/layoutFile'
+import { appChord } from './keys'
+import './theme.css'
 
 declare global {
   interface Window {
@@ -31,6 +33,10 @@ function toEvent(d: unknown): DaemonEvent | null {
   if (m.kind === 'Exit') return { kind: 'Exit', name: m['name'] as string, code: m['code'] as number }
   if (m.kind === 'Error') return { kind: 'Error', msg: m['msg'] as string }
   return null
+}
+
+function shortCwd(cwd: string, home: string): string {
+  return home && cwd.startsWith(home) ? '~' + cwd.slice(home.length) : cwd
 }
 
 function App(): JSX.Element {
@@ -93,7 +99,12 @@ function App(): JSX.Element {
   const tabs = ws?.tabs ?? []
   const tab = tabs.find((t) => t.tab === activeTab) ?? tabs[0]
   const deadCodes: Record<string, number> = {}
-  tab?.panes.forEach((p) => { if (p.deadCode !== null) deadCodes[p.name] = p.deadCode })
+  const paneMeta: Record<string, PaneMeta> = {}
+  const home = window.amber?.homeDir ?? ''
+  tab?.panes.forEach((p) => {
+    if (p.deadCode !== null) deadCodes[p.name] = p.deadCode
+    paneMeta[p.name] = { kind: p.kind, title: `${shortCwd(p.cwd, home)} · ${p.kind}` }
+  })
 
   // Reconcile the persisted tree for this tab with its live pane set. Pending
   // split targets are excluded until placed, so reconcile won't append them.
@@ -131,6 +142,22 @@ function App(): JSX.Element {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pending, liveKey, storedTree, putTree, loaded])
 
+  // App-owned keyboard chords (new tab / new pane / switch tab). The 'close'
+  // chord is handled in SplitView (it needs the focused-pane identity). This
+  // effect registers once; the latest action closures live in a ref, refreshed
+  // every render below, so the handler never goes stale without re-binding.
+  const chordRef = useRef<(c: ReturnType<typeof appChord>) => void>(() => {})
+  useEffect(() => {
+    const h = (e: KeyboardEvent): void => {
+      const c = appChord(e)
+      if (!c || c.type === 'close') return
+      e.preventDefault()
+      chordRef.current(c)
+    }
+    window.addEventListener('keydown', h)
+    return () => window.removeEventListener('keydown', h)
+  }, [])
+
   if (!bridgeReady) return <p style={{ color: 'crimson', padding: 16 }}>preload bridge missing.</p>
 
   const nextOrd = (tab?.panes.reduce((m, p) => Math.max(m, p.ord), -1) ?? -1) + 1
@@ -146,40 +173,62 @@ function App(): JSX.Element {
 
   const nextWs = (workspaces.reduce((m, w) => Math.max(m, w.ws), 0)) + 1
 
+  const openTab = (): void => { newPane(nextTab, 0); setActiveTab(nextTab) }
+  const stepTab = (d: number): void => {
+    if (tabs.length === 0) return
+    const i = Math.max(0, tabs.findIndex((t) => t.tab === (tab?.tab ?? -1)))
+    setActiveTab(tabs[(i + d + tabs.length) % tabs.length]!.tab)
+  }
+  // Refresh the keyboard-chord dispatcher with this render's live closures.
+  chordRef.current = (c) => {
+    if (c?.type === 'new-tab') openTab()
+    else if (c?.type === 'new-pane') { if (tab) newPane(tab.tab, nextOrd) }
+    else if (c?.type === 'prev-tab') stepTab(-1)
+    else if (c?.type === 'next-tab') stepTab(1)
+    else if (c?.type === 'tab') { const t = tabs[c.n - 1]; if (t) setActiveTab(t.tab) }
+  }
+
   return (
-    <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', background: '#000', color: '#ddd' }}>
-      {!connected && <div style={{ background: '#822', color: '#fff', padding: '4px 8px' }}>daemon disconnected — reconnecting…</div>}
-      <div style={{ display: 'flex', gap: 4, padding: 4, background: '#111', alignItems: 'center' }}>
-        <span>ws:</span>
+    <div className="app">
+      {!connected && <div className="banner"><span className="dot" />daemon disconnected — reconnecting…</div>}
+      <div className="toolbar">
+        <span className="label">workspace</span>
         {workspaces.map((w) => (
-          <button key={w.ws} onClick={() => setActiveWs(w.ws)} style={{ fontWeight: w.ws === (ws?.ws ?? -1) ? 'bold' : 'normal' }}>{w.ws}</button>
+          <button key={w.ws} className={'btn ws-pill' + (w.ws === (ws?.ws ?? -1) ? ' active' : '')}
+            onClick={() => setActiveWs(w.ws)}>{w.ws}</button>
         ))}
-        <button onClick={() => { setActiveWs(nextWs); window.amber.createSession(formatName({ ws: nextWs, tab: 1, ord: 0, id: makeId() }), cwd, kind); setActiveTab(1) }}>+ ws</button>
-        <span style={{ marginLeft: 12 }}>new:</span>
-        <select value={kind} onChange={(e) => setKind(e.target.value as 'shell' | 'claude')}>
+        <button className="btn btn-ghost"
+          onClick={() => { setActiveWs(nextWs); window.amber.createSession(formatName({ ws: nextWs, tab: 1, ord: 0, id: makeId() }), cwd, kind); setActiveTab(1) }}>+ ws</button>
+        <div className="divider" />
+        <span className="label">new</span>
+        <select className="select" value={kind} onChange={(e) => setKind(e.target.value as 'shell' | 'claude')}>
           <option value="shell">shell</option>
           <option value="claude">claude</option>
         </select>
-        <span style={{ marginLeft: 8 }}>in:</span>
-        <button
-          title={`${cwd} — click to choose folder`}
-          onClick={() => void window.amber.pickFolder().then((p) => { if (p) setCwd(p) })}
-          style={{ maxWidth: 260, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
-        >
-          📁 {cwd.startsWith(window.amber.homeDir) ? '~' + cwd.slice(window.amber.homeDir.length) : cwd}
+        <span className="label">in</span>
+        <button className="btn cwd-chip" title={`${cwd} — click to choose folder`}
+          onClick={() => void window.amber.pickFolder().then((p) => { if (p) setCwd(p) })}>
+          📁 {shortCwd(cwd, window.amber.homeDir)}
         </button>
+        <div className="spacer" />
+        {tab && <button className="btn btn-accent" onClick={() => newPane(tab.tab, nextOrd)}>+ Pane</button>}
       </div>
-      <div style={{ display: 'flex', gap: 4, padding: 4, background: '#222' }}>
-        {tabs.map((t) => (
-          <button key={t.tab} onClick={() => setActiveTab(t.tab)}
-            style={{ fontWeight: t.tab === (tab?.tab ?? -1) ? 'bold' : 'normal' }}>tab {t.tab} ({t.panes.length})</button>
-        ))}
-        <button onClick={() => { newPane(nextTab, 0); setActiveTab(nextTab) }}>+ Tab</button>
-        {tab && <button onClick={() => newPane(tab.tab, nextOrd)}>+ Pane</button>}
+      <div className="tabbar">
+        {tabs.map((t) => {
+          const hasClaude = t.panes.some((p) => p.kind === 'claude')
+          return (
+            <button key={t.tab} className={'tab' + (t.tab === (tab?.tab ?? -1) ? ' active' : '')}
+              onClick={() => setActiveTab(t.tab)}>
+              <span className={'kind-dot ' + (hasClaude ? 'claude' : 'shell')} />
+              tab {t.tab}<span className="count">{t.panes.length}</span>
+            </button>
+          )
+        })}
+        <button className="btn btn-ghost tab-add" onClick={openTab}>+ Tab</button>
       </div>
-      <div style={{ flex: 1, position: 'relative' }}>
+      <div className="pane-stage">
         {tree
-          ? <SplitView tree={tree} deadCodes={deadCodes} epoch={reconnectEpoch}
+          ? <SplitView tree={tree} deadCodes={deadCodes} meta={paneMeta} epoch={reconnectEpoch}
               onSetRatio={(path, r) => putTree(setRatio(tree, path, r))}
               onSplit={(paneId, dir) => {
                 const name = formatName({ ws: currentWs, tab: currentTab, ord: nextOrd, id: makeId() })
@@ -187,7 +236,7 @@ function App(): JSX.Element {
                 setPending((p) => ({ ...p, [name]: { paneId, dir } }))
               }}
               onClose={(paneId) => { window.amber.killSession(paneId); putTree(removeLeaf(tree, paneId)) }} />
-          : <p style={{ padding: 16 }}>No panes. Click “+ Pane”.</p>}
+          : <p className="empty-hint">No panes — press <kbd>+ Pane</kbd> to start.</p>}
       </div>
     </div>
   )
