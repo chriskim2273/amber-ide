@@ -129,8 +129,14 @@ function App(): JSX.Element {
 
   const nextOrd = (tab?.panes.reduce((m, p) => Math.max(m, p.ord), -1) ?? -1) + 1
   const nextTab = (tabs.reduce((m, t) => Math.max(m, t.tab), 0)) + 1
+  // The workspace/tab actually on screen — NOT the raw activeWs/activeTab state,
+  // which goes stale when the selected ws/tab is closed and `ws`/`tab` fall back
+  // to workspaces[0]. Creating relative to the stale state would resurrect the
+  // dead workspace. Always create relative to what's displayed.
+  const currentWs = ws?.ws ?? activeWs
+  const currentTab = tab?.tab ?? activeTab
   const newPane = (tabId: number, ord: number): void =>
-    window.amber.createSession(formatName({ ws: activeWs, tab: tabId, ord, id: makeId() }), '.', kind)
+    window.amber.createSession(formatName({ ws: currentWs, tab: tabId, ord, id: makeId() }), '.', kind)
 
   const nextWs = (workspaces.reduce((m, w) => Math.max(m, w.ws), 0)) + 1
 
@@ -162,7 +168,7 @@ function App(): JSX.Element {
           ? <SplitView tree={tree} deadCodes={deadCodes} epoch={reconnectEpoch}
               onSetRatio={(path, r) => putTree(setRatio(tree, path, r))}
               onSplit={(paneId, dir) => {
-                const name = formatName({ ws: activeWs, tab: tab!.tab, ord: nextOrd, id: makeId() })
+                const name = formatName({ ws: currentWs, tab: currentTab, ord: nextOrd, id: makeId() })
                 window.amber.createSession(name, '.', kind)
                 setPending((p) => ({ ...p, [name]: { paneId, dir } }))
               }}
