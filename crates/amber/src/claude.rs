@@ -143,29 +143,46 @@ pub fn ensure_global_claude_hook(hook_command: &str) {
 }
 
 fn add_global_hook_in(config: &Path, hook_command: &str) {
-    let mut root: serde_json::Value = std::fs::read_to_string(config)
+    // Absent or unparseable file -> start fresh (created below). A file that
+    // parses to valid JSON of the WRONG shape must be left untouched: warn and
+    // continue rather than clobbering the user's settings.
+    let parsed = std::fs::read_to_string(config)
         .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .filter(serde_json::Value::is_object)
-        .unwrap_or_else(|| serde_json::json!({}));
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
+    let mut root = match parsed {
+        Some(v) if v.is_object() => v,
+        Some(_) => {
+            eprintln!(
+                "amber: {} has a non-object root; skipping global SessionStart hook install",
+                config.display()
+            );
+            return;
+        }
+        None => serde_json::json!({}),
+    };
 
-    let hooks = root
-        .as_object_mut()
-        .unwrap()
-        .entry("hooks")
-        .or_insert_with(|| serde_json::json!({}));
+    let obj = root.as_object_mut().expect("root is an object here");
+    let hooks = obj.entry("hooks").or_insert_with(|| serde_json::json!({}));
     if !hooks.is_object() {
-        *hooks = serde_json::json!({});
+        eprintln!(
+            "amber: {} key `hooks` is not an object; skipping global SessionStart hook install",
+            config.display()
+        );
+        return;
     }
     let ss = hooks
         .as_object_mut()
-        .unwrap()
+        .expect("hooks is an object here")
         .entry("SessionStart")
         .or_insert_with(|| serde_json::json!([]));
     if !ss.is_array() {
-        *ss = serde_json::json!([]);
+        eprintln!(
+            "amber: {} key `hooks.SessionStart` is not an array; skipping global SessionStart hook install",
+            config.display()
+        );
+        return;
     }
-    let arr = ss.as_array_mut().unwrap();
+    let arr = ss.as_array_mut().expect("SessionStart is an array here");
 
     // Already installed? Don't duplicate.
     let present = arr.iter().any(|group| {
@@ -194,8 +211,27 @@ fn add_global_hook_in(config: &Path, hook_command: &str) {
 fn trust_cwd_in(config: &Path, cwd: &Path) {
     let Ok(text) = std::fs::read_to_string(config) else { return };
     let Ok(mut root) = serde_json::from_str::<serde_json::Value>(&text) else { return };
-    if !root.get("projects").map(|p| p.is_object()).unwrap_or(false) {
-        root["projects"] = serde_json::json!({});
+    // A non-object root would panic on `root["projects"] = ...` (serde_json
+    // IndexMut). Leave any wrong-shaped file untouched: warn and continue.
+    let Some(obj) = root.as_object_mut() else {
+        eprintln!(
+            "amber: {} has a non-object root; skipping folder-trust pre-accept",
+            config.display()
+        );
+        return;
+    };
+    match obj.get("projects") {
+        None => {
+            obj.insert("projects".to_string(), serde_json::json!({}));
+        }
+        Some(p) if p.is_object() => {}
+        Some(_) => {
+            eprintln!(
+                "amber: {} key `projects` is not an object; skipping folder-trust pre-accept",
+                config.display()
+            );
+            return;
+        }
     }
     let key = cwd.to_string_lossy().to_string();
     let projects = root["projects"].as_object_mut().expect("projects is an object");
@@ -358,6 +394,69 @@ mod tests {
         let config = dir.path().join("absent.json");
         trust_cwd_in(&config, Path::new("/x")); // must not panic or create
         assert!(!config.exists());
+    }
+
+    #[test]
+    fn global_hook_leaves_array_root_untouched() {
+        // settings.json whose root is a JSON array (wrong shape) must be left
+        // byte-identical, not clobbered into an object.
+        let dir = tempdir().unwrap();
+        let config = dir.path().join("settings.json");
+        let original = r#"[1,2,3]"#;
+        std::fs::write(&config, original).unwrap();
+        add_global_hook_in(&config, "/x/amber hook"); // must not panic
+        let after = std::fs::read_to_string(&config).unwrap();
+        assert_eq!(after, original, "array-root settings.json must be untouched");
+    }
+
+    #[test]
+    fn global_hook_leaves_array_hooks_untouched() {
+        // `"hooks": []` (array instead of object) must be left byte-identical.
+        let dir = tempdir().unwrap();
+        let config = dir.path().join("settings.json");
+        let original = r#"{"theme":"dark","hooks":[]}"#;
+        std::fs::write(&config, original).unwrap();
+        add_global_hook_in(&config, "/x/amber hook"); // must not panic
+        let after = std::fs::read_to_string(&config).unwrap();
+        assert_eq!(after, original, "array `hooks` must be untouched");
+    }
+
+    #[test]
+    fn global_hook_leaves_object_sessionstart_untouched() {
+        // `SessionStart` as an object instead of an array must be left as-is.
+        let dir = tempdir().unwrap();
+        let config = dir.path().join("settings.json");
+        let original = r#"{"hooks":{"SessionStart":{"oops":true}}}"#;
+        std::fs::write(&config, original).unwrap();
+        add_global_hook_in(&config, "/x/amber hook"); // must not panic
+        let after = std::fs::read_to_string(&config).unwrap();
+        assert_eq!(after, original, "object `SessionStart` must be untouched");
+    }
+
+    #[test]
+    fn trust_cwd_leaves_string_projects_untouched() {
+        // `"projects": "..."` (string instead of object) must be left as-is.
+        let dir = tempdir().unwrap();
+        let config = dir.path().join(".claude.json");
+        let original = r#"{"numStartups":5,"projects":"not-an-object"}"#;
+        std::fs::write(&config, original).unwrap();
+        trust_cwd_in(&config, Path::new("/home/u/proj")); // must not panic
+        let after = std::fs::read_to_string(&config).unwrap();
+        assert_eq!(after, original, "string `projects` must be untouched");
+    }
+
+    #[test]
+    fn trust_cwd_leaves_array_root_untouched() {
+        // `.claude.json` whose root is a JSON array is the one shape that truly
+        // panics today (serde_json IndexMut on `root["projects"]`). Must be a
+        // no-op leaving the file byte-identical.
+        let dir = tempdir().unwrap();
+        let config = dir.path().join(".claude.json");
+        let original = r#"[1,2,3]"#;
+        std::fs::write(&config, original).unwrap();
+        trust_cwd_in(&config, Path::new("/home/u/proj")); // must not panic
+        let after = std::fs::read_to_string(&config).unwrap();
+        assert_eq!(after, original, "array-root .claude.json must be untouched");
     }
 
     #[test]
