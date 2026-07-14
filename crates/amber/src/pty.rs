@@ -46,6 +46,9 @@ pub struct PtySession {
     next_sub_id: AtomicU64,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     exit: Arc<Mutex<Option<i32>>>,
+    /// The child's OS process id, captured at spawn (for reading its live cwd
+    /// via /proc/<pid>/cwd so `cd` inside a shell survives restart).
+    pid: Option<u32>,
 }
 
 /// Fan one chunk out to every subscriber, returning the ids to prune.
@@ -115,6 +118,7 @@ impl PtySession {
         drop(pair.slave);
 
         let killer = child.clone_killer();
+        let pid = child.process_id();
         // If pty plumbing fails after the spawn, don't leak the child.
         let mut reader = match pair.master.try_clone_reader() {
             Ok(r) => r,
@@ -202,7 +206,22 @@ impl PtySession {
             next_sub_id: AtomicU64::new(0),
             killer: Mutex::new(killer),
             exit,
+            pid,
         })
+    }
+
+    /// The child's OS process id (None if the platform didn't report one).
+    pub fn pid(&self) -> Option<u32> {
+        self.pid
+    }
+
+    /// The child process's current working directory, read live from
+    /// `/proc/<pid>/cwd`. For a shell this tracks the user's `cd`s, so it can be
+    /// snapshotted and restored. None if unavailable (no pid, not Linux, the
+    /// process is gone, or the link can't be read).
+    pub fn live_cwd(&self) -> Option<std::path::PathBuf> {
+        let pid = self.pid?;
+        std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
     }
 
     /// Write bytes to the child's stdin.

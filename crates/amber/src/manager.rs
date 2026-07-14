@@ -162,8 +162,26 @@ impl SessionManager {
         let sessions = self.sessions.lock().unwrap();
         for (name, sess) in sessions.iter() {
             self.store.write_scrollback(name, &sess.scrollback())?;
+            self.persist_live_cwd(name, sess);
         }
         Ok(())
+    }
+
+    /// Persist a Shell session's live working directory so an in-shell `cd`
+    /// survives restart (the shell respawns where the user left it, not its
+    /// original cwd). Read from the child's `/proc/<pid>/cwd`. Claude sessions
+    /// are left alone — their cwd is the authoritative, pre-trusted folder the
+    /// pane was created in, which `amber run` never `cd`s out of.
+    fn persist_live_cwd(&self, name: &str, sess: &PtySession) {
+        let Ok(Some(meta)) = self.store.read_session(name) else { return };
+        if meta.kind != SessionKind::Shell {
+            return;
+        }
+        let Some(live) = sess.live_cwd() else { return };
+        if live.is_dir() && live != meta.cwd {
+            let updated = SessionMeta { cwd: live, updated: Self::now(), ..meta };
+            let _ = self.store.write_session(&updated);
+        }
     }
 
     /// Recreate every persisted session, seeding its ring with saved scrollback.
@@ -295,6 +313,29 @@ mod tests {
             !dir.path().parent().unwrap().join("evil.json").exists(),
             "traversal name escaped the state dir"
         );
+    }
+
+    #[test]
+    fn snapshot_persists_a_shells_live_cwd_after_cd() {
+        // A `cd` inside a shell must survive restart: snapshot reads the child's
+        // live /proc/<pid>/cwd and updates the stored cwd.
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        mgr.create("sh", "/tmp", SessionKind::Shell).unwrap();
+        let sess = mgr.session("sh").unwrap();
+
+        let target = std::fs::canonicalize(dir.path()).unwrap();
+        sess.write(format!("cd '{}'\n", target.display()).as_bytes()).unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while sess.live_cwd() != Some(target.clone()) {
+            assert!(std::time::Instant::now() < deadline, "shell never cd'd");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        mgr.snapshot().unwrap();
+        let meta = mgr.store.read_session("sh").unwrap().unwrap();
+        assert_eq!(meta.cwd, target, "snapshot did not capture the cd'd dir");
     }
 
     #[test]
