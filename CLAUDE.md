@@ -156,6 +156,17 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   extracted + unit-tested. Still open: renderer component tests (Pane/SplitView
   — deferred with Playwright E2E), aarch64 static build (needs musl-cross
   linker), real-Mac + reboot-torture verification (manual).
+- [x] UX pass (2026-07-14) — draggable panels: a grip in each pane's control
+  strip drags the whole pane; the cursor is hit-tested against `paneRects`
+  (window-listener, mirroring the divider drag), a highlight overlay marks the
+  drop zone, edge zones re-split the target (`layout::moveLeaf`) and the center
+  zone swaps two panes; `Pane` memoized so drag re-renders don't reconcile
+  terminals. Claude user-quit now drops to a shell: a clean exit OR a ^C
+  (SIGINT) classifies as a user quit in `supervisor.rs`, falling through to the
+  shell fallback instead of closing the pane (only genuine crashes retry).
+  `moveLeaf` + SIGINT classification unit-tested; renderer typechecks and the
+  bundle builds. Still open: the live drag gesture + claude ^C→shell need
+  manual verification in the running GUI (renderer-component UI still deferred).
 
 ## Gotchas (learned)
 
