@@ -1,4 +1,5 @@
-import { app, BrowserWindow, utilityProcess, MessageChannelMain } from 'electron'
+import { app, BrowserWindow, utilityProcess, MessageChannelMain, Menu } from 'electron'
+import type { MenuItemConstructorOptions } from 'electron'
 import { ipcMain, dialog } from 'electron'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
@@ -8,6 +9,16 @@ import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { resolveSocketPath } from '../shared/socketPath'
 import { ensureDaemon, probeSocket } from './daemonBoot'
 import { resolveAmberBinary } from './amberBin'
+import {
+  renderDaemonPlist,
+  launchAgentPlistPath,
+  launchctlBootstrapArgv,
+  launchctlLoadArgv,
+  launchctlKickstartArgv,
+  stopDaemonCommand,
+  stopDaemonFallbackCommand,
+  bootUnitPath,
+} from './serviceManager'
 import clientPath from '../client/index?modulePath'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -112,14 +123,102 @@ async function installDaemon(): Promise<void> {
       await spawnOk('systemctl', ['--user', 'enable', '--now', 'amber.service'])
       return
     }
-    // macOS packaged: launchd-agent install is a follow-up; start the daemon
-    // for this session so the app is usable now (reboot survival TODO on mac).
-    spawn(stable, ['daemon'], { detached: true, stdio: 'ignore' }).unref()
+    // macOS packaged: write the launchd agent plist to ~/Library/LaunchAgents
+    // pointing at the STABLE binary (launchd has no %h — needs an absolute path,
+    // never the ephemeral dmg mount) and load it. RunAtLoad + bootstrap start
+    // the daemon now AND give it reboot survival, so — unlike before — we do NOT
+    // also detached-spawn it (two daemons would race for the same socket and hit
+    // the live-socket steal guard). Best-effort like the Linux branch: the outer
+    // ensureDaemon probe loop verifies the socket actually comes up.
+    if (process.platform === 'darwin') {
+      const uid = process.getuid?.() ?? 0
+      const agentDir = join(home, 'Library', 'LaunchAgents')
+      const plistPath = launchAgentPlistPath(home)
+      await mkdir(agentDir, { recursive: true })
+      await writeFile(plistPath, renderDaemonPlist(stable))
+      await chmod(plistPath, 0o644)
+      // bootstrap (modern) → load -w (older / already-bootstrapped) → kickstart
+      // (force-run on re-runs). Each best-effort; none should fail the install.
+      const boot = launchctlBootstrapArgv(uid, plistPath)
+      await spawnOk(boot.cmd, boot.args).catch(async () => {
+        const load = launchctlLoadArgv(plistPath)
+        await spawnOk(load.cmd, load.args).catch(() => {})
+      })
+      const kick = launchctlKickstartArgv(uid)
+      await spawnOk(kick.cmd, kick.args).catch(() => {})
+      return
+    }
     return
   }
 
   // Dev (repo checkout): `amber ctl install` builds + installs from source.
   await spawnOk(amberBinary(), ['ctl', 'install'])
+}
+
+// Spec §3/§6: the ONLY app path that stops the daemon. Confirms, stops the
+// daemon via the service manager (never by guessing pids), then quits the app.
+// The plain OS "Quit" (app/appMenu role) quits the app but leaves the daemon
+// running — that is the intended asymmetry.
+async function quitDaemonAndApp(win: BrowserWindow): Promise<void> {
+  const confirm = await dialog.showMessageBox(win, {
+    type: 'warning',
+    buttons: ['Cancel', 'Quit amber daemon'],
+    defaultId: 0,
+    cancelId: 0,
+    title: 'Quit amber daemon',
+    message: 'Stop the amber daemon and quit?',
+    detail:
+      'This stops the background amber daemon — the only action that does. Every ' +
+      'terminal session it owns will stop (their ptys are killed) until the daemon ' +
+      'next starts. Closing the window normally leaves the daemon running.',
+  })
+  if (confirm.response !== 1) return
+
+  const home = process.env['HOME'] ?? '.'
+  const unit = bootUnitPath(process.platform, home)
+  // No installed boot unit => dev / unmanaged daemon. Don't guess at pids;
+  // report it and quit (the daemon keeps running, as when closing the window).
+  if (unit === null || !existsSync(unit)) {
+    await dialog.showMessageBox(win, {
+      type: 'info',
+      buttons: ['Quit app'],
+      title: 'Daemon not managed here',
+      message: 'No installed amber boot unit found.',
+      detail:
+        'The daemon was not installed via the app (dev mode or unmanaged), so it ' +
+        'cannot be stopped from here. Quitting the app now — the daemon keeps running.',
+    })
+    app.quit()
+    return
+  }
+
+  const uid = process.getuid?.() ?? 0
+  const stop = stopDaemonCommand(process.platform, uid)
+  if (stop !== null) {
+    await spawnOk(stop.cmd, stop.args).catch(async () => {
+      const fb = stopDaemonFallbackCommand(process.platform, launchAgentPlistPath(home))
+      if (fb !== null) await spawnOk(fb.cmd, fb.args).catch(() => {})
+    })
+  }
+  app.quit()
+}
+
+// Minimal application menu. Keeps the standard macOS roles (app/Edit/Window) so
+// copy/paste and window management work; adds the explicit "Quit amber daemon"
+// item required by spec §3/§6. On Linux only that item plus the plain quit.
+function buildAppMenu(onQuitDaemon: () => void): Menu {
+  const isMac = process.platform === 'darwin'
+  const template: MenuItemConstructorOptions[] = []
+  // macOS appMenu already carries a plain "Quit amber-ide" (quits the app,
+  // leaves the daemon running); on Linux we add that plain quit ourselves.
+  if (isMac) template.push({ role: 'appMenu' })
+  const submenu: MenuItemConstructorOptions[] = [
+    { label: 'Quit amber daemon', click: () => onQuitDaemon() },
+  ]
+  if (!isMac) submenu.push({ type: 'separator' }, { role: 'quit' })
+  template.push({ label: isMac ? 'Daemon' : 'File', submenu })
+  if (isMac) template.push({ role: 'editMenu' }, { role: 'windowMenu' })
+  return Menu.buildFromTemplate(template)
 }
 
 async function main(): Promise<void> {
@@ -140,6 +239,8 @@ async function main(): Promise<void> {
       nodeIntegration: false,
     },
   })
+
+  Menu.setApplicationMenu(buildAppMenu(() => { void quitDaemonAndApp(win) }))
 
   // Auto-detect the kernel-6.17/Chromium GPU-shm failure. If we're NOT already
   // in compat mode and the GPU crashes / the renderer dies / the page never

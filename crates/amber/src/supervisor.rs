@@ -32,10 +32,10 @@ pub fn supervise_claude(
 ) -> anyhow::Result<SuperviseOutcome> {
     let store = StateStore::new(root);
     let mut attempts = 0u32;
-    // Escalation within a run of the SAME recorded id: Resume -> Continue ->
-    // Fresh. Reset whenever the recorded id changes (e.g. the hook records a
-    // new id after a fresh start), so a crash then resumes the new id rather
-    // than continuing to escalate.
+    // Escalation within a run of the SAME recorded id: Resume (escalation 0) ->
+    // Fresh (every later attempt). Reset whenever the recorded id changes (e.g.
+    // the hook records a new id after a fresh start), so a crash then resumes
+    // the new id rather than continuing to escalate. See `select_start`.
     let mut escalation = 0u32;
     let mut prev_id: Option<String> = None;
     loop {
@@ -44,14 +44,7 @@ pub fn supervise_claude(
             escalation = 0;
             prev_id = session_id.clone();
         }
-        let start = match (&session_id, escalation) {
-            // Recorded id -> Resume it; on failure fall straight to Fresh. NOT
-            // --continue: it resumes the most recent conversation in the cwd,
-            // which can hijack an UNRELATED one (e.g. a separate `claude` run in
-            // the same dir). A stale/empty id should start a clean conversation.
-            (Some(id), 0) => claude::ClaudeStart::Resume(id.clone()),
-            _ => claude::ClaudeStart::Fresh,
-        };
+        let start = select_start(session_id.as_deref(), escalation);
         let argv = claude::claude_argv(&start, settings);
 
         // A failure to even launch the child (e.g. a transient ETXTBSY while
@@ -65,20 +58,91 @@ pub fn supervise_claude(
             .env("AMBER_STATE_DIR", root)
             .status();
 
-        match outcome {
-            Ok(status) if status.success() => return Ok(SuperviseOutcome::CleanExit),
-            Ok(_) => {}
-            Err(e) => eprintln!("amber: failed to launch claude for session {name}: {e}"),
+        let class = classify_run(&outcome);
+        if class.is_success() {
+            return Ok(SuperviseOutcome::CleanExit);
+        }
+        if let Err(e) = &outcome {
+            eprintln!("amber: failed to launch claude for session {name}: {e}");
         }
 
         attempts += 1;
         escalation += 1;
-        if attempts >= max_attempts {
-            return Ok(SuperviseOutcome::Exhausted);
+        match retry_decision(attempts, max_attempts) {
+            None => return Ok(SuperviseOutcome::Exhausted),
+            Some(delay) => std::thread::sleep(delay),
         }
-        let backoff_ms = 200u64 * (1u64 << (attempts - 1));
-        std::thread::sleep(Duration::from_millis(backoff_ms));
     }
+}
+
+/// Pick how to start `claude` for one attempt (spec §6.2 resume ladder). A
+/// recorded id on the first, un-escalated attempt is resumed; every other case
+/// — no recorded id, or a later attempt after Resume already failed for this
+/// same id — starts `Fresh`. Deliberately NOT `--continue`: it resumes the most
+/// recent conversation in the cwd, which can hijack an UNRELATED one (e.g. a
+/// separate `claude` run in the same dir). A stale/empty id should start clean.
+fn select_start(session_id: Option<&str>, escalation: u32) -> claude::ClaudeStart {
+    match (session_id, escalation) {
+        (Some(id), 0) => claude::ClaudeStart::Resume(id.to_string()),
+        _ => claude::ClaudeStart::Fresh,
+    }
+}
+
+/// How a single `claude` run terminated. The supervisor collapses everything
+/// but [`RunClass::Success`] into "crashed, count it against the budget"; the
+/// finer variants exist so the classification is testable in isolation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunClass {
+    /// Exited 0 (clean exit / user quit).
+    Success,
+    /// Exited with a non-zero status code.
+    Nonzero,
+    /// Killed by a signal (Unix).
+    Signaled,
+    /// The child could not be launched at all (e.g. ENOENT / ETXTBSY).
+    LaunchFailed,
+}
+
+impl RunClass {
+    /// Only a clean exit short-circuits the retry loop.
+    fn is_success(self) -> bool {
+        matches!(self, RunClass::Success)
+    }
+}
+
+/// Classify the result of spawning `claude` once.
+fn classify_run(outcome: &std::io::Result<std::process::ExitStatus>) -> RunClass {
+    match outcome {
+        Ok(status) if status.success() => RunClass::Success,
+        Ok(_status) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                if _status.signal().is_some() {
+                    return RunClass::Signaled;
+                }
+            }
+            RunClass::Nonzero
+        }
+        Err(_) => RunClass::LaunchFailed,
+    }
+}
+
+/// After a failed attempt, decide whether to retry. `attempts` is the number of
+/// failures so far (including the one that just occurred). Returns the backoff
+/// to sleep before retrying, or `None` once the budget is exhausted.
+fn retry_decision(attempts: u32, max_attempts: u32) -> Option<Duration> {
+    if attempts >= max_attempts {
+        None
+    } else {
+        Some(backoff_delay(attempts))
+    }
+}
+
+/// Exponential backoff before the `attempts`-th retry: 200ms, 400ms, 800ms, …
+fn backoff_delay(attempts: u32) -> Duration {
+    let backoff_ms = 200u64 * (1u64 << (attempts - 1));
+    Duration::from_millis(backoff_ms)
 }
 
 /// Resolve claude, supervise it for `name`, and fall through to an
@@ -138,4 +202,100 @@ fn shell_fallback(cwd: &Path) -> anyhow::Result<()> {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
     let err = Command::new(&shell).arg("-l").current_dir(cwd).exec();
     Err(anyhow::anyhow!("failed to exec shell fallback {shell}: {err}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::ExitStatus;
+
+    #[test]
+    fn select_start_resumes_recorded_id_first() {
+        // A recorded id on the first (un-escalated) attempt -> resume it.
+        assert_eq!(
+            select_start(Some("sid-7"), 0),
+            claude::ClaudeStart::Resume("sid-7".to_string())
+        );
+    }
+
+    #[test]
+    fn select_start_falls_back_to_fresh_after_resume_fails() {
+        // The ladder: once Resume has been tried (escalation > 0) for the same
+        // recorded id, every later attempt starts Fresh — NOT Continue and NOT
+        // another Resume.
+        for escalation in 1..=3 {
+            assert_eq!(
+                select_start(Some("sid-7"), escalation),
+                claude::ClaudeStart::Fresh,
+                "escalation {escalation} should fall back to Fresh"
+            );
+        }
+    }
+
+    #[test]
+    fn select_start_fresh_when_no_recorded_id() {
+        // A never-run session (no recorded id) always starts Fresh, regardless
+        // of escalation.
+        assert_eq!(select_start(None, 0), claude::ClaudeStart::Fresh);
+        assert_eq!(select_start(None, 2), claude::ClaudeStart::Fresh);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_clean_exit_is_success() {
+        use std::os::unix::process::ExitStatusExt;
+        let ok: std::io::Result<ExitStatus> = Ok(ExitStatus::from_raw(0));
+        assert_eq!(classify_run(&ok), RunClass::Success);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_nonzero_exit_is_nonzero() {
+        use std::os::unix::process::ExitStatusExt;
+        // wait-status for a normal exit with code 1 is (code << 8).
+        let bad: std::io::Result<ExitStatus> = Ok(ExitStatus::from_raw(1 << 8));
+        assert_eq!(classify_run(&bad), RunClass::Nonzero);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_signal_death_is_signaled() {
+        use std::os::unix::process::ExitStatusExt;
+        // wait-status for death by signal 9 is the raw signal number.
+        let killed: std::io::Result<ExitStatus> = Ok(ExitStatus::from_raw(9));
+        assert_eq!(classify_run(&killed), RunClass::Signaled);
+    }
+
+    #[test]
+    fn classify_launch_failure_is_launch_failed() {
+        // A child that never launches (e.g. ENOENT / ETXTBSY) counts as a crash
+        // against the retry budget, not a clean exit.
+        let err: std::io::Result<ExitStatus> =
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert_eq!(classify_run(&err), RunClass::LaunchFailed);
+    }
+
+    #[test]
+    fn only_success_short_circuits_the_loop() {
+        assert!(RunClass::Success.is_success());
+        assert!(!RunClass::Nonzero.is_success());
+        assert!(!RunClass::Signaled.is_success());
+        assert!(!RunClass::LaunchFailed.is_success());
+    }
+
+    #[test]
+    fn retry_decision_caps_at_max_attempts() {
+        // Below the cap: keep retrying (Some backoff). At/above the cap: give up.
+        assert!(retry_decision(1, 3).is_some());
+        assert!(retry_decision(2, 3).is_some());
+        assert!(retry_decision(3, 3).is_none(), "3rd failure exhausts the budget");
+        assert!(retry_decision(4, 3).is_none());
+    }
+
+    #[test]
+    fn backoff_doubles_per_attempt() {
+        assert_eq!(backoff_delay(1), Duration::from_millis(200));
+        assert_eq!(backoff_delay(2), Duration::from_millis(400));
+        assert_eq!(backoff_delay(3), Duration::from_millis(800));
+    }
 }

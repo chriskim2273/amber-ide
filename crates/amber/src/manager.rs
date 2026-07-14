@@ -254,6 +254,13 @@ impl SessionManager {
         self.sessions.lock().unwrap().get(name).cloned()
     }
 
+    /// The persisted kind of a session, from the state store (None if the
+    /// metadata is missing/unreadable). Consulted on Attach to apply the
+    /// spec-§5 reconnect semantics for raw clients.
+    pub fn session_kind(&self, name: &str) -> Option<SessionKind> {
+        self.store.read_session(name).ok().flatten().map(|m| m.kind)
+    }
+
     pub fn names(&self) -> Vec<String> {
         let mut v: Vec<String> = self.sessions.lock().unwrap().keys().cloned().collect();
         v.sort();

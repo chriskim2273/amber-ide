@@ -45,7 +45,8 @@ session.
    to the daemon socket and forwards to the renderer via MessagePort; the main
    process does window management only.
 5. **Rendering:** xterm.js + `@xterm/addon-webgl` (never the DOM renderer;
-   handle WebGL context loss with a canvas fallback). xterm instances live
+   on WebGL context loss dispose the addon and fall back to xterm's built-in
+   DOM renderer — xterm 5+ ships no separate canvas addon). xterm instances live
    outside React reconciliation — imperative writes via refs. React renders
    chrome only. Never a React state update per output chunk.
 6. **Persistence is the daemon's job, not the app's.** Crash survival: the

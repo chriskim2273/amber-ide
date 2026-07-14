@@ -95,6 +95,16 @@ fn parse_kind(kind: &str) -> anyhow::Result<SessionKind> {
     }
 }
 
+/// Should this Attach suppress historical backlog replay? Spec §5: a plain
+/// terminal (raw client) cannot safely replay an alt-screen (claude)
+/// session's history — it relies on the child's next repaint instead.
+/// xterm.js clients (raw_client=false, a full emulator) and shell sessions
+/// always get the backlog. Unknown kind (missing metadata) replays too:
+/// losing scrollback is worse than a cosmetic glitch we cannot prove.
+fn suppress_backlog(raw_client: bool, kind: Option<SessionKind>) -> bool {
+    raw_client && kind == Some(SessionKind::Claude)
+}
+
 /// Per-connection loop: decode frames from the read half, dispatch each one,
 /// and reply/forward via the shared write half.
 fn handle_connection(
@@ -181,7 +191,7 @@ fn handle_control(
             let names = manager.names();
             let _ = write_frame(writer, &Frame::Control(ControlMsg::SessionList { names }));
         }
-        ControlMsg::Attach { name } => {
+        ControlMsg::Attach { name, raw_client } => {
             let Some(sess) = manager.session(&name) else {
                 let _ = write_frame(
                     writer,
@@ -205,16 +215,31 @@ fn handle_control(
                 }
             });
             let (sub_id, backlog, rx) = sess.subscribe();
-            if write_frame(
-                writer,
-                &Frame::Data { session: name.clone(), bytes: backlog },
-            )
-            .is_err()
+            // Spec §5 reconnect semantics: a raw client (plain terminal)
+            // attaching to an alt-screen (claude) session gets NO historical
+            // backlog — replaying alt-screen/cursor sequences into a cold
+            // terminal corrupts it. The child is nudged to repaint below.
+            // Shell sessions, and all xterm.js attaches, replay in full.
+            let skip_backlog = suppress_backlog(raw_client, manager.session_kind(&name));
+            if !skip_backlog
+                && write_frame(writer, &Frame::Data { session: name.clone(), bytes: backlog })
+                    .is_err()
             {
                 sess.unsubscribe(sub_id);
                 return;
             }
             subscriptions.push((name.clone(), Arc::clone(&sess), sub_id));
+            if skip_backlog {
+                // Repaint nudge: resize one column away and back delivers two
+                // SIGWINCHes with a real size change, which alt-screen TUIs
+                // (claude/ink) answer with a full redraw — the same trick the
+                // app uses after reconnect (Pane.tsx). Best-effort: a nudge
+                // failure must not tear down the attach.
+                if let Some((rows, cols)) = sess.size() {
+                    let _ = sess.resize(rows, cols.saturating_sub(1).max(1));
+                    let _ = sess.resize(rows, cols);
+                }
+            }
             let writer = Arc::clone(writer);
             // `sess` moves into the forwarder so it can report the exit code.
             thread::spawn(move || {
@@ -307,6 +332,15 @@ fn handle_control(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backlog_suppressed_only_for_raw_client_on_claude_sessions() {
+        assert!(suppress_backlog(true, Some(SessionKind::Claude)));
+        assert!(!suppress_backlog(true, Some(SessionKind::Shell)));
+        assert!(!suppress_backlog(false, Some(SessionKind::Claude)));
+        assert!(!suppress_backlog(false, Some(SessionKind::Shell)));
+        assert!(!suppress_backlog(true, None));
+    }
 
     #[test]
     fn prepare_socket_binds_fresh_path() {

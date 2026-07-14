@@ -1,4 +1,5 @@
-//! One owned pty + child process, with a reader thread that fans output into a
+//! One owned pty + child process, with a reader/batcher thread pair that
+//! coalesces output into ~16 ms frames (spec §9) and fans each frame into a
 //! capped scrollback [`Ring`] and to any live subscribers.
 
 use std::io::{Read, Write};
@@ -10,10 +11,26 @@ use std::thread;
 use amber_core::ring::Ring;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 
-/// Bounded per-subscriber output queue depth (in chunks). Memory per
-/// subscriber stays flat at `depth * read-chunk` (spec §9, e.g. `cat` of a
-/// huge file).
-const SUBSCRIBER_QUEUE_DEPTH: usize = 256;
+/// Bounded per-subscriber output queue depth (in frames). Memory per
+/// subscriber stays flat at `depth * BATCH_MAX_BYTES` = 2 MiB (spec §9, e.g.
+/// `cat` of a huge file) — the same budget as the pre-batching
+/// 256-chunks-of-8-KiB queue.
+const SUBSCRIBER_QUEUE_DEPTH: usize = 8;
+
+/// Output batching window (spec §9): pty reads landing within this span are
+/// coalesced into one frame before fan-out — matches the app's render
+/// cadence; never one frame per read. Worst-case added latency per byte.
+const BATCH_WINDOW: std::time::Duration = std::time::Duration::from_millis(16);
+
+/// A batch is flushed early once it reaches this size, so a torrent can't
+/// grow an unbounded frame inside the window.
+const BATCH_MAX_BYTES: usize = 256 * 1024;
+
+/// Depth of the bounded raw-read -> batcher channel (in reads of <= 8 KiB).
+/// Bounded so that when the batcher is blocked on saturated subscribers the
+/// raw reader also blocks after ~256 KiB, the pty fills, and the child
+/// throttles — the flat-memory backpressure invariant survives batching.
+const READER_CHANNEL_DEPTH: usize = 32;
 
 /// Retry cadence while at least one subscriber's queue is full.
 const STALL_POLL: std::time::Duration = std::time::Duration::from_millis(2);
@@ -39,9 +56,10 @@ pub struct PtySession {
     writer: Mutex<Box<dyn Write + Send>>,
     ring: Arc<Mutex<Ring>>,
     subs: Arc<Mutex<Subscribers>>,
-    /// Set by the reader thread (under the `subs` lock) once the pty hits
-    /// EOF. After that nobody will ever clear a newly-registered sender, so
-    /// `subscribe` must hand out an already-closed channel instead.
+    /// Set by the batcher thread (under the `subs` lock) once the pty hits
+    /// EOF and the final frame is flushed. After that nobody will ever clear
+    /// a newly-registered sender, so `subscribe` must hand out an
+    /// already-closed channel instead.
     reader_done: Arc<std::sync::atomic::AtomicBool>,
     next_sub_id: AtomicU64,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
@@ -194,8 +212,38 @@ impl PtySession {
         let subs: Arc<Mutex<Subscribers>> = Arc::new(Mutex::new(Vec::new()));
         let reader_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        // Reader thread: append to ring, fan out to live subscribers. Senders
-        // are snapshotted (subs lock released) BEFORE the blocking send, so a
+        // Output path, two threads (spec §9 batching):
+        //
+        //   raw reader --bounded chan--> batcher --> ring + fan-out
+        //
+        // The raw reader must block in `read()` (portable-pty gives a
+        // blocking `std::io::Read` with no portable timed wait), so the ~16 ms
+        // coalescing window lives on a second, batcher thread that waits on
+        // the channel with `recv_timeout`. The channel is BOUNDED: when the
+        // batcher is wedged on saturated subscribers the raw reader blocks
+        // too, the pty fills, and the child throttles — batching cannot
+        // create unbounded buffering.
+        let (chunk_tx, chunk_rx) = sync_channel::<Vec<u8>>(READER_CHANNEL_DEPTH);
+
+        // Raw reader thread: blocking pty reads -> channel. Dropping the
+        // sender on EOF/read-error is the batcher's end-of-stream signal.
+        thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if chunk_tx.send(buf[..n].to_vec()).is_err() {
+                            break; // batcher gone (unreachable in practice)
+                        }
+                    }
+                }
+            }
+        });
+
+        // Batcher thread: coalesce reads into ~BATCH_WINDOW frames, append
+        // each frame to the ring, fan out to live subscribers. Senders are
+        // snapshotted (subs lock released) BEFORE the blocking delivery, so a
         // backpressured send never wedges subscribe(); dead subscribers
         // (receiver dropped) are pruned afterward.
         {
@@ -203,38 +251,59 @@ impl PtySession {
             let subs = Arc::clone(&subs);
             let reader_done = Arc::clone(&reader_done);
             thread::spawn(move || {
-                let mut buf = [0u8; 8192];
-                loop {
-                    match reader.read(&mut buf) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            let chunk = &buf[..n];
-                            // Push to the ring and snapshot the subscriber
-                            // list while STILL holding the ring lock —
-                            // subscribe() takes ring-then-subs in the same
-                            // order, so a subscriber can never slip in
-                            // between the push and the snapshot (which would
-                            // hand it this chunk both in its backlog and via
-                            // its channel).
-                            let senders: Subscribers = {
-                                let mut ring_guard = ring.lock().unwrap();
-                                ring_guard.push(chunk);
-                                subs.lock().unwrap().clone()
-                            };
-                            let dead = deliver_chunk(chunk, senders);
-                            if !dead.is_empty() {
-                                subs.lock().unwrap().retain(|(id, _)| !dead.contains(id));
+                use std::sync::mpsc::RecvTimeoutError;
+                use std::time::Instant;
+
+                'stream: loop {
+                    // Idle: block until the first bytes of a new frame.
+                    let mut batch = match chunk_rx.recv() {
+                        Ok(chunk) => chunk,
+                        Err(_) => break 'stream, // EOF, nothing pending
+                    };
+                    // First bytes open a <= BATCH_WINDOW coalescing window;
+                    // the frame closes when the window elapses, the size cap
+                    // is hit, or the stream ends (EOF must flush the tail).
+                    let deadline = Instant::now() + BATCH_WINDOW;
+                    let mut eof = false;
+                    while batch.len() < BATCH_MAX_BYTES {
+                        let now = Instant::now();
+                        if now >= deadline {
+                            break;
+                        }
+                        match chunk_rx.recv_timeout(deadline - now) {
+                            Ok(chunk) => batch.extend_from_slice(&chunk),
+                            Err(RecvTimeoutError::Timeout) => break,
+                            Err(RecvTimeoutError::Disconnected) => {
+                                eof = true;
+                                break;
                             }
                         }
-                        Err(_) => break,
+                    }
+                    // Push to the ring and snapshot the subscriber list while
+                    // STILL holding the ring lock — subscribe() takes
+                    // ring-then-subs in the same order, so a subscriber can
+                    // never slip in between the push and the snapshot (which
+                    // would hand it this frame both in its backlog and via
+                    // its channel).
+                    let senders: Subscribers = {
+                        let mut ring_guard = ring.lock().unwrap();
+                        ring_guard.push(&batch);
+                        subs.lock().unwrap().clone()
+                    };
+                    let dead = deliver_chunk(&batch, senders);
+                    if !dead.is_empty() {
+                        subs.lock().unwrap().retain(|(id, _)| !dead.contains(id));
+                    }
+                    if eof {
+                        break 'stream;
                     }
                 }
-                // Pty EOF/read error: the child is gone. Drop every
-                // subscriber's sender so their channels close — attached
-                // clients must observe the pane ending, not silence. The
-                // done-flag is set under the same lock `subscribe` takes, so
-                // a late subscriber can never register a sender that nobody
-                // will clear.
+                // Pty EOF/read error: the child is gone and the tail frame
+                // (if any) was delivered above. Drop every subscriber's
+                // sender so their channels close — attached clients must
+                // observe the pane ending, not silence. The done-flag is set
+                // under the same lock `subscribe` takes, so a late subscriber
+                // can never register a sender that nobody will clear.
                 let mut subs = subs.lock().unwrap();
                 reader_done.store(true, Ordering::SeqCst);
                 subs.clear();
@@ -304,6 +373,17 @@ impl PtySession {
             pixel_height: 0,
         })?;
         Ok(())
+    }
+
+    /// Current pty size as `(rows, cols)`, if the master reports one. Used
+    /// by the daemon's repaint nudge (resize away and back, spec §5).
+    pub fn size(&self) -> Option<(u16, u16)> {
+        self.master
+            .lock()
+            .unwrap()
+            .get_size()
+            .ok()
+            .map(|s| (s.rows, s.cols))
     }
 
     /// Current scrollback contents (oldest byte first).
@@ -639,6 +719,115 @@ mod tests {
                 ),
             }
         }
+    }
+
+    #[test]
+    fn rapid_writes_coalesce_into_fewer_frames() {
+        // Spec §9 batching: many small writes landing within ~16 ms of each
+        // other must be coalesced into shared frames before fan-out — never
+        // one frame per pty read. The child emits 50 distinct small writes
+        // ~2 ms apart (each lands as its own pty read); unbatched delivery
+        // yields ~50 frames, ~16 ms batching yields roughly 100ms/16ms ≈ 7.
+        // Assert by frame COUNT with a generous margin (<= 20), never by
+        // tight wall-clock, so CI load can't flake it. Content equality also
+        // proves ordering and losslessness across batch boundaries.
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.arg("-c");
+        cmd.arg("sleep 0.1; for i in $(seq 1 50); do printf '%s,' \"$i\"; sleep 0.002; done");
+        let sess = PtySession::spawn(cmd, 24, 80, 64 * 1024).unwrap();
+        let (_id, backlog, rx) = sess.subscribe();
+        assert!(backlog.is_empty(), "child ran before subscribe could race it");
+
+        let mut frames = 0usize;
+        let mut acc: Vec<u8> = Vec::new();
+        // Drain until the channel closes (child exit closes it).
+        while let Ok(chunk) = rx.recv_timeout(Duration::from_secs(10)) {
+            frames += 1;
+            acc.extend_from_slice(&chunk);
+        }
+
+        let expected: Vec<u8> = (1..=50).fold(Vec::new(), |mut v, i| {
+            v.extend_from_slice(format!("{i},").as_bytes());
+            v
+        });
+        assert_eq!(
+            acc, expected,
+            "bytes were lost, duplicated, or reordered across batches"
+        );
+        assert!(
+            frames <= 20,
+            "50 rapid writes arrived in {frames} frames — output is not being \
+             coalesced into ~16 ms batches (spec §9)"
+        );
+        assert!(frames >= 2, "sanity: expected multiple frames, got {frames}");
+    }
+
+    #[test]
+    fn tail_bytes_flush_on_child_exit() {
+        // Bytes emitted immediately before exit must be flushed to
+        // subscribers BEFORE their channels close — a pending ~16 ms batch
+        // must never be dropped on EOF.
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.arg("-c");
+        // A beat of silence first so the tail bytes sit in a fresh,
+        // not-yet-elapsed batch window when EOF lands.
+        cmd.arg("sleep 0.1; printf tail-marker");
+        let sess = PtySession::spawn(cmd, 24, 80, 4096).unwrap();
+        let (_id, backlog, rx) = sess.subscribe();
+        let mut acc = backlog;
+        loop {
+            match rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(chunk) => acc.extend_from_slice(&chunk),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    panic!("channel never closed after child exit")
+                }
+            }
+        }
+        assert!(
+            acc.windows(11).any(|w| w == b"tail-marker"),
+            "tail bytes lost at EOF; got {:?}",
+            String::from_utf8_lossy(&acc)
+        );
+    }
+
+    #[test]
+    fn slow_trickle_is_not_held_hostage_by_the_batch_window() {
+        // A trickle (1 write per 50 ms — slower than the batch window) must
+        // still be delivered promptly: each write's window times out alone,
+        // so writes arrive as separate frames instead of clumping into one
+        // giant late frame. Frame count is the latency proxy (per task spec:
+        // no tight wall-clock asserts); a coarse overall deadline guards
+        // against pathological holding.
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.arg("-c");
+        cmd.arg("sleep 0.1; for i in a b c d e; do printf '%s' \"$i\"; sleep 0.05; done");
+        let sess = PtySession::spawn(cmd, 24, 80, 4096).unwrap();
+        let (_id, backlog, rx) = sess.subscribe();
+        assert!(backlog.is_empty(), "child ran before subscribe could race it");
+
+        let start = Instant::now();
+        let mut frames = 0usize;
+        let mut acc: Vec<u8> = Vec::new();
+        while let Ok(chunk) = rx.recv_timeout(Duration::from_secs(10)) {
+            frames += 1;
+            acc.extend_from_slice(&chunk);
+        }
+        let elapsed = start.elapsed();
+
+        assert_eq!(acc, b"abcde", "trickle bytes lost or reordered");
+        assert!(
+            frames >= 4,
+            "5 writes spaced 50 ms apart arrived in only {frames} frames — \
+             the batch window is holding bytes across idle gaps (latency \
+             far exceeds ~16 ms)"
+        );
+        // 5 x 50 ms of production + generous CI slack. Only guards against
+        // a window that never flushes; NOT a tight latency assertion.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "trickle took {elapsed:?} to drain"
+        );
     }
 
     #[test]
