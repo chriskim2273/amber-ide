@@ -16,6 +16,14 @@ use crate::pty::PtySession;
 const DEFAULT_ROWS: u16 = 24;
 const DEFAULT_COLS: u16 = 80;
 
+/// The user's login-shell PATH, captured ONCE per process (it doesn't change).
+/// Computing it per-manager would spawn a login shell on every `new()`, which
+/// under the parallel test run overloads fork/exec.
+fn login_path() -> Option<&'static String> {
+    static LOGIN_PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    LOGIN_PATH.get_or_init(capture_login_path).as_ref()
+}
+
 /// Capture the user's login-shell PATH so spawned panes resolve tools (nvm/node,
 /// ~/.local/bin, …) that the daemon's minimal systemd PATH lacks — otherwise a
 /// pane's programs and claude's own hooks (which run `node`) fail.
@@ -42,10 +50,6 @@ pub struct SessionManager {
     cfg: Config,
     root: PathBuf,
     sessions: Mutex<HashMap<String, Arc<PtySession>>>,
-    /// The user's login-shell PATH, so spawned panes (and their programs /
-    /// claude hooks, e.g. node) resolve tools the daemon's own systemd PATH
-    /// lacks. Captured once at startup.
-    login_path: Option<String>,
 }
 
 impl SessionManager {
@@ -59,7 +63,6 @@ impl SessionManager {
             cfg,
             root,
             sessions: Mutex::new(HashMap::new()),
-            login_path: capture_login_path(),
         })
     }
 
@@ -152,7 +155,7 @@ impl SessionManager {
         cmd.env("COLORTERM", "truecolor");
         // Give panes the user's login PATH so their tools + claude's hooks
         // (node) resolve, not just the daemon's minimal systemd PATH.
-        if let Some(path) = &self.login_path {
+        if let Some(path) = login_path() {
             cmd.env("PATH", path);
         }
         Ok(Arc::new(PtySession::spawn(
