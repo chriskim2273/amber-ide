@@ -214,8 +214,16 @@ async function main(): Promise<void> {
   })
 }
 
-app.whenReady().then(main).catch((e) => {
-  console.error(e)
+// Single-instance lock: a second launch (or a dev run whose predecessor didn't
+// fully exit) would open a second window + utilityProcess attaching the same
+// daemon sessions — duplicate subscriptions that read as "input sent twice".
+// Refuse to run a duplicate; the first instance keeps ownership.
+if (!app.requestSingleInstanceLock()) {
   app.quit()
-})
+} else {
+  app.whenReady().then(main).catch((e) => {
+    console.error(e)
+    app.quit()
+  })
+}
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit() })
