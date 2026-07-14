@@ -16,6 +16,8 @@ declare global {
       killSession: (name: string) => void
       loadLayout: () => Promise<string | null>
       saveLayout: (text: string) => Promise<void>
+      homeDir: string
+      pickFolder: () => Promise<string | null>
     }
   }
 }
@@ -38,6 +40,10 @@ function App(): JSX.Element {
   const [activeTab, setActiveTab] = useState(1)
   const [activeWs, setActiveWs] = useState(1)
   const [kind, setKind] = useState<'shell' | 'claude'>('shell')
+  // Absolute working directory for newly created panes (default $HOME). Sent
+  // verbatim so a session restores in the SAME folder — a relative '.' would
+  // drift to the daemon's cwd ($HOME under systemd) on restart.
+  const [cwd, setCwd] = useState<string>(() => window.amber?.homeDir ?? '/')
   const [connected, setConnected] = useState(true)
   // Gate ALL layout persistence until the sidecar has loaded. Otherwise a
   // Sessions event arriving before loadLayout resolves would reconcile against
@@ -136,7 +142,7 @@ function App(): JSX.Element {
   const currentWs = ws?.ws ?? activeWs
   const currentTab = tab?.tab ?? activeTab
   const newPane = (tabId: number, ord: number): void =>
-    window.amber.createSession(formatName({ ws: currentWs, tab: tabId, ord, id: makeId() }), '.', kind)
+    window.amber.createSession(formatName({ ws: currentWs, tab: tabId, ord, id: makeId() }), cwd, kind)
 
   const nextWs = (workspaces.reduce((m, w) => Math.max(m, w.ws), 0)) + 1
 
@@ -148,12 +154,20 @@ function App(): JSX.Element {
         {workspaces.map((w) => (
           <button key={w.ws} onClick={() => setActiveWs(w.ws)} style={{ fontWeight: w.ws === (ws?.ws ?? -1) ? 'bold' : 'normal' }}>{w.ws}</button>
         ))}
-        <button onClick={() => { setActiveWs(nextWs); window.amber.createSession(formatName({ ws: nextWs, tab: 1, ord: 0, id: makeId() }), '.', kind); setActiveTab(1) }}>+ ws</button>
+        <button onClick={() => { setActiveWs(nextWs); window.amber.createSession(formatName({ ws: nextWs, tab: 1, ord: 0, id: makeId() }), cwd, kind); setActiveTab(1) }}>+ ws</button>
         <span style={{ marginLeft: 12 }}>new:</span>
         <select value={kind} onChange={(e) => setKind(e.target.value as 'shell' | 'claude')}>
           <option value="shell">shell</option>
           <option value="claude">claude</option>
         </select>
+        <span style={{ marginLeft: 8 }}>in:</span>
+        <button
+          title={`${cwd} — click to choose folder`}
+          onClick={() => void window.amber.pickFolder().then((p) => { if (p) setCwd(p) })}
+          style={{ maxWidth: 260, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+        >
+          📁 {cwd.startsWith(window.amber.homeDir) ? '~' + cwd.slice(window.amber.homeDir.length) : cwd}
+        </button>
       </div>
       <div style={{ display: 'flex', gap: 4, padding: 4, background: '#222' }}>
         {tabs.map((t) => (
@@ -169,7 +183,7 @@ function App(): JSX.Element {
               onSetRatio={(path, r) => putTree(setRatio(tree, path, r))}
               onSplit={(paneId, dir) => {
                 const name = formatName({ ws: currentWs, tab: currentTab, ord: nextOrd, id: makeId() })
-                window.amber.createSession(name, '.', kind)
+                window.amber.createSession(name, cwd, kind)
                 setPending((p) => ({ ...p, [name]: { paneId, dir } }))
               }}
               onClose={(paneId) => { window.amber.killSession(paneId); putTree(removeLeaf(tree, paneId)) }} />

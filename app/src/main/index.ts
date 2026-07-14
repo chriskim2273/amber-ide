@@ -1,5 +1,5 @@
 import { app, BrowserWindow, utilityProcess, MessageChannelMain } from 'electron'
-import { ipcMain } from 'electron'
+import { ipcMain, dialog } from 'electron'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 import { spawn } from 'node:child_process'
@@ -200,6 +200,11 @@ async function main(): Promise<void> {
     const { port1: rPort, port2: uPort } = new MessageChannelMain()
     child.postMessage({ kind: 'pane', session }, [uPort])
     win.webContents.postMessage('pane-port', { session }, [rPort])
+  })
+
+  ipcMain.handle('pick-folder', async () => {
+    const r = await dialog.showOpenDialog(win, { properties: ['openDirectory', 'createDirectory'] })
+    return r.canceled || r.filePaths.length === 0 ? null : r.filePaths[0]
   })
 
   ipcMain.handle('layout-load', async () => {
