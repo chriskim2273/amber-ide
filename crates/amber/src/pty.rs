@@ -101,6 +101,61 @@ fn deliver_chunk(chunk: &[u8], senders: Subscribers) -> Vec<u64> {
     dead
 }
 
+/// Basename of a pid's argv[0] == "claude"?
+fn is_claude_pid(pid: u32) -> bool {
+    std::fs::read(format!("/proc/{pid}/cmdline"))
+        .ok()
+        .map(|b| {
+            let s = String::from_utf8_lossy(&b);
+            let argv0 = s.split('\0').next().unwrap_or("");
+            argv0.rsplit('/').next() == Some("claude")
+        })
+        .unwrap_or(false)
+}
+
+/// Is any `claude` process a descendant of `root_pid`? Builds a pid->ppid map
+/// from /proc and walks each claude's ancestor chain. Linux-only.
+fn claude_descends_from(root_pid: u32) -> bool {
+    use std::collections::HashMap;
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    let mut ppid_of: HashMap<u32, u32> = HashMap::new();
+    let mut claude_pids: Vec<u32> = Vec::new();
+    for e in entries.flatten() {
+        let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        // /proc/<pid>/stat: "pid (comm) state ppid ..." — after the last ')',
+        // ppid is the second whitespace field (state is first).
+        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            if let Some(close) = stat.rfind(')') {
+                if let Some(ppid) = stat[close + 1..]
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|p| p.parse::<u32>().ok())
+                {
+                    ppid_of.insert(pid, ppid);
+                }
+            }
+        }
+        if is_claude_pid(pid) {
+            claude_pids.push(pid);
+        }
+    }
+    for &cp in &claude_pids {
+        let mut cur = cp;
+        for _ in 0..64 {
+            match ppid_of.get(&cur) {
+                Some(&pp) if pp == root_pid => return true,
+                Some(&pp) if pp > 1 => cur = pp,
+                _ => break,
+            }
+        }
+    }
+    false
+}
+
 impl PtySession {
     /// Spawn `cmd` in a fresh pty of `rows`x`cols`, retaining at most `cap`
     /// bytes of scrollback.
@@ -222,6 +277,14 @@ impl PtySession {
     pub fn live_cwd(&self) -> Option<std::path::PathBuf> {
         let pid = self.pid?;
         std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+    }
+
+    /// True if a `claude` process is currently a descendant of the child (i.e.
+    /// the user started claude by hand inside this shell). Used to decide
+    /// whether to relaunch the pane as a supervised, resumable claude on
+    /// restore. Linux-only (`/proc`); false elsewhere.
+    pub fn is_running_claude(&self) -> bool {
+        self.pid.map(claude_descends_from).unwrap_or(false)
     }
 
     /// Write bytes to the child's stdin.

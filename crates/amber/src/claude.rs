@@ -132,6 +132,65 @@ pub fn ensure_cwd_trusted(cwd: &Path) {
     }
 }
 
+/// Ensure a GLOBAL claude `SessionStart` hook running `hook_command` exists in
+/// `~/.claude/settings.json`, so a claude the user starts by hand inside an
+/// amber shell also records its resume id (the per-session `--settings` hook
+/// only covers amber-launched claude). Idempotent and merge-preserving.
+pub fn ensure_global_claude_hook(hook_command: &str) {
+    if let Ok(home) = std::env::var("HOME") {
+        add_global_hook_in(&PathBuf::from(home).join(".claude").join("settings.json"), hook_command);
+    }
+}
+
+fn add_global_hook_in(config: &Path, hook_command: &str) {
+    let mut root: serde_json::Value = std::fs::read_to_string(config)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    let hooks = root
+        .as_object_mut()
+        .unwrap()
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}));
+    if !hooks.is_object() {
+        *hooks = serde_json::json!({});
+    }
+    let ss = hooks
+        .as_object_mut()
+        .unwrap()
+        .entry("SessionStart")
+        .or_insert_with(|| serde_json::json!([]));
+    if !ss.is_array() {
+        *ss = serde_json::json!([]);
+    }
+    let arr = ss.as_array_mut().unwrap();
+
+    // Already installed? Don't duplicate.
+    let present = arr.iter().any(|group| {
+        group
+            .get("hooks")
+            .and_then(|h| h.as_array())
+            .map(|hs| hs.iter().any(|h| h.get("command").and_then(|c| c.as_str()) == Some(hook_command)))
+            .unwrap_or(false)
+    });
+    if present {
+        return;
+    }
+    arr.push(serde_json::json!({ "hooks": [ { "type": "command", "command": hook_command } ] }));
+
+    if let Some(dir) = config.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(out) = serde_json::to_string_pretty(&root) {
+        let tmp = config.with_extension("json.amber-tmp");
+        if std::fs::write(&tmp, out).is_ok() {
+            let _ = std::fs::rename(&tmp, config);
+        }
+    }
+}
+
 fn trust_cwd_in(config: &Path, cwd: &Path) {
     let Ok(text) = std::fs::read_to_string(config) else { return };
     let Ok(mut root) = serde_json::from_str::<serde_json::Value>(&text) else { return };
@@ -255,6 +314,42 @@ mod tests {
         // Unrelated keys and existing projects survive the rewrite.
         assert_eq!(v["numStartups"], serde_json::json!(5));
         assert_eq!(v["projects"]["/existing"]["hasTrustDialogAccepted"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn global_hook_merges_preserves_and_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let config = dir.path().join("settings.json");
+        std::fs::write(
+            &config,
+            r#"{"theme":"dark","hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"other"}]}]}}"#,
+        )
+        .unwrap();
+        add_global_hook_in(&config, "/x/amber hook");
+        add_global_hook_in(&config, "/x/amber hook"); // idempotent
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
+        assert_eq!(v["theme"], serde_json::json!("dark")); // unrelated key preserved
+        let arr = v["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(arr.len(), 2, "existing hook group preserved, amber added once");
+        let amber = arr
+            .iter()
+            .filter(|g| g["hooks"][0]["command"] == serde_json::json!("/x/amber hook"))
+            .count();
+        assert_eq!(amber, 1, "amber hook present exactly once");
+    }
+
+    #[test]
+    fn global_hook_creates_missing_config() {
+        let dir = tempdir().unwrap();
+        let config = dir.path().join("nested").join("settings.json");
+        add_global_hook_in(&config, "/x/amber hook");
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
+        assert_eq!(
+            v["hooks"]["SessionStart"][0]["hooks"][0]["command"],
+            serde_json::json!("/x/amber hook")
+        );
     }
 
     #[test]

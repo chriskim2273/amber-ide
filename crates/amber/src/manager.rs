@@ -98,6 +98,11 @@ impl SessionManager {
                 let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
                 let mut cmd = CommandBuilder::new(shell);
                 cmd.cwd(cwd);
+                // A claude the user starts by hand in this shell inherits these,
+                // so the global SessionStart hook can record its resume id
+                // against this session name.
+                cmd.env("AMBER_SESSION", name);
+                cmd.env("AMBER_STATE_DIR", self.root.to_string_lossy().to_string());
                 Ok(cmd)
             }
             SessionKind::Claude => {
@@ -144,6 +149,7 @@ impl SessionManager {
             cwd,
             kind,
             updated: Self::now(),
+            resume_as_claude: false,
         };
         if let Err(e) = self.store.write_session(&meta) {
             // Don't leak the freshly-spawned child if persisting fails.
@@ -177,9 +183,17 @@ impl SessionManager {
         if meta.kind != SessionKind::Shell {
             return;
         }
-        let Some(live) = sess.live_cwd() else { return };
-        if live.is_dir() && live != meta.cwd {
-            let updated = SessionMeta { cwd: live, updated: Self::now(), ..meta };
+        let new_cwd = sess.live_cwd().filter(|d| d.is_dir()).unwrap_or_else(|| meta.cwd.clone());
+        // Was the user running claude by hand in this shell? If so, restore it as
+        // a resumable claude instead of a bare shell.
+        let new_resume = sess.is_running_claude();
+        if new_cwd != meta.cwd || new_resume != meta.resume_as_claude {
+            let updated = SessionMeta {
+                cwd: new_cwd,
+                resume_as_claude: new_resume,
+                updated: Self::now(),
+                ..meta
+            };
             let _ = self.store.write_session(&updated);
         }
     }
@@ -189,7 +203,11 @@ impl SessionManager {
         let metas = self.store.list_sessions()?;
         let mut sessions = self.sessions.lock().unwrap();
         for meta in metas {
-            let sess = self.spawn(meta.kind, &meta.name, &meta.cwd)?;
+            // A shell that was running a hand-started claude comes back as a
+            // supervised, resumable claude (which falls back to a shell when
+            // claude exits — so the pane never regresses).
+            let kind = if meta.resume_as_claude { SessionKind::Claude } else { meta.kind };
+            let sess = self.spawn(kind, &meta.name, &meta.cwd)?;
             if let Some(bytes) = self.store.read_scrollback(&meta.name)? {
                 sess.preload(&bytes);
             }
