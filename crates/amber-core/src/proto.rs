@@ -22,7 +22,16 @@ pub enum ControlMsg {
     Hello,
     ListSessions,
     Create { name: String, cwd: String, kind: String },
-    Attach { name: String },
+    /// `raw_client: true` marks a plain-terminal client (`amber attach`),
+    /// which cannot safely replay historical alt-screen bytes (spec §5).
+    /// `#[serde(default)]` keeps the wire backward compatible: clients that
+    /// omit the field (the Electron app, older binaries) keep getting the
+    /// full backlog.
+    Attach {
+        name: String,
+        #[serde(default)]
+        raw_client: bool,
+    },
     Detach { name: String },
     Resize { name: String, cols: u16, rows: u16 },
     Kill { name: String },
@@ -154,8 +163,17 @@ mod tests {
 
     #[test]
     fn control_frame_roundtrips() {
-        let f = Frame::Control(ControlMsg::Attach { name: "a".into() });
+        let f = Frame::Control(ControlMsg::Attach { name: "a".into(), raw_client: true });
         assert_eq!(roundtrip(&f), f);
+    }
+
+    #[test]
+    fn attach_without_raw_client_field_defaults_to_false() {
+        // Backward compatibility lock: the Electron app (and older binaries)
+        // send Attach without `raw_client`; they must decode as the
+        // full-backlog behavior, not an error.
+        let msg: ControlMsg = serde_json::from_str(r#"{"Attach":{"name":"a"}}"#).unwrap();
+        assert_eq!(msg, ControlMsg::Attach { name: "a".into(), raw_client: false });
     }
 
     #[test]

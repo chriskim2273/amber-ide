@@ -2,9 +2,13 @@
 //! Slice 0 step 2). Connects to the daemon socket, attaches a session, and
 //! proxies stdin/stdout raw bytes over the wire protocol.
 //!
-//! Per spec §5: this client does NOT replay alt-screen history specially —
-//! received bytes are written straight to stdout; a TUI child is expected to
-//! repaint on its own.
+//! Per spec §5: replaying raw history that contains alt-screen/cursor
+//! sequences into a cold terminal can corrupt it. So this client (a) resets
+//! the local terminal ([`TERM_RESET`]) before any replayed bytes land, and
+//! (b) attaches with `raw_client: true`, telling the daemon to suppress
+//! historical backlog for alt-screen (claude) sessions — those rely on the
+//! child's next repaint (the daemon nudges it with a resize). Shell history
+//! replays cleanly and is still sent in full.
 //!
 //! Single-threaded event loop over `poll(2)` (stdin + socket), so:
 //! - the daemon closing the socket tears the client down immediately (no
@@ -29,6 +33,15 @@ use nix::sys::termios::{self, SetArg, Termios};
 /// no fd is ready (a signal may interrupt poll on this thread, but flag-only
 /// delivery on another thread must still be noticed).
 const POLL_TICK_MS: u16 = 100;
+
+/// Written to the local terminal once per attach, before any replayed bytes
+/// (spec §5) — a minimal reset so replay lands in a known-good terminal:
+/// - `ESC [!p` (DECSTR soft reset): restores sane modes (autowrap, origin,
+///   cursor keys) without the screen-clearing side effects of a full RIS;
+/// - `ESC [?1049l`: leave the alternate screen, in case a previous attach
+///   died while a TUI held it;
+/// - `ESC [?25h`: show the cursor (TUIs hide it and may not have restored it).
+const TERM_RESET: &[u8] = b"\x1b[!p\x1b[?1049l\x1b[?25h";
 
 /// Why [`run_client`] returned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,9 +134,14 @@ pub fn run_client(
     mut stdout: impl Write,
     winch: &AtomicBool,
 ) -> anyhow::Result<ClientEnd> {
-    send_control(stream, ControlMsg::Attach { name: name.to_string() })?;
+    send_control(stream, ControlMsg::Attach { name: name.to_string(), raw_client: true })?;
     let (cols, rows) = current_size();
     send_control(stream, ControlMsg::Resize { name: name.to_string(), cols, rows })?;
+
+    // Reset the local terminal before any replayed backlog can land (spec
+    // §5) — see TERM_RESET for the exact sequences and why each is needed.
+    stdout.write_all(TERM_RESET)?;
+    stdout.flush()?;
 
     let mut decoder = Decoder::new();
     let mut sock_buf = [0u8; 8192];
@@ -320,6 +338,41 @@ mod tests {
         h.server.write_all(&proto::encode(&exit)).unwrap();
         let (end, out) = h.done.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(end.unwrap(), ClientEnd::SessionExit(0));
-        assert_eq!(out, b"OUTPUT");
+        assert_eq!(out, [TERM_RESET, b"OUTPUT"].concat());
+    }
+
+    #[test]
+    fn client_attaches_as_raw_client() {
+        // `amber attach` is the plain-terminal client: it must identify
+        // itself so the daemon can suppress alt-screen backlog replay
+        // (spec §5). The Electron app attaches without the flag.
+        let mut h = start_client();
+        let frame =
+            h.server_read_until(|f| matches!(f, Frame::Control(ControlMsg::Attach { .. })));
+        assert_eq!(
+            frame,
+            Frame::Control(ControlMsg::Attach { name: "s".into(), raw_client: true })
+        );
+        drop(h.server);
+        let _ = h.done.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+
+    #[test]
+    fn client_emits_terminal_reset_before_replayed_backlog() {
+        // The reset preamble must land before ANY replayed bytes (spec §5):
+        // the local terminal may still be in a mode a previous attach left it
+        // in (alt screen, hidden cursor).
+        let mut h = start_client();
+        h.expect_attach_and_initial_resize();
+        let data = Frame::Data { session: "s".into(), bytes: b"BACKLOG".to_vec() };
+        h.server.write_all(&proto::encode(&data)).unwrap();
+        let exit = Frame::Control(ControlMsg::Exit { name: "s".into(), code: 0 });
+        h.server.write_all(&proto::encode(&exit)).unwrap();
+        let (_, out) = h.done.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            out.starts_with(TERM_RESET),
+            "terminal reset must precede replayed bytes, got {out:?}"
+        );
+        assert!(out.ends_with(b"BACKLOG"), "replayed bytes lost, got {out:?}");
     }
 }

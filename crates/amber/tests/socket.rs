@@ -31,6 +31,73 @@ fn start_daemon() -> (PathBuf, tempfile::TempDir) {
     (socket_path, dir)
 }
 
+/// Like [`start_daemon`], but also hands back the manager so tests can seed
+/// scrollback rings and flip persisted metadata directly.
+fn start_daemon_with_manager() -> (PathBuf, Arc<SessionManager>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("state");
+    std::fs::create_dir_all(&root).unwrap();
+    let socket_path = dir.path().join("amberd.sock");
+
+    let manager = Arc::new(SessionManager::new(&root).unwrap());
+    let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+    let daemon = Daemon::new(Arc::clone(&manager), Arc::new(Watchers::new()));
+    thread::spawn(move || {
+        let _ = daemon.serve(listener);
+    });
+
+    (socket_path, manager, dir)
+}
+
+/// Rewrite a session's persisted kind to `claude`. Tests cannot spawn a real
+/// claude-kind session (its pty would run `current_exe() run <name>` — i.e.
+/// this test binary), so they spawn a shell and flip the metadata the daemon
+/// consults on Attach.
+fn flip_kind_to_claude(state_root: &Path, name: &str) {
+    let store = amber_core::state::StateStore::new(state_root);
+    let mut meta = store.read_session(name).unwrap().unwrap();
+    meta.kind = amber_core::state::SessionKind::Claude;
+    store.write_session(&meta).unwrap();
+}
+
+/// Accumulate Data-frame bytes from `stream` until `pred(acc)` matches, or
+/// panic after `timeout`. Returns everything accumulated.
+fn read_data_until<F: Fn(&[u8]) -> bool>(
+    stream: &mut UnixStream,
+    decoder: &mut Decoder,
+    pred: F,
+    timeout: Duration,
+) -> Vec<u8> {
+    stream.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+    let deadline = Instant::now() + timeout;
+    let mut acc = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        while let Some(frame) = decoder.next_frame().unwrap() {
+            if let Frame::Data { bytes, .. } = frame {
+                acc.extend_from_slice(&bytes);
+            }
+        }
+        if pred(&acc) {
+            return acc;
+        }
+        if Instant::now() > deadline {
+            panic!(
+                "timed out waiting for expected data; got {:?}",
+                String::from_utf8_lossy(&acc)
+            );
+        }
+        match stream.read(&mut buf) {
+            Ok(0) => panic!("daemon closed the connection unexpectedly"),
+            Ok(n) => decoder.feed(&buf[..n]),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) => panic!("read error: {e}"),
+        }
+    }
+}
+
 fn connect_with_retry(path: &Path) -> UnixStream {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -100,7 +167,7 @@ fn disconnecting_client_releases_its_subscription() {
     let sess = manager.session("idle").unwrap();
 
     let mut stream = connect_with_retry(&socket_path);
-    send(&mut stream, &Frame::Control(ControlMsg::Attach { name: "idle".into() }));
+    send(&mut stream, &Frame::Control(ControlMsg::Attach { name: "idle".into(), raw_client: false }));
 
     let deadline = Instant::now() + Duration::from_secs(5);
     while sess.subscriber_count() != 1 {
@@ -143,7 +210,7 @@ fn reattach_replaces_subscription_not_stacks_it() {
     let sess = manager.session("idle").unwrap();
 
     let mut stream = connect_with_retry(&socket_path);
-    send(&mut stream, &Frame::Control(ControlMsg::Attach { name: "idle".into() }));
+    send(&mut stream, &Frame::Control(ControlMsg::Attach { name: "idle".into(), raw_client: false }));
 
     let deadline = Instant::now() + Duration::from_secs(5);
     while sess.subscriber_count() != 1 {
@@ -152,7 +219,7 @@ fn reattach_replaces_subscription_not_stacks_it() {
     }
 
     // Re-Attach on the same connection; the count must never stack to 2.
-    send(&mut stream, &Frame::Control(ControlMsg::Attach { name: "idle".into() }));
+    send(&mut stream, &Frame::Control(ControlMsg::Attach { name: "idle".into(), raw_client: false }));
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
         assert!(
@@ -187,7 +254,7 @@ fn socket_roundtrip_create_attach_write_read() {
         Duration::from_secs(5),
     );
 
-    send(&mut stream, &Frame::Control(ControlMsg::Attach { name: "s".into() }));
+    send(&mut stream, &Frame::Control(ControlMsg::Attach { name: "s".into(), raw_client: false }));
     send(
         &mut stream,
         &Frame::Data {
@@ -281,7 +348,7 @@ fn attached_client_receives_exit_when_child_dies() {
         Duration::from_secs(5),
     );
 
-    send(&mut stream, &Frame::Control(ControlMsg::Attach { name: "mortal".into() }));
+    send(&mut stream, &Frame::Control(ControlMsg::Attach { name: "mortal".into(), raw_client: false }));
     send(
         &mut stream,
         &Frame::Data { session: "mortal".into(), bytes: b"exit\n".to_vec() },
@@ -396,4 +463,85 @@ fn list_sessions_returns_all_created_names() {
         }
         _ => unreachable!(),
     }
+}
+
+// --- spec §5 reconnect semantics: backlog replay depends on client + kind ---
+
+#[test]
+fn raw_attach_to_claude_session_skips_backlog() {
+    // A plain-terminal client (`amber attach`, raw_client: true) attaching to
+    // an alt-screen (claude) session must NOT receive historical backlog —
+    // replaying alt-screen bytes into a cold terminal corrupts it (spec §5).
+    // The child repaints via the daemon's resize nudge instead.
+    let (socket_path, manager, dir) = start_daemon_with_manager();
+    manager
+        .create("c", "/tmp", amber_core::state::SessionKind::Shell)
+        .unwrap();
+    flip_kind_to_claude(&dir.path().join("state"), "c");
+    let sess = manager.session("c").unwrap();
+    sess.preload(b"OLD_ALT_SCREEN_BYTES");
+
+    let mut stream = connect_with_retry(&socket_path);
+    let mut decoder = Decoder::new();
+    send(&mut stream, &Frame::Control(ControlMsg::Attach { name: "c".into(), raw_client: true }));
+    // Same connection, so the daemon handles Attach before this input.
+    send(&mut stream, &Frame::Data { session: "c".into(), bytes: b"echo LIVE_MARKER\n".to_vec() });
+
+    // Wait for live output to prove the attach is fully serviced; only then
+    // is "no backlog arrived" meaningful (backlog would have been sent first).
+    let acc = read_data_until(
+        &mut stream,
+        &mut decoder,
+        |acc| acc.windows(11).any(|w| w == b"LIVE_MARKER"),
+        Duration::from_secs(10),
+    );
+    assert!(
+        !acc.windows(20).any(|w| w == b"OLD_ALT_SCREEN_BYTES"),
+        "raw client got historical alt-screen backlog: {:?}",
+        String::from_utf8_lossy(&acc)
+    );
+}
+
+#[test]
+fn raw_attach_to_shell_session_replays_backlog() {
+    // Shell history replays cleanly into a plain terminal (spec §5): a raw
+    // client attaching to a shell session still gets the full backlog.
+    let (socket_path, manager, _dir) = start_daemon_with_manager();
+    manager
+        .create("sh", "/tmp", amber_core::state::SessionKind::Shell)
+        .unwrap();
+    manager.session("sh").unwrap().preload(b"SHELL_HISTORY_OK");
+
+    let mut stream = connect_with_retry(&socket_path);
+    let mut decoder = Decoder::new();
+    send(&mut stream, &Frame::Control(ControlMsg::Attach { name: "sh".into(), raw_client: true }));
+    read_data_until(
+        &mut stream,
+        &mut decoder,
+        |acc| acc.windows(16).any(|w| w == b"SHELL_HISTORY_OK"),
+        Duration::from_secs(10),
+    );
+}
+
+#[test]
+fn default_attach_to_claude_session_replays_backlog() {
+    // Backward compatibility: a client that does not set raw_client (the
+    // Electron app — xterm.js is a full emulator, raw replay is clean) keeps
+    // getting the full backlog even for claude sessions.
+    let (socket_path, manager, dir) = start_daemon_with_manager();
+    manager
+        .create("c2", "/tmp", amber_core::state::SessionKind::Shell)
+        .unwrap();
+    flip_kind_to_claude(&dir.path().join("state"), "c2");
+    manager.session("c2").unwrap().preload(b"XTERM_BACKLOG_OK");
+
+    let mut stream = connect_with_retry(&socket_path);
+    let mut decoder = Decoder::new();
+    send(&mut stream, &Frame::Control(ControlMsg::Attach { name: "c2".into(), raw_client: false }));
+    read_data_until(
+        &mut stream,
+        &mut decoder,
+        |acc| acc.windows(16).any(|w| w == b"XTERM_BACKLOG_OK"),
+        Duration::from_secs(10),
+    );
 }
