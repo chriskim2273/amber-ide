@@ -168,6 +168,18 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   `moveLeaf` + SIGINT classification unit-tested; renderer typechecks and the
   bundle builds. Still open: the live drag gesture + claude ^C→shell need
   manual verification in the running GUI (renderer-component UI still deferred).
+- [x] Attach detach hotkey (2026-07-14) — `amber attach` gains tmux-style
+  `Ctrl-b d` detach: a prefix state machine in `run_client` (`Ctrl-b d`
+  detaches via the existing `Detach` frame; `Ctrl-b Ctrl-b` sends a literal
+  prefix; `Ctrl-b <other>` is dropped), armed state crossing reads.
+  `AMBER_PREFIX=C-a` remaps, `--no-prefix` disables (pure-raw escape hatch,
+  keeps core rule #4). `amber attach` with no name attaches the newest live
+  session — adds a serde-default `SessionInfo.updated` ordering key populated
+  by the daemon (app-facing `proto.ts` updated, decode-only). tty-only attach
+  banner names the detach key. Pure `resolve_prefix`/`pick_newest`/`scan_prefix`
+  unit-tested; verified end-to-end against a live daemon (attach-newest, detach,
+  prefix remap, bad-env fallback, `--no-prefix` passthrough, sessions survive).
+  Spec: `docs/superpowers/specs/2026-07-14-attach-detach-hotkey-design.md`.
 
 ## Gotchas (learned)
 
