@@ -58,8 +58,9 @@ session.
    continuum.
 7. **Claude is supervised, resumed precisely.** A `claude` session's pty runs
    `amber run <name>`, which loops `claude --dangerously-skip-permissions
-   --resume <recorded-id>` (falling back to `--continue`, then to a shell after
-   bounded retries so a pane never silently dies). The recorded id comes from a
+   --resume <recorded-id>` (falling back to a fresh start; on a user quit —
+   Ctrl-C / clean exit — or after bounded retries on crashes it drops to a
+   shell so a pane never silently dies). The recorded id comes from a
    generated per-session `SessionStart` hook (`amber hook`) that rewrites it on
    every fire (ids rotate on resume/clear/compaction). Claude is resolved via
    the **login shell** and cached in config — never the daemon's own PATH (the

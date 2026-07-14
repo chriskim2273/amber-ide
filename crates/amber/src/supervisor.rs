@@ -13,7 +13,8 @@ use crate::claude;
 /// Outcome of [`supervise_claude`]'s bounded retry loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SuperviseOutcome {
-    /// `claude` exited successfully (clean exit / user quit).
+    /// The user quit `claude` — a clean exit (code 0) or a ^C (SIGINT). No
+    /// retry; the caller drops the pane to a shell.
     CleanExit,
     /// `claude` crashed `max_attempts` times in a row.
     Exhausted,
@@ -59,7 +60,7 @@ pub fn supervise_claude(
             .status();
 
         let class = classify_run(&outcome);
-        if class.is_success() {
+        if class.is_user_quit() {
             return Ok(SuperviseOutcome::CleanExit);
         }
         if let Err(e) = &outcome {
@@ -95,18 +96,23 @@ fn select_start(session_id: Option<&str>, escalation: u32) -> claude::ClaudeStar
 enum RunClass {
     /// Exited 0 (clean exit / user quit).
     Success,
+    /// Killed by SIGINT — the terminal delivered ^C and claude did not absorb
+    /// it. Treated as a deliberate user quit, NOT a crash: no retry, straight
+    /// to the shell fallback (spec §6.2).
+    UserInterrupt,
     /// Exited with a non-zero status code.
     Nonzero,
-    /// Killed by a signal (Unix).
+    /// Killed by some other signal (Unix).
     Signaled,
     /// The child could not be launched at all (e.g. ENOENT / ETXTBSY).
     LaunchFailed,
 }
 
 impl RunClass {
-    /// Only a clean exit short-circuits the retry loop.
-    fn is_success(self) -> bool {
-        matches!(self, RunClass::Success)
+    /// A run that ends the supervision loop without retrying: either a clean
+    /// exit or a user ^C. Everything else counts against the retry budget.
+    fn is_user_quit(self) -> bool {
+        matches!(self, RunClass::Success | RunClass::UserInterrupt)
     }
 }
 
@@ -118,8 +124,10 @@ fn classify_run(outcome: &std::io::Result<std::process::ExitStatus>) -> RunClass
             #[cfg(unix)]
             {
                 use std::os::unix::process::ExitStatusExt;
-                if _status.signal().is_some() {
-                    return RunClass::Signaled;
+                match _status.signal() {
+                    Some(sig) if sig == nix::libc::SIGINT => return RunClass::UserInterrupt,
+                    Some(_) => return RunClass::Signaled,
+                    None => {}
                 }
             }
             RunClass::Nonzero
@@ -178,8 +186,13 @@ pub fn run_session(root: &Path, name: &str) -> anyhow::Result<()> {
         let hook_command = format!("{} hook", current_exe.display());
         let settings = claude::write_settings(root, name, &hook_command)?;
 
+        // Both outcomes fall through to the shell. On a user quit (Ctrl-C /
+        // clean exit) the pane becomes a plain login shell instead of closing;
+        // exiting THAT shell ends `amber run` and closes the pane normally. On
+        // exhausted retries we do the same rather than let the pane die (spec
+        // §6.2 — "a session never silently dies").
         match supervise_claude(&claude_path, root, name, &cwd, &settings, 3)? {
-            SuperviseOutcome::CleanExit => return Ok(()),
+            SuperviseOutcome::CleanExit => {}
             SuperviseOutcome::Exhausted => {
                 eprintln!(
                     "amber: claude exhausted retries for session {name}; falling back to shell"
@@ -266,6 +279,17 @@ mod tests {
         assert_eq!(classify_run(&killed), RunClass::Signaled);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn classify_sigint_death_is_user_interrupt() {
+        use std::os::unix::process::ExitStatusExt;
+        // Death by ^C (SIGINT) is a deliberate user quit, not a crash: it must
+        // classify distinctly so the loop drops to a shell without retrying.
+        let interrupted: std::io::Result<ExitStatus> =
+            Ok(ExitStatus::from_raw(nix::libc::SIGINT));
+        assert_eq!(classify_run(&interrupted), RunClass::UserInterrupt);
+    }
+
     #[test]
     fn classify_launch_failure_is_launch_failed() {
         // A child that never launches (e.g. ENOENT / ETXTBSY) counts as a crash
@@ -276,11 +300,14 @@ mod tests {
     }
 
     #[test]
-    fn only_success_short_circuits_the_loop() {
-        assert!(RunClass::Success.is_success());
-        assert!(!RunClass::Nonzero.is_success());
-        assert!(!RunClass::Signaled.is_success());
-        assert!(!RunClass::LaunchFailed.is_success());
+    fn only_user_quit_short_circuits_the_loop() {
+        // A clean exit and a ^C both end supervision without retrying; every
+        // crash class stays on the retry ladder.
+        assert!(RunClass::Success.is_user_quit());
+        assert!(RunClass::UserInterrupt.is_user_quit());
+        assert!(!RunClass::Nonzero.is_user_quit());
+        assert!(!RunClass::Signaled.is_user_quit());
+        assert!(!RunClass::LaunchFailed.is_user_quit());
     }
 
     #[test]
