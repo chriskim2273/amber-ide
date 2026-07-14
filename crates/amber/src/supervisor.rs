@@ -105,6 +105,10 @@ pub fn run_session(root: &Path, name: &str) -> anyhow::Result<()> {
         .unwrap_or(std::env::current_dir()?);
 
     if let Some(claude_path) = claude_path {
+        // A detached claude blocks forever on the interactive folder-trust
+        // prompt for an untrusted cwd (never starting the session / recording
+        // the resume id). Pre-accept trust for this cwd.
+        claude::ensure_cwd_trusted(&cwd);
         let current_exe = std::env::current_exe()?;
         let hook_command = format!("{} hook", current_exe.display());
         let settings = claude::write_settings(root, name, &hook_command)?;

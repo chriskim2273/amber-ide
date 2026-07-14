@@ -119,6 +119,44 @@ pub fn resolve_claude() -> Option<PathBuf> {
     resolve_claude_with(&shell, true, &[])
 }
 
+/// Pre-accept claude's interactive folder-trust dialog for `cwd`. A claude
+/// session runs detached in the daemon's pty with no client necessarily
+/// attached; an untrusted cwd makes claude block forever on the "trust this
+/// folder?" prompt, so the session never starts and its SessionStart hook never
+/// records the resume id. Setting `projects.<cwd>.hasTrustDialogAccepted=true`
+/// in `~/.claude.json` is exactly what accepting the dialog does. Best-effort:
+/// any failure leaves claude to prompt as usual.
+pub fn ensure_cwd_trusted(cwd: &Path) {
+    if let Ok(home) = std::env::var("HOME") {
+        trust_cwd_in(&PathBuf::from(home).join(".claude.json"), cwd);
+    }
+}
+
+fn trust_cwd_in(config: &Path, cwd: &Path) {
+    let Ok(text) = std::fs::read_to_string(config) else { return };
+    let Ok(mut root) = serde_json::from_str::<serde_json::Value>(&text) else { return };
+    if !root.get("projects").map(|p| p.is_object()).unwrap_or(false) {
+        root["projects"] = serde_json::json!({});
+    }
+    let key = cwd.to_string_lossy().to_string();
+    let projects = root["projects"].as_object_mut().expect("projects is an object");
+    let entry = projects.entry(key).or_insert_with(|| serde_json::json!({}));
+    if !entry.is_object() {
+        *entry = serde_json::json!({});
+    }
+    // Already trusted -> don't rewrite (avoids clobbering claude's own writes).
+    if entry.get("hasTrustDialogAccepted").and_then(|v| v.as_bool()) == Some(true) {
+        return;
+    }
+    entry["hasTrustDialogAccepted"] = serde_json::Value::Bool(true);
+    if let Ok(out) = serde_json::to_string(&root) {
+        let tmp = config.with_extension("json.amber-tmp");
+        if std::fs::write(&tmp, &out).is_ok() {
+            let _ = std::fs::rename(&tmp, config);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,6 +237,32 @@ mod tests {
         let resolved =
             resolve_claude_with("sh", false, &[("PATH".to_string(), path_env)]).unwrap();
         assert_eq!(resolved, fake);
+    }
+
+    #[test]
+    fn trust_cwd_sets_flag_and_preserves_other_config() {
+        let dir = tempdir().unwrap();
+        let config = dir.path().join(".claude.json");
+        std::fs::write(
+            &config,
+            r#"{"numStartups":5,"projects":{"/existing":{"hasTrustDialogAccepted":true}}}"#,
+        )
+        .unwrap();
+        trust_cwd_in(&config, Path::new("/home/u/proj"));
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
+        assert_eq!(v["projects"]["/home/u/proj"]["hasTrustDialogAccepted"], serde_json::json!(true));
+        // Unrelated keys and existing projects survive the rewrite.
+        assert_eq!(v["numStartups"], serde_json::json!(5));
+        assert_eq!(v["projects"]["/existing"]["hasTrustDialogAccepted"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn trust_cwd_missing_config_is_a_noop() {
+        let dir = tempdir().unwrap();
+        let config = dir.path().join("absent.json");
+        trust_cwd_in(&config, Path::new("/x")); // must not panic or create
+        assert!(!config.exists());
     }
 
     #[test]
