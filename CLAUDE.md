@@ -180,6 +180,22 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   unit-tested; verified end-to-end against a live daemon (attach-newest, detach,
   prefix remap, bad-env fallback, `--no-prefix` passthrough, sessions survive).
   Spec: `docs/superpowers/specs/2026-07-14-attach-detach-hotkey-design.md`.
+- [x] Attach session indicator + nesting refusal (2026-07-14) — `amber attach`
+  gains an OSC 2 terminal title (`amber: <name>`, XTPUSHTITLE/POP; always on
+  for a tty, survives alt-screen, no pty-size impact) and a **best-effort**
+  bottom status bar: reserves the last row by sizing the child `rows-1` +
+  DECSTBM, with an `AltScreenTracker` (bounded CSI state machine, NOT an
+  emulator) so the bar never paints over a full-screen TUI; self-heal redraw
+  after each primary-screen batch; `--no-status` opt-out. **Accepted tradeoff:**
+  a pty has one shared winsize, so the reserved row shrinks the child for every
+  client incl. the GUI, and can flap when both attach (tension with core rules
+  #1/#3 — surfaced to the user, who accepted). Also refuses attaching inside an
+  amber pane (`AMBER_SESSION`) unless `--force`/`AMBER_ALLOW_NEST=1`. Pure
+  `render_status_line`/`AltScreenTracker`/`nest_refusal` unit-tested; real-pty
+  verified: bar drawn on shell, **zero draws during alt-screen** (no TUI
+  corruption), redraw + scroll-region reset on exit, clean detach, nesting
+  refused. `run_client` refactored to break-with-`ClientEnd` + one cleanup
+  block. Spec: `docs/superpowers/specs/2026-07-14-attach-status-nesting-design.md`.
 
 ## Gotchas (learned)
 
