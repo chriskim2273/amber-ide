@@ -7,6 +7,10 @@ export interface SessionInfo {
   cwd: string
   kind: string
   alive: boolean
+  // Unix seconds of the session's last state-store write; the daemon's
+  // ordering key for "most recent". Optional on the wire (serde default 0);
+  // the app does not use it today.
+  updated?: number
 }
 
 export type ControlMsg =

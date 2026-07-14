@@ -35,9 +35,16 @@ enum Command {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
-    /// Raw-mode terminal client — the `tmux attach` replacement.
+    /// Raw-mode terminal client — the `tmux attach` replacement. Detach with
+    /// the prefix key then `d` (default `Ctrl-b`; remap via `AMBER_PREFIX=C-a`,
+    /// or disable interception with `--no-prefix`). With no <name>, attaches
+    /// the most-recently-updated live session.
     Attach {
-        name: String,
+        /// Session to attach; omit to attach the newest live session.
+        name: Option<String>,
+        /// Disable detach-prefix interception; forward stdin fully raw.
+        #[arg(long)]
+        no_prefix: bool,
         #[arg(long)]
         socket: Option<PathBuf>,
     },
@@ -162,7 +169,9 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Daemon { root, socket } => run_daemon(root, socket),
-        Command::Attach { name, socket } => attach::attach(&resolve_socket(socket), &name),
+        Command::Attach { name, no_prefix, socket } => {
+            run_attach(&resolve_socket(socket), name, no_prefix)
+        }
         Command::Ls { socket } => run_ls(&resolve_socket(socket)),
         Command::Create { name, cwd, kind, socket } => {
             run_create(&resolve_socket(socket), &name, &cwd, &kind)
@@ -456,6 +465,45 @@ fn run_ls(socket: &Path) -> anyhow::Result<()> {
                 println!("{n}");
             }
             return Ok(());
+        }
+        let n = stream.read(&mut buf)?;
+        if n == 0 {
+            anyhow::bail!("daemon closed the connection before replying");
+        }
+        decoder.feed(&buf[..n]);
+    }
+}
+
+/// `amber attach [name]`: resolve the detach prefix (from `--no-prefix` and
+/// `AMBER_PREFIX`) and the target session (the newest live one when no name is
+/// given), then hand off to the raw-mode client.
+fn run_attach(socket: &Path, name: Option<String>, no_prefix: bool) -> anyhow::Result<()> {
+    let env = std::env::var("AMBER_PREFIX").ok();
+    let res = attach::resolve_prefix(no_prefix, env.as_deref());
+    if let Some(w) = &res.warning {
+        eprintln!("[amber] {w}");
+    }
+    let name = match name {
+        Some(n) => n,
+        None => newest_session_name(socket)?,
+    };
+    attach::attach(socket, &name, res.prefix)
+}
+
+/// Resolve the target for a no-name `amber attach`: the most-recently-updated
+/// live session. Errors when the daemon has no live session to attach.
+fn newest_session_name(socket: &Path) -> anyhow::Result<String> {
+    let mut stream = UnixStream::connect(socket)?;
+    stream.write_all(&proto::encode(&Frame::Control(ControlMsg::ListSessionsDetailed)))?;
+
+    let mut decoder = Decoder::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        if let Some(Frame::Control(ControlMsg::Sessions { sessions })) = decoder.next_frame()? {
+            return match attach::pick_newest(&sessions) {
+                Some(s) => Ok(s.name.clone()),
+                None => anyhow::bail!("no live sessions to attach"),
+            };
         }
         let n = stream.read(&mut buf)?;
         if n == 0 {

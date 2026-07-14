@@ -15,6 +15,14 @@ pub struct SessionInfo {
     pub cwd: String,
     pub kind: String,
     pub alive: bool,
+    /// Unix seconds of the session's last state-store write (creation, or a
+    /// later cwd change) — the honest ordering key for "most recent" (e.g.
+    /// `amber attach` with no name). `#[serde(default)]` keeps the wire
+    /// backward compatible: peers that omit it (older binaries, the Electron
+    /// app, which never constructs `SessionInfo` and ignores unknown fields)
+    /// decode as `0`.
+    #[serde(default)]
+    pub updated: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -262,6 +270,7 @@ mod tests {
             cwd: "/home/u/proj".into(),
             kind: "claude".into(),
             alive: true,
+            updated: 1_700_000_000,
         };
         let full = Frame::Control(ControlMsg::Sessions { sessions: vec![info.clone()] });
         assert_eq!(roundtrip(&full), full);
@@ -276,6 +285,16 @@ mod tests {
             let f = Frame::Control(unit);
             assert_eq!(roundtrip(&f), f);
         }
+    }
+
+    #[test]
+    fn session_info_updated_defaults_when_absent() {
+        // A peer that predates the `updated` field omits it from the JSON;
+        // `#[serde(default)]` must decode that as 0, not fail.
+        let legacy = r#"{"name":"s","cwd":"/tmp","kind":"shell","alive":true}"#;
+        let info: SessionInfo = serde_json::from_str(legacy).unwrap();
+        assert_eq!(info.updated, 0);
+        assert_eq!(info.name, "s");
     }
 
     #[test]

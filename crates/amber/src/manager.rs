@@ -284,6 +284,7 @@ impl SessionManager {
                         SessionKind::Claude => "claude".to_string(),
                     },
                     alive: sess.is_alive(),
+                    updated: meta.updated,
                 })
             })
             .collect();
