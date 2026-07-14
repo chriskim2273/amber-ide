@@ -121,6 +121,52 @@ fn disconnecting_client_releases_its_subscription() {
 }
 
 #[test]
+fn reattach_replaces_subscription_not_stacks_it() {
+    // A re-Attach on the SAME connection (reconnect resubscribe / pane remount)
+    // must REPLACE the prior subscription, not add a second — else every pty
+    // byte is delivered twice and reads as duplicated input.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("state");
+    std::fs::create_dir_all(&root).unwrap();
+    let socket_path = dir.path().join("amberd.sock");
+
+    let manager = Arc::new(SessionManager::new(&root).unwrap());
+    let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+    let daemon = Daemon::new(Arc::clone(&manager), std::sync::Arc::new(Watchers::new()));
+    thread::spawn(move || {
+        let _ = daemon.serve(listener);
+    });
+
+    manager
+        .create("idle", "/tmp", amber_core::state::SessionKind::Shell)
+        .unwrap();
+    let sess = manager.session("idle").unwrap();
+
+    let mut stream = connect_with_retry(&socket_path);
+    send(&mut stream, &Frame::Control(ControlMsg::Attach { name: "idle".into() }));
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while sess.subscriber_count() != 1 {
+        assert!(Instant::now() < deadline, "first attach never subscribed");
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    // Re-Attach on the same connection; the count must never stack to 2.
+    send(&mut stream, &Frame::Control(ControlMsg::Attach { name: "idle".into() }));
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        assert!(
+            sess.subscriber_count() <= 1,
+            "re-attach stacked a duplicate subscriber ({})",
+            sess.subscriber_count()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(sess.subscriber_count(), 1, "exactly one subscription after re-attach");
+    drop(stream);
+}
+
+#[test]
 fn socket_roundtrip_create_attach_write_read() {
     let (socket_path, _dir) = start_daemon();
     let mut stream = connect_with_retry(&socket_path);

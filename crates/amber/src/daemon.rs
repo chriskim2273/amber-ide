@@ -191,6 +191,19 @@ fn handle_control(
                 );
                 return;
             };
+            // Idempotent per connection: a re-Attach (reconnect resubscribe, or a
+            // pane remount on tab/workspace switch) must REPLACE this connection's
+            // prior subscription for the session, not stack a second subscriber —
+            // otherwise every pty byte is delivered twice and reads as duplicated
+            // input. Drop any existing subscription for this name first.
+            subscriptions.retain(|(sess_name, prev, id)| {
+                if *sess_name == name {
+                    prev.unsubscribe(*id);
+                    false
+                } else {
+                    true
+                }
+            });
             let (sub_id, backlog, rx) = sess.subscribe();
             if write_frame(
                 writer,
