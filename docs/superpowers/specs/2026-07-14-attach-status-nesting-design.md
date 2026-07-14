@@ -165,6 +165,32 @@ that enters the alt-screen and confirm no `amber:` bytes are written to the
 last row while alt-screen is active (no TUI corruption); confirm nesting is
 refused when `AMBER_SESSION` is set.
 
+## Revisions after code review
+
+A review (advisor + self-review) surfaced correctness gaps that changed the
+bar's behavior from the original draft:
+
+- **Shell-only gate.** The bar is drawn only for `kind == "shell"` sessions.
+  Attaching to a full-screen TUI session (claude) that is *already* on the alt
+  screen is the primary SSH case; since `raw_client` skips the alt backlog, the
+  `AltScreenTracker` never observes the `?1049h` and would treat claude as
+  primary, injecting bar escapes into its live output. `run_attach` resolves the
+  target's kind (via the same `ListSessionsDetailed` used for the no-name
+  lookup) and passes `want_bar = !no_status && is_shell`. A bar over a
+  full-screen session is pointless anyway.
+- **No per-batch redraw.** The bar is redrawn only on init, SIGWINCH, and the
+  alt→primary transition — never after every output batch. The daemon batches
+  raw pty bytes with no escape-sequence awareness, so a mid-stream redraw could
+  inject between the two halves of one of the child's own sequences. Cost: a
+  child that resets the scroll region in the primary screen may push the bar off
+  until the next redraw trigger (documented best-effort).
+- **Teardown on all exits.** Unwinding the scroll region + title moved out of
+  `run_client` into `attach` (`teardown_decoration`), which runs on both `Ok`
+  and `Err` returns through a fresh stdout handle — so a mid-loop `?` error can
+  no longer strand a scroll region on the user's shell (mirrors how
+  `RawModeGuard` covers raw mode on all paths).
+- **Empty `AMBER_SESSION`** is treated as unset for the nesting check.
+
 ## Out of scope
 
 Making the bar survive alt-screen TUIs (needs a full emulator — core rule #4);

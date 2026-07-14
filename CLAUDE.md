@@ -186,7 +186,11 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   bottom status bar: reserves the last row by sizing the child `rows-1` +
   DECSTBM, with an `AltScreenTracker` (bounded CSI state machine, NOT an
   emulator) so the bar never paints over a full-screen TUI; self-heal redraw
-  after each primary-screen batch; `--no-status` opt-out. **Accepted tradeoff:**
+  only on init/SIGWINCH/alt-exit (never per-batch — a mid-stream redraw could
+  inject into a child's split escape sequence); shown only for `kind==shell`
+  sessions (a claude session is a full-screen TUI already on the alt screen the
+  raw client can't observe — drawing there would corrupt it); `--no-status`
+  opt-out; teardown runs on all exit paths incl. errors. **Accepted tradeoff:**
   a pty has one shared winsize, so the reserved row shrinks the child for every
   client incl. the GUI, and can flap when both attach (tension with core rules
   #1/#3 — surfaced to the user, who accepted). Also refuses attaching inside an

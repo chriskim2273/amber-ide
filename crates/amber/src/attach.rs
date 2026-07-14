@@ -346,7 +346,7 @@ fn send_control(stream: &UnixStream, msg: ControlMsg) -> anyhow::Result<()> {
 /// Connect to `socket`, attach session `name`, and proxy the terminal until
 /// stdin hits EOF, the socket closes, or the daemon reports the session's
 /// child exited.
-pub fn attach(socket: &Path, name: &str, prefix: Option<u8>, no_status: bool) -> anyhow::Result<()> {
+pub fn attach(socket: &Path, name: &str, prefix: Option<u8>, want_bar: bool) -> anyhow::Result<()> {
     let stream = UnixStream::connect(socket)?;
 
     let winch = Arc::new(AtomicBool::new(false));
@@ -355,10 +355,12 @@ pub fn attach(socket: &Path, name: &str, prefix: Option<u8>, no_status: bool) ->
     let is_tty = io::stdin().is_terminal();
 
     // Decoration is meaningful only on a real terminal. Off a tty (pipes,
-    // tests) everything stays raw. The title is always on; the bar is on
-    // unless suppressed with --no-status.
+    // tests) everything stays raw. The title is always on; the bar is on only
+    // when the caller allows it (`want_bar` folds in --no-status and the
+    // shell-only gate — the bar is never drawn over a full-screen TUI session
+    // such as claude, whose alt-screen state the raw client can't observe).
     let ui = if is_tty {
-        StatusUi { title: true, bar: !no_status, hint: prefix.map(prefix_key_name) }
+        StatusUi { title: true, bar: want_bar, hint: prefix.map(prefix_key_name) }
     } else {
         StatusUi::none()
     };
@@ -380,6 +382,10 @@ pub fn attach(socket: &Path, name: &str, prefix: Option<u8>, no_status: bool) ->
     let raw_guard = if is_tty { Some(RawModeGuard::enable()?) } else { None };
 
     let end = run_client(&stream, name, io::stdin(), io::stdout(), &winch, prefix, &ui);
+
+    // Unwind title/bar on EVERY exit — Ok or Err — before leaving raw mode, so
+    // a mid-loop error never strands a scroll region on the user's shell.
+    teardown_decoration(&ui);
 
     drop(raw_guard); // leave raw mode before printing any trailer
     match end? {
@@ -498,14 +504,16 @@ pub fn run_client(
                     _ => {}
                 }
             }
-            // Reconcile the bar after this output batch. While the child holds
-            // the alt screen, draw nothing (never paint over a TUI). On
-            // primary, redraw so the bar self-heals if output scrolled it off;
-            // re-assert the scroll region when we've just left the alt screen.
-            if bar_at(rows) && !alt.is_alt() {
-                if was_alt {
-                    stdout.write_all(set_scroll_region(rows - 1).as_bytes())?;
-                }
+            // Redraw the bar ONLY when the child has just left the alt screen
+            // (a complete, parsed `?1049l` transition), re-asserting the scroll
+            // region the TUI cleared. We deliberately do NOT redraw after every
+            // batch: the daemon batches raw pty bytes with no escape-sequence
+            // awareness, so a redraw mid-stream could inject between two halves
+            // of one of the child's own sequences (best-effort — a child that
+            // resets the scroll region in the primary screen may push the bar
+            // off until the next redraw trigger).
+            if bar_at(rows) && was_alt && !alt.is_alt() {
+                stdout.write_all(set_scroll_region(rows - 1).as_bytes())?;
                 stdout.write_all(draw_bar(rows, &bar_line(cols)).as_bytes())?;
             }
             stdout.flush()?;
@@ -546,18 +554,29 @@ pub fn run_client(
         }
     };
 
-    // Unwind the terminal decoration on every normal exit path (raw mode is
-    // restored separately by RawModeGuard).
-    if bar_at(rows) {
-        let _ = stdout.write_all(SCROLL_RESET.as_bytes());
-        let _ = stdout.write_all(clear_row(rows).as_bytes());
+    // Terminal decoration is unwound by the caller (`attach`) on ALL exit
+    // paths — including the `?` errors above — so a mid-loop failure can't
+    // strand a scroll region on the user's shell.
+    Ok(end)
+}
+
+/// Undo the terminal decoration set by [`run_client`]: leave the scroll region,
+/// clear the reserved row, and pop the title. Best-effort (ignores write
+/// errors); safe to call even if nothing was set. Written through a fresh
+/// stdout handle so it runs regardless of how `run_client` returned.
+fn teardown_decoration(ui: &StatusUi) {
+    let mut out = io::stdout();
+    if ui.bar {
+        let (_, rows) = current_size();
+        if rows >= 2 {
+            let _ = out.write_all(SCROLL_RESET.as_bytes());
+            let _ = out.write_all(clear_row(rows).as_bytes());
+        }
     }
     if ui.title {
-        let _ = stdout.write_all(TITLE_POP.as_bytes());
+        let _ = out.write_all(TITLE_POP.as_bytes());
     }
-    let _ = stdout.flush();
-
-    Ok(end)
+    let _ = out.flush();
 }
 
 #[cfg(test)]
@@ -949,9 +968,10 @@ mod tests {
     }
 
     #[test]
-    fn no_bar_uses_full_height_and_resets_scroll_region_only_when_barred() {
-        // Without the bar the child gets the full height (rows = 24), and the
-        // cleanup on exit must NOT emit a scroll-region reset (nothing to undo).
+    fn no_bar_uses_full_height_and_emits_no_scroll_region() {
+        // Without the bar the child gets the full height (rows = 24), and
+        // run_client emits no scroll-region control at all (the bar is what
+        // sets it; teardown lives in `attach`, not the loop).
         let mut h = start_client_full(Some(DEFAULT_PREFIX), StatusUi::none());
         let resize = h.server_read_until(|f| matches!(f, Frame::Control(ControlMsg::Resize { .. })));
         match resize {

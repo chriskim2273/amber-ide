@@ -492,8 +492,9 @@ fn run_attach(
 ) -> anyhow::Result<()> {
     // Refuse to nest inside another amber pane unless forced (--force or
     // AMBER_ALLOW_NEST): two stacked raw streams collide on the detach prefix.
+    // An empty AMBER_SESSION is treated as unset.
     let force = force || std::env::var_os("AMBER_ALLOW_NEST").is_some();
-    let amber_session = std::env::var("AMBER_SESSION").ok();
+    let amber_session = std::env::var("AMBER_SESSION").ok().filter(|s| !s.is_empty());
     if let Some(msg) = attach::nest_refusal(amber_session.as_deref(), force) {
         eprintln!("[amber] {msg}");
         std::process::exit(1);
@@ -504,16 +505,21 @@ fn run_attach(
     if let Some(w) = &res.warning {
         eprintln!("[amber] {w}");
     }
-    let name = match name {
-        Some(n) => n,
-        None => newest_session_name(socket)?,
-    };
-    attach::attach(socket, &name, res.prefix, no_status)
+
+    // Resolve the target session AND its kind in one detailed listing. The bar
+    // is shown only for shell sessions: a full-screen TUI session (claude)
+    // lives on the alt screen, which the raw client can't observe, so drawing a
+    // bar over it would inject escapes into the TUI (and reserving a row is
+    // pointless there).
+    let (name, is_shell) = resolve_target(socket, name)?;
+    let want_bar = !no_status && is_shell;
+    attach::attach(socket, &name, res.prefix, want_bar)
 }
 
-/// Resolve the target for a no-name `amber attach`: the most-recently-updated
-/// live session. Errors when the daemon has no live session to attach.
-fn newest_session_name(socket: &Path) -> anyhow::Result<String> {
+/// Resolve the attach target and whether it is a shell session. With a name,
+/// looks that session up (an unknown name is left for the daemon to reject, and
+/// assumed shell); with no name, picks the most-recently-updated live session.
+fn resolve_target(socket: &Path, name: Option<String>) -> anyhow::Result<(String, bool)> {
     let mut stream = UnixStream::connect(socket)?;
     stream.write_all(&proto::encode(&Frame::Control(ControlMsg::ListSessionsDetailed)))?;
 
@@ -521,9 +527,16 @@ fn newest_session_name(socket: &Path) -> anyhow::Result<String> {
     let mut buf = [0u8; 8192];
     loop {
         if let Some(Frame::Control(ControlMsg::Sessions { sessions })) = decoder.next_frame()? {
-            return match attach::pick_newest(&sessions) {
-                Some(s) => Ok(s.name.clone()),
-                None => anyhow::bail!("no live sessions to attach"),
+            return match name {
+                Some(n) => {
+                    let is_shell =
+                        sessions.iter().find(|s| s.name == n).is_none_or(|s| s.kind == "shell");
+                    Ok((n, is_shell))
+                }
+                None => match attach::pick_newest(&sessions) {
+                    Some(s) => Ok((s.name.clone(), s.kind == "shell")),
+                    None => anyhow::bail!("no live sessions to attach"),
+                },
             };
         }
         let n = stream.read(&mut buf)?;
