@@ -72,6 +72,22 @@ impl SessionManager {
             .unwrap_or(0)
     }
 
+    /// Resolve a session cwd to a STABLE absolute directory. A relative cwd
+    /// (e.g. `.`) would resolve against whatever dir the daemon happened to be
+    /// launched from — which differs between a hand-started daemon and the
+    /// systemd unit — so `claude --resume <id>` (conversations are scoped by
+    /// project cwd) breaks after a reboot. Relative or missing dirs fall back
+    /// to `$HOME` (also the constitution's "dir no longer exists" rule).
+    fn resolve_cwd(cwd: &Path) -> PathBuf {
+        if cwd.is_absolute() && cwd.is_dir() {
+            cwd.to_path_buf()
+        } else {
+            std::env::var("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("/"))
+        }
+    }
+
     /// The command a session of `kind` runs. `Shell` spawns the user's shell
     /// directly; `Claude` spawns this same binary as `amber run <name>`,
     /// which supervises the real `claude --resume/--continue` process (and
@@ -96,7 +112,13 @@ impl SessionManager {
     }
 
     fn spawn(&self, kind: SessionKind, name: &str, cwd: &Path) -> anyhow::Result<Arc<PtySession>> {
-        let cmd = self.command_for(kind, name, cwd)?;
+        let cwd = Self::resolve_cwd(cwd);
+        let mut cmd = self.command_for(kind, name, &cwd)?;
+        // The daemon may run under systemd, which has no TERM — without a
+        // color-capable terminal, claude (and any colored program) renders
+        // monochrome. Force one on the pty regardless of the daemon's own env.
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
         Ok(Arc::new(PtySession::spawn(
             cmd,
             DEFAULT_ROWS,
@@ -113,7 +135,9 @@ impl SessionManager {
         kind: SessionKind,
     ) -> anyhow::Result<Arc<PtySession>> {
         Self::validate_name(name)?;
-        let cwd = cwd.into();
+        // Store an absolute, stable cwd (not a relative `.`) so claude resume
+        // works across daemon restarts / reboots regardless of launch context.
+        let cwd = Self::resolve_cwd(&cwd.into());
         let sess = self.spawn(kind, name, &cwd)?;
         let meta = SessionMeta {
             name: name.to_string(),
@@ -271,6 +295,19 @@ mod tests {
             !dir.path().parent().unwrap().join("evil.json").exists(),
             "traversal name escaped the state dir"
         );
+    }
+
+    #[test]
+    fn create_stores_absolute_cwd_for_relative_input() {
+        // A relative `.` would resolve against the daemon's launch dir (which
+        // differs between hand-start and systemd), breaking claude resume.
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        mgr.create("amber-1-1-0-a", ".", SessionKind::Shell).unwrap();
+        let cwd = mgr.session_infos().unwrap()[0].cwd.clone();
+        let home = std::env::var("HOME").unwrap_or_default();
+        assert_eq!(cwd, home, "'.' must resolve to an absolute, stable $HOME");
+        assert!(Path::new(&cwd).is_absolute());
     }
 
     #[test]
