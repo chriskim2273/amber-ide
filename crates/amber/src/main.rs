@@ -56,6 +56,24 @@ enum Command {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
+    /// Kill (destroy) a session.
+    Kill {
+        name: String,
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+    /// Rename a session (spec §2). NOTE: the daemon deliberately rejects this
+    /// today — a live claude session's supervisor is env-bound to its name, so
+    /// renaming would break precise resume until a supervisor-rebind exists.
+    /// The verb ships anyway so the CLI surface matches the spec and starts
+    /// working automatically once the daemon supports Rename; for now it prints
+    /// the daemon's error and exits nonzero.
+    Rename {
+        from: String,
+        to: String,
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
     /// Supervise a claude/shell session inside its pty (spawned by the
     /// daemon as the Claude session's child process; not meant to be run
     /// directly by users).
@@ -98,6 +116,21 @@ enum CtlAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Symmetric to `install`: stop + disable + remove the boot unit (systemd
+    /// user unit on Linux, launchd agent on macOS). Keeps the installed binary
+    /// and the state store by default; opt into removing them with the flags.
+    /// Idempotent — running it twice is not an error.
+    Uninstall {
+        /// Resolve and print what would run, without running it.
+        #[arg(long)]
+        dry_run: bool,
+        /// Also remove the installed binary copy (`~/.local/bin/amber`).
+        #[arg(long)]
+        purge_binary: bool,
+        /// Also remove the state store (sessions snapshot); destroys history.
+        #[arg(long)]
+        purge_state: bool,
+    },
 }
 
 /// `$XDG_STATE_HOME/amber-ide`, falling back to `$HOME/.local/state/amber-ide`.
@@ -134,6 +167,8 @@ fn main() -> anyhow::Result<()> {
         Command::Create { name, cwd, kind, socket } => {
             run_create(&resolve_socket(socket), &name, &cwd, &kind)
         }
+        Command::Kill { name, socket } => run_kill(&resolve_socket(socket), &name),
+        Command::Rename { from, to, socket } => run_rename(&resolve_socket(socket), &from, &to),
         Command::Run { name } => run_supervisor(&name),
         Command::Hook => run_hook(),
         Command::Ctl { action } => match action {
@@ -141,6 +176,9 @@ fn main() -> anyhow::Result<()> {
             CtlAction::Status { socket } => run_status(&resolve_socket(socket)),
             CtlAction::SnapshotNow { socket } => run_snapshot_now(&resolve_socket(socket)),
             CtlAction::Install { dry_run } => run_install(dry_run),
+            CtlAction::Uninstall { dry_run, purge_binary, purge_state } => {
+                run_uninstall(dry_run, purge_binary, purge_state)
+            }
         },
     }
 }
@@ -233,6 +271,40 @@ fn run_install(dry_run: bool) -> anyhow::Result<()> {
     let status = std::process::Command::new("bash").arg(&script).status()?;
     if !status.success() {
         anyhow::bail!("install script failed with {status}");
+    }
+    Ok(())
+}
+
+/// `ctl uninstall`: symmetric to `install`, delegating to the same
+/// `infra/daemon/install.sh` via its `uninstall` subcommand. Stops + disables +
+/// removes the boot unit; `--purge-binary`/`--purge-state` opt into removing
+/// the installed binary and the state store (both kept by default).
+fn run_uninstall(dry_run: bool, purge_binary: bool, purge_state: bool) -> anyhow::Result<()> {
+    let Some(script) = find_install_script() else {
+        eprintln!(
+            "amber ctl uninstall: could not locate infra/daemon/install.sh \
+             relative to this binary.\nRun it from a checkout instead:\n\n    \
+             bash <amber-repo>/infra/daemon/install.sh uninstall\n"
+        );
+        anyhow::bail!("install script not found");
+    };
+    let mut args: Vec<String> = vec!["uninstall".to_string()];
+    if purge_binary {
+        args.push("--purge-binary".to_string());
+    }
+    if purge_state {
+        args.push("--purge-state".to_string());
+    }
+    if dry_run {
+        println!("would run: bash {} {}", script.display(), args.join(" "));
+        return Ok(());
+    }
+    let status = std::process::Command::new("bash")
+        .arg(&script)
+        .args(&args)
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("uninstall script failed with {status}");
     }
     Ok(())
 }
@@ -384,6 +456,71 @@ fn run_ls(socket: &Path) -> anyhow::Result<()> {
                 println!("{n}");
             }
             return Ok(());
+        }
+        let n = stream.read(&mut buf)?;
+        if n == 0 {
+            anyhow::bail!("daemon closed the connection before replying");
+        }
+        decoder.feed(&buf[..n]);
+    }
+}
+
+/// `amber kill <name>`: ask the daemon to destroy a session. The daemon sends
+/// no reply to Kill (it only broadcasts to watchers), so we confirm removal
+/// with a follow-up ListSessions on the same connection — the daemon services
+/// frames in order, so the session is already gone by the time it replies.
+/// Killing a name that never existed is a success (idempotent).
+fn run_kill(socket: &Path, name: &str) -> anyhow::Result<()> {
+    let mut stream = UnixStream::connect(socket)?;
+    stream.write_all(&proto::encode(&Frame::Control(ControlMsg::Kill {
+        name: name.to_string(),
+    })))?;
+    stream.write_all(&proto::encode(&Frame::Control(ControlMsg::ListSessions)))?;
+
+    let mut decoder = Decoder::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        if let Some(Frame::Control(ControlMsg::SessionList { names })) = decoder.next_frame()? {
+            if names.iter().any(|n| n == name) {
+                anyhow::bail!("kill failed: session {name} still present");
+            }
+            println!("killed {name}");
+            return Ok(());
+        }
+        let n = stream.read(&mut buf)?;
+        if n == 0 {
+            anyhow::bail!("daemon closed the connection before replying");
+        }
+        decoder.feed(&buf[..n]);
+    }
+}
+
+/// `amber rename <from> <to>`: send Rename and surface the daemon's reply. The
+/// daemon deliberately rejects rename today (a live claude supervisor is
+/// env-bound to its name), so this always prints that error to stderr and exits
+/// nonzero — but the moment the daemon learns to rename, this starts working
+/// with no CLI change.
+fn run_rename(socket: &Path, from: &str, to: &str) -> anyhow::Result<()> {
+    let mut stream = UnixStream::connect(socket)?;
+    stream.write_all(&proto::encode(&Frame::Control(ControlMsg::Rename {
+        from: from.to_string(),
+        to: to.to_string(),
+    })))?;
+
+    let mut decoder = Decoder::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match decoder.next_frame()? {
+            Some(Frame::Control(ControlMsg::Error { msg })) => {
+                anyhow::bail!("rename failed: {msg}");
+            }
+            // A future daemon that supports rename would ack differently; treat
+            // any non-error reply as success so this needs no change then.
+            Some(Frame::Control(_)) => {
+                println!("renamed {from} -> {to}");
+                return Ok(());
+            }
+            _ => {}
         }
         let n = stream.read(&mut buf)?;
         if n == 0 {

@@ -8,6 +8,7 @@ use amber_core::proto::{self, ControlMsg, Decoder, Frame};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -387,6 +388,76 @@ fn rename_gets_an_explicit_unsupported_error() {
         }
         _ => unreachable!(),
     }
+}
+
+#[test]
+fn kill_via_cli_removes_the_session() {
+    // `amber kill <name>` over the real socket must remove the session. The
+    // daemon sends no reply to Kill, so the client verifies removal with a
+    // follow-up ListSessions on the same (in-order) connection.
+    let (socket_path, _dir) = start_daemon();
+    let mut stream = connect_with_retry(&socket_path);
+    let mut decoder = Decoder::new();
+
+    send(
+        &mut stream,
+        &Frame::Control(ControlMsg::Create {
+            name: "victim".into(),
+            cwd: "/tmp".into(),
+            kind: "shell".into(),
+        }),
+    );
+    read_frame_until(
+        &mut stream,
+        &mut decoder,
+        |f| matches!(f, Frame::Control(ControlMsg::Created { .. })),
+        Duration::from_secs(5),
+    );
+
+    let out = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .args(["kill", "victim", "--socket"])
+        .arg(&socket_path)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "amber kill failed; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Independently confirm the session is gone.
+    let mut probe = connect_with_retry(&socket_path);
+    let mut pdec = Decoder::new();
+    send(&mut probe, &Frame::Control(ControlMsg::ListSessions));
+    let frame = read_frame_until(
+        &mut probe,
+        &mut pdec,
+        |f| matches!(f, Frame::Control(ControlMsg::SessionList { .. })),
+        Duration::from_secs(5),
+    );
+    match frame {
+        Frame::Control(ControlMsg::SessionList { names }) => {
+            assert!(!names.contains(&"victim".to_string()), "victim survived kill: {names:?}");
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn rename_via_cli_surfaces_daemon_error() {
+    // Rename is unsupported daemon-side; the CLI must surface that error to
+    // stderr and exit nonzero (the verb exists so the UX matches the spec).
+    let (socket_path, _dir) = start_daemon();
+    let out = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .args(["rename", "a", "b", "--socket"])
+        .arg(&socket_path)
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "amber rename unexpectedly succeeded");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // The daemon's exact message — proves we surfaced the server error, not a
+    // clap "unrecognized subcommand" (which also contains the word "rename").
+    assert!(stderr.contains("not supported"), "rename error not surfaced: {stderr}");
 }
 
 #[test]
