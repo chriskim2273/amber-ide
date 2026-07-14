@@ -1,4 +1,5 @@
 import { ipcRenderer, contextBridge } from 'electron'
+import { homedir } from 'node:os'
 
 contextBridge.exposeInMainWorld('amber', {
   // True when the app was launched with software GL (SwiftShader); the renderer
@@ -12,7 +13,7 @@ contextBridge.exposeInMainWorld('amber', {
   killSession: (name: string) => ipcRenderer.send('daemon-command', { cmd: 'kill', name }),
   // Absolute home dir (default cwd for new panes) + a native folder picker so
   // panes carry a real absolute cwd, not a relative '.' that drifts on restore.
-  homeDir: process.env['HOME'] ?? '/',
+  homeDir: homedir() || process.env['HOME'] || '/',
   pickFolder: (): Promise<string | null> => ipcRenderer.invoke('pick-folder'),
   loadLayout: (): Promise<string | null> => ipcRenderer.invoke('layout-load'),
   saveLayout: (text: string): Promise<void> => ipcRenderer.invoke('layout-save', text),
