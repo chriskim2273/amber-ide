@@ -12,6 +12,7 @@ repository = "https://github.com/chriskim2273/amber-ide"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
+libc = "0.2"
 
 # Distributable release binary: optimized + stripped. NOT panic=abort — the
 # daemon isolates a panicking connection thread; aborting would kill every

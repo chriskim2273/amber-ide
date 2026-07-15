@@ -9,6 +9,7 @@ dependencies = [
  "amber-core",
  "anyhow",
  "clap",
+ "libc",
  "nix 0.31.3",
  "portable-pty",
  "serde_json",
