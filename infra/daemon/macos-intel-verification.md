@@ -1,9 +1,10 @@
 # macOS (Intel) verification checklist
 
 Behavioral acceptance criteria for macOS Intel (`x86_64-apple-darwin`) support.
-Run on a real Intel Mac — these cannot be checked from Linux. The Linux CI
-already covers the pure logic and the macOS *compile* gate
-(`cargo check --target x86_64-apple-darwin`); this doc covers *behavior*.
+Run on a real Intel Mac — these cannot be checked from Linux. The pure logic
+is covered by the Linux unit tests, and the macOS *compile* gate
+(`cargo check --target x86_64-apple-darwin`) is run from Linux (no Mac needed);
+this doc covers *behavior*.
 
 ## Build & unit tests
 
