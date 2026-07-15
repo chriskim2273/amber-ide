@@ -83,15 +83,26 @@ mod tests {
 
     #[test]
     fn chain_longer_than_64_is_not_falsely_matched() {
-        // claude 70 hops above root; walk caps at 64, so root is never reached.
-        let mut t = vec![e(1_000_000, 1, "claude")];
-        let mut child = 1_000_000u32;
-        for i in 0..70 {
-            let parent = child;
-            child = 2_000_000 + i;
-            t.push(e(child, parent, "sh"));
+        // claude at 5000, ancestor chain 5000 <- 5001 <- ... <- 5070 (70 steps).
+        // Walk must traverse up but caps at 64 iterations before reaching root 5070.
+        let mut t = vec![e(5000, 5001, "claude")];
+        for i in 1..=69 {
+            t.push(e(5000 + i, 5000 + i + 1, "link"));
         }
-        let root = child; // bottom of the chain
+        let root = 5070;
         assert!(!claude_descends_from_table(&t, root));
+    }
+
+    #[test]
+    fn chain_within_64_reaches_root() {
+        // Positive control: when root is within 64 hops, it is found.
+        // claude at 5000, parent chain: 5000 <- 5001 <- 5002 <- 5003 (root).
+        let t = vec![
+            e(5000, 5001, "claude"),
+            e(5001, 5002, "link"),
+            e(5002, 5003, "link"),
+        ];
+        let root = 5003;
+        assert!(claude_descends_from_table(&t, root));
     }
 }
