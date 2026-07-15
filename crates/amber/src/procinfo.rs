@@ -239,6 +239,14 @@ mod tests {
     }
 
     #[test]
+    fn claude_directly_under_pid_1_root_is_detected() {
+        // Root is pid 1 (e.g. init/launchd adopted the pane's shell). The
+        // `pp == root` guard must fire before the `pp > 1` stop condition.
+        let t = vec![e(1, 0, "init"), e(50, 1, "claude")];
+        assert!(claude_descends_from_table(&t, 1));
+    }
+
+    #[test]
     fn claude_not_under_root_is_ignored() {
         let t = vec![e(100, 1, "bash"), e(101, 1, "claude")];
         assert!(!claude_descends_from_table(&t, 100));
