@@ -92,6 +92,10 @@ fn cstr_field(buf: &[libc::c_char]) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+/// `PROC_ALL_PIDS` from Darwin's `<sys/proc_info.h>` — not exposed by `libc`.
+#[cfg(target_os = "macos")]
+const PROC_ALL_PIDS: u32 = 1;
+
 /// Fetch a process's BSD info (ppid + comm) in one `proc_pidinfo` call.
 #[cfg(target_os = "macos")]
 fn bsdinfo(pid: u32) -> Option<libc::proc_bsdinfo> {
@@ -116,7 +120,7 @@ fn bsdinfo(pid: u32) -> Option<libc::proc_bsdinfo> {
 #[cfg(target_os = "macos")]
 pub fn process_table() -> Vec<ProcEntry> {
     // First call sizes the pid buffer; second fills it.
-    let n_bytes = unsafe { libc::proc_listpids(libc::PROC_ALL_PIDS, 0, std::ptr::null_mut(), 0) };
+    let n_bytes = unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, std::ptr::null_mut(), 0) };
     if n_bytes <= 0 {
         return Vec::new();
     }
@@ -124,7 +128,7 @@ pub fn process_table() -> Vec<ProcEntry> {
     let mut pids = vec![0 as libc::c_int; cap];
     let got = unsafe {
         libc::proc_listpids(
-            libc::PROC_ALL_PIDS,
+            PROC_ALL_PIDS,
             0,
             pids.as_mut_ptr() as *mut libc::c_void,
             n_bytes,
@@ -167,7 +171,12 @@ pub fn cwd_of(pid: u32) -> Option<PathBuf> {
     if r != sz {
         return None;
     }
-    let path = cstr_field(&vpi.pvi_cdir.vip_path);
+    // `vip_path` is `[[c_char; 32]; 32]` in this libc (a 1024-byte stand-in for
+    // `[c_char; MAXPATHLEN]`, worked around for old-rustc array-impl limits) —
+    // flatten it to the flat slice `cstr_field` expects.
+    let vip = &vpi.pvi_cdir.vip_path;
+    let flat = unsafe { std::slice::from_raw_parts(vip.as_ptr() as *const libc::c_char, 32 * 32) };
+    let path = cstr_field(flat);
     if path.is_empty() {
         None
     } else {
