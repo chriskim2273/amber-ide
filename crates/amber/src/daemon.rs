@@ -221,13 +221,9 @@ fn handle_control(
             // terminal corrupts it. The child is nudged to repaint below.
             // Shell sessions, and all xterm.js attaches, replay in full.
             let skip_backlog = suppress_backlog(raw_client, manager.session_kind(&name));
-            if !skip_backlog
-                && write_frame(writer, &Frame::Data { session: name.clone(), bytes: backlog })
-                    .is_err()
-            {
-                sess.unsubscribe(sub_id);
-                return;
-            }
+            // Registered BEFORE the forwarder starts so connection teardown
+            // always releases it (unsubscribe is retain-based, so the
+            // forwarder's own error-path unsubscribe stays safe/idempotent).
             subscriptions.push((name.clone(), Arc::clone(&sess), sub_id));
             if skip_backlog {
                 // Repaint nudge: resize one column away and back delivers two
@@ -243,6 +239,26 @@ fn handle_control(
             let writer = Arc::clone(writer);
             // `sess` moves into the forwarder so it can report the exit code.
             thread::spawn(move || {
+                // Replay the historical backlog HERE, off the connection's read
+                // thread. The scrollback is capped at MBs, and a client is only
+                // as fast as it can render it — writing it on the read thread
+                // froze that thread mid-write, so every control frame
+                // (Create/Kill/Resize) multiplexed behind the Attach on the same
+                // socket went unread until the client finished draining. That is
+                // the "panes render but no button does anything" failure.
+                //
+                // Sent as ONE frame, matching the client's contract: the app
+                // resets stale mouse modes after the FIRST post-attach message
+                // (Pane.tsx MOUSE_RESET), so splitting the replay would fire that
+                // reset mid-backlog and let later bytes re-enable mouse tracking.
+                // Ordering holds: this snapshot predates every chunk in `rx`.
+                if !skip_backlog {
+                    let frame = Frame::Data { session: name.clone(), bytes: backlog };
+                    if write_frame(&writer, &frame).is_err() {
+                        sess.unsubscribe(sub_id);
+                        return;
+                    }
+                }
                 while let Ok(chunk) = rx.recv() {
                     let frame = Frame::Data { session: name.clone(), bytes: chunk };
                     if write_frame(&writer, &frame).is_err() {

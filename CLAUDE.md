@@ -200,6 +200,23 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   corruption), redraw + scroll-region reset on exit, clean detach, nesting
   refused. `run_client` refactored to break-with-`ClientEnd` + one cleanup
   block. Spec: `docs/superpowers/specs/2026-07-14-attach-status-nesting-design.md`.
+- [x] Backlog head-of-line fix (2026-07-15) — **the app's "nothing works" bug**:
+  every control gesture (close pane / new tab / split / new pane) silently did
+  nothing while terminals still rendered. `Attach` wrote the up-to-2 MiB
+  scrollback backlog **inline on the connection's read thread**; since the app
+  multiplexes control + all pane data on ONE socket (rule #4), a client slow to
+  render a large backlog froze that read thread, so every `Create`/`Kill`/
+  `Resize` queued behind the `Attach` went unread (output kept flowing — it
+  rides per-attach forwarder threads — which is why panes looked alive). Worsened
+  as scrollback grew; intermittent because it depends on socket-buffer
+  autotuning + client drain speed. Fix: the forwarder thread replays the backlog,
+  so the read thread never blocks on it. Sent as ONE frame (chunking would fire
+  `Pane.tsx`'s post-first-message `MOUSE_RESET` mid-replay). Regression test
+  `crates/amber/tests/backlog_hol.rs` (asserts daemon state, not a reply — a
+  reply would have to be written back to the stuck socket). Verified live: with a
+  2 MiB-backlog pane attached, +Pane/+Tab/close all take effect (all three were
+  no-ops before). **A running daemon keeps the old code — it must be restarted
+  for this fix to take effect.**
 
 ## Gotchas (learned)
 
@@ -216,6 +233,15 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   are never skipped for a live subscriber.
 - Restored pane cwds fall back to `$HOME` if the dir no longer exists — keep
   torture dirs out of `/tmp` (wiped at boot).
+- The per-connection **read thread must never do an unbounded blocking write to
+  the client**. Control and pane data share one socket, so anything it blocks on
+  stalls every control frame behind it — the client goes on rendering while every
+  gesture dies silently. Big writes (backlog) belong on the forwarder thread.
+  Symptom shape to recognise: output fine, control dead, worse over time.
+- Socket-buffer autotuning makes this class of bug **intermittent** — the same
+  2 MiB write blocks or doesn't depending on the host and the client's drain
+  speed. Never conclude "not reproducible" from one green run; assert on daemon
+  state, and force the block (undrained client + a ring filled to its cap).
 - `PtySession` must stay `Send + Sync` (all fields mutex/atomic-guarded) — the
   daemon shares it across connection threads.
 
