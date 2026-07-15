@@ -29,8 +29,23 @@ build_macos() {
     echo "dist: $OUT/amber-macos-universal (universal)"
 }
 
+# Intel-only macOS build (x86_64). Use on an Intel Mac when a universal binary
+# is not needed — avoids requiring the aarch64-apple-darwin target.
+build_macos_intel() {
+    rustup target add x86_64-apple-darwin
+    cargo build --release --target x86_64-apple-darwin --bin amber
+    cp "$ROOT/target/x86_64-apple-darwin/release/amber" "$OUT/amber-x86_64-apple-darwin"
+    echo "dist: $OUT/amber-x86_64-apple-darwin (intel)"
+}
+
 case "$(uname -s)" in
     Linux)  build_linux ;;
-    Darwin) build_macos ;;
+    Darwin)
+        if [ "${AMBER_MACOS_INTEL:-0}" = "1" ]; then
+            build_macos_intel
+        else
+            build_macos
+        fi
+        ;;
     *) echo "unsupported OS: $(uname -s)"; exit 1 ;;
 esac
