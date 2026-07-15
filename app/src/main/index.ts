@@ -233,6 +233,12 @@ async function main(): Promise<void> {
   const win = new BrowserWindow({
     width: 1100,
     height: 720,
+    // Floor the window at the chrome's own footprint plus a usable stage. The
+    // toolbar is a no-wrap flex row with a ~410px min-content width, and
+    // toolbar+tabbar eat 84px of height; below that the pane stage collapses to
+    // zero and every terminal clamps to its 2x1 floor.
+    minWidth: 500,
+    minHeight: 300,
     webPreferences: {
       preload: join(__dirname, '../preload/index.cjs'),
       contextIsolation: true,

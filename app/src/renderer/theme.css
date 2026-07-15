@@ -43,6 +43,17 @@
 
 * { box-sizing: border-box; }
 
+/* The shell is `position:absolute; inset:0` — the document must NEVER scroll.
+ * Without this, chrome that can't shrink below its min-content width overflows
+ * the viewport, a 15px scrollbar appears, the viewport shrinks, the content
+ * fits, the scrollbar vanishes — a resize flap that re-fires every pane's
+ * ResizeObserver twice per frame. */
+html, body {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+}
+
 body {
   font-family: var(--font-ui);
   color: var(--text);

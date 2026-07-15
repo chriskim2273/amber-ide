@@ -87,6 +87,11 @@ export const Pane = memo(function Pane({ session, epoch }: { session: string; ep
     let wired = false
 
     const sendResize = (): void => {
+      // A collapsed host (window crushed below the chrome's own height) makes
+      // FitAddon clamp to its 2x1 floor; posting that would SIGWINCH every pty
+      // to 1 row and make each program repaint its whole screen. The size is
+      // not real — skip it and let the next non-degenerate fire carry the truth.
+      if (host.clientWidth === 0 || host.clientHeight === 0) return
       try { fit.fit() } catch { /* host has zero size mid-layout; ignore */ }
       port?.postMessage({ resize: { cols: term.cols, rows: term.rows } })
     }
