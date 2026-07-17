@@ -244,6 +244,25 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   first real CI run; untimed `write_all` in `write_frame`/Output forwarders on
   a wedged client (pre-existing, ticket-worthy — apply the watcher-style
   timeout discipline).
+- [x] UI/UX pass (2026-07-17) — 10 reviewed tasks (subagent-driven; plan:
+  `docs/superpowers/plans/2026-07-17-ui-ux-improvements-plan.md`). App:
+  actionable empty/loading states + dead-overlay close; keyboard pane
+  navigation (Cmd/Ctrl+Shift+arrows), `CHORD_TABLE` single source + help
+  overlay (`?`), aria/focus-ring pass; drag threshold + Escape cancel +
+  tokenized drop zones; tab/workspace rename + tab close/drag-reorder
+  (sidecar `label`/`tabOrder`); live OSC pane titles + font-size chords
+  (sidecar `fontSize`); per-pane scrollback search (`@xterm/addon-search`,
+  Cmd/Ctrl+Shift+F); pane zoom (Cmd/Ctrl+Shift+M, zoom keyed `ws:tab`) +
+  header context menu (kind-override split, copy cwd); freeze/park a pane
+  with a note (sidecar `frozen` map — display-only parking: input blocked +
+  blurred, activity suppressed, daemon untouched). Daemon: `ReportRunState`
+  (supervisor fire-and-forget) + `SessionInfo.run_state` → claude panes show
+  claude/retrying/shell-fallback dots; rate-limited (500 ms) `Activity`
+  events on pty output → background-tab activity dots — both ride the
+  existing bounded watcher broadcast. Gates: Rust 164 tests + clippy clean,
+  app 140 tests + typecheck + bundle green. Still open: live-GUI gesture
+  verification (renderer components still test-deferred); running daemon
+  needs restart for run-state/activity events.
 
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**
