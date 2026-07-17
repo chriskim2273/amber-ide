@@ -301,6 +301,58 @@ Scope (Rust): `crates/amber-core/src/proto.rs` (+ tests),
 4. UI must not re-render per event beyond the tab bar (activity state lives in
    the reducer; Pane/xterm untouched — rule #5).
 
+## Task 11: Freeze/park a pane with a note
+
+(User-requested addition mid-pass. Execution order: after Task 9, before the
+final gates.)
+
+Scope: `app/src/shared/layoutFile.ts` (+ test), `app/src/renderer/main.tsx`,
+`app/src/renderer/SplitView.tsx`, `app/src/renderer/theme.css`,
+`app/src/renderer/keys.ts` (+ test).
+
+Motivation: the user wants to "freeze/pause" a pane and pin a note on it, for
+sessions they deliberately won't return to for a while — attention management,
+not process control.
+
+1. **Semantics — parking, not suspension.** Freezing NEVER touches the daemon
+   or the process (no SIGSTOP, no Kill, no detach — the session keeps running
+   and its scrollback keeps flowing; core rules #1/#3 untouched). Frozen is
+   app-owned display state: the pane is visually parked and input-locked.
+2. **State.** Sidecar gains an additive-optional top-level map
+   `frozen?: Record<string, { note?: string }>` keyed by SESSION NAME (session
+   names are stable across reboots, so parking survives restart; a frozen
+   entry whose session no longer exists is pruned on load-reconcile). Tolerant
+   parse (old files fine; `Array.isArray`-style shape guards per the Task 4
+   review lesson). Round-trip + tolerance unit tests.
+3. **Freeze gesture.** Context-menu item "freeze pane…" (Task 7's menu) opens
+   a small inline note prompt (single-line input over the pane, Enter commits
+   — empty note allowed —, Esc cancels); plus chord `freeze` =
+   Cmd/Ctrl+Shift+P toggling freeze on the focused pane (toggle-on uses empty
+   note; table-driven, tested). If Task 7's menu item list is already merged,
+   append the item; keep menu code patterns.
+4. **Frozen pane rendering.** A `.frozen-overlay` covers the pane body:
+   dimmed/blurred backdrop (reuse `.dead-overlay` visual language), a ❄/⏸
+   badge, the note text (or "frozen") prominently, freeze timestamp not needed.
+   Overlay intercepts ALL pointer events (terminal unclickable) and the pane
+   is skipped by directional focus navigation (extend the pure
+   `nextPaneInDirection` call site by filtering frozen ids from the rect list
+   — pure helper change unit-tested). Typing cannot reach the pty (overlay
+   blocks focus; additionally guard in Pane or SplitView so a frozen pane's
+   textarea never receives programmatic focus). Header stays interactive
+   (unfreeze must be reachable): grip/split/close still work; title row shows
+   a small frozen badge.
+5. **Unfreeze.** Button on the overlay ("unfreeze", aria-labeled) + the same
+   chord toggling off + a context-menu "unfreeze" item. Unfreezing restores
+   normal focus/input behavior and removes the sidecar entry.
+6. **Interaction with activity indicators (Task 9).** A frozen pane's
+   activity NEVER lights the tab activity dot (that's the point of parking) —
+   filter frozen sessions in the reducer's activity handling; reducer change
+   unit-tested. Frozen state also excludes the pane from the tab's kind-dot
+   claude-state downgrade only if trivial — otherwise leave kind-dot logic
+   alone.
+7. xterm stays mounted and streaming under the overlay (memo invariants
+   hold; overlay is chrome only).
+
 ## Task 10: Final gates
 
 Run in the worktree root: `cargo test --workspace`,
