@@ -34,9 +34,14 @@
 //!   mutex at once; `broadcast()` takes only the registry mutex and does no
 //!   socket I/O under it.
 //!
-//! Worst case for an unrelated thread replying on a wedged watcher's shared
-//! writer mutex: one `WRITE_TIMEOUT` wait, after which the socket errors
-//! immediately. No daemon thread can block indefinitely on a watcher.
+//! Worst case for an unrelated thread contending on a wedged watcher's
+//! shared writer mutex while the WATCHER forwarder holds it: one
+//! `WRITE_TIMEOUT` wait, after which the socket errors immediately. This
+//! bound covers the watcher path only — the pty Output forwarders and
+//! control replies write through the same shared writer with untimed
+//! `write_all`, so a hold by THOSE writers is not bounded here. No watcher
+//! can block the broadcast caller or hold the shared writer beyond one
+//! `WRITE_TIMEOUT`.
 
 use std::io::Write;
 use std::net::Shutdown;
