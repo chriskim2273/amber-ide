@@ -74,6 +74,11 @@ pub enum ControlMsg {
     Sessions { sessions: Vec<SessionInfo> },
     /// Daemon -> watchers: an incremental session-set delta.
     SessionsChanged { added: Vec<SessionInfo>, removed: Vec<String> },
+    /// Daemon -> watchers: a session produced output. Rate-limited to at most
+    /// one per session per 500 ms so a chatty pty can't flood watchers; the app
+    /// uses it to light a background-activity dot on inactive tabs. Carries only
+    /// the name — no bytes (raw output rides `Data` frames on the pane socket).
+    Activity { name: String },
     SessionList { names: Vec<String> },
     Created { name: String },
     Killed { name: String },
@@ -346,6 +351,15 @@ mod tests {
         };
         let f = Frame::Control(ControlMsg::Sessions { sessions: vec![info] });
         assert_eq!(roundtrip(&f), f);
+    }
+
+    #[test]
+    fn activity_control_roundtrips() {
+        let f = Frame::Control(ControlMsg::Activity { name: "amber-1-1-0-a".into() });
+        assert_eq!(roundtrip(&f), f);
+        // Lock the externally-tagged JSON shape the TS client decodes.
+        let json = serde_json::to_string(&ControlMsg::Activity { name: "s".into() }).unwrap();
+        assert_eq!(json, r#"{"Activity":{"name":"s"}}"#);
     }
 
     #[test]

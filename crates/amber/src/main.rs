@@ -410,7 +410,14 @@ fn run_daemon(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Result<
         std::fs::create_dir_all(parent)?;
     }
 
-    let manager = Arc::new(SessionManager::new(&root)?.with_socket(socket_path.clone()));
+    // Created before the manager so restored sessions get their output-activity
+    // hook wired (a restored pane that produces output must light its tab dot).
+    let watchers = std::sync::Arc::new(amber::watchers::Watchers::new());
+    let manager = Arc::new(
+        SessionManager::new(&root)?
+            .with_socket(socket_path.clone())
+            .with_watchers(Arc::clone(&watchers)),
+    );
     // Global claude SessionStart hook: lets a hand-started claude in a shell
     // record its resume id too (best-effort; the per-session hook covers
     // amber-launched claude).
@@ -418,7 +425,6 @@ fn run_daemon(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Result<
         claude::ensure_global_claude_hook(&format!("{} hook", exe.display()));
     }
     manager.restore()?;
-    let watchers = std::sync::Arc::new(amber::watchers::Watchers::new());
 
     // A stale socket file from a previous (crashed/killed) daemon run must
     // not block bind() — but a LIVE daemon's socket must never be stolen.

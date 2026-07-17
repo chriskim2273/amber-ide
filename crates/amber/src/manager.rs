@@ -7,11 +7,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use amber_core::proto::SessionInfo;
+use amber_core::proto::{ControlMsg, SessionInfo};
 use amber_core::state::{Config, SessionKind, SessionMeta, StateStore};
 use portable_pty::CommandBuilder;
 
 use crate::pty::PtySession;
+use crate::watchers::Watchers;
 
 const DEFAULT_ROWS: u16 = 24;
 const DEFAULT_COLS: u16 = 80;
@@ -55,6 +56,10 @@ pub struct SessionManager {
     /// back (`ReportRunState`). `None` in tests / hand-started managers — the
     /// supervisor then reconstructs the default socket from its state root.
     socket: Option<PathBuf>,
+    /// Watcher registry, so each spawned session can broadcast rate-limited
+    /// output `Activity` to watchers. `None` in tests / hand-started managers —
+    /// no activity notifications are wired then (harmless; the app is absent).
+    watchers: Option<Arc<Watchers>>,
 }
 
 impl SessionManager {
@@ -69,7 +74,16 @@ impl SessionManager {
             root,
             sessions: Mutex::new(HashMap::new()),
             socket: None,
+            watchers: None,
         })
+    }
+
+    /// Wire the watcher registry so spawned sessions emit rate-limited output
+    /// `Activity` to watchers. Builder-style so existing callers/tests that
+    /// don't care keep using `new`.
+    pub fn with_watchers(mut self, watchers: Arc<Watchers>) -> Self {
+        self.watchers = Some(watchers);
+        self
     }
 
     /// Record the daemon socket path so claude supervisors learn where to send
@@ -178,12 +192,23 @@ impl SessionManager {
         if let Some(path) = login_path() {
             cmd.env("PATH", path);
         }
-        Ok(Arc::new(PtySession::spawn(
+        let sess = Arc::new(PtySession::spawn(
             cmd,
             DEFAULT_ROWS,
             DEFAULT_COLS,
             self.cfg.scrollback_bytes,
-        )?))
+        )?);
+        // Rate-limited output-activity notification (background-activity dots).
+        // The hook only fires on the pty batcher's ~2/sec gate and rides the
+        // non-blocking watcher broadcast, so it never stalls the fan-out.
+        if let Some(watchers) = &self.watchers {
+            let watchers = Arc::clone(watchers);
+            let name = name.to_string();
+            sess.set_activity_hook(Box::new(move || {
+                watchers.broadcast(&ControlMsg::Activity { name: name.clone() });
+            }));
+        }
+        Ok(sess)
     }
 
     /// Create a new session, persist its metadata, and track it live.

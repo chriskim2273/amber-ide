@@ -35,6 +35,24 @@ const READER_CHANNEL_DEPTH: usize = 32;
 /// Retry cadence while at least one subscriber's queue is full.
 const STALL_POLL: std::time::Duration = std::time::Duration::from_millis(2);
 
+/// Minimum gap between activity notifications for one session (ms). A chatty
+/// pty (e.g. `cat` of a huge file) must not flood watchers — at most one
+/// `Activity` per session per this window (spec: background-activity dots).
+const ACTIVITY_MIN_INTERVAL_MS: u64 = 500;
+
+/// Fires (off the fan-out thread's rate-limit gate) when a session produces
+/// output; the daemon wires this to `watchers.broadcast(Activity)`. Must be
+/// non-blocking — it rides the existing bounded, non-blocking watcher queue.
+pub type ActivityHook = Box<dyn Fn() + Send + Sync>;
+
+/// Monotonic milliseconds since an arbitrary process-wide start. Cheap
+/// (`Instant::now`), never goes backwards — the activity rate-limit clock.
+fn monotonic_ms() -> u64 {
+    use std::time::Instant;
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
 /// Rounds of [`STALL_POLL`] a full subscriber is tolerated for WHILE other
 /// subscribers are making progress (~300 ms). Spec §9 isolation: when every
 /// subscriber is saturated the reader blocks (true backpressure — the child
@@ -71,6 +89,18 @@ pub struct PtySession {
     /// supervisor (`ReportRunState`). App-facing metadata only — it never
     /// affects supervision. Mutex-guarded so `PtySession` stays `Send + Sync`.
     run_state: Mutex<Option<String>>,
+    /// Optional output-activity notifier + its rate-limit clock, shared with
+    /// the batcher thread. The batcher does a cheap atomic check on every
+    /// frame and only locks/fires the hook once per `ACTIVITY_MIN_INTERVAL_MS`
+    /// — so this never adds blocking work to the fan-out path.
+    activity: Arc<ActivityState>,
+}
+
+/// Rate-limit clock + optional notifier for output activity. `last_ms` starts
+/// at 0 so the very first frame fires immediately.
+struct ActivityState {
+    last_ms: AtomicU64,
+    hook: Mutex<Option<ActivityHook>>,
 }
 
 /// Fan one chunk out to every subscriber, returning the ids to prune.
@@ -160,6 +190,10 @@ impl PtySession {
         let ring = Arc::new(Mutex::new(Ring::new(cap)));
         let subs: Arc<Mutex<Subscribers>> = Arc::new(Mutex::new(Vec::new()));
         let reader_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let activity = Arc::new(ActivityState {
+            last_ms: AtomicU64::new(0),
+            hook: Mutex::new(None),
+        });
 
         // Output path, two threads (spec §9 batching):
         //
@@ -199,6 +233,7 @@ impl PtySession {
             let ring = Arc::clone(&ring);
             let subs = Arc::clone(&subs);
             let reader_done = Arc::clone(&reader_done);
+            let activity = Arc::clone(&activity);
             thread::spawn(move || {
                 use std::sync::mpsc::RecvTimeoutError;
                 use std::time::Instant;
@@ -243,6 +278,23 @@ impl PtySession {
                     if !dead.is_empty() {
                         subs.lock().unwrap().retain(|(id, _)| !dead.contains(id));
                     }
+                    // Output activity notification, rate-limited to one per
+                    // ACTIVITY_MIN_INTERVAL_MS. Cheap atomic gate on every frame;
+                    // the hook (a non-blocking watcher broadcast) fires at most
+                    // ~2/sec, so the fan-out thread is never blocked here.
+                    let now = monotonic_ms();
+                    let last = activity.last_ms.load(Ordering::Relaxed);
+                    // `last == 0` is the "never fired" sentinel: the FIRST output
+                    // frame always notifies (monotonic_ms starts near 0, so a
+                    // plain `now - last >= interval` would suppress it for the
+                    // first 500 ms). Store `now.max(1)` so a real fire never
+                    // re-arms the sentinel.
+                    if last == 0 || now.saturating_sub(last) >= ACTIVITY_MIN_INTERVAL_MS {
+                        activity.last_ms.store(now.max(1), Ordering::Relaxed);
+                        if let Some(hook) = activity.hook.lock().unwrap().as_ref() {
+                            hook();
+                        }
+                    }
                     if eof {
                         break 'stream;
                     }
@@ -281,7 +333,14 @@ impl PtySession {
             exit,
             pid,
             run_state: Mutex::new(None),
+            activity,
         })
+    }
+
+    /// Install the output-activity notifier (see [`ActivityHook`]). Set once by
+    /// the manager after spawn/restore; the batcher fires it, rate-limited.
+    pub fn set_activity_hook(&self, hook: ActivityHook) {
+        *self.activity.hook.lock().unwrap() = Some(hook);
     }
 
     /// The last-reported claude supervision phase, if any.
