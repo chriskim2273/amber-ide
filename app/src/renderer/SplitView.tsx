@@ -9,23 +9,40 @@ export interface PaneMeta { kind: string; title: string }
 // debounced incremental findNext on type, Enter/Shift+Enter step, Escape closes.
 // Rendered as an absolute overlay so it never enters the terminal's layout box
 // (which would SIGWINCH the pty on open/close).
-function FindBar({ api, onClose }: { api: SearchApi; onClose: () => void }): JSX.Element {
+function FindBar({ api, focusSeq, onClose }: { api: SearchApi; focusSeq: number; onClose: () => void }): JSX.Element {
   const [query, setQuery] = useState('')
   const [res, setRes] = useState<{ index: number; count: number }>({ index: -1, count: 0 })
   const inputRef = useRef<HTMLInputElement>(null)
-  useEffect(() => { inputRef.current?.focus() }, [])
+  // Focus on mount AND whenever the find chord re-fires on this pane (focusSeq
+  // bumps) — reopening an already-open bar must put the caret back in the input.
+  useEffect(() => { inputRef.current?.focus() }, [focusSeq])
   useEffect(() => {
     api.onResults((r) => setRes({ index: r.resultIndex, count: r.resultCount }))
-    return () => api.onResults(() => {}) // detach on unmount — a later clear() must not setState here
+    return () => {
+      api.onResults(() => {}) // detach — a later clear() must not setState here
+      // Unmount = this pane stops being the find target (close, chord moved to
+      // another pane, pane killed). Always drop its decorations, not only on the
+      // explicit ✕/Escape path. try: the pane-kill path disposes the Terminal
+      // (and the addon) in the same commit — clearing then must not throw.
+      try { api.clear() } catch { /* terminal already disposed */ }
+    }
   }, [api])
   // Debounced incremental search on type; empty query clears decorations rather
   // than searching for '' (which the addon treats as a no-op/clear anyway).
+  // The pending timer lives in a ref so Enter/Shift+Enter/button navigation can
+  // cancel it — otherwise it fires findNext(incremental) ~150 ms AFTER the user
+  // already stepped, yanking the active match back.
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const cancelDebounce = (): void => {
+    if (debounceRef.current !== null) { clearTimeout(debounceRef.current); debounceRef.current = null }
+  }
   useEffect(() => {
-    const id = setTimeout(() => {
+    debounceRef.current = setTimeout(() => {
+      debounceRef.current = null
       if (query) api.findNext(query, { incremental: true })
       else { api.clear(); setRes({ index: -1, count: 0 }) }
     }, 150)
-    return () => clearTimeout(id)
+    return cancelDebounce
   }, [query, api])
   // >1000 matches trips the addon threshold and reports resultIndex -1 with a
   // real count — show the count without a bogus 0/N ordinal in that case.
@@ -40,14 +57,17 @@ function FindBar({ api, onClose }: { api: SearchApi; onClose: () => void }): JSX
           if (e.key === 'Escape') { e.preventDefault(); onClose() }
           else if (e.key === 'Enter') {
             e.preventDefault()
-            if (query) { if (e.shiftKey) api.findPrevious(query); else api.findNext(query) }
+            if (query) {
+              cancelDebounce()
+              if (e.shiftKey) api.findPrevious(query); else api.findNext(query)
+            }
           }
         }} />
       <span className="find-count">{ordinal}</span>
       <button className="icon-btn" aria-label="previous match" title="previous (Shift+Enter)"
-        onClick={() => { if (query) api.findPrevious(query) }}>↑</button>
+        onClick={() => { if (query) { cancelDebounce(); api.findPrevious(query) } }}>↑</button>
       <button className="icon-btn" aria-label="next match" title="next (Enter)"
-        onClick={() => { if (query) api.findNext(query) }}>↓</button>
+        onClick={() => { if (query) { cancelDebounce(); api.findNext(query) } }}>↓</button>
       <button className="icon-btn" aria-label="close find" title="close (Esc)" onClick={onClose}>✕</button>
     </div>
   )
@@ -96,8 +116,10 @@ export function SplitView(props: {
   const focusedRef = useRef<string | null>(null)
   focusedRef.current = focused
   // Which pane (if any) has its find bar open. The find chord opens it on the
-  // FOCUSED pane; only that pane renders the bar.
+  // FOCUSED pane; only that pane renders the bar. `findSeq` bumps on every chord
+  // fire so re-invoking find on an already-open bar refocuses its input.
   const [findPane, setFindPane] = useState<string | null>(null)
+  const [findSeq, setFindSeq] = useState(0)
   // Live tree/size for the keydown handler (registered once). Directional focus
   // needs the current geometry without re-binding the listener each render.
   const treeRef = useRef(props.tree)
@@ -149,7 +171,9 @@ export function SplitView(props: {
     for (const id of [...titleCbs.current.keys()]) {
       if (!live.has(id)) titleCbs.current.delete(id)
     }
-    for (const id of [...searchApis.current.keys()]) {
+    // Union of both maps' keys: a cb can be cached before its api is delivered
+    // (Pane not yet mounted), so sweeping only searchApis would strand cb entries.
+    for (const id of new Set([...searchApis.current.keys(), ...searchReadyCbs.current.keys()])) {
       if (!live.has(id)) { searchApis.current.delete(id); searchReadyCbs.current.delete(id) }
     }
     setFindPane((p) => (p && !live.has(p) ? null : p))
@@ -180,10 +204,13 @@ export function SplitView(props: {
         return
       }
       // Find targets the focused pane (its SearchApi must be ready — it is, once
-      // the pane has mounted). Reopening on the same pane just re-focuses the bar.
+      // the pane has mounted). Switching the target unmounts the previous pane's
+      // FindBar, whose teardown clears that pane's decorations; re-firing on the
+      // already-open pane bumps findSeq, which refocuses the bar's input.
       if (c.type === 'find' && focusedRef.current && searchApis.current.has(focusedRef.current)) {
         e.preventDefault()
         setFindPane(focusedRef.current)
+        setFindSeq((s) => s + 1)
         return
       }
       const dir = dirOf[c.type]
@@ -315,8 +342,8 @@ export function SplitView(props: {
               <Pane session={paneId} epoch={props.epoch} portEpoch={props.portEpoch}
                 fontSize={props.fontSize} onTitle={titleCbFor(paneId)} onSearchReady={searchReadyFor(paneId)} />
               {findPane === paneId && searchApis.current.get(paneId) &&
-                <FindBar api={searchApis.current.get(paneId)!}
-                  onClose={() => { searchApis.current.get(paneId)?.clear(); setFindPane(null); focusPane(paneId) }} />}
+                <FindBar api={searchApis.current.get(paneId)!} focusSeq={findSeq}
+                  onClose={() => { setFindPane(null); focusPane(paneId) }} />}
               {dead !== undefined &&
                 <div className="dead-overlay">
                   <div className={'dead-badge ' + (dead === 0 ? 'ok' : 'err')}>
