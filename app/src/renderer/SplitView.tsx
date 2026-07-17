@@ -430,7 +430,10 @@ export function SplitView(props: {
             <div className="ctx-sep" />
             <button className="ctx-item" role="menuitem" onClick={run(() => props.onToggleZoom(paneId))}>{isZoomed ? 'Restore' : 'Zoom'}</button>
             <button className="ctx-item" role="menuitem"
-              onClick={run(() => { void navigator.clipboard?.writeText(props.meta[paneId]?.cwd ?? '') })}>Copy cwd</button>
+              onClick={run(() => {
+                // Swallow a rejection (clipboard perms) — no unhandled promise rejection.
+                navigator.clipboard?.writeText(props.meta[paneId]?.cwd ?? '').catch(() => {})
+              })}>Copy cwd</button>
             <div className="ctx-sep" />
             <button className="ctx-item danger" role="menuitem" onClick={run(() => props.onClose(paneId))}>Close</button>
           </div>

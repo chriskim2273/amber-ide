@@ -209,30 +209,33 @@ function App(): JSX.Element {
   const storedTree = layout.workspaces[wsKey]?.tabs[tabKey]?.tree ?? null
   const tree = reconcile(storedTree, liveIds)
 
-  // Zoom (transient, per tab). Derive the effective zoomed pane for the visible
-  // tab, guarding a stale id whose pane has already left the live set.
-  const zoomedPane = zoom[tabKey] && liveIds.includes(zoom[tabKey]!) ? zoom[tabKey]! : null
+  // Zoom (transient, per tab). Tab numbering restarts per workspace (every ws
+  // has a tab 1), so the zoom map and the structural-clear ref are keyed by the
+  // COMPOSITE ws:tab — bare tabKey would make ws2/tab1 clobber ws1/tab1's zoom,
+  // and a plain workspace switch would trip the safety-net clear.
+  const zoomKey = `${wsKey}:${tabKey}`
+  const zoomedPane = zoom[zoomKey] && liveIds.includes(zoom[zoomKey]!) ? zoom[zoomKey]! : null
   const toggleZoom = (paneId: string): void => setZoom((z) => {
-    if (z[tabKey] === paneId) { const c = { ...z }; delete c[tabKey]; return c }
-    return { ...z, [tabKey]: paneId }
+    if (z[zoomKey] === paneId) { const c = { ...z }; delete c[zoomKey]; return c }
+    return { ...z, [zoomKey]: paneId }
   })
   const clearZoom = (): void => setZoom((z) => {
-    if (!(tabKey in z)) return z
-    const c = { ...z }; delete c[tabKey]; return c
+    if (!(zoomKey in z)) return z
+    const c = { ...z }; delete c[zoomKey]; return c
   })
   // Structural-change guard: when the visible tab's live pane set changes (a
   // split lands, a pane is closed/reaped — via our gesture OR the daemon), drop
   // that tab's zoom. Moves don't change the set, so those gestures clear zoom
-  // explicitly below. Per-tab tracking so a plain tab switch never clears.
+  // explicitly below. Per-ws:tab tracking so a plain tab/ws switch never clears.
   const liveSetKey = [...liveIds].sort().join(',')
   const prevTabLive = useRef<Record<string, string>>({})
   useEffect(() => {
-    const prev = prevTabLive.current[tabKey]
-    prevTabLive.current[tabKey] = liveSetKey
+    const prev = prevTabLive.current[zoomKey]
+    prevTabLive.current[zoomKey] = liveSetKey
     if (prev !== undefined && prev !== liveSetKey) {
-      setZoom((z) => { if (!(tabKey in z)) return z; const c = { ...z }; delete c[tabKey]; return c })
+      setZoom((z) => { if (!(zoomKey in z)) return z; const c = { ...z }; delete c[zoomKey]; return c })
     }
-  }, [tabKey, liveSetKey])
+  }, [zoomKey, liveSetKey])
 
   // Visual tab order: sidecar `tabOrder` first, unlisted append numerically.
   const orderedTabs = orderTabs(tabs.map((t) => t.tab), layout.workspaces[wsKey]?.tabOrder)
