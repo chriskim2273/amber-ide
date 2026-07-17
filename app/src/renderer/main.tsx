@@ -59,6 +59,12 @@ function App(): JSX.Element {
   // Bumped on each daemon reconnect (disconnected -> connected edge) so panes
   // can re-run their attach fixups (mouse-mode reset, TUI repaint nudge).
   const [reconnectEpoch, setReconnectEpoch] = useState(0)
+  // Bumped when the main process relaunches the client utilityProcess. Distinct
+  // from reconnectEpoch: a daemon blip keeps the pane MessagePorts alive (only a
+  // repaint nudge is needed), but a client relaunch kills every port, so panes
+  // must RE-REQUEST a fresh port from the new child. Both edges look identical
+  // from the renderer's connection status, so main signals the restart explicitly.
+  const [childEpoch, setChildEpoch] = useState(0)
   const prevConnected = useRef(true)
   // Splits whose session was requested but hasn't materialized yet. Held out of
   // reconcile so it can't prune/re-append them as columns; placed with the
@@ -73,6 +79,9 @@ function App(): JSX.Element {
       const st = (d as { status?: string }).status
       if (st === 'connected') setConnected(true)
       else if (st === 'disconnected') setConnected(false)
+      // The client utilityProcess was relaunched: its old pane ports are dead,
+      // so ask every Pane to re-acquire from the new child.
+      if ((d as { childRestart?: boolean }).childRestart) setChildEpoch((e) => e + 1)
       const ev = toEvent(d); if (ev) dispatch(ev)
     })
     void window.amber.loadLayout().then((text) => {
@@ -243,7 +252,7 @@ function App(): JSX.Element {
       </div>
       <div className="pane-stage">
         {tree
-          ? <SplitView tree={tree} deadCodes={deadCodes} meta={paneMeta} epoch={reconnectEpoch}
+          ? <SplitView tree={tree} deadCodes={deadCodes} meta={paneMeta} epoch={reconnectEpoch} portEpoch={childEpoch}
               onSetRatio={(path, r) => putTree(setRatio(tree, path, r))}
               onSplit={(paneId, dir) => {
                 const name = formatName({ ws: currentWs, tab: currentTab, ord: nextOrd, id: makeId() })

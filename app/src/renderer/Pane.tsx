@@ -44,7 +44,9 @@ const MOUSE_RESET = '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l'
 // `epoch` are primitives, so memo keeps a drag from reconciling every terminal
 // (honors "xterm instances live outside React reconciliation").
 // Focus is tracked by SplitView via `focusin` on the wrapper; nothing here.
-export const Pane = memo(function Pane({ session, epoch }: { session: string; epoch: number }): JSX.Element {
+export const Pane = memo(function Pane(
+  { session, epoch, portEpoch }: { session: string; epoch: number; portEpoch: number },
+): JSX.Element {
   const hostRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<Terminal | null>(null)
   const fitRef = useRef<FitAddon | null>(null)
@@ -52,6 +54,10 @@ export const Pane = memo(function Pane({ session, epoch }: { session: string; ep
   // Set on a reconnect so the NEXT backlog message re-runs the reset (the
   // daemon replays a fresh backlog on every re-Attach, re-enabling mouse modes).
   const rearmRef = useRef(false)
+  // Re-acquire the pane's MessagePort. Points at the live mount-effect closure;
+  // called when the client utilityProcess restarts (portEpoch) and the old port
+  // is dead.
+  const acquireRef = useRef<() => void>(() => {})
 
   useEffect(() => {
     const host = hostRef.current
@@ -99,12 +105,17 @@ export const Pane = memo(function Pane({ session, epoch }: { session: string; ep
     ro.observe(host)
     const focus = (): void => term.focus()
 
+    // Input goes to whatever the CURRENT port is. Registered ONCE — re-running it
+    // per (re)acquire would stack handlers and double-send every keystroke.
+    term.onData((s) => port?.postMessage({ data: new TextEncoder().encode(s) }))
+
     const onPortMsg = (e: MessageEvent): void => {
       const d = e.data as { amberPanePort?: boolean; session?: string }
       if (!d?.amberPanePort || d.session !== session || !e.ports[0]) return
       window.removeEventListener('message', onPortMsg)
       if (wired) { e.ports[0].close(); return }
       wired = true
+      port?.close() // drop the previous (now-dead) port on a re-acquire
       port = e.ports[0]
       portRef.current = port
       let sawBacklog = false
@@ -120,15 +131,21 @@ export const Pane = memo(function Pane({ session, epoch }: { session: string; ep
         }
       }
       port.start()
-      term.onData((s) => port?.postMessage({ data: new TextEncoder().encode(s) }))
       sendResize()
       term.focus()
     }
 
-    window.addEventListener('message', onPortMsg)
+    // (Re)acquire a pane port from main: arm the listener and ask for a port.
+    const acquire = (): void => {
+      wired = false
+      window.addEventListener('message', onPortMsg)
+      window.amber.openPane(session)
+    }
+    acquireRef.current = acquire
+
     host.addEventListener('click', focus)
     term.focus()
-    window.amber.openPane(session)
+    acquire()
 
     return () => {
       window.removeEventListener('message', onPortMsg)
@@ -141,6 +158,14 @@ export const Pane = memo(function Pane({ session, epoch }: { session: string; ep
       portRef.current = null
     }
   }, [session])
+
+  // Client utilityProcess restarted (portEpoch): the old MessagePort is dead —
+  // re-request a fresh one from the new child. The terminal (and its scrollback)
+  // is preserved; the daemon replays backlog on the re-Attach.
+  useEffect(() => {
+    if (portEpoch === 0) return
+    acquireRef.current()
+  }, [portEpoch])
 
   // On reconnect (epoch increments): re-arm the mouse reset for the fresh
   // backlog, and nudge a resize so an alt-screen TUI (claude — whose screen
