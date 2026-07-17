@@ -232,22 +232,41 @@ impl SessionManager {
         }
     }
 
-    /// Recreate every persisted session, seeding its ring with saved scrollback.
+    /// Recreate every persisted session, seeding its ring with saved
+    /// scrollback. One unrestorable session (unreadable scrollback, spawn
+    /// failure) is logged and skipped — it must never abort the rest, which
+    /// would leave the daemon dead on startup with zero sessions restored
+    /// (mirrors [`StateStore::list_sessions`]' tolerance of corrupt JSON).
     pub fn restore(&self) -> anyhow::Result<()> {
         let metas = self.store.list_sessions()?;
         let mut sessions = self.sessions.lock().unwrap();
         for meta in metas {
-            // A shell that was running a hand-started claude comes back as a
-            // supervised, resumable claude (which falls back to a shell when
-            // claude exits — so the pane never regresses).
-            let kind = if meta.resume_as_claude { SessionKind::Claude } else { meta.kind };
-            let sess = self.spawn(kind, &meta.name, &meta.cwd)?;
-            if let Some(bytes) = self.store.read_scrollback(&meta.name)? {
-                sess.preload(&bytes);
+            match self.restore_one(&meta) {
+                Ok(sess) => {
+                    sessions.insert(meta.name.clone(), sess);
+                }
+                Err(e) => {
+                    eprintln!("amber daemon: restore skipped session {}: {e}", meta.name);
+                }
             }
-            sessions.insert(meta.name.clone(), sess);
         }
         Ok(())
+    }
+
+    /// Restore a single persisted session. The scrollback is read BEFORE the
+    /// child is spawned so a read failure cannot leak a freshly-spawned
+    /// process.
+    fn restore_one(&self, meta: &SessionMeta) -> anyhow::Result<Arc<PtySession>> {
+        let scrollback = self.store.read_scrollback(&meta.name)?;
+        // A shell that was running a hand-started claude comes back as a
+        // supervised, resumable claude (which falls back to a shell when
+        // claude exits — so the pane never regresses).
+        let kind = if meta.resume_as_claude { SessionKind::Claude } else { meta.kind };
+        let sess = self.spawn(kind, &meta.name, &meta.cwd)?;
+        if let Some(bytes) = scrollback {
+            sess.preload(&bytes);
+        }
+        Ok(sess)
     }
 
     pub fn session(&self, name: &str) -> Option<Arc<PtySession>> {
@@ -448,6 +467,44 @@ mod tests {
         assert!(result.is_err(), "create must fail when the store is unwritable");
         assert!(mgr.names().is_empty(), "failed create must not be tracked");
         assert!(!dir.path().join("sessions/orphan.json").exists());
+    }
+
+    #[test]
+    fn restore_skips_a_poison_session_and_restores_the_healthy_ones() {
+        // One unrestorable session (here: its scrollback path is a DIRECTORY,
+        // so read_scrollback errors) must be logged and skipped — never abort
+        // the whole restore, which would leave the daemon dead on startup
+        // with zero sessions. Mirrors state.rs list_sessions' tolerance of
+        // corrupt JSON.
+        use amber_core::state::{SessionMeta, StateStore};
+        let dir = tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        for name in ["good-a", "poison", "good-b"] {
+            store
+                .write_session(&SessionMeta {
+                    name: name.to_string(),
+                    cwd: PathBuf::from("/tmp"),
+                    kind: SessionKind::Shell,
+                    updated: 1,
+                    resume_as_claude: false,
+                })
+                .unwrap();
+        }
+        store.write_scrollback("good-a", b"history-a").unwrap();
+        // The poison pill: a directory where the scrollback file should be.
+        std::fs::create_dir_all(dir.path().join("scrollback/poison.bin")).unwrap();
+
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        mgr.restore().expect("restore must not abort on one bad session");
+        assert_eq!(
+            mgr.names(),
+            vec!["good-a".to_string(), "good-b".to_string()],
+            "healthy sessions restored, poison one skipped"
+        );
+        assert!(
+            mgr.session("good-a").unwrap().scrollback().windows(9).any(|w| w == b"history-a"),
+            "healthy session's scrollback preloaded"
+        );
     }
 
     #[test]
