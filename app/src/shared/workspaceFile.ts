@@ -55,7 +55,7 @@ function isNode(v: unknown): v is Node {
   if (n.kind === 'leaf') return typeof (v as { paneId?: unknown }).paneId === 'string'
   if (n.kind === 'split') {
     const s = v as { dir?: unknown; ratio?: unknown; a?: unknown; b?: unknown }
-    return (s.dir === 'h' || s.dir === 'v') && typeof s.ratio === 'number' && isNode(s.a) && isNode(s.b)
+    return (s.dir === 'h' || s.dir === 'v') && typeof s.ratio === 'number' && Number.isFinite(s.ratio) && isNode(s.a) && isNode(s.b)
   }
   return false
 }
@@ -135,10 +135,21 @@ export function serializeWorkspaceFile(doc: WorkspaceDoc): string {
 }
 
 // ---- placeholder tree rewrites (pure, both directions) ----------------------
+// Rewrite each leaf's paneId through `map`. A leaf with no mapping is DROPPED
+// (write-clean: never leak a stale name/placeholder into the output) and its
+// split collapses so the sibling takes the space — same discipline as
+// layout.removeLeaf. A tree that maps to nothing → null.
 function rewriteLeaves(tree: Node | null, map: Record<string, string>): Node | null {
   if (tree === null) return null
-  if (tree.kind === 'leaf') return { kind: 'leaf', paneId: map[tree.paneId] ?? tree.paneId }
-  return { ...tree, a: rewriteLeaves(tree.a, map)!, b: rewriteLeaves(tree.b, map)! }
+  if (tree.kind === 'leaf') {
+    const mapped = map[tree.paneId]
+    return mapped === undefined ? null : { kind: 'leaf', paneId: mapped }
+  }
+  const a = rewriteLeaves(tree.a, map)
+  const b = rewriteLeaves(tree.b, map)
+  if (a === null) return b
+  if (b === null) return a
+  return { ...tree, a, b }
 }
 export function treeToPlaceholders(tree: Node | null, nameToId: Record<string, string>): Node | null {
   return rewriteLeaves(tree, nameToId)
@@ -155,6 +166,10 @@ export interface SavePane { name: string; cwd: string; kind: string; ord: number
 export interface SaveTab { tab: number; panes: SavePane[] }
 export interface SaveWorkspace { ws: number; tabs: SaveTab[] }
 
+// Precondition: `live` and `sidecar` derive from the same reconciled state —
+// each sidecar tab tree's leaves name the live sessions in that tab. A leaf
+// naming a session absent from live panes is dropped (rewriteLeaves), never
+// leaked into the file.
 export function assembleSave(
   scope: 'one' | 'all',
   live: SaveWorkspace[],

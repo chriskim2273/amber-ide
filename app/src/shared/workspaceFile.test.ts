@@ -122,6 +122,15 @@ describe('placeholder rewrites', () => {
     expect(treeToPlaceholders(null, {})).toBeNull()
     expect(treeFromPlaceholders(null, {})).toBeNull()
   })
+  it('drops an unmapped leaf and collapses the split (write-clean)', () => {
+    const t: Node = { kind: 'split', dir: 'h', ratio: 0.5, a: { kind: 'leaf', paneId: 'p0' }, b: { kind: 'leaf', paneId: 'p5' } }
+    // Only p0 maps → sibling p5 dropped, split collapses to the surviving leaf.
+    expect(treeFromPlaceholders(t, { p0: 'amber-1-1-0-a' })).toEqual({ kind: 'leaf', paneId: 'amber-1-1-0-a' })
+  })
+  it('reduces a tree with no mapped leaves to null', () => {
+    const t: Node = { kind: 'split', dir: 'v', ratio: 0.5, a: { kind: 'leaf', paneId: 'p0' }, b: { kind: 'leaf', paneId: 'p1' } }
+    expect(treeFromPlaceholders(t, {})).toBeNull()
+  })
 })
 
 // Deterministic id minter for load-plan tests.
@@ -176,6 +185,16 @@ describe('assembleSave', () => {
     // Frozen pane carries frozenNote.
     expect(t1.panes[1]!.frozenNote).toBe('brb')
     expect(t1.panes[0]!.frozenNote).toBeUndefined()
+  })
+
+  it('drops a sidecar tree leaf naming a session absent from live panes (no raw-name leak)', () => {
+    const sc: LayoutFile = {
+      version: 1, activeWorkspace: 1,
+      workspaces: { '1': { activeTab: 1, tabs: { '1': { tree: { kind: 'split', dir: 'h', ratio: 0.5, a: { kind: 'leaf', paneId: 'amber-1-1-0-a' }, b: { kind: 'leaf', paneId: 'amber-1-1-9-gone' } } } } } },
+    }
+    // Only pane -a is live; the stale -gone leaf must not leak into the file.
+    const doc = assembleSave('one', [{ ws: 1, tabs: [{ tab: 1, panes: [{ name: 'amber-1-1-0-a', cwd: '/a', kind: 'shell', ord: 0 }] }] }], sc, {})
+    expect(doc.workspaces[0]!.tabs[0]!.tree).toEqual({ kind: 'leaf', paneId: 'p0' })
   })
 
   it('encodes a noteless-frozen pane as an empty-string frozenNote', () => {
@@ -255,6 +274,16 @@ describe('buildLoadPlan', () => {
     }
     const plan = buildLoadPlan(doc, { mode: 'new', nextWs: 1, mintId: mkMint() })
     expect(plan.frozen).toEqual({ 'amber-1-1-0-id0': {} })
+  })
+
+  it('drops a dangling tree leaf on load (placeholder with no pane)', () => {
+    const doc: WorkspaceDoc = {
+      version: 1, scope: 'one',
+      workspaces: [{ tabs: [{ tab: 1, tree: { kind: 'split', dir: 'h', ratio: 0.5, a: { kind: 'leaf', paneId: 'p0' }, b: { kind: 'leaf', paneId: 'p5' } }, panes: [{ id: 'p0', kind: 'shell', cwd: '/a', ord: 0, scrollback: '' }] }] }],
+    }
+    const plan = buildLoadPlan(doc, { mode: 'new', nextWs: 1, mintId: mkMint() })
+    // p5 has no pane → dropped; tree collapses to the one real leaf, no 'p5' leak.
+    expect(plan.workspaces['1']!.tabs['1']!.tree).toEqual({ kind: 'leaf', paneId: 'amber-1-1-0-id0' })
   })
 
   it('keeps a null tab tree null (renderer reconciles it to equal splits)', () => {
