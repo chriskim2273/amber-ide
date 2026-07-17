@@ -4,7 +4,7 @@ import { ipcMain, dialog } from 'electron'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 import { spawn } from 'node:child_process'
-import { readFile, writeFile, rename, mkdir, copyFile, chmod } from 'node:fs/promises'
+import { readFile, writeFile, rename, mkdir, copyFile, chmod, realpath } from 'node:fs/promises'
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { resolveSocketPath } from '../shared/socketPath'
 import { ensureDaemon, probeSocket } from './daemonBoot'
@@ -20,6 +20,12 @@ import {
   bootUnitPath,
 } from './serviceManager'
 import { backoffDelay, nextAttempt } from './clientSupervisor'
+import {
+  renderDesktopEntry,
+  stableAppImagePath,
+  desktopFilePath,
+  iconInstallPath,
+} from './desktopInstall'
 import clientPath from '../client/index?modulePath'
 
 // A client child that stays up this long counts as a genuine run; a shorter
@@ -208,16 +214,78 @@ async function quitDaemonAndApp(win: BrowserWindow): Promise<void> {
   app.quit()
 }
 
+// Linux desktop integration (spec: desktop-install-button design). Copies the
+// running AppImage to a STABLE path (launcher entry must survive the download
+// being deleted — same pattern as the daemon's ~/.local/bin/amber), installs
+// the icon + .desktop entry, refreshes launcher caches best-effort. Idempotent
+// overwrite: re-running repairs/upgrades.
+async function installDesktopShortcut(win: BrowserWindow): Promise<void> {
+  try {
+    const home = process.env['HOME'] ?? '.'
+    const appImage = process.env['APPIMAGE'] ?? ''
+    const stable = stableAppImagePath(home)
+
+    // Self-copy guard: skip the copy when already running from the stable path.
+    const [src, dst] = await Promise.all([
+      realpath(appImage),
+      realpath(stable).catch(() => ''),
+    ])
+    if (src !== dst) {
+      await mkdir(dirname(stable), { recursive: true })
+      await copyFile(appImage, stable)
+    }
+    await chmod(stable, 0o755)
+
+    const icon = iconInstallPath(home)
+    await mkdir(dirname(icon), { recursive: true })
+    await copyFile(join(process.resourcesPath, 'icon.png'), icon)
+
+    const desktop = desktopFilePath(home)
+    await mkdir(dirname(desktop), { recursive: true })
+    await writeFile(desktop, renderDesktopEntry(stable))
+
+    await spawnOk('update-desktop-database', [dirname(desktop)]).catch(() => {})
+    await spawnOk('gtk-update-icon-cache', [
+      join(home, '.local', 'share', 'icons', 'hicolor'),
+    ]).catch(() => {})
+
+    await dialog.showMessageBox(win, {
+      type: 'info',
+      buttons: ['OK'],
+      title: 'Desktop shortcut installed',
+      message: 'amber-ide is now in your app launcher.',
+      detail:
+        `AppImage copied to ${stable}, launcher entry and icon installed. ` +
+        'You can pin amber-ide to the taskbar from the launcher. Re-run this ' +
+        'after an upgrade to refresh the installed copy.',
+    })
+  } catch (err) {
+    await dialog.showMessageBox(win, {
+      type: 'error',
+      buttons: ['OK'],
+      title: 'Install failed',
+      message: 'Could not install the desktop shortcut.',
+      detail: String(err),
+    })
+  }
+}
+
 // Minimal application menu. Keeps the standard macOS roles (app/Edit/Window) so
 // copy/paste and window management work; adds the explicit "Quit amber daemon"
 // item required by spec §3/§6. On Linux only that item plus the plain quit.
-function buildAppMenu(onQuitDaemon: () => void): Menu {
+function buildAppMenu(onQuitDaemon: () => void, onInstallDesktop: (() => void) | null): Menu {
   const isMac = process.platform === 'darwin'
   const template: MenuItemConstructorOptions[] = []
   // macOS appMenu already carries a plain "Quit amber-ide" (quits the app,
   // leaves the daemon running); on Linux we add that plain quit ourselves.
   if (isMac) template.push({ role: 'appMenu' })
   const submenu: MenuItemConstructorOptions[] = [
+    ...(onInstallDesktop !== null
+      ? [
+          { label: 'Install desktop shortcut', click: () => onInstallDesktop() },
+          { type: 'separator' } as MenuItemConstructorOptions,
+        ]
+      : []),
     { label: 'Quit amber daemon', click: () => onQuitDaemon() },
   ]
   if (!isMac) submenu.push({ type: 'separator' }, { role: 'quit' })
@@ -260,7 +328,15 @@ async function main(): Promise<void> {
     },
   })
 
-  Menu.setApplicationMenu(buildAppMenu(() => { void quitDaemonAndApp(win) }))
+  // The AppImage runtime exports $APPIMAGE (path to the image) — its presence
+  // implies packaged Linux, the only place desktop install applies.
+  const canInstallDesktop = process.platform === 'linux' && !!process.env['APPIMAGE']
+  Menu.setApplicationMenu(
+    buildAppMenu(
+      () => { void quitDaemonAndApp(win) },
+      canInstallDesktop ? () => { void installDesktopShortcut(win) } : null,
+    ),
+  )
 
   // Auto-detect the kernel-6.17/Chromium GPU-shm failure. If we're NOT already
   // in compat mode and the GPU crashes / the renderer dies / the page never

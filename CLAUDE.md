@@ -281,6 +281,17 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   bundle green. Daemon restart required for DumpBacklog; live-GUI dialog/
   replay verification manual (renderer components test-deferred).
 
+- [x] Desktop install (2026-07-17) — Linux AppImage launcher integration: app
+  menu "Install desktop shortcut" (shown only when `$APPIMAGE` set) copies the
+  AppImage to stable `~/Applications/amber-ide.AppImage` (self-copy guard),
+  installs icon + `.desktop` (`StartupWMClass` for taskbar pin grouping),
+  best-effort cache refresh; idempotent = repair/upgrade path. Custom amber
+  prompt-glyph icon at `app/build/icon.png` (electron-builder embed) +
+  `resources/icon.png` (extraResources, copied at install without extracting
+  the AppImage). Pure `desktopInstall.ts` unit-tested (serviceManager split).
+  Spec: `docs/superpowers/specs/2026-07-17-desktop-install-button-design.md`.
+  Live launcher/pin verification manual (needs packaged AppImage run).
+
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**
   `std::io::Read` (dedicated thread); `take_writer()` is one-shot;

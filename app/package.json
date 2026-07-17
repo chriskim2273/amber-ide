@@ -18,7 +18,10 @@
     "productName": "amber-ide",
     "directories": { "output": "release" },
     "files": ["out/**/*", "package.json"],
-    "extraResources": [{ "from": "resources/bin", "to": "bin", "filter": ["**/*"] }],
+    "extraResources": [
+      { "from": "resources/bin", "to": "bin", "filter": ["**/*"] },
+      { "from": "resources/icon.png", "to": "icon.png" }
+    ],
     "linux": { "target": ["AppImage"], "category": "Development" },
     "mac": {
       "category": "public.app-category.developer-tools",
