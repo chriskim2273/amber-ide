@@ -479,6 +479,98 @@ body {
 .dead-close:hover { background: var(--danger-soft); color: var(--danger); border-color: rgba(255, 92, 92, 0.4); }
 .dead-close:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
+/* ---------- frozen (parked) pane ---------- */
+/* Header badge: small frozen chip (mirrors the zoom-badge treatment, cool hue). */
+.frozen-badge {
+  flex: none;
+  font-size: 10.5px;
+  color: var(--accent-2);
+  background: rgba(77, 159, 255, 0.14);
+  border-radius: 10px;
+  padding: 1px 8px;
+  white-space: nowrap;
+  letter-spacing: 0.02em;
+}
+/* Body overlay — same visual language as .dead-overlay, cooler tint. Intercepts
+   ALL pointer events (default div behaviour) so the streaming terminal beneath
+   is unclickable while parked. */
+.frozen-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-2);
+  padding: var(--sp-4);
+  text-align: center;
+  background: rgba(8, 10, 16, 0.86);
+  backdrop-filter: blur(2px);
+  font-family: var(--font-ui);
+}
+.frozen-badge-lg {
+  font-size: 30px;
+  line-height: 1;
+  color: var(--accent-2);
+  filter: drop-shadow(0 0 10px rgba(77, 159, 255, 0.4));
+}
+.frozen-note-text {
+  max-width: 90%;
+  color: var(--text);
+  font-size: 13px;
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+}
+.frozen-unfreeze {
+  font-family: inherit;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: 4px 12px;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+.frozen-unfreeze:hover { background: var(--surface-3); color: var(--text); border-color: var(--accent-2); }
+.frozen-unfreeze:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* Inline freeze-note prompt — an absolute overlay over the terminal (like the
+   find bar: never enters the terminal's layout box, so it can't SIGWINCH the pty). */
+.freeze-note {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: var(--sp-3);
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-2);
+}
+.freeze-note-label {
+  font-size: 11px;
+  color: var(--text-dim);
+  letter-spacing: 0.02em;
+}
+.freeze-note-input {
+  font-family: inherit;
+  font-size: 12px;
+  color: var(--text);
+  background: var(--surface-3);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  padding: 4px 8px;
+  width: 240px;
+  max-width: 60vw;
+  outline: none;
+}
+
 /* split handles — wide invisible hit-zone, thin visible line, hover glow */
 .split-handle {
   position: absolute;

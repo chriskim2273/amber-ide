@@ -168,6 +168,25 @@ describe('appChord (zoom)', () => {
   })
 })
 
+describe('appChord (freeze)', () => {
+  it('maps Cmd+P (and Cmd+Shift+P form) to freeze on mac', () => {
+    setPlatform('MacIntel')
+    expect(appChord(key({ key: 'p', meta: true }))).toEqual({ type: 'freeze' })
+    expect(appChord(key({ key: 'P', meta: true, shift: true }))).toEqual({ type: 'freeze' })
+  })
+  it('maps Ctrl+Shift+P to freeze on linux', () => {
+    setPlatform('Linux x86_64')
+    expect(appChord(key({ key: 'p', ctrl: true, shift: true }))).toEqual({ type: 'freeze' })
+    expect(appChord(key({ key: 'P', ctrl: true, shift: true }))).toEqual({ type: 'freeze' })
+  })
+  it('renders the freeze label per platform', () => {
+    setPlatform('MacIntel')
+    expect(chordLabel('freeze')).toBe('⌘P')
+    setPlatform('Linux x86_64')
+    expect(chordLabel('freeze')).toBe('Ctrl+Shift+P')
+  })
+})
+
 describe('CHORD_TABLE (single source of truth)', () => {
   it('every entry is matched by appChord under the platform modifier', () => {
     setPlatform('MacIntel')

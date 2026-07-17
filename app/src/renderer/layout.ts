@@ -155,6 +155,17 @@ export function nextPaneInDirection(
   return best
 }
 
+/** Frozen (parked) panes are skipped by directional focus. Drop them from the
+ *  candidate rect list, but always keep the source (a frozen pane can still be
+ *  the focused one — reached via its interactive header). Pure. */
+export function focusCandidates(
+  rects: Array<{ paneId: string; rect: Rect }>,
+  frozen: Set<string>,
+  fromId: string,
+): Array<{ paneId: string; rect: Rect }> {
+  return rects.filter((r) => r.paneId === fromId || !frozen.has(r.paneId))
+}
+
 export function reconcile(tree: Node | null, liveIds: string[]): Node | null {
   const live = new Set(liveIds)
   let pruned = tree

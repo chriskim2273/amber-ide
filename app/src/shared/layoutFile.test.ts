@@ -51,6 +51,33 @@ describe('layoutFile', () => {
     expect(l.workspaces['1']!.tabOrder).toBeUndefined()
     expect(l.workspaces['1']!.tabs['1']!.label).toBeUndefined()
   })
+  it('round-trips a frozen map (note and empty-note entries)', () => {
+    const l = emptyLayout()
+    l.frozen = { 'amber-1-1-0-a': { note: 'back after lunch' }, 'amber-2-1-0-b': {} }
+    l.workspaces['1'] = { activeTab: 1, tabs: { '1': { tree: null } } }
+    expect(parseLayout(serializeLayout(l))).toEqual(l)
+  })
+  it('parses an old file with no frozen field (defaults undefined)', () => {
+    const old = JSON.stringify({
+      version: LAYOUT_VERSION,
+      activeWorkspace: 1,
+      workspaces: { '1': { activeTab: 1, tabs: { '1': { tree: null } } } },
+    })
+    expect(parseLayout(old).frozen).toBeUndefined()
+  })
+  it('shape-guards a malformed frozen field (non-object → dropped)', () => {
+    const bad = JSON.stringify({
+      version: LAYOUT_VERSION, activeWorkspace: 1, workspaces: {}, frozen: [1, 2, 3],
+    })
+    expect(parseLayout(bad).frozen).toBeUndefined()
+  })
+  it('shape-guards malformed frozen entries (bad entry → dropped, bad note → empty)', () => {
+    const bad = JSON.stringify({
+      version: LAYOUT_VERSION, activeWorkspace: 1, workspaces: {},
+      frozen: { good: { note: 'ok' }, arr: [1], nullish: null, num: 5, badnote: { note: 42 } },
+    })
+    expect(parseLayout(bad).frozen).toEqual({ good: { note: 'ok' }, badnote: {} })
+  })
 })
 
 describe('orderTabs', () => {

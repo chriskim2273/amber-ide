@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { leaves, splitLeaf, removeLeaf, setRatio, ratioAt, paneRects, equalColumns, reconcile, moveLeaf, nextPaneInDirection, type Node } from './layout'
+import { leaves, splitLeaf, removeLeaf, setRatio, ratioAt, paneRects, equalColumns, reconcile, moveLeaf, nextPaneInDirection, focusCandidates, type Node } from './layout'
 
 const leaf = (id: string): Node => ({ kind: 'leaf', paneId: id })
 
@@ -176,6 +176,27 @@ describe('layout', () => {
 
     it('returns null when only the source exists', () => {
       expect(nextPaneInDirection([grid[0]!], 'a', 'right')).toBeNull()
+    })
+  })
+
+  describe('focusCandidates', () => {
+    const grid = [
+      { paneId: 'a', rect: { x: 0, y: 0, w: 50, h: 50 } },
+      { paneId: 'b', rect: { x: 50, y: 0, w: 50, h: 50 } },
+      { paneId: 'c', rect: { x: 0, y: 50, w: 50, h: 50 } },
+    ]
+    it('drops frozen panes but keeps the source', () => {
+      const out = focusCandidates(grid, new Set(['b', 'a']), 'a')
+      expect(out.map((r) => r.paneId)).toEqual(['a', 'c'])
+    })
+    it('is a no-op when nothing is frozen', () => {
+      expect(focusCandidates(grid, new Set(), 'a')).toEqual(grid)
+    })
+    it('directional focus skips a frozen neighbour', () => {
+      // b (right of a) is frozen — focus-right from a must fall through to nothing.
+      const cands = focusCandidates(grid, new Set(['b']), 'a')
+      expect(nextPaneInDirection(cands, 'a', 'right')).toBeNull()
+      expect(nextPaneInDirection(cands, 'a', 'down')).toBe('c')
     })
   })
 })

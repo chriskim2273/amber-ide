@@ -1,6 +1,6 @@
 import { useRef, useState, useEffect } from 'react'
 import { Pane, type SearchApi } from './Pane'
-import { paneRects, handles, nextPaneInDirection, ratioAt, leaves, type Node, type Rect, type Zone, type FocusDir } from './layout'
+import { paneRects, handles, nextPaneInDirection, focusCandidates, ratioAt, leaves, type Node, type Rect, type Zone, type FocusDir } from './layout'
 import { appChord, chordLabel } from './keys'
 import { paneDot } from './store'
 
@@ -74,6 +74,29 @@ function FindBar({ api, focusSeq, onClose }: { api: SearchApi; focusSeq: number;
   )
 }
 
+// Inline note prompt shown over a pane when freezing (context-menu path).
+// Enter commits (empty note allowed), Escape cancels. Blur = CANCEL (not commit)
+// so an accidental click-away never silently parks the pane — an accidental
+// freeze is a worse surprise than a dropped note. stopPropagation keeps typing
+// away from the global chords.
+function FreezeNoteInput({ onCommit, onCancel }:
+  { onCommit: (note: string) => void; onCancel: () => void }): JSX.Element {
+  const committed = useRef(false)
+  return (
+    <div className="freeze-note" onMouseDown={(e) => e.stopPropagation()}>
+      <span className="freeze-note-label">❄ freeze — add a note</span>
+      <input className="freeze-note-input" autoFocus aria-label="freeze note"
+        placeholder="note (optional), Enter to freeze" spellCheck={false}
+        onKeyDown={(e) => {
+          e.stopPropagation()
+          if (e.key === 'Enter') { committed.current = true; e.currentTarget.blur() }
+          else if (e.key === 'Escape') { e.preventDefault(); e.currentTarget.blur() }
+        }}
+        onBlur={(e) => { if (committed.current) onCommit(e.currentTarget.value); else onCancel() }} />
+    </div>
+  )
+}
+
 // Which zone of a pane the cursor is over: a center band swaps, the outer
 // bands re-split. The center band is the middle third on both axes.
 function zoneAt(rect: Rect, cx: number, cy: number): Zone {
@@ -111,6 +134,11 @@ export function SplitView(props: {
   // view is presentational — it renders the zoomed pane full-stage and toggles.
   zoomedPane: string | null
   onToggleZoom: (paneId: string) => void
+  // Parked panes (display-only), keyed by session name → optional note. App-owned
+  // sidecar state; freezing never touches the daemon.
+  frozen: Record<string, { note?: string }>
+  onFreeze: (paneId: string, note: string) => void
+  onUnfreeze: (paneId: string) => void
 }): JSX.Element {
   const ref = useRef<HTMLDivElement>(null)
   const [size, setSize] = useState<Rect>({ x: 0, y: 0, w: 0, h: 0 })
@@ -128,6 +156,14 @@ export function SplitView(props: {
   // Custom header context menu, if open: which pane and where (stage-relative,
   // clamped on render). Bound to the pane HEADER only — xterm owns body events.
   const [menu, setMenu] = useState<{ paneId: string; x: number; y: number } | null>(null)
+  // Which pane (if any) has the inline freeze-note prompt open (context-menu
+  // "Freeze pane…" path). Only that pane renders the input.
+  const [notePane, setNotePane] = useState<string | null>(null)
+  // Live frozen set for the keydown handler + focus guards (registered once —
+  // read via ref so freeze/unfreeze doesn't rebind the window listener).
+  const frozenSet = new Set(Object.keys(props.frozen))
+  const frozenRef = useRef(frozenSet)
+  frozenRef.current = frozenSet
   // Live tree/size for the keydown handler (registered once). Directional focus
   // needs the current geometry without re-binding the listener each render.
   const treeRef = useRef(props.tree)
@@ -139,7 +175,10 @@ export function SplitView(props: {
   // to onFocusCapture and updates `focused`.
   const bodyEls = useRef<Map<string, HTMLElement>>(new Map())
 
+  // Never programmatically focus a frozen pane's terminal — it's input-locked
+  // (belt-and-suspenders alongside the overlay swallowing pointer events).
   const focusPane = (id: string): void => {
+    if (frozenRef.current.has(id)) return
     const el = bodyEls.current.get(id)
     el?.querySelector('textarea')?.focus()
   }
@@ -186,6 +225,7 @@ export function SplitView(props: {
     }
     setFindPane((p) => (p && !live.has(p) ? null : p))
     setMenu((m) => (m && !live.has(m.paneId) ? null : m))
+    setNotePane((p) => (p && !live.has(p) ? null : p))
   }, [props.tree])
 
   // Dismiss the context menu on Escape or any outside click. The menu itself
@@ -212,6 +252,8 @@ export function SplitView(props: {
   // need the focused-pane identity and pane geometry.
   const onClose = props.onClose
   const onToggleZoom = props.onToggleZoom
+  const onFreeze = props.onFreeze
+  const onUnfreeze = props.onUnfreeze
   useEffect(() => {
     const dirOf: Record<string, FocusDir> = {
       'focus-left': 'left', 'focus-right': 'right', 'focus-up': 'up', 'focus-down': 'down',
@@ -231,6 +273,14 @@ export function SplitView(props: {
         onToggleZoom(focusedRef.current)
         return
       }
+      // Freeze toggles the FOCUSED pane. Toggle-on uses an empty note (the
+      // context-menu path is the way to attach one). Display-only — no daemon call.
+      if (c.type === 'freeze' && focusedRef.current) {
+        e.preventDefault()
+        const id = focusedRef.current
+        if (frozenRef.current.has(id)) onUnfreeze(id); else onFreeze(id, '')
+        return
+      }
       // Find targets the focused pane (its SearchApi must be ready — it is, once
       // the pane has mounted). Switching the target unmounts the previous pane's
       // FindBar, whose teardown clears that pane's decorations; re-firing on the
@@ -243,7 +293,8 @@ export function SplitView(props: {
       }
       const dir = dirOf[c.type]
       if (dir && focusedRef.current && sizeRef.current.w > 0) {
-        const rects = paneRects(treeRef.current, sizeRef.current)
+        // Frozen panes are parked — skip them as focus targets (keeps the source).
+        const rects = focusCandidates(paneRects(treeRef.current, sizeRef.current), frozenRef.current, focusedRef.current)
         const target = nextPaneInDirection(rects, focusedRef.current, dir)
         if (target) {
           e.preventDefault()
@@ -253,7 +304,7 @@ export function SplitView(props: {
     }
     window.addEventListener('keydown', h)
     return () => window.removeEventListener('keydown', h)
-  }, [onClose, onToggleZoom])
+  }, [onClose, onToggleZoom, onFreeze, onUnfreeze])
 
   const panes = size.w > 0 ? paneRects(props.tree, size) : []
   const hs = size.w > 0 ? handles(props.tree, size) : []
@@ -353,6 +404,8 @@ export function SplitView(props: {
         const meta = props.meta[paneId]
         const dead = props.deadCodes[paneId]
         const dot = paneDot(meta?.kind ?? 'shell', meta?.runState)
+        const frozenEntry = props.frozen[paneId]
+        const isFrozen = frozenEntry !== undefined
         const isZoomedPane = zoomActive && props.zoomedPane === paneId
         // Zoomed pane fills the stage; the others stay MOUNTED but hidden via
         // display:none (Pane's ResizeObserver early-returns at 0×0, so this fires
@@ -378,6 +431,7 @@ export function SplitView(props: {
               }}>
               <span className={'kind-dot ' + dot.cls} role="img" aria-label={dot.label} title={dot.label} />
               <span className="pane-title">{meta?.title ?? paneId}</span>
+              {isFrozen && <span className="frozen-badge" title="pane frozen">❄ frozen</span>}
               {isZoomedPane &&
                 <span className="zoom-badge">zoomed — {chordLabel('zoom')} to restore</span>}
               <div className="pane-actions">
@@ -400,6 +454,22 @@ export function SplitView(props: {
                   </div>
                   <button className="dead-close" onClick={() => props.onClose(paneId)}>close pane</button>
                 </div>}
+              {/* Inline freeze-note prompt (context-menu path). Above the terminal;
+                  commits/cancels back into App's sidecar state. */}
+              {notePane === paneId && !isFrozen &&
+                <FreezeNoteInput
+                  onCommit={(note) => { props.onFreeze(paneId, note); setNotePane(null) }}
+                  onCancel={() => setNotePane(null)} />}
+              {/* Frozen (parked) overlay — reuses the dead-overlay visual language.
+                  Intercepts ALL pointer events, so the terminal underneath is
+                  unclickable (it stays MOUNTED and streaming). */}
+              {isFrozen &&
+                <div className="frozen-overlay">
+                  <div className="frozen-badge-lg" role="img" aria-label="frozen pane">❄</div>
+                  <div className="frozen-note-text">{frozenEntry.note?.trim() || 'frozen'}</div>
+                  <button className="frozen-unfreeze" aria-label="unfreeze pane"
+                    onClick={() => props.onUnfreeze(paneId)}>⏵ unfreeze</button>
+                </div>}
             </div>
           </div>
         )
@@ -415,13 +485,14 @@ export function SplitView(props: {
           style={{ left: hoverRect.x, top: hoverRect.y, width: hoverRect.w, height: hoverRect.h }} />}
       {menu && (() => {
         // Clamp the menu box (approx dims) inside the stage so it never spills off.
-        const MW = 200, MH = 232
+        const MW = 200, MH = 268
         const x = Math.max(0, Math.min(menu.x, size.w - MW))
         const y = Math.max(0, Math.min(menu.y, size.h - MH))
         const paneId = menu.paneId
         const close = (): void => setMenu(null)
         const run = (fn: () => void) => (): void => { fn(); close() }
         const isZoomed = props.zoomedPane === paneId
+        const isFrozen = props.frozen[paneId] !== undefined
         return (
           <div className="ctx-menu" role="menu" style={{ left: x, top: y }}
             onMouseDown={(e) => e.stopPropagation()}>
@@ -430,6 +501,9 @@ export function SplitView(props: {
             <button className="ctx-item" role="menuitem" onClick={run(() => props.onSplit(paneId, 'h', 'claude'))}>New claude pane right</button>
             <div className="ctx-sep" />
             <button className="ctx-item" role="menuitem" onClick={run(() => props.onToggleZoom(paneId))}>{isZoomed ? 'Restore' : 'Zoom'}</button>
+            {isFrozen
+              ? <button className="ctx-item" role="menuitem" onClick={run(() => props.onUnfreeze(paneId))}>Unfreeze</button>
+              : <button className="ctx-item" role="menuitem" onClick={run(() => setNotePane(paneId))}>Freeze pane…</button>}
             <button className="ctx-item" role="menuitem"
               onClick={run(() => {
                 // Swallow a rejection (clipboard perms) — no unhandled promise rejection.

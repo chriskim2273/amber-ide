@@ -114,9 +114,12 @@ export function tabDot(panes: PaneModel[]): KindDot {
 }
 
 // True if any of `panes` has output activity newer than it was last seen —
-// drives the tab-bar activity dot on non-active tabs.
-export function hasActivity(state: AppState, panes: PaneModel[]): boolean {
-  return panes.some((p) => (state.lastActivity[p.name] ?? 0) > (state.lastSeen[p.name] ?? 0))
+// drives the tab-bar activity dot on non-active tabs. A frozen (parked) pane
+// is excluded: its activity must never light the dot (that's the point of
+// parking). The reducer stays pure — the frozen set is app-owned (sidecar) and
+// passed in from main.tsx.
+export function hasActivity(state: AppState, panes: PaneModel[], frozen?: Set<string>): boolean {
+  return panes.some((p) => !frozen?.has(p.name) && (state.lastActivity[p.name] ?? 0) > (state.lastSeen[p.name] ?? 0))
 }
 
 export function groupSessions(state: AppState): WorkspaceModel[] {

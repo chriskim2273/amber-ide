@@ -8,7 +8,30 @@ export interface TabLayout { tree: Node | null; label?: string }
 export interface WsLayout { activeTab: number; tabs: Record<string, TabLayout>; label?: string; tabOrder?: number[] }
 // `fontSize` is an app-owned top-level display preference (optional — old
 // sidecars omit it → undefined → the renderer's default).
-export interface LayoutFile { version: number; activeWorkspace: number; workspaces: Record<string, WsLayout>; fontSize?: number }
+// `frozen` parks panes (display-only, never touches the daemon): a map keyed by
+// SESSION NAME → optional note. Session names are stable across reboots, so
+// parking survives restart; stale entries are pruned on load-reconcile.
+export interface FrozenEntry { note?: string }
+export interface LayoutFile {
+  version: number
+  activeWorkspace: number
+  workspaces: Record<string, WsLayout>
+  fontSize?: number
+  frozen?: Record<string, FrozenEntry>
+}
+
+// Shape-guard the frozen map (Task 4 lesson): reject a non-object/array top
+// level → undefined; drop non-object entries; coerce a non-string note away.
+function parseFrozen(v: unknown): Record<string, FrozenEntry> | undefined {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return undefined
+  const out: Record<string, FrozenEntry> = {}
+  for (const [name, entry] of Object.entries(v)) {
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) continue
+    const note = (entry as { note?: unknown }).note
+    out[name] = typeof note === 'string' ? { note } : {}
+  }
+  return out
+}
 
 // Pure display-order reconcile: listed ids keep `order`'s sequence (skipping any
 // that no longer exist); every unlisted id appends in numeric order. Missing or
@@ -51,6 +74,10 @@ export function parseLayout(text: string): LayoutFile {
       // Conditional spread so a missing fontSize stays absent (not `undefined`)
       // under exactOptionalPropertyTypes.
       ...(typeof v.fontSize === 'number' ? { fontSize: v.fontSize } : {}),
+      ...((): { frozen?: Record<string, FrozenEntry> } => {
+        const f = parseFrozen(v.frozen)
+        return f ? { frozen: f } : {}
+      })(),
     }
   } catch {
     return emptyLayout()

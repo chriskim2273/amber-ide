@@ -107,6 +107,15 @@ describe('activity', () => {
     expect(hasActivity(st, [p('a')])).toBe(true)
   })
 
+  it('a frozen pane never reports activity (suppressed via the frozen set)', () => {
+    let st = reduce(initialState(), { kind: 'Sessions', sessions: [s('amber-1-1-0-a')] })
+    st = reduce(st, { kind: 'Activity', name: 'amber-1-1-0-a' })
+    expect(hasActivity(st, [p('amber-1-1-0-a')])).toBe(true)
+    expect(hasActivity(st, [p('amber-1-1-0-a')], new Set(['amber-1-1-0-a']))).toBe(false)
+    // A non-frozen pane in the same tab still lights the dot.
+    expect(hasActivity(st, [p('amber-1-1-0-a')], new Set(['other']))).toBe(true)
+  })
+
   it('a removed session drops its activity state', () => {
     let st = reduce(initialState(), { kind: 'Sessions', sessions: [s('a')] })
     st = reduce(st, { kind: 'Activity', name: 'a' })

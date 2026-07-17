@@ -41,6 +41,9 @@ function shortCwd(cwd: string, home: string): string {
 }
 
 const DEFAULT_FONT_SIZE = 13
+// Stable empty frozen map so `layout.frozen ?? EMPTY_FROZEN` doesn't mint a new
+// object every render (keeps SplitView's `frozen` prop referentially stable).
+const EMPTY_FROZEN: Record<string, { note?: string }> = {}
 // App-wide terminal font size, clamped to a sane range (integer px).
 function clampFont(n: number): number {
   return Math.max(8, Math.min(32, Math.round(n)))
@@ -128,6 +131,10 @@ function App(): JSX.Element {
   // App-wide terminal font size lives in the layout sidecar (single source of
   // truth → auto-persists via the debounced save, no separate state to sync).
   const fontSize = clampFont(layout.fontSize ?? DEFAULT_FONT_SIZE)
+  // Parked panes (display-only, keyed by session name). Kept referentially stable
+  // when absent so SplitView's memo'd children don't churn.
+  const frozen = layout.frozen ?? EMPTY_FROZEN
+  const frozenSet = new Set(Object.keys(frozen))
 
   // Stable dispatcher for OSC pane titles (referential stability keeps Pane's
   // memo effective — SplitView caches a per-pane wrapper around this). Caps the
@@ -281,6 +288,38 @@ function App(): JSX.Element {
     return { ...l, workspaces: { ...l.workspaces, [wsKey]: { ...w, tabOrder: next } } }
   }), [wsKey, activeTab, tabs])
 
+  // Freeze/unfreeze a pane (display-only; daemon untouched — rule #1/#3). An
+  // empty note is stored as `{}` (omit the key) to satisfy
+  // exactOptionalPropertyTypes and keep the sidecar clean.
+  const freezePane = useCallback((name: string, note: string): void => setLayout((l) => {
+    const n = note.trim()
+    const next = { ...(l.frozen ?? {}), [name]: n ? { note: n } : {} }
+    return { ...l, frozen: next }
+  }), [])
+  const unfreezePane = useCallback((name: string): void => setLayout((l) => {
+    if (!l.frozen || !(name in l.frozen)) return l
+    const next = { ...l.frozen }
+    delete next[name]
+    return { ...l, frozen: next }
+  }), [])
+
+  // Prune frozen entries whose session no longer exists — against the FULL live
+  // set (sessions in other workspaces are still live; only drop truly-gone
+  // names). Gated on the first Sessions snapshot so we never prune before the
+  // daemon's real list has arrived.
+  useEffect(() => {
+    if (!loaded || !sawSessions) return
+    setLayout((l) => {
+      if (!l.frozen) return l
+      const live = new Set(sessions.map((s) => s.name))
+      const stale = Object.keys(l.frozen).filter((n) => !live.has(n))
+      if (stale.length === 0) return l
+      const next = { ...l.frozen }
+      for (const n of stale) delete next[n]
+      return { ...l, frozen: next }
+    })
+  }, [sessions, loaded, sawSessions])
+
   useEffect(() => {
     if (!loaded) return
     if (tree && JSON.stringify(tree) !== JSON.stringify(storedTree)) putTree(tree)
@@ -320,8 +359,8 @@ function App(): JSX.Element {
   useEffect(() => {
     const h = (e: KeyboardEvent): void => {
       const c = appChord(e)
-      // `close` and `zoom` both need the focused-pane identity — SplitView owns them.
-      if (!c || c.type === 'close' || c.type === 'zoom') return
+      // `close`, `zoom`, and `freeze` all need the focused-pane identity — SplitView owns them.
+      if (!c || c.type === 'close' || c.type === 'zoom' || c.type === 'freeze') return
       e.preventDefault()
       chordRef.current(c)
     }
@@ -448,7 +487,7 @@ function App(): JSX.Element {
           const dot = tabDot(t.panes)
           const isActive = t.tab === (tab?.tab ?? -1)
           // Background-activity dot: a non-active tab with unseen output.
-          const showActivity = !isActive && hasActivity(state, t.panes)
+          const showActivity = !isActive && hasActivity(state, t.panes, frozenSet)
           const isEditing = editing?.kind === 'tab' && editing.id === t.tab
           const tabLabel = layout.workspaces[wsKey]?.tabs[String(t.tab)]?.label
           // One-way close (rule #3): request a kill for every pane in the tab; the
@@ -491,6 +530,9 @@ function App(): JSX.Element {
             ? <SplitView tree={tree} deadCodes={deadCodes} meta={paneMeta} epoch={reconnectEpoch} portEpoch={childEpoch}
                 fontSize={fontSize} onPaneTitle={onPaneTitle}
                 zoomedPane={zoomedPane}
+                frozen={frozen}
+                onFreeze={freezePane}
+                onUnfreeze={unfreezePane}
                 onToggleZoom={toggleZoom}
                 onSetRatio={(path, r) => putTree(setRatio(tree, path, r))}
                 onSplit={(paneId, dir, overrideKind) => {
