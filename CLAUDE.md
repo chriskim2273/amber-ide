@@ -221,8 +221,29 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   2 MiB-backlog pane attached, +Pane/+Tab/close all take effect (all three were
   no-ops before). **A running daemon keeps the old code — it must be restarted
   for this fix to take effect.**
-
-## Gotchas (learned)
+- [x] Audit-fix pass (2026-07-16) — full-repo audit, findings fixed. Daemon:
+  watcher `SessionsChanged` broadcast made non-blocking (bounded per-watcher
+  queue + forwarder thread + 1 s `SO_SNDTIMEO` on the shared writer, laggard
+  eviction — same HOL class as the backlog fix; previously one wedged GUI
+  client stalled other clients' Create/Kill AND the snapshot timer);
+  `restore()` log-and-skips an unrestorable session instead of aborting the
+  whole daemon start; `atomic_write` tmp names unique per call (was per-pid);
+  stale-session write/resize failures logged. App: utilityProcess crash
+  supervision (disconnected banner + capped-backoff relaunch + `childEpoch`
+  pane-port re-acquisition); frame-decode errors can no longer kill the
+  utilityProcess (destroy socket → reconnect); daemon `Error` frames surface
+  in a dismissible banner; pane close no longer optimistically edits the
+  layout (one-way flow restored; daemon `Kill`/reap broadcasts prune the
+  leaf); `keys.ts` chord parser unit-tested. Infra: GitHub Actions CI
+  (clippy `-D warnings` + cargo test + app typecheck + vitest; lint omitted —
+  pre-existing ESLint-v9 flat-config gap); `app/scripts/dist.sh` now bundles
+  the static-musl (Linux) / universal (macOS) amber with a static-linkage
+  assertion (was silently shipping the host glibc build); spec status headers
+  corrected; app version synced to 0.0.1. Rust 155 tests + app 79 tests green,
+  clippy clean. Still open: live-GUI verification of child-crash recovery;
+  first real CI run; untimed `write_all` in `write_frame`/Output forwarders on
+  a wedged client (pre-existing, ticket-worthy — apply the watcher-style
+  timeout discipline).
 
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**
