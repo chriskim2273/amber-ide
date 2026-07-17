@@ -15,6 +15,7 @@ export type Chord =
   | { type: 'focus-up' }
   | { type: 'focus-down' }
   | { type: 'help' }
+  | { type: 'find' }
   | { type: 'font-bigger' }
   | { type: 'font-smaller' }
   | { type: 'font-reset' }
@@ -52,6 +53,7 @@ export const CHORD_TABLE: ChordEntry[] = [
   { action: 'focus-right', label: '→', keys: ['arrowright'], desc: 'Focus pane right' },
   { action: 'focus-up', label: '↑', keys: ['arrowup'], desc: 'Focus pane up' },
   { action: 'focus-down', label: '↓', keys: ['arrowdown'], desc: 'Focus pane down' },
+  { action: 'find', label: 'F', keys: ['f'], desc: 'Find in pane' },
   { action: 'help', label: '/', keys: ['/', '?'], desc: 'Keyboard shortcuts' },
   // Font size. Linux holds Shift for the modifier, so the key arrives renamed
   // ('=' -> '+', '-' -> '_', '0' -> ')') — accept both forms (mirrors help).

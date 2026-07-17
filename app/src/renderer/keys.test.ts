@@ -117,6 +117,25 @@ describe('appChord (directional focus)', () => {
   })
 })
 
+describe('appChord (find)', () => {
+  it('maps Cmd+F (and Cmd+Shift+F form) to find on mac', () => {
+    setPlatform('MacIntel')
+    expect(appChord(key({ key: 'f', meta: true }))).toEqual({ type: 'find' })
+    expect(appChord(key({ key: 'F', meta: true, shift: true }))).toEqual({ type: 'find' })
+  })
+  it('maps Ctrl+Shift+F to find on linux', () => {
+    setPlatform('Linux x86_64')
+    expect(appChord(key({ key: 'f', ctrl: true, shift: true }))).toEqual({ type: 'find' })
+    expect(appChord(key({ key: 'F', ctrl: true, shift: true }))).toEqual({ type: 'find' })
+  })
+  it('renders the find label per platform', () => {
+    setPlatform('MacIntel')
+    expect(chordLabel('find')).toBe('⌘F')
+    setPlatform('Linux x86_64')
+    expect(chordLabel('find')).toBe('Ctrl+Shift+F')
+  })
+})
+
 describe('appChord (help)', () => {
   it('maps Cmd+/ (and Cmd+Shift+? form) on mac', () => {
     setPlatform('MacIntel')

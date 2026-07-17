@@ -2,8 +2,34 @@ import { memo, useEffect, useRef } from 'react'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { WebglAddon } from '@xterm/addon-webgl'
+import { SearchAddon } from '@xterm/addon-search'
 import '@xterm/xterm/css/xterm.css'
 import { appChord } from './keys'
+
+// Imperative scrollback-search handle handed to the chrome (the find bar in
+// SplitView) via `onSearchReady`. Search execution stays outside React — the
+// bar only calls these; the addon owns match state + decorations.
+export interface SearchApi {
+  // `incremental` (findNext only) expands the current match while typing so the
+  // view doesn't jump to the NEXT match on every keystroke; Enter/buttons omit it.
+  findNext(q: string, opts?: { incremental?: boolean }): boolean
+  findPrevious(q: string): boolean
+  clear(): void
+  onResults(cb: (r: { resultIndex: number; resultCount: number }) => void): void
+}
+
+// Search decoration colors. Like XTERM_THEME, the addon can't read CSS vars, so
+// these MIRROR theme.css tokens (--accent #7c6cff and a lighter active variant).
+// Colors must be 6-digit #RRGGBB (the addon rejects alpha) — the match fill is a
+// muted violet that keeps the glyph legible; the active match is the full accent.
+const SEARCH_DECORATIONS = {
+  matchBackground: '#3d3563',
+  matchBorder: '#7c6cff',
+  matchOverviewRuler: '#7c6cff',
+  activeMatchBackground: '#7c6cff',
+  activeMatchBorder: '#b3a8ff',
+  activeMatchColorOverviewRuler: '#b3a8ff',
+}
 
 // xterm palette — kept in sync with theme.css tokens (Terminal can't read CSS
 // vars at construction). background matches --bg so the pane body blends with
@@ -45,8 +71,8 @@ const MOUSE_RESET = '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l'
 // (honors "xterm instances live outside React reconciliation").
 // Focus is tracked by SplitView via `focusin` on the wrapper; nothing here.
 export const Pane = memo(function Pane(
-  { session, epoch, portEpoch, fontSize, onTitle }:
-    { session: string; epoch: number; portEpoch: number; fontSize: number; onTitle?: (title: string) => void },
+  { session, epoch, portEpoch, fontSize, onTitle, onSearchReady }:
+    { session: string; epoch: number; portEpoch: number; fontSize: number; onTitle?: (title: string) => void; onSearchReady?: (api: SearchApi) => void },
 ): JSX.Element {
   const hostRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<Terminal | null>(null)
@@ -54,11 +80,14 @@ export const Pane = memo(function Pane(
   const portRef = useRef<MessagePort | null>(null)
   // Latest values read inside the once-registered mount effect without making
   // them effect deps (which would recreate the terminal). `fontSize` seeds the
-  // constructor; `onTitle` receives OSC-2 title changes.
+  // constructor; `onTitle` receives OSC-2 title changes; `onSearchReady` receives
+  // the imperative search handle once the addon is loaded.
   const fontSizeRef = useRef(fontSize)
   fontSizeRef.current = fontSize
   const onTitleRef = useRef(onTitle)
   onTitleRef.current = onTitle
+  const onSearchReadyRef = useRef(onSearchReady)
+  onSearchReadyRef.current = onSearchReady
   // Set on a reconnect so the NEXT backlog message re-runs the reset (the
   // daemon replays a fresh backlog on every re-Attach, re-enabling mouse modes).
   const rearmRef = useRef(false)
@@ -93,6 +122,21 @@ export const Pane = memo(function Pane(
       webgl.onContextLoss(() => webgl.dispose())
       term.loadAddon(webgl)
     }
+    // Scrollback search. Decorations are passed on EVERY call (not just for the
+    // highlight): the addon fires onDidChangeResults only when decorations are
+    // enabled, so the ordinal would go stale otherwise. The handle is imperative
+    // — the find bar (React chrome) drives it without touching the Terminal.
+    const search = new SearchAddon()
+    term.loadAddon(search)
+    let resultsCb: ((r: { resultIndex: number; resultCount: number }) => void) | null = null
+    const resultsSub = search.onDidChangeResults((r) => resultsCb?.(r))
+    onSearchReadyRef.current?.({
+      findNext: (q, opts) => search.findNext(q, { decorations: SEARCH_DECORATIONS, incremental: opts?.incremental ?? false }),
+      findPrevious: (q) => search.findPrevious(q, { decorations: SEARCH_DECORATIONS }),
+      clear: () => search.clearDecorations(),
+      onResults: (cb) => { resultsCb = cb },
+    })
+
     fit.fit()
     termRef.current = term
     fitRef.current = fit
@@ -164,6 +208,7 @@ export const Pane = memo(function Pane(
       window.removeEventListener('message', onPortMsg)
       host.removeEventListener('click', focus)
       ro.disconnect()
+      resultsSub.dispose()
       port?.close()
       term.dispose()
       termRef.current = null

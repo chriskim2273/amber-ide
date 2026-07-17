@@ -340,6 +340,45 @@ body {
 
 .pane-body { position: absolute; inset: 26px 0 0 0; }
 
+/* ---------- per-pane find bar (scrollback search) ---------- */
+/* Absolute overlay over the terminal — must NOT enter the terminal's layout box
+   (that would resize the pty on open/close). Anchored top-right of pane-body. */
+.find-bar {
+  position: absolute;
+  top: var(--sp-2);
+  right: var(--sp-2);
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px 4px 3px 6px;
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-2);
+}
+.find-input {
+  font-family: inherit;
+  font-size: 12px;
+  color: var(--text);
+  background: var(--surface-3);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 3px 6px;
+  width: 160px;
+  outline: none;
+}
+.find-input:focus { border-color: var(--accent); }
+.find-count {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  min-width: 44px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
 /* dead-session overlay */
 .dead-overlay {
   position: absolute;
