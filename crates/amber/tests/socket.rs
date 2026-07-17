@@ -616,3 +616,29 @@ fn default_attach_to_claude_session_replays_backlog() {
         Duration::from_secs(10),
     );
 }
+
+#[test]
+fn stale_session_write_and_resize_do_not_kill_the_connection() {
+    // Input/Resize aimed at a session that no longer exists is logged on the
+    // daemon side but must NOT tear down the client's connection — the same
+    // socket keeps serving control traffic afterward.
+    let (socket_path, _dir) = start_daemon();
+    let mut stream = connect_with_retry(&socket_path);
+    let mut decoder = Decoder::new();
+
+    send(&mut stream, &Frame::Data { session: "ghost".into(), bytes: b"boo".to_vec() });
+    send(&mut stream, &Frame::Control(ControlMsg::Resize { name: "ghost".into(), cols: 80, rows: 24 }));
+    send(&mut stream, &Frame::Control(ControlMsg::ListSessions));
+
+    let reply = read_frame_until(
+        &mut stream,
+        &mut decoder,
+        |f| matches!(f, Frame::Control(ControlMsg::SessionList { .. })),
+        Duration::from_secs(5),
+    );
+    assert_eq!(
+        reply,
+        Frame::Control(ControlMsg::SessionList { names: vec![] }),
+        "connection died after a stale-session write/resize"
+    );
+}

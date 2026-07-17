@@ -155,8 +155,10 @@ fn handle_frame(
         Frame::Control(msg) => handle_control(manager, watchers, writer, msg, subscriptions),
         Frame::Data { session, bytes } => {
             // Input from the client: forward to the child's stdin. A stale
-            // session name is not fatal to the connection.
-            let _ = manager.write(&session, &bytes);
+            // session name is not fatal to the connection — log and carry on.
+            if let Err(e) = manager.write(&session, &bytes) {
+                eprintln!("amber daemon: write to session {session} failed: {e}");
+            }
         }
     }
 }
@@ -294,7 +296,11 @@ fn handle_control(
             let _ = write_frame(writer, &Frame::Control(reply));
         }
         ControlMsg::Resize { name, cols, rows } => {
-            let _ = manager.resize(&name, rows, cols);
+            // A stale session name is not fatal to the connection — log and
+            // carry on.
+            if let Err(e) = manager.resize(&name, rows, cols) {
+                eprintln!("amber daemon: resize of session {name} failed: {e}");
+            }
         }
         ControlMsg::Kill { name } => {
             let existed = manager.session(&name).is_some();
