@@ -1,12 +1,29 @@
 import type { SessionInfo } from '../shared/proto'
 import { parseName } from '../shared/names'
 
-export interface AppState { sessions: SessionInfo[]; dead: Record<string, number>; error: string | null }
+export interface AppState {
+  sessions: SessionInfo[]
+  dead: Record<string, number>
+  error: string | null
+  // Background-activity tracking. `seq` is a monotonic event counter (no wall
+  // clock needed — arrival order is all that matters). `lastActivity[name]` is
+  // the `seq` of a session's most recent output Activity; `lastSeen[name]` is
+  // the `seq` up to which its tab was last visible/active. A pane has UNSEEN
+  // activity when lastActivity > lastSeen.
+  lastActivity: Record<string, number>
+  lastSeen: Record<string, number>
+  seq: number
+}
 export type DaemonEvent =
   | { kind: 'Sessions'; sessions: SessionInfo[] }
   | { kind: 'SessionsChanged'; added: SessionInfo[]; removed: string[] }
   | { kind: 'Exit'; name: string; code: number }
   | { kind: 'Error'; msg: string }
+  // Daemon: a session produced output (rate-limited to ~2/s/session).
+  | { kind: 'Activity'; name: string }
+  // UI-originated: the visible tab's panes have been seen (active tab/ws change,
+  // or activity for the already-visible tab) — mark their activity as seen.
+  | { kind: 'MarkSeen'; names: string[] }
   // UI-originated: the user dismissed the daemon-error banner.
   | { kind: 'ClearError' }
 export interface PaneModel { name: string; cwd: string; kind: string; alive: boolean; ord: number; deadCode: number | null; runState?: string | undefined }
@@ -14,25 +31,53 @@ export interface TabModel { tab: number; panes: PaneModel[] }
 export interface WorkspaceModel { ws: number; tabs: TabModel[] }
 
 export function initialState(): AppState {
-  return { sessions: [], dead: {}, error: null }
+  return { sessions: [], dead: {}, error: null, lastActivity: {}, lastSeen: {}, seq: 0 }
+}
+
+// Keep only the keys present in `live` (prunes activity state for removed
+// sessions so the maps don't grow without bound in a long-lived renderer).
+function keepLive(map: Record<string, number>, live: Set<string>): Record<string, number> {
+  const out: Record<string, number> = {}
+  for (const [n, v] of Object.entries(map)) if (live.has(n)) out[n] = v
+  return out
 }
 
 export function reduce(state: AppState, ev: DaemonEvent): AppState {
   switch (ev.kind) {
     case 'Sessions': {
       const names = new Set(ev.sessions.map((x) => x.name))
-      const dead: Record<string, number> = {}
-      for (const [n, c] of Object.entries(state.dead)) if (names.has(n)) dead[n] = c
-      return { sessions: [...ev.sessions], dead, error: null }
+      return {
+        ...state,
+        sessions: [...ev.sessions],
+        dead: keepLive(state.dead, names),
+        error: null,
+        lastActivity: keepLive(state.lastActivity, names),
+        lastSeen: keepLive(state.lastSeen, names),
+      }
     }
     case 'SessionsChanged': {
       const removed = new Set(ev.removed)
       const byName = new Map<string, SessionInfo>()
       for (const x of state.sessions) if (!removed.has(x.name)) byName.set(x.name, x)
       for (const x of ev.added) byName.set(x.name, x)
-      const dead: Record<string, number> = {}
-      for (const [n, c] of Object.entries(state.dead)) if (!removed.has(n) && byName.has(n)) dead[n] = c
-      return { sessions: [...byName.values()], dead, error: state.error }
+      const live = new Set(byName.keys())
+      return {
+        ...state,
+        sessions: [...byName.values()],
+        dead: keepLive(state.dead, live),
+        lastActivity: keepLive(state.lastActivity, live),
+        lastSeen: keepLive(state.lastSeen, live),
+      }
+    }
+    case 'Activity': {
+      const seq = state.seq + 1
+      return { ...state, seq, lastActivity: { ...state.lastActivity, [ev.name]: seq } }
+    }
+    case 'MarkSeen': {
+      let changed = false
+      const lastSeen = { ...state.lastSeen }
+      for (const n of ev.names) if (lastSeen[n] !== state.seq) { lastSeen[n] = state.seq; changed = true }
+      return changed ? { ...state, lastSeen } : state
     }
     case 'Exit':
       return { ...state, dead: { ...state.dead, [ev.name]: ev.code } }
@@ -66,6 +111,12 @@ export function tabDot(panes: PaneModel[]): KindDot {
   if (claudes.some((p) => p.runState === 'claude-retrying')) return { cls: 'claude-retrying', label: 'claude (retrying)' }
   if (claudes.every((p) => p.runState === 'shell-fallback')) return { cls: 'shell-fallback', label: 'shell (claude exited)' }
   return { cls: 'claude', label: 'claude' }
+}
+
+// True if any of `panes` has output activity newer than it was last seen —
+// drives the tab-bar activity dot on non-active tabs.
+export function hasActivity(state: AppState, panes: PaneModel[]): boolean {
+  return panes.some((p) => (state.lastActivity[p.name] ?? 0) > (state.lastSeen[p.name] ?? 0))
 }
 
 export function groupSessions(state: AppState): WorkspaceModel[] {

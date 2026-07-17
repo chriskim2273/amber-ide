@@ -41,6 +41,16 @@ describe('proto', () => {
     expect(roundtrip(f)).toEqual(f)
   })
 
+  it('roundtrips an Activity control frame (daemon -> app)', () => {
+    const f: Frame = { type: 'control', msg: { kind: 'Activity', name: 'amber-1-1-0-a' } }
+    expect(roundtrip(f)).toEqual(f)
+    // Lock the externally-tagged shape the daemon emits.
+    const wire = encode(f)
+    const bodyLen = new DataView(wire.buffer).getUint32(0, false)
+    const json = new TextDecoder().decode(wire.slice(5, 4 + bodyLen))
+    expect(json).toBe('{"Activity":{"name":"amber-1-1-0-a"}}')
+  })
+
   it('decodes byte-at-a-time and across chunk splits', () => {
     const f: Frame = { type: 'data', session: 's', bytes: new Uint8Array([10, 13, 0, 255]) }
     const wire = encode(f)

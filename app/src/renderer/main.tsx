@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useReducer, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { SplitView, type PaneMeta } from './SplitView'
-import { initialState, reduce, groupSessions, tabDot, type DaemonEvent } from './store'
+import { initialState, reduce, groupSessions, tabDot, hasActivity, type DaemonEvent } from './store'
 import { formatName, makeId } from '../shared/names'
 import { splitLeaf, setRatio, reconcile, leaves, moveLeaf, type Node } from './layout'
 import { emptyLayout, parseLayout, serializeLayout, orderTabs, moveTab, type LayoutFile } from '../shared/layoutFile'
@@ -30,6 +30,7 @@ function toEvent(d: unknown): DaemonEvent | null {
   const m = f.msg as { kind: string; [k: string]: unknown }
   if (m.kind === 'Sessions') return { kind: 'Sessions', sessions: m['sessions'] as never }
   if (m.kind === 'SessionsChanged') return { kind: 'SessionsChanged', added: m['added'] as never, removed: m['removed'] as never }
+  if (m.kind === 'Activity') return { kind: 'Activity', name: m['name'] as string }
   if (m.kind === 'Exit') return { kind: 'Exit', name: m['name'] as string, code: m['code'] as number }
   if (m.kind === 'Error') return { kind: 'Error', msg: m['msg'] as string }
   return null
@@ -285,6 +286,17 @@ function App(): JSX.Element {
     if (tree && JSON.stringify(tree) !== JSON.stringify(storedTree)) putTree(tree)
   }, [tree, storedTree, putTree, loaded])
 
+  // Mark the visible tab's panes as seen whenever it becomes visible (active
+  // tab/ws change) or any activity arrives while it's visible (state.seq bump).
+  // This clears/keeps-clear the active tab's dot; background tabs keep theirs.
+  // MarkSeen never bumps seq, so this cannot loop.
+  const visibleNames = tab?.panes.map((p) => p.name) ?? []
+  const visibleKey = visibleNames.join(',')
+  useEffect(() => {
+    if (visibleNames.length > 0) dispatch({ kind: 'MarkSeen', names: visibleNames })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visibleKey, state.seq])
+
   // Place pending splits once their session exists, preserving H/V direction.
   const liveKey = allLive.join(',')
   useEffect(() => {
@@ -435,6 +447,8 @@ function App(): JSX.Element {
         {orderedTabs.map((t) => {
           const dot = tabDot(t.panes)
           const isActive = t.tab === (tab?.tab ?? -1)
+          // Background-activity dot: a non-active tab with unseen output.
+          const showActivity = !isActive && hasActivity(state, t.panes)
           const isEditing = editing?.kind === 'tab' && editing.id === t.tab
           const tabLabel = layout.workspaces[wsKey]?.tabs[String(t.tab)]?.label
           // One-way close (rule #3): request a kill for every pane in the tab; the
@@ -454,6 +468,7 @@ function App(): JSX.Element {
               onDrop={(e) => { e.preventDefault(); if (dragTab.current !== null) reorderTab(dragTab.current, t.tab); dragTab.current = null }}
               onDragEnd={() => { dragTab.current = null }}>
               <span className={'kind-dot ' + dot.cls} role="img" aria-label={dot.label} title={dot.label} />
+              {showActivity && <span className="activity-dot" role="img" aria-label="activity" title="background activity" />}
               {isEditing
                 ? <RenameInput initial={tabLabel ?? `tab ${t.tab}`}
                     onCommit={(v) => { setTabLabel(t.tab, v); setEditing(null) }}

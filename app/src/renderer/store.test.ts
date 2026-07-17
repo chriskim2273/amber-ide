@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { initialState, reduce, groupSessions, paneDot, tabDot, type PaneModel } from './store'
+import { initialState, reduce, groupSessions, paneDot, tabDot, hasActivity, type PaneModel } from './store'
 import type { SessionInfo } from '../shared/proto'
 
 const s = (name: string, alive = true): SessionInfo => ({ name, cwd: '/w', kind: 'shell', alive })
@@ -69,6 +69,50 @@ describe('store', () => {
     let st = reduce(initialState(), { kind: 'Sessions', sessions: [claude('amber-1-1-0-c')] })
     st = reduce(st, { kind: 'SessionsChanged', added: [claude('amber-1-1-0-c', 'claude-retrying')], removed: [] })
     expect(groupSessions(st)[0]!.tabs[0]!.panes[0]!.runState).toBe('claude-retrying')
+  })
+})
+
+describe('activity', () => {
+  const p = (name: string): PaneModel => ({ name, cwd: '/w', kind: 'shell', alive: true, ord: 0, deadCode: null })
+
+  it('a pane with activity newer than lastSeen has unseen activity', () => {
+    let st = reduce(initialState(), { kind: 'Sessions', sessions: [s('amber-1-1-0-a')] })
+    expect(hasActivity(st, [p('amber-1-1-0-a')])).toBe(false)
+    st = reduce(st, { kind: 'Activity', name: 'amber-1-1-0-a' })
+    expect(hasActivity(st, [p('amber-1-1-0-a')])).toBe(true)
+  })
+
+  it('MarkSeen clears the pane it names', () => {
+    let st = reduce(initialState(), { kind: 'Sessions', sessions: [s('amber-1-1-0-a')] })
+    st = reduce(st, { kind: 'Activity', name: 'amber-1-1-0-a' })
+    st = reduce(st, { kind: 'MarkSeen', names: ['amber-1-1-0-a'] })
+    expect(hasActivity(st, [p('amber-1-1-0-a')])).toBe(false)
+  })
+
+  it('MarkSeen on the visible tab does not clear a background pane', () => {
+    let st = reduce(initialState(), { kind: 'Sessions', sessions: [s('vis'), s('bg')] })
+    st = reduce(st, { kind: 'Activity', name: 'bg' })
+    // The visible tab (vis) is marked seen; the background pane (bg) keeps its dot.
+    st = reduce(st, { kind: 'MarkSeen', names: ['vis'] })
+    expect(hasActivity(st, [p('bg')])).toBe(true)
+    expect(hasActivity(st, [p('vis')])).toBe(false)
+  })
+
+  it('activity after MarkSeen re-lights the pane', () => {
+    let st = reduce(initialState(), { kind: 'Sessions', sessions: [s('a')] })
+    st = reduce(st, { kind: 'Activity', name: 'a' })
+    st = reduce(st, { kind: 'MarkSeen', names: ['a'] })
+    expect(hasActivity(st, [p('a')])).toBe(false)
+    st = reduce(st, { kind: 'Activity', name: 'a' })
+    expect(hasActivity(st, [p('a')])).toBe(true)
+  })
+
+  it('a removed session drops its activity state', () => {
+    let st = reduce(initialState(), { kind: 'Sessions', sessions: [s('a')] })
+    st = reduce(st, { kind: 'Activity', name: 'a' })
+    st = reduce(st, { kind: 'SessionsChanged', added: [], removed: ['a'] })
+    expect(st.lastActivity['a']).toBeUndefined()
+    expect(st.lastSeen['a']).toBeUndefined()
   })
 })
 

@@ -222,6 +222,16 @@ body {
 .tab .kind-dot.claude-retrying { background: var(--warn); animation: pulse 1.2s ease-in-out infinite; }
 /* claude gave up / user quit — pane is a plain shell now (gray) */
 .tab .kind-dot.shell-fallback { background: var(--text-faint); }
+/* Background-activity indicator on a non-active tab: a small accent dot,
+   visually distinct from the kind-dot. Softly pulses to draw the eye. */
+.tab .activity-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+  animation: pulse 1.6s ease-in-out infinite;
+}
 .tab .count {
   color: var(--text-faint);
   font-variant-numeric: tabular-nums;

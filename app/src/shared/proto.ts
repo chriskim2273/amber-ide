@@ -33,6 +33,7 @@ export type ControlMsg =
   | { kind: 'SessionList'; names: string[] }
   | { kind: 'Sessions'; sessions: SessionInfo[] }
   | { kind: 'SessionsChanged'; added: SessionInfo[]; removed: string[] }
+  | { kind: 'Activity'; name: string }
   | { kind: 'Created'; name: string }
   | { kind: 'Exit'; name: string; code: number }
   | { kind: 'Error'; msg: string }
@@ -71,6 +72,8 @@ function msgToJson(m: ControlMsg): unknown {
       return { Sessions: { sessions: m.sessions } }
     case 'SessionsChanged':
       return { SessionsChanged: { added: m.added, removed: m.removed } }
+    case 'Activity':
+      return { Activity: { name: m.name } }
     case 'Created':
       return { Created: { name: m.name } }
     case 'Exit':
@@ -99,6 +102,7 @@ function jsonToMsg(v: unknown): ControlMsg {
       case 'SessionList': return { kind: 'SessionList', names: body['names'] as string[] }
       case 'Sessions': return { kind: 'Sessions', sessions: body['sessions'] as SessionInfo[] }
       case 'SessionsChanged': return { kind: 'SessionsChanged', added: body['added'] as SessionInfo[], removed: body['removed'] as string[] }
+      case 'Activity': return { kind: 'Activity', name: body['name'] as string }
       case 'Created': return { kind: 'Created', name: body['name'] as string }
       case 'Exit': return { kind: 'Exit', name: body['name'] as string, code: body['code'] as number }
       case 'Error': return { kind: 'Error', msg: body['msg'] as string }
