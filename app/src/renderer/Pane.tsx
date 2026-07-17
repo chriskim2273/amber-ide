@@ -36,6 +36,8 @@ const SEARCH_DECORATIONS = {
 // the header/chrome; cursor + selection use the violet accent.
 const FONT_STACK =
   "'JetBrains Mono','SF Mono','Menlo','Monaco','DejaVu Sans Mono','Consolas',monospace"
+// fixterms encoding of Shift+Enter (see attachCustomKeyEventHandler below).
+const SHIFT_ENTER_CSI_U = new TextEncoder().encode('\x1b[13;2u')
 const XTERM_THEME = {
   background: '#0c0c0f',
   foreground: '#e6e6ec',
@@ -108,10 +110,6 @@ export const Pane = memo(function Pane(
       cursorBlink: true,
       allowProposedApi: true,
     })
-    // App chords (Cmd on mac / Ctrl+Shift on Linux) must not be sent to the
-    // pty — return false so xterm neither renders nor forwards them; the event
-    // still bubbles to the window handlers in App/SplitView.
-    term.attachCustomKeyEventHandler((e) => !(e.type === 'keydown' && appChord(e)))
     const fit = new FitAddon()
     term.open(host)
     term.loadAddon(fit)
@@ -143,6 +141,24 @@ export const Pane = memo(function Pane(
 
     let port: MessagePort | null = null
     let wired = false
+
+    // App chords (Cmd on mac / Ctrl+Shift on Linux) must not be sent to the
+    // pty — return false so xterm neither renders nor forwards them; the event
+    // still bubbles to the window handlers in App/SplitView.
+    // Shift+Enter is translated to the fixterms CSI-u encoding (ESC [13;2u) —
+    // what iTerm2/Kitty/Ghostty send natively — so CSI-u-aware TUIs (Claude
+    // Code's newline-without-submit) can tell it apart from plain Enter.
+    // Shells without CSI-u bindings may echo a stray fragment on Shift+Enter;
+    // accepted tradeoff.
+    term.attachCustomKeyEventHandler((e) => {
+      if (e.type !== 'keydown') return true
+      if (appChord(e)) return false
+      if (e.key === 'Enter' && e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        port?.postMessage({ data: SHIFT_ENTER_CSI_U })
+        return false
+      }
+      return true
+    })
 
     const sendResize = (): void => {
       // A collapsed host (window crushed below the chrome's own height) makes
