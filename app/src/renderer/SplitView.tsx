@@ -1,9 +1,9 @@
 import { useRef, useState, useEffect } from 'react'
 import { Pane, type SearchApi } from './Pane'
 import { paneRects, handles, nextPaneInDirection, ratioAt, leaves, type Node, type Rect, type Zone, type FocusDir } from './layout'
-import { appChord } from './keys'
+import { appChord, chordLabel } from './keys'
 
-export interface PaneMeta { kind: string; title: string }
+export interface PaneMeta { kind: string; title: string; cwd: string }
 
 // Per-pane scrollback find bar (chrome). Drives the pane's imperative SearchApi:
 // debounced incremental findNext on type, Enter/Shift+Enter step, Escape closes.
@@ -103,9 +103,13 @@ export function SplitView(props: {
   fontSize: number
   onPaneTitle: (session: string, title: string) => void
   onSetRatio: (path: Array<'a' | 'b'>, ratio: number) => void
-  onSplit: (paneId: string, dir: 'h' | 'v') => void
+  onSplit: (paneId: string, dir: 'h' | 'v', kind?: 'shell' | 'claude') => void
   onMove: (sourceId: string, targetId: string, zone: Zone) => void
   onClose: (paneId: string) => void
+  // Zoom is transient per-tab renderer state owned by App (never persisted); this
+  // view is presentational — it renders the zoomed pane full-stage and toggles.
+  zoomedPane: string | null
+  onToggleZoom: (paneId: string) => void
 }): JSX.Element {
   const ref = useRef<HTMLDivElement>(null)
   const [size, setSize] = useState<Rect>({ x: 0, y: 0, w: 0, h: 0 })
@@ -120,6 +124,9 @@ export function SplitView(props: {
   // fire so re-invoking find on an already-open bar refocuses its input.
   const [findPane, setFindPane] = useState<string | null>(null)
   const [findSeq, setFindSeq] = useState(0)
+  // Custom header context menu, if open: which pane and where (stage-relative,
+  // clamped on render). Bound to the pane HEADER only — xterm owns body events.
+  const [menu, setMenu] = useState<{ paneId: string; x: number; y: number } | null>(null)
   // Live tree/size for the keydown handler (registered once). Directional focus
   // needs the current geometry without re-binding the listener each render.
   const treeRef = useRef(props.tree)
@@ -177,7 +184,19 @@ export function SplitView(props: {
       if (!live.has(id)) { searchApis.current.delete(id); searchReadyCbs.current.delete(id) }
     }
     setFindPane((p) => (p && !live.has(p) ? null : p))
+    setMenu((m) => (m && !live.has(m.paneId) ? null : m))
   }, [props.tree])
+
+  // Dismiss the context menu on Escape or any outside click. The menu itself
+  // stops mousedown propagation, so clicks inside it don't reach this listener.
+  useEffect(() => {
+    if (!menu) return
+    const onDown = (): void => setMenu(null)
+    const onKey = (e: KeyboardEvent): void => { if (e.key === 'Escape') setMenu(null) }
+    window.addEventListener('mousedown', onDown)
+    window.addEventListener('keydown', onKey)
+    return () => { window.removeEventListener('mousedown', onDown); window.removeEventListener('keydown', onKey) }
+  }, [menu])
 
   useEffect(() => {
     const el = ref.current
@@ -191,6 +210,7 @@ export function SplitView(props: {
   // switch-tab / help chords are owned by App; here we act on the ones that
   // need the focused-pane identity and pane geometry.
   const onClose = props.onClose
+  const onToggleZoom = props.onToggleZoom
   useEffect(() => {
     const dirOf: Record<string, FocusDir> = {
       'focus-left': 'left', 'focus-right': 'right', 'focus-up': 'up', 'focus-down': 'down',
@@ -201,6 +221,13 @@ export function SplitView(props: {
       if (c.type === 'close' && focusedRef.current) {
         e.preventDefault()
         onClose(focusedRef.current)
+        return
+      }
+      // Zoom toggles the FOCUSED pane (identity lives here, not App). App owns the
+      // per-tab zoom state; this only requests the toggle.
+      if (c.type === 'zoom' && focusedRef.current) {
+        e.preventDefault()
+        onToggleZoom(focusedRef.current)
         return
       }
       // Find targets the focused pane (its SearchApi must be ready — it is, once
@@ -225,10 +252,13 @@ export function SplitView(props: {
     }
     window.addEventListener('keydown', h)
     return () => window.removeEventListener('keydown', h)
-  }, [onClose])
+  }, [onClose, onToggleZoom])
 
   const panes = size.w > 0 ? paneRects(props.tree, size) : []
   const hs = size.w > 0 ? handles(props.tree, size) : []
+  // Zoom is a DISPLAY override only — the layout tree is untouched. Guard against
+  // a stale zoomed id (pane already gone): only zoom if it's a real pane here.
+  const zoomActive = props.zoomedPane != null && panes.some((p) => p.paneId === props.zoomedPane)
 
   const startDrag = (path: Array<'a' | 'b'>, dir: 'h' | 'v') => (e: React.MouseEvent) => {
     e.preventDefault()
@@ -322,15 +352,33 @@ export function SplitView(props: {
         const meta = props.meta[paneId]
         const dead = props.deadCodes[paneId]
         const kindClass = meta?.kind === 'claude' ? 'claude' : 'shell'
+        const isZoomedPane = zoomActive && props.zoomedPane === paneId
+        // Zoomed pane fills the stage; the others stay MOUNTED but hidden via
+        // display:none (Pane's ResizeObserver early-returns at 0×0, so this fires
+        // NO spurious pty resize — verified in Pane.sendResize).
+        const box = isZoomedPane ? size : rect
+        const hidden = zoomActive && !isZoomedPane
         return (
           <div key={paneId}
             className={'pane' + (focused === paneId ? ' focused' : '')}
-            style={{ left: rect.x, top: rect.y, width: rect.w, height: rect.h, opacity: drag?.source === paneId ? 0.4 : 1 }}
+            style={{ left: box.x, top: box.y, width: box.w, height: box.h,
+              opacity: drag?.source === paneId ? 0.4 : 1,
+              display: hidden ? 'none' : undefined, zIndex: isZoomedPane ? 2 : undefined }}
             onFocusCapture={() => setFocused(paneId)}
             onMouseDownCapture={() => setFocused(paneId)}>
-            <div className="pane-header">
+            <div className="pane-header"
+              onDoubleClick={(e) => { if (!(e.target as HTMLElement).closest('button')) props.onToggleZoom(paneId) }}
+              onContextMenu={(e) => {
+                e.preventDefault()
+                const b = ref.current?.getBoundingClientRect()
+                if (!b) return
+                setFocused(paneId)
+                setMenu({ paneId, x: e.clientX - b.left, y: e.clientY - b.top })
+              }}>
               <span className={'kind-dot ' + kindClass} />
               <span className="pane-title">{meta?.title ?? paneId}</span>
+              {isZoomedPane &&
+                <span className="zoom-badge">zoomed — {chordLabel('zoom')} to restore</span>}
               <div className="pane-actions">
                 <button className="icon-btn" aria-label="move pane" title="drag to move" onMouseDown={startPaneDrag(paneId)} style={{ cursor: 'grab' }}>⠿</button>
                 <button className="icon-btn" aria-label="split right" title="split right" onClick={() => props.onSplit(paneId, 'h')}>⬌</button>
@@ -355,14 +403,39 @@ export function SplitView(props: {
           </div>
         )
       })}
-      {hs.map((h, i) => (
+      {/* No dividers or drop targets while a pane is zoomed — the others are hidden. */}
+      {!zoomActive && hs.map((h, i) => (
         <div key={i} onMouseDown={startDrag(h.path, h.dir)}
           className={'split-handle ' + h.dir}
           style={{ left: h.rect.x, top: h.rect.y, width: h.rect.w, height: h.rect.h }} />
       ))}
-      {hoverRect &&
+      {!zoomActive && hoverRect &&
         <div className="drop-zone"
           style={{ left: hoverRect.x, top: hoverRect.y, width: hoverRect.w, height: hoverRect.h }} />}
+      {menu && (() => {
+        // Clamp the menu box (approx dims) inside the stage so it never spills off.
+        const MW = 200, MH = 232
+        const x = Math.max(0, Math.min(menu.x, size.w - MW))
+        const y = Math.max(0, Math.min(menu.y, size.h - MH))
+        const paneId = menu.paneId
+        const close = (): void => setMenu(null)
+        const run = (fn: () => void) => (): void => { fn(); close() }
+        const isZoomed = props.zoomedPane === paneId
+        return (
+          <div className="ctx-menu" role="menu" style={{ left: x, top: y }}
+            onMouseDown={(e) => e.stopPropagation()}>
+            <button className="ctx-item" role="menuitem" onClick={run(() => props.onSplit(paneId, 'h'))}>Split right</button>
+            <button className="ctx-item" role="menuitem" onClick={run(() => props.onSplit(paneId, 'v'))}>Split down</button>
+            <button className="ctx-item" role="menuitem" onClick={run(() => props.onSplit(paneId, 'h', 'claude'))}>New claude pane right</button>
+            <div className="ctx-sep" />
+            <button className="ctx-item" role="menuitem" onClick={run(() => props.onToggleZoom(paneId))}>{isZoomed ? 'Restore' : 'Zoom'}</button>
+            <button className="ctx-item" role="menuitem"
+              onClick={run(() => { void navigator.clipboard?.writeText(props.meta[paneId]?.cwd ?? '') })}>Copy cwd</button>
+            <div className="ctx-sep" />
+            <button className="ctx-item danger" role="menuitem" onClick={run(() => props.onClose(paneId))}>Close</button>
+          </div>
+        )
+      })()}
     </div>
   )
 }

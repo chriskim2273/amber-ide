@@ -118,6 +118,10 @@ function App(): JSX.Element {
   // reconcile so it can't prune/re-append them as columns; placed with the
   // requested direction once the daemon confirms the session exists.
   const [pending, setPending] = useState<Record<string, { paneId: string; dir: 'h' | 'v' }>>({})
+  // Transient per-tab pane zoom (tabKey -> zoomed paneId). Renderer-only — never
+  // written to the layout sidecar. Cleared when the tab's pane set changes
+  // structurally (split/close/move), so it can't outlive its pane.
+  const [zoom, setZoom] = useState<Record<string, string>>({})
   const layoutRef = useRef(layout)
   layoutRef.current = layout
   // App-wide terminal font size lives in the layout sidecar (single source of
@@ -191,7 +195,9 @@ function App(): JSX.Element {
     // Whitespace-only titles (some prompts emit blank OSC 2) fall back to cwd.
     const osc = titles[p.name]
     const lead = osc && osc.trim().length > 0 ? osc : shortCwd(p.cwd, home)
-    paneMeta[p.name] = { kind: p.kind, title: `${lead} · ${p.kind}` }
+    // Raw absolute cwd (not shortCwd) so the context-menu "copy cwd" yields a
+    // path that actually resolves when pasted.
+    paneMeta[p.name] = { kind: p.kind, title: `${lead} · ${p.kind}`, cwd: p.cwd }
   })
 
   // Reconcile the persisted tree for this tab with its live pane set. Pending
@@ -202,6 +208,31 @@ function App(): JSX.Element {
   const tabKey = String(tab?.tab ?? activeTab)
   const storedTree = layout.workspaces[wsKey]?.tabs[tabKey]?.tree ?? null
   const tree = reconcile(storedTree, liveIds)
+
+  // Zoom (transient, per tab). Derive the effective zoomed pane for the visible
+  // tab, guarding a stale id whose pane has already left the live set.
+  const zoomedPane = zoom[tabKey] && liveIds.includes(zoom[tabKey]!) ? zoom[tabKey]! : null
+  const toggleZoom = (paneId: string): void => setZoom((z) => {
+    if (z[tabKey] === paneId) { const c = { ...z }; delete c[tabKey]; return c }
+    return { ...z, [tabKey]: paneId }
+  })
+  const clearZoom = (): void => setZoom((z) => {
+    if (!(tabKey in z)) return z
+    const c = { ...z }; delete c[tabKey]; return c
+  })
+  // Structural-change guard: when the visible tab's live pane set changes (a
+  // split lands, a pane is closed/reaped — via our gesture OR the daemon), drop
+  // that tab's zoom. Moves don't change the set, so those gestures clear zoom
+  // explicitly below. Per-tab tracking so a plain tab switch never clears.
+  const liveSetKey = [...liveIds].sort().join(',')
+  const prevTabLive = useRef<Record<string, string>>({})
+  useEffect(() => {
+    const prev = prevTabLive.current[tabKey]
+    prevTabLive.current[tabKey] = liveSetKey
+    if (prev !== undefined && prev !== liveSetKey) {
+      setZoom((z) => { if (!(tabKey in z)) return z; const c = { ...z }; delete c[tabKey]; return c })
+    }
+  }, [tabKey, liveSetKey])
 
   // Visual tab order: sidecar `tabOrder` first, unlisted append numerically.
   const orderedTabs = orderTabs(tabs.map((t) => t.tab), layout.workspaces[wsKey]?.tabOrder)
@@ -271,7 +302,8 @@ function App(): JSX.Element {
   useEffect(() => {
     const h = (e: KeyboardEvent): void => {
       const c = appChord(e)
-      if (!c || c.type === 'close') return
+      // `close` and `zoom` both need the focused-pane identity — SplitView owns them.
+      if (!c || c.type === 'close' || c.type === 'zoom') return
       e.preventDefault()
       chordRef.current(c)
     }
@@ -437,14 +469,17 @@ function App(): JSX.Element {
           : tree
             ? <SplitView tree={tree} deadCodes={deadCodes} meta={paneMeta} epoch={reconnectEpoch} portEpoch={childEpoch}
                 fontSize={fontSize} onPaneTitle={onPaneTitle}
+                zoomedPane={zoomedPane}
+                onToggleZoom={toggleZoom}
                 onSetRatio={(path, r) => putTree(setRatio(tree, path, r))}
-                onSplit={(paneId, dir) => {
+                onSplit={(paneId, dir, overrideKind) => {
                   const name = formatName({ ws: currentWs, tab: currentTab, ord: nextOrd, id: makeId() })
-                  window.amber.createSession(name, cwd, kind)
+                  window.amber.createSession(name, cwd, overrideKind ?? kind)
                   setPending((p) => ({ ...p, [name]: { paneId, dir } }))
+                  clearZoom()
                 }}
-                onMove={(s, t, z) => putTree(moveLeaf(tree, s, t, z))}
-                onClose={(paneId) => window.amber.killSession(paneId)} />
+                onMove={(s, t, z) => { putTree(moveLeaf(tree, s, t, z)); clearZoom() }}
+                onClose={(paneId) => { window.amber.killSession(paneId); clearZoom() }} />
             : <button className="empty-cta" onClick={startPane}>
                 <span className="empty-cta-title">Start a pane</span>
                 <span className="empty-cta-sub">{chordLabel('new-pane')}</span>

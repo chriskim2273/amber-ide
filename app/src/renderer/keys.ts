@@ -19,6 +19,7 @@ export type Chord =
   | { type: 'font-bigger' }
   | { type: 'font-smaller' }
   | { type: 'font-reset' }
+  | { type: 'zoom' }
   | { type: 'tab'; n: number }
 
 // A single non-parametric chord action (everything except the 1–9 tab jump,
@@ -60,6 +61,8 @@ export const CHORD_TABLE: ChordEntry[] = [
   { action: 'font-bigger', label: '=', keys: ['=', '+'], desc: 'Increase font size' },
   { action: 'font-smaller', label: '-', keys: ['-', '_'], desc: 'Decrease font size' },
   { action: 'font-reset', label: '0', keys: ['0', ')'], desc: 'Reset font size' },
+  // Zoom the focused pane to fill the stage (M avoids the Z=undo collision).
+  { action: 'zoom', label: 'M', keys: ['m'], desc: 'Zoom / restore focused pane' },
 ]
 
 export function appChord(e: KeyLike): Chord | null {

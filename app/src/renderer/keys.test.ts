@@ -149,6 +149,25 @@ describe('appChord (help)', () => {
   })
 })
 
+describe('appChord (zoom)', () => {
+  it('maps Cmd+M (and Cmd+Shift+M form) to zoom on mac', () => {
+    setPlatform('MacIntel')
+    expect(appChord(key({ key: 'm', meta: true }))).toEqual({ type: 'zoom' })
+    expect(appChord(key({ key: 'M', meta: true, shift: true }))).toEqual({ type: 'zoom' })
+  })
+  it('maps Ctrl+Shift+M to zoom on linux', () => {
+    setPlatform('Linux x86_64')
+    expect(appChord(key({ key: 'm', ctrl: true, shift: true }))).toEqual({ type: 'zoom' })
+    expect(appChord(key({ key: 'M', ctrl: true, shift: true }))).toEqual({ type: 'zoom' })
+  })
+  it('renders the zoom label per platform', () => {
+    setPlatform('MacIntel')
+    expect(chordLabel('zoom')).toBe('⌘M')
+    setPlatform('Linux x86_64')
+    expect(chordLabel('zoom')).toBe('Ctrl+Shift+M')
+  })
+})
+
 describe('CHORD_TABLE (single source of truth)', () => {
   it('every entry is matched by appChord under the platform modifier', () => {
     setPlatform('MacIntel')
