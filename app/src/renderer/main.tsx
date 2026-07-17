@@ -205,7 +205,7 @@ function App(): JSX.Element {
   // Refresh the keyboard-chord dispatcher with this render's live closures.
   chordRef.current = (c) => {
     if (c?.type === 'new-tab') openTab()
-    else if (c?.type === 'new-pane') { if (tab) newPane(tab.tab, nextOrd) }
+    else if (c?.type === 'new-pane') startPane()
     else if (c?.type === 'prev-tab') stepTab(-1)
     else if (c?.type === 'next-tab') stepTab(1)
     else if (c?.type === 'tab') { const t = tabs[c.n - 1]; if (t) setActiveTab(t.tab) }
