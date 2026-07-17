@@ -288,6 +288,32 @@ fn handle_control(
                 }
             });
         }
+        ControlMsg::ReportRunState { name, state } => {
+            // A claude session's supervisor reporting its phase. Store it and
+            // fan the updated SessionInfo out to watchers via the existing
+            // non-blocking broadcast (bounded queue + forwarder). On success we
+            // send NO reply — the supervisor is fire-and-forget; only an
+            // invalid report (unknown/non-claude session, bad state) gets an
+            // Error, and that is a small frame, never a big blocking write.
+            match manager.set_run_state(&name, &state) {
+                Ok(()) => {
+                    if let Ok(infos) = manager.session_infos() {
+                        if let Some(info) = infos.into_iter().find(|i| i.name == name) {
+                            watchers.broadcast(&ControlMsg::SessionsChanged {
+                                added: vec![info],
+                                removed: vec![],
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = write_frame(
+                        writer,
+                        &Frame::Control(ControlMsg::Error { msg: e.to_string() }),
+                    );
+                }
+            }
+        }
         ControlMsg::Snapshot => {
             let reply = match manager.snapshot() {
                 Ok(()) => ControlMsg::SnapshotOk,

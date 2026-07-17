@@ -23,6 +23,16 @@ pub struct SessionInfo {
     /// decode as `0`.
     #[serde(default)]
     pub updated: u64,
+    /// Claude supervision phase for a `kind == "claude"` session, reported by
+    /// its `amber run` supervisor: `"claude"` (running), `"claude-retrying"`
+    /// (crashed, in the bounded-retry backoff), `"shell-fallback"` (claude
+    /// gave up / the user quit — the pane is now a plain shell). `None` for a
+    /// shell session or a claude session that has not reported yet.
+    /// `#[serde(default)]` keeps the wire backward compatible: peers that omit
+    /// it (older binaries, the Electron app, which never constructs
+    /// `SessionInfo`) decode as `None`.
+    #[serde(default)]
+    pub run_state: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,6 +54,13 @@ pub enum ControlMsg {
     Resize { name: String, cols: u16, rows: u16 },
     Kill { name: String },
     Rename { from: String, to: String },
+    /// Client -> daemon: a `claude` session's `amber run` supervisor reports
+    /// its current supervision phase (`state`: one of `"claude"`,
+    /// `"claude-retrying"`, `"shell-fallback"`). The daemon stores it on the
+    /// session and broadcasts the change to watchers. Fire-and-forget: the
+    /// supervisor never waits for a reply (the daemon replies `Error` only for
+    /// an unknown session, a non-claude session, or an invalid state string).
+    ReportRunState { name: String, state: String },
     /// Ask the daemon to flush a snapshot to the state store now.
     Snapshot,
     /// Daemon reply: the snapshot completed successfully.
@@ -271,6 +288,7 @@ mod tests {
             kind: "claude".into(),
             alive: true,
             updated: 1_700_000_000,
+            run_state: Some("claude-retrying".into()),
         };
         let full = Frame::Control(ControlMsg::Sessions { sessions: vec![info.clone()] });
         assert_eq!(roundtrip(&full), full);
@@ -289,12 +307,45 @@ mod tests {
 
     #[test]
     fn session_info_updated_defaults_when_absent() {
-        // A peer that predates the `updated` field omits it from the JSON;
-        // `#[serde(default)]` must decode that as 0, not fail.
+        // A peer that predates the `updated`/`run_state` fields omits them from
+        // the JSON; `#[serde(default)]` must decode that as 0/None, not fail.
         let legacy = r#"{"name":"s","cwd":"/tmp","kind":"shell","alive":true}"#;
         let info: SessionInfo = serde_json::from_str(legacy).unwrap();
         assert_eq!(info.updated, 0);
+        assert_eq!(info.run_state, None);
         assert_eq!(info.name, "s");
+    }
+
+    #[test]
+    fn report_run_state_control_roundtrips() {
+        let f = Frame::Control(ControlMsg::ReportRunState {
+            name: "amber-1-1-0-a".into(),
+            state: "claude-retrying".into(),
+        });
+        assert_eq!(roundtrip(&f), f);
+        // Lock the externally-tagged JSON shape the supervisor emits.
+        let json = serde_json::to_string(&ControlMsg::ReportRunState {
+            name: "s".into(),
+            state: "shell-fallback".into(),
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"ReportRunState":{"name":"s","state":"shell-fallback"}}"#);
+    }
+
+    #[test]
+    fn session_info_carries_run_state_on_the_wire() {
+        // A claude session's reported phase must survive encode/decode so the
+        // app can render the pane's supervision state.
+        let info = SessionInfo {
+            name: "amber-1-1-0-a".into(),
+            cwd: "/tmp".into(),
+            kind: "claude".into(),
+            alive: true,
+            updated: 0,
+            run_state: Some("shell-fallback".into()),
+        };
+        let f = Frame::Control(ControlMsg::Sessions { sessions: vec![info] });
+        assert_eq!(roundtrip(&f), f);
     }
 
     #[test]

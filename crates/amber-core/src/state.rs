@@ -36,6 +36,13 @@ pub struct SessionMeta {
     /// conversation) instead of a bare shell. Defaulted for older records.
     #[serde(default)]
     pub resume_as_claude: bool,
+    /// Last-known claude supervision phase (see
+    /// [`amber_core::proto::SessionInfo::run_state`]). Persisted so a snapshot
+    /// round-trips; on restore a claude session is reset to `"claude"` (its
+    /// supervisor re-reports), so the stored value is never read back — it
+    /// exists for wire/format completeness. Defaulted for older records.
+    #[serde(default)]
+    pub run_state: Option<String>,
 }
 
 /// Metadata for a Claude sub-session, persisted as `claude/<name>.json`.
@@ -237,6 +244,7 @@ mod tests {
             kind: SessionKind::Shell,
             updated: 1_700_000_000,
             resume_as_claude: false,
+            run_state: None,
         }
     }
 
@@ -250,6 +258,37 @@ mod tests {
         let read = store.read_session("alpha").unwrap();
 
         assert_eq!(read, Some(meta));
+    }
+
+    #[test]
+    fn session_meta_tolerates_snapshots_without_run_state() {
+        // An older snapshot's JSON has no `run_state` key; `#[serde(default)]`
+        // must decode it as None rather than failing the whole restore.
+        let dir = tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        let sessions_dir = dir.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        fs::write(
+            sessions_dir.join("legacy.json"),
+            br#"{"name":"legacy","cwd":"/tmp","kind":"claude","updated":1}"#,
+        )
+        .unwrap();
+
+        let meta = store.read_session("legacy").unwrap().unwrap();
+        assert_eq!(meta.run_state, None);
+        assert!(!meta.resume_as_claude);
+        assert_eq!(meta.kind, SessionKind::Claude);
+    }
+
+    #[test]
+    fn session_meta_run_state_round_trips() {
+        let dir = tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        let mut meta = sample_session("phased");
+        meta.kind = SessionKind::Claude;
+        meta.run_state = Some("shell-fallback".to_string());
+        store.write_session(&meta).unwrap();
+        assert_eq!(store.read_session("phased").unwrap(), Some(meta));
     }
 
     #[test]

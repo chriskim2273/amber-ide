@@ -2,13 +2,21 @@
 //! with resume/continue argv selection, falling back to an interactive shell
 //! so a pane never silently dies.
 
+use std::io::Write;
+use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
+use amber_core::proto::{self, ControlMsg, Frame};
 use amber_core::state::StateStore;
 
 use crate::claude;
+
+/// Upper bound on a single fire-and-forget run-state report write. Reporting
+/// must NEVER stall supervision, so both the connect and the write are
+/// best-effort and time-bounded; a failure is logged and ignored.
+const REPORT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Outcome of [`supervise_claude`]'s bounded retry loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,6 +31,13 @@ pub enum SuperviseOutcome {
 /// Run `claude_path` in `cwd`, resuming the recorded session id (if any) or
 /// continuing the most recent conversation, retrying with exponential
 /// backoff on non-zero exit up to `max_attempts` times.
+///
+/// `report` is invoked at each supervision transition with the phase string
+/// (`"claude"` on every (re)start, `"claude-retrying"` before a backoff). It
+/// is fire-and-forget from the loop's perspective — the closure must never
+/// block supervision (the socket-backed reporter used in production time-bounds
+/// its I/O and swallows errors); tests pass a recording closure to assert the
+/// exact transition sequence.
 pub fn supervise_claude(
     claude_path: &Path,
     root: &Path,
@@ -30,6 +45,7 @@ pub fn supervise_claude(
     cwd: &Path,
     settings: &Path,
     max_attempts: u32,
+    report: impl Fn(&str),
 ) -> anyhow::Result<SuperviseOutcome> {
     let store = StateStore::new(root);
     let mut attempts = 0u32;
@@ -47,6 +63,9 @@ pub fn supervise_claude(
         }
         let start = select_start(session_id.as_deref(), escalation);
         let argv = claude::claude_argv(&start, settings);
+
+        // Entering (or re-entering) the running phase.
+        report("claude");
 
         // A failure to even launch the child (e.g. a transient ETXTBSY while
         // the binary is being replaced) is treated the same as a crash: it
@@ -71,7 +90,11 @@ pub fn supervise_claude(
         escalation += 1;
         match retry_decision(attempts, max_attempts) {
             None => return Ok(SuperviseOutcome::Exhausted),
-            Some(delay) => std::thread::sleep(delay),
+            Some(delay) => {
+                // A crash that will be retried after a backoff.
+                report("claude-retrying");
+                std::thread::sleep(delay);
+            }
         }
     }
 }
@@ -160,10 +183,34 @@ fn backoff_delay(attempts: u32) -> Duration {
     Duration::from_millis(backoff_ms)
 }
 
+/// Best-effort, time-bounded report of `name`'s supervision phase to the
+/// daemon at `socket`. Fire-and-forget: a connect/write failure is logged and
+/// swallowed — reporting must never affect supervision or block the pty. The
+/// connection is opened, the frame written, then dropped; the daemon reads the
+/// frame off the half-closed socket.
+fn report_run_state(socket: &Path, name: &str, state: &str) {
+    if let Err(e) = try_report_run_state(socket, name, state) {
+        eprintln!("amber run: failed to report run_state {state} for {name}: {e}");
+    }
+}
+
+fn try_report_run_state(socket: &Path, name: &str, state: &str) -> anyhow::Result<()> {
+    let mut stream = UnixStream::connect(socket)?;
+    stream.set_write_timeout(Some(REPORT_WRITE_TIMEOUT))?;
+    let frame = proto::encode(&Frame::Control(ControlMsg::ReportRunState {
+        name: name.to_string(),
+        state: state.to_string(),
+    }));
+    stream.write_all(&frame)?;
+    stream.flush()?;
+    Ok(())
+}
+
 /// Resolve claude, supervise it for `name`, and fall through to an
 /// interactive shell (replacing this process) if claude is unresolvable or
 /// exhausts its retries. Runs inside the pty, so the child inherits the tty.
-pub fn run_session(root: &Path, name: &str) -> anyhow::Result<()> {
+/// `socket` is the daemon socket the supervisor reports its phase to.
+pub fn run_session(root: &Path, name: &str, socket: &Path) -> anyhow::Result<()> {
     let store = StateStore::new(root);
     let mut cfg = store.load_config()?;
 
@@ -198,7 +245,8 @@ pub fn run_session(root: &Path, name: &str) -> anyhow::Result<()> {
         // exiting THAT shell ends `amber run` and closes the pane normally. On
         // exhausted retries we do the same rather than let the pane die (spec
         // §6.2 — "a session never silently dies").
-        match supervise_claude(&claude_path, root, name, &cwd, &settings, 3)? {
+        let report = |state: &str| report_run_state(socket, name, state);
+        match supervise_claude(&claude_path, root, name, &cwd, &settings, 3, report)? {
             SuperviseOutcome::CleanExit => {}
             SuperviseOutcome::Exhausted => {
                 eprintln!(
@@ -210,6 +258,9 @@ pub fn run_session(root: &Path, name: &str) -> anyhow::Result<()> {
         eprintln!("amber: claude not found on PATH; falling back to shell");
     }
 
+    // The pane is now a plain shell (user quit, exhausted retries, or claude
+    // unresolvable). Surface that to clients before exec'ing the shell.
+    report_run_state(socket, name, "shell-fallback");
     shell_fallback(&cwd)
 }
 

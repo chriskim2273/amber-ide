@@ -67,6 +67,10 @@ pub struct PtySession {
     /// The child's OS process id, captured at spawn (for reading its live cwd
     /// via `procinfo::cwd_of` so `cd` inside a shell survives restart).
     pid: Option<u32>,
+    /// Claude supervision phase reported by this session's `amber run`
+    /// supervisor (`ReportRunState`). App-facing metadata only — it never
+    /// affects supervision. Mutex-guarded so `PtySession` stays `Send + Sync`.
+    run_state: Mutex<Option<String>>,
 }
 
 /// Fan one chunk out to every subscriber, returning the ids to prune.
@@ -276,7 +280,19 @@ impl PtySession {
             killer: Mutex::new(killer),
             exit,
             pid,
+            run_state: Mutex::new(None),
         })
+    }
+
+    /// The last-reported claude supervision phase, if any.
+    pub fn run_state(&self) -> Option<String> {
+        self.run_state.lock().unwrap().clone()
+    }
+
+    /// Record the claude supervision phase (from `ReportRunState`, or reset to
+    /// `Some("claude")` on restore).
+    pub fn set_run_state(&self, state: Option<String>) {
+        *self.run_state.lock().unwrap() = state;
     }
 
     /// The child's OS process id (None if the platform didn't report one).

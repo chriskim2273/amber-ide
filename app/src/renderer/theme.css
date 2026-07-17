@@ -218,6 +218,10 @@ body {
 }
 .tab .kind-dot.claude { background: var(--warn); }
 .tab .kind-dot.shell { background: var(--accent-2); }
+/* claude crashed and is retrying — pulsing amber draws the eye */
+.tab .kind-dot.claude-retrying { background: var(--warn); animation: pulse 1.2s ease-in-out infinite; }
+/* claude gave up / user quit — pane is a plain shell now (gray) */
+.tab .kind-dot.shell-fallback { background: var(--text-faint); }
 .tab .count {
   color: var(--text-faint);
   font-variant-numeric: tabular-nums;
@@ -303,6 +307,10 @@ body {
 }
 .pane-header .kind-dot.claude { background: var(--warn); }
 .pane-header .kind-dot.shell { background: var(--accent-2); }
+/* claude crashed and is retrying — pulsing amber draws the eye */
+.pane-header .kind-dot.claude-retrying { background: var(--warn); animation: pulse 1.2s ease-in-out infinite; }
+/* claude gave up / user quit — pane is a plain shell now (gray) */
+.pane-header .kind-dot.shell-fallback { background: var(--text-faint); }
 .pane-title {
   font-family: var(--font-mono);
   overflow: hidden;

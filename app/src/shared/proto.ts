@@ -11,6 +11,11 @@ export interface SessionInfo {
   // ordering key for "most recent". Optional on the wire (serde default 0);
   // the app does not use it today.
   updated?: number
+  // Claude supervision phase for a claude session: 'claude' (running),
+  // 'claude-retrying' (crashed, retrying), 'shell-fallback' (dropped to a
+  // shell). Optional on the wire (serde default None → undefined); decode-only,
+  // forwarded wholesale through the client → renderer hops.
+  run_state?: string | undefined
 }
 
 export type ControlMsg =

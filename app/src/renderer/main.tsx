@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useReducer, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { SplitView, type PaneMeta } from './SplitView'
-import { initialState, reduce, groupSessions, type DaemonEvent } from './store'
+import { initialState, reduce, groupSessions, tabDot, type DaemonEvent } from './store'
 import { formatName, makeId } from '../shared/names'
 import { splitLeaf, setRatio, reconcile, leaves, moveLeaf, type Node } from './layout'
 import { emptyLayout, parseLayout, serializeLayout, orderTabs, moveTab, type LayoutFile } from '../shared/layoutFile'
@@ -195,9 +195,12 @@ function App(): JSX.Element {
     // Whitespace-only titles (some prompts emit blank OSC 2) fall back to cwd.
     const osc = titles[p.name]
     const lead = osc && osc.trim().length > 0 ? osc : shortCwd(p.cwd, home)
+    // A claude pane that fell back to a shell (supervisor gave up / user quit)
+    // is labelled as such instead of "claude"; otherwise the suffix is the kind.
+    const suffix = p.runState === 'shell-fallback' ? 'shell (claude exited)' : p.kind
     // Raw absolute cwd (not shortCwd) so the context-menu "copy cwd" yields a
     // path that actually resolves when pasted.
-    paneMeta[p.name] = { kind: p.kind, title: `${lead} · ${p.kind}`, cwd: p.cwd }
+    paneMeta[p.name] = { kind: p.kind, title: `${lead} · ${suffix}`, cwd: p.cwd, runState: p.runState }
   })
 
   // Reconcile the persisted tree for this tab with its live pane set. Pending
@@ -430,7 +433,7 @@ function App(): JSX.Element {
       </div>
       <div className="tabbar" role="tablist">
         {orderedTabs.map((t) => {
-          const hasClaude = t.panes.some((p) => p.kind === 'claude')
+          const dot = tabDot(t.panes)
           const isActive = t.tab === (tab?.tab ?? -1)
           const isEditing = editing?.kind === 'tab' && editing.id === t.tab
           const tabLabel = layout.workspaces[wsKey]?.tabs[String(t.tab)]?.label
@@ -450,7 +453,7 @@ function App(): JSX.Element {
               onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move' }}
               onDrop={(e) => { e.preventDefault(); if (dragTab.current !== null) reorderTab(dragTab.current, t.tab); dragTab.current = null }}
               onDragEnd={() => { dragTab.current = null }}>
-              <span className={'kind-dot ' + (hasClaude ? 'claude' : 'shell')} />
+              <span className={'kind-dot ' + dot.cls} role="img" aria-label={dot.label} title={dot.label} />
               {isEditing
                 ? <RenameInput initial={tabLabel ?? `tab ${t.tab}`}
                     onCommit={(v) => { setTabLabel(t.tab, v); setEditing(null) }}

@@ -1,8 +1,10 @@
 import { describe, it, expect } from 'vitest'
-import { initialState, reduce, groupSessions } from './store'
+import { initialState, reduce, groupSessions, paneDot, tabDot, type PaneModel } from './store'
 import type { SessionInfo } from '../shared/proto'
 
 const s = (name: string, alive = true): SessionInfo => ({ name, cwd: '/w', kind: 'shell', alive })
+const claude = (name: string, runState?: string): SessionInfo => ({ name, cwd: '/w', kind: 'claude', alive: true, run_state: runState })
+const pane = (kind: string, runState?: string): PaneModel => ({ name: 'x', cwd: '/w', kind, alive: true, ord: 0, deadCode: null, runState })
 
 describe('store', () => {
   it('Sessions replaces the set', () => {
@@ -60,5 +62,43 @@ describe('store', () => {
     let st = reduce(initialState(), { kind: 'Error', msg: 'boom' })
     st = reduce(st, { kind: 'SessionsChanged', added: [s('amber-1-1-0-a')], removed: [] })
     expect(st.error).toBe('boom')
+  })
+  // A claude session's run_state must flow through SessionsChanged upsert into
+  // the grouped pane model (the daemon reports it via ReportRunState).
+  it('groupSessions surfaces a claude pane run_state', () => {
+    let st = reduce(initialState(), { kind: 'Sessions', sessions: [claude('amber-1-1-0-c')] })
+    st = reduce(st, { kind: 'SessionsChanged', added: [claude('amber-1-1-0-c', 'claude-retrying')], removed: [] })
+    expect(groupSessions(st)[0]!.tabs[0]!.panes[0]!.runState).toBe('claude-retrying')
+  })
+})
+
+describe('paneDot', () => {
+  it('shell kind is always the shell dot', () => {
+    expect(paneDot('shell', undefined)).toEqual({ cls: 'shell', label: 'shell' })
+    expect(paneDot('shell', 'claude-retrying')).toEqual({ cls: 'shell', label: 'shell' })
+  })
+  it('claude maps run_state to dot + label', () => {
+    expect(paneDot('claude', undefined)).toEqual({ cls: 'claude', label: 'claude' })
+    expect(paneDot('claude', 'claude')).toEqual({ cls: 'claude', label: 'claude' })
+    expect(paneDot('claude', 'claude-retrying')).toEqual({ cls: 'claude-retrying', label: 'claude (retrying)' })
+    expect(paneDot('claude', 'shell-fallback')).toEqual({ cls: 'shell-fallback', label: 'shell (claude exited)' })
+  })
+})
+
+describe('tabDot', () => {
+  it('no claude pane → shell', () => {
+    expect(tabDot([pane('shell'), pane('shell')]).cls).toBe('shell')
+  })
+  it('a running claude → claude', () => {
+    expect(tabDot([pane('shell'), pane('claude', 'claude')]).cls).toBe('claude')
+  })
+  it('any retrying claude wins (most attention-worthy)', () => {
+    expect(tabDot([pane('claude', 'shell-fallback'), pane('claude', 'claude-retrying')]).cls).toBe('claude-retrying')
+  })
+  it('all claude panes fallen back → gray shell-fallback', () => {
+    expect(tabDot([pane('claude', 'shell-fallback'), pane('claude', 'shell-fallback')])).toEqual({ cls: 'shell-fallback', label: 'shell (claude exited)' })
+  })
+  it('a mix of fallen-back and running claude → claude', () => {
+    expect(tabDot([pane('claude', 'shell-fallback'), pane('claude', 'claude')]).cls).toBe('claude')
   })
 })

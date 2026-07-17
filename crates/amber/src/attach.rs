@@ -790,6 +790,7 @@ mod tests {
             kind: "shell".into(),
             alive,
             updated,
+            run_state: None,
         }
     }
 

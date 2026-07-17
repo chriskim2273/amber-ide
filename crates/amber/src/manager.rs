@@ -50,6 +50,11 @@ pub struct SessionManager {
     cfg: Config,
     root: PathBuf,
     sessions: Mutex<HashMap<String, Arc<PtySession>>>,
+    /// The daemon socket path, passed to each claude session's `amber run`
+    /// supervisor (via `AMBER_SOCK`) so it can report its supervision phase
+    /// back (`ReportRunState`). `None` in tests / hand-started managers — the
+    /// supervisor then reconstructs the default socket from its state root.
+    socket: Option<PathBuf>,
 }
 
 impl SessionManager {
@@ -63,7 +68,16 @@ impl SessionManager {
             cfg,
             root,
             sessions: Mutex::new(HashMap::new()),
+            socket: None,
         })
+    }
+
+    /// Record the daemon socket path so claude supervisors learn where to send
+    /// their `ReportRunState` updates (`AMBER_SOCK`). Builder-style so existing
+    /// callers/tests that don't care keep using `new`.
+    pub fn with_socket(mut self, socket: impl Into<PathBuf>) -> Self {
+        self.socket = Some(socket.into());
+        self
     }
 
     /// The state directory this manager (and its spawned supervisors) is
@@ -140,6 +154,12 @@ impl SessionManager {
                 cmd.args(["run", name]);
                 cmd.cwd(cwd);
                 cmd.env("AMBER_STATE_DIR", self.root.to_string_lossy().to_string());
+                // Tell the supervisor where to report its phase back. If unset
+                // (hand-started manager / tests), the supervisor falls back to
+                // the default socket derived from AMBER_STATE_DIR.
+                if let Some(sock) = &self.socket {
+                    cmd.env("AMBER_SOCK", sock.to_string_lossy().to_string());
+                }
                 Ok(cmd)
             }
         }
@@ -184,6 +204,7 @@ impl SessionManager {
             kind,
             updated: Self::now(),
             resume_as_claude: false,
+            run_state: None,
         };
         if let Err(e) = self.store.write_session(&meta) {
             // Don't leak the freshly-spawned child if persisting fails.
@@ -266,6 +287,12 @@ impl SessionManager {
         if let Some(bytes) = scrollback {
             sess.preload(&bytes);
         }
+        // A restored claude session starts back in the `claude` phase; its
+        // freshly-spawned supervisor re-reports on any later transition. Any
+        // persisted run_state is deliberately discarded here.
+        if kind == SessionKind::Claude {
+            sess.set_run_state(Some("claude".to_string()));
+        }
         Ok(sess)
     }
 
@@ -278,6 +305,32 @@ impl SessionManager {
     /// spec-§5 reconnect semantics for raw clients.
     pub fn session_kind(&self, name: &str) -> Option<SessionKind> {
         self.store.read_session(name).ok().flatten().map(|m| m.kind)
+    }
+
+    /// Record a claude session's supervision phase (from `ReportRunState`).
+    /// Errors — surfaced to the client as an `Error` reply — if the session is
+    /// unknown, is not a claude session, or `state` is not one of the three
+    /// allowed values. A restored hand-started claude (`resume_as_claude`) runs
+    /// the supervisor too, so it counts as claude here.
+    pub fn set_run_state(&self, name: &str, state: &str) -> anyhow::Result<()> {
+        if !matches!(state, "claude" | "claude-retrying" | "shell-fallback") {
+            anyhow::bail!("invalid run_state: {state}");
+        }
+        let sess = self
+            .session(name)
+            .ok_or_else(|| anyhow::anyhow!("no such session: {name}"))?;
+        let is_claude = self
+            .store
+            .read_session(name)
+            .ok()
+            .flatten()
+            .map(|m| m.kind == SessionKind::Claude || m.resume_as_claude)
+            .unwrap_or(false);
+        if !is_claude {
+            anyhow::bail!("run_state applies only to claude sessions: {name}");
+        }
+        sess.set_run_state(Some(state.to_string()));
+        Ok(())
     }
 
     pub fn names(&self) -> Vec<String> {
@@ -304,6 +357,7 @@ impl SessionManager {
                     },
                     alive: sess.is_alive(),
                     updated: meta.updated,
+                    run_state: sess.run_state(),
                 })
             })
             .collect();
@@ -487,6 +541,7 @@ mod tests {
                     kind: SessionKind::Shell,
                     updated: 1,
                     resume_as_claude: false,
+                    run_state: None,
                 })
                 .unwrap();
         }
@@ -505,6 +560,37 @@ mod tests {
             mgr.session("good-a").unwrap().scrollback().windows(9).any(|w| w == b"history-a"),
             "healthy session's scrollback preloaded"
         );
+    }
+
+    #[test]
+    fn set_run_state_stores_on_claude_and_surfaces_in_session_infos() {
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        mgr.create("amber-1-1-0-c", dir.path(), SessionKind::Claude).unwrap();
+
+        mgr.set_run_state("amber-1-1-0-c", "claude-retrying").unwrap();
+        let info = mgr
+            .session_infos()
+            .unwrap()
+            .into_iter()
+            .find(|i| i.name == "amber-1-1-0-c")
+            .unwrap();
+        assert_eq!(info.run_state.as_deref(), Some("claude-retrying"));
+    }
+
+    #[test]
+    fn set_run_state_rejects_shell_unknown_and_bad_state() {
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        mgr.create("amber-1-1-0-s", "/tmp", SessionKind::Shell).unwrap();
+        mgr.create("amber-1-1-1-c", dir.path(), SessionKind::Claude).unwrap();
+
+        // Shell session: run_state does not apply.
+        assert!(mgr.set_run_state("amber-1-1-0-s", "claude").is_err());
+        // Unknown session.
+        assert!(mgr.set_run_state("nope", "claude").is_err());
+        // Invalid state string, even on a claude session.
+        assert!(mgr.set_run_state("amber-1-1-1-c", "bogus").is_err());
     }
 
     #[test]

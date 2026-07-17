@@ -360,8 +360,21 @@ fn supervisor_root() -> PathBuf {
         .unwrap_or_else(|_| default_root())
 }
 
+/// Socket the supervisor reports its run-state to. The daemon passes its actual
+/// socket via `AMBER_SOCK` when spawning `amber run`; absent that (a
+/// hand-started supervisor), fall back to the same default the daemon derives
+/// from the state root.
+fn supervisor_socket() -> PathBuf {
+    let root = supervisor_root();
+    std::env::var("AMBER_SOCK")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_socket(&root))
+}
+
 fn run_supervisor(name: &str) -> anyhow::Result<()> {
-    supervisor::run_session(&supervisor_root(), name)
+    supervisor::run_session(&supervisor_root(), name, &supervisor_socket())
 }
 
 /// `SessionStart` hook: read the hook JSON from stdin and record the
@@ -397,7 +410,7 @@ fn run_daemon(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Result<
         std::fs::create_dir_all(parent)?;
     }
 
-    let manager = Arc::new(SessionManager::new(&root)?);
+    let manager = Arc::new(SessionManager::new(&root)?.with_socket(socket_path.clone()));
     // Global claude SessionStart hook: lets a hand-started claude in a shell
     // record its resume id too (best-effort; the per-session hook covers
     // amber-launched claude).

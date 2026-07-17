@@ -2,8 +2,9 @@ import { useRef, useState, useEffect } from 'react'
 import { Pane, type SearchApi } from './Pane'
 import { paneRects, handles, nextPaneInDirection, ratioAt, leaves, type Node, type Rect, type Zone, type FocusDir } from './layout'
 import { appChord, chordLabel } from './keys'
+import { paneDot } from './store'
 
-export interface PaneMeta { kind: string; title: string; cwd: string }
+export interface PaneMeta { kind: string; title: string; cwd: string; runState?: string | undefined }
 
 // Per-pane scrollback find bar (chrome). Drives the pane's imperative SearchApi:
 // debounced incremental findNext on type, Enter/Shift+Enter step, Escape closes.
@@ -351,7 +352,7 @@ export function SplitView(props: {
       {panes.map(({ paneId, rect }) => {
         const meta = props.meta[paneId]
         const dead = props.deadCodes[paneId]
-        const kindClass = meta?.kind === 'claude' ? 'claude' : 'shell'
+        const dot = paneDot(meta?.kind ?? 'shell', meta?.runState)
         const isZoomedPane = zoomActive && props.zoomedPane === paneId
         // Zoomed pane fills the stage; the others stay MOUNTED but hidden via
         // display:none (Pane's ResizeObserver early-returns at 0×0, so this fires
@@ -375,7 +376,7 @@ export function SplitView(props: {
                 setFocused(paneId)
                 setMenu({ paneId, x: e.clientX - b.left, y: e.clientY - b.top })
               }}>
-              <span className={'kind-dot ' + kindClass} />
+              <span className={'kind-dot ' + dot.cls} role="img" aria-label={dot.label} title={dot.label} />
               <span className="pane-title">{meta?.title ?? paneId}</span>
               {isZoomedPane &&
                 <span className="zoom-badge">zoomed — {chordLabel('zoom')} to restore</span>}

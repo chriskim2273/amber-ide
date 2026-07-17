@@ -9,7 +9,7 @@ export type DaemonEvent =
   | { kind: 'Error'; msg: string }
   // UI-originated: the user dismissed the daemon-error banner.
   | { kind: 'ClearError' }
-export interface PaneModel { name: string; cwd: string; kind: string; alive: boolean; ord: number; deadCode: number | null }
+export interface PaneModel { name: string; cwd: string; kind: string; alive: boolean; ord: number; deadCode: number | null; runState?: string | undefined }
 export interface TabModel { tab: number; panes: PaneModel[] }
 export interface WorkspaceModel { ws: number; tabs: TabModel[] }
 
@@ -43,6 +43,31 @@ export function reduce(state: AppState, ev: DaemonEvent): AppState {
   }
 }
 
+export interface KindDot { cls: string; label: string }
+
+// A pane's kind-dot appearance + tooltip, from its kind and claude run_state.
+// Shared by the pane header and the tab bar so they downgrade identically:
+// amber = claude, pulsing amber = claude-retrying, gray = shell-fallback.
+export function paneDot(kind: string, runState: string | undefined): KindDot {
+  if (kind !== 'claude') return { cls: 'shell', label: 'shell' }
+  switch (runState) {
+    case 'claude-retrying': return { cls: 'claude-retrying', label: 'claude (retrying)' }
+    case 'shell-fallback': return { cls: 'shell-fallback', label: 'shell (claude exited)' }
+    default: return { cls: 'claude', label: 'claude' }
+  }
+}
+
+// The tab bar's dot, aggregated over a tab's panes: no claude → shell; any
+// retrying claude → retrying (most attention-worthy); every claude fallen back
+// to a shell → shell-fallback (gray); otherwise → claude.
+export function tabDot(panes: PaneModel[]): KindDot {
+  const claudes = panes.filter((p) => p.kind === 'claude')
+  if (claudes.length === 0) return { cls: 'shell', label: 'shell' }
+  if (claudes.some((p) => p.runState === 'claude-retrying')) return { cls: 'claude-retrying', label: 'claude (retrying)' }
+  if (claudes.every((p) => p.runState === 'shell-fallback')) return { cls: 'shell-fallback', label: 'shell (claude exited)' }
+  return { cls: 'claude', label: 'claude' }
+}
+
 export function groupSessions(state: AppState): WorkspaceModel[] {
   const wsMap = new Map<number, Map<number, PaneModel[]>>()
   for (const sess of state.sessions) {
@@ -51,6 +76,7 @@ export function groupSessions(state: AppState): WorkspaceModel[] {
     const pane: PaneModel = {
       name: sess.name, cwd: sess.cwd, kind: sess.kind, alive: sess.alive,
       ord: p.ord, deadCode: sess.name in state.dead ? state.dead[sess.name]! : null,
+      runState: sess.run_state,
     }
     if (!wsMap.has(p.ws)) wsMap.set(p.ws, new Map())
     const tabs = wsMap.get(p.ws)!
