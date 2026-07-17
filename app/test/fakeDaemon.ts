@@ -38,6 +38,13 @@ export class FakeDaemon {
     for (const c of this.clients) c.write(encode(frame))
   }
 
+  // Write arbitrary (possibly malformed) bytes straight to every client — used
+  // to exercise the decoder's error handling, which `push` (which always encodes
+  // a valid frame) cannot reach.
+  pushRaw(bytes: Uint8Array): void {
+    for (const c of this.clients) c.write(bytes)
+  }
+
   close(): Promise<void> {
     for (const c of this.clients) c.destroy()
     return new Promise((res) => this.server.close(() => res()))

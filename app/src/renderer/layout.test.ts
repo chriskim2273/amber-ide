@@ -37,6 +37,28 @@ describe('layout', () => {
     expect(reconcile(null, ['x'])).toEqual(leaf('x'))
   })
 
+  // Fix 4: close is one-way. onClose only requests the kill; the leaf must
+  // survive reconcile until the daemon confirms removal (id leaves liveIds).
+  it('close-then-confirm: leaf stays until the daemon prunes the session', () => {
+    const t = equalColumns(['a', 'b'])!
+    // Kill requested for 'b' but the daemon has NOT confirmed: it is still live.
+    expect(leaves(reconcile(t, ['a', 'b'])!).sort()).toEqual(['a', 'b'])
+    // Daemon confirms removal -> 'b' gone from liveIds -> reconcile drops it,
+    // and does NOT re-append it.
+    expect(reconcile(t, ['a'])).toEqual(leaf('a'))
+  })
+
+  // Documents the bug the fix removes: optimistically removing the leaf while
+  // the id is still live makes reconcile re-append it as a fresh right-split.
+  it('optimistic local removal races reconcile back into a right-split', () => {
+    const t = equalColumns(['a', 'b'])!
+    const optimistic = removeLeaf(t, 'b') // what onClose used to do locally
+    expect(leaves(optimistic!)).toEqual(['a'])
+    // 'b' still live (daemon unconfirmed) -> reconcile treats it as missing and
+    // re-appends it: the pane reappears, mispositioned.
+    expect(leaves(reconcile(optimistic, ['a', 'b'])!).sort()).toEqual(['a', 'b'])
+  })
+
   describe('moveLeaf', () => {
     // a | (b / c): 'a' beside a vertical split of 'b' over 'c'
     const tree = (): Node => ({

@@ -7,6 +7,8 @@ export type DaemonEvent =
   | { kind: 'SessionsChanged'; added: SessionInfo[]; removed: string[] }
   | { kind: 'Exit'; name: string; code: number }
   | { kind: 'Error'; msg: string }
+  // UI-originated: the user dismissed the daemon-error banner.
+  | { kind: 'ClearError' }
 export interface PaneModel { name: string; cwd: string; kind: string; alive: boolean; ord: number; deadCode: number | null }
 export interface TabModel { tab: number; panes: PaneModel[] }
 export interface WorkspaceModel { ws: number; tabs: TabModel[] }
@@ -36,6 +38,8 @@ export function reduce(state: AppState, ev: DaemonEvent): AppState {
       return { ...state, dead: { ...state.dead, [ev.name]: ev.code } }
     case 'Error':
       return { ...state, error: ev.msg }
+    case 'ClearError':
+      return state.error === null ? state : { ...state, error: null }
   }
 }
 

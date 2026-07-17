@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client'
 import { SplitView, type PaneMeta } from './SplitView'
 import { initialState, reduce, groupSessions, type DaemonEvent } from './store'
 import { formatName, makeId } from '../shared/names'
-import { splitLeaf, removeLeaf, setRatio, reconcile, leaves, moveLeaf, type Node } from './layout'
+import { splitLeaf, setRatio, reconcile, leaves, moveLeaf, type Node } from './layout'
 import { emptyLayout, parseLayout, serializeLayout, type LayoutFile } from '../shared/layoutFile'
 import { appChord } from './keys'
 import './theme.css'
@@ -59,6 +59,12 @@ function App(): JSX.Element {
   // Bumped on each daemon reconnect (disconnected -> connected edge) so panes
   // can re-run their attach fixups (mouse-mode reset, TUI repaint nudge).
   const [reconnectEpoch, setReconnectEpoch] = useState(0)
+  // Bumped when the main process relaunches the client utilityProcess. Distinct
+  // from reconnectEpoch: a daemon blip keeps the pane MessagePorts alive (only a
+  // repaint nudge is needed), but a client relaunch kills every port, so panes
+  // must RE-REQUEST a fresh port from the new child. Both edges look identical
+  // from the renderer's connection status, so main signals the restart explicitly.
+  const [childEpoch, setChildEpoch] = useState(0)
   const prevConnected = useRef(true)
   // Splits whose session was requested but hasn't materialized yet. Held out of
   // reconcile so it can't prune/re-append them as columns; placed with the
@@ -73,6 +79,9 @@ function App(): JSX.Element {
       const st = (d as { status?: string }).status
       if (st === 'connected') setConnected(true)
       else if (st === 'disconnected') setConnected(false)
+      // The client utilityProcess was relaunched: its old pane ports are dead,
+      // so ask every Pane to re-acquire from the new child.
+      if ((d as { childRestart?: boolean }).childRestart) setChildEpoch((e) => e + 1)
       const ev = toEvent(d); if (ev) dispatch(ev)
     })
     void window.amber.loadLayout().then((text) => {
@@ -188,9 +197,24 @@ function App(): JSX.Element {
     else if (c?.type === 'tab') { const t = tabs[c.n - 1]; if (t) setActiveTab(t.tab) }
   }
 
+  // Pane close is one-way (rule #3): `onClose` only requests the kill. Removal
+  // then flows from the daemon's SessionsChanged{removed} -> store prunes
+  // state.sessions -> liveIds drops it -> reconcile drops the leaf. An optimistic
+  // local removeLeaf would race reconcile, which still sees the not-yet-confirmed
+  // id in liveIds and re-appends it as a fresh right-split (mispositioned pane).
+  // The daemon broadcasts removal for live AND dead-not-reaped sessions
+  // (daemon.rs Kill broadcasts when the session still exists; the main.rs reap
+  // timer broadcasts too), so dead panes ("close to remove") also flow cleanly.
   return (
     <div className="app">
       {!connected && <div className="banner"><span className="dot" />daemon disconnected — reconnecting…</div>}
+      {state.error && (
+        <div className="banner error-banner" role="alert">
+          <span className="dot" />
+          <span className="banner-msg">daemon error: {state.error}</span>
+          <button className="banner-close" title="dismiss" onClick={() => dispatch({ kind: 'ClearError' })}>✕</button>
+        </div>
+      )}
       <div className="toolbar">
         <span className="label">workspace</span>
         {workspaces.map((w) => (
@@ -228,7 +252,7 @@ function App(): JSX.Element {
       </div>
       <div className="pane-stage">
         {tree
-          ? <SplitView tree={tree} deadCodes={deadCodes} meta={paneMeta} epoch={reconnectEpoch}
+          ? <SplitView tree={tree} deadCodes={deadCodes} meta={paneMeta} epoch={reconnectEpoch} portEpoch={childEpoch}
               onSetRatio={(path, r) => putTree(setRatio(tree, path, r))}
               onSplit={(paneId, dir) => {
                 const name = formatName({ ws: currentWs, tab: currentTab, ord: nextOrd, id: makeId() })
@@ -236,7 +260,7 @@ function App(): JSX.Element {
                 setPending((p) => ({ ...p, [name]: { paneId, dir } }))
               }}
               onMove={(s, t, z) => putTree(moveLeaf(tree, s, t, z))}
-              onClose={(paneId) => { window.amber.killSession(paneId); putTree(removeLeaf(tree, paneId)) }} />
+              onClose={(paneId) => window.amber.killSession(paneId)} />
           : <p className="empty-hint">No panes — press <kbd>+ Pane</kbd> to start.</p>}
       </div>
     </div>

@@ -31,6 +31,7 @@ export function SplitView(props: {
   deadCodes: Record<string, number>
   meta: Record<string, PaneMeta>
   epoch: number
+  portEpoch: number
   onSetRatio: (path: Array<'a' | 'b'>, ratio: number) => void
   onSplit: (paneId: string, dir: 'h' | 'v') => void
   onMove: (sourceId: string, targetId: string, zone: Zone) => void
@@ -138,7 +139,7 @@ export function SplitView(props: {
               </div>
             </div>
             <div className="pane-body">
-              <Pane session={paneId} epoch={props.epoch} />
+              <Pane session={paneId} epoch={props.epoch} portEpoch={props.portEpoch} />
               {dead !== undefined &&
                 <div className="dead-overlay">
                   <div className={'dead-badge ' + (dead === 0 ? 'ok' : 'err')}>

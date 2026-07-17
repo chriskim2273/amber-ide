@@ -19,7 +19,12 @@ import {
   stopDaemonFallbackCommand,
   bootUnitPath,
 } from './serviceManager'
+import { backoffDelay, nextAttempt } from './clientSupervisor'
 import clientPath from '../client/index?modulePath'
+
+// A client child that stays up this long counts as a genuine run; a shorter
+// life is treated as a crash-loop and widens the relaunch backoff.
+const CLIENT_STABLE_MS = 5000
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
@@ -303,18 +308,63 @@ async function main(): Promise<void> {
   if (process.env['ELECTRON_RENDERER_URL']) await win.loadURL(process.env['ELECTRON_RENDERER_URL'])
   else await win.loadFile(join(__dirname, '../renderer/index.html'))
 
-  const child = utilityProcess.fork(clientPath)
-  const { port1, port2 } = new MessageChannelMain()
-  child.postMessage({ kind: 'control' }, [port2])
-  // Forward daemon control events to the renderer for logging (slice 2 proof).
-  port1.on('message', (e) => win.webContents.send('daemon-event', e.data))
-  port1.start()
+  // Supervise the client utilityProcess. It owns the daemon socket (rule #4:
+  // terminal bytes never touch the main process), and the renderer's
+  // "disconnected" banner is fed ONLY by events from inside it — so if it dies
+  // the UI freezes silently. On death: tell the renderer immediately (banner),
+  // then relaunch with capped backoff, and signal the renderer to re-request its
+  // now-dead pane ports from the fresh child. The `open-pane`/`daemon-command`
+  // handlers below are registered ONCE and read the current child/port via these
+  // mutable refs, so relaunches never stack duplicate handlers.
+  let child: Electron.UtilityProcess | null = null
+  let controlPort: Electron.MessagePortMain | null = null
+  let relaunchAttempt = 0
+  let quitting = false
+  app.on('before-quit', () => { quitting = true })
 
-  ipcMain.on('daemon-command', (_e, cmd: unknown) => port1.postMessage(cmd))
+  const notifyRenderer = (data: unknown): void => {
+    if (!win.isDestroyed()) win.webContents.send('daemon-event', data)
+  }
+
+  const wireChild = (): void => {
+    const c = utilityProcess.fork(clientPath)
+    child = c
+    const spawnedAt = Date.now()
+    const { port1, port2 } = new MessageChannelMain()
+    controlPort = port1
+    c.postMessage({ kind: 'control' }, [port2])
+    // Forward daemon control events (and connection status) to the renderer.
+    port1.on('message', (e) => notifyRenderer(e.data))
+    port1.start()
+    c.on('exit', () => {
+      // This child's control channel died with it — close our end explicitly
+      // (matches the "replace dead ports" intent; nothing will read port1 again).
+      port1.close()
+      if (child === c) { child = null; controlPort = null }
+      if (quitting) return
+      // Crash is never silent: flip the renderer to disconnected right away
+      // (same shape the daemon uses), even if the window is gone on macOS.
+      notifyRenderer({ status: 'disconnected' })
+      relaunchAttempt = nextAttempt(relaunchAttempt, Date.now() - spawnedAt, CLIENT_STABLE_MS)
+      const delay = backoffDelay(relaunchAttempt, { baseMs: 100, maxMs: 2000 })
+      setTimeout(() => {
+        if (quitting || win.isDestroyed()) return
+        wireChild()
+        // The renderer's MessagePorts died with the old child. Tell it to
+        // re-request pane ports from the NEW child (handled via childEpoch).
+        notifyRenderer({ childRestart: true })
+      }, delay)
+    })
+  }
+  wireChild()
+
+  ipcMain.on('daemon-command', (_e, cmd: unknown) => controlPort?.postMessage(cmd))
 
   ipcMain.on('open-pane', (_e, session: string) => {
+    const c = child
+    if (!c || win.isDestroyed()) return
     const { port1: rPort, port2: uPort } = new MessageChannelMain()
-    child.postMessage({ kind: 'pane', session }, [uPort])
+    c.postMessage({ kind: 'pane', session }, [uPort])
     win.webContents.postMessage('pane-port', { session }, [rPort])
   })
 
