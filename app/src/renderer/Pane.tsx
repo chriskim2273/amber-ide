@@ -199,5 +199,5 @@ export const Pane = memo(function Pane(
     return () => { clearTimeout(t1); clearTimeout(t2) }
   }, [epoch])
 
-  return <div ref={hostRef} style={{ width: '100%', height: '100%', background: '#0c0c0f' }} />
+  return <div ref={hostRef} style={{ width: '100%', height: '100%', background: 'var(--bg)' }} />
 })

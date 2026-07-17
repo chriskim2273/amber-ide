@@ -1,6 +1,6 @@
 import { useRef, useState, useEffect } from 'react'
 import { Pane } from './Pane'
-import { paneRects, handles, nextPaneInDirection, type Node, type Rect, type Zone, type FocusDir } from './layout'
+import { paneRects, handles, nextPaneInDirection, ratioAt, type Node, type Rect, type Zone, type FocusDir } from './layout'
 import { appChord } from './keys'
 
 export interface PaneMeta { kind: string; title: string }
@@ -104,13 +104,30 @@ export function SplitView(props: {
 
   const startDrag = (path: Array<'a' | 'b'>, dir: 'h' | 'v') => (e: React.MouseEvent) => {
     e.preventDefault()
+    // Capture the pre-drag ratio so Escape can restore it (divider drag applies
+    // live via onSetRatio, so aborting means putting the stored ratio back).
+    const startRatio = ratioAt(props.tree, path)
     const move = (ev: MouseEvent) => {
       const ratio = dir === 'h' ? (ev.clientX - size.x) / size.w : (ev.clientY - size.y) / size.h
       props.onSetRatio(path, ratio)
     }
-    const up = () => { window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up) }
+    const cleanup = () => {
+      window.removeEventListener('mousemove', move)
+      window.removeEventListener('mouseup', up)
+      window.removeEventListener('keydown', onKey)
+    }
+    const up = () => cleanup()
+    // Escape aborts: removing `up` before the (still-held) mouse releases stops a
+    // later mouseup from committing; then restore the ratio captured at start.
+    const onKey = (ev: KeyboardEvent) => {
+      if (ev.key !== 'Escape') return
+      ev.preventDefault()
+      cleanup()
+      if (startRatio !== null) props.onSetRatio(path, startRatio)
+    }
     window.addEventListener('mousemove', move)
     window.addEventListener('mouseup', up)
+    window.addEventListener('keydown', onKey)
   }
 
   // Whole-pane drag: starts on the grip (never the terminal body — xterm needs
@@ -127,16 +144,41 @@ export function SplitView(props: {
       const hit = rects.find(({ rect }) => cx >= rect.x && cx < rect.x + rect.w && cy >= rect.y && cy < rect.y + rect.h)
       return hit ? { targetId: hit.paneId, zone: zoneAt(hit.rect, cx, cy) } : null
     }
-    setDrag({ source, hover: null })
-    const move = (ev: MouseEvent) => setDrag((d) => (d ? { ...d, hover: hitZone(ev) } : d))
+    // Move threshold: don't enter drag state (setDrag + dimming) until the cursor
+    // travels ≥4 px from mousedown, so a plain click on the grip does nothing.
+    const sx = e.clientX, sy = e.clientY
+    let started = false
+    const cleanup = () => {
+      window.removeEventListener('mousemove', move)
+      window.removeEventListener('mouseup', up)
+      window.removeEventListener('keydown', onKey)
+    }
+    const move = (ev: MouseEvent) => {
+      if (!started) {
+        if (Math.hypot(ev.clientX - sx, ev.clientY - sy) < 4) return
+        started = true
+      }
+      setDrag({ source, hover: hitZone(ev) })
+    }
     const up = (ev: MouseEvent) => {
-      window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up)
-      const h = hitZone(ev)
-      if (h) props.onMove(source, h.targetId, h.zone)
+      cleanup()
+      if (started) {
+        const h = hitZone(ev)
+        if (h) props.onMove(source, h.targetId, h.zone)
+      }
+      setDrag(null)
+    }
+    // Escape aborts an in-flight drag: drop the listeners (so the still-held
+    // mouse's release can't commit a move) and clear the drag state.
+    const onKey = (ev: KeyboardEvent) => {
+      if (ev.key !== 'Escape') return
+      ev.preventDefault()
+      cleanup()
       setDrag(null)
     }
     window.addEventListener('mousemove', move)
     window.addEventListener('mouseup', up)
+    window.addEventListener('keydown', onKey)
   }
 
   const hoverRect = drag?.hover
@@ -187,9 +229,8 @@ export function SplitView(props: {
           style={{ left: h.rect.x, top: h.rect.y, width: h.rect.w, height: h.rect.h }} />
       ))}
       {hoverRect &&
-        <div style={{ position: 'absolute', left: hoverRect.x, top: hoverRect.y, width: hoverRect.w, height: hoverRect.h,
-                      background: 'rgba(80,140,255,.35)', border: '1px solid rgba(120,170,255,.9)', boxSizing: 'border-box',
-                      pointerEvents: 'none', zIndex: 6 }} />}
+        <div className="drop-zone"
+          style={{ left: hoverRect.x, top: hoverRect.y, width: hoverRect.w, height: hoverRect.h }} />}
     </div>
   )
 }

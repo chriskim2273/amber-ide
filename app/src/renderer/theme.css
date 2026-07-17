@@ -25,6 +25,9 @@
   --danger-soft: rgba(255, 92, 92, 0.14);
   --warn: #ffb454;
   --ok: #52d273;
+  /* pane-drag drop-zone highlight */
+  --drop-zone-bg: rgba(80, 140, 255, 0.35);
+  --drop-zone-border: rgba(120, 170, 255, 0.9);
 
   --radius: 6px;
   --radius-lg: 9px;
@@ -349,6 +352,16 @@ body {
 .split-handle.v { cursor: row-resize; }
 .split-handle.v::after { left: 0; right: 0; top: 50%; height: 1px; transform: translateY(-0.5px); }
 .split-handle:hover::after { background: var(--accent); }
+
+/* pane-drag drop-zone highlight — geometry is set inline (it's data); the color
+   is theme. Purely visual, never intercepts the drag's mouse events. */
+.drop-zone {
+  position: absolute;
+  z-index: 6;
+  pointer-events: none;
+  background: var(--drop-zone-bg);
+  border: 1px solid var(--drop-zone-border);
+}
 
 /* ---------- disconnect banner ---------- */
 .banner {

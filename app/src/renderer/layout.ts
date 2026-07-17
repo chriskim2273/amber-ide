@@ -33,6 +33,16 @@ export function setRatio(n: Node, path: Array<'a' | 'b'>, ratio: number): Node {
     : { ...n, b: setRatio(n.b, rest, ratio) }
 }
 
+/** Read the ratio of the split node at `path` (mirrors `setRatio`'s walk).
+ *  Returns null if the path doesn't land on a split (invalid path / leaf).
+ *  Used to capture a divider's start ratio so Escape can restore it. Pure. */
+export function ratioAt(n: Node, path: Array<'a' | 'b'>): number | null {
+  if (n.kind !== 'split') return null
+  if (path.length === 0) return n.ratio
+  const [head, ...rest] = path
+  return ratioAt(head === 'a' ? n.a : n.b, rest)
+}
+
 export type Zone = 'left' | 'right' | 'top' | 'bottom' | 'center'
 
 /** Move `sourceId` next to (or onto) `targetId` per drop `zone`. The leaf set

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { leaves, splitLeaf, removeLeaf, setRatio, paneRects, equalColumns, reconcile, moveLeaf, nextPaneInDirection, type Node } from './layout'
+import { leaves, splitLeaf, removeLeaf, setRatio, ratioAt, paneRects, equalColumns, reconcile, moveLeaf, nextPaneInDirection, type Node } from './layout'
 
 const leaf = (id: string): Node => ({ kind: 'leaf', paneId: id })
 
@@ -18,6 +18,14 @@ describe('layout', () => {
     const t = splitLeaf(leaf('a'), 'a', 'v', 'b')
     const t2 = setRatio(t, [], 0.3) as Extract<Node, { kind: 'split' }>
     expect(t2.ratio).toBeCloseTo(0.3)
+  })
+  it('ratioAt reads the ratio at a path and returns null off a split', () => {
+    const inner: Node = { kind: 'split', dir: 'v', ratio: 0.4, a: leaf('b'), b: leaf('c') }
+    const t: Node = { kind: 'split', dir: 'h', ratio: 0.25, a: leaf('a'), b: inner }
+    expect(ratioAt(t, [])).toBeCloseTo(0.25)
+    expect(ratioAt(t, ['b'])).toBeCloseTo(0.4)
+    expect(ratioAt(t, ['a'])).toBeNull() // lands on a leaf
+    expect(ratioAt(leaf('a'), [])).toBeNull() // not a split
   })
   it('paneRects tiles a horizontal split by ratio', () => {
     const t: Node = { kind: 'split', dir: 'h', ratio: 0.25, a: leaf('a'), b: leaf('b') }
