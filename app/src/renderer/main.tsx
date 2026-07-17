@@ -395,7 +395,6 @@ function App(): JSX.Element {
   // leaves so a dead pane never persists as a dangling leaf.
   const commitLoad = useCallback((pl: { plan: LoadPlan }, liveForFix: Set<string> | null): void => {
     const plan = pl.plan
-    stageReplay(plan.scrollback)
     setLayout((l) => {
       let wsEntries = plan.workspaces
       if (liveForFix) {
@@ -567,6 +566,12 @@ function App(): JSX.Element {
       for (const t of cur?.tabs ?? []) for (const p of t.panes) { window.amber.killSession(p.name); killed.push(p.name) }
     }
     const plan = planLoad(doc, { mode, currentWs, liveWs, mintId: makeId })
+    // Stage scrollback NOW, before the panes can mount. In replace mode reconcile
+    // appends the new live sessions to the current tab as they arrive (during the
+    // pending-load window, before commitLoad runs), mounting each Pane — and a
+    // Pane's mount effect (child) runs before App's commit effect (parent), so
+    // takeReplay must find its bytes already staged or the replay is lost.
+    stageReplay(plan.scrollback)
     for (const c of plan.creates) window.amber.createSession(c.name, c.cwd, c.kind)
     setPendingLoad({ plan, createNames: plan.creates.map((c) => c.name), killed })
   }
