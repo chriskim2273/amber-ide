@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { leaves, splitLeaf, removeLeaf, setRatio, paneRects, equalColumns, reconcile, moveLeaf, type Node } from './layout'
+import { leaves, splitLeaf, removeLeaf, setRatio, paneRects, equalColumns, reconcile, moveLeaf, nextPaneInDirection, type Node } from './layout'
 
 const leaf = (id: string): Node => ({ kind: 'leaf', paneId: id })
 
@@ -125,6 +125,49 @@ describe('layout', () => {
         const r = moveLeaf(tree(), 'a', 'c', zone)
         expect(leaves(r).sort()).toEqual(['a', 'b', 'c'])
       }
+    })
+  })
+
+  describe('nextPaneInDirection', () => {
+    // 2x2 grid of unit panes; centers at (25,25) (75,25) (25,75) (75,75).
+    const grid = [
+      { paneId: 'a', rect: { x: 0, y: 0, w: 50, h: 50 } },
+      { paneId: 'b', rect: { x: 50, y: 0, w: 50, h: 50 } },
+      { paneId: 'c', rect: { x: 0, y: 50, w: 50, h: 50 } },
+      { paneId: 'd', rect: { x: 50, y: 50, w: 50, h: 50 } },
+    ]
+
+    it('moves to the adjacent pane in each direction', () => {
+      expect(nextPaneInDirection(grid, 'a', 'right')).toBe('b')
+      expect(nextPaneInDirection(grid, 'a', 'down')).toBe('c')
+      expect(nextPaneInDirection(grid, 'd', 'left')).toBe('c')
+      expect(nextPaneInDirection(grid, 'd', 'up')).toBe('b')
+    })
+
+    it('no-ops at an edge (returns null)', () => {
+      expect(nextPaneInDirection(grid, 'a', 'left')).toBeNull()
+      expect(nextPaneInDirection(grid, 'a', 'up')).toBeNull()
+      expect(nextPaneInDirection(grid, 'd', 'right')).toBeNull()
+      expect(nextPaneInDirection(grid, 'd', 'down')).toBeNull()
+    })
+
+    it('tie-breaks on secondary-axis distance (nearest on the cross axis wins)', () => {
+      // Two panes to the right of the source at equal primary distance; the one
+      // sharing the source row (smaller secondary distance) wins.
+      const rects = [
+        { paneId: 'src', rect: { x: 0, y: 0, w: 40, h: 40 } },       // center (20,20)
+        { paneId: 'same-row', rect: { x: 60, y: 0, w: 40, h: 40 } }, // center (80,20)
+        { paneId: 'far-row', rect: { x: 60, y: 100, w: 40, h: 40 } },// center (80,120)
+      ]
+      expect(nextPaneInDirection(rects, 'src', 'right')).toBe('same-row')
+    })
+
+    it('returns null for an unknown source', () => {
+      expect(nextPaneInDirection(grid, 'z', 'right')).toBeNull()
+    })
+
+    it('returns null when only the source exists', () => {
+      expect(nextPaneInDirection([grid[0]!], 'a', 'right')).toBeNull()
     })
   })
 })

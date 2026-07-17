@@ -1,6 +1,6 @@
 import { useRef, useState, useEffect } from 'react'
 import { Pane } from './Pane'
-import { paneRects, handles, type Node, type Rect, type Zone } from './layout'
+import { paneRects, handles, nextPaneInDirection, type Node, type Rect, type Zone, type FocusDir } from './layout'
 import { appChord } from './keys'
 
 export interface PaneMeta { kind: string; title: string }
@@ -45,6 +45,21 @@ export function SplitView(props: {
   const [focused, setFocused] = useState<string | null>(null)
   const focusedRef = useRef<string | null>(null)
   focusedRef.current = focused
+  // Live tree/size for the keydown handler (registered once). Directional focus
+  // needs the current geometry without re-binding the listener each render.
+  const treeRef = useRef(props.tree)
+  treeRef.current = props.tree
+  const sizeRef = useRef(size)
+  sizeRef.current = size
+  // Pane-body elements, keyed by paneId (ref callback below). Directional focus
+  // calls .focus() on the target's xterm textarea; the resulting focusin bubbles
+  // to onFocusCapture and updates `focused`.
+  const bodyEls = useRef<Map<string, HTMLElement>>(new Map())
+
+  const focusPane = (id: string): void => {
+    const el = bodyEls.current.get(id)
+    el?.querySelector('textarea')?.focus()
+  }
 
   useEffect(() => {
     const el = ref.current
@@ -54,15 +69,30 @@ export function SplitView(props: {
     return () => ro.disconnect()
   }, [])
 
-  // Keyboard: close the focused pane. New-tab / switch-tab chords are owned by
-  // App; here we only act on the one that needs the focused-pane identity.
+  // Keyboard: close the focused pane, and move focus between panes. New-tab /
+  // switch-tab / help chords are owned by App; here we act on the ones that
+  // need the focused-pane identity and pane geometry.
   const onClose = props.onClose
   useEffect(() => {
+    const dirOf: Record<string, FocusDir> = {
+      'focus-left': 'left', 'focus-right': 'right', 'focus-up': 'up', 'focus-down': 'down',
+    }
     const h = (e: KeyboardEvent): void => {
       const c = appChord(e)
-      if (c?.type === 'close' && focusedRef.current) {
+      if (!c) return
+      if (c.type === 'close' && focusedRef.current) {
         e.preventDefault()
         onClose(focusedRef.current)
+        return
+      }
+      const dir = dirOf[c.type]
+      if (dir && focusedRef.current && sizeRef.current.w > 0) {
+        const rects = paneRects(treeRef.current, sizeRef.current)
+        const target = nextPaneInDirection(rects, focusedRef.current, dir)
+        if (target) {
+          e.preventDefault()
+          focusPane(target)
+        }
       }
     }
     window.addEventListener('keydown', h)
@@ -132,13 +162,13 @@ export function SplitView(props: {
               <span className={'kind-dot ' + kindClass} />
               <span className="pane-title">{meta?.title ?? paneId}</span>
               <div className="pane-actions">
-                <button className="icon-btn" title="drag to move" onMouseDown={startPaneDrag(paneId)} style={{ cursor: 'grab' }}>⠿</button>
-                <button className="icon-btn" title="split right" onClick={() => props.onSplit(paneId, 'h')}>⬌</button>
-                <button className="icon-btn" title="split down" onClick={() => props.onSplit(paneId, 'v')}>⬍</button>
-                <button className="icon-btn danger" title="close" onClick={() => props.onClose(paneId)}>✕</button>
+                <button className="icon-btn" aria-label="move pane" title="drag to move" onMouseDown={startPaneDrag(paneId)} style={{ cursor: 'grab' }}>⠿</button>
+                <button className="icon-btn" aria-label="split right" title="split right" onClick={() => props.onSplit(paneId, 'h')}>⬌</button>
+                <button className="icon-btn" aria-label="split down" title="split down" onClick={() => props.onSplit(paneId, 'v')}>⬍</button>
+                <button className="icon-btn danger" aria-label="close pane" title="close" onClick={() => props.onClose(paneId)}>✕</button>
               </div>
             </div>
-            <div className="pane-body">
+            <div className="pane-body" ref={(el) => { if (el) bodyEls.current.set(paneId, el); else bodyEls.current.delete(paneId) }}>
               <Pane session={paneId} epoch={props.epoch} portEpoch={props.portEpoch} />
               {dead !== undefined &&
                 <div className="dead-overlay">

@@ -5,7 +5,7 @@ import { initialState, reduce, groupSessions, type DaemonEvent } from './store'
 import { formatName, makeId } from '../shared/names'
 import { splitLeaf, setRatio, reconcile, leaves, moveLeaf, type Node } from './layout'
 import { emptyLayout, parseLayout, serializeLayout, type LayoutFile } from '../shared/layoutFile'
-import { appChord, chordLabel } from './keys'
+import { appChord, chordLabel, modLabel, CHORD_TABLE } from './keys'
 import './theme.css'
 
 declare global {
@@ -51,6 +51,7 @@ function App(): JSX.Element {
   // drift to the daemon's cwd ($HOME under systemd) on restart.
   const [cwd, setCwd] = useState<string>(() => window.amber?.homeDir ?? '/')
   const [connected, setConnected] = useState(true)
+  const [showHelp, setShowHelp] = useState(false)
   // Gate ALL layout persistence until the sidecar has loaded. Otherwise a
   // Sessions event arriving before loadLayout resolves would reconcile against
   // an empty layout (equal-columns 'h' fallback) and overwrite the real,
@@ -174,6 +175,14 @@ function App(): JSX.Element {
     return () => window.removeEventListener('keydown', h)
   }, [])
 
+  // Esc closes the cheatsheet overlay (single-window app — no focus trap needed).
+  useEffect(() => {
+    if (!showHelp) return
+    const h = (e: KeyboardEvent): void => { if (e.key === 'Escape') setShowHelp(false) }
+    window.addEventListener('keydown', h)
+    return () => window.removeEventListener('keydown', h)
+  }, [showHelp])
+
   if (!bridgeReady) return <p style={{ color: 'crimson', padding: 16 }}>preload bridge missing.</p>
 
   const nextOrd = (tab?.panes.reduce((m, p) => Math.max(m, p.ord), -1) ?? -1) + 1
@@ -208,6 +217,7 @@ function App(): JSX.Element {
     else if (c?.type === 'new-pane') startPane()
     else if (c?.type === 'prev-tab') stepTab(-1)
     else if (c?.type === 'next-tab') stepTab(1)
+    else if (c?.type === 'help') setShowHelp(true)
     else if (c?.type === 'tab') { const t = tabs[c.n - 1]; if (t) setActiveTab(t.tab) }
   }
 
@@ -221,12 +231,12 @@ function App(): JSX.Element {
   // timer broadcasts too), so dead panes ("close to remove") also flow cleanly.
   return (
     <div className="app">
-      {!connected && <div className="banner"><span className="dot" />daemon disconnected — reconnecting…</div>}
+      {!connected && <div className="banner" role="status" aria-live="polite"><span className="dot" />daemon disconnected — reconnecting…</div>}
       {state.error && (
         <div className="banner error-banner" role="alert">
           <span className="dot" />
           <span className="banner-msg">daemon error: {state.error}</span>
-          <button className="banner-close" title="dismiss" onClick={() => dispatch({ kind: 'ClearError' })}>✕</button>
+          <button className="banner-close" aria-label="dismiss error" title="dismiss" onClick={() => dispatch({ kind: 'ClearError' })}>✕</button>
         </div>
       )}
       <div className="toolbar">
@@ -250,6 +260,8 @@ function App(): JSX.Element {
         </button>
         <div className="spacer" />
         <button className="btn btn-accent" onClick={startPane}>+ Pane</button>
+        <button className="icon-btn help-btn" aria-label="keyboard shortcuts"
+          title={`Keyboard shortcuts (${chordLabel('help')})`} onClick={() => setShowHelp(true)}>?</button>
       </div>
       <div className="tabbar">
         {tabs.map((t) => {
@@ -282,6 +294,30 @@ function App(): JSX.Element {
                 <span className="empty-cta-sub">{chordLabel('new-pane')}</span>
               </button>}
       </div>
+      {showHelp && (
+        <div className="help-overlay" onClick={() => setShowHelp(false)}>
+          <div className="help-card" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts"
+            onClick={(e) => e.stopPropagation()}>
+            <div className="help-head">
+              <span className="help-title">Keyboard shortcuts</span>
+              <button className="icon-btn" aria-label="close shortcuts" title="close"
+                onClick={() => setShowHelp(false)}>✕</button>
+            </div>
+            <ul className="help-list">
+              {CHORD_TABLE.map((c) => (
+                <li key={c.action}>
+                  <span className="help-desc">{c.desc}</span>
+                  <kbd className="help-keys">{chordLabel(c.action)}</kbd>
+                </li>
+              ))}
+              <li>
+                <span className="help-desc">Switch to tab 1–9</span>
+                <kbd className="help-keys">{modLabel('1–9')}</kbd>
+              </li>
+            </ul>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

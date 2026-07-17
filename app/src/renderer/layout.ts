@@ -107,6 +107,44 @@ export function equalColumns(paneIds: string[]): Node | null {
   return tree
 }
 
+export type FocusDir = 'left' | 'right' | 'up' | 'down'
+
+/** Pick the pane to focus when moving `dir` from `fromId`, given the laid-out
+ *  rect list. Considers only panes whose center lies strictly in that direction
+ *  from the source center; among those, nearest on the primary axis wins, ties
+ *  broken by the smaller secondary-axis distance. Returns null at an edge (no
+ *  pane in that direction) or when `fromId` is not in the list. Pure. */
+export function nextPaneInDirection(
+  rects: Array<{ paneId: string; rect: Rect }>,
+  fromId: string,
+  dir: FocusDir,
+): string | null {
+  const from = rects.find((r) => r.paneId === fromId)
+  if (!from) return null
+  const fx = from.rect.x + from.rect.w / 2
+  const fy = from.rect.y + from.rect.h / 2
+  let best: string | null = null
+  let bestPrimary = Infinity
+  let bestSecondary = Infinity
+  for (const r of rects) {
+    if (r.paneId === fromId) continue
+    const cx = r.rect.x + r.rect.w / 2
+    const cy = r.rect.y + r.rect.h / 2
+    let primary: number
+    let secondary: number
+    if (dir === 'left') { if (cx >= fx) continue; primary = fx - cx; secondary = Math.abs(cy - fy) }
+    else if (dir === 'right') { if (cx <= fx) continue; primary = cx - fx; secondary = Math.abs(cy - fy) }
+    else if (dir === 'up') { if (cy >= fy) continue; primary = fy - cy; secondary = Math.abs(cx - fx) }
+    else { if (cy <= fy) continue; primary = cy - fy; secondary = Math.abs(cx - fx) }
+    if (primary < bestPrimary || (primary === bestPrimary && secondary < bestSecondary)) {
+      best = r.paneId
+      bestPrimary = primary
+      bestSecondary = secondary
+    }
+  }
+  return best
+}
+
 export function reconcile(tree: Node | null, liveIds: string[]): Node | null {
   const live = new Set(liveIds)
   let pruned = tree

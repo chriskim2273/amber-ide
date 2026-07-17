@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach, vi } from 'vitest'
-import { appChord, chordLabel } from './keys'
+import { appChord, chordLabel, CHORD_TABLE, modLabel } from './keys'
 
 // keys.ts branches on navigator.platform (mac -> Cmd, else -> Ctrl+Shift). The
 // tests stub the global per case; Node ships a read-only `navigator`, so use
@@ -74,16 +74,66 @@ describe('appChord (shared edge cases)', () => {
   })
 })
 
-describe('chordLabel', () => {
+describe('appChord (directional focus)', () => {
+  it('maps Cmd+Arrow to focus chords on mac', () => {
+    setPlatform('MacIntel')
+    expect(appChord(key({ key: 'ArrowLeft', meta: true }))).toEqual({ type: 'focus-left' })
+    expect(appChord(key({ key: 'ArrowRight', meta: true }))).toEqual({ type: 'focus-right' })
+    expect(appChord(key({ key: 'ArrowUp', meta: true }))).toEqual({ type: 'focus-up' })
+    expect(appChord(key({ key: 'ArrowDown', meta: true }))).toEqual({ type: 'focus-down' })
+  })
+  it('maps Ctrl+Shift+Arrow to focus chords on linux', () => {
+    setPlatform('Linux x86_64')
+    expect(appChord(key({ key: 'ArrowLeft', ctrl: true, shift: true }))).toEqual({ type: 'focus-left' })
+    expect(appChord(key({ key: 'ArrowDown', ctrl: true, shift: true }))).toEqual({ type: 'focus-down' })
+  })
+})
+
+describe('appChord (help)', () => {
+  it('maps Cmd+/ (and Cmd+Shift+? form) on mac', () => {
+    setPlatform('MacIntel')
+    expect(appChord(key({ key: '/', meta: true }))).toEqual({ type: 'help' })
+    expect(appChord(key({ key: '?', meta: true }))).toEqual({ type: 'help' })
+  })
+  it('maps Ctrl+Shift+/ (arriving as ?) on linux', () => {
+    setPlatform('Linux x86_64')
+    expect(appChord(key({ key: '?', ctrl: true, shift: true }))).toEqual({ type: 'help' })
+    expect(appChord(key({ key: '/', ctrl: true, shift: true }))).toEqual({ type: 'help' })
+  })
+})
+
+describe('CHORD_TABLE (single source of truth)', () => {
+  it('every entry is matched by appChord under the platform modifier', () => {
+    setPlatform('MacIntel')
+    for (const entry of CHORD_TABLE) {
+      const k = entry.keys[0]!
+      expect(appChord(key({ key: k, meta: true }))).toEqual({ type: entry.action })
+    }
+  })
+  it('exposes action/label/keys for every entry', () => {
+    for (const entry of CHORD_TABLE) {
+      expect(typeof entry.action).toBe('string')
+      expect(typeof entry.label).toBe('string')
+      expect(Array.isArray(entry.keys)).toBe(true)
+      expect(entry.keys.length).toBeGreaterThan(0)
+    }
+  })
+})
+
+describe('chordLabel / modLabel', () => {
   it('renders the mac Cmd label', () => {
     setPlatform('MacIntel')
     expect(chordLabel('new-pane')).toBe('⌘Enter')
     expect(chordLabel('new-tab')).toBe('⌘T')
+    expect(chordLabel('focus-left')).toBe('⌘←')
+    expect(modLabel('1–9')).toBe('⌘1–9')
   })
   it('renders the non-mac Ctrl+Shift label', () => {
     setPlatform('Linux x86_64')
     expect(chordLabel('new-pane')).toBe('Ctrl+Shift+Enter')
     expect(chordLabel('new-tab')).toBe('Ctrl+Shift+T')
     expect(chordLabel('close')).toBe('Ctrl+Shift+W')
+    expect(chordLabel('help')).toBe('Ctrl+Shift+/')
+    expect(modLabel('1–9')).toBe('Ctrl+Shift+1–9')
   })
 })
