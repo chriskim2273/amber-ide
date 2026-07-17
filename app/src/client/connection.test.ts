@@ -54,6 +54,24 @@ describe('Connection', () => {
     expect(closed).toBe(true)
   })
 
+  it('survives a malformed frame: destroys the socket and reconnects', async () => {
+    daemon = new FakeDaemon()
+    const path = await daemon.listen()
+    let opens = 0
+    const conn = new Connection(path)
+    conn.on('open', () => { opens += 1 })
+    conn.connect()
+    await waitFor(() => (opens >= 1 ? true : null))
+    // A frame with an unknown tag makes Decoder.next() throw. Without the guard
+    // this uncaught exception would kill the utilityProcess; with it, the socket
+    // is destroyed and the existing close -> reconnect path takes over with a
+    // fresh Decoder, so `open` fires a second time.
+    daemon.pushRaw(new Uint8Array([0, 0, 0, 1, 2])) // len=1, tag=2 (unknown)
+    await waitFor(() => (opens >= 2 ? true : null), 5000)
+    expect(opens).toBeGreaterThanOrEqual(2)
+    conn.close()
+  })
+
   it('reconnects and re-opens after the daemon drops and returns', async () => {
     daemon = new FakeDaemon()
     const path = await daemon.listen()

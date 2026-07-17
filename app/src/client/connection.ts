@@ -31,14 +31,23 @@ export class Connection {
     this.socket = socket
     socket.on('connect', () => { this.attempt = 0; for (const cb of this.openCbs) cb() })
     socket.on('data', (chunk: Buffer) => {
-      this.decoder.feed(new Uint8Array(chunk))
-      for (let f = this.decoder.next(); f; f = this.decoder.next()) for (const cb of this.frameCbs) cb(f)
+      // Decoder.next() throws on an oversized frame or an unknown tag. An
+      // uncaught throw here would kill the whole utilityProcess (control + every
+      // pane share this socket). Instead, drop the poisoned connection: destroy
+      // the socket so the 'close' handler reconnects with a fresh Decoder.
+      try {
+        this.decoder.feed(new Uint8Array(chunk))
+        for (let f = this.decoder.next(); f; f = this.decoder.next()) for (const cb of this.frameCbs) cb(f)
+      } catch (err) {
+        console.warn('amber: dropping connection after frame decode error:', err)
+        socket.destroy()
+      }
     })
     socket.on('close', () => {
       for (const cb of this.closeCbs) cb()
       this.scheduleReconnect()
     })
-    socket.on('error', () => { /* 'close' follows */ })
+    socket.on('error', (err) => { console.warn('amber: socket error:', err) /* 'close' follows */ })
   }
 
   private scheduleReconnect(): void {
