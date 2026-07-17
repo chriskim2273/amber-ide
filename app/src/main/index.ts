@@ -383,6 +383,32 @@ async function main(): Promise<void> {
     await writeFile(tmp, text)
     await rename(tmp, p)
   })
+
+  // Portable workspace file: native save dialog + atomic write (layout-save
+  // precedent). Returns true on write, false on cancel.
+  ipcMain.handle('workspace-save-file', async (_e, json: string, suggestedName: string) => {
+    const r = await dialog.showSaveDialog(win, {
+      defaultPath: suggestedName,
+      filters: [{ name: 'amber workspace', extensions: ['amberws'] }],
+    })
+    if (r.canceled || !r.filePath) return false
+    // showSaveDialog does not reliably append the filter extension on Linux —
+    // add it so the open filter finds the file later.
+    const p = r.filePath.endsWith('.amberws') ? r.filePath : r.filePath + '.amberws'
+    const tmp = p + '.tmp'
+    await writeFile(tmp, json)
+    await rename(tmp, p)
+    return true
+  })
+  // Native open dialog; returns the file text, or null on cancel.
+  ipcMain.handle('workspace-open-file', async () => {
+    const r = await dialog.showOpenDialog(win, {
+      properties: ['openFile'],
+      filters: [{ name: 'amber workspace', extensions: ['amberws'] }, { name: 'All files', extensions: ['*'] }],
+    })
+    if (r.canceled || r.filePaths.length === 0 || !r.filePaths[0]) return null
+    return readFile(r.filePaths[0], 'utf8')
+  })
 }
 
 // Single-instance lock: a second launch (or a dev run whose predecessor didn't

@@ -28,10 +28,13 @@ process.parentPort.on('message', (event) => {
       const cmd = e.data as
         | { cmd: 'create'; name: string; cwd: string; sessionKind: string }
         | { cmd: 'kill'; name: string }
+        | { cmd: 'dumpBacklog'; name: string }
       if (cmd.cmd === 'create') {
         conn.send({ type: 'control', msg: { kind: 'Create', name: cmd.name, cwd: cmd.cwd, sessionKind: cmd.sessionKind } })
       } else if (cmd.cmd === 'kill') {
         conn.send({ type: 'control', msg: { kind: 'Kill', name: cmd.name } })
+      } else if (cmd.cmd === 'dumpBacklog') {
+        conn.send({ type: 'control', msg: { kind: 'DumpBacklog', name: cmd.name } })
       }
     })
     port.start()

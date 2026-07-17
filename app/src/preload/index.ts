@@ -16,12 +16,20 @@ contextBridge.exposeInMainWorld('amber', {
   createSession: (name: string, cwd: string, sessionKind: string) =>
     ipcRenderer.send('daemon-command', { cmd: 'create', name, cwd, sessionKind }),
   killSession: (name: string) => ipcRenderer.send('daemon-command', { cmd: 'kill', name }),
+  // Request the daemon dump a session's scrollback ring; the reply arrives as a
+  // `Backlog` control frame via onDaemonEvent (correlated by name renderer-side).
+  dumpBacklog: (name: string) => ipcRenderer.send('daemon-command', { cmd: 'dumpBacklog', name }),
   // Absolute home dir (default cwd for new panes) + a native folder picker so
   // panes carry a real absolute cwd, not a relative '.' that drifts on restore.
   homeDir: homeArg || '/',
   pickFolder: (): Promise<string | null> => ipcRenderer.invoke('pick-folder'),
   loadLayout: (): Promise<string | null> => ipcRenderer.invoke('layout-load'),
   saveLayout: (text: string): Promise<void> => ipcRenderer.invoke('layout-save', text),
+  // Portable `.amberws` workspace files via native OS dialogs. Save returns true
+  // on write, false on cancel; open returns the file text or null on cancel.
+  saveWorkspaceFile: (json: string, suggestedName: string): Promise<boolean> =>
+    ipcRenderer.invoke('workspace-save-file', json, suggestedName),
+  openWorkspaceFile: (): Promise<string | null> => ipcRenderer.invoke('workspace-open-file'),
 })
 
 // A transferred MessagePort cannot cross contextBridge; re-dispatch the live

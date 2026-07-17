@@ -9,6 +9,8 @@ import {
   treeFromPlaceholders,
   assembleSave,
   buildLoadPlan,
+  nextFreeWs,
+  planLoad,
   type WorkspaceDoc,
   type SaveWorkspace,
 } from './workspaceFile'
@@ -295,5 +297,50 @@ describe('buildLoadPlan', () => {
     expect(plan.workspaces['1']!.tabs['1']!.tree).toBeNull()
     // Panes still created so the renderer can reconstruct the grouping.
     expect(plan.creates.map((c) => c.name)).toEqual(['amber-1-1-0-id0', 'amber-1-1-1-id1'])
+  })
+})
+
+describe('nextFreeWs', () => {
+  it('is max+1, never reuses gaps', () => {
+    expect(nextFreeWs([1, 3, 4])).toBe(5) // gap at 2 not reused
+    expect(nextFreeWs([2])).toBe(3)
+    expect(nextFreeWs([])).toBe(1)
+  })
+})
+
+// One-pane-per-workspace doc, N workspaces, for targeting assertions.
+function multiWsDoc(n: number): WorkspaceDoc {
+  return {
+    version: 1, scope: 'all',
+    workspaces: Array.from({ length: n }, (_, i) => ({
+      tabs: [{ tab: 1, tree: null, panes: [{ id: 'p0', kind: 'shell', cwd: `/w${i}`, ord: 0, scrollback: '' }] }],
+    })),
+  }
+}
+
+describe('planLoad', () => {
+  it('new mode: every file workspace lands above max live ws, in doc order', () => {
+    const plan = planLoad(multiWsDoc(2), { mode: 'new', currentWs: 1, liveWs: [1, 3, 4], mintId: mkMint() })
+    expect(plan.targetWorkspaces).toEqual([5, 6]) // max(4)+1, +2
+  })
+
+  it('replace mode single-ws file: reuses the current workspace number', () => {
+    const plan = planLoad(multiWsDoc(1), { mode: 'replace', currentWs: 3, liveWs: [1, 3, 4], mintId: mkMint() })
+    expect(plan.targetWorkspaces).toEqual([3])
+  })
+
+  it('replace mode multi-ws file: first replaces current, rest are new above max', () => {
+    // DECIDED policy: first→currentWs, remaining→genuinely free numbers (max+1…).
+    const plan = planLoad(multiWsDoc(3), { mode: 'replace', currentWs: 3, liveWs: [1, 3, 4], mintId: mkMint() })
+    expect(plan.targetWorkspaces).toEqual([3, 5, 6])
+    // Every created pane's name encodes its target ws — no collision with live.
+    const wsOf = (name: string): number => Number(name.split('-')[1])
+    expect(plan.creates.map((c) => wsOf(c.name))).toEqual([3, 5, 6])
+  })
+
+  it('empty file → empty plan (no creates)', () => {
+    const plan = planLoad(multiWsDoc(0), { mode: 'replace', currentWs: 2, liveWs: [1, 2], mintId: mkMint() })
+    expect(plan.creates).toEqual([])
+    expect(plan.targetWorkspaces).toEqual([])
   })
 })

@@ -266,3 +266,35 @@ export function buildLoadPlan(doc: WorkspaceDoc, opts: LoadOptions): LoadPlan {
 
   return { creates, workspaces, frozen, scrollback, targetWorkspaces }
 }
+
+// Lowest free workspace number: one above the highest live number (gaps are NOT
+// reused — always max+1, matching the toolbar "+ ws" button). Empty → 1.
+export function nextFreeWs(liveWs: number[]): number {
+  return (liveWs.length ? Math.max(...liveWs) : 0) + 1
+}
+
+// Policy layer over buildLoadPlan (keeps that pure primitive untouched):
+// - new: every file workspace lands at a free number above max live ws.
+// - replace: the CURRENT workspace is replaced with the file's FIRST workspace;
+//   any remaining file workspaces load as NEW workspaces at free numbers above
+//   max live ws. Free allocation always scans ALL live workspaces (nextFreeWs).
+export function planLoad(
+  doc: WorkspaceDoc,
+  opts: { mode: 'new' | 'replace'; currentWs: number; liveWs: number[]; mintId: () => string },
+): LoadPlan {
+  const free = nextFreeWs(opts.liveWs)
+  if (opts.mode === 'new' || doc.workspaces.length === 0) {
+    return buildLoadPlan(doc, { mode: 'new', nextWs: free, mintId: opts.mintId })
+  }
+  const [first, ...rest] = doc.workspaces
+  const firstPlan = buildLoadPlan({ ...doc, workspaces: [first!] }, { mode: 'replace', ws: opts.currentWs, mintId: opts.mintId })
+  if (rest.length === 0) return firstPlan
+  const restPlan = buildLoadPlan({ ...doc, workspaces: rest }, { mode: 'new', nextWs: free, mintId: opts.mintId })
+  return {
+    creates: [...firstPlan.creates, ...restPlan.creates],
+    workspaces: { ...firstPlan.workspaces, ...restPlan.workspaces },
+    frozen: { ...firstPlan.frozen, ...restPlan.frozen },
+    scrollback: { ...firstPlan.scrollback, ...restPlan.scrollback },
+    targetWorkspaces: [...firstPlan.targetWorkspaces, ...restPlan.targetWorkspaces],
+  }
+}
