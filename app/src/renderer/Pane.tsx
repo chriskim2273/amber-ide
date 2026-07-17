@@ -5,6 +5,7 @@ import { WebglAddon } from '@xterm/addon-webgl'
 import { SearchAddon } from '@xterm/addon-search'
 import '@xterm/xterm/css/xterm.css'
 import { appChord } from './keys'
+import { takeReplay } from './replay'
 
 // Imperative scrollback-search handle handed to the chrome (the find bar in
 // SplitView) via `onSearchReady`. Search execution stays outside React — the
@@ -138,6 +139,14 @@ export const Pane = memo(function Pane(
     fit.fit()
     termRef.current = term
     fitRef.current = fit
+
+    // Workspace-load scrollback replay (single-shot). A freshly created session
+    // has empty daemon backlog, so writing the saved history here — before the
+    // live port is wired — yields display-correct ordering (history, then live
+    // output). MOUSE_RESET clears any mouse-tracking mode the replayed bytes
+    // re-enabled (same hazard as an Attach backlog).
+    const replay = takeReplay(session)
+    if (replay) { term.write(replay); term.write(MOUSE_RESET) }
 
     let port: MessagePort | null = null
     let wired = false

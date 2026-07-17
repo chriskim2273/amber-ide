@@ -740,3 +740,36 @@ body {
   padding: 2px 7px;
   white-space: nowrap;
 }
+
+/* ---------- workspace save/load ---------- */
+/* Toolbar 💾/📂 buttons: emoji glyphs, slightly larger tap target than the
+   borderless pane icon-btns; no border so they sit quietly by the ws pills. */
+.ws-io { font-size: 14px; }
+
+/* Info notice banner (parse errors / dump-timeout): the banner shell, recolored
+   from danger to a neutral accent so it never reads as a daemon error. */
+.notice-banner {
+  background: var(--accent-soft);
+  color: var(--text);
+  border-bottom: 1px solid var(--border-strong);
+}
+.notice-banner .dot { background: var(--accent); animation: none; }
+.notice-banner .banner-msg { flex: 1; min-width: 0; }
+
+/* Save/load mini-dialogs reuse .help-overlay/.help-card; this is just the body. */
+.dialog-card { width: min(380px, calc(100vw - 2 * var(--sp-4))); }
+.dialog-body { padding: var(--sp-3) var(--sp-4) var(--sp-4); }
+.dialog-text { margin: 0 0 var(--sp-3); color: var(--text-dim); font-size: 12.5px; }
+.dialog-text code {
+  font-family: var(--font-mono); font-size: 11.5px;
+  background: var(--surface-3); border-radius: 4px; padding: 1px 5px; color: var(--text);
+}
+.dialog-actions { display: flex; gap: var(--sp-2); }
+.dialog-actions.column { flex-direction: column; }
+.dialog-actions .btn { flex: 1; justify-content: center; text-align: center; }
+/* Destructive dialog action (replace = closes panes): danger-tinted outline. */
+.danger-btn {
+  color: var(--danger);
+  border-color: rgba(255, 92, 92, 0.4);
+}
+.danger-btn:hover { background: var(--danger-soft); border-color: var(--danger); }

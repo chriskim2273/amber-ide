@@ -4,7 +4,13 @@ import { SplitView, type PaneMeta } from './SplitView'
 import { initialState, reduce, groupSessions, tabDot, hasActivity, type DaemonEvent } from './store'
 import { formatName, makeId } from '../shared/names'
 import { splitLeaf, setRatio, reconcile, leaves, moveLeaf, type Node } from './layout'
-import { emptyLayout, parseLayout, serializeLayout, orderTabs, moveTab, type LayoutFile } from '../shared/layoutFile'
+import { emptyLayout, parseLayout, serializeLayout, orderTabs, moveTab, type LayoutFile, type TabLayout } from '../shared/layoutFile'
+import {
+  parseWorkspaceFile, serializeWorkspaceFile, assembleSave, planLoad,
+  type WorkspaceDoc, type SaveWorkspace, type LoadPlan,
+} from '../shared/workspaceFile'
+import { collectDumps } from './dumps'
+import { stageReplay } from './replay'
 import { appChord, chordLabel, modLabel, CHORD_TABLE } from './keys'
 import './theme.css'
 
@@ -16,8 +22,11 @@ declare global {
       openPane: (session: string) => void
       createSession: (name: string, cwd: string, sessionKind: string) => void
       killSession: (name: string) => void
+      dumpBacklog: (name: string) => void
       loadLayout: () => Promise<string | null>
       saveLayout: (text: string) => Promise<void>
+      saveWorkspaceFile: (json: string, suggestedName: string) => Promise<boolean>
+      openWorkspaceFile: () => Promise<string | null>
       homeDir: string
       pickFolder: () => Promise<string | null>
     }
@@ -94,6 +103,23 @@ function App(): JSX.Element {
   const [cwd, setCwd] = useState<string>(() => window.amber?.homeDir ?? '/')
   const [connected, setConnected] = useState(true)
   const [showHelp, setShowHelp] = useState(false)
+  // Workspace save/load UI. `saveScopeOpen` shows the one-vs-all scope dialog;
+  // `loadDoc` (a parsed file) shows the new-vs-replace mode dialog; `notice` is a
+  // local, dismissible info banner (parse errors, dump-timeout stragglers) kept
+  // SEPARATE from the daemon-error banner (state.error) so neither hijacks the other.
+  const [saveScopeOpen, setSaveScopeOpen] = useState(false)
+  const [loadDoc, setLoadDoc] = useState<WorkspaceDoc | null>(null)
+  const [notice, setNotice] = useState<string | null>(null)
+  // A load in flight: created sessions not yet all confirmed by the daemon. The
+  // sidecar (trees/labels/frozen) + scrollback replay commit ONCE the daemon
+  // confirms every created session AND (replace mode) the killed old panes are
+  // gone — the load equivalent of the split `pending` placement pattern.
+  const [pendingLoad, setPendingLoad] = useState<
+    { plan: LoadPlan; createNames: string[]; killed: string[] } | null>(null)
+  // Backlog-reply resolvers, keyed by session name (correlates DumpBacklog
+  // requests to their async `Backlog` frames). A ref — mutating it must never
+  // re-render. Consumed + cleared by collectDumps via register/unregister.
+  const dumpResolvers = useRef<Map<string, (d: Uint8Array) => void>>(new Map())
   // Live OSC-2 pane titles, keyed by session name. Grows with distinct sessions
   // seen (bounded, harmless — paneMeta only reads titles for live panes).
   const [titles, setTitles] = useState<Record<string, string>>({})
@@ -164,6 +190,14 @@ function App(): JSX.Element {
   useEffect(() => {
     if (!bridgeReady) return
     window.amber.onDaemonEvent((d) => {
+      // Backlog replies are routed to the pending dump resolver by name (not
+      // through the store reducer) — a save is waiting on collectDumps for them.
+      const bf = (d as { frame?: { type?: string; msg?: { kind?: string; name?: string; data?: Uint8Array } } }).frame
+      if (bf?.type === 'control' && bf.msg?.kind === 'Backlog' && typeof bf.msg.name === 'string') {
+        const cb = dumpResolvers.current.get(bf.msg.name)
+        if (cb) { dumpResolvers.current.delete(bf.msg.name); cb(bf.msg.data ?? new Uint8Array()) }
+        return
+      }
       const st = (d as { status?: string }).status
       if (st === 'connected') setConnected(true)
       else if (st === 'disconnected') setConnected(false)
@@ -353,6 +387,57 @@ function App(): JSX.Element {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pending, liveKey, storedTree, putTree, loaded])
 
+  // Commit a confirmed (or force-committed) load: stage scrollback for replay,
+  // merge the plan's sidecar (trees/labels/tabOrder/frozen) into the layout, and
+  // switch to the first loaded workspace. `liveForFix` is null on the clean path
+  // (every session confirmed, tree leaves already all live) and a live-set on the
+  // timeout backstop, where each non-null tree is reconciled down to its live
+  // leaves so a dead pane never persists as a dangling leaf.
+  const commitLoad = useCallback((pl: { plan: LoadPlan }, liveForFix: Set<string> | null): void => {
+    const plan = pl.plan
+    stageReplay(plan.scrollback)
+    setLayout((l) => {
+      let wsEntries = plan.workspaces
+      if (liveForFix) {
+        wsEntries = {}
+        for (const [wsKey, wl] of Object.entries(plan.workspaces)) {
+          const tabs: Record<string, TabLayout> = {}
+          for (const [tabKey, tl] of Object.entries(wl.tabs)) {
+            tabs[tabKey] = tl.tree
+              ? { ...tl, tree: reconcile(tl.tree, leaves(tl.tree).filter((n) => liveForFix.has(n))) }
+              : tl
+          }
+          wsEntries[wsKey] = { ...wl, tabs }
+        }
+      }
+      const next: LayoutFile = { ...l, workspaces: { ...l.workspaces, ...wsEntries } }
+      if (Object.keys(plan.frozen).length) next.frozen = { ...(l.frozen ?? {}), ...plan.frozen }
+      return next
+    })
+    const first = plan.targetWorkspaces[0]
+    if (first !== undefined) {
+      setActiveWs(first)
+      const at = plan.workspaces[String(first)]?.activeTab
+      if (at !== undefined) setActiveTab(at)
+    }
+    setPendingLoad(null)
+  }, [])
+
+  // Watch for a load's sessions to materialize. Commit when EVERY created session
+  // is live AND (replace) every killed old pane is gone — otherwise reconcile
+  // would append a stale dying leaf to the just-committed tree (self-heals on
+  // reap, but the gate avoids the transient wrong persist). Backstop: force-commit
+  // after a grace if the daemon never confirms (e.g. died mid-load).
+  useEffect(() => {
+    if (!pendingLoad) return
+    const live = new Set(state.sessions.map((s) => s.name))
+    const created = pendingLoad.createNames.every((n) => live.has(n))
+    const oldGone = pendingLoad.killed.every((n) => !live.has(n))
+    if (created && oldGone) { commitLoad(pendingLoad, null); return }
+    const t = setTimeout(() => commitLoad(pendingLoad, new Set(state.sessions.map((s) => s.name))), 8000)
+    return () => clearTimeout(t)
+  }, [pendingLoad, state.sessions, commitLoad])
+
   // App-owned keyboard chords (new tab / new pane / switch tab). The 'close'
   // chord is handled in SplitView (it needs the focused-pane identity). This
   // effect registers once; the latest action closures live in a ref, refreshed
@@ -377,6 +462,14 @@ function App(): JSX.Element {
     window.addEventListener('keydown', h)
     return () => window.removeEventListener('keydown', h)
   }, [showHelp])
+
+  // Esc dismisses the save-scope / load-mode dialogs.
+  useEffect(() => {
+    if (!saveScopeOpen && !loadDoc) return
+    const h = (e: KeyboardEvent): void => { if (e.key === 'Escape') { setSaveScopeOpen(false); setLoadDoc(null) } }
+    window.addEventListener('keydown', h)
+    return () => window.removeEventListener('keydown', h)
+  }, [saveScopeOpen, loadDoc])
 
   if (!bridgeReady) return <p style={{ color: 'crimson', padding: 16 }}>preload bridge missing.</p>
 
@@ -419,6 +512,65 @@ function App(): JSX.Element {
   const resetFont = (): void => setLayout((l) =>
     clampFont(l.fontSize ?? DEFAULT_FONT_SIZE) === DEFAULT_FONT_SIZE ? l : { ...l, fontSize: DEFAULT_FONT_SIZE })
 
+  // Save: dump each target pane's scrollback (name-correlated, per-pane timeout),
+  // assemble the file from live grouping + sidecar + dumps, write via native
+  // dialog. Cancel anywhere → clean no-op. Uses layoutRef for the freshest sidecar.
+  const doSave = async (scope: 'one' | 'all'): Promise<void> => {
+    setSaveScopeOpen(false)
+    const wsList = scope === 'one' ? workspaces.filter((w) => w.ws === currentWs) : workspaces
+    const names = wsList.flatMap((w) => w.tabs.flatMap((t) => t.panes.map((p) => p.name)))
+    const { dumps, stragglers } = await collectDumps(
+      names,
+      (n) => window.amber.dumpBacklog(n),
+      (n, cb) => { dumpResolvers.current.set(n, cb) },
+      (n) => { dumpResolvers.current.delete(n) },
+    )
+    const live: SaveWorkspace[] = wsList.map((w) => ({
+      ws: w.ws,
+      tabs: w.tabs.map((t) => ({ tab: t.tab, panes: t.panes.map((p) => ({ name: p.name, cwd: p.cwd, kind: p.kind, ord: p.ord })) })),
+    }))
+    const doc = assembleSave(scope, live, layoutRef.current, dumps)
+    const base = scope === 'one'
+      ? (layout.workspaces[String(currentWs)]?.label ?? `workspace-${currentWs}`)
+      : 'workspaces'
+    const ok = await window.amber.saveWorkspaceFile(serializeWorkspaceFile(doc), `${base}.amberws`)
+    if (ok && stragglers.length > 0) {
+      setNotice(`Saved. Scrollback capture timed out for ${stragglers.length} pane(s) — saved with empty history for those.`)
+    }
+  }
+
+  // Load step 1: pick + read + parse the file. Parse errors surface in the notice
+  // banner; a valid file opens the new-vs-replace mode dialog.
+  const doLoad = async (): Promise<void> => {
+    const text = await window.amber.openWorkspaceFile()
+    if (text === null) return
+    let doc: WorkspaceDoc
+    try { doc = parseWorkspaceFile(text) } catch (e) {
+      setNotice(`Could not load workspace — ${(e as Error).message}.`)
+      return
+    }
+    if (doc.workspaces.length === 0) { setNotice('That workspace file has no workspaces.'); return }
+    setLoadDoc(doc)
+  }
+
+  // Load step 2: chosen mode. Replace kills the current workspace's panes first
+  // (one-way — removal lands via daemon events); createSession per planned pane;
+  // the pendingLoad effect commits the sidecar + replay once the daemon confirms.
+  const applyLoad = (mode: 'new' | 'replace'): void => {
+    const doc = loadDoc
+    setLoadDoc(null)
+    if (!doc) return
+    const liveWs = workspaces.map((w) => w.ws)
+    const killed: string[] = []
+    if (mode === 'replace') {
+      const cur = workspaces.find((w) => w.ws === currentWs)
+      for (const t of cur?.tabs ?? []) for (const p of t.panes) { window.amber.killSession(p.name); killed.push(p.name) }
+    }
+    const plan = planLoad(doc, { mode, currentWs, liveWs, mintId: makeId })
+    for (const c of plan.creates) window.amber.createSession(c.name, c.cwd, c.kind)
+    setPendingLoad({ plan, createNames: plan.creates.map((c) => c.name), killed })
+  }
+
   // Refresh the keyboard-chord dispatcher with this render's live closures.
   chordRef.current = (c) => {
     if (c?.type === 'new-tab') openTab()
@@ -450,6 +602,13 @@ function App(): JSX.Element {
           <button className="banner-close" aria-label="dismiss error" title="dismiss" onClick={() => dispatch({ kind: 'ClearError' })}>✕</button>
         </div>
       )}
+      {notice && (
+        <div className="banner notice-banner" role="status" aria-live="polite">
+          <span className="dot" />
+          <span className="banner-msg">{notice}</span>
+          <button className="banner-close" aria-label="dismiss notice" title="dismiss" onClick={() => setNotice(null)}>✕</button>
+        </div>
+      )}
       <div className="toolbar">
         <span className="label">workspace</span>
         {workspaces.map((w) => {
@@ -468,6 +627,10 @@ function App(): JSX.Element {
         })}
         <button className="btn btn-ghost"
           onClick={() => { setActiveWs(nextWs); window.amber.createSession(formatName({ ws: nextWs, tab: 1, ord: 0, id: makeId() }), cwd, kind); setActiveTab(1) }}>+ ws</button>
+        <button className="icon-btn ws-io" aria-label="save workspace to file" title="Save workspace…"
+          onClick={() => setSaveScopeOpen(true)}>💾</button>
+        <button className="icon-btn ws-io" aria-label="load workspace from file" title="Load workspace…"
+          onClick={() => void doLoad()}>📂</button>
         <div className="divider" />
         <span className="label">new</span>
         <select className="select" value={kind} onChange={(e) => setKind(e.target.value as 'shell' | 'claude')}>
@@ -550,6 +713,50 @@ function App(): JSX.Element {
                 <span className="empty-cta-sub">{chordLabel('new-pane')}</span>
               </button>}
       </div>
+      {saveScopeOpen && (
+        <div className="help-overlay" onClick={() => setSaveScopeOpen(false)}>
+          <div className="help-card dialog-card" role="dialog" aria-modal="true" aria-label="Save workspace"
+            onClick={(e) => e.stopPropagation()}>
+            <div className="help-head">
+              <span className="help-title">Save workspace</span>
+              <button className="icon-btn" aria-label="close" title="close" onClick={() => setSaveScopeOpen(false)}>✕</button>
+            </div>
+            <div className="dialog-body">
+              <p className="dialog-text">Save structure and scrollback to a portable <code>.amberws</code> file.</p>
+              <div className="dialog-actions">
+                <button className="btn btn-accent" onClick={() => void doSave('one')}>This workspace</button>
+                <button className="btn" onClick={() => void doSave('all')}>All workspaces</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+      {loadDoc && (() => {
+        const cur = workspaces.find((w) => w.ws === currentWs)
+        const paneCount = cur?.tabs.reduce((m, t) => m + t.panes.length, 0) ?? 0
+        const wsCount = loadDoc.workspaces.length
+        return (
+          <div className="help-overlay" onClick={() => setLoadDoc(null)}>
+            <div className="help-card dialog-card" role="dialog" aria-modal="true" aria-label="Load workspace"
+              onClick={(e) => e.stopPropagation()}>
+              <div className="help-head">
+                <span className="help-title">Load workspace{wsCount > 1 ? ` (${wsCount} workspaces)` : ''}</span>
+                <button className="icon-btn" aria-label="close" title="close" onClick={() => setLoadDoc(null)}>✕</button>
+              </div>
+              <div className="dialog-body">
+                <div className="dialog-actions column">
+                  <button className="btn btn-accent" onClick={() => applyLoad('new')}>
+                    Load as new workspace{wsCount > 1 ? 's' : ''}
+                  </button>
+                  <button className="btn danger-btn" onClick={() => applyLoad('replace')}>
+                    Replace current workspace{paneCount > 0 ? ` — closes ${paneCount} pane${paneCount === 1 ? '' : 's'}` : ''}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )
+      })()}
       {showHelp && (
         <div className="help-overlay" onClick={() => setShowHelp(false)}>
           <div className="help-card" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts"
