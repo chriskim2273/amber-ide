@@ -2,6 +2,7 @@ import { useCallback, useEffect, useReducer, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { SplitView, type PaneMeta } from './SplitView'
 import { initialState, reduce, groupSessions, tabDot, hasActivity, type DaemonEvent } from './store'
+import { deriveTab, shortCwd } from './tabView'
 import { formatName, makeId } from '../shared/names'
 import { splitLeaf, setRatio, reconcile, leaves, moveLeaf, type Node } from './layout'
 import { emptyLayout, parseLayout, serializeLayout, orderTabs, moveTab, type LayoutFile, type TabLayout } from '../shared/layoutFile'
@@ -47,9 +48,6 @@ function toEvent(d: unknown): DaemonEvent | null {
   return null
 }
 
-function shortCwd(cwd: string, home: string): string {
-  return home && cwd.startsWith(home) ? '~' + cwd.slice(home.length) : cwd
-}
 
 const DEFAULT_FONT_SIZE = 13
 // Stable empty frozen map so `layout.frozen ?? EMPTY_FROZEN` doesn't mint a new
@@ -246,31 +244,15 @@ function App(): JSX.Element {
   const ws = workspaces.find((w) => w.ws === activeWs) ?? workspaces[0]
   const tabs = ws?.tabs ?? []
   const tab = tabs.find((t) => t.tab === activeTab) ?? tabs[0]
-  const deadCodes: Record<string, number> = {}
-  const paneMeta: Record<string, PaneMeta> = {}
   const home = window.amber?.homeDir ?? ''
-  tab?.panes.forEach((p) => {
-    if (p.deadCode !== null) deadCodes[p.name] = p.deadCode
-    // Prefer a live OSC title (e.g. shell/program-set) over the cwd; else cwd.
-    // Whitespace-only titles (some prompts emit blank OSC 2) fall back to cwd.
-    const osc = titles[p.name]
-    const lead = osc && osc.trim().length > 0 ? osc : shortCwd(p.cwd, home)
-    // A claude pane that fell back to a shell (supervisor gave up / user quit)
-    // is labelled as such instead of "claude"; otherwise the suffix is the kind.
-    const suffix = p.runState === 'shell-fallback' ? 'shell (claude exited)' : p.kind
-    // Raw absolute cwd (not shortCwd) so the context-menu "copy cwd" yields a
-    // path that actually resolves when pasted.
-    paneMeta[p.name] = { kind: p.kind, title: `${lead} · ${suffix}`, cwd: p.cwd, runState: p.runState }
-  })
-
-  // Reconcile the persisted tree for this tab with its live pane set. Pending
-  // split targets are excluded until placed, so reconcile won't append them.
-  const allLive = tab?.panes.map((p) => p.name) ?? []
-  const liveIds = allLive.filter((n) => !(n in pending))
   const wsKey = String(ws?.ws ?? activeWs)
   const tabKey = String(tab?.tab ?? activeTab)
   const storedTree = layout.workspaces[wsKey]?.tabs[tabKey]?.tree ?? null
-  const tree = reconcile(storedTree, liveIds)
+  // Active-tab render inputs, via the shared deriveTab (same path the keep-alive
+  // layer map uses below — no drift). allLive is the UNFILTERED name set (keeps
+  // the pending-split placement effect's `liveKey`).
+  const allLive = tab?.panes.map((p) => p.name) ?? []
+  const { tree, paneMeta, deadCodes, liveIds } = deriveTab(tab?.panes ?? [], storedTree, pending, titles, home)
 
   // Zoom (transient, per tab). Tab numbering restarts per workspace (every ws
   // has a tab 1), so the zoom map and the structural-clear ref are keyed by the
@@ -461,8 +443,9 @@ function App(): JSX.Element {
   useEffect(() => {
     const h = (e: KeyboardEvent): void => {
       const c = appChord(e)
-      // `close`, `zoom`, and `freeze` all need the focused-pane identity — SplitView owns them.
-      if (!c || c.type === 'close' || c.type === 'zoom' || c.type === 'freeze') return
+      // `close`, `zoom`, `freeze`, and `insert-skip-perms` all need the focused-pane
+      // identity — SplitView owns them (and gates them on its tab being active).
+      if (!c || c.type === 'close' || c.type === 'zoom' || c.type === 'freeze' || c.type === 'insert-skip-perms') return
       e.preventDefault()
       chordRef.current(c)
     }
@@ -710,29 +693,62 @@ function App(): JSX.Element {
         <button className="btn btn-ghost tab-add" onClick={openTab}>+ Tab</button>
       </div>
       <div className="pane-stage">
+        {/* Keep-alive: render ONE SplitView per tab in the workspace, hiding the
+            inactive ones with display:none instead of unmounting them. Switching
+            tabs no longer disposes/rebuilds terminals or replays backlog — the
+            first view of a tab still mounts+replays once; every switch after is
+            instant. Keyed by ws:tab so the active toggle never remounts a layer.
+            Interactive handlers close over the ACTIVE tree; background layers are
+            display:none (pointer-inert) and SplitView gates chords on `active`,
+            so those handlers are unreachable there. Scope: within the active
+            workspace only — switching WORKSPACE still remounts (bigger footprint,
+            not the reported gesture). */}
         {!(loaded && sawSessions)
           ? <div className="stage-loading">connecting to daemon…</div>
-          : tree
-            ? <SplitView tree={tree} deadCodes={deadCodes} meta={paneMeta} epoch={reconnectEpoch} portEpoch={childEpoch}
-                fontSize={fontSize} onPaneTitle={onPaneTitle}
-                zoomedPane={zoomedPane}
-                frozen={frozen}
-                onFreeze={freezePane}
-                onUnfreeze={unfreezePane}
-                onToggleZoom={toggleZoom}
-                onSetRatio={(path, r) => putTree(setRatio(tree, path, r))}
-                onSplit={(paneId, dir, overrideKind) => {
-                  const name = formatName({ ws: currentWs, tab: currentTab, ord: nextOrd, id: makeId() })
-                  window.amber.createSession(name, cwd, overrideKind ?? kind)
-                  setPending((p) => ({ ...p, [name]: { paneId, dir } }))
-                  clearZoom()
-                }}
-                onMove={(s, t, z) => { putTree(moveLeaf(tree, s, t, z)); clearZoom() }}
-                onClose={(paneId) => { window.amber.killSession(paneId); clearZoom() }} />
-            : <button className="empty-cta" onClick={startPane}>
+          : orderedTabs.length === 0
+            ? <button className="empty-cta" onClick={startPane}>
                 <span className="empty-cta-title">Start a pane</span>
                 <span className="empty-cta-sub">{chordLabel('new-pane')}</span>
-              </button>}
+              </button>
+            : orderedTabs.map((t) => {
+                const isActive = t.tab === (tab?.tab ?? -1)
+                const stored = layout.workspaces[wsKey]?.tabs[String(t.tab)]?.tree ?? null
+                const d = isActive ? { tree, paneMeta, deadCodes } : deriveTab(t.panes, stored, pending, titles, home)
+                // `const` so the truthy-branch narrowing (Node|null -> Node) is kept
+                // inside the handler closures. Handlers operate on the layer's own
+                // tree; only the active layer is reachable (background is
+                // display:none + chord-gated), and putTree writes the active slot.
+                const layerTree = d.tree
+                return (
+                  <div key={`${wsKey}:${t.tab}`} className="pane-layer"
+                    style={{ position: 'absolute', inset: 0, display: isActive ? undefined : 'none' }}>
+                    {layerTree
+                      ? <SplitView tree={layerTree} active={isActive} deadCodes={d.deadCodes} meta={d.paneMeta}
+                          epoch={reconnectEpoch} portEpoch={childEpoch}
+                          fontSize={fontSize} onPaneTitle={onPaneTitle}
+                          zoomedPane={isActive ? zoomedPane : null}
+                          frozen={frozen}
+                          onFreeze={freezePane}
+                          onUnfreeze={unfreezePane}
+                          onToggleZoom={toggleZoom}
+                          onSetRatio={(path, r) => putTree(setRatio(layerTree, path, r))}
+                          onSplit={(paneId, dir, overrideKind) => {
+                            const name = formatName({ ws: currentWs, tab: currentTab, ord: nextOrd, id: makeId() })
+                            window.amber.createSession(name, cwd, overrideKind ?? kind)
+                            setPending((p) => ({ ...p, [name]: { paneId, dir } }))
+                            clearZoom()
+                          }}
+                          onMove={(s, tgt, z) => { putTree(moveLeaf(layerTree, s, tgt, z)); clearZoom() }}
+                          onClose={(paneId) => { window.amber.killSession(paneId); clearZoom() }} />
+                      : isActive
+                        ? <button className="empty-cta" onClick={startPane}>
+                            <span className="empty-cta-title">Start a pane</span>
+                            <span className="empty-cta-sub">{chordLabel('new-pane')}</span>
+                          </button>
+                        : null}
+                  </div>
+                )
+              })}
       </div>
       {saveScopeOpen && (
         <div className="help-overlay" onClick={() => setSaveScopeOpen(false)}>

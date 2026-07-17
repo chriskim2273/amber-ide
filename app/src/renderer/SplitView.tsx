@@ -122,6 +122,11 @@ export function SplitView(props: {
   tree: Node
   deadCodes: Record<string, number>
   meta: Record<string, PaneMeta>
+  // Whether this view's tab is the visible one. Background tabs stay MOUNTED
+  // (keep-alive — no terminal teardown/backlog-replay on switch) but hidden via
+  // display:none by the parent. When false, this view ignores window keyboard
+  // chords (its focusedRef is stale) so a chord only ever acts on the visible tab.
+  active: boolean
   epoch: number
   portEpoch: number
   fontSize: number
@@ -148,6 +153,12 @@ export function SplitView(props: {
   const [focused, setFocused] = useState<string | null>(null)
   const focusedRef = useRef<string | null>(null)
   focusedRef.current = focused
+  // Live `active` for the once-registered window keydown handler (read via ref so
+  // toggling active never rebinds the listener). Bumped `activateSeq` is handed to
+  // every Pane so it can repaint when the tab becomes visible again (keep-alive).
+  const activeRef = useRef(props.active)
+  activeRef.current = props.active
+  const [activateSeq, setActivateSeq] = useState(0)
   // Which pane (if any) has its find bar open. The find chord opens it on the
   // FOCUSED pane; only that pane renders the bar. `findSeq` bumps on every chord
   // fire so re-invoking find on an already-open bar refocuses its input.
@@ -182,6 +193,22 @@ export function SplitView(props: {
     const el = bodyEls.current.get(id)
     el?.querySelector('textarea')?.focus()
   }
+
+  // Keep-alive activation: when this tab goes hidden -> visible (parent flips
+  // `active`), nothing remounts, so no Pane calls term.focus() and the outgoing
+  // tab's blur left focus on <body>. Re-focus the previously-focused (or first)
+  // pane so typing lands immediately, and bump activateSeq so every Pane repaints
+  // its possibly-stale backgrounded frame. Rising edge only (a prevActive ref).
+  const prevActiveRef = useRef(props.active)
+  useEffect(() => {
+    const rising = props.active && !prevActiveRef.current
+    prevActiveRef.current = props.active
+    if (!rising) return
+    setActivateSeq((s) => s + 1)
+    const target = focusedRef.current ?? leaves(props.tree)[0] ?? null
+    if (target) focusPane(target)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [props.active])
 
   // Freeze a pane. The overlay + focusPane guard only block FUTURE focus; if this
   // pane's xterm textarea already holds DOM focus, keystrokes keep flowing into
@@ -252,7 +279,15 @@ export function SplitView(props: {
   useEffect(() => {
     const el = ref.current
     if (!el) return
-    const ro = new ResizeObserver(() => setSize({ x: 0, y: 0, w: el.clientWidth, h: el.clientHeight }))
+    // Keep-alive: a backgrounded tab is display:none, so its stage measures 0×0.
+    // If we accepted that, `panes` (below, gated on size.w>0) would collapse to []
+    // and every Pane would UNMOUNT — defeating keep-alive and disposing the
+    // terminals. So only accept non-zero sizes; a hidden view retains its last
+    // real geometry (its Panes stay mounted, positioned, hidden by the parent),
+    // and re-measures on show. Also dodges transient 0-size flicker mid-layout.
+    const ro = new ResizeObserver(() => {
+      if (el.clientWidth > 0 && el.clientHeight > 0) setSize({ x: 0, y: 0, w: el.clientWidth, h: el.clientHeight })
+    })
     ro.observe(el)
     return () => ro.disconnect()
   }, [])
@@ -269,8 +304,18 @@ export function SplitView(props: {
       'focus-left': 'left', 'focus-right': 'right', 'focus-up': 'up', 'focus-down': 'down',
     }
     const h = (e: KeyboardEvent): void => {
+      // Keep-alive: background (hidden) tabs stay mounted and each registers this
+      // window listener. Only the visible tab may act on a chord — otherwise a
+      // close/zoom would fire against a hidden tab's stale focusedRef too.
+      if (!activeRef.current) return
       const c = appChord(e)
       if (!c) return
+      // Type the skip-permissions flag into the focused pane's pty (no Enter).
+      if (c.type === 'insert-skip-perms' && focusedRef.current && !frozenRef.current.has(focusedRef.current)) {
+        const api = searchApis.current.get(focusedRef.current)
+        if (api) { e.preventDefault(); api.insert(' --dangerously-skip-permissions') }
+        return
+      }
       if (c.type === 'close' && focusedRef.current) {
         e.preventDefault()
         onClose(focusedRef.current)
@@ -452,7 +497,7 @@ export function SplitView(props: {
               </div>
             </div>
             <div className="pane-body" ref={(el) => { if (el) bodyEls.current.set(paneId, el); else bodyEls.current.delete(paneId) }}>
-              <Pane session={paneId} epoch={props.epoch} portEpoch={props.portEpoch}
+              <Pane session={paneId} epoch={props.epoch} portEpoch={props.portEpoch} activateSeq={activateSeq}
                 fontSize={props.fontSize} cwd={meta?.cwd ?? ''} onTitle={titleCbFor(paneId)} onSearchReady={searchReadyFor(paneId)} />
               {findPane === paneId && !isFrozen && searchApis.current.get(paneId) &&
                 <FindBar api={searchApis.current.get(paneId)!} focusSeq={findSeq}

@@ -21,6 +21,7 @@ export type Chord =
   | { type: 'font-reset' }
   | { type: 'zoom' }
   | { type: 'freeze' }
+  | { type: 'insert-skip-perms' }
   | { type: 'tab'; n: number }
 
 // A single non-parametric chord action (everything except the 1–9 tab jump,
@@ -72,6 +73,9 @@ export const CHORD_TABLE: ChordEntry[] = [
   { action: 'zoom', label: 'M', keys: ['m'], desc: 'Zoom / restore focused pane', macShift: true },
   // Park (freeze) the focused pane — display-only, input-locked; toggles off.
   { action: 'freeze', label: 'P', keys: ['p'], desc: 'Freeze / unfreeze focused pane' },
+  // Type ' --dangerously-skip-permissions' into the focused pane's pty (appends
+  // to whatever's on the line — e.g. after `claude`). Just types it; no Enter.
+  { action: 'insert-skip-perms', label: 'Y', keys: ['y'], desc: 'Type --dangerously-skip-permissions' },
 ]
 
 export function appChord(e: KeyLike): Chord | null {

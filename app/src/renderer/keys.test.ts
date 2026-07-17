@@ -193,6 +193,15 @@ describe('appChord (freeze)', () => {
   })
 })
 
+describe('appChord (insert-skip-perms)', () => {
+  it('maps Cmd+Y on mac and Ctrl+Shift+Y on linux', () => {
+    setPlatform('MacIntel')
+    expect(appChord(key({ key: 'y', meta: true }))).toEqual({ type: 'insert-skip-perms' })
+    setPlatform('Linux x86_64')
+    expect(appChord(key({ key: 'y', ctrl: true, shift: true }))).toEqual({ type: 'insert-skip-perms' })
+  })
+})
+
 describe('CHORD_TABLE (single source of truth)', () => {
   it('every entry is matched by appChord under the platform modifier', () => {
     setPlatform('MacIntel')

@@ -17,6 +17,9 @@ export interface SearchApi {
   findPrevious(q: string): boolean
   clear(): void
   onResults(cb: (r: { resultIndex: number; resultCount: number }) => void): void
+  // Type raw text into the pane's pty (as if the user typed it). Used by the
+  // skip-permissions chord in SplitView. No-op until the port is wired.
+  insert(text: string): void
 }
 
 // Search decoration colors. Like XTERM_THEME, the addon can't read CSS vars, so
@@ -74,8 +77,8 @@ const MOUSE_RESET = '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l'
 // (honors "xterm instances live outside React reconciliation").
 // Focus is tracked by SplitView via `focusin` on the wrapper; nothing here.
 export const Pane = memo(function Pane(
-  { session, epoch, portEpoch, fontSize, cwd, onTitle, onSearchReady }:
-    { session: string; epoch: number; portEpoch: number; fontSize: number; cwd: string; onTitle?: (title: string) => void; onSearchReady?: (api: SearchApi) => void },
+  { session, epoch, portEpoch, activateSeq, fontSize, cwd, onTitle, onSearchReady }:
+    { session: string; epoch: number; portEpoch: number; activateSeq: number; fontSize: number; cwd: string; onTitle?: (title: string) => void; onSearchReady?: (api: SearchApi) => void },
 ): JSX.Element {
   const containerRef = useRef<HTMLDivElement>(null)
   const hostRef = useRef<HTMLDivElement>(null)
@@ -144,6 +147,9 @@ export const Pane = memo(function Pane(
       findPrevious: (q) => search.findPrevious(q, { decorations: SEARCH_DECORATIONS }),
       clear: () => search.clearDecorations(),
       onResults: (cb) => { resultsCb = cb },
+      // Reads the live `port` binding (reassigned on wire/re-acquire), same as
+      // term.onData below — so it targets the current pty even after a reconnect.
+      insert: (text) => port?.postMessage({ data: new TextEncoder().encode(text) }),
     })
 
     fit.fit()
@@ -318,6 +324,18 @@ export const Pane = memo(function Pane(
     const t2 = setTimeout(nudge, 2000)
     return () => { clearTimeout(t1); clearTimeout(t2) }
   }, [epoch])
+
+  // Tab became visible again (keep-alive: switching to an already-visited tab
+  // does NOT remount this Pane). A backgrounded terminal was display:none, so its
+  // renderer may hold a stale/blank frame — force a full repaint. SplitView owns
+  // re-focusing the right pane; this only repaints. Skips the seed value (0).
+  useEffect(() => {
+    if (activateSeq === 0) return
+    const term = termRef.current
+    if (!term) return
+    try { fitRef.current?.fit() } catch { /* host mid-layout; ignore */ }
+    term.refresh(0, Math.max(0, term.rows - 1))
+  }, [activateSeq])
 
   // Font-size changes (chord). memo re-renders on the new `fontSize` prop but the
   // [session] effect doesn't re-run, so the Terminal instance persists — we just
