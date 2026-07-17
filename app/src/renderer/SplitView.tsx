@@ -453,7 +453,7 @@ export function SplitView(props: {
             </div>
             <div className="pane-body" ref={(el) => { if (el) bodyEls.current.set(paneId, el); else bodyEls.current.delete(paneId) }}>
               <Pane session={paneId} epoch={props.epoch} portEpoch={props.portEpoch}
-                fontSize={props.fontSize} onTitle={titleCbFor(paneId)} onSearchReady={searchReadyFor(paneId)} />
+                fontSize={props.fontSize} cwd={meta?.cwd ?? ''} onTitle={titleCbFor(paneId)} onSearchReady={searchReadyFor(paneId)} />
               {findPane === paneId && !isFrozen && searchApis.current.get(paneId) &&
                 <FindBar api={searchApis.current.get(paneId)!} focusSeq={findSeq}
                   onClose={() => { setFindPane(null); focusPane(paneId) }} />}

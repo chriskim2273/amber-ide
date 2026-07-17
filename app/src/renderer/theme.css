@@ -773,3 +773,26 @@ body {
   border-color: rgba(255, 92, 92, 0.4);
 }
 .danger-btn:hover { background: var(--danger-soft); border-color: var(--danger); }
+
+/* Floating "Open" button — appears at a pane text selection that resolves to a
+   real path; reveals it in the OS file manager. Anchored over the terminal, so
+   it sits above the WebGL canvas but below full-pane overlays (dead/frozen). */
+.open-path-btn {
+  position: absolute;
+  z-index: 5;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 9px;
+  font: 500 12px/1 var(--font-ui);
+  color: #fff;
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-2);
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+.open-path-btn:hover { filter: brightness(1.12); }
+.open-path-btn:active { filter: brightness(0.95); }

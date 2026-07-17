@@ -29,6 +29,8 @@ declare global {
       openWorkspaceFile: () => Promise<string | null>
       homeDir: string
       pickFolder: () => Promise<string | null>
+      resolvePath: (cwd: string, raw: string) => Promise<string | null>
+      revealPath: (abs: string) => void
     }
   }
 }

@@ -1,4 +1,4 @@
-import { memo, useEffect, useRef } from 'react'
+import { memo, useEffect, useRef, useState } from 'react'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { WebglAddon } from '@xterm/addon-webgl'
@@ -74,10 +74,20 @@ const MOUSE_RESET = '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l'
 // (honors "xterm instances live outside React reconciliation").
 // Focus is tracked by SplitView via `focusin` on the wrapper; nothing here.
 export const Pane = memo(function Pane(
-  { session, epoch, portEpoch, fontSize, onTitle, onSearchReady }:
-    { session: string; epoch: number; portEpoch: number; fontSize: number; onTitle?: (title: string) => void; onSearchReady?: (api: SearchApi) => void },
+  { session, epoch, portEpoch, fontSize, cwd, onTitle, onSearchReady }:
+    { session: string; epoch: number; portEpoch: number; fontSize: number; cwd: string; onTitle?: (title: string) => void; onSearchReady?: (api: SearchApi) => void },
 ): JSX.Element {
+  const containerRef = useRef<HTMLDivElement>(null)
   const hostRef = useRef<HTMLDivElement>(null)
+  // Floating "Open" button state: shown when the current selection resolves to a
+  // real path (main-process stat). `path` is the abs path revealed on click.
+  const [openBtn, setOpenBtn] = useState<{ x: number; y: number; path: string } | null>(null)
+  // Latest pointer position (container-relative) from the selection's mouseup —
+  // where the button anchors. cwd (for relative-path resolution) lives in a ref
+  // so it stays fresh without re-running the once-only [session] mount effect.
+  const ptrRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 })
+  const cwdRef = useRef(cwd)
+  cwdRef.current = cwd
   const termRef = useRef<Terminal | null>(null)
   const fitRef = useRef<FitAddon | null>(null)
   const portRef = useRef<MessagePort | null>(null)
@@ -161,6 +171,7 @@ export const Pane = memo(function Pane(
     // accepted tradeoff.
     term.attachCustomKeyEventHandler((e) => {
       if (e.type !== 'keydown') return true
+      if (e.key === 'Escape') setOpenBtn(null) // dismiss the Open button; still goes to pty
       if (appChord(e)) return false
       if (e.key === 'Enter' && e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) {
         port?.postMessage({ data: SHIFT_ENTER_CSI_U })
@@ -190,6 +201,31 @@ export const Pane = memo(function Pane(
     // latest consumer lives in a ref so a stable prop identity isn't required
     // to keep the callback fresh. Fires only on title sequences, not per byte.
     term.onTitleChange((title) => onTitleRef.current?.(title))
+
+    // Floating "Open" button: on a text selection that resolves to a real path
+    // (relative to this pane's cwd), pop a button anchored at the selection's
+    // mouseup. Resolution/stat happens in main (renderer is sandboxed); the
+    // button only appears for paths that exist, so plain-prose selections are
+    // silently ignored. Anchored at the last pointer position, not selection
+    // cell coords (those need xterm private APIs).
+    const onMouseUp = (e: MouseEvent): void => {
+      const b = containerRef.current?.getBoundingClientRect()
+      if (b) ptrRef.current = { x: e.clientX - b.left, y: e.clientY - b.top }
+    }
+    host.addEventListener('mouseup', onMouseUp)
+    let selSeq = 0
+    term.onSelectionChange(() => {
+      const sel = term.getSelection().trim()
+      if (!sel || sel.length > 512 || sel.includes('\n')) { setOpenBtn(null); return }
+      const seq = ++selSeq
+      const { x, y } = ptrRef.current
+      void window.amber.resolvePath(cwdRef.current, sel).then((abs) => {
+        // Drop stale resolves: selection changed while the stat was in flight.
+        if (seq !== selSeq) return
+        setOpenBtn(abs ? { x, y, path: abs } : null)
+      })
+    })
+    term.onScroll(() => setOpenBtn(null)) // anchor would drift off the moved line
 
     const onPortMsg = (e: MessageEvent): void => {
       const d = e.data as { amberPanePort?: boolean; session?: string }
@@ -232,6 +268,7 @@ export const Pane = memo(function Pane(
     return () => {
       window.removeEventListener('message', onPortMsg)
       host.removeEventListener('click', focus)
+      host.removeEventListener('mouseup', onMouseUp)
       ro.disconnect()
       resultsSub.dispose()
       port?.close()
@@ -296,5 +333,29 @@ export const Pane = memo(function Pane(
     portRef.current?.postMessage({ resize: { cols: term.cols, rows: term.rows } })
   }, [fontSize])
 
-  return <div ref={hostRef} style={{ width: '100%', height: '100%', background: 'var(--bg)' }} />
+  // Clamp the button inside the pane so it never spills past the right/bottom
+  // edge (approx button box: 84×26). translate keeps a right-edge selection's
+  // button visible.
+  const btnStyle = openBtn
+    ? {
+        left: Math.max(2, Math.min(openBtn.x, (containerRef.current?.clientWidth ?? 9999) - 90)),
+        top: Math.max(2, Math.min(openBtn.y + 6, (containerRef.current?.clientHeight ?? 9999) - 30)),
+      }
+    : undefined
+  return (
+    <div ref={containerRef} style={{ position: 'relative', width: '100%', height: '100%', background: 'var(--bg)' }}>
+      <div ref={hostRef} style={{ width: '100%', height: '100%' }} />
+      {openBtn &&
+        <button
+          className="open-path-btn"
+          style={btnStyle}
+          title={'Reveal in file manager: ' + openBtn.path}
+          // preventDefault on mousedown: don't steal focus / clear the selection
+          // before the click lands.
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => { window.amber.revealPath(openBtn.path); setOpenBtn(null) }}>
+          ↗ Open
+        </button>}
+    </div>
+  )
 })

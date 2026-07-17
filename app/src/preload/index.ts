@@ -30,6 +30,11 @@ contextBridge.exposeInMainWorld('amber', {
   saveWorkspaceFile: (json: string, suggestedName: string): Promise<boolean> =>
     ipcRenderer.invoke('workspace-save-file', json, suggestedName),
   openWorkspaceFile: (): Promise<string | null> => ipcRenderer.invoke('workspace-open-file'),
+  // Resolve a pane selection to an existing absolute path (null if none), then
+  // reveal it in the OS file manager. Powers the pane's floating "Open" button.
+  resolvePath: (cwd: string, raw: string): Promise<string | null> =>
+    ipcRenderer.invoke('resolve-path', cwd, raw),
+  revealPath: (abs: string): void => ipcRenderer.send('reveal-path', abs),
 })
 
 // A transferred MessagePort cannot cross contextBridge; re-dispatch the live

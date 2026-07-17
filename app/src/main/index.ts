@@ -1,12 +1,14 @@
-import { app, BrowserWindow, utilityProcess, MessageChannelMain, Menu } from 'electron'
+import { app, BrowserWindow, utilityProcess, MessageChannelMain, Menu, shell } from 'electron'
 import type { MenuItemConstructorOptions } from 'electron'
 import { ipcMain, dialog } from 'electron'
 import { fileURLToPath } from 'node:url'
-import { dirname, join } from 'node:path'
+import { dirname, join, resolve as resolvePathJoin, isAbsolute } from 'node:path'
+import { homedir } from 'node:os'
 import { spawn } from 'node:child_process'
-import { readFile, writeFile, rename, mkdir, copyFile, chmod, realpath } from 'node:fs/promises'
+import { readFile, writeFile, rename, mkdir, copyFile, chmod, realpath, stat } from 'node:fs/promises'
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { resolveSocketPath } from '../shared/socketPath'
+import { pathCandidates } from '../shared/pathSel'
 import { ensureDaemon, probeSocket } from './daemonBoot'
 import { resolveAmberBinary } from './amberBin'
 import {
@@ -442,6 +444,28 @@ async function main(): Promise<void> {
     const { port1: rPort, port2: uPort } = new MessageChannelMain()
     c.postMessage({ kind: 'pane', session }, [uPort])
     win.webContents.postMessage('pane-port', { session }, [rPort])
+  })
+
+  // Resolve a terminal selection to an EXISTING absolute path so the pane's
+  // floating "Open" button only shows for real files/dirs. Relative selections
+  // resolve against the pane's cwd; ~ expands; surrounding quotes and a trailing
+  // grep/compiler :line[:col] suffix are stripped as fallbacks (stat is the real
+  // gate). Returns the abs path, or null if nothing matched.
+  // ponytail: quote+`:line` stripping is a heuristic, not a shell tokenizer —
+  // upgrade to real word-splitting only if selections routinely miss.
+  ipcMain.handle('resolve-path', async (_e, cwd: string, raw: string) => {
+    const base = cwd && isAbsolute(cwd) ? cwd : homedir()
+    for (const c of pathCandidates(String(raw))) {
+      let s = c
+      if (s === '~' || s.startsWith('~/')) s = join(homedir(), s.slice(1))
+      const abs = isAbsolute(s) ? s : resolvePathJoin(base, s)
+      try { await stat(abs); return abs } catch { /* try next candidate */ }
+    }
+    return null
+  })
+  // Reveal a resolved path in the OS file manager (item highlighted in folder).
+  ipcMain.on('reveal-path', (_e, abs: unknown) => {
+    if (typeof abs === 'string' && isAbsolute(abs)) shell.showItemInFolder(abs)
   })
 
   ipcMain.handle('pick-folder', async () => {
