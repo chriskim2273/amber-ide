@@ -40,7 +40,8 @@ enum Command {
     /// or disable interception with `--no-prefix`). With no <name>, attaches
     /// the most-recently-updated live session.
     Attach {
-        /// Session to attach; omit to attach the newest live session.
+        /// Session to attach: a name, or a 1-based index from `amber ls`. Omit
+        /// to attach the newest live session.
         name: Option<String>,
         /// Disable detach-prefix interception; forward stdin fully raw.
         #[arg(long)]
@@ -485,9 +486,14 @@ fn run_ls(socket: &Path) -> anyhow::Result<()> {
     let mut decoder = Decoder::new();
     let mut buf = [0u8; 8192];
     loop {
-        if let Some(Frame::Control(ControlMsg::SessionList { names })) = decoder.next_frame()? {
-            for n in names {
-                println!("{n}");
+        if let Some(Frame::Control(ControlMsg::SessionList { mut names })) = decoder.next_frame()? {
+            // Sort by name so the 1-based index printed here is the SAME order
+            // `amber attach <n>` resolves against (attach::pick_by_index sorts by
+            // name too). Width-pad the index so columns line up past 9 sessions.
+            names.sort();
+            let w = names.len().to_string().len();
+            for (i, n) in names.iter().enumerate() {
+                println!("{:>w$}  {n}", i + 1, w = w);
             }
             return Ok(());
         }
@@ -499,7 +505,7 @@ fn run_ls(socket: &Path) -> anyhow::Result<()> {
     }
 }
 
-/// `amber attach [name]`: resolve the detach prefix (from `--no-prefix` and
+/// `amber attach [name|index]`: resolve the detach prefix (from `--no-prefix` and
 /// `AMBER_PREFIX`) and the target session (the newest live one when no name is
 /// given), then hand off to the raw-mode client.
 fn run_attach(
@@ -547,6 +553,17 @@ fn resolve_target(socket: &Path, name: Option<String>) -> anyhow::Result<(String
     loop {
         if let Some(Frame::Control(ControlMsg::Sessions { sessions })) = decoder.next_frame()? {
             return match name {
+                // A pure-integer arg is a 1-based index into the by-name sort
+                // (what `amber ls` prints); anything else is a literal session
+                // name. amber session names are `amber-…`, never bare integers,
+                // so there's no practical ambiguity.
+                Some(n) if n.parse::<usize>().is_ok() => {
+                    let idx = n.parse::<usize>().unwrap();
+                    match attach::pick_by_index(&sessions, idx) {
+                        Some(s) => Ok((s.name.clone(), s.kind == "shell")),
+                        None => anyhow::bail!("no session at index {idx} (see `amber ls`)"),
+                    }
+                }
                 Some(n) => {
                     let is_shell =
                         sessions.iter().find(|s| s.name == n).is_none_or(|s| s.kind == "shell");

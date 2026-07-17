@@ -43,6 +43,22 @@ const POLL_TICK_MS: u16 = 100;
 /// - `ESC [?25h`: show the cursor (TUIs hide it and may not have restored it).
 const TERM_RESET: &[u8] = b"\x1b[!p\x1b[?1049l\x1b[?25h";
 
+/// Written to the local terminal on detach/exit (the mirror of [`TERM_RESET`]).
+/// The attach client is a raw pipe, so any mode the streamed session output set
+/// (mouse tracking, bracketed paste, the alt screen, a hidden cursor) reached
+/// the user's REAL terminal directly and stays set after we stop streaming.
+/// Without this, detaching leaves:
+/// - mouse tracking on → the shell spams encoded reports (`ESC[<…M`) on every
+///   pointer move/click — the "character spam" bug;
+/// - the alt screen held → a TUI session (claude) leaves a frozen buffer on
+///   screen instead of returning the user to their shell — "rendering off".
+///
+/// Mirrors tmux/screen detach restore. Order: disable mouse (all encodings) +
+/// bracketed paste, DECSTR soft reset (autowrap/origin/cursor-keys/margins),
+/// leave the alt screen, show the cursor.
+const TERM_RESTORE: &[u8] =
+    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[!p\x1b[?1049l\x1b[?25h";
+
 /// Why [`run_client`] returned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientEnd {
@@ -126,6 +142,17 @@ pub fn pick_newest(sessions: &[proto::SessionInfo]) -> Option<&proto::SessionInf
         .iter()
         .filter(|s| s.alive)
         .max_by(|a, b| a.updated.cmp(&b.updated).then_with(|| a.name.cmp(&b.name)))
+}
+
+/// The session at 1-based `index` in the by-name sort — the exact ordering
+/// `amber ls` prints, so `amber attach <n>` selects the n-th listed session.
+/// No alive filter (matches `ls`, which lists every session). `None` for index
+/// 0 or out of range.
+pub fn pick_by_index(sessions: &[proto::SessionInfo], index: usize) -> Option<&proto::SessionInfo> {
+    let i = index.checked_sub(1)?;
+    let mut refs: Vec<&proto::SessionInfo> = sessions.iter().collect();
+    refs.sort_by(|a, b| a.name.cmp(&b.name));
+    refs.get(i).copied()
 }
 
 /// One stdin chunk scanned for prefix commands (see [`scan_prefix`]).
@@ -560,22 +587,43 @@ pub fn run_client(
     Ok(end)
 }
 
-/// Undo the terminal decoration set by [`run_client`]: leave the scroll region,
-/// clear the reserved row, and pop the title. Best-effort (ignores write
-/// errors); safe to call even if nothing was set. Written through a fresh
-/// stdout handle so it runs regardless of how `run_client` returned.
-fn teardown_decoration(ui: &StatusUi) {
-    let mut out = io::stdout();
-    if ui.bar {
-        let (_, rows) = current_size();
-        if rows >= 2 {
-            let _ = out.write_all(SCROLL_RESET.as_bytes());
-            let _ = out.write_all(clear_row(rows).as_bytes());
-        }
+/// Build the teardown byte sequence: undo the attach decoration (leave the
+/// scroll region, clear the reserved row, pop the title) AND restore sane
+/// terminal modes ([`TERM_RESTORE`] — mouse/paste/alt-screen/cursor), which the
+/// streamed session output may have left set on the LOCAL terminal. Pure so it
+/// is unit-testable; empty for a non-tty (`StatusUi::none()`), where there is no
+/// terminal to restore. The restore always runs on a tty — not just when the
+/// bar/title were drawn — because the mode leak is independent of decoration
+/// (e.g. a claude session runs with the bar OFF but still leaves the alt screen
+/// and mouse tracking on).
+fn restore_bytes(ui: &StatusUi, rows: u16) -> Vec<u8> {
+    let mut b = Vec::new();
+    if !(ui.title || ui.bar) {
+        return b; // non-tty: nothing was decorated and nothing to restore
+    }
+    if ui.bar && rows >= 2 {
+        b.extend_from_slice(SCROLL_RESET.as_bytes());
+        b.extend_from_slice(clear_row(rows).as_bytes());
     }
     if ui.title {
-        let _ = out.write_all(TITLE_POP.as_bytes());
+        b.extend_from_slice(TITLE_POP.as_bytes());
     }
+    b.extend_from_slice(TERM_RESTORE);
+    b
+}
+
+/// Undo attach decoration + restore sane terminal modes on EVERY exit path
+/// (detach, socket close, session exit, stdin EOF). Best-effort (ignores write
+/// errors); written through a fresh stdout handle so it runs regardless of how
+/// `run_client` returned.
+fn teardown_decoration(ui: &StatusUi) {
+    let (_, rows) = current_size();
+    let bytes = restore_bytes(ui, rows);
+    if bytes.is_empty() {
+        return;
+    }
+    let mut out = io::stdout();
+    let _ = out.write_all(&bytes);
     let _ = out.flush();
 }
 
@@ -806,6 +854,47 @@ mod tests {
         // tie on `updated` breaks toward the greater name, deterministically.
         let tie = [info("a", true, 5), info("z", true, 5)];
         assert_eq!(pick_newest(&tie).unwrap().name, "z");
+    }
+
+    #[test]
+    fn restore_bytes_resets_terminal_modes_on_teardown() {
+        let has = |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).any(|w| w == needle);
+
+        // Non-tty (piped/tests): nothing to restore.
+        assert!(restore_bytes(&StatusUi::none(), 24).is_empty());
+
+        // claude-style attach (title on, bar off): no scroll-region reset, but
+        // the mode restore (mouse-off + leave alt screen) MUST run — this is the
+        // exact detach-glitch case.
+        let claude = StatusUi { title: true, bar: false, hint: None };
+        let out = restore_bytes(&claude, 24);
+        assert!(!has(&out, SCROLL_RESET.as_bytes()), "no bar => no scroll reset");
+        assert!(has(&out, TITLE_POP.as_bytes()));
+        assert!(has(&out, b"\x1b[?1000l"), "must disable mouse tracking");
+        assert!(has(&out, b"\x1b[?1006l"), "must disable SGR mouse encoding");
+        assert!(has(&out, b"\x1b[?2004l"), "must disable bracketed paste");
+        assert!(has(&out, b"\x1b[?1049l"), "must leave the alt screen");
+        assert!(has(&out, b"\x1b[?25h"), "must show the cursor");
+
+        // Shell attach with the bar: scroll region + reserved row cleared too.
+        let bar = StatusUi { title: true, bar: true, hint: None };
+        let out = restore_bytes(&bar, 24);
+        assert!(has(&out, SCROLL_RESET.as_bytes()));
+        assert!(has(&out, b"\x1b[?1000l"));
+        assert!(has(&out, b"\x1b[?1049l"));
+    }
+
+    #[test]
+    fn pick_by_index_matches_ls_order() {
+        // Given out-of-order input, indexing follows the by-name sort (== `ls`).
+        let s = [info("amber-c", true, 1), info("amber-a", false, 9), info("amber-b", true, 5)];
+        assert_eq!(pick_by_index(&s, 1).unwrap().name, "amber-a"); // sorted: a,b,c
+        assert_eq!(pick_by_index(&s, 2).unwrap().name, "amber-b");
+        assert_eq!(pick_by_index(&s, 3).unwrap().name, "amber-c"); // dead sessions still indexed
+        // 0 is invalid (1-based); past-the-end is None.
+        assert!(pick_by_index(&s, 0).is_none());
+        assert!(pick_by_index(&s, 4).is_none());
+        assert!(pick_by_index(&[], 1).is_none());
     }
 
     #[test]

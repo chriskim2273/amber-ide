@@ -20,6 +20,11 @@ export interface SearchApi {
   // Type raw text into the pane's pty (as if the user typed it). Used by the
   // skip-permissions chord in SplitView. No-op until the port is wired.
   insert(text: string): void
+  // Force a local re-fit + repaint (header refresh button). Re-syncs the pty
+  // size (SIGWINCH → program repaints) and repaints xterm's buffer — fixes a
+  // garbled/stale frame or a pane mis-sized by the shared-winsize flap. Does NOT
+  // re-attach to the daemon (no fresh backlog replay).
+  refresh(): void
 }
 
 // Search decoration colors. Like XTERM_THEME, the addon can't read CSS vars, so
@@ -150,6 +155,11 @@ export const Pane = memo(function Pane(
       // Reads the live `port` binding (reassigned on wire/re-acquire), same as
       // term.onData below — so it targets the current pty even after a reconnect.
       insert: (text) => port?.postMessage({ data: new TextEncoder().encode(text) }),
+      refresh: () => {
+        try { fit.fit() } catch { /* host mid-layout; ignore */ }
+        port?.postMessage({ resize: { cols: term.cols, rows: term.rows } })
+        term.refresh(0, Math.max(0, term.rows - 1))
+      },
     })
 
     fit.fit()

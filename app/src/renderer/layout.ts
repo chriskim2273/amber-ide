@@ -3,8 +3,8 @@ export type Node =
   | { kind: 'split'; dir: 'h' | 'v'; ratio: number; a: Node; b: Node }
 export interface Rect { x: number; y: number; w: number; h: number }
 
-export function leaves(n: Node): string[] {
-  return n.kind === 'leaf' ? [n.paneId] : [...leaves(n.a), ...leaves(n.b)]
+export function leaves(n: Node | null): string[] {
+  return !n ? [] : n.kind === 'leaf' ? [n.paneId] : [...leaves(n.a), ...leaves(n.b)]
 }
 
 export function splitLeaf(n: Node, paneId: string, dir: 'h' | 'v', newId: string): Node {

@@ -491,6 +491,8 @@ export function SplitView(props: {
                 <span className="zoom-badge">zoomed — {chordLabel('zoom')} to restore</span>}
               <div className="pane-actions">
                 <button className="icon-btn" aria-label="move pane" title="drag to move" onMouseDown={startPaneDrag(paneId)} style={{ cursor: 'grab' }}>⠿</button>
+                <button className="icon-btn" aria-label="refresh pane" title="force refresh (re-fit + repaint)"
+                  onClick={() => searchApis.current.get(paneId)?.refresh()}>⟳</button>
                 <button className="icon-btn" aria-label="split right" title="split right" onClick={() => props.onSplit(paneId, 'h')}>⬌</button>
                 <button className="icon-btn" aria-label="split down" title="split down" onClick={() => props.onSplit(paneId, 'v')}>⬍</button>
                 <button className="icon-btn danger" aria-label="close pane" title="close" onClick={() => props.onClose(paneId)}>✕</button>
