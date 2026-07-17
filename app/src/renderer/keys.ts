@@ -15,6 +15,9 @@ export type Chord =
   | { type: 'focus-up' }
   | { type: 'focus-down' }
   | { type: 'help' }
+  | { type: 'font-bigger' }
+  | { type: 'font-smaller' }
+  | { type: 'font-reset' }
   | { type: 'tab'; n: number }
 
 // A single non-parametric chord action (everything except the 1–9 tab jump,
@@ -50,6 +53,11 @@ export const CHORD_TABLE: ChordEntry[] = [
   { action: 'focus-up', label: '↑', keys: ['arrowup'], desc: 'Focus pane up' },
   { action: 'focus-down', label: '↓', keys: ['arrowdown'], desc: 'Focus pane down' },
   { action: 'help', label: '/', keys: ['/', '?'], desc: 'Keyboard shortcuts' },
+  // Font size. Linux holds Shift for the modifier, so the key arrives renamed
+  // ('=' -> '+', '-' -> '_', '0' -> ')') — accept both forms (mirrors help).
+  { action: 'font-bigger', label: '=', keys: ['=', '+'], desc: 'Increase font size' },
+  { action: 'font-smaller', label: '-', keys: ['-', '_'], desc: 'Decrease font size' },
+  { action: 'font-reset', label: '0', keys: ['0', ')'], desc: 'Reset font size' },
 ]
 
 export function appChord(e: KeyLike): Chord | null {

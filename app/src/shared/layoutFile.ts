@@ -6,7 +6,9 @@ export const LAYOUT_VERSION = 1
 // undefined) and old readers ignore unknown-but-additive keys.
 export interface TabLayout { tree: Node | null; label?: string }
 export interface WsLayout { activeTab: number; tabs: Record<string, TabLayout>; label?: string; tabOrder?: number[] }
-export interface LayoutFile { version: number; activeWorkspace: number; workspaces: Record<string, WsLayout> }
+// `fontSize` is an app-owned top-level display preference (optional — old
+// sidecars omit it → undefined → the renderer's default).
+export interface LayoutFile { version: number; activeWorkspace: number; workspaces: Record<string, WsLayout>; fontSize?: number }
 
 // Pure display-order reconcile: listed ids keep `order`'s sequence (skipping any
 // that no longer exist); every unlisted id appends in numeric order. Missing or
@@ -46,6 +48,9 @@ export function parseLayout(text: string): LayoutFile {
       version: LAYOUT_VERSION,
       activeWorkspace: typeof v.activeWorkspace === 'number' ? v.activeWorkspace : 1,
       workspaces: v.workspaces as Record<string, WsLayout>,
+      // Conditional spread so a missing fontSize stays absent (not `undefined`)
+      // under exactOptionalPropertyTypes.
+      ...(typeof v.fontSize === 'number' ? { fontSize: v.fontSize } : {}),
     }
   } catch {
     return emptyLayout()

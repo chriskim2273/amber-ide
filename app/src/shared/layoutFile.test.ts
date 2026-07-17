@@ -26,6 +26,20 @@ describe('layoutFile', () => {
     }
     expect(parseLayout(serializeLayout(l))).toEqual(l)
   })
+  it('round-trips a top-level fontSize', () => {
+    const l = emptyLayout()
+    l.fontSize = 16
+    l.workspaces['1'] = { activeTab: 1, tabs: { '1': { tree: null } } }
+    expect(parseLayout(serializeLayout(l))).toEqual(l)
+  })
+  it('parses an old file with no fontSize (defaults undefined)', () => {
+    const old = JSON.stringify({
+      version: LAYOUT_VERSION,
+      activeWorkspace: 1,
+      workspaces: { '1': { activeTab: 1, tabs: { '1': { tree: null } } } },
+    })
+    expect(parseLayout(old).fontSize).toBeUndefined()
+  })
   it('parses an old file with no label/tabOrder fields (defaults undefined)', () => {
     const old = JSON.stringify({
       version: LAYOUT_VERSION,

@@ -45,12 +45,20 @@ const MOUSE_RESET = '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l'
 // (honors "xterm instances live outside React reconciliation").
 // Focus is tracked by SplitView via `focusin` on the wrapper; nothing here.
 export const Pane = memo(function Pane(
-  { session, epoch, portEpoch }: { session: string; epoch: number; portEpoch: number },
+  { session, epoch, portEpoch, fontSize, onTitle }:
+    { session: string; epoch: number; portEpoch: number; fontSize: number; onTitle?: (title: string) => void },
 ): JSX.Element {
   const hostRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<Terminal | null>(null)
   const fitRef = useRef<FitAddon | null>(null)
   const portRef = useRef<MessagePort | null>(null)
+  // Latest values read inside the once-registered mount effect without making
+  // them effect deps (which would recreate the terminal). `fontSize` seeds the
+  // constructor; `onTitle` receives OSC-2 title changes.
+  const fontSizeRef = useRef(fontSize)
+  fontSizeRef.current = fontSize
+  const onTitleRef = useRef(onTitle)
+  onTitleRef.current = onTitle
   // Set on a reconnect so the NEXT backlog message re-runs the reset (the
   // daemon replays a fresh backlog on every re-Attach, re-enabling mouse modes).
   const rearmRef = useRef(false)
@@ -65,7 +73,7 @@ export const Pane = memo(function Pane(
     const term = new Terminal({
       convertEol: false,
       fontFamily: FONT_STACK,
-      fontSize: 13,
+      fontSize: fontSizeRef.current,
       lineHeight: 1.15,
       theme: XTERM_THEME,
       cursorBlink: true,
@@ -108,6 +116,11 @@ export const Pane = memo(function Pane(
     // Input goes to whatever the CURRENT port is. Registered ONCE — re-running it
     // per (re)acquire would stack handlers and double-send every keystroke.
     term.onData((s) => port?.postMessage({ data: new TextEncoder().encode(s) }))
+
+    // OSC 2 title changes (e.g. shell PROMPT_COMMAND). Registered once; the
+    // latest consumer lives in a ref so a stable prop identity isn't required
+    // to keep the callback fresh. Fires only on title sequences, not per byte.
+    term.onTitleChange((title) => onTitleRef.current?.(title))
 
     const onPortMsg = (e: MessageEvent): void => {
       const d = e.data as { amberPanePort?: boolean; session?: string }
@@ -198,6 +211,20 @@ export const Pane = memo(function Pane(
     const t2 = setTimeout(nudge, 2000)
     return () => { clearTimeout(t1); clearTimeout(t2) }
   }, [epoch])
+
+  // Font-size changes (chord). memo re-renders on the new `fontSize` prop but the
+  // [session] effect doesn't re-run, so the Terminal instance persists — we just
+  // retune its options and refit (cell size changed → new cols/rows → SIGWINCH
+  // the pty). Skips a degenerate 0-size host (see sendResize).
+  useEffect(() => {
+    const term = termRef.current
+    if (!term || term.options.fontSize === fontSize) return
+    term.options.fontSize = fontSize
+    const host = hostRef.current
+    if (host && (host.clientWidth === 0 || host.clientHeight === 0)) return
+    try { fitRef.current?.fit() } catch { /* host has zero size mid-layout; ignore */ }
+    portRef.current?.postMessage({ resize: { cols: term.cols, rows: term.rows } })
+  }, [fontSize])
 
   return <div ref={hostRef} style={{ width: '100%', height: '100%', background: 'var(--bg)' }} />
 })

@@ -39,6 +39,12 @@ function shortCwd(cwd: string, home: string): string {
   return home && cwd.startsWith(home) ? '~' + cwd.slice(home.length) : cwd
 }
 
+const DEFAULT_FONT_SIZE = 13
+// App-wide terminal font size, clamped to a sane range (integer px).
+function clampFont(n: number): number {
+  return Math.max(8, Math.min(32, Math.round(n)))
+}
+
 // Inline rename field for workspace pills / tabs. Enter commits, Escape cancels,
 // blur commits — Enter/Escape just blur (with a cancel flag) so the single commit
 // path lives in onBlur. stopPropagation keeps typing away from the global chords
@@ -84,6 +90,9 @@ function App(): JSX.Element {
   const [cwd, setCwd] = useState<string>(() => window.amber?.homeDir ?? '/')
   const [connected, setConnected] = useState(true)
   const [showHelp, setShowHelp] = useState(false)
+  // Live OSC-2 pane titles, keyed by session name. Grows with distinct sessions
+  // seen (bounded, harmless — paneMeta only reads titles for live panes).
+  const [titles, setTitles] = useState<Record<string, string>>({})
   // Gate ALL layout persistence until the sidecar has loaded. Otherwise a
   // Sessions event arriving before loadLayout resolves would reconcile against
   // an empty layout (equal-columns 'h' fallback) and overwrite the real,
@@ -111,6 +120,17 @@ function App(): JSX.Element {
   const [pending, setPending] = useState<Record<string, { paneId: string; dir: 'h' | 'v' }>>({})
   const layoutRef = useRef(layout)
   layoutRef.current = layout
+  // App-wide terminal font size lives in the layout sidecar (single source of
+  // truth → auto-persists via the debounced save, no separate state to sync).
+  const fontSize = clampFont(layout.fontSize ?? DEFAULT_FONT_SIZE)
+
+  // Stable dispatcher for OSC pane titles (referential stability keeps Pane's
+  // memo effective — SplitView caches a per-pane wrapper around this). Caps the
+  // stored title and no-ops identical values to avoid pointless re-renders.
+  const onPaneTitle = useCallback((session: string, title: string): void => {
+    const t = title.slice(0, 120)
+    setTitles((prev) => (prev[session] === t ? prev : { ...prev, [session]: t }))
+  }, [])
 
   useEffect(() => {
     if (!bridgeReady) return
@@ -152,7 +172,10 @@ function App(): JSX.Element {
   const home = window.amber?.homeDir ?? ''
   tab?.panes.forEach((p) => {
     if (p.deadCode !== null) deadCodes[p.name] = p.deadCode
-    paneMeta[p.name] = { kind: p.kind, title: `${shortCwd(p.cwd, home)} · ${p.kind}` }
+    // Prefer a live OSC title (e.g. shell/program-set) over the cwd; else cwd.
+    const osc = titles[p.name]
+    const lead = osc && osc.length > 0 ? osc : shortCwd(p.cwd, home)
+    paneMeta[p.name] = { kind: p.kind, title: `${lead} · ${p.kind}` }
   })
 
   // Reconcile the persisted tree for this tab with its live pane set. Pending
@@ -278,6 +301,17 @@ function App(): JSX.Element {
     const i = Math.max(0, orderedTabs.findIndex((t) => t.tab === (tab?.tab ?? -1)))
     setActiveTab(orderedTabs[(i + d + orderedTabs.length) % orderedTabs.length]!.tab)
   }
+  // Font-size chords. Persist to the sidecar (top-level fontSize); the derived
+  // `fontSize` above flows to every Pane. Clamp + no-op-guard so hitting the
+  // range edge doesn't churn state/persistence.
+  const bumpFont = (d: number): void => setLayout((l) => {
+    const cur = clampFont(l.fontSize ?? DEFAULT_FONT_SIZE)
+    const next = clampFont(cur + d)
+    return next === cur ? l : { ...l, fontSize: next }
+  })
+  const resetFont = (): void => setLayout((l) =>
+    clampFont(l.fontSize ?? DEFAULT_FONT_SIZE) === DEFAULT_FONT_SIZE ? l : { ...l, fontSize: DEFAULT_FONT_SIZE })
+
   // Refresh the keyboard-chord dispatcher with this render's live closures.
   chordRef.current = (c) => {
     if (c?.type === 'new-tab') openTab()
@@ -285,6 +319,9 @@ function App(): JSX.Element {
     else if (c?.type === 'prev-tab') stepTab(-1)
     else if (c?.type === 'next-tab') stepTab(1)
     else if (c?.type === 'help') setShowHelp(true)
+    else if (c?.type === 'font-bigger') bumpFont(1)
+    else if (c?.type === 'font-smaller') bumpFont(-1)
+    else if (c?.type === 'font-reset') resetFont()
     else if (c?.type === 'tab') { const t = orderedTabs[c.n - 1]; if (t) setActiveTab(t.tab) }
   }
 
@@ -383,6 +420,7 @@ function App(): JSX.Element {
           ? <div className="stage-loading">connecting to daemon…</div>
           : tree
             ? <SplitView tree={tree} deadCodes={deadCodes} meta={paneMeta} epoch={reconnectEpoch} portEpoch={childEpoch}
+                fontSize={fontSize} onPaneTitle={onPaneTitle}
                 onSetRatio={(path, r) => putTree(setRatio(tree, path, r))}
                 onSplit={(paneId, dir) => {
                   const name = formatName({ ws: currentWs, tab: currentTab, ord: nextOrd, id: makeId() })

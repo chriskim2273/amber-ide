@@ -32,6 +32,8 @@ export function SplitView(props: {
   meta: Record<string, PaneMeta>
   epoch: number
   portEpoch: number
+  fontSize: number
+  onPaneTitle: (session: string, title: string) => void
   onSetRatio: (path: Array<'a' | 'b'>, ratio: number) => void
   onSplit: (paneId: string, dir: 'h' | 'v') => void
   onMove: (sourceId: string, targetId: string, zone: Zone) => void
@@ -59,6 +61,18 @@ export function SplitView(props: {
   const focusPane = (id: string): void => {
     const el = bodyEls.current.get(id)
     el?.querySelector('textarea')?.focus()
+  }
+
+  // Per-pane title callbacks, cached by paneId so each `Pane` gets a REFERENTIALLY
+  // STABLE `onTitle` — otherwise a fresh closure every render would defeat Pane's
+  // memo (every drag mousemove would reconcile all terminals). `onPaneTitle` from
+  // App is itself stable (useCallback), so caching the wrapper once is safe.
+  const titleCbs = useRef<Map<string, (t: string) => void>>(new Map())
+  const onPaneTitle = props.onPaneTitle
+  const titleCbFor = (paneId: string): ((t: string) => void) => {
+    let cb = titleCbs.current.get(paneId)
+    if (!cb) { cb = (t) => onPaneTitle(paneId, t); titleCbs.current.set(paneId, cb) }
+    return cb
   }
 
   useEffect(() => {
@@ -211,7 +225,8 @@ export function SplitView(props: {
               </div>
             </div>
             <div className="pane-body" ref={(el) => { if (el) bodyEls.current.set(paneId, el); else bodyEls.current.delete(paneId) }}>
-              <Pane session={paneId} epoch={props.epoch} portEpoch={props.portEpoch} />
+              <Pane session={paneId} epoch={props.epoch} portEpoch={props.portEpoch}
+                fontSize={props.fontSize} onTitle={titleCbFor(paneId)} />
               {dead !== undefined &&
                 <div className="dead-overlay">
                   <div className={'dead-badge ' + (dead === 0 ? 'ok' : 'err')}>

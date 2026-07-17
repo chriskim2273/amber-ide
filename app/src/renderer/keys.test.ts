@@ -69,8 +69,36 @@ describe('appChord (shared edge cases)', () => {
   it('unmapped keys under the right modifier return null', () => {
     setPlatform('MacIntel')
     expect(appChord(key({ key: 'q', meta: true }))).toBeNull()
-    expect(appChord(key({ key: '0', meta: true }))).toBeNull()
     expect(appChord(key({ key: 'Tab', meta: true }))).toBeNull()
+  })
+})
+
+describe('appChord (font size)', () => {
+  it('maps Cmd += / - / 0 on mac (and shift-alias forms)', () => {
+    setPlatform('MacIntel')
+    expect(appChord(key({ key: '=', meta: true }))).toEqual({ type: 'font-bigger' })
+    expect(appChord(key({ key: '+', meta: true }))).toEqual({ type: 'font-bigger' })
+    expect(appChord(key({ key: '-', meta: true }))).toEqual({ type: 'font-smaller' })
+    expect(appChord(key({ key: '_', meta: true }))).toEqual({ type: 'font-smaller' })
+    expect(appChord(key({ key: '0', meta: true }))).toEqual({ type: 'font-reset' })
+    expect(appChord(key({ key: ')', meta: true }))).toEqual({ type: 'font-reset' })
+  })
+  it('maps Ctrl+Shift chords (shift renames the key) on linux', () => {
+    setPlatform('Linux x86_64')
+    // Shift is held for the modifier, so '=' arrives as '+', '-' as '_', '0' as ')'.
+    expect(appChord(key({ key: '+', ctrl: true, shift: true }))).toEqual({ type: 'font-bigger' })
+    expect(appChord(key({ key: '_', ctrl: true, shift: true }))).toEqual({ type: 'font-smaller' })
+    expect(appChord(key({ key: ')', ctrl: true, shift: true }))).toEqual({ type: 'font-reset' })
+  })
+  it('renders labels matching the brief', () => {
+    setPlatform('MacIntel')
+    expect(chordLabel('font-bigger')).toBe('⌘=')
+    expect(chordLabel('font-smaller')).toBe('⌘-')
+    expect(chordLabel('font-reset')).toBe('⌘0')
+    setPlatform('Linux x86_64')
+    expect(chordLabel('font-bigger')).toBe('Ctrl+Shift+=')
+    expect(chordLabel('font-smaller')).toBe('Ctrl+Shift+-')
+    expect(chordLabel('font-reset')).toBe('Ctrl+Shift+0')
   })
 })
 
