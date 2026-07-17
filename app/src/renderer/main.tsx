@@ -132,6 +132,21 @@ function App(): JSX.Element {
     setTitles((prev) => (prev[session] === t ? prev : { ...prev, [session]: t }))
   }, [])
 
+  // Prune titles whose session the daemon removed (state.sessions is the
+  // authoritative live set) — without this the map grows without bound in a
+  // long-lived renderer as sessions come and go.
+  const sessions = state.sessions
+  useEffect(() => {
+    setTitles((prev) => {
+      const live = new Set(sessions.map((s) => s.name))
+      const stale = Object.keys(prev).filter((n) => !live.has(n))
+      if (stale.length === 0) return prev
+      const next = { ...prev }
+      for (const n of stale) delete next[n]
+      return next
+    })
+  }, [sessions])
+
   useEffect(() => {
     if (!bridgeReady) return
     window.amber.onDaemonEvent((d) => {
@@ -173,8 +188,9 @@ function App(): JSX.Element {
   tab?.panes.forEach((p) => {
     if (p.deadCode !== null) deadCodes[p.name] = p.deadCode
     // Prefer a live OSC title (e.g. shell/program-set) over the cwd; else cwd.
+    // Whitespace-only titles (some prompts emit blank OSC 2) fall back to cwd.
     const osc = titles[p.name]
-    const lead = osc && osc.length > 0 ? osc : shortCwd(p.cwd, home)
+    const lead = osc && osc.trim().length > 0 ? osc : shortCwd(p.cwd, home)
     paneMeta[p.name] = { kind: p.kind, title: `${lead} · ${p.kind}` }
   })
 

@@ -1,6 +1,6 @@
 import { useRef, useState, useEffect } from 'react'
 import { Pane } from './Pane'
-import { paneRects, handles, nextPaneInDirection, ratioAt, type Node, type Rect, type Zone, type FocusDir } from './layout'
+import { paneRects, handles, nextPaneInDirection, ratioAt, leaves, type Node, type Rect, type Zone, type FocusDir } from './layout'
 import { appChord } from './keys'
 
 export interface PaneMeta { kind: string; title: string }
@@ -65,8 +65,12 @@ export function SplitView(props: {
 
   // Per-pane title callbacks, cached by paneId so each `Pane` gets a REFERENTIALLY
   // STABLE `onTitle` — otherwise a fresh closure every render would defeat Pane's
-  // memo (every drag mousemove would reconcile all terminals). `onPaneTitle` from
-  // App is itself stable (useCallback), so caching the wrapper once is safe.
+  // memo (every drag mousemove would reconcile all terminals).
+  //
+  // CONTRACT: `props.onPaneTitle` must itself be PERMANENTLY referentially stable
+  // (App creates it with useCallback([], …)). Each wrapper captures the value at
+  // cache time and is never refreshed, so a changing onPaneTitle would silently
+  // keep dispatching to the stale closure.
   const titleCbs = useRef<Map<string, (t: string) => void>>(new Map())
   const onPaneTitle = props.onPaneTitle
   const titleCbFor = (paneId: string): ((t: string) => void) => {
@@ -74,6 +78,15 @@ export function SplitView(props: {
     if (!cb) { cb = (t) => onPaneTitle(paneId, t); titleCbs.current.set(paneId, cb) }
     return cb
   }
+  // Sweep cached callbacks for panes no longer in the tree — the cache is keyed
+  // by session name, which never repeats, so without this it grows unboundedly
+  // in a long-lived renderer.
+  useEffect(() => {
+    const live = new Set(leaves(props.tree))
+    for (const id of [...titleCbs.current.keys()]) {
+      if (!live.has(id)) titleCbs.current.delete(id)
+    }
+  }, [props.tree])
 
   useEffect(() => {
     const el = ref.current
