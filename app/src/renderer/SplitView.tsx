@@ -145,7 +145,7 @@ export function SplitView(props: {
                   <div className={'dead-badge ' + (dead === 0 ? 'ok' : 'err')}>
                     exited · code {dead}
                   </div>
-                  <div className="dead-hint">session ended — close to remove</div>
+                  <button className="dead-close" onClick={() => props.onClose(paneId)}>close pane</button>
                 </div>}
             </div>
           </div>

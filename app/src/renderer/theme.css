@@ -303,7 +303,19 @@ body {
 }
 .dead-badge.ok { color: var(--ok); border-color: rgba(82, 210, 115, 0.4); }
 .dead-badge.err { color: var(--danger); border-color: rgba(255, 92, 92, 0.4); }
-.dead-hint { color: var(--text-faint); font-size: 11px; }
+.dead-close {
+  font-family: inherit;
+  font-size: 11px;
+  color: var(--text-dim);
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: 4px 12px;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+.dead-close:hover { background: var(--danger-soft); color: var(--danger); border-color: rgba(255, 92, 92, 0.4); }
+.dead-close:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 /* split handles — wide invisible hit-zone, thin visible line, hover glow */
 .split-handle {
@@ -359,17 +371,41 @@ body {
 }
 .banner-close:hover { opacity: 1; background: rgba(255, 92, 92, 0.18); }
 
-.empty-hint {
-  padding: var(--sp-4);
+/* ---------- pane-stage placeholders ---------- */
+/* Quiet "still connecting" state — shown until the daemon's first Sessions
+   snapshot arrives, so the empty CTA never flashes before the real list. */
+.stage-loading {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
   color: var(--text-faint);
   font-size: 13px;
 }
-kbd {
+/* Empty state as a real call-to-action card (clickable = create first pane). */
+.empty-cta {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-4) calc(var(--sp-4) * 1.5);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  cursor: pointer;
+  font-family: inherit;
+  box-shadow: var(--shadow-1);
+  transition: background 0.12s, border-color 0.12s;
+}
+.empty-cta:hover { background: var(--surface-2); border-color: var(--border-strong); }
+.empty-cta:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.empty-cta-title { font-size: 15px; font-weight: 600; color: var(--text); }
+.empty-cta-sub {
   font-family: var(--font-mono);
-  font-size: 10.5px;
-  padding: 1px 5px;
-  border-radius: 4px;
-  background: var(--surface-3);
-  border: 1px solid var(--border-strong);
-  color: var(--text-dim);
+  font-size: 11.5px;
+  color: var(--text-faint);
 }

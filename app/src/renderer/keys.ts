@@ -30,3 +30,18 @@ export function appChord(e: KeyLike): Chord | null {
   if (k >= '1' && k <= '9') return { type: 'tab', n: Number(k) }
   return null
 }
+
+// Human-readable label for a chord, matching the platform branch above (mac
+// Cmd, else Ctrl+Shift). Used by the empty-state CTA to hint the new-pane key.
+const CHORD_KEYS: Record<Exclude<Chord['type'], 'tab'>, string> = {
+  'new-tab': 'T',
+  'new-pane': 'Enter',
+  'close': 'W',
+  'prev-tab': '[',
+  'next-tab': ']',
+}
+
+export function chordLabel(action: Exclude<Chord['type'], 'tab'>): string {
+  const k = CHORD_KEYS[action]
+  return isMac() ? `⌘${k}` : `Ctrl+Shift+${k}`
+}

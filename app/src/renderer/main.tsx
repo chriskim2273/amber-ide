@@ -5,7 +5,7 @@ import { initialState, reduce, groupSessions, type DaemonEvent } from './store'
 import { formatName, makeId } from '../shared/names'
 import { splitLeaf, setRatio, reconcile, leaves, moveLeaf, type Node } from './layout'
 import { emptyLayout, parseLayout, serializeLayout, type LayoutFile } from '../shared/layoutFile'
-import { appChord } from './keys'
+import { appChord, chordLabel } from './keys'
 import './theme.css'
 
 declare global {
@@ -56,6 +56,12 @@ function App(): JSX.Element {
   // an empty layout (equal-columns 'h' fallback) and overwrite the real,
   // possibly-vertical saved tree before we ever read it.
   const [loaded, setLoaded] = useState(false)
+  // Whether the daemon has delivered its first `Sessions` snapshot. Distinct
+  // from `loaded` (the layout sidecar): a fresh daemon with zero sessions still
+  // emits `Sessions{[]}` on WatchSessions, so this reliably flips true. Until
+  // both are true the stage shows a loading placeholder — never the empty CTA,
+  // which would flash before the real session list arrives.
+  const [sawSessions, setSawSessions] = useState(false)
   // Bumped on each daemon reconnect (disconnected -> connected edge) so panes
   // can re-run their attach fixups (mouse-mode reset, TUI repaint nudge).
   const [reconnectEpoch, setReconnectEpoch] = useState(0)
@@ -83,6 +89,7 @@ function App(): JSX.Element {
       // so ask every Pane to re-acquire from the new child.
       if ((d as { childRestart?: boolean }).childRestart) setChildEpoch((e) => e + 1)
       const ev = toEvent(d); if (ev) dispatch(ev)
+      if (ev?.kind === 'Sessions') setSawSessions(true)
     })
     void window.amber.loadLayout().then((text) => {
       if (text) setLayout(parseLayout(text))
@@ -183,6 +190,13 @@ function App(): JSX.Element {
   const nextWs = (workspaces.reduce((m, w) => Math.max(m, w.ws), 0)) + 1
 
   const openTab = (): void => { newPane(nextTab, 0); setActiveTab(nextTab) }
+  // Create a pane in the displayed tab, or — when nothing exists yet — the very
+  // first session at tab 1, ord 0 in the shown workspace. Shared by the toolbar
+  // `+ Pane` button and the empty-state CTA.
+  const startPane = (): void => {
+    if (tab) newPane(tab.tab, nextOrd)
+    else { newPane(1, 0); setActiveTab(1) }
+  }
   const stepTab = (d: number): void => {
     if (tabs.length === 0) return
     const i = Math.max(0, tabs.findIndex((t) => t.tab === (tab?.tab ?? -1)))
@@ -235,7 +249,7 @@ function App(): JSX.Element {
           📁 {shortCwd(cwd, window.amber.homeDir)}
         </button>
         <div className="spacer" />
-        {tab && <button className="btn btn-accent" onClick={() => newPane(tab.tab, nextOrd)}>+ Pane</button>}
+        <button className="btn btn-accent" onClick={startPane}>+ Pane</button>
       </div>
       <div className="tabbar">
         {tabs.map((t) => {
@@ -251,17 +265,22 @@ function App(): JSX.Element {
         <button className="btn btn-ghost tab-add" onClick={openTab}>+ Tab</button>
       </div>
       <div className="pane-stage">
-        {tree
-          ? <SplitView tree={tree} deadCodes={deadCodes} meta={paneMeta} epoch={reconnectEpoch} portEpoch={childEpoch}
-              onSetRatio={(path, r) => putTree(setRatio(tree, path, r))}
-              onSplit={(paneId, dir) => {
-                const name = formatName({ ws: currentWs, tab: currentTab, ord: nextOrd, id: makeId() })
-                window.amber.createSession(name, cwd, kind)
-                setPending((p) => ({ ...p, [name]: { paneId, dir } }))
-              }}
-              onMove={(s, t, z) => putTree(moveLeaf(tree, s, t, z))}
-              onClose={(paneId) => window.amber.killSession(paneId)} />
-          : <p className="empty-hint">No panes — press <kbd>+ Pane</kbd> to start.</p>}
+        {!(loaded && sawSessions)
+          ? <div className="stage-loading">connecting to daemon…</div>
+          : tree
+            ? <SplitView tree={tree} deadCodes={deadCodes} meta={paneMeta} epoch={reconnectEpoch} portEpoch={childEpoch}
+                onSetRatio={(path, r) => putTree(setRatio(tree, path, r))}
+                onSplit={(paneId, dir) => {
+                  const name = formatName({ ws: currentWs, tab: currentTab, ord: nextOrd, id: makeId() })
+                  window.amber.createSession(name, cwd, kind)
+                  setPending((p) => ({ ...p, [name]: { paneId, dir } }))
+                }}
+                onMove={(s, t, z) => putTree(moveLeaf(tree, s, t, z))}
+                onClose={(paneId) => window.amber.killSession(paneId)} />
+            : <button className="empty-cta" onClick={startPane}>
+                <span className="empty-cta-title">Start a pane</span>
+                <span className="empty-cta-sub">{chordLabel('new-pane')}</span>
+              </button>}
       </div>
     </div>
   )

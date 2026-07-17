@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach, vi } from 'vitest'
-import { appChord } from './keys'
+import { appChord, chordLabel } from './keys'
 
 // keys.ts branches on navigator.platform (mac -> Cmd, else -> Ctrl+Shift). The
 // tests stub the global per case; Node ships a read-only `navigator`, so use
@@ -71,5 +71,19 @@ describe('appChord (shared edge cases)', () => {
     expect(appChord(key({ key: 'q', meta: true }))).toBeNull()
     expect(appChord(key({ key: '0', meta: true }))).toBeNull()
     expect(appChord(key({ key: 'Tab', meta: true }))).toBeNull()
+  })
+})
+
+describe('chordLabel', () => {
+  it('renders the mac Cmd label', () => {
+    setPlatform('MacIntel')
+    expect(chordLabel('new-pane')).toBe('⌘Enter')
+    expect(chordLabel('new-tab')).toBe('⌘T')
+  })
+  it('renders the non-mac Ctrl+Shift label', () => {
+    setPlatform('Linux x86_64')
+    expect(chordLabel('new-pane')).toBe('Ctrl+Shift+Enter')
+    expect(chordLabel('new-tab')).toBe('Ctrl+Shift+T')
+    expect(chordLabel('close')).toBe('Ctrl+Shift+W')
   })
 })
