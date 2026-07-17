@@ -28,6 +28,8 @@ export type ControlMsg =
   | { kind: 'Create'; name: string; cwd: string; sessionKind: string }
   | { kind: 'Attach'; name: string }
   | { kind: 'Detach'; name: string }
+  | { kind: 'DumpBacklog'; name: string }
+  | { kind: 'Backlog'; name: string; data: Uint8Array }
   | { kind: 'Kill'; name: string }
   | { kind: 'Resize'; name: string; cols: number; rows: number }
   | { kind: 'SessionList'; names: string[] }
@@ -62,6 +64,11 @@ function msgToJson(m: ControlMsg): unknown {
       return { Attach: { name: m.name } }
     case 'Detach':
       return { Detach: { name: m.name } }
+    case 'DumpBacklog':
+      return { DumpBacklog: { name: m.name } }
+    case 'Backlog':
+      // serde encodes Vec<u8> as a JSON numeric array (not base64); mirror it.
+      return { Backlog: { name: m.name, data: Array.from(m.data) } }
     case 'Kill':
       return { Kill: { name: m.name } }
     case 'Resize':
@@ -97,6 +104,9 @@ function jsonToMsg(v: unknown): ControlMsg {
       case 'Create': return { kind: 'Create', name: body['name'] as string, cwd: body['cwd'] as string, sessionKind: body['kind'] as string }
       case 'Attach': return { kind: 'Attach', name: body['name'] as string }
       case 'Detach': return { kind: 'Detach', name: body['name'] as string }
+      case 'DumpBacklog': return { kind: 'DumpBacklog', name: body['name'] as string }
+      // serde encodes Vec<u8> as a JSON numeric array; rebuild the Uint8Array.
+      case 'Backlog': return { kind: 'Backlog', name: body['name'] as string, data: Uint8Array.from(body['data'] as number[]) }
       case 'Kill': return { kind: 'Kill', name: body['name'] as string }
       case 'Resize': return { kind: 'Resize', name: body['name'] as string, cols: body['cols'] as number, rows: body['rows'] as number }
       case 'SessionList': return { kind: 'SessionList', names: body['names'] as string[] }

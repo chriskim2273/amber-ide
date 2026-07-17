@@ -51,6 +51,42 @@ describe('proto', () => {
     expect(json).toBe('{"Activity":{"name":"amber-1-1-0-a"}}')
   })
 
+  it('encodes DumpBacklog externally-tagged to match serde', () => {
+    const f: Frame = { type: 'control', msg: { kind: 'DumpBacklog', name: 's' } }
+    const wire = encode(f)
+    const bodyLen = new DataView(wire.buffer).getUint32(0, false)
+    const json = new TextDecoder().decode(wire.slice(5, 4 + bodyLen))
+    expect(json).toBe('{"DumpBacklog":{"name":"s"}}')
+  })
+
+  it('decodes a Backlog reply (Vec<u8> as numeric array) into a Uint8Array', () => {
+    // Mirror serde's exact JSON: {"Backlog":{"name":"s","data":[0,65,255]}}.
+    const json = '{"Backlog":{"name":"s","data":[0,65,255]}}'
+    const jsonBytes = new TextEncoder().encode(json)
+    const body = new Uint8Array(1 + jsonBytes.length)
+    body[0] = 0 // TAG_CONTROL
+    body.set(jsonBytes, 1)
+    const wire = new Uint8Array(4 + body.length)
+    new DataView(wire.buffer).setUint32(0, body.length, false)
+    wire.set(body, 4)
+
+    const d = new Decoder()
+    d.feed(wire)
+    const out = d.next()
+    expect(out).toEqual({
+      type: 'control',
+      msg: { kind: 'Backlog', name: 's', data: new Uint8Array([0, 65, 255]) },
+    })
+  })
+
+  it('roundtrips a Backlog frame preserving raw bytes', () => {
+    const f: Frame = {
+      type: 'control',
+      msg: { kind: 'Backlog', name: 's', data: new Uint8Array([0, 1, 255, 27, 91, 50, 74]) },
+    }
+    expect(roundtrip(f)).toEqual(f)
+  })
+
   it('decodes byte-at-a-time and across chunk splits', () => {
     const f: Frame = { type: 'data', session: 's', bytes: new Uint8Array([10, 13, 0, 255]) }
     const wire = encode(f)

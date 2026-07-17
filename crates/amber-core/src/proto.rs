@@ -65,6 +65,16 @@ pub enum ControlMsg {
     Snapshot,
     /// Daemon reply: the snapshot completed successfully.
     SnapshotOk,
+    /// Client -> daemon: request a one-shot copy of a session's scrollback ring
+    /// (the same bytes an Attach backlog would replay), for the workspace
+    /// save/load feature. Reply is a single `Backlog`; an unknown session
+    /// replies `Error`. The reply is written off the connection read thread
+    /// (forwarder path) — a multi-MiB `data` must never block control frames
+    /// multiplexed on the same socket (backlog head-of-line lesson).
+    DumpBacklog { name: String },
+    /// Daemon -> client: the requested session's full scrollback bytes, in one
+    /// frame (ring cap ≤2 MiB ≪ 64 MiB frame cap, so no chunking).
+    Backlog { name: String, data: Vec<u8> },
     /// Client -> daemon: opt this connection in to pushed session-change events.
     WatchSessions,
     /// Client -> daemon: request the full session set with metadata.
@@ -360,6 +370,34 @@ mod tests {
         // Lock the externally-tagged JSON shape the TS client decodes.
         let json = serde_json::to_string(&ControlMsg::Activity { name: "s".into() }).unwrap();
         assert_eq!(json, r#"{"Activity":{"name":"s"}}"#);
+    }
+
+    #[test]
+    fn dump_backlog_and_backlog_roundtrip() {
+        let req = Frame::Control(ControlMsg::DumpBacklog { name: "amber-1-1-0-a".into() });
+        assert_eq!(roundtrip(&req), req);
+        let reply = Frame::Control(ControlMsg::Backlog {
+            name: "amber-1-1-0-a".into(),
+            data: vec![0, 1, 255, 27, b'[', b'2', b'J'],
+        });
+        assert_eq!(roundtrip(&reply), reply);
+    }
+
+    #[test]
+    fn backlog_data_is_a_json_numeric_array() {
+        // Shape-lock for the TS port: serde_json serializes `Vec<u8>` as a JSON
+        // array of numbers (NOT base64). proto.ts must decode `data` the same
+        // way. Locking it here catches a serde/serde_bytes change that would
+        // silently break the wire.
+        let json = serde_json::to_string(&ControlMsg::Backlog {
+            name: "s".into(),
+            data: vec![0, 65, 255],
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"Backlog":{"name":"s","data":[0,65,255]}}"#);
+        // And the request side.
+        let json = serde_json::to_string(&ControlMsg::DumpBacklog { name: "s".into() }).unwrap();
+        assert_eq!(json, r#"{"DumpBacklog":{"name":"s"}}"#);
     }
 
     #[test]

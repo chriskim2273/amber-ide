@@ -314,6 +314,27 @@ fn handle_control(
                 }
             }
         }
+        ControlMsg::DumpBacklog { name } => {
+            let Some(sess) = manager.session(&name) else {
+                let _ = write_frame(
+                    writer,
+                    &Frame::Control(ControlMsg::Error {
+                        msg: format!("no such session: {name}"),
+                    }),
+                );
+                return;
+            };
+            // The reply can be up to the full ring (~2 MiB). Snapshot AND write
+            // it on a forwarder thread — never inline on the read thread. A big
+            // inline write to a slow client would head-of-line-block every
+            // control frame multiplexed on the same socket (the backlog HOL
+            // lesson). One frame: ring cap ≪ MAX_FRAME_LEN, no chunking.
+            let writer = Arc::clone(writer);
+            thread::spawn(move || {
+                let data = sess.scrollback();
+                let _ = write_frame(&writer, &Frame::Control(ControlMsg::Backlog { name, data }));
+            });
+        }
         ControlMsg::Snapshot => {
             let reply = match manager.snapshot() {
                 Ok(()) => ControlMsg::SnapshotOk,
