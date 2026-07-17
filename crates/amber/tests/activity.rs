@@ -1,6 +1,8 @@
 //! A session that produces output broadcasts a rate-limited `Activity` to
-//! watchers: at most one per session per 500 ms, and none at all for a session
-//! that never produces output.
+//! watchers: at most one per session per 500 ms, correctly attributed — driven
+//! output lands on the busy session's name and never on an undriven one (the
+//! per-session attribution property; a spawned shell always emits a startup
+//! prompt, so a literal zero-output session isn't reachable via the manager).
 //!
 //! Fake-stub style (mirrors `run_state.rs`): sessions are created directly on
 //! the manager and driven with `manager.write`; a watcher connection observes
@@ -114,7 +116,8 @@ fn output_broadcasts_rate_limited_activity_and_silence_stays_silent() {
     );
     assert!(
         !first.iter().any(|n| n == "silent"),
-        "a session with no output must not broadcast Activity, got {first:?}"
+        "activity must be attributed per session: no Activity for the undriven \
+         session in the same window, got {first:?}"
     );
 
     // Clear the window opened by that write before the burst, so the burst's
