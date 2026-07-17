@@ -4,7 +4,7 @@ import { SplitView, type PaneMeta } from './SplitView'
 import { initialState, reduce, groupSessions, type DaemonEvent } from './store'
 import { formatName, makeId } from '../shared/names'
 import { splitLeaf, setRatio, reconcile, leaves, moveLeaf, type Node } from './layout'
-import { emptyLayout, parseLayout, serializeLayout, type LayoutFile } from '../shared/layoutFile'
+import { emptyLayout, parseLayout, serializeLayout, orderTabs, moveTab, type LayoutFile } from '../shared/layoutFile'
 import { appChord, chordLabel, modLabel, CHORD_TABLE } from './keys'
 import './theme.css'
 
@@ -39,12 +39,44 @@ function shortCwd(cwd: string, home: string): string {
   return home && cwd.startsWith(home) ? '~' + cwd.slice(home.length) : cwd
 }
 
+// Inline rename field for workspace pills / tabs. Enter commits, Escape cancels,
+// blur commits — Enter/Escape just blur (with a cancel flag) so the single commit
+// path lives in onBlur. stopPropagation keeps typing away from the global chords
+// and the parent's click-to-switch / double-click handlers.
+function RenameInput({ initial, onCommit, onCancel }:
+  { initial: string; onCommit: (v: string) => void; onCancel: () => void }): JSX.Element {
+  const cancel = useRef(false)
+  return (
+    <input
+      className="rename-input"
+      defaultValue={initial}
+      autoFocus
+      aria-label="rename"
+      spellCheck={false}
+      onFocus={(e) => e.currentTarget.select()}
+      onClick={(e) => e.stopPropagation()}
+      onDoubleClick={(e) => e.stopPropagation()}
+      onKeyDown={(e) => {
+        e.stopPropagation()
+        if (e.key === 'Enter') { cancel.current = false; e.currentTarget.blur() }
+        else if (e.key === 'Escape') { cancel.current = true; e.currentTarget.blur() }
+      }}
+      onBlur={(e) => { if (cancel.current) onCancel(); else onCommit(e.currentTarget.value) }}
+    />
+  )
+}
+
 function App(): JSX.Element {
   const bridgeReady = typeof window.amber?.onDaemonEvent === 'function'
   const [state, dispatch] = useReducer(reduce, undefined, initialState)
   const [layout, setLayout] = useState<LayoutFile>(emptyLayout)
   const [activeTab, setActiveTab] = useState(1)
   const [activeWs, setActiveWs] = useState(1)
+  // Which label is being inline-renamed (workspace pill or tab), if any.
+  const [editing, setEditing] = useState<{ kind: 'ws' | 'tab'; id: number } | null>(null)
+  // Tab id currently being dragged for reorder (HTML5 drag; ref, not state, so
+  // the drag gesture never re-renders the terminals).
+  const dragTab = useRef<number | null>(null)
   const [kind, setKind] = useState<'shell' | 'claude'>('shell')
   // Absolute working directory for newly created panes (default $HOME). Sent
   // verbatim so a session restores in the SAME folder — a relative '.' would
@@ -132,12 +164,45 @@ function App(): JSX.Element {
   const storedTree = layout.workspaces[wsKey]?.tabs[tabKey]?.tree ?? null
   const tree = reconcile(storedTree, liveIds)
 
+  // Visual tab order: sidecar `tabOrder` first, unlisted append numerically.
+  const orderedTabs = orderTabs(tabs.map((t) => t.tab), layout.workspaces[wsKey]?.tabOrder)
+    .map((id) => tabs.find((t) => t.tab === id))
+    .filter((t): t is (typeof tabs)[number] => t !== undefined)
+
   const putTree = useCallback((next: Node | null) => {
     setLayout((l) => {
       const w = l.workspaces[wsKey] ?? { activeTab, tabs: {} }
-      return { ...l, workspaces: { ...l.workspaces, [wsKey]: { ...w, tabs: { ...w.tabs, [tabKey]: { tree: next } } } } }
+      // Preserve any existing tab-level fields (e.g. `label`) — only the tree changes.
+      const prev = w.tabs[tabKey]
+      return { ...l, workspaces: { ...l.workspaces, [wsKey]: { ...w, tabs: { ...w.tabs, [tabKey]: { ...prev, tree: next } } } } }
     })
   }, [wsKey, tabKey, activeTab])
+
+  // Sidecar label edits — app-owned display metadata; daemon state untouched. An
+  // empty/whitespace value clears the label (drops the key → numeric default;
+  // omitting rather than setting `undefined` satisfies exactOptionalPropertyTypes).
+  const setWsLabel = useCallback((wsId: number, value: string): void => setLayout((l) => {
+    const key = String(wsId)
+    const { label: _drop, ...w } = l.workspaces[key] ?? { activeTab: 1, tabs: {} }
+    const t = value.trim()
+    return { ...l, workspaces: { ...l.workspaces, [key]: t ? { ...w, label: t } : w } }
+  }), [])
+  const setTabLabel = useCallback((tabId: number, value: string): void => setLayout((l) => {
+    const w = l.workspaces[wsKey] ?? { activeTab, tabs: {} }
+    const tKey = String(tabId)
+    const { label: _drop, ...prev } = w.tabs[tKey] ?? { tree: null }
+    const t = value.trim()
+    const nextTab = t ? { ...prev, label: t } : prev
+    return { ...l, workspaces: { ...l.workspaces, [wsKey]: { ...w, tabs: { ...w.tabs, [tKey]: nextTab } } } }
+  }), [wsKey, activeTab])
+  // Persist a drag-reorder as `tabOrder` (pure `moveTab` on the current order).
+  const reorderTab = useCallback((from: number, to: number): void => setLayout((l) => {
+    const w = l.workspaces[wsKey] ?? { activeTab, tabs: {} }
+    const current = orderTabs(tabs.map((t) => t.tab), w.tabOrder)
+    const next = moveTab(current, from, to)
+    if (next === current) return l
+    return { ...l, workspaces: { ...l.workspaces, [wsKey]: { ...w, tabOrder: next } } }
+  }), [wsKey, activeTab, tabs])
 
   useEffect(() => {
     if (!loaded) return
@@ -206,10 +271,12 @@ function App(): JSX.Element {
     if (tab) newPane(tab.tab, nextOrd)
     else { newPane(1, 0); setActiveTab(1) }
   }
+  // Keyboard nav follows the VISUAL order (orderedTabs), so prev/next and the
+  // 1–9 jump match what the user sees after a reorder.
   const stepTab = (d: number): void => {
-    if (tabs.length === 0) return
-    const i = Math.max(0, tabs.findIndex((t) => t.tab === (tab?.tab ?? -1)))
-    setActiveTab(tabs[(i + d + tabs.length) % tabs.length]!.tab)
+    if (orderedTabs.length === 0) return
+    const i = Math.max(0, orderedTabs.findIndex((t) => t.tab === (tab?.tab ?? -1)))
+    setActiveTab(orderedTabs[(i + d + orderedTabs.length) % orderedTabs.length]!.tab)
   }
   // Refresh the keyboard-chord dispatcher with this render's live closures.
   chordRef.current = (c) => {
@@ -218,7 +285,7 @@ function App(): JSX.Element {
     else if (c?.type === 'prev-tab') stepTab(-1)
     else if (c?.type === 'next-tab') stepTab(1)
     else if (c?.type === 'help') setShowHelp(true)
-    else if (c?.type === 'tab') { const t = tabs[c.n - 1]; if (t) setActiveTab(t.tab) }
+    else if (c?.type === 'tab') { const t = orderedTabs[c.n - 1]; if (t) setActiveTab(t.tab) }
   }
 
   // Pane close is one-way (rule #3): `onClose` only requests the kill. Removal
@@ -241,10 +308,20 @@ function App(): JSX.Element {
       )}
       <div className="toolbar">
         <span className="label">workspace</span>
-        {workspaces.map((w) => (
-          <button key={w.ws} className={'btn ws-pill' + (w.ws === (ws?.ws ?? -1) ? ' active' : '')}
-            onClick={() => setActiveWs(w.ws)}>{w.ws}</button>
-        ))}
+        {workspaces.map((w) => {
+          const wsLabel = layout.workspaces[String(w.ws)]?.label
+          if (editing?.kind === 'ws' && editing.id === w.ws) {
+            return <RenameInput key={w.ws} initial={wsLabel ?? String(w.ws)}
+              onCommit={(v) => { setWsLabel(w.ws, v); setEditing(null) }}
+              onCancel={() => setEditing(null)} />
+          }
+          return (
+            <button key={w.ws} className={'btn ws-pill' + (w.ws === (ws?.ws ?? -1) ? ' active' : '')}
+              aria-label={`workspace ${wsLabel ?? w.ws}`} title="double-click to rename"
+              onClick={() => setActiveWs(w.ws)}
+              onDoubleClick={() => setEditing({ kind: 'ws', id: w.ws })}>{wsLabel ?? w.ws}</button>
+          )
+        })}
         <button className="btn btn-ghost"
           onClick={() => { setActiveWs(nextWs); window.amber.createSession(formatName({ ws: nextWs, tab: 1, ord: 0, id: makeId() }), cwd, kind); setActiveTab(1) }}>+ ws</button>
         <div className="divider" />
@@ -263,15 +340,40 @@ function App(): JSX.Element {
         <button className="icon-btn help-btn" aria-label="keyboard shortcuts"
           title={`Keyboard shortcuts (${chordLabel('help')})`} onClick={() => setShowHelp(true)}>?</button>
       </div>
-      <div className="tabbar">
-        {tabs.map((t) => {
+      <div className="tabbar" role="tablist">
+        {orderedTabs.map((t) => {
           const hasClaude = t.panes.some((p) => p.kind === 'claude')
+          const isActive = t.tab === (tab?.tab ?? -1)
+          const isEditing = editing?.kind === 'tab' && editing.id === t.tab
+          const tabLabel = layout.workspaces[wsKey]?.tabs[String(t.tab)]?.label
+          // One-way close (rule #3): request a kill for every pane in the tab; the
+          // tab vanishes when the daemon's removal events empty it. No local removal.
+          const closeTab = (): void => t.panes.forEach((p) => window.amber.killSession(p.name))
           return (
-            <button key={t.tab} className={'tab' + (t.tab === (tab?.tab ?? -1) ? ' active' : '')}
-              onClick={() => setActiveTab(t.tab)}>
+            <div key={t.tab} role="tab" aria-selected={isActive} tabIndex={0}
+              className={'tab' + (isActive ? ' active' : '')}
+              draggable={!isEditing}
+              onClick={() => setActiveTab(t.tab)}
+              onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setActiveTab(t.tab) } }}
+              onDoubleClick={() => setEditing({ kind: 'tab', id: t.tab })}
+              onMouseDown={(e) => { if (e.button === 1) e.preventDefault() }}
+              onAuxClick={(e) => { if (e.button === 1) { e.preventDefault(); closeTab() } }}
+              onDragStart={(e) => { dragTab.current = t.tab; e.dataTransfer.effectAllowed = 'move' }}
+              onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move' }}
+              onDrop={(e) => { e.preventDefault(); if (dragTab.current !== null) reorderTab(dragTab.current, t.tab); dragTab.current = null }}
+              onDragEnd={() => { dragTab.current = null }}>
               <span className={'kind-dot ' + (hasClaude ? 'claude' : 'shell')} />
-              tab {t.tab}<span className="count">{t.panes.length}</span>
-            </button>
+              {isEditing
+                ? <RenameInput initial={tabLabel ?? `tab ${t.tab}`}
+                    onCommit={(v) => { setTabLabel(t.tab, v); setEditing(null) }}
+                    onCancel={() => setEditing(null)} />
+                : <>
+                    <span className="tab-label">{tabLabel ?? `tab ${t.tab}`}</span>
+                    <span className="count">{t.panes.length}</span>
+                    <button className="tab-close" aria-label="close tab" title="close tab"
+                      onClick={(e) => { e.stopPropagation(); closeTab() }}>✕</button>
+                  </>}
+            </div>
           )
         })}
         <button className="btn btn-ghost tab-add" onClick={openTab}>+ Tab</button>

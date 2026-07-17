@@ -1,9 +1,36 @@
 import type { Node } from '../renderer/layout'
 
 export const LAYOUT_VERSION = 1
-export interface TabLayout { tree: Node | null }
-export interface WsLayout { activeTab: number; tabs: Record<string, TabLayout> }
+// `label` is app-owned display metadata ONLY (never touches daemon session
+// names). All added fields are OPTIONAL — old sidecars parse fine (missing →
+// undefined) and old readers ignore unknown-but-additive keys.
+export interface TabLayout { tree: Node | null; label?: string }
+export interface WsLayout { activeTab: number; tabs: Record<string, TabLayout>; label?: string; tabOrder?: number[] }
 export interface LayoutFile { version: number; activeWorkspace: number; workspaces: Record<string, WsLayout> }
+
+// Pure display-order reconcile: listed ids keep `order`'s sequence (skipping any
+// that no longer exist); every unlisted id appends in numeric order. Missing or
+// empty `order` → pure numeric order.
+export function orderTabs(ids: number[], order?: number[]): number[] {
+  const present = new Set(ids)
+  const listed = (order ?? []).filter((id) => present.has(id))
+  const seen = new Set(listed)
+  const rest = ids.filter((id) => !seen.has(id)).sort((a, b) => a - b)
+  return [...listed, ...rest]
+}
+
+// Pure reorder: move `from` to `to`'s slot within `order`. Standard drag
+// semantics — left→right lands after the target, right→left lands before it.
+// No-op if either id is absent or from === to.
+export function moveTab(order: number[], from: number, to: number): number[] {
+  const fi = order.indexOf(from)
+  const ti = order.indexOf(to)
+  if (fi < 0 || ti < 0 || fi === ti) return order
+  const next = [...order]
+  next.splice(fi, 1)
+  next.splice(ti, 0, from)
+  return next
+}
 
 export function emptyLayout(): LayoutFile {
   return { version: LAYOUT_VERSION, activeWorkspace: 1, workspaces: {} }
