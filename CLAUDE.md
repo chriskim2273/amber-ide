@@ -263,6 +263,23 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   app 140 tests + typecheck + bundle green. Still open: live-GUI gesture
   verification (renderer components still test-deferred); running daemon
   needs restart for run-state/activity events.
+- [x] Workspace save/load (2026-07-17) — manual save/restore of workspaces to
+  portable `.amberws` JSON (structure + scrollback). Spec:
+  `docs/superpowers/specs/2026-07-17-workspace-save-load-design.md`. Daemon:
+  `DumpBacklog`/`Backlog` control msgs — ring snapshot sent as ONE frame off
+  the read thread (Attach-forwarder discipline; ring ≤2 MiB ≪ 64 MiB frame
+  cap). App: `workspaceFile.ts` (versioned parse/serialize, placeholder tree
+  rewrites — write-clean, shape-guarded), toolbar 💾/📂 + native dialogs
+  (atomic write), scope dialog (current/all ws), load dialog (new ws /
+  replace current w/ confirm; multi-ws replace = first→current, rest at free
+  numbers), name-keyed dump correlation (5 s timeout → empty + straggler
+  banner), fresh sessions via `createSession` only (one-way flow; sidecar
+  commits after daemon confirms — pending-placement pattern), saved
+  scrollback replayed once into xterm at mount via staged ref-map (no Pane
+  prop churn). Claude panes load as fresh claude (no resume; history under
+  alt screen). Gates: Rust 167 + clippy clean, app 181 tests + typecheck +
+  bundle green. Daemon restart required for DumpBacklog; live-GUI dialog/
+  replay verification manual (renderer components test-deferred).
 
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**
