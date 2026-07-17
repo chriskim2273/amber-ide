@@ -149,20 +149,26 @@ describe('appChord (help)', () => {
   })
 })
 
-describe('appChord (zoom)', () => {
-  it('maps Cmd+M (and Cmd+Shift+M form) to zoom on mac', () => {
+describe('appChord (zoom — mac needs Shift to dodge the Cmd+M Minimize accelerator)', () => {
+  it('requires Cmd+Shift+M on mac; plain Cmd+M does NOT zoom', () => {
     setPlatform('MacIntel')
-    expect(appChord(key({ key: 'm', meta: true }))).toEqual({ type: 'zoom' })
+    // e.key for Cmd+Shift+M is uppercase 'M' — matching normalizes case.
     expect(appChord(key({ key: 'M', meta: true, shift: true }))).toEqual({ type: 'zoom' })
+    expect(appChord(key({ key: 'm', meta: true }))).toBeNull()
   })
-  it('maps Ctrl+Shift+M to zoom on linux', () => {
+  it('leaves non-macShift chords shift-agnostic on mac', () => {
+    setPlatform('MacIntel')
+    expect(appChord(key({ key: 't', meta: true }))).toEqual({ type: 'new-tab' })
+    expect(appChord(key({ key: 't', meta: true, shift: true }))).toEqual({ type: 'new-tab' })
+  })
+  it('maps Ctrl+Shift+M to zoom on linux (unchanged)', () => {
     setPlatform('Linux x86_64')
     expect(appChord(key({ key: 'm', ctrl: true, shift: true }))).toEqual({ type: 'zoom' })
     expect(appChord(key({ key: 'M', ctrl: true, shift: true }))).toEqual({ type: 'zoom' })
   })
   it('renders the zoom label per platform', () => {
     setPlatform('MacIntel')
-    expect(chordLabel('zoom')).toBe('⌘M')
+    expect(chordLabel('zoom')).toBe('⌘⇧M')
     setPlatform('Linux x86_64')
     expect(chordLabel('zoom')).toBe('Ctrl+Shift+M')
   })
@@ -192,7 +198,8 @@ describe('CHORD_TABLE (single source of truth)', () => {
     setPlatform('MacIntel')
     for (const entry of CHORD_TABLE) {
       const k = entry.keys[0]!
-      expect(appChord(key({ key: k, meta: true }))).toEqual({ type: entry.action })
+      // macShift entries require Shift; the rest are shift-agnostic.
+      expect(appChord(key({ key: k, meta: true, shift: entry.macShift === true }))).toEqual({ type: entry.action })
     }
   })
   it('exposes action/label/keys for every entry', () => {

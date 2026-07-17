@@ -51,6 +51,22 @@ describe('layoutFile', () => {
     expect(l.workspaces['1']!.tabOrder).toBeUndefined()
     expect(l.workspaces['1']!.tabs['1']!.label).toBeUndefined()
   })
+  it('shape-guards a non-array tabOrder and non-string label (both dropped)', () => {
+    const bad = JSON.stringify({
+      version: LAYOUT_VERSION, activeWorkspace: 1,
+      workspaces: { '1': { activeTab: 1, tabs: { '1': { tree: null } }, tabOrder: 'nope', label: 42 } },
+    })
+    const w = parseLayout(bad).workspaces['1']!
+    expect(w.tabOrder).toBeUndefined()
+    expect(w.label).toBeUndefined()
+  })
+  it('filters non-number entries out of a valid tabOrder', () => {
+    const l = parseLayout(JSON.stringify({
+      version: LAYOUT_VERSION, activeWorkspace: 1,
+      workspaces: { '1': { activeTab: 1, tabs: { '1': { tree: null } }, tabOrder: [2, 'x', 1, null] } },
+    }))
+    expect(l.workspaces['1']!.tabOrder).toEqual([2, 1])
+  })
   it('round-trips a frozen map (note and empty-note entries)', () => {
     const l = emptyLayout()
     l.frozen = { 'amber-1-1-0-a': { note: 'back after lunch' }, 'amber-2-1-0-b': {} }

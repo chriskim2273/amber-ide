@@ -284,11 +284,15 @@ impl PtySession {
                     // ~2/sec, so the fan-out thread is never blocked here.
                     let now = monotonic_ms();
                     let last = activity.last_ms.load(Ordering::Relaxed);
-                    // `last == 0` is the "never fired" sentinel: the FIRST output
-                    // frame always notifies (monotonic_ms starts near 0, so a
-                    // plain `now - last >= interval` would suppress it for the
-                    // first 500 ms). Store `now.max(1)` so a real fire never
-                    // re-arms the sentinel.
+                    // `last == 0` is the "never fired" sentinel: the first output
+                    // frame *after the hook is installed* notifies immediately
+                    // (monotonic_ms starts near 0, so a plain `now - last >=
+                    // interval` would suppress it for the first 500 ms). The hook
+                    // is installed after spawn, so a frame that lands before then
+                    // still arms the sentinel here with `hook == None` — that one
+                    // frame goes unnotified and its activity folds into the next
+                    // 500 ms window (harmless). Store `now.max(1)` so a real fire
+                    // never re-arms the sentinel.
                     if last == 0 || now.saturating_sub(last) >= ACTIVITY_MIN_INTERVAL_MS {
                         activity.last_ms.store(now.max(1), Ordering::Relaxed);
                         if let Some(hook) = activity.hook.lock().unwrap().as_ref() {

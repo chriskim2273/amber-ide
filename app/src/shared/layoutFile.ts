@@ -33,6 +33,29 @@ function parseFrozen(v: unknown): Record<string, FrozenEntry> | undefined {
   return out
 }
 
+// Shape-guard each workspace's hand-editable display fields (same lesson as
+// parseFrozen): a non-array `tabOrder` would throw in `orderTabs` on every
+// render, a non-string `label` renders garbage. Drop `tabOrder` unless it's an
+// array (filtered to finite numbers); drop `label` unless it's a string. Other
+// fields (activeTab, tabs) pass through — malformed non-objects are skipped.
+function parseWorkspaces(v: unknown): Record<string, WsLayout> {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return {}
+  const out: Record<string, WsLayout> = {}
+  for (const [k, ws] of Object.entries(v)) {
+    if (typeof ws !== 'object' || ws === null || Array.isArray(ws)) continue
+    const w = ws as Partial<WsLayout> & { label?: unknown; tabOrder?: unknown }
+    out[k] = {
+      activeTab: typeof w.activeTab === 'number' ? w.activeTab : 1,
+      tabs: (w.tabs ?? {}) as Record<string, TabLayout>,
+      ...(typeof w.label === 'string' ? { label: w.label } : {}),
+      ...(Array.isArray(w.tabOrder)
+        ? { tabOrder: w.tabOrder.filter((n): n is number => typeof n === 'number' && Number.isFinite(n)) }
+        : {}),
+    }
+  }
+  return out
+}
+
 // Pure display-order reconcile: listed ids keep `order`'s sequence (skipping any
 // that no longer exist); every unlisted id appends in numeric order. Missing or
 // empty `order` → pure numeric order.
@@ -70,7 +93,7 @@ export function parseLayout(text: string): LayoutFile {
     return {
       version: LAYOUT_VERSION,
       activeWorkspace: typeof v.activeWorkspace === 'number' ? v.activeWorkspace : 1,
-      workspaces: v.workspaces as Record<string, WsLayout>,
+      workspaces: parseWorkspaces(v.workspaces),
       // Conditional spread so a missing fontSize stays absent (not `undefined`)
       // under exactOptionalPropertyTypes.
       ...(typeof v.fontSize === 'number' ? { fontSize: v.fontSize } : {}),

@@ -43,6 +43,10 @@ export interface ChordEntry {
   label: string
   keys: string[]
   desc: string
+  // Mac-only: require Cmd+Shift (not plain Cmd) so the chord dodges a native
+  // menu accelerator on plain Cmd+key. Ignored on Linux (Shift is already the
+  // modifier). See `zoom` — plain Cmd+M is the windowMenu Minimize.
+  macShift?: true
 }
 
 export const CHORD_TABLE: ChordEntry[] = [
@@ -63,30 +67,39 @@ export const CHORD_TABLE: ChordEntry[] = [
   { action: 'font-smaller', label: '-', keys: ['-', '_'], desc: 'Decrease font size' },
   { action: 'font-reset', label: '0', keys: ['0', ')'], desc: 'Reset font size' },
   // Zoom the focused pane to fill the stage (M avoids the Z=undo collision).
-  { action: 'zoom', label: 'M', keys: ['m'], desc: 'Zoom / restore focused pane' },
+  // Mac uses Cmd+Shift+M: plain Cmd+M is the windowMenu Minimize accelerator,
+  // which consumes the key before the renderer sees it. Linux: Ctrl+Shift+M.
+  { action: 'zoom', label: 'M', keys: ['m'], desc: 'Zoom / restore focused pane', macShift: true },
   // Park (freeze) the focused pane — display-only, input-locked; toggles off.
   { action: 'freeze', label: 'P', keys: ['p'], desc: 'Freeze / unfreeze focused pane' },
 ]
 
 export function appChord(e: KeyLike): Chord | null {
   if (e.altKey) return null
-  const mod = isMac() ? (e.metaKey && !e.ctrlKey) : (e.ctrlKey && e.shiftKey && !e.metaKey)
+  const mac = isMac()
+  const mod = mac ? (e.metaKey && !e.ctrlKey) : (e.ctrlKey && e.shiftKey && !e.metaKey)
   if (!mod) return null
   const k = e.key.toLowerCase()
   if (k >= '1' && k <= '9') return { type: 'tab', n: Number(k) }
   const entry = CHORD_TABLE.find((c) => c.keys.includes(k))
-  return entry ? { type: entry.action } : null
+  if (!entry) return null
+  // A macShift entry requires Cmd+Shift on mac (see ChordEntry.macShift): plain
+  // Cmd+key would collide with a native accelerator, and without this it would
+  // also fire on the plain form. Linux already holds Shift, so no extra gate.
+  if (mac && entry.macShift && !e.shiftKey) return null
+  return { type: entry.action }
 }
 
 // Platform modifier prefix + a key label. Used by `chordLabel` and directly by
 // the overlay for the parametric 1–9 tab-jump row (not a CHORD_TABLE entry).
-export function modLabel(key: string): string {
-  return isMac() ? `⌘${key}` : `Ctrl+Shift+${key}`
+// `macShift` adds ⇧ to the mac prefix (Linux is Ctrl+Shift regardless).
+export function modLabel(key: string, macShift = false): string {
+  return isMac() ? `⌘${macShift ? '⇧' : ''}${key}` : `Ctrl+Shift+${key}`
 }
 
 // Human-readable label for a chord action, matching the platform branch above
 // (mac Cmd, else Ctrl+Shift). Used by the empty-state CTA and the cheatsheet.
 export function chordLabel(action: ChordAction): string {
   const entry = CHORD_TABLE.find((c) => c.action === action)
-  return modLabel(entry?.label ?? '')
+  return modLabel(entry?.label ?? '', entry?.macShift ?? false)
 }

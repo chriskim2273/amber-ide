@@ -122,7 +122,9 @@ function App(): JSX.Element {
   // reconcile so it can't prune/re-append them as columns; placed with the
   // requested direction once the daemon confirms the session exists.
   const [pending, setPending] = useState<Record<string, { paneId: string; dir: 'h' | 'v' }>>({})
-  // Transient per-tab pane zoom (tabKey -> zoomed paneId). Renderer-only — never
+  // Transient pane zoom, keyed by composite `${wsKey}:${tabKey}` -> zoomed
+  // paneId (see zoomKey below — bare tabKey would clobber across workspaces).
+  // Renderer-only — never
   // written to the layout sidecar. Cleared when the tab's pane set changes
   // structurally (split/close/move), so it can't outlive its pane.
   const [zoom, setZoom] = useState<Record<string, string>>({})
