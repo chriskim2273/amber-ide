@@ -642,3 +642,38 @@ fn stale_session_write_and_resize_do_not_kill_the_connection() {
         "connection died after a stale-session write/resize"
     );
 }
+
+#[test]
+fn unknown_control_frame_is_skipped_not_fatal() {
+    // Forward-compat: a newer client sends a control message this daemon can't
+    // decode (simulated here by a raw control frame with an unknown JSON
+    // variant). The daemon must log-and-skip it and keep serving the
+    // multiplexed connection — a subsequent ListSessions still answers.
+    let (socket_path, _dir) = start_daemon();
+    let mut stream = connect_with_retry(&socket_path);
+    let mut decoder = Decoder::new();
+
+    // Hand-encode a control frame (tag 0) whose body is a valid-JSON but
+    // unknown-to-this-build ControlMsg variant. Framing stays length-prefixed.
+    const TAG_CONTROL: u8 = 0;
+    let json = br#"{"FutureMsg":{"x":1}}"#;
+    let mut body = vec![TAG_CONTROL];
+    body.extend_from_slice(json);
+    let mut raw = (body.len() as u32).to_be_bytes().to_vec();
+    raw.extend_from_slice(&body);
+    stream.write_all(&raw).unwrap();
+
+    // A normal request after the unknown one must still be served.
+    send(&mut stream, &Frame::Control(ControlMsg::ListSessions));
+    let reply = read_frame_until(
+        &mut stream,
+        &mut decoder,
+        |f| matches!(f, Frame::Control(ControlMsg::SessionList { .. })),
+        Duration::from_secs(5),
+    );
+    assert_eq!(
+        reply,
+        Frame::Control(ControlMsg::SessionList { names: vec![] }),
+        "connection died after an undecodable control frame"
+    );
+}

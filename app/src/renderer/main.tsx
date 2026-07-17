@@ -9,7 +9,7 @@ import {
   parseWorkspaceFile, serializeWorkspaceFile, assembleSave, planLoad,
   type WorkspaceDoc, type SaveWorkspace, type LoadPlan,
 } from '../shared/workspaceFile'
-import { collectDumps } from './dumps'
+import { collectDumps, matchDumpError } from './dumps'
 import { stageReplay } from './replay'
 import { appChord, chordLabel, modLabel, CHORD_TABLE } from './keys'
 import './theme.css'
@@ -192,11 +192,25 @@ function App(): JSX.Element {
     window.amber.onDaemonEvent((d) => {
       // Backlog replies are routed to the pending dump resolver by name (not
       // through the store reducer) — a save is waiting on collectDumps for them.
-      const bf = (d as { frame?: { type?: string; msg?: { kind?: string; name?: string; data?: Uint8Array } } }).frame
+      const bf = (d as { frame?: { type?: string; msg?: { kind?: string; name?: string; msg?: string; data?: Uint8Array } } }).frame
       if (bf?.type === 'control' && bf.msg?.kind === 'Backlog' && typeof bf.msg.name === 'string') {
         const cb = dumpResolvers.current.get(bf.msg.name)
         if (cb) { dumpResolvers.current.delete(bf.msg.name); cb(bf.msg.data ?? new Uint8Array()) }
         return
+      }
+      // A pane that died mid-save makes its in-flight DumpBacklog reply come back
+      // as an Error ("no such session: <name>"). While dumps are pending, resolve
+      // the matching name as empty scrollback and swallow the Error so it doesn't
+      // ALSO land in the store as a red daemon-error banner (double-surface). Only
+      // while dumps pending, only a name currently awaiting a dump.
+      if (bf?.type === 'control' && bf.msg?.kind === 'Error' && typeof bf.msg.msg === 'string' && dumpResolvers.current.size > 0) {
+        const hit = matchDumpError(bf.msg.msg, dumpResolvers.current.keys())
+        if (hit !== null) {
+          const cb = dumpResolvers.current.get(hit)
+          dumpResolvers.current.delete(hit)
+          cb?.(new Uint8Array())
+          return
+        }
       }
       const st = (d as { status?: string }).status
       if (st === 'connected') setConnected(true)
@@ -530,7 +544,7 @@ function App(): JSX.Element {
     }))
     const doc = assembleSave(scope, live, layoutRef.current, dumps)
     const base = scope === 'one'
-      ? (layout.workspaces[String(currentWs)]?.label ?? `workspace-${currentWs}`)
+      ? (layoutRef.current.workspaces[String(currentWs)]?.label ?? `workspace-${currentWs}`)
       : 'workspaces'
     const ok = await window.amber.saveWorkspaceFile(serializeWorkspaceFile(doc), `${base}.amberws`)
     if (ok && stragglers.length > 0) {

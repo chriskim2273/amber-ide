@@ -6,7 +6,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use amber_core::proto::{self, ControlMsg, Decoder, Frame};
+use amber_core::proto::{self, ControlMsg, Decoded, Decoder, Frame};
 use amber_core::state::SessionKind;
 
 use crate::manager::SessionManager;
@@ -133,8 +133,20 @@ fn connection_loop(
     let mut buf = [0u8; 8192];
 
     loop {
-        while let Some(frame) = decoder.next_frame()? {
-            handle_frame(manager, watchers, writer, frame, subscriptions);
+        while let Some(decoded) = decoder.next_decoded()? {
+            match decoded {
+                Decoded::Frame(frame) => {
+                    handle_frame(manager, watchers, writer, frame, subscriptions)
+                }
+                // Forward-compat: a control body this build can't decode (e.g. a
+                // newer client's new message). Framing is length-prefixed and the
+                // frame is already consumed, so log-and-skip on the read thread
+                // (cheap, no reply — that would be a read-thread write) instead of
+                // dropping the whole multiplexed connection over one gesture.
+                Decoded::UndecodableControl(e) => {
+                    eprintln!("amber daemon: skipping undecodable control frame: {e}");
+                }
+            }
         }
         let n = read_half.read(&mut buf)?;
         if n == 0 {

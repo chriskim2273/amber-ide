@@ -10,6 +10,16 @@ export interface DumpResult {
   stragglers: string[]
 }
 
+// A pane that dies mid-save makes its in-flight `DumpBacklog` reply come back as
+// a daemon `Error` ("no such session: <name>") instead of a `Backlog`. While a
+// save is collecting dumps, we resolve that name as empty scrollback and swallow
+// the Error so it doesn't ALSO surface as a red daemon-error banner. Match by the
+// daemon's exact suffix form so one pending name can't match another's message.
+export function matchDumpError(msg: string, pending: Iterable<string>): string | null {
+  for (const name of pending) if (msg.endsWith(name)) return name
+  return null
+}
+
 export function collectDumps(
   names: string[],
   request: (name: string) => void,

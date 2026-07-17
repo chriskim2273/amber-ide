@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { collectDumps } from './dumps'
+import { collectDumps, matchDumpError } from './dumps'
 
 // A fake resolver registry mirroring the renderer's dumpResolvers map.
 function harness() {
@@ -51,5 +51,26 @@ describe('collectDumps', () => {
     // A late reply for 'b' is a no-op (does not mutate the already-resolved result).
     h.reply('b', new Uint8Array([7]))
     expect(r.dumps['b']).toBeUndefined()
+  })
+})
+
+describe('matchDumpError', () => {
+  it('matches a daemon no-such-session error to an awaiting dump name', () => {
+    const msg = 'no such session: amber-1-1-0-abc'
+    expect(matchDumpError(msg, ['amber-1-1-0-abc', 'amber-1-1-1-def'])).toBe('amber-1-1-0-abc')
+  })
+
+  it('returns null when no awaiting name is referenced', () => {
+    expect(matchDumpError('snapshot failed: disk full', ['amber-1-1-0-abc'])).toBeNull()
+  })
+
+  it('returns null with no pending dumps', () => {
+    expect(matchDumpError('no such session: amber-1-1-0-abc', [])).toBeNull()
+  })
+
+  it('does not match a name that is only a mid-string substring of another', () => {
+    // endsWith (not includes) so "abc" can't be matched by an error naming
+    // "abcd" — the daemon suffixes the exact name.
+    expect(matchDumpError('no such session: amber-1-1-0-abcd', ['amber-1-1-0-abc'])).toBeNull()
   })
 })

@@ -102,6 +102,18 @@ pub enum Frame {
     Data { session: String, bytes: Vec<u8> },
 }
 
+/// Outcome of a lenient decode ([`Decoder::next_decoded`]). Distinguishes a
+/// usable frame from a well-framed control body that failed serde decode — a
+/// newer peer sending a control message this build doesn't know. Because
+/// framing is length-prefixed, an undecodable body has already been consumed
+/// and the stream stays in sync, so the daemon can log-and-skip it instead of
+/// dropping the whole (multiplexed) connection over one unknown message.
+#[derive(Debug)]
+pub enum Decoded {
+    Frame(Frame),
+    UndecodableControl(anyhow::Error),
+}
+
 const TAG_CONTROL: u8 = 0;
 const TAG_DATA: u8 = 1;
 
@@ -154,7 +166,28 @@ impl Decoder {
     }
 
     /// Pull the next complete frame, or `Ok(None)` if more bytes are needed.
+    ///
+    /// Strict: a control body that fails serde decode is a hard error, dropping
+    /// the connection. Used by clients (attach/CLI), where an undecodable reply
+    /// is unrecoverable. The daemon's inbound path uses [`next_decoded`] instead
+    /// to log-and-skip such a frame (forward-compat).
+    ///
+    /// [`next_decoded`]: Self::next_decoded
     pub fn next_frame(&mut self) -> anyhow::Result<Option<Frame>> {
+        match self.next_decoded()? {
+            Some(Decoded::Frame(f)) => Ok(Some(f)),
+            Some(Decoded::UndecodableControl(e)) => Err(e),
+            None => Ok(None),
+        }
+    }
+
+    /// Like [`next_frame`](Self::next_frame) but forward-tolerant: a well-framed
+    /// control body that fails serde decode yields
+    /// [`Decoded::UndecodableControl`] instead of an error, so the caller can
+    /// skip it and keep the connection alive. Genuine framing violations
+    /// (oversize length, truncated/malformed/unknown-tag frames) are still hard
+    /// errors — skipping those would mean trusting a corrupt length prefix.
+    pub fn next_decoded(&mut self) -> anyhow::Result<Option<Decoded>> {
         if self.buf.len() < 4 {
             return Ok(None);
         }
@@ -166,13 +199,22 @@ impl Decoder {
             return Ok(None);
         }
         let body: Vec<u8> = self.buf[4..4 + len].to_vec();
+        // Drain BEFORE decoding the body: framing is length-prefixed, so once
+        // the frame is consumed the stream stays in sync even if the body turns
+        // out to be an undecodable control message we skip.
         self.buf.drain(..4 + len);
 
         let (&tag, rest) = body
             .split_first()
             .ok_or_else(|| anyhow::anyhow!("empty frame body"))?;
-        let frame = match tag {
-            TAG_CONTROL => Frame::Control(serde_json::from_slice(rest)?),
+        let decoded = match tag {
+            TAG_CONTROL => match serde_json::from_slice(rest) {
+                Ok(msg) => Decoded::Frame(Frame::Control(msg)),
+                // Well-framed but undecodable (e.g. a newer peer's unknown
+                // control variant). The frame is already drained; signal a
+                // skippable frame rather than tearing down the connection.
+                Err(e) => Decoded::UndecodableControl(anyhow::Error::new(e)),
+            },
             TAG_DATA => {
                 if rest.len() < 2 {
                     anyhow::bail!("truncated data frame header");
@@ -183,11 +225,11 @@ impl Decoder {
                 }
                 let session = std::str::from_utf8(&rest[2..2 + name_len])?.to_string();
                 let bytes = rest[2 + name_len..].to_vec();
-                Frame::Data { session, bytes }
+                Decoded::Frame(Frame::Data { session, bytes })
             }
             other => anyhow::bail!("unknown frame tag {other}"),
         };
-        Ok(Some(frame))
+        Ok(Some(decoded))
     }
 }
 
@@ -199,6 +241,59 @@ mod tests {
         let mut d = Decoder::new();
         d.feed(&encode(f));
         d.next_frame().unwrap().expect("one full frame")
+    }
+
+    /// Hand-encode a control frame with an arbitrary JSON body (bypassing
+    /// `encode`, which only ever emits valid `ControlMsg`) — used to simulate a
+    /// newer peer sending a control message this build can't decode.
+    fn encode_raw_control(json: &[u8]) -> Vec<u8> {
+        let mut body = vec![TAG_CONTROL];
+        body.extend_from_slice(json);
+        let mut out = (body.len() as u32).to_be_bytes().to_vec();
+        out.extend_from_slice(&body);
+        out
+    }
+
+    #[test]
+    fn undecodable_control_body_is_skippable_not_fatal() {
+        // Forward-compat: a newer peer sends a control variant this build does
+        // not know. Framing is length-prefixed, so the body is already consumed
+        // and the stream stays in sync — `next_decoded` reports a skippable
+        // signal instead of erroring, and the following good frame still decodes.
+        let mut d = Decoder::new();
+        d.feed(&encode_raw_control(br#"{"FutureMsg":{"x":1}}"#));
+        d.feed(&encode(&Frame::Control(ControlMsg::Hello)));
+        match d.next_decoded().unwrap() {
+            Some(Decoded::UndecodableControl(_)) => {}
+            other => panic!("expected UndecodableControl skip, got {other:?}"),
+        }
+        match d.next_decoded().unwrap() {
+            Some(Decoded::Frame(Frame::Control(ControlMsg::Hello))) => {}
+            other => panic!("stream out of sync after skip: {other:?}"),
+        }
+        assert!(d.next_decoded().unwrap().is_none());
+    }
+
+    #[test]
+    fn next_decoded_still_hard_errors_on_framing_violation() {
+        // Oversize length is a genuine framing violation, NOT a decodable body:
+        // it must stay a hard error (the connection drops) even on the lenient
+        // path — skipping it would mean trusting a corrupt/hostile length prefix.
+        let mut d = Decoder::new();
+        let mut bytes = ((MAX_FRAME_LEN as u32) + 1).to_be_bytes().to_vec();
+        bytes.push(TAG_CONTROL);
+        d.feed(&bytes);
+        assert!(d.next_decoded().is_err());
+    }
+
+    #[test]
+    fn next_frame_still_errors_on_undecodable_control() {
+        // Back-compat: strict callers (attach/CLI) keep getting a hard error on
+        // an undecodable control body — only the daemon opts into leniency via
+        // `next_decoded`.
+        let mut d = Decoder::new();
+        d.feed(&encode_raw_control(br#"{"FutureMsg":{}}"#));
+        assert!(d.next_frame().is_err());
     }
 
     #[test]
