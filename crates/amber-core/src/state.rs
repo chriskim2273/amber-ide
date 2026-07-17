@@ -103,9 +103,12 @@ impl StateStore {
     }
 
     /// Atomically write `bytes` to `path`: create parent dirs, write a
-    /// same-directory temp file (named with the pid to avoid collisions),
-    /// then rename over the final path.
+    /// same-directory temp file, then rename over the final path. The temp
+    /// name carries the pid (unique across processes) AND a per-call atomic
+    /// counter (unique across threads) — a pid-only name let two threads of
+    /// the same process share a tmp path and interleave write/rename.
     fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let parent = path
             .parent()
             .ok_or_else(|| anyhow::anyhow!("path has no parent: {}", path.display()))?;
@@ -114,7 +117,8 @@ impl StateStore {
             .file_name()
             .ok_or_else(|| anyhow::anyhow!("path has no file name: {}", path.display()))?
             .to_string_lossy();
-        let tmp_path = parent.join(format!("{file_name}.{}.tmp", std::process::id()));
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp_path = parent.join(format!("{file_name}.{}.{seq}.tmp", std::process::id()));
         fs::write(&tmp_path, bytes)?;
         fs::rename(&tmp_path, path)?;
         Ok(())
@@ -323,6 +327,41 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
             .collect();
         assert_eq!(entries, vec!["alpha.json".to_string()]);
+    }
+
+    #[test]
+    fn concurrent_atomic_writes_to_same_path_never_error_or_interleave() {
+        // Two threads in the same process hammering atomic_write on the same
+        // target must not share a tmp path: sharing one lets writes
+        // interleave (torn content) or lets one thread rename the tmp away
+        // under the other (NotFound). The final file must be exactly one
+        // thread's complete payload and no call may error.
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("state/contended.bin");
+        const ROUNDS: usize = 500;
+        const LEN: usize = 64 * 1024;
+
+        let mut handles = Vec::new();
+        for byte in [b'a', b'b'] {
+            let target = target.clone();
+            handles.push(std::thread::spawn(move || {
+                let payload = vec![byte; LEN];
+                for _ in 0..ROUNDS {
+                    StateStore::atomic_write(&target, &payload)?;
+                }
+                anyhow::Ok(())
+            }));
+        }
+        for h in handles {
+            h.join().unwrap().expect("atomic_write errored under contention");
+        }
+
+        let final_bytes = fs::read(&target).unwrap();
+        assert_eq!(final_bytes.len(), LEN, "torn/truncated final file");
+        assert!(
+            final_bytes.iter().all(|&b| b == b'a') || final_bytes.iter().all(|&b| b == b'b'),
+            "final file interleaves both threads' payloads"
+        );
     }
 
     #[test]
