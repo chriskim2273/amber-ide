@@ -191,6 +191,13 @@ function App(): JSX.Element {
   return (
     <div className="app">
       {!connected && <div className="banner"><span className="dot" />daemon disconnected — reconnecting…</div>}
+      {state.error && (
+        <div className="banner error-banner" role="alert">
+          <span className="dot" />
+          <span className="banner-msg">daemon error: {state.error}</span>
+          <button className="banner-close" title="dismiss" onClick={() => dispatch({ kind: 'ClearError' })}>✕</button>
+        </div>
+      )}
       <div className="toolbar">
         <span className="label">workspace</span>
         {workspaces.map((w) => (

@@ -32,8 +32,20 @@ describe('store', () => {
     expect(ws[0]!.tabs.map((t) => t.tab)).toEqual([1, 2])
     expect(ws[0]!.tabs[0]!.panes.map((p) => p.name)).toEqual(['amber-1-1-0-a', 'amber-1-1-1-b'])
   })
-  it('Error sets error', () => {
-    const st = reduce(initialState(), { kind: 'Error', msg: 'boom' })
+  it('Error sets error; a later Error replaces it', () => {
+    let st = reduce(initialState(), { kind: 'Error', msg: 'boom' })
+    expect(st.error).toBe('boom')
+    st = reduce(st, { kind: 'Error', msg: 'rename unsupported' })
+    expect(st.error).toBe('rename unsupported')
+  })
+  it('ClearError resets error to null', () => {
+    let st = reduce(initialState(), { kind: 'Error', msg: 'boom' })
+    st = reduce(st, { kind: 'ClearError' })
+    expect(st.error).toBeNull()
+  })
+  it('SessionsChanged preserves an unread error', () => {
+    let st = reduce(initialState(), { kind: 'Error', msg: 'boom' })
+    st = reduce(st, { kind: 'SessionsChanged', added: [s('amber-1-1-0-a')], removed: [] })
     expect(st.error).toBe('boom')
   })
 })
