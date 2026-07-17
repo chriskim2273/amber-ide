@@ -1,7 +1,7 @@
 # Design: Draggable panels + claude ^C falls to shell
 
 Date: 2026-07-14
-Status: approved, ready for implementation plan
+Status: **shipped / implemented** (see CLAUDE.md build status — UX pass 2026-07-14)
 
 Two independent changes:
 

@@ -164,7 +164,7 @@ enum ControlMsg {
 - **Socket path (verified against `crates/amber/src/main.rs` `default_socket`/`default_root`):** `$XDG_RUNTIME_DIR/amber-ide/amberd.sock`; if `XDG_RUNTIME_DIR` is unset/empty, the daemon falls back to `<root>/amberd.sock` where `root` = `$XDG_STATE_HOME/amber-ide` (else `$HOME/.local/state/amber-ide`). The app MUST replicate this exact resolution, or accept an explicit path, so it connects to the same socket the daemon binds. A daemon started with a non-default `--socket` is out of scope for auto-detect (the app assumes the default resolution).
 - **On app launch (`daemon-boot.ts`):** connect-probe. If it answers → proceed. If refused → exec the **bundled** `amber` binary to install + start the boot unit (`ctl install`, which sets up the systemd user unit / launchd agent per the daemon spec), then retry connect with backoff (cap ~5 s, surfaced as a first-run splash).
 - The daemon **outlives the app**: window close never stops it (reboot survival). An explicit menu item "Quit amber daemon" is the only app path that stops it.
-- The bundled `amber` binary is the same static-musl / universal artifact `scripts/dist.sh` already produces; §9 packaging ships it inside the app bundle.
+- The bundled `amber` binary is the same static-musl (Linux) / universal (macOS) artifact `scripts/dist.sh` produces; `app/scripts/dist.sh` invokes that script and bundles THAT artifact (not a host glibc build), and §9 packaging ships it inside the app bundle.
 
 ---
 

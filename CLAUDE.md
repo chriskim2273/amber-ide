@@ -139,7 +139,11 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   Fixes shipped: claude fresh-start for new sessions; deferred split placement;
   per-pane ResizeObserver; DOM renderer under software GL; layout-load gate.
 - [x] App Slice 7 — packaging: electron-builder (AppImage/dmg), bundled `amber`
-  resolver, `scripts/dist.sh`. **AppImage built with amber bundled.** Packaged
+  resolver. App packaging (`npm run dist` → `app/scripts/dist.sh`) obtains the
+  distributable binary by invoking repo-root `scripts/dist.sh` (static-musl on
+  Linux / universal on macOS) and bundles THAT artifact — not a host glibc build
+  (the Linux path asserts the staged binary is statically linked before
+  bundling). **AppImage built with amber bundled.** Packaged
   first-run does a cargo-free install (copies amber to `~/.local/bin/amber` +
   writes the boot unit directly — systemd user unit on Linux, launchd agent on
   macOS — since the ephemeral AppImage mount can't back a boot unit). Running

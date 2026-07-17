@@ -1,6 +1,6 @@
 # Amber Session Daemon — Design Spec
 
-Status: **draft, awaiting user review**
+Status: **shipped / implemented** (see CLAUDE.md build status — Slices 0–5 + hardening)
 Date: 2026-07-12
 Branch: `feat/rust-session-daemon`
 Supersedes: the tmux + tmux-resurrect + tmux-continuum persistence spine (Phase 1) and the
