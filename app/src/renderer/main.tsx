@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client'
 import { SplitView, type PaneMeta } from './SplitView'
 import { initialState, reduce, groupSessions, type DaemonEvent } from './store'
 import { formatName, makeId } from '../shared/names'
-import { splitLeaf, removeLeaf, setRatio, reconcile, leaves, moveLeaf, type Node } from './layout'
+import { splitLeaf, setRatio, reconcile, leaves, moveLeaf, type Node } from './layout'
 import { emptyLayout, parseLayout, serializeLayout, type LayoutFile } from '../shared/layoutFile'
 import { appChord } from './keys'
 import './theme.css'
@@ -188,6 +188,14 @@ function App(): JSX.Element {
     else if (c?.type === 'tab') { const t = tabs[c.n - 1]; if (t) setActiveTab(t.tab) }
   }
 
+  // Pane close is one-way (rule #3): `onClose` only requests the kill. Removal
+  // then flows from the daemon's SessionsChanged{removed} -> store prunes
+  // state.sessions -> liveIds drops it -> reconcile drops the leaf. An optimistic
+  // local removeLeaf would race reconcile, which still sees the not-yet-confirmed
+  // id in liveIds and re-appends it as a fresh right-split (mispositioned pane).
+  // The daemon broadcasts removal for live AND dead-not-reaped sessions
+  // (daemon.rs Kill broadcasts when the session still exists; the main.rs reap
+  // timer broadcasts too), so dead panes ("close to remove") also flow cleanly.
   return (
     <div className="app">
       {!connected && <div className="banner"><span className="dot" />daemon disconnected — reconnecting…</div>}
@@ -243,7 +251,7 @@ function App(): JSX.Element {
                 setPending((p) => ({ ...p, [name]: { paneId, dir } }))
               }}
               onMove={(s, t, z) => putTree(moveLeaf(tree, s, t, z))}
-              onClose={(paneId) => { window.amber.killSession(paneId); putTree(removeLeaf(tree, paneId)) }} />
+              onClose={(paneId) => window.amber.killSession(paneId)} />
           : <p className="empty-hint">No panes — press <kbd>+ Pane</kbd> to start.</p>}
       </div>
     </div>

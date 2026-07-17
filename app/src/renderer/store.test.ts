@@ -32,6 +32,19 @@ describe('store', () => {
     expect(ws[0]!.tabs.map((t) => t.tab)).toEqual([1, 2])
     expect(ws[0]!.tabs[0]!.panes.map((p) => p.name)).toEqual(['amber-1-1-0-a', 'amber-1-1-1-b'])
   })
+  // Fix 4 dead-pane close: a process-exited pane is marked dead but stays in
+  // the session set (overlay: "close to remove"). Closing it Kills the session;
+  // the daemon broadcasts SessionsChanged{removed}, which must prune BOTH the
+  // session and its dead-code entry so groupSessions no longer yields the pane.
+  it('SessionsChanged removal prunes a dead session and its dead-code entry', () => {
+    let st = reduce(initialState(), { kind: 'Sessions', sessions: [s('amber-1-1-0-a')] })
+    st = reduce(st, { kind: 'Exit', name: 'amber-1-1-0-a', code: 3 })
+    expect(st.dead['amber-1-1-0-a']).toBe(3)
+    st = reduce(st, { kind: 'SessionsChanged', added: [], removed: ['amber-1-1-0-a'] })
+    expect(st.sessions).toHaveLength(0)
+    expect(st.dead['amber-1-1-0-a']).toBeUndefined()
+    expect(groupSessions(st)).toHaveLength(0)
+  })
   it('Error sets error; a later Error replaces it', () => {
     let st = reduce(initialState(), { kind: 'Error', msg: 'boom' })
     expect(st.error).toBe('boom')
