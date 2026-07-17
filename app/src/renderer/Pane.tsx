@@ -162,8 +162,21 @@ export const Pane = memo(function Pane(
   // Client utilityProcess restarted (portEpoch): the old MessagePort is dead —
   // re-request a fresh one from the new child. The terminal (and its scrollback)
   // is preserved; the daemon replays backlog on the re-Attach.
+  //
+  // Fire only when portEpoch CHANGES after mount — the ref is seeded with the
+  // mount-time value, so a pane created while childEpoch is already > 0 does
+  // NOT re-acquire here (the [session] effect's single acquire() covers the
+  // fresh mount; a second openPane would broker a port pair nobody wires,
+  // leaking it).
+  //
+  // Narrow race (accepted): if a restart lands while the INITIAL open is still
+  // in flight, the pre-restart port can arrive after re-acquire re-arms the
+  // listener and get wired even though its child is gone — a dead pane until
+  // the next restart bumps portEpoch again and re-acquires (self-heals).
+  const prevPortEpochRef = useRef(portEpoch)
   useEffect(() => {
-    if (portEpoch === 0) return
+    if (portEpoch === prevPortEpochRef.current) return
+    prevPortEpochRef.current = portEpoch
     acquireRef.current()
   }, [portEpoch])
 

@@ -337,6 +337,9 @@ async function main(): Promise<void> {
     port1.on('message', (e) => notifyRenderer(e.data))
     port1.start()
     c.on('exit', () => {
+      // This child's control channel died with it — close our end explicitly
+      // (matches the "replace dead ports" intent; nothing will read port1 again).
+      port1.close()
       if (child === c) { child = null; controlPort = null }
       if (quitting) return
       // Crash is never silent: flip the renderer to disconnected right away
