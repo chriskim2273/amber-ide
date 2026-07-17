@@ -183,6 +183,16 @@ export function SplitView(props: {
     el?.querySelector('textarea')?.focus()
   }
 
+  // Freeze a pane. The overlay + focusPane guard only block FUTURE focus; if this
+  // pane's xterm textarea already holds DOM focus, keystrokes keep flowing into
+  // its pty. So blur the live focus now (both freeze entry points route here).
+  const freeze = (id: string, note: string): void => {
+    const el = bodyEls.current.get(id)
+    const active = document.activeElement
+    if (el && active instanceof HTMLElement && el.contains(active)) active.blur()
+    onFreeze(id, note)
+  }
+
   // Per-pane title callbacks, cached by paneId so each `Pane` gets a REFERENTIALLY
   // STABLE `onTitle` — otherwise a fresh closure every render would defeat Pane's
   // memo (every drag mousemove would reconcile all terminals).
@@ -278,14 +288,14 @@ export function SplitView(props: {
       if (c.type === 'freeze' && focusedRef.current) {
         e.preventDefault()
         const id = focusedRef.current
-        if (frozenRef.current.has(id)) onUnfreeze(id); else onFreeze(id, '')
+        if (frozenRef.current.has(id)) onUnfreeze(id); else freeze(id, '')
         return
       }
       // Find targets the focused pane (its SearchApi must be ready — it is, once
       // the pane has mounted). Switching the target unmounts the previous pane's
       // FindBar, whose teardown clears that pane's decorations; re-firing on the
       // already-open pane bumps findSeq, which refocuses the bar's input.
-      if (c.type === 'find' && focusedRef.current && searchApis.current.has(focusedRef.current)) {
+      if (c.type === 'find' && focusedRef.current && !frozenRef.current.has(focusedRef.current) && searchApis.current.has(focusedRef.current)) {
         e.preventDefault()
         setFindPane(focusedRef.current)
         setFindSeq((s) => s + 1)
@@ -444,7 +454,7 @@ export function SplitView(props: {
             <div className="pane-body" ref={(el) => { if (el) bodyEls.current.set(paneId, el); else bodyEls.current.delete(paneId) }}>
               <Pane session={paneId} epoch={props.epoch} portEpoch={props.portEpoch}
                 fontSize={props.fontSize} onTitle={titleCbFor(paneId)} onSearchReady={searchReadyFor(paneId)} />
-              {findPane === paneId && searchApis.current.get(paneId) &&
+              {findPane === paneId && !isFrozen && searchApis.current.get(paneId) &&
                 <FindBar api={searchApis.current.get(paneId)!} focusSeq={findSeq}
                   onClose={() => { setFindPane(null); focusPane(paneId) }} />}
               {dead !== undefined &&
@@ -458,12 +468,15 @@ export function SplitView(props: {
                   commits/cancels back into App's sidecar state. */}
               {notePane === paneId && !isFrozen &&
                 <FreezeNoteInput
-                  onCommit={(note) => { props.onFreeze(paneId, note); setNotePane(null) }}
+                  onCommit={(note) => { freeze(paneId, note); setNotePane(null) }}
                   onCancel={() => setNotePane(null)} />}
               {/* Frozen (parked) overlay — reuses the dead-overlay visual language.
                   Intercepts ALL pointer events, so the terminal underneath is
-                  unclickable (it stays MOUNTED and streaming). */}
-              {isFrozen &&
+                  unclickable (it stays MOUNTED and streaming). Suppressed when the
+                  session has EXITED: death takes precedence (same z-index would
+                  otherwise hide the exit code + close button under the note). The
+                  header frozen badge still marks the pane as parked. */}
+              {isFrozen && dead === undefined &&
                 <div className="frozen-overlay">
                   <div className="frozen-badge-lg" role="img" aria-label="frozen pane">❄</div>
                   <div className="frozen-note-text">{frozenEntry.note?.trim() || 'frozen'}</div>
