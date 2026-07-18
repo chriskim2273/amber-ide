@@ -53,8 +53,11 @@ const SEARCH_DECORATIONS = {
 // the header/chrome; cursor + selection use the violet accent.
 const FONT_STACK =
   "'JetBrains Mono','SF Mono','Menlo','Monaco','DejaVu Sans Mono','Consolas',monospace"
-// fixterms encoding of Shift+Enter (see attachCustomKeyEventHandler below).
-const SHIFT_ENTER_CSI_U = new TextEncoder().encode('\x1b[13;2u')
+// Shift+Enter → ESC+CR (Meta+Enter). Claude Code inserts a newline without
+// submitting on this sequence with NO terminal negotiation needed. The fixterms
+// CSI-u form (\x1b[13;2u) only works once the app negotiates the kitty keyboard
+// protocol — which xterm.js here never advertises, so claude ignored it.
+const SHIFT_ENTER_SEQ = new TextEncoder().encode('\x1b\r')
 const XTERM_THEME = {
   background: '#0c0c0f',
   foreground: '#e6e6ec',
@@ -204,17 +207,15 @@ export const Pane = memo(function Pane(
     // App chords (Cmd on mac / Ctrl+Shift on Linux) must not be sent to the
     // pty — return false so xterm neither renders nor forwards them; the event
     // still bubbles to the window handlers in App/SplitView.
-    // Shift+Enter is translated to the fixterms CSI-u encoding (ESC [13;2u) —
-    // what iTerm2/Kitty/Ghostty send natively — so CSI-u-aware TUIs (Claude
-    // Code's newline-without-submit) can tell it apart from plain Enter.
-    // Shells without CSI-u bindings may echo a stray fragment on Shift+Enter;
-    // accepted tradeoff.
+    // Shift+Enter → ESC+CR (Meta+Enter): Claude Code inserts a newline instead
+    // of submitting on this sequence, while plain Enter stays a bare CR (submit).
+    // A shell sees M-RET (unbound → no-op), so no stray echo.
     term.attachCustomKeyEventHandler((e) => {
       if (e.type !== 'keydown') return true
       if (e.key === 'Escape') setOpenBtn(null) // dismiss the Open button; still goes to pty
       if (appChord(e)) return false
       if (e.key === 'Enter' && e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) {
-        port?.postMessage({ data: SHIFT_ENTER_CSI_U })
+        port?.postMessage({ data: SHIFT_ENTER_SEQ })
         return false
       }
       return true
