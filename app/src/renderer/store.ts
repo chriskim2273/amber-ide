@@ -1,4 +1,5 @@
 import type { SessionInfo } from '../shared/proto'
+import type { BrowserEntry } from '../shared/layoutFile'
 import { parseName } from '../shared/names'
 
 export interface AppState {
@@ -108,6 +109,7 @@ export interface KindDot { cls: string; label: string }
 // Shared by the pane header and the tab bar so they downgrade identically:
 // amber = claude, pulsing amber = claude-retrying, gray = shell-fallback.
 export function paneDot(kind: string, runState: string | undefined): KindDot {
+  if (kind === 'browser') return { cls: 'browser', label: 'browser' }
   if (kind !== 'claude') return { cls: 'shell', label: 'shell' }
   switch (runState) {
     case 'claude-retrying': return { cls: 'claude-retrying', label: 'claude (retrying)' }
@@ -136,6 +138,33 @@ export function tabDot(panes: PaneModel[]): KindDot {
 // passed in from main.tsx.
 export function hasActivity(state: AppState, panes: PaneModel[], frozen?: Set<string>): boolean {
   return panes.some((p) => !frozen?.has(p.name) && (state.lastActivity[p.name] ?? 0) > (state.lastSeen[p.name] ?? 0))
+}
+
+// Inject app-local browser panes (sidecar-owned, no daemon session) into the
+// grouped model so they flow through deriveTab exactly like a daemon pane. A
+// browser pane's {ws,tab} may be a grouping that has no daemon session at all,
+// so ws/tab entries are created on demand. Result stays sorted by ord.
+export function mergeBrowsers(workspaces: WorkspaceModel[], browsers: Record<string, BrowserEntry>): WorkspaceModel[] {
+  const entries = Object.entries(browsers)
+  if (entries.length === 0) return workspaces
+  const wsMap = new Map<number, Map<number, PaneModel[]>>()
+  for (const w of workspaces) {
+    const tabs = new Map<number, PaneModel[]>()
+    for (const t of w.tabs) tabs.set(t.tab, [...t.panes])
+    wsMap.set(w.ws, tabs)
+  }
+  for (const [name, b] of entries) {
+    if (!wsMap.has(b.ws)) wsMap.set(b.ws, new Map())
+    const tabs = wsMap.get(b.ws)!
+    if (!tabs.has(b.tab)) tabs.set(b.tab, [])
+    tabs.get(b.tab)!.push({ name, cwd: '', kind: 'browser', alive: true, ord: b.ord, deadCode: null })
+  }
+  return [...wsMap.entries()].sort((a, b) => a[0] - b[0]).map(([ws, tabs]) => ({
+    ws,
+    tabs: [...tabs.entries()].sort((a, b) => a[0] - b[0]).map(([tab, panes]) => ({
+      tab, panes: panes.sort((a, b) => a.ord - b.ord),
+    })),
+  }))
 }
 
 export function groupSessions(state: AppState): WorkspaceModel[] {

@@ -12,12 +12,17 @@ export interface WsLayout { activeTab: number; tabs: Record<string, TabLayout>; 
 // SESSION NAME → optional note. Session names are stable across reboots, so
 // parking survives restart; stale entries are pruned on load-reconcile.
 export interface FrozenEntry { note?: string }
+// `browsers` are app-local web-viewer panes (spec 2026-07-18): a synthetic leaf
+// with NO daemon session, keyed by a `browser-<ws>-<tab>-<ord>-<id>` paneId.
+// This map is the pane's entire existence — grouping (ws/tab/ord) + last URL.
+export interface BrowserEntry { ws: number; tab: number; ord: number; url: string }
 export interface LayoutFile {
   version: number
   activeWorkspace: number
   workspaces: Record<string, WsLayout>
   fontSize?: number
   frozen?: Record<string, FrozenEntry>
+  browsers?: Record<string, BrowserEntry>
 }
 
 // Shape-guard the frozen map (Task 4 lesson): reject a non-object/array top
@@ -29,6 +34,23 @@ function parseFrozen(v: unknown): Record<string, FrozenEntry> | undefined {
     if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) continue
     const note = (entry as { note?: unknown }).note
     out[name] = typeof note === 'string' ? { note } : {}
+  }
+  return out
+}
+
+// Shape-guard the browsers map (same lesson as parseFrozen): reject a
+// non-object/array top level; drop entries missing/mistyping any field. A
+// malformed entry is silently dropped so a hand-edited sidecar never throws.
+function parseBrowsers(v: unknown): Record<string, BrowserEntry> | undefined {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return undefined
+  const out: Record<string, BrowserEntry> = {}
+  for (const [name, e] of Object.entries(v)) {
+    if (typeof e !== 'object' || e === null || Array.isArray(e)) continue
+    const { ws, tab, ord, url } = e as Record<string, unknown>
+    if (typeof ws === 'number' && typeof tab === 'number' && typeof ord === 'number' && typeof url === 'string'
+        && Number.isFinite(ws) && Number.isFinite(tab) && Number.isFinite(ord)) {
+      out[name] = { ws, tab, ord, url }
+    }
   }
   return out
 }
@@ -100,6 +122,10 @@ export function parseLayout(text: string): LayoutFile {
       ...((): { frozen?: Record<string, FrozenEntry> } => {
         const f = parseFrozen(v.frozen)
         return f ? { frozen: f } : {}
+      })(),
+      ...((): { browsers?: Record<string, BrowserEntry> } => {
+        const b = parseBrowsers(v.browsers)
+        return b ? { browsers: b } : {}
       })(),
     }
   } catch {

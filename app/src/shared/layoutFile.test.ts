@@ -1,5 +1,25 @@
 import { describe, it, expect } from 'vitest'
-import { emptyLayout, parseLayout, serializeLayout, orderTabs, moveTab, LAYOUT_VERSION } from './layoutFile'
+import { emptyLayout, parseLayout, serializeLayout, orderTabs, moveTab, LAYOUT_VERSION, type LayoutFile } from './layoutFile'
+
+describe('layout browsers map', () => {
+  it('round-trips valid entries', () => {
+    const l: LayoutFile = { version: 1, activeWorkspace: 1, workspaces: {},
+      browsers: { 'browser-1-1-0-a': { ws: 1, tab: 1, ord: 0, url: 'https://x.dev' } } }
+    expect(parseLayout(serializeLayout(l)).browsers).toEqual(l.browsers)
+  })
+  it('drops malformed entries, keeps valid', () => {
+    const text = JSON.stringify({ version: 1, activeWorkspace: 1, workspaces: {}, browsers: {
+      ok: { ws: 1, tab: 1, ord: 0, url: 'https://a' },
+      badUrl: { ws: 1, tab: 1, ord: 0, url: 5 },
+      badWs: { ws: 'x', tab: 1, ord: 0, url: 'https://b' },
+      notObj: 42,
+    } })
+    expect(parseLayout(text).browsers).toEqual({ ok: { ws: 1, tab: 1, ord: 0, url: 'https://a' } })
+  })
+  it('non-object browsers → undefined', () => {
+    expect(parseLayout(JSON.stringify({ version: 1, activeWorkspace: 1, workspaces: {}, browsers: [] })).browsers).toBeUndefined()
+  })
+})
 
 describe('layoutFile', () => {
   it('round-trips a layout', () => {
