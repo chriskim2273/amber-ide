@@ -1,6 +1,6 @@
 import { app, BrowserWindow, utilityProcess, MessageChannelMain, Menu, shell } from 'electron'
 import type { MenuItemConstructorOptions } from 'electron'
-import { ipcMain, dialog } from 'electron'
+import { ipcMain, dialog, clipboard } from 'electron'
 import { fileURLToPath } from 'node:url'
 import { dirname, join, resolve as resolvePathJoin, isAbsolute } from 'node:path'
 import { homedir } from 'node:os'
@@ -467,6 +467,18 @@ async function main(): Promise<void> {
   ipcMain.on('reveal-path', (_e, abs: unknown) => {
     if (typeof abs === 'string' && isAbsolute(abs)) shell.showItemInFolder(abs)
   })
+
+  // Terminal clipboard via Electron's `clipboard` module — the reliable path.
+  // The renderer's xterm selection is drawn by xterm itself (not in a DOM
+  // selection), so the native Edit-menu copy role misses it; and the Edit menu
+  // only exists on macOS, so Linux had NO copy path at all. Routing through main
+  // sidesteps navigator.clipboard's focus/permission quirks (readText in
+  // particular). Write ignores empty strings so an empty selection never clobbers
+  // the clipboard.
+  ipcMain.on('clipboard-write', (_e, text: unknown) => {
+    if (typeof text === 'string' && text.length > 0) clipboard.writeText(text)
+  })
+  ipcMain.handle('clipboard-read', () => clipboard.readText())
 
   ipcMain.handle('pick-folder', async () => {
     const r = await dialog.showOpenDialog(win, { properties: ['openDirectory', 'createDirectory'] })

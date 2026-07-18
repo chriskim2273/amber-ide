@@ -32,6 +32,8 @@ declare global {
       pickFolder: () => Promise<string | null>
       resolvePath: (cwd: string, raw: string) => Promise<string | null>
       revealPath: (abs: string) => void
+      clipboardWrite: (text: string) => void
+      clipboardRead: () => Promise<string>
     }
   }
 }
@@ -443,9 +445,10 @@ function App(): JSX.Element {
   useEffect(() => {
     const h = (e: KeyboardEvent): void => {
       const c = appChord(e)
-      // `close`, `zoom`, `freeze`, and `insert-skip-perms` all need the focused-pane
-      // identity — SplitView owns them (and gates them on its tab being active).
-      if (!c || c.type === 'close' || c.type === 'zoom' || c.type === 'freeze' || c.type === 'insert-skip-perms') return
+      // These all need the focused-pane identity — SplitView owns them (and gates
+      // them on its tab being active): close, zoom, freeze, skip-perms, copy, paste.
+      if (!c || c.type === 'close' || c.type === 'zoom' || c.type === 'freeze'
+        || c.type === 'insert-skip-perms' || c.type === 'copy' || c.type === 'paste') return
       e.preventDefault()
       chordRef.current(c)
     }

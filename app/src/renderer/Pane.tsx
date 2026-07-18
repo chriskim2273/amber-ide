@@ -20,6 +20,13 @@ export interface SearchApi {
   // Type raw text into the pane's pty (as if the user typed it). Used by the
   // skip-permissions chord in SplitView. No-op until the port is wired.
   insert(text: string): void
+  // The current terminal selection (empty string if nothing selected) — for the
+  // copy chord.
+  copySelection(): string
+  // Paste text into the pty via xterm, which wraps it in bracketed-paste markers
+  // when the running program requested that mode (so multiline paste doesn't
+  // submit line-by-line in claude/vim). Routes through onData → the port.
+  paste(text: string): void
   // Force a local re-fit + repaint (header refresh button). Re-syncs the pty
   // size (SIGWINCH → program repaints) and repaints xterm's buffer — fixes a
   // garbled/stale frame or a pane mis-sized by the shared-winsize flap. Does NOT
@@ -155,6 +162,10 @@ export const Pane = memo(function Pane(
       // Reads the live `port` binding (reassigned on wire/re-acquire), same as
       // term.onData below — so it targets the current pty even after a reconnect.
       insert: (text) => port?.postMessage({ data: new TextEncoder().encode(text) }),
+      copySelection: () => term.getSelection(),
+      // term.paste() emits through onData (registered below) → the live port,
+      // and applies bracketed-paste framing when the program enabled it.
+      paste: (text) => term.paste(text),
       refresh: () => {
         try { fit.fit() } catch { /* host mid-layout; ignore */ }
         port?.postMessage({ resize: { cols: term.cols, rows: term.rows } })

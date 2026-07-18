@@ -202,6 +202,24 @@ describe('appChord (insert-skip-perms)', () => {
   })
 })
 
+describe('appChord (copy/paste)', () => {
+  it('mac requires Cmd+Shift (dodges the native Edit-menu Cmd+C/V roles)', () => {
+    setPlatform('MacIntel')
+    expect(appChord(key({ key: 'c', meta: true, shift: true }))).toEqual({ type: 'copy' })
+    expect(appChord(key({ key: 'v', meta: true, shift: true }))).toEqual({ type: 'paste' })
+    // Plain Cmd+C / Cmd+V are left to the native Edit menu, not our chord.
+    expect(appChord(key({ key: 'c', meta: true }))).toBeNull()
+    expect(appChord(key({ key: 'v', meta: true }))).toBeNull()
+  })
+  it('linux maps Ctrl+Shift+C / Ctrl+Shift+V', () => {
+    setPlatform('Linux x86_64')
+    expect(appChord(key({ key: 'c', ctrl: true, shift: true }))).toEqual({ type: 'copy' })
+    expect(appChord(key({ key: 'v', ctrl: true, shift: true }))).toEqual({ type: 'paste' })
+    // Bare Ctrl+C stays SIGINT (no chord) so it still interrupts.
+    expect(appChord(key({ key: 'c', ctrl: true }))).toBeNull()
+  })
+})
+
 describe('CHORD_TABLE (single source of truth)', () => {
   it('every entry is matched by appChord under the platform modifier', () => {
     setPlatform('MacIntel')

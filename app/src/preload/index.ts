@@ -35,6 +35,11 @@ contextBridge.exposeInMainWorld('amber', {
   resolvePath: (cwd: string, raw: string): Promise<string | null> =>
     ipcRenderer.invoke('resolve-path', cwd, raw),
   revealPath: (abs: string): void => ipcRenderer.send('reveal-path', abs),
+  // Terminal copy/paste through Electron's clipboard (reliable across platforms;
+  // xterm's visual selection isn't in a DOM selection, and Linux has no Edit
+  // menu, so the native copy role can't reach it).
+  clipboardWrite: (text: string): void => ipcRenderer.send('clipboard-write', text),
+  clipboardRead: (): Promise<string> => ipcRenderer.invoke('clipboard-read'),
 })
 
 // A transferred MessagePort cannot cross contextBridge; re-dispatch the live

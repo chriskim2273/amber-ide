@@ -22,6 +22,8 @@ export type Chord =
   | { type: 'zoom' }
   | { type: 'freeze' }
   | { type: 'insert-skip-perms' }
+  | { type: 'copy' }
+  | { type: 'paste' }
   | { type: 'tab'; n: number }
 
 // A single non-parametric chord action (everything except the 1–9 tab jump,
@@ -76,6 +78,13 @@ export const CHORD_TABLE: ChordEntry[] = [
   // Type ' --dangerously-skip-permissions' into the focused pane's pty (appends
   // to whatever's on the line — e.g. after `claude`). Just types it; no Enter.
   { action: 'insert-skip-perms', label: 'Y', keys: ['y'], desc: 'Type --dangerously-skip-permissions' },
+  // Terminal copy/paste. Linux: Ctrl+Shift+C/V (standard — Ctrl+C is SIGINT).
+  // Mac uses Cmd+Shift+C/V (macShift): plain Cmd+C/V are the native Edit-menu
+  // copy/paste accelerators, which act on the (empty) xterm textarea and miss
+  // xterm's visual selection — Shift dodges them so our handler copies the real
+  // selection and pastes bracketed-paste-aware.
+  { action: 'copy', label: 'C', keys: ['c'], desc: 'Copy selection', macShift: true },
+  { action: 'paste', label: 'V', keys: ['v'], desc: 'Paste', macShift: true },
 ]
 
 export function appChord(e: KeyLike): Chord | null {

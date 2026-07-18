@@ -316,6 +316,25 @@ export function SplitView(props: {
         if (api) { e.preventDefault(); api.insert(' --dangerously-skip-permissions') }
         return
       }
+      // Copy the focused pane's terminal selection to the clipboard. Only acts
+      // when there IS a selection, so with none the chord is inert (on Linux it
+      // never reaches here as ^C — Ctrl is required WITH Shift, which xterm
+      // doesn't treat as SIGINT).
+      if (c.type === 'copy' && focusedRef.current) {
+        const sel = searchApis.current.get(focusedRef.current)?.copySelection()
+        if (sel) { e.preventDefault(); window.amber.clipboardWrite(sel) }
+        return
+      }
+      // Paste clipboard text into the focused pane (bracketed-paste-aware). Read
+      // via the main-process clipboard bridge (reliable; no permission prompt).
+      if (c.type === 'paste' && focusedRef.current && !frozenRef.current.has(focusedRef.current)) {
+        const api = searchApis.current.get(focusedRef.current)
+        if (api) {
+          e.preventDefault()
+          void window.amber.clipboardRead().then((t) => { if (t) api.paste(t) }).catch(() => {})
+        }
+        return
+      }
       if (c.type === 'close' && focusedRef.current) {
         e.preventDefault()
         onClose(focusedRef.current)
