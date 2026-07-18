@@ -32,7 +32,7 @@ export type DaemonEvent =
   | { kind: 'MarkSeen'; names: string[] }
   // UI-originated: the user dismissed the daemon-error banner.
   | { kind: 'ClearError' }
-export interface PaneModel { name: string; cwd: string; kind: string; alive: boolean; ord: number; deadCode: number | null; runState?: string | undefined }
+export interface PaneModel { name: string; cwd: string; kind: string; alive: boolean; ord: number; deadCode: number | null; runState?: string | undefined; claudeId?: string | undefined }
 export interface TabModel { tab: number; panes: PaneModel[] }
 export interface WorkspaceModel { ws: number; tabs: TabModel[] }
 
@@ -146,7 +146,7 @@ export function groupSessions(state: AppState): WorkspaceModel[] {
     const pane: PaneModel = {
       name: sess.name, cwd: sess.cwd, kind: sess.kind, alive: sess.alive,
       ord: p.ord, deadCode: sess.name in state.dead ? state.dead[sess.name]! : null,
-      runState: sess.run_state,
+      runState: sess.run_state, claudeId: sess.claude_id,
     }
     if (!wsMap.has(p.ws)) wsMap.set(p.ws, new Map())
     const tabs = wsMap.get(p.ws)!

@@ -60,6 +60,37 @@ pub struct SessionManager {
     /// output `Activity` to watchers. `None` in tests / hand-started managers —
     /// no activity notifications are wired then (harmless; the app is absent).
     watchers: Option<Arc<Watchers>>,
+    /// Per-shell-session count of CONSECUTIVE periodic snapshots that saw no
+    /// hand-started claude, for the `resume_as_claude` downgrade hysteresis. A
+    /// single transient miss (Claude Code briefly rotating its process) must not
+    /// drop a live claude pane back to a bare shell on the next restart; only a
+    /// sustained absence downgrades. See `decide_resume`.
+    claude_absent: Mutex<HashMap<String, u32>>,
+}
+
+/// Consecutive absent periodic snapshots before `resume_as_claude` downgrades
+/// true→false. At the default ~10 s snapshot cadence this is ~20 s of a shell
+/// with no claude before it stops being restored as claude.
+const CLAUDE_ABSENT_THRESHOLD: u32 = 2;
+
+/// Decide a shell session's `resume_as_claude` on a PERIODIC snapshot, with
+/// downgrade hysteresis. Upgrades immediately when claude is detected; downgrades
+/// true→false only after `threshold` CONSECUTIVE absences, so one transient miss
+/// (Claude Code briefly between processes) can't drop a live pane. Returns
+/// (new_flag, new_absent_streak). Pure.
+fn decide_resume(current: bool, detected: bool, streak: u32, threshold: u32) -> (bool, u32) {
+    if detected {
+        (true, 0)
+    } else if !current {
+        (false, 0)
+    } else {
+        let next = streak + 1;
+        if next >= threshold {
+            (false, 0)
+        } else {
+            (true, next)
+        }
+    }
 }
 
 impl SessionManager {
@@ -75,6 +106,7 @@ impl SessionManager {
             sessions: Mutex::new(HashMap::new()),
             socket: None,
             watchers: None,
+            claude_absent: Mutex::new(HashMap::new()),
         })
     }
 
@@ -244,12 +276,30 @@ impl SessionManager {
     }
 
     /// Flush every live session's scrollback + metadata to the state store.
+    /// Periodic snapshot (daemon healthy): re-detects hand-started claude with
+    /// downgrade hysteresis.
     pub fn snapshot(&self) -> anyhow::Result<()> {
+        self.snapshot_inner(false)
+    }
+
+    /// Final snapshot on SIGTERM/SIGINT (pre-reboot / pre-restart). `is_final`
+    /// makes it PRESERVE each shell's `resume_as_claude` instead of re-detecting
+    /// it: `systemctl restart` SIGTERMs the whole cgroup at once, so claude is
+    /// already being killed when this runs — re-detecting would see "no claude"
+    /// and wrongly drop a live claude pane to a bare shell on restore. The last
+    /// periodic snapshot holds the truth; this one must not clobber it.
+    pub fn snapshot_final(&self) -> anyhow::Result<()> {
+        self.snapshot_inner(true)
+    }
+
+    fn snapshot_inner(&self, is_final: bool) -> anyhow::Result<()> {
         let sessions = self.sessions.lock().unwrap();
         for (name, sess) in sessions.iter() {
             self.store.write_scrollback(name, &sess.scrollback())?;
-            self.persist_live_cwd(name, sess);
+            self.persist_live_cwd(name, sess, is_final);
         }
+        // Drop hysteresis counters for sessions that no longer exist (bounded).
+        self.claude_absent.lock().unwrap().retain(|k, _| sessions.contains_key(k));
         Ok(())
     }
 
@@ -257,16 +307,33 @@ impl SessionManager {
     /// survives restart (the shell respawns where the user left it, not its
     /// original cwd). Read from the child's `/proc/<pid>/cwd`. Claude sessions
     /// are left alone — their cwd is the authoritative, pre-trusted folder the
-    /// pane was created in, which `amber run` never `cd`s out of.
-    fn persist_live_cwd(&self, name: &str, sess: &PtySession) {
+    /// pane was created in, which `amber run` never `cd`s out of. `is_final`
+    /// preserves `resume_as_claude` (see `snapshot_final`).
+    fn persist_live_cwd(&self, name: &str, sess: &PtySession, is_final: bool) {
         let Ok(Some(meta)) = self.store.read_session(name) else { return };
         if meta.kind != SessionKind::Shell {
             return;
         }
         let new_cwd = sess.live_cwd().filter(|d| d.is_dir()).unwrap_or_else(|| meta.cwd.clone());
         // Was the user running claude by hand in this shell? If so, restore it as
-        // a resumable claude instead of a bare shell.
-        let new_resume = sess.is_running_claude();
+        // a resumable claude instead of a bare shell. Final snapshots preserve the
+        // stored flag (detection is unreliable mid-shutdown); periodic snapshots
+        // re-detect with hysteresis so one transient miss can't downgrade.
+        let new_resume = if is_final {
+            meta.resume_as_claude
+        } else {
+            let detected = sess.is_running_claude();
+            let mut streaks = self.claude_absent.lock().unwrap();
+            let streak = streaks.get(name).copied().unwrap_or(0);
+            let (flag, next) =
+                decide_resume(meta.resume_as_claude, detected, streak, CLAUDE_ABSENT_THRESHOLD);
+            if next == 0 {
+                streaks.remove(name);
+            } else {
+                streaks.insert(name.to_string(), next);
+            }
+            flag
+        };
         if new_cwd != meta.cwd || new_resume != meta.resume_as_claude {
             let updated = SessionMeta {
                 cwd: new_cwd,
@@ -434,6 +501,7 @@ impl SessionManager {
                     alive: sess.is_alive(),
                     updated: meta.updated,
                     run_state: sess.run_state(),
+                    claude_id: self.store.read_claude(&meta.name).ok().flatten().map(|c| c.session_id),
                 })
             })
             .collect();
@@ -486,6 +554,27 @@ impl SessionManager {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn decide_resume_upgrades_immediately_on_detection() {
+        // claude seen => true, streak reset — from either prior state.
+        assert_eq!(decide_resume(false, true, 0, 2), (true, 0));
+        assert_eq!(decide_resume(true, true, 1, 2), (true, 0));
+    }
+
+    #[test]
+    fn decide_resume_holds_through_one_transient_miss() {
+        // A live claude pane (current=true) that misses ONCE stays true (streak 1).
+        assert_eq!(decide_resume(true, false, 0, 2), (true, 1));
+        // The SECOND consecutive miss reaches the threshold and downgrades.
+        assert_eq!(decide_resume(true, false, 1, 2), (false, 0));
+    }
+
+    #[test]
+    fn decide_resume_stays_false_when_never_claude() {
+        // A plain shell that was never claude stays false, streak stays 0.
+        assert_eq!(decide_resume(false, false, 0, 2), (false, 0));
+    }
 
     #[test]
     fn session_infos_projects_metadata_for_live_sessions() {

@@ -839,6 +839,7 @@ mod tests {
             alive,
             updated,
             run_state: None,
+            claude_id: None,
         }
     }
 

@@ -33,6 +33,12 @@ pub struct SessionInfo {
     /// `SessionInfo`) decode as `None`.
     #[serde(default)]
     pub run_state: Option<String>,
+    /// The last Claude Code session id recorded for this session (from the
+    /// `SessionStart` hook), if any — lets the app offer a "reload claude"
+    /// action that resumes this exact conversation (`claude --resume <id>`).
+    /// `#[serde(default)]` keeps the wire back-compatible.
+    #[serde(default)]
+    pub claude_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -420,6 +426,7 @@ mod tests {
             alive: true,
             updated: 1_700_000_000,
             run_state: Some("claude-retrying".into()),
+            claude_id: Some("sid-abc".into()),
         };
         let full = Frame::Control(ControlMsg::Sessions { sessions: vec![info.clone()] });
         assert_eq!(roundtrip(&full), full);
@@ -474,6 +481,7 @@ mod tests {
             alive: true,
             updated: 0,
             run_state: Some("shell-fallback".into()),
+            claude_id: None,
         };
         let f = Frame::Control(ControlMsg::Sessions { sessions: vec![info] });
         assert_eq!(roundtrip(&f), f);

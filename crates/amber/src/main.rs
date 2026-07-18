@@ -511,7 +511,9 @@ fn run_daemon(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Result<
         let mut signals = Signals::new([SIGTERM, SIGINT])?;
         thread::spawn(move || {
             if signals.forever().next().is_some() {
-                if let Err(e) = manager.snapshot() {
+                // Final snapshot PRESERVES resume_as_claude (claude is being
+                // cgroup-killed alongside us; re-detecting would clobber it).
+                if let Err(e) = manager.snapshot_final() {
                     eprintln!("amber daemon: final snapshot failed: {e}");
                 }
                 std::process::exit(0);

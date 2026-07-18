@@ -4,7 +4,7 @@ import { paneRects, handles, nextPaneInDirection, focusCandidates, ratioAt, leav
 import { appChord, chordLabel } from './keys'
 import { paneDot } from './store'
 
-export interface PaneMeta { kind: string; title: string; cwd: string; runState?: string | undefined; rssKb?: number | undefined; growing?: boolean | undefined }
+export interface PaneMeta { kind: string; title: string; cwd: string; runState?: string | undefined; rssKb?: number | undefined; growing?: boolean | undefined; claudeId?: string | undefined }
 
 // Compact memory label from resident KiB: "0" hidden by the caller; MB up to
 // ~1 GB, then GB with one decimal. Display-only.
@@ -177,6 +177,10 @@ export function SplitView(props: {
   // Which pane (if any) has the inline freeze-note prompt open (context-menu
   // "Freeze pane…" path). Only that pane renders the input.
   const [notePane, setNotePane] = useState<string | null>(null)
+  // Which pane (if any) has the "reload claude" confirmation open. Runs
+  // `claude --resume` in the pane's shell — a real command, so it's gated behind
+  // this confirm. Only that pane renders the prompt.
+  const [reloadPane, setReloadPane] = useState<string | null>(null)
   // Live frozen set for the keydown handler + focus guards (registered once —
   // read via ref so freeze/unfreeze doesn't rebind the window listener).
   const frozenSet = new Set(Object.keys(props.frozen))
@@ -227,6 +231,18 @@ export function SplitView(props: {
     onFreeze(id, note)
   }
 
+  // Reload claude in a pane's shell: Ctrl-U (\x15) clears any stray input line,
+  // then `claude --resume` + Enter. `id` resumes that exact conversation; null
+  // omits the id so claude opens its own session picker (its full history).
+  const reloadClaude = (paneId: string, id: string | null): void => {
+    const api = searchApis.current.get(paneId)
+    if (api) {
+      const flag = id ? ` --resume ${id}` : ' --resume'
+      api.insert(`\x15claude --dangerously-skip-permissions${flag}\n`)
+    }
+    setReloadPane(null)
+  }
+
   // Per-pane title callbacks, cached by paneId so each `Pane` gets a REFERENTIALLY
   // STABLE `onTitle` — otherwise a fresh closure every render would defeat Pane's
   // memo (every drag mousemove would reconcile all terminals).
@@ -270,6 +286,7 @@ export function SplitView(props: {
     setFindPane((p) => (p && !live.has(p) ? null : p))
     setMenu((m) => (m && !live.has(m.paneId) ? null : m))
     setNotePane((p) => (p && !live.has(p) ? null : p))
+    setReloadPane((p) => (p && !live.has(p) ? null : p))
   }, [props.tree])
 
   // Dismiss the context menu on Escape or any outside click. The menu itself
@@ -524,6 +541,9 @@ export function SplitView(props: {
                 <button className="icon-btn" aria-label="move pane" title="drag to move" onMouseDown={startPaneDrag(paneId)} style={{ cursor: 'grab' }}>⠿</button>
                 <button className="icon-btn" aria-label="refresh pane" title="force refresh (re-fit + repaint)"
                   onClick={() => searchApis.current.get(paneId)?.refresh()}>⟳</button>
+                {meta?.claudeId &&
+                  <button className="icon-btn" aria-label="reload claude session" title="reload claude — resume this conversation"
+                    onClick={() => setReloadPane(paneId)}>↺claude</button>}
                 <button className="icon-btn" aria-label="split right" title="split right" onClick={() => props.onSplit(paneId, 'h')}>⬌</button>
                 <button className="icon-btn" aria-label="split down" title="split down" onClick={() => props.onSplit(paneId, 'v')}>⬍</button>
                 <button className="icon-btn danger" aria-label="close pane" title="close" onClick={() => props.onClose(paneId)}>✕</button>
@@ -548,6 +568,24 @@ export function SplitView(props: {
                 <FreezeNoteInput
                   onCommit={(note) => { freeze(paneId, note); setNotePane(null) }}
                   onCancel={() => setNotePane(null)} />}
+              {/* Reload-claude confirmation. Runs `claude --resume` in the shell,
+                  so it's gated behind this prompt. "Resume last" targets the exact
+                  recorded conversation; "Pick session…" opens claude's own history
+                  picker. Clears the input line first (Ctrl-U). */}
+              {reloadPane === paneId && meta?.claudeId && !isFrozen &&
+                <div className="reload-claude-prompt" role="dialog" aria-label="reload claude">
+                  <div className="reload-claude-title">Reload claude in this pane?</div>
+                  <div className="reload-claude-sub">Clears the current line, then runs <code>claude --resume</code>.</div>
+                  <div className="reload-claude-actions">
+                    <button className="btn btn-accent" onClick={() => reloadClaude(paneId, meta.claudeId ?? null)}>
+                      Resume last <span className="reload-id">{meta.claudeId!.slice(0, 8)}…</span>
+                    </button>
+                    <button className="btn" onClick={() => reloadClaude(paneId, null)} title="opens claude's own session list">
+                      Pick session…
+                    </button>
+                    <button className="btn btn-ghost" onClick={() => setReloadPane(null)}>Cancel</button>
+                  </div>
+                </div>}
               {/* Frozen (parked) overlay — reuses the dead-overlay visual language.
                   Intercepts ALL pointer events, so the terminal underneath is
                   unclickable (it stays MOUNTED and streaming). Suppressed when the

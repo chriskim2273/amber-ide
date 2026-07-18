@@ -41,7 +41,7 @@ export function deriveTab(
     const m = mem[p.name]
     paneMeta[p.name] = {
       kind: p.kind, title: `${lead} · ${suffix}`, cwd: p.cwd, runState: p.runState,
-      rssKb: m?.rssKb, growing: m?.growing,
+      rssKb: m?.rssKb, growing: m?.growing, claudeId: p.claudeId,
     }
   })
   const liveIds = panes.map((p) => p.name).filter((n) => !(n in pending))

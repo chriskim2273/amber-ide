@@ -16,6 +16,10 @@ export interface SessionInfo {
   // shell). Optional on the wire (serde default None → undefined); decode-only,
   // forwarded wholesale through the client → renderer hops.
   run_state?: string | undefined
+  // Last Claude Code session id recorded for this pane (SessionStart hook), if
+  // any. Powers the "reload claude" action (resume this exact conversation).
+  // Optional on the wire (serde default None → undefined); decode-only.
+  claude_id?: string | undefined
 }
 
 export type ControlMsg =
