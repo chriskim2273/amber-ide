@@ -31,17 +31,15 @@ export function Browser({ paneId, url, active, onNav, onTitle }: BrowserProps): 
       onNav(paneId, u)
     }
     const onTitleUpdated = (e: Event): void => onTitle(paneId, (e as unknown as { title: string }).title)
-    // Popups (target=_blank / window.open) → system browser, never a new webview.
-    const onNewWindow = (e: Event): void => window.amber.openExternal((e as unknown as { url: string }).url)
+    // Popups + navigation policy live in the main process (setWindowOpenHandler /
+    // will-navigate) — Electron 43 removed the <webview> `new-window` event.
     wv.addEventListener('did-navigate', onNavigate)
     wv.addEventListener('did-navigate-in-page', onNavigate)
     wv.addEventListener('page-title-updated', onTitleUpdated)
-    wv.addEventListener('new-window', onNewWindow)
     return () => {
       wv.removeEventListener('did-navigate', onNavigate)
       wv.removeEventListener('did-navigate-in-page', onNavigate)
       wv.removeEventListener('page-title-updated', onTitleUpdated)
-      wv.removeEventListener('new-window', onNewWindow)
     }
   }, [paneId, onNav, onTitle])
 

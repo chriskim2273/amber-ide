@@ -404,6 +404,22 @@ async function main(): Promise<void> {
   let quitting = false
   app.on('before-quit', () => { quitting = true })
 
+  // Browser panes host <webview> web contents. Route popups (window.open /
+  // target=_blank) to the system browser and refuse in-app popup windows, and
+  // restrict navigation to http/https/about (spec 2026-07-18 §8). Electron 43
+  // removed the renderer <webview> `new-window` event, so this MUST live in the
+  // main process. Non-webview contents (the app window itself) are untouched.
+  app.on('web-contents-created', (_e, contents) => {
+    if (contents.getType() !== 'webview') return
+    contents.setWindowOpenHandler(({ url }) => {
+      if (/^https?:\/\//i.test(url)) void shell.openExternal(url)
+      return { action: 'deny' }
+    })
+    contents.on('will-navigate', (ev, url) => {
+      if (!/^(https?:|about:)/i.test(url)) ev.preventDefault()
+    })
+  })
+
   const notifyRenderer = (data: unknown): void => {
     if (!win.isDestroyed()) win.webContents.send('daemon-event', data)
   }
@@ -472,12 +488,6 @@ async function main(): Promise<void> {
     if (typeof abs === 'string' && isAbsolute(abs)) shell.showItemInFolder(abs)
   })
 
-  // Browser-pane popups (target=_blank / window.open) open in the system browser
-  // rather than spawning a new in-app webview (spec 2026-07-18 §8). Guarded to
-  // http/https so a hostile page can't drive shell.openExternal at other schemes.
-  ipcMain.on('open-external', (_e, url: unknown) => {
-    if (typeof url === 'string' && /^https?:\/\//i.test(url)) void shell.openExternal(url)
-  })
 
   // Terminal clipboard via Electron's `clipboard` module — the reliable path.
   // The renderer's xterm selection is drawn by xterm itself (not in a DOM

@@ -38,8 +38,6 @@ contextBridge.exposeInMainWorld('amber', {
   resolvePath: (cwd: string, raw: string): Promise<string | null> =>
     ipcRenderer.invoke('resolve-path', cwd, raw),
   revealPath: (abs: string): void => ipcRenderer.send('reveal-path', abs),
-  // Browser-pane popups → system browser (main guards to http/https).
-  openExternal: (url: string): void => ipcRenderer.send('open-external', url),
   // Terminal copy/paste through Electron's clipboard (reliable across platforms;
   // xterm's visual selection isn't in a DOM selection, and Linux has no Edit
   // menu, so the native copy role can't reach it).

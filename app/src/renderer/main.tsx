@@ -35,7 +35,6 @@ declare global {
       pickFolder: () => Promise<string | null>
       resolvePath: (cwd: string, raw: string) => Promise<string | null>
       revealPath: (abs: string) => void
-      openExternal: (url: string) => void
       clipboardWrite: (text: string) => void
       clipboardRead: () => Promise<string>
     }
