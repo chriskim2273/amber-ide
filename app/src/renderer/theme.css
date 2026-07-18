@@ -491,6 +491,22 @@ body {
   white-space: nowrap;
   letter-spacing: 0.02em;
 }
+/* Per-pane child-process memory (daemon monitor). Muted by default; turns amber
+   with a ▲ when the reading is a sustained climb (possible leak). */
+.mem-tag {
+  flex: none;
+  font-size: 10.5px;
+  color: var(--text-dim, #9a9aa5);
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 10px;
+  padding: 1px 7px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.mem-tag.growing {
+  color: var(--warn, #ffb454);
+  background: rgba(255, 180, 84, 0.15);
+}
 /* Body overlay — same visual language as .dead-overlay, cooler tint. Intercepts
    ALL pointer events (default div behaviour) so the streaming terminal beneath
    is unclickable while parked. */

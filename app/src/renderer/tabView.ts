@@ -26,6 +26,7 @@ export function deriveTab(
   pending: Record<string, unknown>,
   titles: Record<string, string>,
   home: string,
+  mem: Record<string, { rssKb: number; growing: boolean }> = {},
 ): DerivedTab {
   const deadCodes: Record<string, number> = {}
   const paneMeta: Record<string, PaneMeta> = {}
@@ -37,7 +38,11 @@ export function deriveTab(
     // A claude pane that fell back to a shell is labelled as such, not "claude".
     const suffix = p.runState === 'shell-fallback' ? 'shell (claude exited)' : p.kind
     // Raw absolute cwd (not shortCwd) so the context-menu "copy cwd" resolves.
-    paneMeta[p.name] = { kind: p.kind, title: `${lead} · ${suffix}`, cwd: p.cwd, runState: p.runState }
+    const m = mem[p.name]
+    paneMeta[p.name] = {
+      kind: p.kind, title: `${lead} · ${suffix}`, cwd: p.cwd, runState: p.runState,
+      rssKb: m?.rssKb, growing: m?.growing,
+    }
   })
   const liveIds = panes.map((p) => p.name).filter((n) => !(n in pending))
   return { tree: reconcile(storedTree, liveIds), paneMeta, deadCodes, liveIds }

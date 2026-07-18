@@ -4,7 +4,14 @@ import { paneRects, handles, nextPaneInDirection, focusCandidates, ratioAt, leav
 import { appChord, chordLabel } from './keys'
 import { paneDot } from './store'
 
-export interface PaneMeta { kind: string; title: string; cwd: string; runState?: string | undefined }
+export interface PaneMeta { kind: string; title: string; cwd: string; runState?: string | undefined; rssKb?: number | undefined; growing?: boolean | undefined }
+
+// Compact memory label from resident KiB: "0" hidden by the caller; MB up to
+// ~1 GB, then GB with one decimal. Display-only.
+export function fmtMem(rssKb: number): string {
+  const mb = rssKb / 1024
+  return mb < 1024 ? `${Math.round(mb)} MB` : `${(mb / 1024).toFixed(1)} GB`
+}
 
 // Per-pane scrollback find bar (chrome). Drives the pane's imperative SearchApi:
 // debounced incremental findNext on type, Enter/Shift+Enter step, Escape closes.
@@ -505,6 +512,11 @@ export function SplitView(props: {
               }}>
               <span className={'kind-dot ' + dot.cls} role="img" aria-label={dot.label} title={dot.label} />
               <span className="pane-title">{meta?.title ?? paneId}</span>
+              {meta?.rssKb !== undefined && meta.rssKb > 0 &&
+                <span className={'mem-tag' + (meta.growing ? ' growing' : '')}
+                  title={meta.growing ? 'memory climbing (possible leak)' : 'child process memory'}>
+                  {meta.growing ? '▲ ' : ''}{fmtMem(meta.rssKb)}
+                </span>}
               {isFrozen && <span className="frozen-badge" title="pane frozen">❄ frozen</span>}
               {isZoomedPane &&
                 <span className="zoom-badge">zoomed — {chordLabel('zoom')} to restore</span>}

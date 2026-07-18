@@ -325,6 +325,19 @@ impl SessionManager {
         self.sessions.lock().unwrap().get(name).cloned()
     }
 
+    /// (name, child pid) for every live session with a pid — the memory monitor
+    /// sums each pid's process-tree RSS. Snapshotted under the lock, which is
+    /// then released: the caller does its `/proc` reads WITHOUT holding the
+    /// session lock (a slow read must never stall create/kill/attach).
+    pub fn live_pids(&self) -> Vec<(String, u32)> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(name, sess)| sess.pid().map(|p| (name.clone(), p)))
+            .collect()
+    }
+
     /// The persisted kind of a session, from the state store (None if the
     /// metadata is missing/unreadable). Consulted on Attach to apply the
     /// spec-§5 reconnect semantics for raw clients.

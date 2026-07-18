@@ -89,6 +89,18 @@ pub enum ControlMsg {
     /// uses it to light a background-activity dot on inactive tabs. Carries only
     /// the name — no bytes (raw output rides `Data` frames on the pane socket).
     Activity { name: String },
+    /// Daemon -> watchers: a session's child-process-tree memory (KiB RSS),
+    /// emitted periodically by the memory monitor (Slice 1). `growing` flags a
+    /// sustained upward trend (leak signature) so the app can badge it without
+    /// re-deriving. Rides the same bounded watcher broadcast as `Activity`.
+    /// Additive `#[serde(default)]` fields keep the wire back-compatible.
+    MemoryStat {
+        name: String,
+        #[serde(default)]
+        rss_kb: u64,
+        #[serde(default)]
+        growing: bool,
+    },
     SessionList { names: Vec<String> },
     Created { name: String },
     Killed { name: String },

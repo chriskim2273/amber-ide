@@ -11,6 +11,45 @@ pub struct ProcEntry {
     pub ppid: u32,
     /// argv0 / exec basename, e.g. "claude".
     pub comm: String,
+    /// Resident set size in KiB (0 if unreadable). Summed per session subtree
+    /// by [`subtree_rss_kb`] for the memory monitor.
+    pub rss_kb: u64,
+}
+
+/// Total RSS (KiB) of `root` plus every descendant in `table`. Pure over the
+/// table — no syscalls. A `seen` set bounds it so a malformed ppid cycle can't
+/// loop, and self-parented / unknown roots are handled. Returns 0 if `root` is
+/// absent. This is the per-session figure the monitor broadcasts: a pane's
+/// child pty runs one process which may fork a whole tree (shell → claude → …).
+pub fn subtree_rss_kb(table: &[ProcEntry], root: u32) -> u64 {
+    use std::collections::{HashMap, HashSet, VecDeque};
+    let mut rss_of: HashMap<u32, u64> = HashMap::with_capacity(table.len());
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for e in table {
+        rss_of.insert(e.pid, e.rss_kb);
+        if e.pid != e.ppid {
+            children.entry(e.ppid).or_default().push(e.pid);
+        }
+    }
+    if !rss_of.contains_key(&root) {
+        return 0;
+    }
+    let mut total = 0u64;
+    let mut seen: HashSet<u32> = HashSet::new();
+    let mut q: VecDeque<u32> = VecDeque::new();
+    seen.insert(root);
+    q.push_back(root);
+    while let Some(pid) = q.pop_front() {
+        total = total.saturating_add(*rss_of.get(&pid).unwrap_or(&0));
+        if let Some(kids) = children.get(&pid) {
+            for &kid in kids {
+                if seen.insert(kid) {
+                    q.push_back(kid);
+                }
+            }
+        }
+    }
+    total
 }
 
 /// Is any process named `claude` a descendant of `root` within `table`?
@@ -39,6 +78,29 @@ pub fn claude_descends_from_table(table: &[ProcEntry], root: u32) -> bool {
     false
 }
 
+/// Sustained-growth (leak) detector over `samples` (oldest→newest RSS KiB).
+/// True when: enough samples, the newest exceeds the oldest by more than
+/// `min_growth_kb`, AND it never dipped by more than `noise_kb` along the way
+/// (a leak climbs monotonically; a stable-but-big process stays flat and is NOT
+/// flagged — that's the "don't punish a legit claude" rule from the design).
+/// Pure — drives only the UI warning badge in Slice 1.
+pub fn is_growing(samples: &[u64], min_growth_kb: u64, noise_kb: u64) -> bool {
+    if samples.len() < 3 {
+        return false;
+    }
+    let first = samples[0];
+    let last = samples[samples.len() - 1];
+    if last <= first.saturating_add(min_growth_kb) {
+        return false;
+    }
+    for w in samples.windows(2) {
+        if w[0] > w[1].saturating_add(noise_kb) {
+            return false; // a material dip breaks the "sustained rise"
+        }
+    }
+    true
+}
+
 // ---- Linux: /proc ----
 
 #[cfg(target_os = "linux")]
@@ -53,9 +115,33 @@ pub fn process_table() -> Vec<ProcEntry> {
         };
         let Some(ppid) = read_ppid_linux(pid) else { continue };
         let comm = argv0_basename(pid).unwrap_or_default();
-        out.push(ProcEntry { pid, ppid, comm });
+        let rss_kb = read_rss_kb_linux(pid);
+        out.push(ProcEntry { pid, ppid, comm, rss_kb });
     }
     out
+}
+
+/// Resident set size (KiB) of `pid`. `/proc/<pid>/smaps_rollup` aggregates the
+/// whole address space and reports `Rss:` already in KiB — no page-size math.
+/// Falls back to `statm` (resident pages × 4 KiB) if rollup is unavailable
+/// (very old kernel / permissions). 0 when nothing is readable (dead/denied).
+#[cfg(target_os = "linux")]
+fn read_rss_kb_linux(pid: u32) -> u64 {
+    if let Ok(s) = std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup")) {
+        for line in s.lines() {
+            if let Some(rest) = line.strip_prefix("Rss:") {
+                if let Some(kb) = rest.split_whitespace().next().and_then(|n| n.parse::<u64>().ok()) {
+                    return kb;
+                }
+            }
+        }
+    }
+    // Fallback: statm field 2 (resident pages) × 4 KiB (assumes 4 KiB pages).
+    std::fs::read_to_string(format!("/proc/{pid}/statm"))
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(1).and_then(|f| f.parse::<u64>().ok()))
+        .map(|pages| pages.saturating_mul(4))
+        .unwrap_or(0)
 }
 
 /// Parse ppid from `/proc/<pid>/stat`: after the last ')', ppid is the second
@@ -149,10 +235,33 @@ pub fn process_table() -> Vec<ProcEntry> {
                 pid: pid as u32,
                 ppid: info.pbi_ppid,
                 comm: cstr_field(&info.pbi_comm),
+                rss_kb: read_rss_kb_macos(pid as u32),
             });
         }
     }
     out
+}
+
+/// Resident set size (KiB) of `pid` via `proc_pidinfo(PROC_PIDTASKINFO)`'s
+/// `pti_resident_size` (bytes). 0 on failure (dead/denied).
+#[cfg(target_os = "macos")]
+fn read_rss_kb_macos(pid: u32) -> u64 {
+    let mut ti: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+    let sz = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+    let r = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTASKINFO,
+            0,
+            &mut ti as *mut _ as *mut libc::c_void,
+            sz,
+        )
+    };
+    if r == sz {
+        ti.pti_resident_size / 1024
+    } else {
+        0
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -218,7 +327,78 @@ mod tests {
     use super::*;
 
     fn e(pid: u32, ppid: u32, comm: &str) -> ProcEntry {
-        ProcEntry { pid, ppid, comm: comm.to_string() }
+        ProcEntry { pid, ppid, comm: comm.to_string(), rss_kb: 0 }
+    }
+
+    /// Like `e` but with an RSS (KiB) — for subtree_rss_kb tests.
+    fn er(pid: u32, ppid: u32, rss_kb: u64) -> ProcEntry {
+        ProcEntry { pid, ppid, comm: String::new(), rss_kb }
+    }
+
+    #[test]
+    fn subtree_rss_sums_root_and_all_descendants() {
+        // root 100 (10) -> 200 (20) -> 300 (30); plus sibling 201 (5) under 100.
+        let t = vec![er(100, 1, 10), er(200, 100, 20), er(300, 200, 30), er(201, 100, 5)];
+        assert_eq!(subtree_rss_kb(&t, 100), 65); // 10+20+30+5
+        assert_eq!(subtree_rss_kb(&t, 200), 50); // 20+30 (subtree from 200)
+        assert_eq!(subtree_rss_kb(&t, 300), 30); // leaf
+    }
+
+    #[test]
+    fn subtree_rss_absent_root_is_zero() {
+        let t = vec![er(100, 1, 10)];
+        assert_eq!(subtree_rss_kb(&t, 999), 0);
+    }
+
+    #[test]
+    fn subtree_rss_ignores_unrelated_trees() {
+        let t = vec![er(100, 1, 10), er(500, 1, 999)]; // 500 not under 100
+        assert_eq!(subtree_rss_kb(&t, 100), 10);
+    }
+
+    #[test]
+    fn subtree_rss_cycle_terminates() {
+        // Malformed 2-cycle 10<->11 not reaching root; must not loop.
+        let t = vec![er(10, 11, 1), er(11, 10, 2)];
+        assert_eq!(subtree_rss_kb(&t, 10), 3); // both counted once, no infinite loop
+    }
+
+    #[test]
+    fn subtree_rss_self_parented_root_counts_once() {
+        // A self-parented pid (pid == ppid) must not be treated as its own child.
+        let t = vec![er(7, 7, 42)];
+        assert_eq!(subtree_rss_kb(&t, 7), 42);
+    }
+
+    #[test]
+    fn is_growing_flags_sustained_rise() {
+        // Climbs 100 -> 400 (KiB), delta 300 > min 100, no dips.
+        assert!(is_growing(&[100, 200, 300, 400], 100, 50));
+    }
+
+    #[test]
+    fn is_growing_ignores_stable_high() {
+        // Big but FLAT (jitters ~6 MiB) — a healthy claude, not a leak. With a
+        // realistic 50 MiB min-growth threshold the net rise (2 MiB) is ignored.
+        assert!(!is_growing(&[900_000, 905_000, 899_000, 902_000], 50_000, 50_000));
+    }
+
+    #[test]
+    fn is_growing_needs_enough_samples() {
+        assert!(!is_growing(&[10, 9999], 1, 0)); // < 3 samples
+        assert!(!is_growing(&[], 1, 0));
+    }
+
+    #[test]
+    fn is_growing_rejects_a_material_dip() {
+        // Net rise 100->400 but dips 300->150 mid-window beyond noise → not sustained.
+        assert!(!is_growing(&[100, 300, 150, 400], 100, 20));
+    }
+
+    #[test]
+    fn is_growing_requires_min_delta() {
+        // Rises monotonically but only by 30 < min 100 → not flagged.
+        assert!(!is_growing(&[100, 110, 120, 130], 100, 10));
     }
 
     #[test]

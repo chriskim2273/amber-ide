@@ -125,6 +125,25 @@ describe('activity', () => {
   })
 })
 
+describe('reduce Memory', () => {
+  it('records rss + growing, and no-ops an identical reading (referential stability)', () => {
+    let st = reduce(initialState(), { kind: 'Sessions', sessions: [s('a')] })
+    st = reduce(st, { kind: 'Memory', name: 'a', rssKb: 512_000, growing: false })
+    expect(st.mem['a']).toEqual({ rssKb: 512_000, growing: false })
+    const same = reduce(st, { kind: 'Memory', name: 'a', rssKb: 512_000, growing: false })
+    expect(same).toBe(st) // unchanged reading => same object (skips a re-render)
+    const changed = reduce(st, { kind: 'Memory', name: 'a', rssKb: 700_000, growing: true })
+    expect(changed.mem['a']).toEqual({ rssKb: 700_000, growing: true })
+  })
+
+  it('drops a removed session\'s memory reading', () => {
+    let st = reduce(initialState(), { kind: 'Sessions', sessions: [s('a')] })
+    st = reduce(st, { kind: 'Memory', name: 'a', rssKb: 100_000, growing: false })
+    st = reduce(st, { kind: 'SessionsChanged', added: [], removed: ['a'] })
+    expect(st.mem['a']).toBeUndefined()
+  })
+})
+
 describe('paneDot', () => {
   it('shell kind is always the shell dot', () => {
     expect(paneDot('shell', undefined)).toEqual({ cls: 'shell', label: 'shell' })

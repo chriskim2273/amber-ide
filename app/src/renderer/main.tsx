@@ -45,6 +45,7 @@ function toEvent(d: unknown): DaemonEvent | null {
   if (m.kind === 'Sessions') return { kind: 'Sessions', sessions: m['sessions'] as never }
   if (m.kind === 'SessionsChanged') return { kind: 'SessionsChanged', added: m['added'] as never, removed: m['removed'] as never }
   if (m.kind === 'Activity') return { kind: 'Activity', name: m['name'] as string }
+  if (m.kind === 'MemoryStat') return { kind: 'Memory', name: m['name'] as string, rssKb: (m['rss_kb'] as number) ?? 0, growing: (m['growing'] as boolean) ?? false }
   if (m.kind === 'Exit') return { kind: 'Exit', name: m['name'] as string, code: m['code'] as number }
   if (m.kind === 'Error') return { kind: 'Error', msg: m['msg'] as string }
   return null
@@ -254,7 +255,7 @@ function App(): JSX.Element {
   // layer map uses below — no drift). allLive is the UNFILTERED name set (keeps
   // the pending-split placement effect's `liveKey`).
   const allLive = tab?.panes.map((p) => p.name) ?? []
-  const { tree, paneMeta, deadCodes, liveIds } = deriveTab(tab?.panes ?? [], storedTree, pending, titles, home)
+  const { tree, paneMeta, deadCodes, liveIds } = deriveTab(tab?.panes ?? [], storedTree, pending, titles, home, state.mem)
 
   // Zoom (transient, per tab). Tab numbering restarts per workspace (every ws
   // has a tab 1), so the zoom map and the structural-clear ref are keyed by the
@@ -716,7 +717,7 @@ function App(): JSX.Element {
             : orderedTabs.map((t) => {
                 const isActive = t.tab === (tab?.tab ?? -1)
                 const stored = layout.workspaces[wsKey]?.tabs[String(t.tab)]?.tree ?? null
-                const d = isActive ? { tree, paneMeta, deadCodes } : deriveTab(t.panes, stored, pending, titles, home)
+                const d = isActive ? { tree, paneMeta, deadCodes } : deriveTab(t.panes, stored, pending, titles, home, state.mem)
                 // `const` so the truthy-branch narrowing (Node|null -> Node) is kept
                 // inside the handler closures. Handlers operate on the layer's own
                 // tree; only the active layer is reachable (background is

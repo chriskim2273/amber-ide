@@ -460,6 +460,51 @@ fn run_daemon(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Result<
         });
     }
 
+    // Periodic memory monitor (Slice 1). Every MEM_POLL_SECS, take ONE /proc
+    // snapshot and sum each live session's child-process-tree RSS, tracking a
+    // small per-session ring to flag a sustained-growth (leak) signature. Each
+    // reading is broadcast as MemoryStat over the SAME bounded watcher channel as
+    // Activity, so a wedged client can never stall the monitor or the daemon.
+    // Degrades to a silent no-op where process_table() is empty (non-Linux, or an
+    // unreadable /proc). Read-only: it never touches session lifecycle.
+    {
+        use std::collections::{HashMap, HashSet, VecDeque};
+        let manager = Arc::clone(&manager);
+        let watchers = Arc::clone(&watchers);
+        const MEM_POLL_SECS: u64 = 3;
+        const WINDOW: usize = 5;
+        const MIN_GROWTH_KB: u64 = 100_000; // ~100 MiB sustained rise over the window
+        const NOISE_KB: u64 = 20_000;
+        thread::spawn(move || {
+            let mut samples: HashMap<String, VecDeque<u64>> = HashMap::new();
+            loop {
+                thread::sleep(Duration::from_secs(MEM_POLL_SECS));
+                let table = amber::procinfo::process_table();
+                if table.is_empty() {
+                    continue; // unsupported OS / unreadable /proc — nothing to report
+                }
+                let pids = manager.live_pids();
+                let live: HashSet<&str> = pids.iter().map(|(n, _)| n.as_str()).collect();
+                samples.retain(|name, _| live.contains(name.as_str()));
+                for (name, pid) in &pids {
+                    let rss = amber::procinfo::subtree_rss_kb(&table, *pid);
+                    let ring = samples.entry(name.clone()).or_default();
+                    ring.push_back(rss);
+                    while ring.len() > WINDOW {
+                        ring.pop_front();
+                    }
+                    let series: Vec<u64> = ring.iter().copied().collect();
+                    let growing = amber::procinfo::is_growing(&series, MIN_GROWTH_KB, NOISE_KB);
+                    watchers.broadcast(&amber_core::proto::ControlMsg::MemoryStat {
+                        name: name.clone(),
+                        rss_kb: rss,
+                        growing,
+                    });
+                }
+            }
+        });
+    }
+
     // SIGTERM/SIGINT -> final snapshot, then exit (spec §7 pre-reboot gap).
     {
         let manager = Arc::clone(&manager);

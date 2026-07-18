@@ -13,6 +13,10 @@ export interface AppState {
   lastActivity: Record<string, number>
   lastSeen: Record<string, number>
   seq: number
+  // Per-session child-tree memory from the daemon monitor (Slice 1): resident
+  // KiB + a sustained-growth flag. Keyed by session name; pruned with the live
+  // set. Display-only — never affects lifecycle.
+  mem: Record<string, { rssKb: number; growing: boolean }>
 }
 export type DaemonEvent =
   | { kind: 'Sessions'; sessions: SessionInfo[] }
@@ -21,6 +25,8 @@ export type DaemonEvent =
   | { kind: 'Error'; msg: string }
   // Daemon: a session produced output (rate-limited to ~2/s/session).
   | { kind: 'Activity'; name: string }
+  // Daemon: periodic per-session memory reading (child-tree RSS KiB + growth).
+  | { kind: 'Memory'; name: string; rssKb: number; growing: boolean }
   // UI-originated: the visible tab's panes have been seen (active tab/ws change,
   // or activity for the already-visible tab) — mark their activity as seen.
   | { kind: 'MarkSeen'; names: string[] }
@@ -31,13 +37,13 @@ export interface TabModel { tab: number; panes: PaneModel[] }
 export interface WorkspaceModel { ws: number; tabs: TabModel[] }
 
 export function initialState(): AppState {
-  return { sessions: [], dead: {}, error: null, lastActivity: {}, lastSeen: {}, seq: 0 }
+  return { sessions: [], dead: {}, error: null, lastActivity: {}, lastSeen: {}, seq: 0, mem: {} }
 }
 
-// Keep only the keys present in `live` (prunes activity state for removed
+// Keep only the keys present in `live` (prunes per-session state for removed
 // sessions so the maps don't grow without bound in a long-lived renderer).
-function keepLive(map: Record<string, number>, live: Set<string>): Record<string, number> {
-  const out: Record<string, number> = {}
+function keepLive<T>(map: Record<string, T>, live: Set<string>): Record<string, T> {
+  const out: Record<string, T> = {}
   for (const [n, v] of Object.entries(map)) if (live.has(n)) out[n] = v
   return out
 }
@@ -53,6 +59,7 @@ export function reduce(state: AppState, ev: DaemonEvent): AppState {
         error: null,
         lastActivity: keepLive(state.lastActivity, names),
         lastSeen: keepLive(state.lastSeen, names),
+        mem: keepLive(state.mem, names),
       }
     }
     case 'SessionsChanged': {
@@ -67,11 +74,18 @@ export function reduce(state: AppState, ev: DaemonEvent): AppState {
         dead: keepLive(state.dead, live),
         lastActivity: keepLive(state.lastActivity, live),
         lastSeen: keepLive(state.lastSeen, live),
+        mem: keepLive(state.mem, live),
       }
     }
     case 'Activity': {
       const seq = state.seq + 1
       return { ...state, seq, lastActivity: { ...state.lastActivity, [ev.name]: seq } }
+    }
+    case 'Memory': {
+      const prev = state.mem[ev.name]
+      // No-op identical readings so a stable pane doesn't re-render every poll.
+      if (prev && prev.rssKb === ev.rssKb && prev.growing === ev.growing) return state
+      return { ...state, mem: { ...state.mem, [ev.name]: { rssKb: ev.rssKb, growing: ev.growing } } }
     }
     case 'MarkSeen': {
       let changed = false

@@ -36,6 +36,7 @@ export type ControlMsg =
   | { kind: 'Sessions'; sessions: SessionInfo[] }
   | { kind: 'SessionsChanged'; added: SessionInfo[]; removed: string[] }
   | { kind: 'Activity'; name: string }
+  | { kind: 'MemoryStat'; name: string; rss_kb: number; growing: boolean }
   | { kind: 'Created'; name: string }
   | { kind: 'Exit'; name: string; code: number }
   | { kind: 'Error'; msg: string }
@@ -113,6 +114,7 @@ function jsonToMsg(v: unknown): ControlMsg {
       case 'Sessions': return { kind: 'Sessions', sessions: body['sessions'] as SessionInfo[] }
       case 'SessionsChanged': return { kind: 'SessionsChanged', added: body['added'] as SessionInfo[], removed: body['removed'] as string[] }
       case 'Activity': return { kind: 'Activity', name: body['name'] as string }
+      case 'MemoryStat': return { kind: 'MemoryStat', name: body['name'] as string, rss_kb: (body['rss_kb'] as number) ?? 0, growing: (body['growing'] as boolean) ?? false }
       case 'Created': return { kind: 'Created', name: body['name'] as string }
       case 'Exit': return { kind: 'Exit', name: body['name'] as string, code: body['code'] as number }
       case 'Error': return { kind: 'Error', msg: body['msg'] as string }
