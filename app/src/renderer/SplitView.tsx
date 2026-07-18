@@ -3,6 +3,7 @@ import { Pane, type SearchApi } from './Pane'
 import { paneRects, handles, nextPaneInDirection, focusCandidates, ratioAt, leaves, type Node, type Rect, type Zone, type FocusDir } from './layout'
 import { appChord, chordLabel } from './keys'
 import { paneDot } from './store'
+import { CLAUDE_SESSION_ID } from '../shared/ids'
 
 export interface PaneMeta { kind: string; title: string; cwd: string; runState?: string | undefined; rssKb?: number | undefined; growing?: boolean | undefined; claudeId?: string | undefined }
 
@@ -234,7 +235,13 @@ export function SplitView(props: {
   // Reload claude in a pane's shell: Ctrl-U (\x15) clears any stray input line,
   // then `claude --resume` + Enter. `id` resumes that exact conversation; null
   // omits the id so claude opens its own session picker (its full history).
+  // SECURITY: the id is interpolated into a command line run in the pane's
+  // SHELL, so it must be shape-validated first — a value with shell
+  // metacharacters (`; rm -rf ~`) would otherwise execute. Claude Code session
+  // ids are UUIDs; anything else is rejected (the command is not sent). It comes
+  // from the store today, but this is the trust boundary, so validate at use.
   const reloadClaude = (paneId: string, id: string | null): void => {
+    if (id !== null && !CLAUDE_SESSION_ID.test(id)) { setReloadPane(null); return }
     const api = searchApis.current.get(paneId)
     if (api) {
       const flag = id ? ` --resume ${id}` : ' --resume'
