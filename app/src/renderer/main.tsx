@@ -449,8 +449,10 @@ function App(): JSX.Element {
         for (const [wsKey, wl] of Object.entries(plan.workspaces)) {
           const tabs: Record<string, TabLayout> = {}
           for (const [tabKey, tl] of Object.entries(wl.tabs)) {
+            // Browser leaves are app-local (never a daemon session), so they must
+            // survive the live-daemon filter — keep any browser id unconditionally.
             tabs[tabKey] = tl.tree
-              ? { ...tl, tree: reconcile(tl.tree, leaves(tl.tree).filter((n) => liveForFix.has(n))) }
+              ? { ...tl, tree: reconcile(tl.tree, leaves(tl.tree).filter((n) => liveForFix.has(n) || isBrowserName(n))) }
               : tl
           }
           wsEntries[wsKey] = { ...wl, tabs }
@@ -458,6 +460,7 @@ function App(): JSX.Element {
       }
       const next: LayoutFile = { ...l, workspaces: { ...l.workspaces, ...wsEntries } }
       if (Object.keys(plan.frozen).length) next.frozen = { ...(l.frozen ?? {}), ...plan.frozen }
+      if (Object.keys(plan.browsers).length) next.browsers = { ...(l.browsers ?? {}), ...plan.browsers }
       return next
     })
     const first = plan.targetWorkspaces[0]
@@ -593,7 +596,9 @@ function App(): JSX.Element {
   const doSave = async (scope: 'one' | 'all'): Promise<void> => {
     setSaveScopeOpen(false)
     const wsList = scope === 'one' ? workspaces.filter((w) => w.ws === currentWs) : workspaces
-    const names = wsList.flatMap((w) => w.tabs.flatMap((t) => t.panes.map((p) => p.name)))
+    // Browser panes have no daemon session, so no backlog to dump — exclude them
+    // (a dumpBacklog for a non-session would just draw an Error reply).
+    const names = wsList.flatMap((w) => w.tabs.flatMap((t) => t.panes.filter((p) => p.kind !== 'browser').map((p) => p.name)))
     const { dumps, stragglers } = await collectDumps(
       names,
       (n) => window.amber.dumpBacklog(n),
@@ -602,7 +607,10 @@ function App(): JSX.Element {
     )
     const live: SaveWorkspace[] = wsList.map((w) => ({
       ws: w.ws,
-      tabs: w.tabs.map((t) => ({ tab: t.tab, panes: t.panes.map((p) => ({ name: p.name, cwd: p.cwd, kind: p.kind, ord: p.ord })) })),
+      tabs: w.tabs.map((t) => ({ tab: t.tab, panes: t.panes.map((p) => ({
+        name: p.name, cwd: p.cwd, kind: p.kind, ord: p.ord,
+        ...(p.kind === 'browser' ? { url: layoutRef.current.browsers?.[p.name]?.url ?? '' } : {}),
+      })) })),
     }))
     const doc = assembleSave(scope, live, layoutRef.current, dumps)
     const base = scope === 'one'
@@ -639,7 +647,12 @@ function App(): JSX.Element {
     const killed: string[] = []
     if (mode === 'replace') {
       const cur = workspaces.find((w) => w.ws === currentWs)
-      for (const t of cur?.tabs ?? []) for (const p of t.panes) { window.amber.killSession(p.name); killed.push(p.name) }
+      // Browser panes are purged from the sidecar (closePane); only real daemon
+      // sessions are killed + gated on in pendingLoad.
+      for (const t of cur?.tabs ?? []) for (const p of t.panes) {
+        if (isBrowserName(p.name)) closePane(p.name)
+        else { window.amber.killSession(p.name); killed.push(p.name) }
+      }
     }
     const plan = planLoad(doc, { mode, currentWs, liveWs, mintId: makeId })
     // Stage scrollback NOW, before the panes can mount. In replace mode reconcile

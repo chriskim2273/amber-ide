@@ -1,6 +1,30 @@
 import { describe, it, expect } from 'vitest'
 import type { Node } from '../renderer/layout'
 import type { LayoutFile } from './layoutFile'
+
+import { assembleSave as _asm, planLoad as _pl } from './workspaceFile'
+describe('browser panes in .amberws', () => {
+  it('save emits a browser pane with url, no scrollback', () => {
+    const doc = _asm('one',
+      [{ ws: 1, tabs: [{ tab: 1, panes: [{ name: 'browser-1-1-0-a', cwd: '', kind: 'browser', ord: 0, url: 'https://x.dev' }] }] }],
+      { version: 1, activeWorkspace: 1, workspaces: { '1': { activeTab: 1, tabs: { '1': { tree: { kind: 'leaf', paneId: 'browser-1-1-0-a' } } } } } },
+      {})
+    const pane = doc.workspaces[0]!.tabs[0]!.panes[0]!
+    expect(pane.kind).toBe('browser')
+    expect(pane.url).toBe('https://x.dev')
+    expect(pane.scrollback).toBe('')
+  })
+  it('load routes a browser pane to browsers, not creates', () => {
+    const doc = { version: 1, scope: 'one' as const, workspaces: [{ tabs: [{ tab: 1, tree: { kind: 'leaf' as const, paneId: 'p0' },
+      panes: [{ id: 'p0', kind: 'browser', cwd: '', ord: 0, scrollback: '', url: 'https://y.dev' }] }] }] }
+    let n = 0
+    const plan = _pl(doc, { mode: 'new', currentWs: 1, liveWs: [1], mintId: () => `m${n++}` })
+    expect(plan.creates).toEqual([])
+    const [name, entry] = Object.entries(plan.browsers)[0]!
+    expect(name.startsWith('browser-2-1-0-')).toBe(true)
+    expect(entry).toEqual({ ws: 2, tab: 1, ord: 0, url: 'https://y.dev' })
+  })
+})
 import {
   WORKSPACE_VERSION,
   parseWorkspaceFile,

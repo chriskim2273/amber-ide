@@ -1,6 +1,7 @@
 import type { Node } from '../renderer/layout'
 import { formatName } from './names'
-import type { LayoutFile, WsLayout, TabLayout, FrozenEntry } from './layoutFile'
+import { formatBrowserName } from './browserName'
+import type { LayoutFile, WsLayout, TabLayout, FrozenEntry, BrowserEntry } from './layoutFile'
 
 // The `.amberws` portable workspace file. Structure (grouping/tree/labels) +
 // per-pane scrollback, versioned. Tree leaves are file-local placeholders
@@ -9,11 +10,12 @@ export const WORKSPACE_VERSION = 1
 
 export interface WsPane {
   id: string // placeholder referenced by tree leaves (p0, p1…)
-  kind: string // 'shell' | 'claude' (daemon session kind, stored verbatim)
+  kind: string // 'shell' | 'claude' | 'browser' (app-local; stored verbatim)
   cwd: string
   ord: number
   frozenNote?: string // presence (incl. '') = frozen; the value is the note
-  scrollback: string // base64; '' when no dump was captured
+  scrollback: string // base64; '' when no dump was captured (always '' for browser)
+  url?: string // browser panes only: the saved address
 }
 export interface WsTab {
   tab: number
@@ -80,6 +82,7 @@ function parsePane(v: unknown): WsPane {
     scrollback: p['scrollback'],
     // frozenNote is optional; drop it unless a string ('' is valid = frozen, no note).
     ...(typeof p['frozenNote'] === 'string' ? { frozenNote: p['frozenNote'] } : {}),
+    ...(typeof p['url'] === 'string' ? { url: p['url'] } : {}),
   }
 }
 
@@ -162,7 +165,7 @@ export function treeFromPlaceholders(tree: Node | null, idToName: Record<string,
 // Narrow structural inputs (superset-compatible with store.ts's WorkspaceModel/
 // TabModel/PaneModel) so this module stays pure and never imports the renderer
 // store.
-export interface SavePane { name: string; cwd: string; kind: string; ord: number }
+export interface SavePane { name: string; cwd: string; kind: string; ord: number; url?: string }
 export interface SaveTab { tab: number; panes: SavePane[] }
 export interface SaveWorkspace { ws: number; tabs: SaveTab[] }
 
@@ -193,10 +196,12 @@ export function assembleSave(
           kind: p.kind,
           cwd: p.cwd,
           ord: p.ord,
-          scrollback: dump ? toBase64(dump) : '',
+          // Browser panes have no daemon scrollback; they carry a URL instead.
+          scrollback: p.kind === 'browser' ? '' : (dump ? toBase64(dump) : ''),
           // Frozen presence must survive even with no note → encode '' so the
           // pane still round-trips as frozen (presence, not truthiness).
           ...(fz ? { frozenNote: fz.note ?? '' } : {}),
+          ...(p.kind === 'browser' ? { url: p.url ?? '' } : {}),
         }
       })
       return {
@@ -226,6 +231,7 @@ export interface LoadPlan {
   workspaces: Record<string, WsLayout> // sidecar mutations, keyed by ws-number string
   frozen: Record<string, FrozenEntry> // keyed by minted session name
   scrollback: Record<string, Uint8Array> // keyed by minted session name
+  browsers: Record<string, BrowserEntry> // app-local browser panes, keyed by minted browser id
   targetWorkspaces: number[] // ws numbers used, in doc order
 }
 
@@ -235,6 +241,7 @@ export function buildLoadPlan(doc: WorkspaceDoc, opts: LoadOptions): LoadPlan {
   const workspaces: Record<string, WsLayout> = {}
   const frozen: Record<string, FrozenEntry> = {}
   const scrollback: Record<string, Uint8Array> = {}
+  const browsers: Record<string, BrowserEntry> = {}
   const targetWorkspaces: number[] = []
 
   doc.workspaces.forEach((ws, wsIdx) => {
@@ -244,6 +251,14 @@ export function buildLoadPlan(doc: WorkspaceDoc, opts: LoadOptions): LoadPlan {
     for (const tab of ws.tabs) {
       const idToName: Record<string, string> = {}
       for (const pane of tab.panes) {
+        // Browser panes are app-local: mint a browser id, record a sidecar entry,
+        // and DO NOT create a daemon session (no `creates` push).
+        if (pane.kind === 'browser') {
+          const bname = formatBrowserName({ ws: targetWs, tab: tab.tab, ord: pane.ord, id: opts.mintId() })
+          idToName[pane.id] = bname
+          browsers[bname] = { ws: targetWs, tab: tab.tab, ord: pane.ord, url: pane.url ?? '' }
+          continue
+        }
         const name = formatName({ ws: targetWs, tab: tab.tab, ord: pane.ord, id: opts.mintId() })
         idToName[pane.id] = name
         creates.push({ name, cwd: pane.cwd, kind: pane.kind })
@@ -264,7 +279,7 @@ export function buildLoadPlan(doc: WorkspaceDoc, opts: LoadOptions): LoadPlan {
     }
   })
 
-  return { creates, workspaces, frozen, scrollback, targetWorkspaces }
+  return { creates, workspaces, frozen, scrollback, browsers, targetWorkspaces }
 }
 
 // Lowest free workspace number: one above the highest live number (gaps are NOT
@@ -295,6 +310,7 @@ export function planLoad(
     workspaces: { ...firstPlan.workspaces, ...restPlan.workspaces },
     frozen: { ...firstPlan.frozen, ...restPlan.frozen },
     scrollback: { ...firstPlan.scrollback, ...restPlan.scrollback },
+    browsers: { ...firstPlan.browsers, ...restPlan.browsers },
     targetWorkspaces: [...firstPlan.targetWorkspaces, ...restPlan.targetWorkspaces],
   }
 }
