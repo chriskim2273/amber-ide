@@ -121,6 +121,40 @@ Linux cgroup v2 `memory.high`. Requires the daemon to restructure its cgroup:
 
 Deploying Slice 2 restarts the daemon (sessions restore with scrollback).
 
+## Slice 3 — Freeze → claude suspend/resume (designed, deferred)
+
+A different lever than throttling: **actually free a parked claude pane's RAM**
+by killing its child and resuming it on unfreeze. This is *manual, per-session
+reboot survival* — it reuses the existing restore/spawn path and the claude
+`--resume <id>` ladder (core rules #6/#7), so most of the machinery exists.
+
+**Decisions (settled with user):**
+- **Scope: claude panes only.** A claude child (Node) is the real RAM hog and
+  resumes cleanly (`claude --resume <recorded-id>`; the transcript lives under
+  the alt screen and redraws on resume). **Shell panes keep today's
+  display-only freeze** — a shell's state *is* its process memory (env, shell
+  vars, running foreground programs, in-memory history); killing it would
+  discard all of that (only cwd survives), so shells are excluded.
+- **Trigger: after a grace delay.** Freeze parks the pane (display-only) now;
+  the daemon kills the claude child only if it stays frozen ≥ `suspend_grace`
+  (config, e.g. 30 s). A brief freeze/unfreeze pays nothing; a long park frees
+  the RAM. Unfreeze before the grace = no kill, no resume cost.
+
+**Mechanism:**
+- New control msgs `Suspend { name }` / `Resume { name }`. `Suspend` kills the
+  child but **retains** the session metadata (name, cwd, kind, recorded claude
+  id) and marks it suspended; `Resume` respawns from that metadata via the
+  restore path. The reap timer must **skip suspended sessions** (their child
+  exited on purpose — never destroy the record). New `run_state` = `"suspended"`
+  so the UI shows a distinct parked-and-freed state vs plain frozen.
+- App: the freeze gesture starts a per-pane grace timer (claude panes only);
+  on expiry → `Suspend`; unfreeze → `Resume` (and cancel a pending timer).
+  Reuses the existing frozen overlay; resume triggers the daemon repaint nudge.
+
+**Risks:** unfreeze latency = a full claude relaunch+resume (seconds); a claude
+whose recorded id is stale/rotated falls through the resume ladder to a fresh
+start (same as reboot restore — acceptable). Deploying restarts the daemon.
+
 ## Out of scope
 
 - Renderer-pane LRU eviction (a separate lever for the keep-alive footprint;
