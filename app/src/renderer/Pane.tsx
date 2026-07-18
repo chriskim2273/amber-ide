@@ -6,6 +6,7 @@ import { SearchAddon } from '@xterm/addon-search'
 import '@xterm/xterm/css/xterm.css'
 import { appChord } from './keys'
 import { takeReplay } from './replay'
+import { decodeOsc52Payload } from './osc'
 
 // Imperative scrollback-search handle handed to the chrome (the find bar in
 // SplitView) via `onSearchReady`. Search execution stays outside React — the
@@ -171,6 +172,18 @@ export const Pane = memo(function Pane(
         port?.postMessage({ resize: { cols: term.cols, rows: term.rows } })
         term.refresh(0, Math.max(0, term.rows - 1))
       },
+    })
+
+    // OSC 52 clipboard writes: a TUI sets the system clipboard by emitting
+    // ESC ] 52 ; <sel> ; <base64> BEL. Claude Code's select-to-copy uses this.
+    // xterm.js ignores OSC 52 by default, so route it to the same clipboard
+    // bridge as the copy chord. decodeOsc52Payload returns null for a "?" READ
+    // request (denied — no clipboard exfiltration) or malformed data. We own
+    // OSC 52, so always return true (consume it). Disposed with the Terminal.
+    term.parser.registerOscHandler(52, (data) => {
+      const text = decodeOsc52Payload(data)
+      if (text) window.amber.clipboardWrite(text)
+      return true
     })
 
     fit.fit()
