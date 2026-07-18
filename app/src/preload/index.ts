@@ -16,6 +16,9 @@ contextBridge.exposeInMainWorld('amber', {
   createSession: (name: string, cwd: string, sessionKind: string) =>
     ipcRenderer.send('daemon-command', { cmd: 'create', name, cwd, sessionKind }),
   killSession: (name: string) => ipcRenderer.send('daemon-command', { cmd: 'kill', name }),
+  // Slice 3 freeze grace: park/un-park a claude session to free its RAM.
+  suspendSession: (name: string) => ipcRenderer.send('daemon-command', { cmd: 'suspend', name }),
+  resumeSession: (name: string) => ipcRenderer.send('daemon-command', { cmd: 'resume', name }),
   // Request the daemon dump a session's scrollback ring; the reply arrives as a
   // `Backlog` control frame via onDaemonEvent (correlated by name renderer-side).
   dumpBacklog: (name: string) => ipcRenderer.send('daemon-command', { cmd: 'dumpBacklog', name }),

@@ -31,6 +31,8 @@ export type ControlMsg =
   | { kind: 'DumpBacklog'; name: string }
   | { kind: 'Backlog'; name: string; data: Uint8Array }
   | { kind: 'Kill'; name: string }
+  | { kind: 'Suspend'; name: string }
+  | { kind: 'Resume'; name: string }
   | { kind: 'Resize'; name: string; cols: number; rows: number }
   | { kind: 'SessionList'; names: string[] }
   | { kind: 'Sessions'; sessions: SessionInfo[] }
@@ -72,6 +74,10 @@ function msgToJson(m: ControlMsg): unknown {
       return { Backlog: { name: m.name, data: Array.from(m.data) } }
     case 'Kill':
       return { Kill: { name: m.name } }
+    case 'Suspend':
+      return { Suspend: { name: m.name } }
+    case 'Resume':
+      return { Resume: { name: m.name } }
     case 'Resize':
       return { Resize: { name: m.name, cols: m.cols, rows: m.rows } }
     case 'SessionList':

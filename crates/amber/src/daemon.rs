@@ -326,6 +326,27 @@ fn handle_control(
                 }
             }
         }
+        // Slice 3: park/un-park a claude session to free its RAM. Signal the
+        // supervisor (SIGUSR1/SIGUSR2); the supervisor reports the resulting phase
+        // ("suspended"/"claude") back via ReportRunState, which fans the change to
+        // watchers. On success, no reply (fire-and-forget, like ReportRunState);
+        // only a failure gets a small Error frame.
+        ControlMsg::Suspend { name } => {
+            if let Err(e) = manager.signal_suspend(&name, false) {
+                let _ = write_frame(
+                    writer,
+                    &Frame::Control(ControlMsg::Error { msg: e.to_string() }),
+                );
+            }
+        }
+        ControlMsg::Resume { name } => {
+            if let Err(e) = manager.signal_suspend(&name, true) {
+                let _ = write_frame(
+                    writer,
+                    &Frame::Control(ControlMsg::Error { msg: e.to_string() }),
+                );
+            }
+        }
         ControlMsg::DumpBacklog { name } => {
             let Some(sess) = manager.session(&name) else {
                 let _ = write_frame(

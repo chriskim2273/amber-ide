@@ -112,6 +112,8 @@ export function paneDot(kind: string, runState: string | undefined): KindDot {
   switch (runState) {
     case 'claude-retrying': return { cls: 'claude-retrying', label: 'claude (retrying)' }
     case 'shell-fallback': return { cls: 'shell-fallback', label: 'shell (claude exited)' }
+    // Slice 3: parked by a freeze grace — claude killed to free RAM, resumable.
+    case 'suspended': return { cls: 'suspended', label: 'suspended (RAM freed)' }
     default: return { cls: 'claude', label: 'claude' }
   }
 }

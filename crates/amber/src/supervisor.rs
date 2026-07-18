@@ -6,6 +6,8 @@ use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use amber_core::proto::{self, ControlMsg, Frame};
@@ -17,6 +19,29 @@ use crate::claude;
 /// must NEVER stall supervision, so both the connect and the write are
 /// best-effort and time-bounded; a failure is logged and ignored.
 const REPORT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How often the interruptible run-wait polls for claude's exit or a suspend
+/// request (Slice 3). Replaces a blocking wait so a SIGUSR1 can park claude
+/// promptly; 150 ms is imperceptible for a long-lived TUI and negligible CPU.
+const WAIT_POLL: Duration = Duration::from_millis(150);
+/// How often a parked (suspended) supervisor polls for the resume request.
+const IDLE_POLL: Duration = Duration::from_millis(250);
+
+/// Suspend/resume signalling for a claude session (Slice 3, freeze grace). The
+/// daemon sets `suspend` (SIGUSR1) to park claude — the supervisor kills it,
+/// freeing its RAM, and idles holding the pty — and `resume` (SIGUSR2) to
+/// relaunch it. Two one-shot flags, drained with `swap(false)`.
+#[derive(Clone, Default)]
+pub struct SuspendControl {
+    pub suspend: Arc<AtomicBool>,
+    pub resume: Arc<AtomicBool>,
+}
+
+impl SuspendControl {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
 
 /// Outcome of [`supervise_claude`]'s bounded retry loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +63,9 @@ pub enum SuperviseOutcome {
 /// block supervision (the socket-backed reporter used in production time-bounds
 /// its I/O and swallows errors); tests pass a recording closure to assert the
 /// exact transition sequence.
+// Eight params (the seven original + the suspend control). Grouping them into a
+// config struct would add ceremony without clarity here; the call sites are few.
+#[allow(clippy::too_many_arguments)]
 pub fn supervise_claude(
     claude_path: &Path,
     root: &Path,
@@ -46,6 +74,7 @@ pub fn supervise_claude(
     settings: &Path,
     max_attempts: u32,
     report: impl Fn(&str),
+    ctl: &SuspendControl,
 ) -> anyhow::Result<SuperviseOutcome> {
     let store = StateStore::new(root);
     let mut attempts = 0u32;
@@ -55,7 +84,7 @@ pub fn supervise_claude(
     // the new id rather than continuing to escalate. See `select_start`.
     let mut escalation = 0u32;
     let mut prev_id: Option<String> = None;
-    loop {
+    'sup: loop {
         let session_id = store.read_claude(name)?.map(|m| m.session_id);
         if session_id != prev_id {
             escalation = 0;
@@ -67,16 +96,45 @@ pub fn supervise_claude(
         // Entering (or re-entering) the running phase.
         report("claude");
 
-        // A failure to even launch the child (e.g. a transient ETXTBSY while
-        // the binary is being replaced) is treated the same as a crash: it
-        // counts against the retry budget instead of aborting supervision
-        // outright, since "a session never silently dies" (spec §6.2).
-        let outcome = Command::new(claude_path)
+        // Spawn (not `.status()`) so the run is interruptible: a SIGUSR1-set
+        // suspend request parks claude mid-run. A launch failure (e.g. a
+        // transient ETXTBSY while the binary is replaced) counts against the
+        // retry budget rather than aborting supervision ("a session never
+        // silently dies", spec §6.2).
+        let outcome: std::io::Result<std::process::ExitStatus> = match Command::new(claude_path)
             .args(&argv)
             .current_dir(cwd)
             .env("AMBER_SESSION", name)
             .env("AMBER_STATE_DIR", root)
-            .status();
+            .spawn()
+        {
+            Err(e) => Err(e),
+            Ok(mut child) => 'wait: loop {
+                // Prefer a real exit over a coincident suspend: if claude has
+                // already exited (e.g. a user quit), handle that normally.
+                match child.try_wait() {
+                    Ok(Some(status)) => break 'wait Ok(status),
+                    Ok(None) => {}
+                    Err(e) => break 'wait Err(e),
+                }
+                if ctl.suspend.swap(false, Ordering::SeqCst) {
+                    // Park: kill claude (frees its RAM), idle holding the pty
+                    // until a resume, then relaunch via the resume ladder. NOT
+                    // counted as a crash — escalation/prev_id reset so the
+                    // recorded id is Resumed on relaunch.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    report("suspended");
+                    while !ctl.resume.swap(false, Ordering::SeqCst) {
+                        std::thread::sleep(IDLE_POLL);
+                    }
+                    escalation = 0;
+                    prev_id = None;
+                    continue 'sup;
+                }
+                std::thread::sleep(WAIT_POLL);
+            },
+        };
 
         let class = classify_run(&outcome);
         if class.is_user_quit() {
@@ -245,8 +303,16 @@ pub fn run_session(root: &Path, name: &str, socket: &Path) -> anyhow::Result<()>
         // exiting THAT shell ends `amber run` and closes the pane normally. On
         // exhausted retries we do the same rather than let the pane die (spec
         // §6.2 — "a session never silently dies").
+        // Suspend/resume signalling (Slice 3). SIGUSR1 parks claude, SIGUSR2
+        // resumes it. `amber run` is a dedicated per-pane process, so these
+        // signals are ours. Registration is best-effort: a failure just means
+        // freeze-to-free-RAM won't work for this pane (supervision is unaffected).
+        let ctl = SuspendControl::new();
+        let _ = signal_hook::flag::register(signal_hook::consts::SIGUSR1, Arc::clone(&ctl.suspend));
+        let _ = signal_hook::flag::register(signal_hook::consts::SIGUSR2, Arc::clone(&ctl.resume));
+
         let report = |state: &str| report_run_state(socket, name, state);
-        match supervise_claude(&claude_path, root, name, &cwd, &settings, 3, report)? {
+        match supervise_claude(&claude_path, root, name, &cwd, &settings, 3, report, &ctl)? {
             SuperviseOutcome::CleanExit => {}
             SuperviseOutcome::Exhausted => {
                 eprintln!(

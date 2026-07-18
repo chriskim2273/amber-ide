@@ -23,6 +23,8 @@ declare global {
       openPane: (session: string) => void
       createSession: (name: string, cwd: string, sessionKind: string) => void
       killSession: (name: string) => void
+      suspendSession: (name: string) => void
+      resumeSession: (name: string) => void
       dumpBacklog: (name: string) => void
       loadLayout: () => Promise<string | null>
       saveLayout: (text: string) => Promise<void>
@@ -53,6 +55,9 @@ function toEvent(d: unknown): DaemonEvent | null {
 
 
 const DEFAULT_FONT_SIZE = 13
+// Slice 3: how long a claude pane stays frozen before the daemon kills its child
+// to free RAM (resumed on unfreeze). A brief freeze/unfreeze pays nothing.
+const SUSPEND_GRACE_MS = 30_000
 // Stable empty frozen map so `layout.frozen ?? EMPTY_FROZEN` doesn't mint a new
 // object every render (keeps SplitView's `frozen` prop referentially stable).
 const EMPTY_FROZEN: Record<string, { note?: string }> = {}
@@ -325,20 +330,49 @@ function App(): JSX.Element {
     return { ...l, workspaces: { ...l.workspaces, [wsKey]: { ...w, tabOrder: next } } }
   }), [wsKey, activeTab, tabs])
 
-  // Freeze/unfreeze a pane (display-only; daemon untouched — rule #1/#3). An
-  // empty note is stored as `{}` (omit the key) to satisfy
-  // exactOptionalPropertyTypes and keep the sidecar clean.
-  const freezePane = useCallback((name: string, note: string): void => setLayout((l) => {
-    const n = note.trim()
-    const next = { ...(l.frozen ?? {}), [name]: n ? { note: n } : {} }
-    return { ...l, frozen: next }
-  }), [])
-  const unfreezePane = useCallback((name: string): void => setLayout((l) => {
-    if (!l.frozen || !(name in l.frozen)) return l
-    const next = { ...l.frozen }
-    delete next[name]
-    return { ...l, frozen: next }
-  }), [])
+  // Slice 3 freeze grace: per-pane pending suspend timers + the set of sessions
+  // currently suspended (child killed). Refs so scheduling never re-renders.
+  // `sessionsRef` gives freezePane the live kind without a dep on state.sessions.
+  const suspendTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
+  const suspendedRef = useRef<Set<string>>(new Set())
+  const sessionsRef = useRef(state.sessions)
+  sessionsRef.current = state.sessions
+
+  // Freeze/unfreeze a pane. The sidecar `frozen` map is display-only (rule #1/#3).
+  // For a CLAUDE pane, freezing ALSO schedules a daemon suspend after the grace:
+  // the daemon kills claude (frees RAM) and the supervisor resumes it on unfreeze.
+  // An empty note is stored as `{}` (exactOptionalPropertyTypes) to keep it clean.
+  const freezePane = useCallback((name: string, note: string): void => {
+    setLayout((l) => {
+      const n = note.trim()
+      const next = { ...(l.frozen ?? {}), [name]: n ? { note: n } : {} }
+      return { ...l, frozen: next }
+    })
+    const isClaude = sessionsRef.current.find((s) => s.name === name)?.kind === 'claude'
+    if (isClaude && !suspendTimers.current.has(name)) {
+      const t = setTimeout(() => {
+        window.amber.suspendSession(name)
+        suspendedRef.current.add(name)
+        suspendTimers.current.delete(name)
+      }, SUSPEND_GRACE_MS)
+      suspendTimers.current.set(name, t)
+    }
+  }, [])
+  const unfreezePane = useCallback((name: string): void => {
+    setLayout((l) => {
+      if (!l.frozen || !(name in l.frozen)) return l
+      const next = { ...l.frozen }
+      delete next[name]
+      return { ...l, frozen: next }
+    })
+    // Cancel a pending suspend; if the child was already killed, resume it.
+    const t = suspendTimers.current.get(name)
+    if (t) { clearTimeout(t); suspendTimers.current.delete(name) }
+    if (suspendedRef.current.has(name)) {
+      window.amber.resumeSession(name)
+      suspendedRef.current.delete(name)
+    }
+  }, [])
 
   // Prune frozen entries whose session no longer exists — against the FULL live
   // set (sessions in other workspaces are still live; only drop truly-gone

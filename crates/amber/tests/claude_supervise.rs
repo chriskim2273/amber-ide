@@ -2,13 +2,33 @@
 //! selection, bounded-retry crash handling) and the `amber hook` subcommand
 //! that records the rotating session id (spec §6.2, §8).
 
-use amber::supervisor::{supervise_claude, SuperviseOutcome};
+use amber::supervisor::{supervise_claude, SuperviseOutcome, SuspendControl};
 use amber_core::state::{ClaudeMeta, StateStore};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// Poll `phases` until `pred` holds or `timeout` elapses; panic on timeout.
+fn wait_until(
+    phases: &Arc<Mutex<Vec<String>>>,
+    pred: impl Fn(&[String]) -> bool,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if pred(&phases.lock().unwrap()) {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!("timed out; phases so far: {:?}", phases.lock().unwrap());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
 
 // `supervise_claude`'s reporter is invoked at each supervision transition; a
 // `Mutex<Vec<String>>` records the exact phase sequence for assertions. The
@@ -54,7 +74,7 @@ fn resume_after_first_run() {
     let phases = Mutex::new(Vec::<String>::new());
     let report = |s: &str| phases.lock().unwrap().push(s.to_string());
     let outcome =
-        supervise_claude(&claude_path, root, "work", cwd, &settings, 3, report).unwrap();
+        supervise_claude(&claude_path, root, "work", cwd, &settings, 3, report, &SuspendControl::new()).unwrap();
     assert!(matches!(outcome, SuperviseOutcome::CleanExit));
     // A clean first run reports exactly one "claude" (start), no retry.
     assert_eq!(phases.lock().unwrap().clone(), vec!["claude".to_string()]);
@@ -80,7 +100,7 @@ fn resume_after_first_run() {
     // Second run: claude/<name>.json now present -> --resume sid-9.
     let report = |_s: &str| {};
     let outcome =
-        supervise_claude(&claude_path, root, "work", cwd, &settings, 3, report).unwrap();
+        supervise_claude(&claude_path, root, "work", cwd, &settings, 3, report, &SuspendControl::new()).unwrap();
     assert!(matches!(outcome, SuperviseOutcome::CleanExit));
 
     let lines = log_lines(root);
@@ -100,7 +120,7 @@ fn crash_exhausts_to_outcome() {
     let phases = Mutex::new(Vec::<String>::new());
     let report = |s: &str| phases.lock().unwrap().push(s.to_string());
     let outcome =
-        supervise_claude(&claude_path, root, "work", cwd, &settings, 3, report).unwrap();
+        supervise_claude(&claude_path, root, "work", cwd, &settings, 3, report, &SuspendControl::new()).unwrap();
     assert!(matches!(outcome, SuperviseOutcome::Exhausted));
 
     let lines = log_lines(root);
@@ -119,6 +139,60 @@ fn crash_exhausts_to_outcome() {
             "claude-retrying".to_string(),
             "claude".to_string(),
         ]
+    );
+}
+
+#[test]
+fn suspend_then_resume_parks_and_relaunches_claude() {
+    // Slice 3: SIGUSR1 (suspend flag) mid-run must KILL the running claude,
+    // report "suspended", idle, and — on the resume flag — relaunch it. The kill
+    // must NOT count as a crash. Uses a fake claude that runs ~1s so suspend
+    // fires while it is still alive.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let claude_path = bin.join("claude");
+    fs::write(
+        &claude_path,
+        "#!/bin/sh\necho \"$@\" >> \"$AMBER_STATE_DIR/claude_argv.log\"\nsleep 1\nexit 0\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&claude_path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let settings = root.join("settings.json");
+    let ctl = SuspendControl::new();
+    let phases = Arc::new(Mutex::new(Vec::<String>::new()));
+
+    let (root2, cp2, set2, ctl2, ph2) = (
+        root.clone(),
+        claude_path.clone(),
+        settings.clone(),
+        ctl.clone(),
+        Arc::clone(&phases),
+    );
+    let handle = std::thread::spawn(move || {
+        let report = |s: &str| ph2.lock().unwrap().push(s.to_string());
+        supervise_claude(&cp2, &root2, "work", &root2, &set2, 3, report, &ctl2).unwrap()
+    });
+
+    // Run #1 is up.
+    wait_until(&phases, |p| p.first().is_some_and(|s| s == "claude"), Duration::from_secs(3));
+    // Park it (the wait loop polls the flag every 150 ms).
+    ctl.suspend.store(true, Ordering::SeqCst);
+    wait_until(&phases, |p| p.iter().any(|s| s == "suspended"), Duration::from_secs(3));
+    // Resume → relaunch; run #2 sleeps 1s then exits 0 → CleanExit ends the loop.
+    ctl.resume.store(true, Ordering::SeqCst);
+    let outcome = handle.join().unwrap();
+
+    assert!(matches!(outcome, SuperviseOutcome::CleanExit));
+    assert_eq!(
+        *phases.lock().unwrap(),
+        vec!["claude".to_string(), "suspended".to_string(), "claude".to_string()],
+        "expected start → suspended → relaunch, with the kill NOT counted as a crash"
     );
 }
 

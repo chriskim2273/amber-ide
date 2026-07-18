@@ -222,6 +222,8 @@ body {
 .tab .kind-dot.claude-retrying { background: var(--warn); animation: pulse 1.2s ease-in-out infinite; }
 /* claude gave up / user quit — pane is a plain shell now (gray) */
 .tab .kind-dot.shell-fallback { background: var(--text-faint); }
+/* parked by a freeze grace — claude killed to free RAM, resumable (cyan) */
+.tab .kind-dot.suspended { background: var(--accent-3, #4dd6c8); }
 /* Background-activity indicator on a non-active tab: a small accent dot,
    visually distinct from the kind-dot. Softly pulses to draw the eye. */
 .tab .activity-dot {
@@ -321,6 +323,8 @@ body {
 .pane-header .kind-dot.claude-retrying { background: var(--warn); animation: pulse 1.2s ease-in-out infinite; }
 /* claude gave up / user quit — pane is a plain shell now (gray) */
 .pane-header .kind-dot.shell-fallback { background: var(--text-faint); }
+/* parked by a freeze grace — claude killed to free RAM, resumable (cyan) */
+.pane-header .kind-dot.suspended { background: var(--accent-3, #4dd6c8); }
 .pane-title {
   font-family: var(--font-mono);
   overflow: hidden;

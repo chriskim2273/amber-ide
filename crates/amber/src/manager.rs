@@ -351,7 +351,9 @@ impl SessionManager {
     /// allowed values. A restored hand-started claude (`resume_as_claude`) runs
     /// the supervisor too, so it counts as claude here.
     pub fn set_run_state(&self, name: &str, state: &str) -> anyhow::Result<()> {
-        if !matches!(state, "claude" | "claude-retrying" | "shell-fallback") {
+        // "suspended" (Slice 3): claude parked by a freeze grace — child killed
+        // to free RAM, pty held idle, resumable.
+        if !matches!(state, "claude" | "claude-retrying" | "shell-fallback" | "suspended") {
             anyhow::bail!("invalid run_state: {state}");
         }
         let sess = self
@@ -368,6 +370,42 @@ impl SessionManager {
             anyhow::bail!("run_state applies only to claude sessions: {name}");
         }
         sess.set_run_state(Some(state.to_string()));
+        Ok(())
+    }
+
+    /// Signal a claude session's supervisor (`amber run`) to suspend (SIGUSR1 —
+    /// kill claude, free its RAM, idle) or resume (SIGUSR2 — relaunch
+    /// `claude --resume`). Slice 3 freeze-to-free-RAM. Errors if the session is
+    /// unknown, not a claude session, or has no child pid. The supervisor
+    /// reports the resulting phase back via `ReportRunState`, so this does not
+    /// itself set run_state.
+    pub fn signal_suspend(&self, name: &str, resume: bool) -> anyhow::Result<()> {
+        let sess = self
+            .session(name)
+            .ok_or_else(|| anyhow::anyhow!("no such session: {name}"))?;
+        let is_claude = self
+            .store
+            .read_session(name)
+            .ok()
+            .flatten()
+            .map(|m| m.kind == SessionKind::Claude || m.resume_as_claude)
+            .unwrap_or(false);
+        if !is_claude {
+            anyhow::bail!("suspend applies only to claude sessions: {name}");
+        }
+        let pid = sess
+            .pid()
+            .ok_or_else(|| anyhow::anyhow!("session {name} has no child pid"))?;
+        let sig = if resume { nix::libc::SIGUSR2 } else { nix::libc::SIGUSR1 };
+        // SAFETY: kill(2) with our own child's pid and a fixed valid signal;
+        // failure is reported via errno, never UB.
+        let rc = unsafe { nix::libc::kill(pid as nix::libc::pid_t, sig) };
+        if rc != 0 {
+            anyhow::bail!(
+                "failed to signal session {name}: {}",
+                std::io::Error::last_os_error()
+            );
+        }
         Ok(())
     }
 

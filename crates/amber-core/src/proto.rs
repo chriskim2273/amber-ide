@@ -61,6 +61,15 @@ pub enum ControlMsg {
     /// supervisor never waits for a reply (the daemon replies `Error` only for
     /// an unknown session, a non-claude session, or an invalid state string).
     ReportRunState { name: String, state: String },
+    /// Client -> daemon: park a claude session's child to free its RAM (Slice 3,
+    /// freeze grace). The daemon signals the session's `amber run` supervisor
+    /// (SIGUSR1) to kill claude and idle; the session record + pty + attachments
+    /// stay alive. Non-claude / unknown sessions reply `Error`.
+    Suspend { name: String },
+    /// Client -> daemon: un-park a suspended claude session — the daemon signals
+    /// the supervisor (SIGUSR2) to relaunch `claude --resume`. Non-claude /
+    /// unknown sessions reply `Error`.
+    Resume { name: String },
     /// Ask the daemon to flush a snapshot to the state store now.
     Snapshot,
     /// Daemon reply: the snapshot completed successfully.

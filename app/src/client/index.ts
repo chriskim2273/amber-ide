@@ -29,12 +29,18 @@ process.parentPort.on('message', (event) => {
         | { cmd: 'create'; name: string; cwd: string; sessionKind: string }
         | { cmd: 'kill'; name: string }
         | { cmd: 'dumpBacklog'; name: string }
+        | { cmd: 'suspend'; name: string }
+        | { cmd: 'resume'; name: string }
       if (cmd.cmd === 'create') {
         conn.send({ type: 'control', msg: { kind: 'Create', name: cmd.name, cwd: cmd.cwd, sessionKind: cmd.sessionKind } })
       } else if (cmd.cmd === 'kill') {
         conn.send({ type: 'control', msg: { kind: 'Kill', name: cmd.name } })
       } else if (cmd.cmd === 'dumpBacklog') {
         conn.send({ type: 'control', msg: { kind: 'DumpBacklog', name: cmd.name } })
+      } else if (cmd.cmd === 'suspend') {
+        conn.send({ type: 'control', msg: { kind: 'Suspend', name: cmd.name } })
+      } else if (cmd.cmd === 'resume') {
+        conn.send({ type: 'control', msg: { kind: 'Resume', name: cmd.name } })
       }
     })
     port.start()

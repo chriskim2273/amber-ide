@@ -154,6 +154,7 @@ describe('paneDot', () => {
     expect(paneDot('claude', 'claude')).toEqual({ cls: 'claude', label: 'claude' })
     expect(paneDot('claude', 'claude-retrying')).toEqual({ cls: 'claude-retrying', label: 'claude (retrying)' })
     expect(paneDot('claude', 'shell-fallback')).toEqual({ cls: 'shell-fallback', label: 'shell (claude exited)' })
+    expect(paneDot('claude', 'suspended')).toEqual({ cls: 'suspended', label: 'suspended (RAM freed)' })
   })
 })
 
