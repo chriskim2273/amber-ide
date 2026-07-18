@@ -292,6 +292,29 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   Spec: `docs/superpowers/specs/2026-07-17-desktop-install-button-design.md`.
   Live launcher/pin verification manual (needs packaged AppImage run).
 
+- [x] Browser pane (2026-07-18) — a web-viewer pane kind (`kind:'browser'`):
+  an Electron `<webview>` leaf owned entirely by the app-local sidecar, with
+  **zero daemon/Rust/protocol changes**. A browser pane has no daemon session
+  (spec §2 accepted tradeoff: sidecar-owned only, outside "grouping from names
+  alone" — sidecar loss loses it, same class as geometry). Id grammar
+  `browser-<ws>-<tab>-<ord>-<id>` (`shared/browserName.ts`); sidecar `browsers`
+  map (grouping + URL) on `LayoutFile`; `mergeBrowsers` injects them into
+  `groupSessions` output and feeds their ids to `reconcile` as always-live so
+  they're never pruned; `SplitView` renders `<Browser>` (webview + URL bar) for
+  `kind==='browser'`, hiding terminal-only affordances. Popups + navigation
+  policy live in the MAIN process (`setWindowOpenHandler` → system browser via
+  `shell.openExternal`; `will-navigate` restricts to http/https/about — Electron
+  43 removed the renderer `<webview>` `new-window` event). URL persists on nav
+  (debounced sidecar save); reboot survival free via the sidecar; `.amberws`
+  save/load routes browser panes to `LoadPlan.browsers` (never `creates`, no
+  daemon session). Pure parts TDD'd (browserName/layoutFile/store/workspaceFile
+  — 230 app tests + typecheck + bundle green). **Live-verified end-to-end** on
+  this box against an isolated private daemon (create → navigate example.com →
+  webview renders full-height → app restart → pane restored with its URL → close
+  → no phantom). Spec: `docs/superpowers/specs/2026-07-18-browser-pane-design.md`,
+  plan: `docs/superpowers/plans/2026-07-18-browser-pane.md`. Renderer components
+  (`Browser`/`SplitView`) stay test-deferred (repo pattern).
+
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**
   `std::io::Read` (dedicated thread); `take_writer()` is one-shot;
