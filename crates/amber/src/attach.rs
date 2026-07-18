@@ -60,7 +60,7 @@ const TERM_RESTORE: &[u8] =
     b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[!p\x1b[?1049l\x1b[?25h";
 
 /// Why [`run_client`] returned.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientEnd {
     /// Local stdin reached EOF (user closed input).
     StdinEof,
@@ -71,6 +71,11 @@ pub enum ClientEnd {
     /// The user pressed the detach hotkey (prefix + `d`). The `Detach` control
     /// message was sent; the session keeps running in the daemon.
     Detached,
+    /// The daemon rejected the attach with an `Error` frame (e.g. `amber attach
+    /// <typo>` — "no such session"). Carries the daemon's message; the caller
+    /// prints it and exits nonzero. Without this, a bad attach silently emitted
+    /// the terminal reset and left a dead, unresponsive terminal.
+    Rejected(String),
 }
 
 /// Default detach prefix key: `Ctrl-b` (`0x02`), matching tmux muscle memory.
@@ -422,6 +427,13 @@ pub fn attach(socket: &Path, name: &str, prefix: Option<u8>, want_bar: bool) -> 
         ClientEnd::SessionExit(code) => {
             eprintln!("[amber] session {name} ended (exit code {code})");
         }
+        // Daemon refused the attach (no such session, etc.). Report + exit
+        // nonzero so a typo'd `amber attach` doesn't look like success. The
+        // terminal is already restored (teardown + raw_guard drop ran above).
+        ClientEnd::Rejected(msg) => {
+            eprintln!("[amber] {msg}");
+            std::process::exit(1);
+        }
     }
     Ok(())
 }
@@ -518,6 +530,7 @@ pub fn run_client(
             decoder.feed(&sock_buf[..n]);
             let was_alt = alt.is_alt();
             let mut exit_code: Option<i32> = None;
+            let mut rejected: Option<String> = None;
             while let Some(frame) = decoder.next_frame()? {
                 match frame {
                     Frame::Data { bytes, .. } => {
@@ -526,6 +539,13 @@ pub fn run_client(
                     }
                     Frame::Control(ControlMsg::Exit { name: ended, code }) if ended == name => {
                         exit_code = Some(code);
+                        break;
+                    }
+                    // The daemon refused the attach (e.g. no such session).
+                    // Surface it instead of dropping it — otherwise the reset is
+                    // emitted and the terminal sits dead with no feedback.
+                    Frame::Control(ControlMsg::Error { msg }) => {
+                        rejected = Some(msg);
                         break;
                     }
                     _ => {}
@@ -544,6 +564,9 @@ pub fn run_client(
                 stdout.write_all(draw_bar(rows, &bar_line(cols)).as_bytes())?;
             }
             stdout.flush()?;
+            if let Some(msg) = rejected {
+                break 'ev ClientEnd::Rejected(msg);
+            }
             if let Some(code) = exit_code {
                 break 'ev ClientEnd::SessionExit(code);
             }
@@ -725,6 +748,19 @@ mod tests {
         });
         drop(h.server);
         let _ = h.done.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+
+    #[test]
+    fn client_surfaces_error_frame_as_rejected() {
+        // The daemon rejects an attach to a nonexistent session with an Error
+        // frame. The client must surface it (and exit nonzero) rather than
+        // silently emit the terminal reset and sit on a dead terminal.
+        let mut h = start_client();
+        h.expect_attach_and_initial_resize();
+        let err = Frame::Control(ControlMsg::Error { msg: "no such session: s".into() });
+        h.server.write_all(&proto::encode(&err)).unwrap();
+        let (end, _) = h.done.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(end.unwrap(), ClientEnd::Rejected("no such session: s".into()));
     }
 
     #[test]
