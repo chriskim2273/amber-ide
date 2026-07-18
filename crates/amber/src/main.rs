@@ -592,7 +592,13 @@ fn run_attach(
 /// looks that session up (an unknown name is left for the daemon to reject, and
 /// assumed shell); with no name, picks the most-recently-updated live session.
 fn resolve_target(socket: &Path, name: Option<String>) -> anyhow::Result<(String, bool)> {
-    let mut stream = UnixStream::connect(socket)?;
+    let mut stream = UnixStream::connect(socket).map_err(|e| {
+        anyhow::anyhow!(
+            "cannot reach the amber daemon at {} ({e}) — is it running? \
+             start it with `amber daemon` or the systemd/launchd service",
+            socket.display()
+        )
+    })?;
     stream.write_all(&proto::encode(&Frame::Control(ControlMsg::ListSessionsDetailed)))?;
 
     let mut decoder = Decoder::new();

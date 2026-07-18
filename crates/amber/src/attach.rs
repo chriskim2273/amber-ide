@@ -379,7 +379,12 @@ fn send_control(stream: &UnixStream, msg: ControlMsg) -> anyhow::Result<()> {
 /// stdin hits EOF, the socket closes, or the daemon reports the session's
 /// child exited.
 pub fn attach(socket: &Path, name: &str, prefix: Option<u8>, want_bar: bool) -> anyhow::Result<()> {
-    let stream = UnixStream::connect(socket)?;
+    let stream = UnixStream::connect(socket).map_err(|e| {
+        anyhow::anyhow!(
+            "cannot reach the amber daemon at {} ({e}) — is it running?",
+            socket.display()
+        )
+    })?;
 
     let winch = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGWINCH, Arc::clone(&winch))?;
