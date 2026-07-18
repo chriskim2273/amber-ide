@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useReducer, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { SplitView, type PaneMeta } from './SplitView'
-import { initialState, reduce, groupSessions, tabDot, hasActivity, type DaemonEvent } from './store'
+import { initialState, reduce, groupSessions, mergeBrowsers, tabDot, hasActivity, type DaemonEvent } from './store'
 import { deriveTab, shortCwd } from './tabView'
 import { formatName, makeId } from '../shared/names'
+import { formatBrowserName, isBrowserName } from '../shared/browserName'
 import { splitLeaf, setRatio, reconcile, leaves, moveLeaf, type Node } from './layout'
 import { emptyLayout, parseLayout, serializeLayout, orderTabs, moveTab, type LayoutFile, type TabLayout } from '../shared/layoutFile'
 import {
@@ -34,6 +35,7 @@ declare global {
       pickFolder: () => Promise<string | null>
       resolvePath: (cwd: string, raw: string) => Promise<string | null>
       revealPath: (abs: string) => void
+      openExternal: (url: string) => void
       clipboardWrite: (text: string) => void
       clipboardRead: () => Promise<string>
     }
@@ -104,7 +106,7 @@ function App(): JSX.Element {
   // Tab id currently being dragged for reorder (HTML5 drag; ref, not state, so
   // the drag gesture never re-renders the terminals).
   const dragTab = useRef<number | null>(null)
-  const [kind, setKind] = useState<'shell' | 'claude'>('shell')
+  const [kind, setKind] = useState<'shell' | 'claude' | 'browser'>('shell')
   // Absolute working directory for newly created panes (default $HOME). Sent
   // verbatim so a session restores in the SAME folder — a relative '.' would
   // drift to the daemon's cwd ($HOME under systemd) on restart.
@@ -248,7 +250,7 @@ function App(): JSX.Element {
     return () => clearTimeout(id)
   }, [layout, bridgeReady, loaded])
 
-  const workspaces = groupSessions(state)
+  const workspaces = mergeBrowsers(groupSessions(state), layout.browsers ?? {})
   const ws = workspaces.find((w) => w.ws === activeWs) ?? workspaces[0]
   const tabs = ws?.tabs ?? []
   const tab = tabs.find((t) => t.tab === activeTab) ?? tabs[0]
@@ -303,6 +305,16 @@ function App(): JSX.Element {
       return { ...l, workspaces: { ...l.workspaces, [wsKey]: { ...w, tabs: { ...w.tabs, [tabKey]: { ...prev, tree: next } } } } }
     })
   }, [wsKey, tabKey, activeTab])
+
+  // Persist a browser pane's current URL to the sidecar (fired on every webview
+  // navigation). Preserves ws/tab/ord; no-ops on an unchanged URL so a stable
+  // page never churns state or the debounced save. Stable identity so Browser's
+  // event effect doesn't re-subscribe each render.
+  const setBrowserUrl = useCallback((paneId: string, url: string): void => setLayout((l) => {
+    const prev = l.browsers?.[paneId]
+    if (!prev || prev.url === url) return l
+    return { ...l, browsers: { ...(l.browsers ?? {}), [paneId]: { ...prev, url } } }
+  }), [])
 
   // Sidecar label edits — app-owned display metadata; daemon state untouched. An
   // empty/whitespace value clears the label (drops the key → numeric default;
@@ -517,8 +529,35 @@ function App(): JSX.Element {
   // dead workspace. Always create relative to what's displayed.
   const currentWs = ws?.ws ?? activeWs
   const currentTab = tab?.tab ?? activeTab
-  const newPane = (tabId: number, ord: number): void =>
+  // App-local browser pane: no daemon session. Write the sidecar entry and let
+  // mergeBrowsers + deriveTab place it (reconcile appends it as a new leaf).
+  // Returns the minted paneId so a split caller can position it with direction.
+  const newBrowser = (tabId: number, ord: number): string => {
+    const name = formatBrowserName({ ws: currentWs, tab: tabId, ord, id: makeId() })
+    setLayout((l) => ({ ...l, browsers: { ...(l.browsers ?? {}), [name]: { ws: currentWs, tab: tabId, ord, url: '' } } }))
+    return name
+  }
+  const newPane = (tabId: number, ord: number): void => {
+    if (kind === 'browser') { newBrowser(tabId, ord); return }
     window.amber.createSession(formatName({ ws: currentWs, tab: tabId, ord, id: makeId() }), cwd, kind)
+  }
+  // url-only view of the sidecar browsers map for SplitView (referentially stable
+  // enough — a new object only when layout changes, which already re-renders).
+  const browserUrls: Record<string, { url: string }> =
+    Object.fromEntries(Object.entries(layout.browsers ?? {}).map(([k, v]) => [k, { url: v.url }]))
+  // Close a pane: browser panes are purged from the sidecar (mergeBrowsers then
+  // drops them → reconcile prunes the leaf); daemon panes go through Kill (the
+  // reap broadcast prunes the leaf — one-way flow, no optimistic tree edit).
+  const closePane = (paneId: string): void => {
+    if (isBrowserName(paneId)) {
+      setLayout((l) => {
+        if (!l.browsers?.[paneId]) return l
+        const rest = { ...l.browsers }
+        delete rest[paneId]
+        return { ...l, browsers: rest }
+      })
+    } else window.amber.killSession(paneId)
+  }
 
   const nextWs = (workspaces.reduce((m, w) => Math.max(m, w.ws), 0)) + 1
 
@@ -668,16 +707,24 @@ function App(): JSX.Element {
           )
         })}
         <button className="btn btn-ghost"
-          onClick={() => { setActiveWs(nextWs); window.amber.createSession(formatName({ ws: nextWs, tab: 1, ord: 0, id: makeId() }), cwd, kind); setActiveTab(1) }}>+ ws</button>
+          onClick={() => {
+            setActiveWs(nextWs)
+            if (kind === 'browser') {
+              const name = formatBrowserName({ ws: nextWs, tab: 1, ord: 0, id: makeId() })
+              setLayout((l) => ({ ...l, browsers: { ...(l.browsers ?? {}), [name]: { ws: nextWs, tab: 1, ord: 0, url: '' } } }))
+            } else window.amber.createSession(formatName({ ws: nextWs, tab: 1, ord: 0, id: makeId() }), cwd, kind)
+            setActiveTab(1)
+          }}>+ ws</button>
         <button className="icon-btn ws-io" aria-label="save workspace to file" title="Save workspace…"
           onClick={() => setSaveScopeOpen(true)}>💾</button>
         <button className="icon-btn ws-io" aria-label="load workspace from file" title="Load workspace…"
           onClick={() => void doLoad()}>📂</button>
         <div className="divider" />
         <span className="label">new</span>
-        <select className="select" value={kind} onChange={(e) => setKind(e.target.value as 'shell' | 'claude')}>
+        <select className="select" value={kind} onChange={(e) => setKind(e.target.value as 'shell' | 'claude' | 'browser')}>
           <option value="shell">shell</option>
           <option value="claude">claude</option>
+          <option value="browser">browser</option>
         </select>
         <span className="label">in</span>
         <button className="btn cwd-chip" title={`${cwd} — click to choose folder`}
@@ -699,7 +746,7 @@ function App(): JSX.Element {
           const tabLabel = layout.workspaces[wsKey]?.tabs[String(t.tab)]?.label
           // One-way close (rule #3): request a kill for every pane in the tab; the
           // tab vanishes when the daemon's removal events empty it. No local removal.
-          const closeTab = (): void => t.panes.forEach((p) => window.amber.killSession(p.name))
+          const closeTab = (): void => t.panes.forEach((p) => closePane(p.name))
           return (
             <div key={t.tab} role="tab" aria-selected={isActive} tabIndex={0}
               className={'tab' + (isActive ? ' active' : '')}
@@ -770,14 +817,24 @@ function App(): JSX.Element {
                           onUnfreeze={unfreezePane}
                           onToggleZoom={toggleZoom}
                           onSetRatio={(path, r) => putTree(setRatio(layerTree, path, r))}
+                          browsers={browserUrls}
+                          onBrowserNav={setBrowserUrl}
                           onSplit={(paneId, dir, overrideKind) => {
+                            // Browser split: no daemon round-trip, so place the leaf NOW with
+                            // its requested direction (pending is only for daemon sessions).
+                            if ((overrideKind ?? kind) === 'browser') {
+                              const name = newBrowser(currentTab, nextOrd)
+                              putTree(splitLeaf(layerTree, paneId, dir, name))
+                              clearZoom()
+                              return
+                            }
                             const name = formatName({ ws: currentWs, tab: currentTab, ord: nextOrd, id: makeId() })
                             window.amber.createSession(name, cwd, overrideKind ?? kind)
                             setPending((p) => ({ ...p, [name]: { paneId, dir } }))
                             clearZoom()
                           }}
                           onMove={(s, tgt, z) => { putTree(moveLeaf(layerTree, s, tgt, z)); clearZoom() }}
-                          onClose={(paneId) => { window.amber.killSession(paneId); clearZoom() }} />
+                          onClose={(paneId) => { closePane(paneId); clearZoom() }} />
                       : isActive
                         ? <button className="empty-cta" onClick={startPane}>
                             <span className="empty-cta-title">Start a pane</span>

@@ -1,5 +1,6 @@
 import { useRef, useState, useEffect } from 'react'
 import { Pane, type SearchApi } from './Pane'
+import { Browser } from './Browser'
 import { paneRects, handles, nextPaneInDirection, focusCandidates, ratioAt, leaves, type Node, type Rect, type Zone, type FocusDir } from './layout'
 import { appChord, chordLabel } from './keys'
 import { paneDot } from './store'
@@ -140,9 +141,13 @@ export function SplitView(props: {
   fontSize: number
   onPaneTitle: (session: string, title: string) => void
   onSetRatio: (path: Array<'a' | 'b'>, ratio: number) => void
-  onSplit: (paneId: string, dir: 'h' | 'v', kind?: 'shell' | 'claude') => void
+  onSplit: (paneId: string, dir: 'h' | 'v', kind?: 'shell' | 'claude' | 'browser') => void
   onMove: (sourceId: string, targetId: string, zone: Zone) => void
   onClose: (paneId: string) => void
+  // App-local browser panes (kind==='browser'): url keyed by paneId + a nav
+  // callback that persists the current URL to the sidecar. Empty when none.
+  browsers: Record<string, { url: string }>
+  onBrowserNav: (paneId: string, url: string) => void
   // Zoom is transient per-tab renderer state owned by App (never persisted); this
   // view is presentational — it renders the zoomed pane full-stage and toggles.
   zoomedPane: string | null
@@ -508,6 +513,7 @@ export function SplitView(props: {
       {panes.map(({ paneId, rect }) => {
         const meta = props.meta[paneId]
         const dead = props.deadCodes[paneId]
+        const isBrowser = meta?.kind === 'browser'
         const dot = paneDot(meta?.kind ?? 'shell', meta?.runState)
         const frozenEntry = props.frozen[paneId]
         const isFrozen = frozenEntry !== undefined
@@ -546,9 +552,10 @@ export function SplitView(props: {
                 <span className="zoom-badge">zoomed — {chordLabel('zoom')} to restore</span>}
               <div className="pane-actions">
                 <button className="icon-btn" aria-label="move pane" title="drag to move" onMouseDown={startPaneDrag(paneId)} style={{ cursor: 'grab' }}>⠿</button>
-                <button className="icon-btn" aria-label="refresh pane" title="force refresh (re-fit + repaint)"
-                  onClick={() => searchApis.current.get(paneId)?.refresh()}>⟳</button>
-                {meta?.claudeId &&
+                {!isBrowser &&
+                  <button className="icon-btn" aria-label="refresh pane" title="force refresh (re-fit + repaint)"
+                    onClick={() => searchApis.current.get(paneId)?.refresh()}>⟳</button>}
+                {!isBrowser && meta?.claudeId &&
                   <button className="icon-btn" aria-label="reload claude session" title="reload claude — resume this conversation"
                     onClick={() => setReloadPane(paneId)}>↺claude</button>}
                 <button className="icon-btn" aria-label="split right" title="split right" onClick={() => props.onSplit(paneId, 'h')}>⬌</button>
@@ -557,9 +564,12 @@ export function SplitView(props: {
               </div>
             </div>
             <div className="pane-body" ref={(el) => { if (el) bodyEls.current.set(paneId, el); else bodyEls.current.delete(paneId) }}>
-              <Pane session={paneId} epoch={props.epoch} portEpoch={props.portEpoch} activateSeq={activateSeq}
-                fontSize={props.fontSize} cwd={meta?.cwd ?? ''} onTitle={titleCbFor(paneId)} onSearchReady={searchReadyFor(paneId)} />
-              {findPane === paneId && !isFrozen && searchApis.current.get(paneId) &&
+              {isBrowser
+                ? <Browser paneId={paneId} url={props.browsers[paneId]?.url ?? ''}
+                    active={props.active && !hidden} onNav={props.onBrowserNav} onTitle={props.onPaneTitle} />
+                : <Pane session={paneId} epoch={props.epoch} portEpoch={props.portEpoch} activateSeq={activateSeq}
+                    fontSize={props.fontSize} cwd={meta?.cwd ?? ''} onTitle={titleCbFor(paneId)} onSearchReady={searchReadyFor(paneId)} />}
+              {!isBrowser && findPane === paneId && !isFrozen && searchApis.current.get(paneId) &&
                 <FindBar api={searchApis.current.get(paneId)!} focusSeq={findSeq}
                   onClose={() => { setFindPane(null); focusPane(paneId) }} />}
               {dead !== undefined &&

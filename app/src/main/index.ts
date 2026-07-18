@@ -318,6 +318,10 @@ async function main(): Promise<void> {
       preload: join(__dirname, '../preload/index.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
+      // Browser panes (web-viewer): the renderer hosts <webview> tags. Each runs
+      // unprivileged (no nodeIntegration, its own persist partition) — see
+      // Browser.tsx + spec 2026-07-18 §8.
+      webviewTag: true,
       // Keep the preload SANDBOXED (default) for security. A sandboxed preload
       // has no node builtins and no `process.env`, so the two values it needs
       // are passed as argv flags (reachable via `process.argv` in sandbox).
@@ -466,6 +470,13 @@ async function main(): Promise<void> {
   // Reveal a resolved path in the OS file manager (item highlighted in folder).
   ipcMain.on('reveal-path', (_e, abs: unknown) => {
     if (typeof abs === 'string' && isAbsolute(abs)) shell.showItemInFolder(abs)
+  })
+
+  // Browser-pane popups (target=_blank / window.open) open in the system browser
+  // rather than spawning a new in-app webview (spec 2026-07-18 §8). Guarded to
+  // http/https so a hostile page can't drive shell.openExternal at other schemes.
+  ipcMain.on('open-external', (_e, url: unknown) => {
+    if (typeof url === 'string' && /^https?:\/\//i.test(url)) void shell.openExternal(url)
   })
 
   // Terminal clipboard via Electron's `clipboard` module — the reliable path.

@@ -218,6 +218,7 @@ body {
 }
 .tab .kind-dot.claude { background: var(--warn); }
 .tab .kind-dot.shell { background: var(--accent-2); }
+.tab .kind-dot.browser { background: var(--ok, #3fb950); }
 /* claude crashed and is retrying — pulsing amber draws the eye */
 .tab .kind-dot.claude-retrying { background: var(--warn); animation: pulse 1.2s ease-in-out infinite; }
 /* claude gave up / user quit — pane is a plain shell now (gray) */
@@ -319,6 +320,31 @@ body {
 }
 .pane-header .kind-dot.claude { background: var(--warn); }
 .pane-header .kind-dot.shell { background: var(--accent-2); }
+/* app-local web viewer (green) */
+.pane-header .kind-dot.browser { background: var(--ok, #3fb950); }
+
+/* Browser pane: address bar above the <webview>. */
+.browser-bar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 6px;
+  background: var(--bg-elev, #16161c);
+  border-bottom: 1px solid var(--border, #2a2a33);
+}
+.browser-addr {
+  flex: 1;
+  min-width: 0;
+  padding: 3px 8px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text, #e6e6ea);
+  background: var(--bg, #0c0c0f);
+  border: 1px solid var(--border, #2a2a33);
+  border-radius: 5px;
+  outline: none;
+}
+.browser-addr:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
 /* claude crashed and is retrying — pulsing amber draws the eye */
 .pane-header .kind-dot.claude-retrying { background: var(--warn); animation: pulse 1.2s ease-in-out infinite; }
 /* claude gave up / user quit — pane is a plain shell now (gray) */
