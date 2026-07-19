@@ -85,23 +85,70 @@ First launch installs the `amber` daemon to `~/.local/bin` and a systemd user
 boot unit, so your sessions survive reboots. macOS builds: build from source
 (below) for now.
 
-## Build
+## Contributing / building from source
 
-Daemon + CLI:
+### Prerequisites
+
+**1. Rust (stable)** — for the daemon/CLI. Install via [rustup](https://rustup.rs):
 
 ```bash
-cargo build --workspace
-cargo test --workspace
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+rustup component add clippy          # CI runs clippy -D warnings
 ```
 
-App:
+The workspace tracks the **stable** toolchain (edition 2021). Static release
+builds also need the musl target + linker (Linux only):
 
 ```bash
+rustup target add x86_64-unknown-linux-musl
+sudo apt install musl-tools          # provides musl-gcc  (Debian/Ubuntu)
+```
+
+**2. Node.js (LTS) + npm** — for the Electron app. CI uses `lts/*`. Recommended
+via [nvm](https://github.com/nvm-sh/nvm):
+
+```bash
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
+nvm install --lts && nvm use --lts
+```
+
+**3. System tools** — `git`, and a C toolchain (`build-essential` on
+Debian/Ubuntu; Xcode Command Line Tools on macOS) for native build steps.
+
+> **Odd-kernel note:** on some Linux kernels the dev GUI needs
+> `AMBER_NO_SANDBOX=1 AMBER_SOFTWARE_GL=1` to render (documented in `CLAUDE.md`).
+
+### Build
+
+Clone, then build each half:
+
+```bash
+git clone https://github.com/chriskim2273/amber-ide.git
+cd amber-ide
+
+# Daemon + CLI (Rust)
+cargo build --workspace
+cargo test  --workspace
+
+# App (Electron)
 cd app
-npm install
+npm ci             # or: npm install
 npm run dev        # dev GUI
 npm run dist       # packaged AppImage (Linux) / dmg (macOS)
 ```
+
+### Before opening a PR
+
+Mirror what CI checks — all must be green:
+
+```bash
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test  --workspace
+cd app && npm run typecheck && npx vitest run
+```
+
+Work in a git worktree, use conventional commits, and follow the working
+agreements in [`CLAUDE.md`](CLAUDE.md).
 
 The `amber` CLI also stands alone — attach to any session from a plain terminal:
 
