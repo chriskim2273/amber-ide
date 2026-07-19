@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Slice 1 exit test: a raw client round-trips Create -> Attach -> input ->
 //! output over the real unix socket, using amber_core::proto directly (no CLI).
 
@@ -23,7 +24,7 @@ fn start_daemon() -> (PathBuf, tempfile::TempDir) {
     let socket_path = dir.path().join("amberd.sock");
 
     let manager = Arc::new(SessionManager::new(&root).unwrap());
-    let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+    let listener = amber::daemon::prepare_socket(&socket_path).unwrap();
     let daemon = Daemon::new(manager, std::sync::Arc::new(Watchers::new()));
     thread::spawn(move || {
         let _ = daemon.serve(listener);
@@ -41,7 +42,7 @@ fn start_daemon_with_manager() -> (PathBuf, Arc<SessionManager>, tempfile::TempD
     let socket_path = dir.path().join("amberd.sock");
 
     let manager = Arc::new(SessionManager::new(&root).unwrap());
-    let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+    let listener = amber::daemon::prepare_socket(&socket_path).unwrap();
     let daemon = Daemon::new(Arc::clone(&manager), Arc::new(Watchers::new()));
     thread::spawn(move || {
         let _ = daemon.serve(listener);
@@ -155,7 +156,7 @@ fn disconnecting_client_releases_its_subscription() {
     let socket_path = dir.path().join("amberd.sock");
 
     let manager = Arc::new(SessionManager::new(&root).unwrap());
-    let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+    let listener = amber::daemon::prepare_socket(&socket_path).unwrap();
     let daemon = Daemon::new(Arc::clone(&manager), std::sync::Arc::new(Watchers::new()));
     thread::spawn(move || {
         let _ = daemon.serve(listener);
@@ -199,7 +200,7 @@ fn reattach_replaces_subscription_not_stacks_it() {
     let socket_path = dir.path().join("amberd.sock");
 
     let manager = Arc::new(SessionManager::new(&root).unwrap());
-    let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+    let listener = amber::daemon::prepare_socket(&socket_path).unwrap();
     let daemon = Daemon::new(Arc::clone(&manager), std::sync::Arc::new(Watchers::new()));
     thread::spawn(move || {
         let _ = daemon.serve(listener);

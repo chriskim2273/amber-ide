@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! A claude session's supervisor reports its phase via `ReportRunState`: the
 //! daemon stores it (surfacing in `ListSessionsDetailed`), broadcasts the
 //! change to watchers, and rejects reports for a non-claude session.

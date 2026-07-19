@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! A session that produces output broadcasts a rate-limited `Activity` to
 //! watchers: at most one per session per 500 ms, correctly attributed — driven
 //! output lands on the busy session's name and never on an undriven one (the

@@ -2,7 +2,6 @@
 //! (spec §2).
 
 use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
@@ -13,11 +12,10 @@ use amber::claude;
 use amber::daemon::Daemon;
 use amber::manager::SessionManager;
 use amber::supervisor;
+use amber::transport;
 use amber_core::proto::{self, ControlMsg, Decoder, Frame};
 use amber_core::state::StateStore;
 use clap::{Parser, Subcommand};
-use signal_hook::consts::{SIGINT, SIGTERM};
-use signal_hook::iterator::Signals;
 
 #[derive(Parser)]
 #[command(name = "amber", about = "amber session daemon + CLI")]
@@ -147,7 +145,12 @@ enum CtlAction {
     },
 }
 
-/// `$XDG_STATE_HOME/amber-ide`, falling back to `$HOME/.local/state/amber-ide`.
+/// State-store root.
+/// - Unix: `$XDG_STATE_HOME/amber-ide`, falling back to
+///   `$HOME/.local/state/amber-ide`.
+/// - Windows: `%LOCALAPPDATA%\amber-ide` (non-roaming — correct for large,
+///   volatile scrollback), via `directories`.
+#[cfg(unix)]
 fn default_root() -> PathBuf {
     if let Ok(state_home) = std::env::var("XDG_STATE_HOME") {
         if !state_home.is_empty() {
@@ -158,7 +161,27 @@ fn default_root() -> PathBuf {
     PathBuf::from(home).join(".local/state/amber-ide")
 }
 
-/// `$XDG_RUNTIME_DIR/amber-ide/amberd.sock`, falling back to `<root>/amberd.sock`.
+#[cfg(windows)]
+fn default_root() -> PathBuf {
+    if let Some(dirs) = directories::ProjectDirs::from("", "amber", "amber-ide") {
+        return dirs.data_local_dir().to_path_buf();
+    }
+    // Fallback: %LOCALAPPDATA%\amber-ide, then the current dir.
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        if !local.is_empty() {
+            return PathBuf::from(local).join("amber-ide");
+        }
+    }
+    PathBuf::from(".").join("amber-ide")
+}
+
+/// The daemon endpoint.
+/// - Unix: `$XDG_RUNTIME_DIR/amber-ide/amberd.sock`, falling back to
+///   `<root>/amberd.sock`.
+/// - Windows: a named pipe `\\.\pipe\amber-ide-<user>` — there is no
+///   filesystem socket path. MUST match `app/src/shared/socketPath.ts` so the
+///   Electron (Node `net`) client connects to the same pipe.
+#[cfg(unix)]
 fn default_socket(root: &Path) -> PathBuf {
     if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
         if !runtime_dir.is_empty() {
@@ -166,6 +189,17 @@ fn default_socket(root: &Path) -> PathBuf {
         }
     }
     root.join("amberd.sock")
+}
+
+#[cfg(windows)]
+fn default_socket(_root: &Path) -> PathBuf {
+    let user = std::env::var("USERNAME").unwrap_or_else(|_| "user".to_string());
+    // Sanitize: pipe names allow most chars but keep it to a safe subset.
+    let user: String = user
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    PathBuf::from(format!(r"\\.\pipe\amber-ide-{user}"))
 }
 
 fn resolve_socket(explicit: Option<PathBuf>) -> PathBuf {
@@ -223,7 +257,7 @@ fn run_doctor(root: Option<PathBuf>) -> anyhow::Result<()> {
 
 /// Connect to the daemon and report liveness + session count.
 fn run_status(socket: &Path) -> anyhow::Result<()> {
-    match UnixStream::connect(socket) {
+    match transport::connect(socket) {
         Ok(mut stream) => {
             stream.write_all(&proto::encode(&Frame::Control(ControlMsg::ListSessions)))?;
             let mut decoder = Decoder::new();
@@ -327,7 +361,7 @@ fn run_uninstall(dry_run: bool, purge_binary: bool, purge_state: bool) -> anyhow
 
 /// Ask the daemon for an immediate snapshot and wait for the ack.
 fn run_snapshot_now(socket: &Path) -> anyhow::Result<()> {
-    let mut stream = UnixStream::connect(socket)
+    let mut stream = transport::connect(socket)
         .map_err(|e| anyhow::anyhow!("daemon unreachable at {}: {e}", socket.display()))?;
     stream.write_all(&proto::encode(&Frame::Control(ControlMsg::Snapshot)))?;
 
@@ -505,18 +539,34 @@ fn run_daemon(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Result<
         });
     }
 
-    // SIGTERM/SIGINT -> final snapshot, then exit (spec §7 pre-reboot gap).
+    // Pre-shutdown final snapshot (spec §7 pre-reboot gap). The final snapshot
+    // PRESERVES resume_as_claude (claude is being killed alongside us;
+    // re-detecting would clobber it).
+    // - Unix: a SIGTERM/SIGINT handler thread (the boot unit / shell delivers
+    //   these on stop and at shutdown).
+    // - Windows: a hidden message-only window pumping WM_QUERYENDSESSION /
+    //   WM_ENDSESSION, plus a console CTRL_C/CTRL_CLOSE handler (spec §D3).
+    #[cfg(unix)]
     {
+        use signal_hook::consts::{SIGINT, SIGTERM};
+        use signal_hook::iterator::Signals;
         let manager = Arc::clone(&manager);
         let mut signals = Signals::new([SIGTERM, SIGINT])?;
         thread::spawn(move || {
             if signals.forever().next().is_some() {
-                // Final snapshot PRESERVES resume_as_claude (claude is being
-                // cgroup-killed alongside us; re-detecting would clobber it).
                 if let Err(e) = manager.snapshot_final() {
                     eprintln!("amber daemon: final snapshot failed: {e}");
                 }
                 std::process::exit(0);
+            }
+        });
+    }
+    #[cfg(windows)]
+    {
+        let manager = Arc::clone(&manager);
+        amber::winlifecycle::install_shutdown_handler(move || {
+            if let Err(e) = manager.snapshot_final() {
+                eprintln!("amber daemon: final snapshot failed: {e}");
             }
         });
     }
@@ -527,7 +577,7 @@ fn run_daemon(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Result<
 }
 
 fn run_ls(socket: &Path) -> anyhow::Result<()> {
-    let mut stream = UnixStream::connect(socket)?;
+    let mut stream = transport::connect(socket)?;
     stream.write_all(&proto::encode(&Frame::Control(ControlMsg::ListSessions)))?;
 
     let mut decoder = Decoder::new();
@@ -592,7 +642,7 @@ fn run_attach(
 /// looks that session up (an unknown name is left for the daemon to reject, and
 /// assumed shell); with no name, picks the most-recently-updated live session.
 fn resolve_target(socket: &Path, name: Option<String>) -> anyhow::Result<(String, bool)> {
-    let mut stream = UnixStream::connect(socket).map_err(|e| {
+    let mut stream = transport::connect(socket).map_err(|e| {
         anyhow::anyhow!(
             "cannot reach the amber daemon at {} ({e}) — is it running? \
              start it with `amber daemon` or the systemd/launchd service",
@@ -642,7 +692,7 @@ fn resolve_target(socket: &Path, name: Option<String>) -> anyhow::Result<(String
 /// frames in order, so the session is already gone by the time it replies.
 /// Killing a name that never existed is a success (idempotent).
 fn run_kill(socket: &Path, name: &str) -> anyhow::Result<()> {
-    let mut stream = UnixStream::connect(socket)?;
+    let mut stream = transport::connect(socket)?;
     stream.write_all(&proto::encode(&Frame::Control(ControlMsg::Kill {
         name: name.to_string(),
     })))?;
@@ -672,7 +722,7 @@ fn run_kill(socket: &Path, name: &str) -> anyhow::Result<()> {
 /// nonzero — but the moment the daemon learns to rename, this starts working
 /// with no CLI change.
 fn run_rename(socket: &Path, from: &str, to: &str) -> anyhow::Result<()> {
-    let mut stream = UnixStream::connect(socket)?;
+    let mut stream = transport::connect(socket)?;
     stream.write_all(&proto::encode(&Frame::Control(ControlMsg::Rename {
         from: from.to_string(),
         to: to.to_string(),
@@ -702,7 +752,7 @@ fn run_rename(socket: &Path, from: &str, to: &str) -> anyhow::Result<()> {
 }
 
 fn run_create(socket: &Path, name: &str, cwd: &Path, kind: &str) -> anyhow::Result<()> {
-    let mut stream = UnixStream::connect(socket)?;
+    let mut stream = transport::connect(socket)?;
     let request = Frame::Control(ControlMsg::Create {
         name: name.to_string(),
         cwd: cwd.to_string_lossy().to_string(),

@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! A watcher connection sees session create/kill deltas; a non-watcher does not.
 
 use std::io::{Read, Write};

@@ -23,7 +23,7 @@
 //! - The forwarder writes with a bounded [`WRITE_TIMEOUT`] (`SO_SNDTIMEO`).
 //!   On timeout/error it **shuts the socket down** and exits. Shutdown
 //!   matters twice over: (1) the watcher's write half is an
-//!   `Arc<Mutex<UnixStream>>` SHARED with that connection's control-reply
+//!   `Arc<Mutex<LocalWriter>>` SHARED with that connection's control-reply
 //!   writes (daemon.rs), so the forwarder may hold that mutex only for a
 //!   bounded time — after the timeout the socket is dead and every later
 //!   write on it fails fast instead of blocking; (2) a timed-out `write_all`
@@ -44,8 +44,6 @@
 //! `WRITE_TIMEOUT`.
 
 use std::io::Write;
-use std::net::Shutdown;
-use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, Weak};
@@ -53,6 +51,8 @@ use std::thread;
 use std::time::Duration;
 
 use amber_core::proto::{self, ControlMsg, Frame};
+
+use crate::transport::LocalWriter;
 
 /// Bounded per-watcher event queue depth. SessionsChanged events are
 /// low-rate; a watcher this far behind is wedged, not merely slow.
@@ -90,7 +90,7 @@ impl Watchers {
     /// Register a connection's shared write half as a watcher, spawning its
     /// dedicated forwarder thread. Holds only a `Weak` to the writer, so a
     /// vanished connection is pruned automatically.
-    pub fn register(&self, writer: &Arc<Mutex<UnixStream>>) {
+    pub fn register(&self, writer: &Arc<Mutex<LocalWriter>>) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = sync_channel(WATCHER_QUEUE_DEPTH);
         self.entries.lock().unwrap().push(Entry { id, tx });
@@ -131,7 +131,7 @@ impl Watchers {
 fn forward(
     id: u64,
     rx: Receiver<Arc<Vec<u8>>>,
-    weak: Weak<Mutex<UnixStream>>,
+    weak: Weak<Mutex<LocalWriter>>,
     entries: Arc<Mutex<Vec<Entry>>>,
 ) {
     let mut evicted = false;
@@ -153,7 +153,7 @@ fn forward(
             // partial frame on the stream — it is no longer frame-aligned —
             // so sever it entirely; later writes fail fast instead of
             // blocking, and the client reconnects.
-            let _ = s.shutdown(Shutdown::Both);
+            let _ = s.shutdown();
             evicted = true;
             break;
         }
@@ -166,12 +166,21 @@ fn forward(
     }
 }
 
-#[cfg(test)]
+// Unix-only: these exercise laggard eviction via `UnixStream::pair()` socket
+// saturation + `SO_SNDTIMEO`, which have no Windows named-pipe analog. The
+// forwarder logic they cover is the same on both platforms; on Windows
+// eviction is via bounded-queue drop + handle close (spec §D1).
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use amber_core::proto::Decoder;
     use std::io::Read;
+    use std::os::unix::net::UnixStream;
     use std::time::Duration;
+
+    fn wrap(s: UnixStream) -> Arc<Mutex<LocalWriter>> {
+        Arc::new(Mutex::new(LocalWriter::from_unix_stream(s)))
+    }
 
     fn read_one(stream: &mut UnixStream) -> Option<Frame> {
         stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
@@ -194,8 +203,8 @@ mod tests {
         let watchers = Watchers::new();
         let (mut client_a, server_a) = UnixStream::pair().unwrap();
         let (mut client_b, server_b) = UnixStream::pair().unwrap();
-        let wa = Arc::new(Mutex::new(server_a));
-        let wb = Arc::new(Mutex::new(server_b));
+        let wa = wrap(server_a);
+        let wb = wrap(server_b);
         watchers.register(&wa);
         watchers.register(&wb);
 
@@ -258,8 +267,8 @@ mod tests {
         let (_wedged_peer, wedged_server) = UnixStream::pair().unwrap();
         let (mut healthy_peer, healthy_server) = UnixStream::pair().unwrap();
         saturate(&wedged_server);
-        let wedged = Arc::new(Mutex::new(wedged_server));
-        let healthy = Arc::new(Mutex::new(healthy_server));
+        let wedged = wrap(wedged_server);
+        let healthy = wrap(healthy_server);
         watchers.register(&wedged);
         watchers.register(&healthy);
 
@@ -295,8 +304,8 @@ mod tests {
         let (_wedged_peer, wedged_server) = UnixStream::pair().unwrap();
         let (mut healthy_peer, healthy_server) = UnixStream::pair().unwrap();
         saturate(&wedged_server);
-        let wedged = Arc::new(Mutex::new(wedged_server));
-        let healthy = Arc::new(Mutex::new(healthy_server));
+        let wedged = wrap(wedged_server);
+        let healthy = wrap(healthy_server);
         watchers.register(&wedged);
         watchers.register(&healthy);
         assert_eq!(watchers.watcher_count(), 2);
@@ -326,7 +335,7 @@ mod tests {
         let watchers = Arc::new(Watchers::new());
         let (_peer, server) = UnixStream::pair().unwrap();
         saturate(&server);
-        let wedged = Arc::new(Mutex::new(server));
+        let wedged = wrap(server);
         watchers.register(&wedged);
         watchers.broadcast(&ControlMsg::SessionsChanged { added: vec![], removed: vec![] });
 

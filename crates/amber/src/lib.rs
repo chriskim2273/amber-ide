@@ -8,4 +8,8 @@ pub mod manager;
 pub mod procinfo;
 pub mod pty;
 pub mod supervisor;
+pub mod transport;
 pub mod watchers;
+
+#[cfg(windows)]
+pub mod winlifecycle;

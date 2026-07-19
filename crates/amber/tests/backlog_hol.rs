@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Regression: a slow client replaying a large scrollback backlog must NOT
 //! head-of-line-block the control frames multiplexed on the SAME connection.
 //!

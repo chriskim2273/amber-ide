@@ -2,7 +2,6 @@
 //! wire protocol, and dispatches to the [`SessionManager`].
 
 use std::io::{Read, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -11,11 +10,12 @@ use amber_core::state::SessionKind;
 
 use crate::manager::SessionManager;
 use crate::pty::PtySession;
+use crate::transport::{self, LocalListener, LocalReader, LocalStream, LocalWriter};
 
 /// Shared handle to a connection's write half — both the control-reply path
 /// and a per-attach output-forwarder thread write to it, so it must be
 /// mutex-guarded.
-type SharedWriter = Arc<Mutex<UnixStream>>;
+type SharedWriter = Arc<Mutex<LocalWriter>>;
 
 /// Subscriptions this connection holds: `(session name, session, sub id)`.
 /// Released on `Detach` and when the connection ends, so a vanished client
@@ -39,7 +39,7 @@ impl Daemon {
     /// Accept loop. Runs until the listener itself errors (e.g. the socket
     /// file is removed out from under it); per-connection errors are logged
     /// and otherwise ignored.
-    pub fn serve(&self, listener: UnixListener) -> anyhow::Result<()> {
+    pub fn serve(&self, listener: LocalListener) -> anyhow::Result<()> {
         for conn in listener.incoming() {
             match conn {
                 Ok(stream) => {
@@ -60,23 +60,12 @@ impl Daemon {
     }
 }
 
-/// Bind the daemon's unix socket at `path`, handling leftovers safely:
-/// - nothing there -> bind;
-/// - a live socket (another daemon answers a connect) -> error, NEVER unlink
-///   a running daemon's socket out from under it;
-/// - a stale socket file (connect refused: previous daemon crashed/was
-///   SIGKILLed) -> remove it and bind.
-pub fn prepare_socket(path: &std::path::Path) -> anyhow::Result<UnixListener> {
-    if path.exists() {
-        match UnixStream::connect(path) {
-            Ok(_) => anyhow::bail!(
-                "another daemon is already listening on {}",
-                path.display()
-            ),
-            Err(_) => std::fs::remove_file(path)?,
-        }
-    }
-    Ok(UnixListener::bind(path)?)
+/// Bind the daemon's local socket at `path`, handling leftovers safely (see
+/// [`transport::bind`]). On Unix this is a unix-domain socket with the
+/// stale-file steal-guard; on Windows a named pipe (a live daemon is detected
+/// by create-in-use, and there is no stale filesystem file to clean up).
+pub fn prepare_socket(path: &std::path::Path) -> anyhow::Result<LocalListener> {
+    transport::bind(path)
 }
 
 fn write_frame(writer: &SharedWriter, frame: &Frame) -> anyhow::Result<()> {
@@ -110,11 +99,12 @@ fn suppress_backlog(raw_client: bool, kind: Option<SessionKind>) -> bool {
 fn handle_connection(
     manager: Arc<SessionManager>,
     watchers: Arc<crate::watchers::Watchers>,
-    stream: UnixStream,
+    stream: LocalStream,
 ) -> anyhow::Result<()> {
-    let writer: SharedWriter = Arc::new(Mutex::new(stream.try_clone()?));
+    let (reader, writer) = stream.into_split()?;
+    let writer: SharedWriter = Arc::new(Mutex::new(writer));
     let mut subscriptions: Subscriptions = Vec::new();
-    let result = connection_loop(&manager, &watchers, &writer, stream, &mut subscriptions);
+    let result = connection_loop(&manager, &watchers, &writer, reader, &mut subscriptions);
     // However the connection ended, release every subscription it held.
     for (_, sess, id) in subscriptions {
         sess.unsubscribe(id);
@@ -126,7 +116,7 @@ fn connection_loop(
     manager: &Arc<SessionManager>,
     watchers: &Arc<crate::watchers::Watchers>,
     writer: &SharedWriter,
-    mut read_half: UnixStream,
+    mut read_half: LocalReader,
     subscriptions: &mut Subscriptions,
 ) -> anyhow::Result<()> {
     let mut decoder = Decoder::new();
@@ -444,6 +434,7 @@ mod tests {
         assert!(!suppress_backlog(true, None));
     }
 
+    #[cfg(unix)]
     #[test]
     fn prepare_socket_binds_fresh_path() {
         let dir = tempfile::tempdir().unwrap();
@@ -452,8 +443,10 @@ mod tests {
         assert!(path.exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn prepare_socket_refuses_to_steal_a_live_socket() {
+        use std::os::unix::net::UnixListener;
         // A second daemon instance must fail loudly, not silently unbind the
         // first one's socket (killing every client's connection path).
         let dir = tempfile::tempdir().unwrap();
@@ -464,6 +457,7 @@ mod tests {
         assert!(path.exists(), "live socket file must be left alone");
     }
 
+    #[cfg(unix)]
     #[test]
     fn prepare_socket_replaces_stale_socket_file() {
         // A crashed daemon leaves a socket file behind with nobody accepting:

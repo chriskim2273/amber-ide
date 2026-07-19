@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! `DumpBacklog` returns a one-shot copy of a session's scrollback ring in a
 //! single `Backlog` reply (workspace save/load feature); an unknown session
 //! replies `Error`. Style mirrors `run_state.rs` / `backlog_hol.rs`.

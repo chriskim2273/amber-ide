@@ -13,14 +13,37 @@ amber-core = { path = "../amber-core" }
 anyhow = { workspace = true }
 serde_json = { workspace = true }
 clap = { version = "4.6.1", features = ["derive"] }
+portable-pty = "0.9"
+terminal_size = "0.4.4"
+# Cross-platform dirs + executable resolution (Windows shell/claude lookup, and
+# a $HOME-fallback that works on all three platforms).
+directories = "6"
+which = "6"
+
+# Unix-only: nix (termios/poll/kill) and signal-hook (SIGTERM/SIGWINCH/SIGUSR)
+# have no Windows analog — the Windows paths use windows-sys instead.
+[target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 nix = { version = "0.31.3", features = ["term", "poll"] }
-portable-pty = "0.9"
 signal-hook = "0.4.4"
-terminal_size = "0.4.4"
+
+# Windows-only: named-pipe transport (interprocess), Win32 lifecycle/console FFI
+# (windows-sys), and the HKCU Run-key auto-start (winreg).
+[target.'cfg(windows)'.dependencies]
+interprocess = "2.4"
+winreg = "0.52"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_Shutdown",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [dev-dependencies]
 tempfile = "3"
+
+[target.'cfg(unix)'.dev-dependencies]
 libc = { workspace = true }
 
 [lib]

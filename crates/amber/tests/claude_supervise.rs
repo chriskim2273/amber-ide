@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Slice 2 exit test: the claude supervisor loop (resume/continue argv
 //! selection, bounded-retry crash handling) and the `amber hook` subcommand
 //! that records the rotating session id (spec §6.2, §8).
