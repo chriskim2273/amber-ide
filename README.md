@@ -95,6 +95,11 @@ workspaces, splits, drag-to-rearrange, browser panes, workspace save/load) all
 work and have been verified on a live GUI. See the build-status checklist at the
 bottom of [`CLAUDE.md`](CLAUDE.md) for the detailed per-slice state.
 
+## License
+
+[GPL-3.0](LICENSE) © 2026 chriskim2273. Use, modify, and redistribute freely —
+derivatives must stay open under the same license.
+
 ## Out of scope
 
 Windows support (deferred), floating panes, multiplexing inside a session, an
