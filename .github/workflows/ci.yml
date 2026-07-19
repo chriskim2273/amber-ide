@@ -22,6 +22,24 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  rust-macos:
+    # Apple Silicon: macos-latest runners are arm64 (aarch64-apple-darwin), so
+    # this is a real arm64 build + link + test — the shipped mac artifact is a
+    # universal binary (scripts/dist.sh lipos x86_64 + arm64). Guards against a
+    # macOS/aarch64 regression (a Linux-only API, a broken cfg branch) landing.
+    name: rust (macos / apple silicon)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --workspace --all-targets
+      - name: Test
+        run: cargo test --workspace
+
   app:
     name: app (typecheck + test)
     runs-on: ubuntu-latest
