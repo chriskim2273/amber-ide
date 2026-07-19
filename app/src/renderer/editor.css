@@ -1,0 +1,164 @@
+/* Editor pane (spec 2026-07-19). Scoped to `.editor-pane` so nothing here can
+ * leak into terminal/browser panes; tokens come from theme.css. */
+
+.editor-pane {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-ui);
+  min-width: 0;
+}
+
+.editor-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  flex-wrap: wrap;
+  padding: var(--sp-1) var(--sp-2);
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  font-size: 11px;
+}
+
+.editor-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+
+.editor-dirty {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--warn);
+  flex: none;
+}
+
+.editor-btn {
+  background: var(--surface-2);
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 2px 6px;
+  font: inherit;
+  line-height: 1.5;
+  cursor: pointer;
+}
+
+.editor-btn:hover { color: var(--text); border-color: var(--border-strong); }
+.editor-btn:focus-visible { outline: var(--focus-ring); outline-offset: 1px; }
+.editor-btn[aria-pressed='true'] { background: var(--accent-soft); color: var(--text); border-color: var(--accent); }
+.editor-sep { width: 1px; align-self: stretch; background: var(--border); margin: 0 3px; }
+
+/* Inline link-URL input (replaces window.prompt, which Electron rejects). */
+.editor-link-input {
+  width: 180px;
+  background: var(--surface-3);
+  color: var(--text);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+  padding: 2px 6px;
+  font: inherit;
+  font-family: var(--font-mono);
+}
+
+.editor-link-input:focus-visible { outline: none; }
+.editor-spacer { flex: 1; }
+
+.editor-body {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+  min-width: 0;
+}
+
+/* CodeMirror host. `min-width: 0` keeps a long line from pushing the flex row. */
+.editor-cm {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.editor-cm .cm-editor { height: 100%; }
+.editor-cm .cm-scroller { overflow: auto; }
+
+.editor-side {
+  width: 220px;
+  flex: none;
+  overflow: auto;
+  border-right: 1px solid var(--border);
+  background: var(--surface);
+  font-size: 11px;
+  padding: var(--sp-1) 0;
+}
+
+.editor-banner {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-1) var(--sp-2);
+  font-size: 11px;
+  background: var(--accent-soft);
+  border-bottom: 1px solid var(--border);
+}
+
+.editor-banner.danger { background: var(--danger-soft); }
+.editor-banner-msg { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+
+/* ---- json tree ---- */
+.json-row {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  width: 100%;
+  padding: 1px var(--sp-2);
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.json-row:hover { background: var(--surface-2); color: var(--text); }
+.json-row:focus-visible { outline: var(--focus-ring); outline-offset: -2px; }
+.json-caret { width: 10px; flex: none; color: var(--text-faint); }
+.json-key { color: var(--accent-2); }
+.json-preview { color: var(--text-faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.json-empty { padding: var(--sp-2); color: var(--text-faint); font-size: 11px; }
+
+/* ---- markdown outline ---- */
+.md-outline-row {
+  display: block;
+  width: 100%;
+  padding: 2px var(--sp-2);
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  font: inherit;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.md-outline-row:hover { background: var(--surface-2); color: var(--text); }
+.md-outline-row:focus-visible { outline: var(--focus-ring); outline-offset: -2px; }
+
+/* ---- markdown preview ---- */
+.md-preview {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  border-left: 1px solid var(--border);
+  background: var(--bg);
+}

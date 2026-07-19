@@ -1,5 +1,82 @@
 import { describe, it, expect } from 'vitest'
-import { emptyLayout, parseLayout, serializeLayout, orderTabs, moveTab, LAYOUT_VERSION, type LayoutFile } from './layoutFile'
+import { emptyLayout, parseLayout, serializeLayout, orderTabs, moveTab, pushRecent, LAYOUT_VERSION, type LayoutFile } from './layoutFile'
+
+describe('layout editors map', () => {
+  it('round-trips valid entries (incl. all optional fields)', () => {
+    const l: LayoutFile = { version: 1, activeWorkspace: 1, workspaces: {},
+      editors: {
+        'editor-1-1-0-a': { ws: 1, tab: 1, ord: 0, path: '/tmp/a.json' },
+        'editor-1-1-1-b': { ws: 1, tab: 1, ord: 1, path: '/tmp/b.md', view: 'split', outline: true, wrap: false },
+      } }
+    expect(parseLayout(serializeLayout(l)).editors).toEqual(l.editors)
+  })
+  it('keeps a null path (unsaved scratch buffer)', () => {
+    const text = JSON.stringify({ version: 1, activeWorkspace: 1, workspaces: {}, editors: {
+      scratch: { ws: 2, tab: 3, ord: 0, path: null },
+    } })
+    expect(parseLayout(text).editors).toEqual({ scratch: { ws: 2, tab: 3, ord: 0, path: null } })
+  })
+  it('drops malformed entries, keeps valid', () => {
+    const text = JSON.stringify({ version: 1, activeWorkspace: 1, workspaces: {}, editors: {
+      ok: { ws: 1, tab: 1, ord: 0, path: '/a' },
+      noPath: { ws: 1, tab: 1, ord: 0 },
+      badPath: { ws: 1, tab: 1, ord: 0, path: 5 },
+      badWs: { ws: 'x', tab: 1, ord: 0, path: '/b' },
+      notObj: 42,
+      nullish: null,
+      arr: [1],
+    } })
+    expect(parseLayout(text).editors).toEqual({ ok: { ws: 1, tab: 1, ord: 0, path: '/a' } })
+  })
+  it('drops malformed optional fields but keeps the entry', () => {
+    const text = JSON.stringify({ version: 1, activeWorkspace: 1, workspaces: {}, editors: {
+      e: { ws: 1, tab: 1, ord: 0, path: '/a', view: 'nope', outline: 'yes', wrap: 1 },
+    } })
+    expect(parseLayout(text).editors).toEqual({ e: { ws: 1, tab: 1, ord: 0, path: '/a' } })
+  })
+  it('non-object editors → undefined; missing → undefined', () => {
+    expect(parseLayout(JSON.stringify({ version: 1, activeWorkspace: 1, workspaces: {}, editors: [] })).editors).toBeUndefined()
+    expect(parseLayout(JSON.stringify({ version: 1, activeWorkspace: 1, workspaces: {} })).editors).toBeUndefined()
+  })
+})
+
+describe('layout recentFiles', () => {
+  it('round-trips', () => {
+    const l: LayoutFile = { version: 1, activeWorkspace: 1, workspaces: {}, recentFiles: ['/a', '/b'] }
+    expect(parseLayout(serializeLayout(l)).recentFiles).toEqual(['/a', '/b'])
+  })
+  it('drops non-strings, dedupes and caps at 20 on parse', () => {
+    const many = Array.from({ length: 30 }, (_, i) => `/f${i}`)
+    const text = JSON.stringify({ version: 1, activeWorkspace: 1, workspaces: {},
+      recentFiles: ['/a', 5, '/a', null, ...many] })
+    const r = parseLayout(text).recentFiles!
+    expect(r.length).toBe(20)
+    expect(r.slice(0, 3)).toEqual(['/a', '/f0', '/f1'])
+  })
+  it('non-array → undefined; missing → undefined', () => {
+    expect(parseLayout(JSON.stringify({ version: 1, activeWorkspace: 1, workspaces: {}, recentFiles: 'x' })).recentFiles).toBeUndefined()
+    expect(parseLayout(JSON.stringify({ version: 1, activeWorkspace: 1, workspaces: {} })).recentFiles).toBeUndefined()
+  })
+})
+
+describe('pushRecent', () => {
+  it('puts the path first', () => {
+    expect(pushRecent(['/a', '/b'], '/c')).toEqual(['/c', '/a', '/b'])
+  })
+  it('dedupes (moves an existing path to the front)', () => {
+    expect(pushRecent(['/a', '/b'], '/b')).toEqual(['/b', '/a'])
+  })
+  it('handles a missing list', () => {
+    expect(pushRecent(undefined, '/a')).toEqual(['/a'])
+  })
+  it('caps at 20', () => {
+    const list = Array.from({ length: 20 }, (_, i) => `/f${i}`)
+    const out = pushRecent(list, '/new')
+    expect(out.length).toBe(20)
+    expect(out[0]).toBe('/new')
+    expect(out).not.toContain('/f19')
+  })
+})
 
 describe('layout browsers map', () => {
   it('round-trips valid entries', () => {

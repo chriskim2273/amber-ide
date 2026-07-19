@@ -2,7 +2,54 @@ import { describe, it, expect } from 'vitest'
 import type { Node } from '../renderer/layout'
 import type { LayoutFile } from './layoutFile'
 
-import { assembleSave as _asm, planLoad as _pl } from './workspaceFile'
+import { assembleSave as _asm, planLoad as _pl, parseWorkspaceFile as _parse, serializeWorkspaceFile as _ser } from './workspaceFile'
+
+describe('editor panes in .amberws', () => {
+  it('save emits an editor pane with its path, no scrollback and no contents', () => {
+    const doc = _asm('one',
+      [{ ws: 1, tabs: [{ tab: 1, panes: [{ name: 'editor-1-1-0-a', cwd: '/w', kind: 'editor', ord: 0, path: '/tmp/a.md' }] }] }],
+      { version: 1, activeWorkspace: 1, workspaces: { '1': { activeTab: 1, tabs: { '1': { tree: { kind: 'leaf', paneId: 'editor-1-1-0-a' } } } } } },
+      { 'editor-1-1-0-a': new Uint8Array([1, 2, 3]) })
+    const pane = doc.workspaces[0]!.tabs[0]!.panes[0]!
+    expect(pane.kind).toBe('editor')
+    expect(pane.path).toBe('/tmp/a.md')
+    expect(pane.scrollback).toBe('')
+    expect(_ser(doc)).not.toContain('scratch contents')
+  })
+  it('save keeps a null path for an unsaved scratch pane', () => {
+    const doc = _asm('one',
+      [{ ws: 1, tabs: [{ tab: 1, panes: [{ name: 'editor-1-1-0-a', cwd: '', kind: 'editor', ord: 0, path: null }] }] }],
+      { version: 1, activeWorkspace: 1, workspaces: {} }, {})
+    expect(doc.workspaces[0]!.tabs[0]!.panes[0]!.path).toBeNull()
+    expect(_parse(_ser(doc)).workspaces[0]!.tabs[0]!.panes[0]!.path).toBeNull()
+  })
+  it('load routes an editor pane to editors, not creates', () => {
+    const doc = { version: 1, scope: 'one' as const, workspaces: [{ tabs: [{ tab: 1, tree: { kind: 'leaf' as const, paneId: 'p0' },
+      panes: [{ id: 'p0', kind: 'editor', cwd: '', ord: 0, scrollback: '', path: '/tmp/z.json' }] }] }] }
+    let n = 0
+    const plan = _pl(doc, { mode: 'new', currentWs: 1, liveWs: [1], mintId: () => `m${n++}` })
+    expect(plan.creates).toEqual([])
+    const [name, entry] = Object.entries(plan.editors)[0]!
+    expect(name.startsWith('editor-2-1-0-')).toBe(true)
+    expect(entry).toEqual({ ws: 2, tab: 1, ord: 0, path: '/tmp/z.json' })
+    // the tree leaf is rewritten to the minted editor id
+    expect(plan.workspaces['2']!.tabs['1']!.tree).toEqual({ kind: 'leaf', paneId: name })
+  })
+  it('a missing/malformed path loads as a scratch buffer (null), never throws', () => {
+    const doc = _parse(JSON.stringify({ version: 1, scope: 'one', workspaces: [{ tabs: [{ tab: 1, tree: null,
+      panes: [{ id: 'p0', kind: 'editor', cwd: '', ord: 0, scrollback: '', path: 42 }] }] }] }))
+    const plan = _pl(doc, { mode: 'new', currentWs: 1, liveWs: [1], mintId: () => 'm0' })
+    expect(Object.values(plan.editors)[0]!.path).toBeNull()
+  })
+  it('planLoad merges editors across replace + new workspaces', () => {
+    const wsWith = (path: string) => ({ tabs: [{ tab: 1, tree: null, panes: [{ id: 'p0', kind: 'editor', cwd: '', ord: 0, scrollback: '', path }] }] })
+    const doc = { version: 1, scope: 'all' as const, workspaces: [wsWith('/a'), wsWith('/b')] }
+    let n = 0
+    const plan = _pl(doc, { mode: 'replace', currentWs: 1, liveWs: [1], mintId: () => `m${n++}` })
+    expect(Object.values(plan.editors).map((e) => e.path).sort()).toEqual(['/a', '/b'])
+  })
+})
+
 describe('browser panes in .amberws', () => {
   it('save emits a browser pane with url, no scrollback', () => {
     const doc = _asm('one',

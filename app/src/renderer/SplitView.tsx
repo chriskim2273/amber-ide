@@ -1,6 +1,7 @@
 import { useRef, useState, useEffect } from 'react'
 import { Pane, type SearchApi } from './Pane'
 import { Browser } from './Browser'
+import { Editor, type EditorApi } from './Editor'
 import { paneRects, handles, nextPaneInDirection, focusCandidates, ratioAt, leaves, type Node, type Rect, type Zone, type FocusDir } from './layout'
 import { appChord, chordLabel } from './keys'
 import { paneDot } from './store'
@@ -141,7 +142,7 @@ export function SplitView(props: {
   fontSize: number
   onPaneTitle: (session: string, title: string) => void
   onSetRatio: (path: Array<'a' | 'b'>, ratio: number) => void
-  onSplit: (paneId: string, dir: 'h' | 'v', kind?: 'shell' | 'claude' | 'browser') => void
+  onSplit: (paneId: string, dir: 'h' | 'v', kind?: 'shell' | 'claude' | 'browser' | 'editor') => void
   onMove: (sourceId: string, targetId: string, zone: Zone) => void
   // Cross-group move: the pane was dropped on a tab header (`{ tab }`) or a
   // workspace pill (`{ ws }`). Grouping is name-encoded, so App turns this into a
@@ -152,6 +153,16 @@ export function SplitView(props: {
   // callback that persists the current URL to the sidecar. Empty when none.
   browsers: Record<string, { url: string }>
   onBrowserNav: (paneId: string, url: string) => void
+  // App-local editor panes (kind==='editor'): the sidecar entry IS the pane.
+  // `onEditorState` persists path/view changes; `onCloseGuard` lets a pane with
+  // unsaved work veto its own close (spec §3.3).
+  editors: Record<string, { path: string | null; view?: 'code' | 'split' | 'preview'; outline?: boolean; wrap?: boolean }>
+  onEditorPath: (paneId: string, path: string | null) => void
+  onEditorViewState: (paneId: string, patch: { view?: 'code' | 'split' | 'preview'; outline?: boolean; wrap?: boolean }) => void
+  onEditorDirty: (paneId: string, dirty: boolean) => void
+  // Imperative per-pane handle (same pattern as Pane's onSearchReady): the close
+  // guard needs a synchronous dirty read and an awaitable save.
+  onEditorReady: (paneId: string, api: EditorApi | null) => void
   // Zoom is transient per-tab renderer state owned by App (never persisted); this
   // view is presentational — it renders the zoomed pane full-stage and toggles.
   zoomedPane: string | null
@@ -554,6 +565,10 @@ export function SplitView(props: {
         const meta = props.meta[paneId]
         const dead = props.deadCodes[paneId]
         const isBrowser = meta?.kind === 'browser'
+        const isEditor = meta?.kind === 'editor'
+        // Terminal-only affordances (refresh, scrollback search, claude reload,
+        // freeze) are meaningless for a pane that owns no pty.
+        const noTerm = isBrowser || isEditor
         const dot = paneDot(meta?.kind ?? 'shell', meta?.runState)
         const frozenEntry = props.frozen[paneId]
         const isFrozen = frozenEntry !== undefined
@@ -592,10 +607,10 @@ export function SplitView(props: {
                 <span className="zoom-badge">zoomed — {chordLabel('zoom')} to restore</span>}
               <div className="pane-actions">
                 <button className="icon-btn" aria-label="move pane" title="drag to move" onMouseDown={startPaneDrag(paneId)} style={{ cursor: 'grab' }}>⠿</button>
-                {!isBrowser &&
+                {!noTerm &&
                   <button className="icon-btn" aria-label="refresh pane" title="force refresh (re-fit + repaint)"
                     onClick={() => searchApis.current.get(paneId)?.refresh()}>⟳</button>}
-                {!isBrowser && meta?.claudeId &&
+                {!noTerm && meta?.claudeId &&
                   <button className="icon-btn" aria-label="reload claude session" title="reload claude — resume this conversation"
                     onClick={() => setReloadPane(paneId)}>↺claude</button>}
                 <button className="icon-btn" aria-label="split right" title="split right — choose kind"
@@ -606,12 +621,25 @@ export function SplitView(props: {
               </div>
             </div>
             <div className="pane-body" ref={(el) => { if (el) bodyEls.current.set(paneId, el); else bodyEls.current.delete(paneId) }}>
-              {isBrowser
+              {isEditor
+                ? (() => {
+                    const e = props.editors[paneId] ?? { path: null }
+                    return <Editor paneId={paneId} path={e.path}
+                      view={e.view ?? 'code'} outline={e.outline ?? false}
+                      wrap={e.wrap ?? true}
+                      active={props.active && !hidden} fontSize={props.fontSize}
+                      onChangePath={props.onEditorPath}
+                      onChangeViewState={props.onEditorViewState}
+                      onDirtyChange={props.onEditorDirty}
+                      onReady={props.onEditorReady}
+                      onTitle={props.onPaneTitle} />
+                  })()
+                : isBrowser
                 ? <Browser paneId={paneId} url={props.browsers[paneId]?.url ?? ''}
                     active={props.active && !hidden} onNav={props.onBrowserNav} onTitle={props.onPaneTitle} />
                 : <Pane session={paneId} epoch={props.epoch} portEpoch={props.portEpoch} activateSeq={activateSeq}
                     fontSize={props.fontSize} cwd={meta?.cwd ?? ''} onTitle={titleCbFor(paneId)} onSearchReady={searchReadyFor(paneId)} />}
-              {!isBrowser && findPane === paneId && !isFrozen && searchApis.current.get(paneId) &&
+              {!noTerm && findPane === paneId && !isFrozen && searchApis.current.get(paneId) &&
                 <FindBar api={searchApis.current.get(paneId)!} focusSeq={findSeq}
                   onClose={() => { setFindPane(null); focusPane(paneId) }} />}
               {dead !== undefined &&
@@ -687,7 +715,7 @@ export function SplitView(props: {
           return (
             <div className="ctx-menu" role="menu" aria-label={dir === 'h' ? 'split right as' : 'split down as'}
               style={{ left: x, top: y }} onMouseDown={(e) => e.stopPropagation()}>
-              {(['shell', 'claude', 'browser'] as const).map((k) => (
+              {(['shell', 'claude', 'browser', 'editor'] as const).map((k) => (
                 <button key={k} className="ctx-item" role="menuitem"
                   onClick={run(() => props.onSplit(paneId, dir, k))}>{k}</button>
               ))}

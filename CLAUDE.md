@@ -385,6 +385,46 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   behind `tailscale serve` every peer IP is 127.0.0.1, so the auth throttle
   buckets all clients together (a 256-bit token makes brute force moot).
 
+- [x] Editor pane (2026-07-19) — a CodeMirror 6 file editor as a pane kind
+  (`kind:'editor'`), with JSON and Markdown specializations. Spec:
+  `docs/superpowers/specs/2026-07-19-editor-pane-design.md`. **Zero daemon/Rust/
+  protocol change**: like a browser pane it is app-local and sidecar-owned
+  (`editors` map + `recentFiles`, id grammar `editor-<ws>-<tab>-<ord>-<id>`), so
+  every site that special-cases `browser` had to learn `editor` too — TypeScript
+  does NOT catch those (they are runtime `isBrowserName`/`kind==='browser'`
+  checks): `newPane`, `+ ws` (its own inline branch — the one that was missed
+  first time), `onSplit`, `closePane`, `applyLoad`, `moveTo`, `doSave`'s dump
+  filter (now an allowlist), `commitLoad`'s `liveForFix`. Unsaved work is the
+  correctness-critical part: dirty dot, debounced draft to
+  `<state>/drafts/<paneId>.txt`, draft-restore bar after a restart, a close guard
+  (save/discard/cancel, cancel ABORTS), and mtime-conflict detection on save
+  (overwrite/reload/save-as, never a silent clobber). All disk access lives in
+  main (`editorFiles.ts`: atomic tmp+rename, 8 MiB cap, NUL-byte binary sniff,
+  regular-file check, and paneId grammar validation + a drafts-dir containment
+  assert — an unvalidated id would be a path-traversal write primitive). JSON:
+  lint with real line/col, format/minify/sort-keys, folding, tree panel with
+  JSONPath copy + cursor jump. Markdown: outline, editing helpers (bold/italic/
+  code/link/list/checkbox/table), and a preview rendered into a **`sandbox=""`
+  srcdoc iframe** — markdown can carry scripts and this renderer holds the
+  file-write bridge, so the frame is the security boundary (local images are
+  inlined as data: URIs by main; remote images are never fetched; split-mode
+  scroll sync is therefore NOT possible and was dropped rather than relaxing the
+  sandbox). Gates: app 352 tests + typecheck + bundle green (Rust untouched).
+  **Live-verified**: create via `+ Pane`/split-picker/`+ ws`, restore-from-sidecar,
+  JSON format/sort/tree/lint, dirty→draft→restart→restore→discard, save-to-disk,
+  close guard (cancel aborts, discard closes + clears the draft), cross-tab drag
+  keeping the paneId (so the draft follows), markdown preview + live update +
+  bold + the link input. Three live-only bugs fixed in the pass: app-local panes
+  were pruned from the `titles` map on every `Sessions` event (pre-existing for
+  browser panes — their OSC title never stuck); an iframe given `srcdoc` while it
+  has no layout box is PERMANENTLY inert (later assignments never retry — the
+  preview now waits for a non-zero box via ResizeObserver); and a Discard close
+  had its draft recreated by the pane's unmount flush (the guard now calls the
+  pane's `discardDraft()` first). Still manual: the native open/save-as dialogs
+  and the `.amberws` round-trip (unit-tested; a native modal can't be driven
+  headlessly). NOTE: `npm install` is required after pulling this — it adds the
+  CodeMirror 6 packages + `marked`.
+
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**
   `std::io::Read` (dedicated thread); `take_writer()` is one-shot;

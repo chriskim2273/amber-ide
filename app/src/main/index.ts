@@ -28,6 +28,14 @@ import {
   desktopFilePath,
   iconInstallPath,
 } from './desktopInstall'
+import {
+  readEditorFile,
+  saveEditorFile,
+  writeDraft,
+  readDraft,
+  clearDraft,
+  inlineImages,
+} from './editorFiles'
 import clientPath from '../client/index?modulePath'
 
 // A client child that stays up this long counts as a genuine run; a shorter
@@ -542,6 +550,39 @@ async function main(): Promise<void> {
     if (r.canceled || r.filePaths.length === 0 || !r.filePaths[0]) return null
     return readFile(r.filePaths[0], 'utf8')
   })
+
+  // ---- editor pane file IO (spec §4). Thin wrappers; the guards, the atomic
+  // write and the paneId validation all live in editorFiles.ts.
+  const EDITOR_FILTERS = [
+    { name: 'All files', extensions: ['*'] },
+    { name: 'JSON', extensions: ['json', 'jsonc'] },
+    { name: 'Markdown', extensions: ['md', 'markdown'] },
+  ]
+  const draftsDir = () => join(stateRoot(), 'drafts')
+
+  ipcMain.handle('editor-open-dialog', async () => {
+    const r = await dialog.showOpenDialog(win, { properties: ['openFile'], filters: EDITOR_FILTERS })
+    const p = r.canceled ? undefined : r.filePaths[0]
+    if (!p) return null
+    return { path: p, ...(await readEditorFile(p)) }
+  })
+  ipcMain.handle('editor-read', (_e, path: string) => readEditorFile(String(path)))
+  ipcMain.handle('editor-save', (_e, path: string, text: string, expectedMtimeMs: number | null) =>
+    saveEditorFile(String(path), String(text), typeof expectedMtimeMs === 'number' ? expectedMtimeMs : null))
+  ipcMain.handle('editor-save-dialog', async (_e, suggestedName: string, text: string) => {
+    const r = await dialog.showSaveDialog(win, { defaultPath: suggestedName, filters: EDITOR_FILTERS })
+    if (r.canceled || !r.filePath) return null
+    return { path: r.filePath, ...(await saveEditorFile(r.filePath, String(text), null)) }
+  })
+  ipcMain.handle('editor-draft-write', (_e, paneId: string, text: string) =>
+    writeDraft(draftsDir(), String(paneId), String(text)))
+  ipcMain.handle('editor-draft-read', (_e, paneId: string) => readDraft(draftsDir(), String(paneId)))
+  ipcMain.handle('editor-draft-clear', (_e, paneId: string) => clearDraft(draftsDir(), String(paneId)))
+  // Markdown preview images: the sandboxed srcdoc frame inherits the renderer
+  // CSP (img-src 'self' data:), so local file: images never load — main inlines
+  // them as data: URIs. Remote srcs are deliberately left alone.
+  ipcMain.handle('editor-inline-images', (_e, mdDir: string, html: string) =>
+    inlineImages(String(mdDir), String(html)))
 }
 
 // Single-instance lock: a second launch (or a dev run whose predecessor didn't
