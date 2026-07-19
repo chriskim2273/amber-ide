@@ -16,6 +16,7 @@ contextBridge.exposeInMainWorld('amber', {
   createSession: (name: string, cwd: string, sessionKind: string) =>
     ipcRenderer.send('daemon-command', { cmd: 'create', name, cwd, sessionKind }),
   killSession: (name: string) => ipcRenderer.send('daemon-command', { cmd: 'kill', name }),
+  renameSession: (from: string, to: string) => ipcRenderer.send('daemon-command', { cmd: 'rename', from, to }),
   // Slice 3 freeze grace: park/un-park a claude session to free its RAM.
   suspendSession: (name: string) => ipcRenderer.send('daemon-command', { cmd: 'suspend', name }),
   resumeSession: (name: string) => ipcRenderer.send('daemon-command', { cmd: 'resume', name }),

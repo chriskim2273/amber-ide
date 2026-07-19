@@ -664,6 +664,14 @@ body {
   border: 1px solid var(--drop-zone-border);
 }
 
+/* Tab header / workspace pill under a pane drag — the class is toggled
+   imperatively during the drag (a React round-trip per mousemove would
+   reconcile every terminal). */
+.drop-target {
+  background: var(--drop-zone-bg);
+  outline: 1px solid var(--drop-zone-border);
+}
+
 /* ---------- disconnect banner ---------- */
 .banner {
   display: flex;

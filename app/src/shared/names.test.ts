@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { parseName, formatName, makeId } from './names'
+import { parseName, formatName, makeId, retargetPane } from './names'
 
 describe('names', () => {
   it('parses a well-formed name', () => {
@@ -17,5 +17,17 @@ describe('names', () => {
     const id = makeId()
     expect(id).toMatch(/^[a-z0-9]+$/)
     expect(id.length).toBeGreaterThan(0)
+  })
+})
+
+describe('retargetPane', () => {
+  it('rewrites ws/tab/ord and keeps the stable id', () => {
+    expect(retargetPane('amber-1-2-0-abc', { ws: 3, tab: 4, ord: 2 })).toBe('amber-3-4-2-abc')
+  })
+  it('keeps the current ws when only the tab moves', () => {
+    expect(retargetPane('amber-1-2-0-abc', { tab: 5, ord: 0 })).toBe('amber-1-5-0-abc')
+  })
+  it('returns null for a non-session name', () => {
+    expect(retargetPane('browser-1-1-0-abc', { ws: 2, ord: 0 })).toBeNull()
   })
 })

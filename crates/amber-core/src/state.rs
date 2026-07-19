@@ -197,6 +197,45 @@ impl StateStore {
         Ok(())
     }
 
+    /// Path of a session's generated claude settings file (the `SessionStart`
+    /// hook). Its CONTENT is name-independent (the hook command is
+    /// `<exe> hook`; the name reaches it via `AMBER_SESSION`), so a rename only
+    /// has to move the file — nothing inside it needs rewriting.
+    fn claude_settings_path(&self, name: &str) -> PathBuf {
+        self.claude_dir().join(format!("{name}.settings.json"))
+    }
+
+    /// Move every name-keyed artifact of `from` to `to`, rewriting the embedded
+    /// `SessionMeta.name`. Used by a cross-tab pane move: the tab is encoded in
+    /// the session name, so moving a pane IS a rename.
+    ///
+    /// Crash-safe by ordering: the optional artifacts move first, then
+    /// `sessions/<to>.json` is written, and `sessions/<from>.json` is removed
+    /// LAST. `sessions/*.json` is what `list_sessions` (and therefore restore)
+    /// enumerates, so a crash at any point leaves either the old fully
+    /// restorable session or the new one — never half of each. (A crash between
+    /// the last two steps leaves both names listed; the duplicate is the safe
+    /// direction — nothing is lost.)
+    pub fn rename_session(&self, from: &str, to: &str) -> anyhow::Result<()> {
+        let mut meta = self
+            .read_session(from)?
+            .ok_or_else(|| anyhow::anyhow!("no such session: {from}"))?;
+        for (old, new) in [
+            (self.claude_path(from), self.claude_path(to)),
+            (self.claude_settings_path(from), self.claude_settings_path(to)),
+            (self.scrollback_path(from), self.scrollback_path(to)),
+        ] {
+            match fs::rename(&old, &new) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        meta.name = to.to_string();
+        self.write_session(&meta)?;
+        Self::remove_if_exists(&self.session_path(from))
+    }
+
     pub fn write_scrollback(&self, name: &str, bytes: &[u8]) -> anyhow::Result<()> {
         Self::atomic_write(&self.scrollback_path(name), bytes)
     }
@@ -523,6 +562,66 @@ mod tests {
         assert_eq!(store.read_session("alpha").unwrap(), None);
         assert_eq!(store.read_claude("alpha").unwrap(), None);
         assert_eq!(store.read_scrollback("alpha").unwrap(), None);
+    }
+
+    #[test]
+    fn rename_session_moves_every_artifact_and_rewrites_the_embedded_name() {
+        let dir = tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        store.write_session(&sample_session("amber-1-1-0-a")).unwrap();
+        store
+            .write_claude(
+                "amber-1-1-0-a",
+                &ClaudeMeta {
+                    session_id: "sess-1".to_string(),
+                    cwd: PathBuf::from("/tmp"),
+                    updated: 1,
+                },
+            )
+            .unwrap();
+        store.write_scrollback("amber-1-1-0-a", b"history").unwrap();
+        let settings = dir.path().join("claude/amber-1-1-0-a.settings.json");
+        fs::write(&settings, b"{}").unwrap();
+
+        store.rename_session("amber-1-1-0-a", "amber-1-2-0-a").unwrap();
+
+        let moved = store.read_session("amber-1-2-0-a").unwrap().unwrap();
+        assert_eq!(moved.name, "amber-1-2-0-a", "embedded name must be rewritten");
+        assert_eq!(moved.cwd, PathBuf::from("/tmp/proj"), "other fields preserved");
+        assert_eq!(store.read_session("amber-1-1-0-a").unwrap(), None);
+        assert_eq!(
+            store.read_claude("amber-1-2-0-a").unwrap().unwrap().session_id,
+            "sess-1"
+        );
+        assert_eq!(store.read_claude("amber-1-1-0-a").unwrap(), None);
+        assert_eq!(
+            store.read_scrollback("amber-1-2-0-a").unwrap(),
+            Some(b"history".to_vec())
+        );
+        assert_eq!(store.read_scrollback("amber-1-1-0-a").unwrap(), None);
+        assert!(dir.path().join("claude/amber-1-2-0-a.settings.json").exists());
+        assert!(!settings.exists());
+    }
+
+    #[test]
+    fn rename_session_tolerates_missing_optional_artifacts() {
+        // A plain shell has no claude meta, no settings, and (before its first
+        // snapshot) no scrollback — renaming it must still succeed.
+        let dir = tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        store.write_session(&sample_session("bare")).unwrap();
+
+        store.rename_session("bare", "bare-moved").unwrap();
+
+        assert_eq!(store.read_session("bare").unwrap(), None);
+        assert_eq!(store.read_session("bare-moved").unwrap().unwrap().name, "bare-moved");
+    }
+
+    #[test]
+    fn rename_session_errors_when_the_source_is_missing() {
+        let dir = tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        assert!(store.rename_session("ghost", "somewhere").is_err());
     }
 
     #[test]

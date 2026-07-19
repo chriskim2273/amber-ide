@@ -1,7 +1,7 @@
 # Cross-Tab Pane Move (Session Rename) — Design
 
 **Date:** 2026-07-18
-**Status:** Approved (design decisions settled); plan + implementation pending.
+**Status:** Implemented 2026-07-19 (daemon Rename + app pane-drop move). Deviation: the settings file carries no session name, so it moves unchanged.
 **Scope:** Let a pane be moved to another tab (or workspace) by dragging it onto
 a tab header. Because a session's tab is encoded in its name
 (`amber-<ws>-<tab>-<ord>-<id>`, core rule #2), a cross-tab move **is** a session

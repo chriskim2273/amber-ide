@@ -12,6 +12,17 @@ export function formatName(p: PaneName): string {
   return `amber-${p.ws}-${p.tab}-${p.ord}-${p.id}`
 }
 
+// Retarget a daemon session name at another ws/tab (grouping is name-encoded —
+// core rule #2 — so a cross-tab/ws move IS a rename). The pane's stable `id` is
+// kept; only ws/tab/ord change. Omitted ws/tab keep their current value. Returns
+// null for anything that isn't a session name (e.g. a browser pane id — those
+// live in the sidecar and move by a plain entry edit, no rename).
+export function retargetPane(name: string, to: { ws?: number; tab?: number; ord: number }): string | null {
+  const p = parseName(name)
+  if (!p) return null
+  return formatName({ ...p, ws: to.ws ?? p.ws, tab: to.tab ?? p.tab, ord: to.ord })
+}
+
 let counter = 0
 export function makeId(): string {
   counter = (counter + 1) % 0xffff

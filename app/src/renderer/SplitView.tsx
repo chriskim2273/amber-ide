@@ -143,6 +143,10 @@ export function SplitView(props: {
   onSetRatio: (path: Array<'a' | 'b'>, ratio: number) => void
   onSplit: (paneId: string, dir: 'h' | 'v', kind?: 'shell' | 'claude' | 'browser') => void
   onMove: (sourceId: string, targetId: string, zone: Zone) => void
+  // Cross-group move: the pane was dropped on a tab header (`{ tab }`) or a
+  // workspace pill (`{ ws }`). Grouping is name-encoded, so App turns this into a
+  // daemon Rename (or a sidecar edit for browser panes) — never a local tree move.
+  onMoveTo: (sourceId: string, target: { ws: number } | { tab: number }) => void
   onClose: (paneId: string) => void
   // App-local browser panes (kind==='browser'): url keyed by paneId + a nav
   // callback that persists the current URL to the sidecar. Empty when none.
@@ -179,7 +183,9 @@ export function SplitView(props: {
   const [findSeq, setFindSeq] = useState(0)
   // Custom header context menu, if open: which pane and where (stage-relative,
   // clamped on render). Bound to the pane HEADER only — xterm owns body events.
-  const [menu, setMenu] = useState<{ paneId: string; x: number; y: number } | null>(null)
+  // With `split` set it renders the kind picker instead (shell/claude/browser for
+  // that direction) — same state so dismissal/clamping/pruning are shared.
+  const [menu, setMenu] = useState<{ paneId: string; x: number; y: number; split?: 'h' | 'v' } | null>(null)
   // Which pane (if any) has the inline freeze-note prompt open (context-menu
   // "Freeze pane…" path). Only that pane renders the input.
   const [notePane, setNotePane] = useState<string | null>(null)
@@ -253,6 +259,17 @@ export function SplitView(props: {
       api.insert(`\x15claude --dangerously-skip-permissions${flag}\n`)
     }
     setReloadPane(null)
+  }
+
+  // Open the split kind picker under a split button, stage-relative (the render
+  // clamps it inside the stage). Every split goes through the picker so the pane
+  // kind is chosen at split time instead of via the toolbar dropdown.
+  const openSplitPicker = (paneId: string, dir: 'h' | 'v', btn: HTMLElement): void => {
+    const b = ref.current?.getBoundingClientRect()
+    if (!b) return
+    const r = btn.getBoundingClientRect()
+    setFocused(paneId)
+    setMenu({ paneId, x: r.left - b.left, y: r.bottom - b.top, split: dir })
   }
 
   // Per-pane title callbacks, cached by paneId so each `Pane` gets a REFERENTIALLY
@@ -468,7 +485,22 @@ export function SplitView(props: {
     // travels ≥4 px from mousedown, so a plain click on the grip does nothing.
     const sx = e.clientX, sy = e.clientY
     let started = false
+    // Tab header / workspace pill under the cursor, if any. Those live OUTSIDE
+    // this view (App's toolbar), so hit-testing goes through the DOM rather than
+    // the geometry tree; the highlight is applied imperatively for the same reason
+    // (a React state round-trip per mousemove would reconcile every terminal).
+    let dropEl: HTMLElement | null = null
+    const hitGroup = (ev: MouseEvent): HTMLElement | null =>
+      (document.elementFromPoint(ev.clientX, ev.clientY) as HTMLElement | null)
+        ?.closest<HTMLElement>('[data-drop-tab],[data-drop-ws]') ?? null
+    const markGroup = (el: HTMLElement | null): void => {
+      if (el === dropEl) return
+      dropEl?.classList.remove('drop-target')
+      el?.classList.add('drop-target')
+      dropEl = el
+    }
     const cleanup = () => {
+      markGroup(null)
       window.removeEventListener('mousemove', move)
       window.removeEventListener('mouseup', up)
       window.removeEventListener('keydown', onKey)
@@ -478,13 +510,21 @@ export function SplitView(props: {
         if (Math.hypot(ev.clientX - sx, ev.clientY - sy) < 4) return
         started = true
       }
-      setDrag({ source, hover: hitZone(ev) })
+      const g = hitGroup(ev)
+      markGroup(g)
+      setDrag({ source, hover: g ? null : hitZone(ev) })
     }
     const up = (ev: MouseEvent) => {
+      const g = started ? hitGroup(ev) : null
       cleanup()
       if (started) {
-        const h = hitZone(ev)
-        if (h) props.onMove(source, h.targetId, h.zone)
+        const tab = g?.dataset['dropTab'], wsId = g?.dataset['dropWs']
+        if (tab !== undefined) props.onMoveTo(source, { tab: Number(tab) })
+        else if (wsId !== undefined) props.onMoveTo(source, { ws: Number(wsId) })
+        else {
+          const h = hitZone(ev)
+          if (h) props.onMove(source, h.targetId, h.zone)
+        }
       }
       setDrag(null)
     }
@@ -558,8 +598,10 @@ export function SplitView(props: {
                 {!isBrowser && meta?.claudeId &&
                   <button className="icon-btn" aria-label="reload claude session" title="reload claude — resume this conversation"
                     onClick={() => setReloadPane(paneId)}>↺claude</button>}
-                <button className="icon-btn" aria-label="split right" title="split right" onClick={() => props.onSplit(paneId, 'h')}>⬌</button>
-                <button className="icon-btn" aria-label="split down" title="split down" onClick={() => props.onSplit(paneId, 'v')}>⬍</button>
+                <button className="icon-btn" aria-label="split right" title="split right — choose kind"
+                  onClick={(e) => openSplitPicker(paneId, 'h', e.currentTarget)}>⬌</button>
+                <button className="icon-btn" aria-label="split down" title="split down — choose kind"
+                  onClick={(e) => openSplitPicker(paneId, 'v', e.currentTarget)}>⬍</button>
                 <button className="icon-btn danger" aria-label="close pane" title="close" onClick={() => props.onClose(paneId)}>✕</button>
               </div>
             </div>
@@ -639,12 +681,26 @@ export function SplitView(props: {
         const run = (fn: () => void) => (): void => { fn(); close() }
         const isZoomed = props.zoomedPane === paneId
         const isFrozen = props.frozen[paneId] !== undefined
+        // Kind picker variant: three kinds for the requested direction.
+        if (menu.split) {
+          const dir = menu.split
+          return (
+            <div className="ctx-menu" role="menu" aria-label={dir === 'h' ? 'split right as' : 'split down as'}
+              style={{ left: x, top: y }} onMouseDown={(e) => e.stopPropagation()}>
+              {(['shell', 'claude', 'browser'] as const).map((k) => (
+                <button key={k} className="ctx-item" role="menuitem"
+                  onClick={run(() => props.onSplit(paneId, dir, k))}>{k}</button>
+              ))}
+            </div>
+          )
+        }
         return (
           <div className="ctx-menu" role="menu" style={{ left: x, top: y }}
             onMouseDown={(e) => e.stopPropagation()}>
-            <button className="ctx-item" role="menuitem" onClick={run(() => props.onSplit(paneId, 'h'))}>Split right</button>
-            <button className="ctx-item" role="menuitem" onClick={run(() => props.onSplit(paneId, 'v'))}>Split down</button>
-            <button className="ctx-item" role="menuitem" onClick={run(() => props.onSplit(paneId, 'h', 'claude'))}>New claude pane right</button>
+            <button className="ctx-item" role="menuitem"
+              onClick={() => setMenu({ paneId, x: menu.x, y: menu.y, split: 'h' })}>Split right…</button>
+            <button className="ctx-item" role="menuitem"
+              onClick={() => setMenu({ paneId, x: menu.x, y: menu.y, split: 'v' })}>Split down…</button>
             <div className="ctx-sep" />
             <button className="ctx-item" role="menuitem" onClick={run(() => props.onToggleZoom(paneId))}>{isZoomed ? 'Restore' : 'Zoom'}</button>
             {isFrozen

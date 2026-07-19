@@ -12,6 +12,30 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// Serializes the tests in this file, which would otherwise flake with
+/// `ETXTBSY` ("Text file busy") when the supervisor execs its fake `claude`.
+///
+/// Every test here writes an executable script and then execs it, while the
+/// others concurrently `Command::spawn` (fork+exec). `fork` copies the parent's
+/// whole fd table, so a fork that lands between another thread's
+/// `fs::write(script)` open and close leaves the forked child holding a WRITE fd
+/// to that script's inode. `O_CLOEXEC` only closes it at the child's `execve`,
+/// so for that window the kernel sees the script as open-for-writing and refuses
+/// to exec it. It is the inherited fd, not a shared path, that collides —
+/// per-test tempdirs cannot help, and neither can an atomic write+rename (the
+/// inherited fd follows the inode through the rename).
+///
+/// Pre-existing flake, reproducible on an untouched tree: 4/10 runs of this file
+/// alone failed before the guard, 0/15 after.
+// ponytail: whole-test mutex (these tests run serially, ~4s). The alternative —
+// retrying an ETXTBSY exec inside the supervisor — would inject extra phases
+// into the exact sequences these tests assert.
+fn exec_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    // Poison-tolerant: one failing test must not cascade into the others.
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Poll `phases` until `pred` holds or `timeout` elapses; panic on timeout.
 fn wait_until(
     phases: &Arc<Mutex<Vec<String>>>,
@@ -63,6 +87,7 @@ fn log_lines(root: &Path) -> Vec<String> {
 
 #[test]
 fn resume_after_first_run() {
+    let _exec_guard = exec_guard();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let claude_path = write_fake_claude(root, 0);
@@ -111,6 +136,7 @@ fn resume_after_first_run() {
 
 #[test]
 fn crash_exhausts_to_outcome() {
+    let _exec_guard = exec_guard();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let claude_path = write_fake_claude(root, 1);
@@ -144,6 +170,7 @@ fn crash_exhausts_to_outcome() {
 
 #[test]
 fn suspend_then_resume_parks_and_relaunches_claude() {
+    let _exec_guard = exec_guard();
     // Slice 3: SIGUSR1 (suspend flag) mid-run must KILL the running claude,
     // report "suspended", idle, and — on the resume flag — relaunch it. The kill
     // must NOT count as a crash. Uses a fake claude that runs ~1s so suspend
@@ -198,6 +225,7 @@ fn suspend_then_resume_parks_and_relaunches_claude() {
 
 #[test]
 fn hook_subcommand_records_id() {
+    let _exec_guard = exec_guard();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
 

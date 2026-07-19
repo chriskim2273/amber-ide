@@ -76,12 +76,10 @@ enum Command {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
-    /// Rename a session (spec §2). NOTE: the daemon deliberately rejects this
-    /// today — a live claude session's supervisor is env-bound to its name, so
-    /// renaming would break precise resume until a supervisor-rebind exists.
-    /// The verb ships anyway so the CLI surface matches the spec and starts
-    /// working automatically once the daemon supports Rename; for now it prints
-    /// the daemon's error and exits nonzero.
+    /// Rename a session (spec §2). Because a pane's workspace/tab is encoded in
+    /// its session name, this is also how a pane moves between tabs. A shell is
+    /// renamed in place (same child); a claude session is respawned under the
+    /// new name and resumes the same conversation.
     Rename {
         from: String,
         to: String,
@@ -667,10 +665,9 @@ fn run_kill(socket: &Path, name: &str) -> anyhow::Result<()> {
 }
 
 /// `amber rename <from> <to>`: send Rename and surface the daemon's reply. The
-/// daemon deliberately rejects rename today (a live claude supervisor is
-/// env-bound to its name), so this always prints that error to stderr and exits
-/// nonzero — but the moment the daemon learns to rename, this starts working
-/// with no CLI change.
+/// daemon acks with `Created { name: to }`; a refusal (unknown `from`, a `to`
+/// that already exists, an invalid name) comes back as `Error` and exits
+/// nonzero.
 fn run_rename(socket: &Path, from: &str, to: &str) -> anyhow::Result<()> {
     let mut stream = UnixStream::connect(socket)?;
     stream.write_all(&proto::encode(&Frame::Control(ControlMsg::Rename {
@@ -685,8 +682,7 @@ fn run_rename(socket: &Path, from: &str, to: &str) -> anyhow::Result<()> {
             Some(Frame::Control(ControlMsg::Error { msg })) => {
                 anyhow::bail!("rename failed: {msg}");
             }
-            // A future daemon that supports rename would ack differently; treat
-            // any non-error reply as success so this needs no change then.
+            // The ack is `Created { name: to }`; any non-error reply counts.
             Some(Frame::Control(_)) => {
                 println!("renamed {from} -> {to}");
                 return Ok(());
