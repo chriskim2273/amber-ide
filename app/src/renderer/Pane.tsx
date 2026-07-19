@@ -211,13 +211,18 @@ export const Pane = memo(function Pane(
     // of submitting on this sequence, while plain Enter stays a bare CR (submit).
     // A shell sees M-RET (unbound → no-op), so no stray echo.
     term.attachCustomKeyEventHandler((e) => {
+      // Checked BEFORE the keydown gate and preventDefault'd: returning false
+      // only skips xterm's keydown path, it does not stop the event, so the
+      // browser's follow-up keypress made xterm emit a bare CR right after our
+      // ESC+CR — newline inserted, then submitted anyway.
+      if (e.key === 'Enter' && e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        if (e.type === 'keydown') port?.postMessage({ data: SHIFT_ENTER_SEQ })
+        e.preventDefault()
+        return false
+      }
       if (e.type !== 'keydown') return true
       if (e.key === 'Escape') setOpenBtn(null) // dismiss the Open button; still goes to pty
       if (appChord(e)) return false
-      if (e.key === 'Enter' && e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) {
-        port?.postMessage({ data: SHIFT_ENTER_SEQ })
-        return false
-      }
       return true
     })
 
