@@ -8,4 +8,5 @@ pub mod manager;
 pub mod procinfo;
 pub mod pty;
 pub mod supervisor;
+pub mod web;
 pub mod watchers;

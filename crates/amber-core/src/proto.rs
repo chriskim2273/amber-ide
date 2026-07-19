@@ -39,6 +39,18 @@ pub struct SessionInfo {
     /// `#[serde(default)]` keeps the wire back-compatible.
     #[serde(default)]
     pub claude_id: Option<String>,
+    /// The session pty's CURRENT winsize, read live from the master. A pty has
+    /// ONE winsize shared by every subscriber, so a client that must not
+    /// resize it (`amber web`, spec §4 — the phone) needs to know the real
+    /// geometry to render at: guessing 80×24 reflows a shell messily and
+    /// corrupts an alt-screen TUI, whose absolute cursor positioning lands on
+    /// the wrong grid. `0` when the size cannot be read (a dead session).
+    /// `#[serde(default)]` keeps the wire back-compatible: peers that omit
+    /// them decode as 0.
+    #[serde(default)]
+    pub cols: u16,
+    #[serde(default)]
+    pub rows: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -427,6 +439,8 @@ mod tests {
             updated: 1_700_000_000,
             run_state: Some("claude-retrying".into()),
             claude_id: Some("sid-abc".into()),
+            cols: 120,
+            rows: 40,
         };
         let full = Frame::Control(ControlMsg::Sessions { sessions: vec![info.clone()] });
         assert_eq!(roundtrip(&full), full);
@@ -451,6 +465,7 @@ mod tests {
         let info: SessionInfo = serde_json::from_str(legacy).unwrap();
         assert_eq!(info.updated, 0);
         assert_eq!(info.run_state, None);
+        assert_eq!((info.cols, info.rows), (0, 0));
         assert_eq!(info.name, "s");
     }
 
@@ -482,6 +497,8 @@ mod tests {
             updated: 0,
             run_state: Some("shell-fallback".into()),
             claude_id: None,
+            cols: 80,
+            rows: 24,
         };
         let f = Frame::Control(ControlMsg::Sessions { sessions: vec![info] });
         assert_eq!(roundtrip(&f), f);

@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- viewport-fit=cover for safe-area insets; pinch-zoom deliberately NOT locked
+     (maximum-scale/user-scalable=no would break pinching the terminal). -->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="mobile-web-app-capable" content="yes">
+<title>amber</title>
+<link rel="icon" href="data:,"><!-- offline app: no favicon request -->
+<link rel="stylesheet" href="/xterm.css">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<div id="banner" class="banner" hidden></div>
+
+<!-- ---------- session list ---------- -->
+<section id="view-list" class="view">
+  <header class="bar">
+    <span class="brand">amber</span>
+    <span class="spacer"></span>
+    <span id="list-count" class="dim"></span>
+  </header>
+  <div id="list" class="list"></div>
+</section>
+
+<!-- ---------- terminal ---------- -->
+<section id="view-term" class="view" hidden>
+  <header class="bar">
+    <button id="back" class="btn" aria-label="Back to session list">‹ Sessions</button>
+    <span id="term-title" class="title"></span>
+    <span class="spacer"></span>
+    <button id="geom" class="btn" title="Override: the server did not report this session's pty size. Local only — never resizes the pty." hidden>size 80&#215;24</button>
+    <button id="zoom-out" class="btn" aria-label="Zoom out">A−</button>
+    <button id="zoom-in" class="btn" aria-label="Zoom in">A+</button>
+  </header>
+  <div id="screen" class="screen"><div id="sizer"><div id="stage"><div id="host"></div></div></div></div>
+  <div id="keybar" class="keybar" role="toolbar" aria-label="Terminal keys">
+    <button class="key" data-key="esc">Esc</button>
+    <button class="key" data-key="tab">Tab</button>
+    <button class="key" data-key="ctrl" id="k-ctrl" aria-pressed="false">Ctrl</button>
+    <button class="key" data-key="left" aria-label="Left">&#8592;</button>
+    <button class="key" data-key="down" aria-label="Down">&#8595;</button>
+    <button class="key" data-key="up" aria-label="Up">&#8593;</button>
+    <button class="key" data-key="right" aria-label="Right">&#8594;</button>
+    <button class="key" data-key="ctrl-c">^C</button>
+  </div>
+</section>
+
+<script src="/xterm.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

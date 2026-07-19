@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Template: install.sh substitutes __AMBER_BIN__ with the installed path. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.amber-ide.web</string>
+    <!-- Binds 127.0.0.1 ONLY; reach it from a phone via `tailscale serve`. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__AMBER_BIN__</string>
+        <string>web</string>
+        <string>--port</string>
+        <string>7717</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
