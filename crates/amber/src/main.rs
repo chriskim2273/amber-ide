@@ -285,7 +285,9 @@ fn run_status(socket: &Path) -> anyhow::Result<()> {
 
 /// Locate the repo's `infra/daemon/install.sh`: walk up from the running
 /// binary (covers `target/{debug,release}/amber` in a checkout) and from this
-/// crate's manifest dir (covers `cargo run` / test builds).
+/// crate's manifest dir (covers `cargo run` / test builds). Unix-only —
+/// Windows install writes the HKCU Run key directly (no shell script).
+#[cfg(unix)]
 fn find_install_script() -> Option<PathBuf> {
     let mut starts: Vec<PathBuf> = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
@@ -303,8 +305,55 @@ fn find_install_script() -> Option<PathBuf> {
     None
 }
 
+/// The stable per-user install path for amber.exe on Windows —
+/// `%LOCALAPPDATA%\Programs\amber-ide\amber.exe`. MUST match the app's
+/// `windowsStablePath()` (serviceManager.ts), which is the path the HKCU Run
+/// key points at.
+#[cfg(windows)]
+fn windows_stable_exe() -> PathBuf {
+    let local = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(local)
+        .join("Programs")
+        .join("amber-ide")
+        .join("amber.exe")
+}
+
+#[cfg(windows)]
+const WINDOWS_RUN_SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+#[cfg(windows)]
+const WINDOWS_RUN_VALUE: &str = "amber-daemon";
+
+/// `ctl install` on Windows: copy this binary to the stable path and register
+/// it at logon via an HKCU Run key (no admin). Idempotent (re-run = repair).
+#[cfg(windows)]
+fn run_install(dry_run: bool) -> anyhow::Result<()> {
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+
+    let stable = windows_stable_exe();
+    let value = format!("\"{}\" daemon", stable.display());
+    if dry_run {
+        println!("would copy this binary to {}", stable.display());
+        println!("would set HKCU\\{WINDOWS_RUN_SUBKEY}\\{WINDOWS_RUN_VALUE} = {value}");
+        return Ok(());
+    }
+    if let Some(parent) = stable.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let current = std::env::current_exe()?;
+    if current != stable {
+        std::fs::copy(&current, &stable)?;
+    }
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let (run, _) = hkcu.create_subkey(WINDOWS_RUN_SUBKEY)?;
+    run.set_value(WINDOWS_RUN_VALUE, &value)?;
+    println!("installed amber daemon at {} (auto-starts at logon)", stable.display());
+    Ok(())
+}
+
 /// `ctl install`: thin wrapper over `infra/daemon/install.sh` (which builds
 /// the release binary, installs it, and enables the boot unit).
+#[cfg(unix)]
 fn run_install(dry_run: bool) -> anyhow::Result<()> {
     let Some(script) = find_install_script() else {
         eprintln!(
@@ -325,10 +374,48 @@ fn run_install(dry_run: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `ctl uninstall` on Windows: remove the HKCU Run key (and, with
+/// `--purge-binary`, the installed exe; `--purge-state`, the state store).
+/// Idempotent — missing keys/files are not errors.
+#[cfg(windows)]
+fn run_uninstall(dry_run: bool, purge_binary: bool, purge_state: bool) -> anyhow::Result<()> {
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_WRITE};
+    use winreg::RegKey;
+
+    let stable = windows_stable_exe();
+    if dry_run {
+        println!("would delete HKCU\\{WINDOWS_RUN_SUBKEY}\\{WINDOWS_RUN_VALUE}");
+        if purge_binary {
+            println!("would remove {}", stable.display());
+        }
+        if purge_state {
+            println!("would remove state store {}", default_root().display());
+        }
+        return Ok(());
+    }
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    if let Ok(run) = hkcu.open_subkey_with_flags(WINDOWS_RUN_SUBKEY, KEY_WRITE) {
+        // Missing value is fine (already uninstalled).
+        let _ = run.delete_value(WINDOWS_RUN_VALUE);
+    }
+    if purge_binary && stable.exists() {
+        std::fs::remove_file(&stable)?;
+    }
+    if purge_state {
+        let root = default_root();
+        if root.exists() {
+            std::fs::remove_dir_all(&root)?;
+        }
+    }
+    println!("uninstalled amber daemon auto-start");
+    Ok(())
+}
+
 /// `ctl uninstall`: symmetric to `install`, delegating to the same
 /// `infra/daemon/install.sh` via its `uninstall` subcommand. Stops + disables +
 /// removes the boot unit; `--purge-binary`/`--purge-state` opt into removing
 /// the installed binary and the state store (both kept by default).
+#[cfg(unix)]
 fn run_uninstall(dry_run: bool, purge_binary: bool, purge_state: bool) -> anyhow::Result<()> {
     let Some(script) = find_install_script() else {
         eprintln!(

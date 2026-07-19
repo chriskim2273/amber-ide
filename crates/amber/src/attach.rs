@@ -18,16 +18,39 @@
 //! - a daemon `Exit` frame (the pane's child ended) exits the client.
 
 use std::io::{self, IsTerminal, Read, Write};
-use std::os::fd::AsFd;
-use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
 use amber_core::proto::{self, ControlMsg, Decoder, Frame};
+
+#[cfg(unix)]
+use std::os::fd::AsFd;
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(unix)]
+use std::sync::Arc;
+
+#[cfg(unix)]
 use nix::errno::Errno;
+#[cfg(unix)]
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+#[cfg(unix)]
 use nix::sys::termios::{self, SetArg, Termios};
+
+#[cfg(windows)]
+use std::sync::mpsc;
+#[cfg(windows)]
+use std::time::Duration;
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
+#[cfg(windows)]
+use windows_sys::Win32::System::Console::{
+    GetConsoleMode, GetConsoleScreenBufferInfo, GetStdHandle, SetConsoleMode,
+    CONSOLE_SCREEN_BUFFER_INFO, DISABLE_NEWLINE_AUTO_RETURN, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT,
+    ENABLE_PROCESSED_INPUT, ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+    STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+};
 
 /// Poll timeout: the cadence at which the SIGWINCH flag is rechecked even if
 /// no fd is ready (a signal may interrupt poll on this thread, but flag-only
@@ -337,10 +360,12 @@ pub fn nest_refusal(amber_session: Option<&str>, force: bool) -> Option<String> 
 /// Restores the original terminal settings when dropped, even on error or
 /// panic unwind, so a crashing client never leaves the user's shell in raw
 /// mode.
+#[cfg(unix)]
 struct RawModeGuard {
     original: Termios,
 }
 
+#[cfg(unix)]
 impl RawModeGuard {
     fn enable() -> anyhow::Result<Self> {
         let stdin = io::stdin();
@@ -352,10 +377,92 @@ impl RawModeGuard {
     }
 }
 
+#[cfg(unix)]
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         let stdin = io::stdin();
         let _ = termios::tcsetattr(&stdin, SetArg::TCSANOW, &self.original);
+    }
+}
+
+/// Windows console equivalent of the Unix raw-mode guard. Puts the console
+/// input into VT/raw mode (line-editing, echo and Ctrl-C processing off, VT
+/// input on) and the output into VT-processing mode, saving the original modes
+/// and restoring both on drop. The saved handles are console handles, only ever
+/// touched from the main thread.
+#[cfg(windows)]
+struct RawModeGuard {
+    in_handle: HANDLE,
+    out_handle: HANDLE,
+    in_original: u32,
+    out_original: u32,
+}
+
+#[cfg(windows)]
+impl RawModeGuard {
+    fn enable() -> anyhow::Result<Self> {
+        // SAFETY: all calls are documented Win32 console APIs; handles come from
+        // GetStdHandle and are validated before use, and every out-pointer
+        // points at a live local `u32`.
+        unsafe {
+            let in_handle = GetStdHandle(STD_INPUT_HANDLE);
+            let out_handle = GetStdHandle(STD_OUTPUT_HANDLE);
+            if in_handle == INVALID_HANDLE_VALUE || out_handle == INVALID_HANDLE_VALUE {
+                anyhow::bail!("cannot obtain console handles");
+            }
+            let mut in_original: u32 = 0;
+            let mut out_original: u32 = 0;
+            if GetConsoleMode(in_handle, &mut in_original) == 0 {
+                anyhow::bail!("GetConsoleMode(stdin) failed");
+            }
+            if GetConsoleMode(out_handle, &mut out_original) == 0 {
+                anyhow::bail!("GetConsoleMode(stdout) failed");
+            }
+            let raw_in = (in_original
+                & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT))
+                | ENABLE_VIRTUAL_TERMINAL_INPUT;
+            let raw_out =
+                out_original | ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN;
+            if SetConsoleMode(in_handle, raw_in) == 0 {
+                anyhow::bail!("SetConsoleMode(stdin) failed");
+            }
+            if SetConsoleMode(out_handle, raw_out) == 0 {
+                anyhow::bail!("SetConsoleMode(stdout) failed");
+            }
+            Ok(RawModeGuard { in_handle, out_handle, in_original, out_original })
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        // SAFETY: restoring the modes captured in `enable` on the same handles.
+        unsafe {
+            SetConsoleMode(self.in_handle, self.in_original);
+            SetConsoleMode(self.out_handle, self.out_original);
+        }
+    }
+}
+
+/// Current console window size on Windows via `GetConsoleScreenBufferInfo`
+/// (the visible window, not the buffer), used to detect resizes since there is
+/// no SIGWINCH. Falls back to [`current_size`] if the query fails (e.g. off a
+/// real console).
+#[cfg(windows)]
+fn windows_console_size() -> (u16, u16) {
+    // SAFETY: GetStdHandle + GetConsoleScreenBufferInfo on a zeroed, owned
+    // CONSOLE_SCREEN_BUFFER_INFO; the handle is validated before the call.
+    unsafe {
+        let h = GetStdHandle(STD_OUTPUT_HANDLE);
+        let mut info: CONSOLE_SCREEN_BUFFER_INFO = std::mem::zeroed();
+        if h != INVALID_HANDLE_VALUE && GetConsoleScreenBufferInfo(h, &mut info) != 0 {
+            let w = info.srWindow.Right - info.srWindow.Left + 1;
+            let hgt = info.srWindow.Bottom - info.srWindow.Top + 1;
+            (w.max(1) as u16, hgt.max(1) as u16)
+        } else {
+            current_size()
+        }
     }
 }
 
@@ -368,6 +475,7 @@ fn current_size() -> (u16, u16) {
     }
 }
 
+#[cfg(unix)]
 fn send_control(stream: &UnixStream, msg: ControlMsg) -> anyhow::Result<()> {
     let mut w = stream;
     w.write_all(&proto::encode(&Frame::Control(msg)))?;
@@ -378,6 +486,7 @@ fn send_control(stream: &UnixStream, msg: ControlMsg) -> anyhow::Result<()> {
 /// Connect to `socket`, attach session `name`, and proxy the terminal until
 /// stdin hits EOF, the socket closes, or the daemon reports the session's
 /// child exited.
+#[cfg(unix)]
 pub fn attach(socket: &Path, name: &str, prefix: Option<u8>, want_bar: bool) -> anyhow::Result<()> {
     let stream = UnixStream::connect(socket).map_err(|e| {
         anyhow::anyhow!(
@@ -445,6 +554,7 @@ pub fn attach(socket: &Path, name: &str, prefix: Option<u8>, want_bar: bool) -> 
 
 /// The client event loop, separated from tty/signal setup so it can be
 /// driven in tests with socket pairs and pipes instead of a real terminal.
+#[cfg(unix)]
 pub fn run_client(
     stream: &UnixStream,
     name: &str,
@@ -615,6 +725,285 @@ pub fn run_client(
     Ok(end)
 }
 
+// ---- Windows attach: two-thread event loop ------------------------------
+//
+// Windows has no `poll(2)` over a console handle + a pipe, and no SIGWINCH.
+// So the single-fd poll loop is replaced by two blocking reader threads
+// feeding an `mpsc` channel; the main loop selects with `recv_timeout` and,
+// on each idle tick, polls the console size to synthesize a resize. Every
+// per-event decision reuses the SAME pure helpers as the Unix loop
+// (`scan_prefix`, `AltScreenTracker`, `render_status_line`, the decoration
+// builders), so the two paths stay behaviourally identical — only the I/O
+// multiplexing differs.
+
+/// Poll cadence for the Windows main loop: how often the console size is
+/// re-queried when no stdin/socket message arrives (SIGWINCH replacement).
+#[cfg(windows)]
+const POLL_TICK: Duration = Duration::from_millis(POLL_TICK_MS as u64);
+
+/// Messages funnelled from the two reader threads into the Windows main loop.
+#[cfg(windows)]
+enum Msg {
+    /// Bytes read from stdin (raw console input).
+    Stdin(Vec<u8>),
+    /// Stdin reached EOF or errored — the user closed input.
+    StdinEof,
+    /// Bytes read from the daemon socket.
+    Socket(Vec<u8>),
+    /// The daemon closed the socket / the read errored.
+    SocketEof,
+}
+
+/// Write one control frame to the daemon over the (Windows) socket writer.
+#[cfg(windows)]
+fn send_control_w(w: &mut crate::transport::LocalWriter, msg: ControlMsg) -> anyhow::Result<()> {
+    w.write_all(&proto::encode(&Frame::Control(msg)))?;
+    w.flush()?;
+    Ok(())
+}
+
+/// Connect to `socket`, attach session `name`, and proxy the terminal until
+/// stdin hits EOF, the socket closes, or the daemon reports the session's
+/// child exited. Windows counterpart of the Unix [`attach`] — identical
+/// tty-detection, banner, decoration and teardown; only the transport (named
+/// pipe) and the event loop differ.
+#[cfg(windows)]
+pub fn attach(socket: &Path, name: &str, prefix: Option<u8>, want_bar: bool) -> anyhow::Result<()> {
+    let stream = crate::transport::connect(socket).map_err(|e| {
+        anyhow::anyhow!(
+            "cannot reach the amber daemon at {} ({e}) — is it running?",
+            socket.display()
+        )
+    })?;
+
+    let is_tty = io::stdin().is_terminal();
+
+    let ui = if is_tty {
+        StatusUi { title: true, bar: want_bar, hint: prefix.map(prefix_key_name) }
+    } else {
+        StatusUi::none()
+    };
+
+    if is_tty {
+        match prefix {
+            Some(p) => {
+                eprintln!("[amber] attached to {name} — {} d to detach", prefix_key_name(p));
+            }
+            None => eprintln!("[amber] attached to {name} — close the terminal to detach"),
+        }
+    }
+
+    let raw_guard = if is_tty { Some(RawModeGuard::enable()?) } else { None };
+
+    let end = run_client(stream, name, prefix, &ui);
+
+    teardown_decoration(&ui);
+
+    drop(raw_guard);
+    match end? {
+        ClientEnd::StdinEof => {}
+        ClientEnd::Detached => eprintln!("[amber] detached from {name}"),
+        ClientEnd::SocketClosed => eprintln!("[amber] daemon closed the connection"),
+        ClientEnd::SessionExit(code) => {
+            eprintln!("[amber] session {name} ended (exit code {code})");
+        }
+        ClientEnd::Rejected(msg) => {
+            eprintln!("[amber] {msg}");
+            std::process::exit(1);
+        }
+    }
+    Ok(())
+}
+
+/// The Windows client event loop. Takes ownership of the connected stream (so
+/// it can split it into an owned read half for the socket thread and a write
+/// half for the main loop). Mirrors the Unix [`run_client`] logic frame-for-
+/// frame; the only difference is the two-thread + `mpsc` multiplexing that
+/// stands in for `poll` + SIGWINCH.
+#[cfg(windows)]
+pub fn run_client(
+    stream: crate::transport::LocalStream,
+    name: &str,
+    prefix: Option<u8>,
+    ui: &StatusUi,
+) -> anyhow::Result<ClientEnd> {
+    let (mut reader, mut writer) = stream.into_split()?;
+
+    // --- synchronous prelude: this MUST run before the recv loop drains any
+    // Msg::Socket, so the first frames out are Attach then Resize and the
+    // TERM_RESET preamble lands on stdout before any replayed backlog. The
+    // stdin/socket threads may be spawned first (their messages just queue).
+    send_control_w(&mut writer, ControlMsg::Attach { name: name.to_string(), raw_client: true })?;
+
+    let bar_at = |rows: u16| ui.bar && rows >= 2;
+    let child_rows = |rows: u16| if bar_at(rows) { rows - 1 } else { rows };
+    let bar_line = |cols: u16| render_status_line(name, cols, ui.hint.as_deref());
+
+    let (mut cols, mut rows) = windows_console_size();
+    send_control_w(
+        &mut writer,
+        ControlMsg::Resize { name: name.to_string(), cols, rows: child_rows(rows) },
+    )?;
+
+    let mut prefix_armed = false;
+    let mut alt = AltScreenTracker::new();
+
+    let mut stdout = io::stdout();
+    stdout.write_all(TERM_RESET)?;
+    if ui.title {
+        stdout.write_all(title_set(name).as_bytes())?;
+    }
+    if bar_at(rows) {
+        stdout.write_all(set_scroll_region(rows - 1).as_bytes())?;
+        stdout.write_all(draw_bar(rows, &bar_line(cols)).as_bytes())?;
+    }
+    stdout.flush()?;
+
+    // --- reader threads. Blocking reads on stdin and the socket half; each
+    // sends framed chunks into the channel and a terminal marker on EOF/error.
+    let (tx, rx) = mpsc::channel::<Msg>();
+    {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            let mut stdin = io::stdin();
+            loop {
+                match stdin.read(&mut buf) {
+                    Ok(0) | Err(_) => {
+                        let _ = tx.send(Msg::StdinEof);
+                        break;
+                    }
+                    Ok(n) => {
+                        if tx.send(Msg::Stdin(buf[..n].to_vec())).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+    {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => {
+                        let _ = tx.send(Msg::SocketEof);
+                        break;
+                    }
+                    Ok(n) => {
+                        if tx.send(Msg::Socket(buf[..n].to_vec())).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+    drop(tx); // only the threads keep senders now
+
+    let mut decoder = Decoder::new();
+
+    let end = 'ev: loop {
+        let msg = match rx.recv_timeout(POLL_TICK) {
+            Ok(m) => m,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // SIGWINCH replacement: re-query the console size and, on a
+                // change, resize the child and (mirroring the Unix winch arm)
+                // redraw the bar when it is showing and the child is not on the
+                // alt screen.
+                let (c, r) = windows_console_size();
+                if (c, r) != (cols, rows) {
+                    cols = c;
+                    rows = r;
+                    send_control_w(
+                        &mut writer,
+                        ControlMsg::Resize { name: name.to_string(), cols, rows: child_rows(rows) },
+                    )?;
+                    if bar_at(rows) && !alt.is_alt() {
+                        stdout.write_all(set_scroll_region(rows - 1).as_bytes())?;
+                        stdout.write_all(draw_bar(rows, &bar_line(cols)).as_bytes())?;
+                        stdout.flush()?;
+                    }
+                }
+                continue;
+            }
+            // Both reader threads gone without a clean marker — treat as the
+            // socket dying, matching the Unix loop's SocketClosed exit.
+            Err(mpsc::RecvTimeoutError::Disconnected) => break 'ev ClientEnd::SocketClosed,
+        };
+
+        match msg {
+            Msg::SocketEof => break 'ev ClientEnd::SocketClosed,
+            Msg::StdinEof => break 'ev ClientEnd::StdinEof,
+            Msg::Socket(bytes) => {
+                decoder.feed(&bytes);
+                let was_alt = alt.is_alt();
+                let mut exit_code: Option<i32> = None;
+                let mut rejected: Option<String> = None;
+                while let Some(frame) = decoder.next_frame()? {
+                    match frame {
+                        Frame::Data { bytes, .. } => {
+                            alt.feed(&bytes);
+                            stdout.write_all(&bytes)?;
+                        }
+                        Frame::Control(ControlMsg::Exit { name: ended, code }) if ended == name => {
+                            exit_code = Some(code);
+                            break;
+                        }
+                        Frame::Control(ControlMsg::Error { msg }) => {
+                            rejected = Some(msg);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                // Redraw the bar ONLY on a complete alt-screen exit — never per
+                // batch — for the same reason as the Unix loop (a mid-stream
+                // redraw could split one of the child's own escape sequences).
+                if bar_at(rows) && was_alt && !alt.is_alt() {
+                    stdout.write_all(set_scroll_region(rows - 1).as_bytes())?;
+                    stdout.write_all(draw_bar(rows, &bar_line(cols)).as_bytes())?;
+                }
+                stdout.flush()?;
+                if let Some(msg) = rejected {
+                    break 'ev ClientEnd::Rejected(msg);
+                }
+                if let Some(code) = exit_code {
+                    break 'ev ClientEnd::SessionExit(code);
+                }
+            }
+            Msg::Stdin(chunk) => {
+                let (to_send, detach) = match prefix {
+                    None => (chunk, false),
+                    Some(p) => {
+                        let res = scan_prefix(&chunk, p, prefix_armed);
+                        prefix_armed = res.armed;
+                        (res.forward, res.detach)
+                    }
+                };
+
+                if !to_send.is_empty() {
+                    let frame = Frame::Data { session: name.to_string(), bytes: to_send };
+                    writer.write_all(&proto::encode(&frame))?;
+                    writer.flush()?;
+                }
+
+                if detach {
+                    send_control_w(&mut writer, ControlMsg::Detach { name: name.to_string() })?;
+                    break 'ev ClientEnd::Detached;
+                }
+            }
+        }
+    };
+
+    // Decoration is unwound by the caller (`attach`) on ALL exit paths, as on
+    // Unix. The reader threads are left parked on their blocking reads; the
+    // process exits right after `amber attach` returns, reaping them.
+    Ok(end)
+}
+
 /// Build the teardown byte sequence: undo the attach decoration (leave the
 /// scroll region, clear the reserved row, pop the title) AND restore sane
 /// terminal modes ([`TERM_RESTORE`] — mouse/paste/alt-screen/cursor), which the
@@ -655,7 +1044,7 @@ fn teardown_decoration(ui: &StatusUi) {
     let _ = out.flush();
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::sync::mpsc;

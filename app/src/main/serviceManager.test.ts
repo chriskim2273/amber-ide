@@ -8,9 +8,38 @@ import {
   stopDaemonCommand,
   stopDaemonFallbackCommand,
   bootUnitPath,
+  windowsRunKeyAddArgv,
+  windowsRunKeyDeleteArgv,
+  WINDOWS_RUN_KEY,
+  WINDOWS_RUN_VALUE,
   LAUNCHD_LABEL,
   SYSTEMD_SERVICE,
 } from './serviceManager'
+
+describe('windows Run-key argv', () => {
+  it('add registers "<exe>" daemon under HKCU Run (no admin)', () => {
+    expect(windowsRunKeyAddArgv('C:\\p\\amber.exe')).toEqual({
+      cmd: 'reg',
+      args: [
+        'add',
+        WINDOWS_RUN_KEY,
+        '/v',
+        WINDOWS_RUN_VALUE,
+        '/t',
+        'REG_SZ',
+        '/d',
+        '"C:\\p\\amber.exe" daemon',
+        '/f',
+      ],
+    })
+  })
+  it('delete removes the Run value', () => {
+    expect(windowsRunKeyDeleteArgv()).toEqual({
+      cmd: 'reg',
+      args: ['delete', WINDOWS_RUN_KEY, '/v', WINDOWS_RUN_VALUE, '/f'],
+    })
+  })
+})
 
 describe('renderDaemonPlist', () => {
   it('substitutes the binary path and leaves no placeholder', () => {
@@ -70,8 +99,14 @@ describe('stopDaemonCommand', () => {
       args: ['bootout', 'gui/501/com.amber-ide.daemon'],
     })
   })
+  it('win32 force-terminates amber.exe', () => {
+    expect(stopDaemonCommand('win32', 501)).toEqual({
+      cmd: 'taskkill',
+      args: ['/IM', 'amber.exe', '/F'],
+    })
+  })
   it('returns null on unsupported platforms', () => {
-    expect(stopDaemonCommand('win32', 501)).toBeNull()
+    expect(stopDaemonCommand('freebsd', 501)).toBeNull()
   })
 })
 
@@ -98,8 +133,13 @@ describe('bootUnitPath', () => {
       '/Users/u/Library/LaunchAgents/com.amber-ide.daemon.plist',
     )
   })
+  it('win32 points at the stable installed amber.exe', () => {
+    expect(bootUnitPath('win32', 'C:\\Users\\u')).toBe(
+      'C:\\Users\\u/AppData/Local/Programs/amber-ide/amber.exe',
+    )
+  })
   it('returns null elsewhere', () => {
-    expect(bootUnitPath('win32', '/home/u')).toBeNull()
+    expect(bootUnitPath('freebsd', '/home/u')).toBeNull()
   })
 })
 

@@ -20,6 +20,8 @@ import {
   stopDaemonCommand,
   stopDaemonFallbackCommand,
   bootUnitPath,
+  windowsStablePath,
+  windowsRunKeyAddArgv,
 } from './serviceManager'
 import { backoffDelay, nextAttempt } from './clientSupervisor'
 import {
@@ -113,9 +115,24 @@ function spawnOk(cmd: string, args: string[]): Promise<void> {
 }
 
 async function installDaemon(): Promise<void> {
-  const home = process.env['HOME'] ?? '.'
+  const home = homedir()
 
   if (app.isPackaged) {
+    // Windows packaged: copy the bundled amber.exe to a STABLE per-user path,
+    // register it at logon via an HKCU Run key (no admin), and start it now
+    // (windowless, detached so it outlives the app). The daemon's own
+    // hidden-window WM_ENDSESSION handler gives reboot survival.
+    if (process.platform === 'win32') {
+      const stable = windowsStablePath(home)
+      await mkdir(dirname(stable), { recursive: true })
+      await copyFile(amberBinary(), stable)
+      const runKey = windowsRunKeyAddArgv(stable)
+      await spawnOk(runKey.cmd, runKey.args).catch(() => {})
+      const child = spawn(stable, ['daemon'], { detached: true, stdio: 'ignore' })
+      child.unref()
+      return
+    }
+
     // A packaged app has no repo/toolchain, so `amber ctl install` (which runs
     // cargo from a source checkout) can't work. Do a cargo-free install: place
     // the bundled amber at a STABLE path and write the boot unit directly — the
@@ -187,7 +204,7 @@ async function quitDaemonAndApp(win: BrowserWindow): Promise<void> {
   })
   if (confirm.response !== 1) return
 
-  const home = process.env['HOME'] ?? '.'
+  const home = homedir()
   const unit = bootUnitPath(process.platform, home)
   // No installed boot unit => dev / unmanaged daemon. Don't guess at pids;
   // report it and quit (the daemon keeps running, as when closing the window).
@@ -206,6 +223,11 @@ async function quitDaemonAndApp(win: BrowserWindow): Promise<void> {
   }
 
   const uid = process.getuid?.() ?? 0
+  // Windows: the daemon is windowless and taskkill /F skips its shutdown
+  // snapshot, so flush one now over the pipe before killing (no state lost).
+  if (process.platform === 'win32') {
+    await spawnOk(windowsStablePath(home), ['ctl', 'snapshot-now']).catch(() => {})
+  }
   const stop = stopDaemonCommand(process.platform, uid)
   if (stop !== null) {
     await spawnOk(stop.cmd, stop.args).catch(async () => {

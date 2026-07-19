@@ -8,6 +8,19 @@ import { join } from 'node:path'
 export const LAUNCHD_LABEL = 'com.amber-ide.daemon'
 export const SYSTEMD_SERVICE = 'amber.service'
 
+// Windows auto-start: an HKCU Run-key value (no admin), the analog of the
+// systemd user unit / launchd agent. Set to `"<stable>\amber.exe" daemon`.
+export const WINDOWS_RUN_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run'
+export const WINDOWS_RUN_VALUE = 'amber-daemon'
+
+// Stable per-user install path for amber.exe on Windows — the path the Run key
+// points at (the app's own install dir may be replaced on upgrade, so the
+// daemon binary is copied here, mirroring ~/.local/bin/amber on Unix).
+// `home` is %USERPROFILE%.
+export function windowsStablePath(home: string): string {
+  return join(home, 'AppData', 'Local', 'Programs', 'amber-ide', 'amber.exe')
+}
+
 // launchd agent, mirroring infra/daemon/com.amber-ide.daemon.plist.in. A
 // packaged app has no repo to read the template from, so it is inlined here (the
 // same reason the systemd unit is inlined in index.ts). __AMBER_BIN__ is the
@@ -75,7 +88,37 @@ export function stopDaemonCommand(platform: NodeJS.Platform, uid: number): Argv 
   if (platform === 'darwin') {
     return { cmd: 'launchctl', args: ['bootout', `gui/${uid}/${LAUNCHD_LABEL}`] }
   }
+  if (platform === 'win32') {
+    // No per-user service to stop; force-terminate the process. The app runs
+    // `ctl snapshot-now` first (see index.ts) so no state is lost — the daemon
+    // is windowless and a graceful WM_CLOSE isn't reliably deliverable.
+    return { cmd: 'taskkill', args: ['/IM', 'amber.exe', '/F'] }
+  }
   return null
+}
+
+// `reg add` argv to register the daemon at logon (HKCU — no admin). `exePath`
+// is the stable amber.exe path from `windowsStablePath`.
+export function windowsRunKeyAddArgv(exePath: string): Argv {
+  return {
+    cmd: 'reg',
+    args: [
+      'add',
+      WINDOWS_RUN_KEY,
+      '/v',
+      WINDOWS_RUN_VALUE,
+      '/t',
+      'REG_SZ',
+      '/d',
+      `"${exePath}" daemon`,
+      '/f',
+    ],
+  }
+}
+
+// `reg delete` argv to unregister the daemon (uninstall).
+export function windowsRunKeyDeleteArgv(): Argv {
+  return { cmd: 'reg', args: ['delete', WINDOWS_RUN_KEY, '/v', WINDOWS_RUN_VALUE, '/f'] }
 }
 
 // macOS fallback if `bootout` is unsupported on the running launchd.
@@ -97,6 +140,13 @@ export function bootUnitPath(platform: NodeJS.Platform, home: string): string | 
   }
   if (platform === 'darwin') {
     return launchAgentPlistPath(home)
+  }
+  if (platform === 'win32') {
+    // Windows has no boot-unit FILE (the "unit" is an HKCU Run-key value). Use
+    // the stable installed binary as the "is the daemon managed here?" proxy —
+    // its presence means the app's first-run install ran. `home` is
+    // %USERPROFILE%.
+    return windowsStablePath(home)
   }
   return null
 }

@@ -1,10 +1,18 @@
 # Windows Port — Design & Implementation Plan
 
-> **Status: PLANNING — not approved for execution.** Windows support is
-> explicitly out of scope in the project constitution (`CLAUDE.md`: "do not add
-> a Windows target without asking"). This document is the "asking." Executing it
-> requires the owner's explicit go-ahead and moves Windows from *out of scope* to
-> *in scope* as a first-class target alongside macOS/Linux.
+> **Status: IN PROGRESS (owner-approved, spike skipped at owner's request).**
+> Windows moved from *out of scope* to *in scope* per the owner. Phases 0 (spike)
+> deliberately skipped. Implemented on branch `feat/windows-port`:
+> Phases 1–5 (transport, pty-exit, shell/claude/supervisor, lifecycle, install,
+> packaging, attach). Phase 6 (freeze/park control-channel) is DEFERRED — it
+> degrades gracefully (a clear "not supported on Windows" error) per §D7.3.
+>
+> **Verification ceiling:** built on a Linux host with NO MSVC linker and NO
+> Windows runtime, so "done" here means: the Windows target **typechecks**
+> (`cargo check --target x86_64-pc-windows-msvc`), the Unix build + full test
+> suite stay green (no regression), and pure logic is unit-tested. Producing a
+> runnable `.exe` (needs the MSVC toolchain) and every live gate — the pipe↔Node
+> handshake, live GUI, reboot-torture — remain for the owner's Windows dual-boot.
 >
 > **For agentic workers:** phases are milestones, each ending in working,
 > testable software. Phase 0 is a throwaway spike that MUST pass before any

@@ -42,10 +42,21 @@ EOF
             SRC="$ROOT_DIR/dist/amber-macos-universal"
         fi
         ;;
+    MINGW*|MSYS*|CYGWIN*)
+        bash "$ROOT_DIR/scripts/dist.sh"
+        SRC="$ROOT_DIR/dist/amber-windows-x86_64.exe"
+        ;;
     *)
         echo "error: unsupported OS: $os" >&2
         exit 1
         ;;
+esac
+
+# The bundled binary keeps its platform name so amberBin.ts resolves it
+# (`amber.exe` on Windows, `amber` elsewhere).
+case "$os" in
+    MINGW*|MSYS*|CYGWIN*) DEST_NAME="amber.exe" ;;
+    *) DEST_NAME="amber" ;;
 esac
 
 if [ ! -f "$SRC" ]; then
@@ -68,8 +79,8 @@ fi
 
 echo "==> bundling amber into app resources"
 mkdir -p "$APP_DIR/resources/bin"
-cp "$SRC" "$APP_DIR/resources/bin/amber"
-chmod +x "$APP_DIR/resources/bin/amber"
+cp "$SRC" "$APP_DIR/resources/bin/$DEST_NAME"
+chmod +x "$APP_DIR/resources/bin/$DEST_NAME" 2>/dev/null || true
 
 echo "==> building renderer/main/preload"
 ( cd "$APP_DIR" && npm run build )

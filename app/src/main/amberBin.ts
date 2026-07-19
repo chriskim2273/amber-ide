@@ -10,6 +10,7 @@ export function resolveAmberBinary(
 ): string {
   const override = env['AMBER_BIN']
   if (override && override.length > 0) return override
-  if (isPackaged) return join(resourcesPath, 'bin', 'amber')
-  return 'amber'
+  const exe = process.platform === 'win32' ? 'amber.exe' : 'amber'
+  if (isPackaged) return join(resourcesPath, 'bin', exe)
+  return exe
 }

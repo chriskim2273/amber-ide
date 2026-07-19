@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Build distributable amber binaries. Linux → fully static (musl, zero deps).
-# macOS → universal (x86_64 + arm64) via lipo. Run each on its own OS (or use a
-# cross toolchain). Artifacts land in dist/.
+# macOS → universal (x86_64 + arm64) via lipo. Windows → x86_64-pc-windows-msvc
+# amber.exe. Run each on its own OS (or use a cross toolchain). Artifacts land
+# in dist/.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -38,6 +39,17 @@ build_macos_intel() {
     echo "dist: $OUT/amber-x86_64-apple-darwin (intel)"
 }
 
+# Windows: native msvc build. `amber.exe` is the windows-subsystem daemon +
+# console CLI. Run from a Git-Bash/MSYS shell on a Windows host with the MSVC
+# toolchain installed.
+build_windows() {
+    local target=x86_64-pc-windows-msvc
+    rustup target add "$target"
+    cargo build --release --target "$target" --bin amber
+    cp "$ROOT/target/$target/release/amber.exe" "$OUT/amber-windows-x86_64.exe"
+    echo "dist: $OUT/amber-windows-x86_64.exe"
+}
+
 case "$(uname -s)" in
     Linux)  build_linux ;;
     Darwin)
@@ -47,5 +59,6 @@ case "$(uname -s)" in
             build_macos
         fi
         ;;
+    MINGW*|MSYS*|CYGWIN*) build_windows ;;
     *) echo "unsupported OS: $(uname -s)"; exit 1 ;;
 esac

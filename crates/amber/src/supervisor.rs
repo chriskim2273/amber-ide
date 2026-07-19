@@ -185,7 +185,9 @@ enum RunClass {
     UserInterrupt,
     /// Exited with a non-zero status code.
     Nonzero,
-    /// Killed by some other signal (Unix).
+    /// Killed by some other signal (Unix). Windows has no signals, so this
+    /// variant is never constructed there (the classifier uses exit codes).
+    #[cfg_attr(windows, allow(dead_code))]
     Signaled,
     /// The child could not be launched at all (e.g. ENOENT / ETXTBSY).
     LaunchFailed,
