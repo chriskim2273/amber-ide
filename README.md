@@ -100,6 +100,24 @@ straight to a single xterm.js emulator.
   an existing amber pane.
 - `ctl doctor` / `status` / `install` / `uninstall` / `snapshot-now`.
 
+**Phone access — `amber web`**
+- `amber web` serves a mobile browser UI for your live sessions: tap a session,
+  get a full-screen terminal, type into it — including driving a running claude.
+- It is an ordinary daemon **client**; the daemon itself never touches the
+  network. The server binds `127.0.0.1` only.
+- Reach it from your phone over Tailscale:
+  ```sh
+  amber web --print-url          # prints http://127.0.0.1:7717/#t=<token>
+  amber web &                    # or: amber ctl install --web
+  tailscale serve --bg 7717      # real HTTPS, tailnet-only
+  ```
+  Open the printed URL on the phone (swap the host for your tailnet name). The
+  token rides in the URL **fragment**, so it never reaches the server logs; the
+  page exchanges it for an HttpOnly cookie and strips it from history.
+- The phone can open sessions and type. It **cannot** create, kill, rename or
+  resize them — a pty's size is shared with your desktop panes, so a phone-sized
+  resize would reflow your live work.
+
 **Platform & packaging**
 - Linux AppImage / macOS dmg via electron-builder, with the static `amber`
   binary bundled.

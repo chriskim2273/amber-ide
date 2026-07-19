@@ -502,6 +502,8 @@ impl SessionManager {
                     updated: meta.updated,
                     run_state: sess.run_state(),
                     claude_id: self.store.read_claude(&meta.name).ok().flatten().map(|c| c.session_id),
+                    cols: sess.size().map(|(_, c)| c).unwrap_or(0),
+                    rows: sess.size().map(|(r, _)| r).unwrap_or(0),
                 })
             })
             .collect();
@@ -619,6 +621,8 @@ impl SessionManager {
             updated: meta.updated,
             run_state: sess.run_state(),
             claude_id: self.store.read_claude(to).ok().flatten().map(|c| c.session_id),
+            cols: sess.size().map(|(_, c)| c).unwrap_or(0),
+            rows: sess.size().map(|(r, _)| r).unwrap_or(0),
         })
     }
 

@@ -881,6 +881,8 @@ mod tests {
             updated,
             run_state: None,
             claude_id: None,
+            cols: 80,
+            rows: 24,
         }
     }
 

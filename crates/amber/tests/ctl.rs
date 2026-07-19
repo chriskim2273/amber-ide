@@ -50,6 +50,27 @@ fn ctl_uninstall_dry_run_resolves_the_install_script() {
 }
 
 #[test]
+fn ctl_install_web_flag_reaches_the_install_script() {
+    // `--web` opts into the `amber web` boot unit (systemd user unit /
+    // launchd agent). Dry-run proves the flag is plumbed through.
+    let out = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .args(["ctl", "install", "--dry-run", "--web"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains(" install --web"), "{stdout}");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .args(["ctl", "uninstall", "--dry-run", "--web"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("uninstall") && stdout.contains("--web"), "{stdout}");
+}
+
+#[test]
 fn install_script_passes_bash_syntax_check() {
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../infra/daemon/install.sh");
     let status = Command::new("bash").args(["-n", script]).status().unwrap();

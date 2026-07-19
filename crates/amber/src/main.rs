@@ -86,6 +86,25 @@ enum Command {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
+    /// Serve the mobile web UI for live sessions on 127.0.0.1 (spec
+    /// `2026-07-19-amber-web-mobile-design.md`). A long-lived daemon CLIENT —
+    /// it never binds another interface; reach it from a phone by fronting it
+    /// with `tailscale serve`.
+    Web {
+        /// Port on 127.0.0.1.
+        #[arg(long, default_value_t = 7717)]
+        port: u16,
+        /// Rotate the web token, invalidating existing QR links.
+        #[arg(long)]
+        new_token: bool,
+        /// Print the tokenised URL and exit (does not serve).
+        #[arg(long)]
+        print_url: bool,
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
     /// Supervise a claude/shell session inside its pty (spawned by the
     /// daemon as the Claude session's child process; not meant to be run
     /// directly by users).
@@ -127,6 +146,10 @@ enum CtlAction {
         /// Resolve and print what would run, without running it.
         #[arg(long)]
         dry_run: bool,
+        /// Also install the `amber web` boot unit (mobile web UI on
+        /// 127.0.0.1:7717). Opt-in: it opens a local port.
+        #[arg(long)]
+        web: bool,
     },
     /// Symmetric to `install`: stop + disable + remove the boot unit (systemd
     /// user unit on Linux, launchd agent on macOS). Keeps the installed binary
@@ -142,6 +165,9 @@ enum CtlAction {
         /// Also remove the state store (sessions snapshot); destroys history.
         #[arg(long)]
         purge_state: bool,
+        /// Also remove the `amber web` boot unit.
+        #[arg(long)]
+        web: bool,
     },
 }
 
@@ -183,15 +209,18 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Kill { name, socket } => run_kill(&resolve_socket(socket), &name),
         Command::Rename { from, to, socket } => run_rename(&resolve_socket(socket), &from, &to),
+        Command::Web { port, new_token, print_url, root, socket } => {
+            run_web(root, socket, port, new_token, print_url)
+        }
         Command::Run { name } => run_supervisor(&name),
         Command::Hook => run_hook(),
         Command::Ctl { action } => match action {
             CtlAction::Doctor { root } => run_doctor(root),
             CtlAction::Status { socket } => run_status(&resolve_socket(socket)),
             CtlAction::SnapshotNow { socket } => run_snapshot_now(&resolve_socket(socket)),
-            CtlAction::Install { dry_run } => run_install(dry_run),
-            CtlAction::Uninstall { dry_run, purge_binary, purge_state } => {
-                run_uninstall(dry_run, purge_binary, purge_state)
+            CtlAction::Install { dry_run, web } => run_install(dry_run, web),
+            CtlAction::Uninstall { dry_run, purge_binary, purge_state, web } => {
+                run_uninstall(dry_run, purge_binary, purge_state, web)
             }
         },
     }
@@ -269,7 +298,7 @@ fn find_install_script() -> Option<PathBuf> {
 
 /// `ctl install`: thin wrapper over `infra/daemon/install.sh` (which builds
 /// the release binary, installs it, and enables the boot unit).
-fn run_install(dry_run: bool) -> anyhow::Result<()> {
+fn run_install(dry_run: bool, web: bool) -> anyhow::Result<()> {
     let Some(script) = find_install_script() else {
         eprintln!(
             "amber ctl install: could not locate infra/daemon/install.sh \
@@ -278,11 +307,16 @@ fn run_install(dry_run: bool) -> anyhow::Result<()> {
         );
         anyhow::bail!("install script not found");
     };
+    let args: Vec<String> = if web {
+        vec!["install".to_string(), "--web".to_string()]
+    } else {
+        Vec::new()
+    };
     if dry_run {
-        println!("would run: bash {}", script.display());
+        println!("{}", format!("would run: bash {} {}", script.display(), args.join(" ")).trim_end());
         return Ok(());
     }
-    let status = std::process::Command::new("bash").arg(&script).status()?;
+    let status = std::process::Command::new("bash").arg(&script).args(&args).status()?;
     if !status.success() {
         anyhow::bail!("install script failed with {status}");
     }
@@ -293,7 +327,12 @@ fn run_install(dry_run: bool) -> anyhow::Result<()> {
 /// `infra/daemon/install.sh` via its `uninstall` subcommand. Stops + disables +
 /// removes the boot unit; `--purge-binary`/`--purge-state` opt into removing
 /// the installed binary and the state store (both kept by default).
-fn run_uninstall(dry_run: bool, purge_binary: bool, purge_state: bool) -> anyhow::Result<()> {
+fn run_uninstall(
+    dry_run: bool,
+    purge_binary: bool,
+    purge_state: bool,
+    web: bool,
+) -> anyhow::Result<()> {
     let Some(script) = find_install_script() else {
         eprintln!(
             "amber ctl uninstall: could not locate infra/daemon/install.sh \
@@ -308,6 +347,9 @@ fn run_uninstall(dry_run: bool, purge_binary: bool, purge_state: bool) -> anyhow
     }
     if purge_state {
         args.push("--purge-state".to_string());
+    }
+    if web {
+        args.push("--web".to_string());
     }
     if dry_run {
         println!("would run: bash {} {}", script.display(), args.join(" "));
@@ -399,6 +441,32 @@ fn run_hook() -> anyhow::Result<()> {
         eprintln!("amber hook: failed to record session: {e}");
     }
     Ok(())
+}
+
+/// `amber web`: serve the mobile UI on 127.0.0.1 as a long-lived daemon
+/// client. The token lives in the state dir (0600) and rides the URL fragment,
+/// which browsers never send to a server (spec §3.3).
+fn run_web(
+    root: Option<PathBuf>,
+    socket: Option<PathBuf>,
+    port: u16,
+    new_token: bool,
+    print_url: bool,
+) -> anyhow::Result<()> {
+    let root = root.unwrap_or_else(default_root);
+    std::fs::create_dir_all(&root)?;
+    let token = amber::web::load_or_create_token(&root, new_token)?;
+    let url = format!("http://127.0.0.1:{port}/#t={token}");
+    if print_url {
+        println!("{url}");
+        return Ok(());
+    }
+    let socket = socket.unwrap_or_else(|| default_socket(&root));
+    let listener = amber::web::bind(port)?;
+    eprintln!("amber web: listening on 127.0.0.1:{port} (daemon {})", socket.display());
+    eprintln!("amber web: open {url}");
+    eprintln!("amber web: expose it to your tailnet with: tailscale serve --bg {port}");
+    amber::web::serve(listener, socket, token)
 }
 
 fn run_daemon(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Result<()> {

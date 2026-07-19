@@ -4,8 +4,10 @@
 # Linux (systemd user unit) and macOS (launchd agent).
 #
 # Usage:
-#   install.sh [install]                       build + install + enable boot unit
-#   install.sh uninstall [--purge-binary] [--purge-state]
+#   install.sh [install] [--web]               build + install + enable boot unit
+#                                              (--web also enables `amber web`,
+#                                              the 127.0.0.1 mobile UI)
+#   install.sh uninstall [--purge-binary] [--purge-state] [--web]
 #                                              stop + disable + remove boot unit
 set -euo pipefail
 
@@ -58,11 +60,46 @@ install_macos() {
     log "launchd agent loaded ($plist)"
 }
 
+# `amber web`: the 127.0.0.1 mobile UI. Opt-in (it opens a local port), and a
+# plain daemon CLIENT — safe to start before/after the daemon (it reconnects).
+install_web_linux() {
+    local unit_dir="$HOME/.config/systemd/user"
+    mkdir -p "$unit_dir"
+    install -m 0644 "$REPO_ROOT/infra/daemon/amber-web.service" "$unit_dir/amber-web.service"
+    systemctl --user daemon-reload
+    systemctl --user enable --now amber-web.service
+    log "amber web enabled on 127.0.0.1:7717"
+    log "phone URL: $AMBER_BIN web --print-url   (expose it: tailscale serve --bg 7717)"
+}
+
+install_web_macos() {
+    local plist="$HOME/Library/LaunchAgents/com.amber-ide.web.plist"
+    mkdir -p "$HOME/Library/LaunchAgents"
+    sed "s#__AMBER_BIN__#$AMBER_BIN#g" \
+        "$REPO_ROOT/infra/daemon/com.amber-ide.web.plist.in" > "$plist"
+    chmod 0644 "$plist"
+    launchctl unload "$plist" 2>/dev/null || true
+    launchctl load "$plist"
+    log "amber web agent loaded ($plist), 127.0.0.1:7717"
+    log "phone URL: $AMBER_BIN web --print-url   (expose it: tailscale serve --bg 7717)"
+}
+
 do_install() {
+    local with_web=false
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --web) with_web=true ;;
+            *) log "unknown install option: $1"; exit 1 ;;
+        esac
+        shift
+    done
+
     build_and_install_bin
     case "$(uname -s)" in
-        Linux)  install_linux ;;
-        Darwin) install_macos ;;
+        # `if` not `&&`: a false test as the last command of a case branch
+        # would exit the script under `set -e`.
+        Linux)  install_linux;  if [ "$with_web" = true ]; then install_web_linux; fi ;;
+        Darwin) install_macos;  if [ "$with_web" = true ]; then install_web_macos; fi ;;
         *) log "unsupported OS: $(uname -s) (Linux and macOS only)"; exit 1 ;;
     esac
     log "done. The daemon owns sessions on its unix socket; attach with 'amber attach <name>'."
@@ -95,20 +132,37 @@ uninstall_macos() {
     fi
 }
 
+uninstall_web_linux() {
+    local unit="$HOME/.config/systemd/user/amber-web.service"
+    systemctl --user stop amber-web.service 2>/dev/null || true
+    systemctl --user disable amber-web.service 2>/dev/null || true
+    rm -f "$unit"
+    systemctl --user daemon-reload 2>/dev/null || true
+    log "removed amber web unit"
+}
+
+uninstall_web_macos() {
+    local plist="$HOME/Library/LaunchAgents/com.amber-ide.web.plist"
+    launchctl unload "$plist" 2>/dev/null || true
+    rm -f "$plist"
+    log "removed amber web agent"
+}
+
 do_uninstall() {
-    local purge_binary=false purge_state=false
+    local purge_binary=false purge_state=false with_web=false
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --purge-binary) purge_binary=true ;;
             --purge-state)  purge_state=true ;;
+            --web)          with_web=true ;;
             *) log "unknown uninstall option: $1"; exit 1 ;;
         esac
         shift
     done
 
     case "$(uname -s)" in
-        Linux)  uninstall_linux ;;
-        Darwin) uninstall_macos ;;
+        Linux)  uninstall_linux;  if [ "$with_web" = true ]; then uninstall_web_linux; fi ;;
+        Darwin) uninstall_macos;  if [ "$with_web" = true ]; then uninstall_web_macos; fi ;;
         *) log "unsupported OS: $(uname -s) (Linux and macOS only)"; exit 1 ;;
     esac
 
@@ -141,7 +195,8 @@ do_uninstall() {
 # Default (no arg) is install, so `bash install.sh` and the existing ctl-install
 # wiring keep working unchanged.
 case "${1:-install}" in
-    install)   do_install ;;
+    install)   shift || true; do_install "$@" ;;
     uninstall) shift; do_uninstall "$@" ;;
+    --web)     do_install --web ;;
     *) log "unknown subcommand: $1 (expected 'install' or 'uninstall')"; exit 1 ;;
 esac

@@ -1,0 +1,17 @@
+[Unit]
+Description=amber web (mobile browser access to live amber sessions)
+Documentation=https://github.com/chriskim2273/amber-ide
+# A daemon CLIENT, not a second daemon: it self-heals if amber.service is not
+# up yet (reconnect with backoff), so this is a soft ordering hint only.
+Wants=amber.service
+After=amber.service
+
+[Service]
+Type=simple
+# Binds 127.0.0.1 ONLY. Reach it from a phone via `tailscale serve --bg 7717`.
+ExecStart=%h/.local/bin/amber web --port 7717
+Restart=on-failure
+RestartSec=1
+
+[Install]
+WantedBy=default.target

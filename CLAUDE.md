@@ -345,6 +345,41 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   `amber-1-1-2-…` → `amber-1-2-0-…` → `amber-2-1-0-…`) staying alive, shell moved
   keeping scrollback + accepting input, browser pane moved across tabs; a renamed session survives a daemon restart (restored from the store under the new name).
 
+- [x] `amber web` — phone browser access (2026-07-19) — a mobile web UI for live
+  sessions: list → tap → full-screen xterm → type (drives claude too). Spec:
+  `docs/superpowers/specs/2026-07-19-amber-web-mobile-design.md`. It is a daemon
+  **client** (rule #1 intact; the daemon still never binds a network interface),
+  binding `127.0.0.1` in exactly one place — no flag reaches another interface —
+  and fronted by `tailscale serve` for TLS + tailnet-only reach (no in-process
+  TLS, no relay, no accounts; that stack stays the collab spec's job). Auth: 32
+  random bytes in `<state>/web-token` (0600), carried in the URL **fragment**
+  (never sent to the server / logs), POSTed for an `HttpOnly; SameSite=Strict`
+  cookie, constant-time compared, failed attempts throttled → 429. Browser
+  protocol is its own whitelist — `open`/`close` + raw binary input — mapping
+  ONLY onto `Attach`/`Detach`/`Input`; **no browser message can reach
+  Create/Kill/Rename/Suspend/Resume/DumpBacklog/Snapshot, and none can reach
+  `Resize`** (a pty's winsize is shared with the desktop panes, so a phone-sized
+  resize would reflow live work and corrupt a claude TUI — the front end has no
+  fit addon and scales/pans in CSS instead). `SessionInfo` gained `cols`/`rows`
+  (serde-default, additive) so the phone renders at the session's REAL grid and
+  follows it live; `/api/sessions` polls the daemon at 1 s rather than making the
+  daemon broadcast on every `Resize` (a divider drag would flood the bounded
+  watcher queue and risk evicting the app). Front end is vendored xterm UMD +
+  hand-written HTML/CSS/JS embedded with `include_bytes!` (offline, no CDN, no
+  bundler) with an on-screen key bar (Esc/Tab/sticky Ctrl/arrows honoring
+  `applicationCursorKeysMode`/^C). Deviation from spec §8: `/` + assets serve
+  WITHOUT a cookie — a fragment token is only readable by JS on the served page,
+  so the page must bootstrap first; the boundary is `/api/sessions` + `/ws`.
+  Gates: Rust 214 tests ×2 + clippy clean + musl check + no openssl/tokio in the
+  tree. **Live-verified** end-to-end on a private daemon: 401 unauth / 401 forged
+  cookie / 429 throttle (a good token is refused while throttled), 101 upgrade,
+  backlog as exactly ONE binary frame, typing from a 390×844 browser reaching the
+  real pty, forbidden control JSON ignored (session alive, geometry untouched),
+  key-bar ^C interrupting a `sleep`, and a daemon-side resize to 120×40 followed
+  by the phone client without it ever sending a resize. Open: real-phone touch
+  behavior over a tailnet (needs the user's device); no server→browser ping, so a
+  vanished phone's subscription lingers until the next write times out (10 s).
+
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**
   `std::io::Read` (dedicated thread); `take_writer()` is one-shot;
