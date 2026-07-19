@@ -86,6 +86,14 @@ npm run dev        # dev GUI
 npm run dist       # packaged AppImage (Linux) / dmg (macOS)
 ```
 
+### Releases
+
+Prebuilt macOS builds are attached to the [`v0.0.1`](https://github.com/chriskim2273/amber-ide/releases/tag/v0.0.1)
+release — an Apple Silicon `.dmg`, an Intel `.dmg`, and a universal (`x86_64` +
+`arm64`) standalone `amber` binary — built and added by **inbedby12**. The dmgs
+are unsigned, so on first launch right-click the app and choose **Open** to get
+past Gatekeeper.
+
 The `amber` CLI also stands alone — attach to any session from a plain terminal:
 
 ```bash
