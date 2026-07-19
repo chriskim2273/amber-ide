@@ -1,7 +1,7 @@
 //! `amber` CLI: busybox-style subcommands over the daemon's unix socket
 //! (spec §2).
 
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -464,7 +464,16 @@ fn run_web(
     let socket = socket.unwrap_or_else(|| default_socket(&root));
     let listener = amber::web::bind(port)?;
     eprintln!("amber web: listening on 127.0.0.1:{port} (daemon {})", socket.display());
-    eprintln!("amber web: open {url}");
+    // The tokenized URL is printed ONLY to an interactive terminal. Run as a
+    // service (`amber ctl install --web`) stderr goes to the journal / a log
+    // file, and the token is long-lived (rotated only by `--new-token`) — the
+    // whole point of carrying it in the URL fragment is that it never lands in
+    // a log. Same TTY-only discipline as the attach banner.
+    if std::io::stderr().is_terminal() {
+        eprintln!("amber web: open {url}");
+    } else {
+        eprintln!("amber web: run `amber web --print-url` in a terminal for the login URL");
+    }
     eprintln!("amber web: expose it to your tailnet with: tailscale serve --bg {port}");
     amber::web::serve(listener, socket, token)
 }

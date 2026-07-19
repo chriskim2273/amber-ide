@@ -378,7 +378,9 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   key-bar ^C interrupting a `sleep`, and a daemon-side resize to 120×40 followed
   by the phone client without it ever sending a resize. Open: real-phone touch
   behavior over a tailnet (needs the user's device); no server→browser ping, so a
-  vanished phone's subscription lingers until the next write times out (10 s).
+  vanished phone's subscription lingers until the next write times out (10 s);
+  behind `tailscale serve` every peer IP is 127.0.0.1, so the auth throttle
+  buckets all clients together (a 256-bit token makes brute force moot).
 
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**
