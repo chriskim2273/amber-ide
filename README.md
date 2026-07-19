@@ -1,5 +1,8 @@
 # amber
 
+[![Latest release](https://img.shields.io/github/v/release/chriskim2273/amber-ide)](https://github.com/chriskim2273/amber-ide/releases/latest)
+[![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue)](LICENSE)
+
 A terminal workspace (Warp/iTerm2-style) whose defining feature is **total
 session persistence**: every pane, tab, workspace, and running Claude Code
 conversation survives app crashes **and** machine reboots, restored exactly as
@@ -49,6 +52,62 @@ daemon (`amber`) that owns everything.
 No tmux, no double terminal emulation. Raw pty bytes stream over a unix socket
 straight to a single xterm.js emulator.
 
+## Features
+
+**Persistence**
+- Sessions survive **app crashes** (daemon outlives every client) and **machine
+  reboots** (snapshot on a timer + a final one on `SIGTERM`, restored on start —
+  no `send-keys` replay).
+- Capped raw-byte scrollback preserved and replayed on restore.
+- Split geometry, tab/workspace grouping, and pane titles all come back exactly.
+
+**Terminal & panes**
+- Real ptys owned by the daemon, raw bytes streamed to a single xterm.js +
+  WebGL emulator (DOM-renderer fallback on WebGL context loss).
+- Tabs and multiple workspaces, with a workspace switcher.
+- Binary split layout — interactive split, drag-to-resize dividers, close.
+- **Drag to rearrange panes** — drop on an edge to re-split, on the center to
+  swap two panes.
+- **Keyboard pane navigation** (Cmd/Ctrl+Shift+arrows) and a chord help overlay (`?`).
+- **Pane zoom** (Cmd/Ctrl+Shift+M) and per-pane **scrollback search**
+  (Cmd/Ctrl+Shift+F).
+- Live OSC pane titles, per-pane font-size chords, header context menu
+  (copy cwd, kind override).
+- **Freeze/park a pane** with a note — input blocked, blurred, activity
+  suppressed (display-only; daemon untouched).
+- Background-tab **activity dots**; disconnected/reconnect banners with
+  auto-backoff.
+- Tab + workspace rename, tab close, drag-to-reorder tabs.
+
+**Claude Code**
+- A Claude pane is supervised by `amber run` — it resumes the **exact**
+  conversation id across restarts, rotates the id as it changes, and falls back
+  to a shell so a pane never silently dies.
+- Run-state dots: claude / retrying / shell-fallback.
+
+**Browser pane**
+- A web-viewer pane kind (Electron `<webview>` + URL bar); its URL persists and
+  survives reboot via the sidecar. Popups open in the system browser.
+
+**Workspaces**
+- Save/load a whole workspace (structure + scrollback) to a portable
+  `.amberws` JSON file.
+
+**CLI (`amber`)** — works standalone from any terminal
+- `ls`, `create`, `attach` (newest or by name), `kill`, `rename`.
+- `attach` extras: `Ctrl-b d` tmux-style detach (remappable, `--no-prefix` to
+  disable), OSC terminal title, a bottom status bar, and refusal to nest inside
+  an existing amber pane.
+- `ctl doctor` / `status` / `install` / `uninstall` / `snapshot-now`.
+
+**Platform & packaging**
+- Linux AppImage / macOS dmg via electron-builder, with the static `amber`
+  binary bundled.
+- First run does a **cargo-free install** — copies `amber` to `~/.local/bin`
+  and writes a boot unit (systemd user unit on Linux, launchd agent on macOS).
+- Linux "Install desktop shortcut" — icon + `.desktop` entry with taskbar-pin
+  grouping.
+
 ## Stack
 
 - **Daemon/CLI:** Rust — one dependency-free `amber` binary (static musl on
@@ -68,31 +127,84 @@ straight to a single xterm.js emulator.
 - `scripts/dist.sh` — static/universal release builds.
 - `docs/superpowers/specs/` — design specs.
 
-## Build
+## Download
 
-Daemon + CLI:
+**Linux (x86_64):** grab the latest AppImage from
+[Releases](https://github.com/chriskim2273/amber-ide/releases/latest), then:
 
 ```bash
-cargo build --workspace
-cargo test --workspace
+chmod +x amber-ide-*.AppImage
+./amber-ide-*.AppImage
 ```
 
-App:
+First launch installs the `amber` daemon to `~/.local/bin` and a systemd user
+boot unit, so your sessions survive reboots. macOS builds: build from source
+(below) for now.
+
+## Contributing / building from source
+
+### Prerequisites
+
+**1. Rust (stable)** — for the daemon/CLI. Install via [rustup](https://rustup.rs):
 
 ```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+rustup component add clippy          # CI runs clippy -D warnings
+```
+
+The workspace tracks the **stable** toolchain (edition 2021). Static release
+builds also need the musl target + linker (Linux only):
+
+```bash
+rustup target add x86_64-unknown-linux-musl
+sudo apt install musl-tools          # provides musl-gcc  (Debian/Ubuntu)
+```
+
+**2. Node.js (LTS) + npm** — for the Electron app. CI uses `lts/*`. Recommended
+via [nvm](https://github.com/nvm-sh/nvm):
+
+```bash
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
+nvm install --lts && nvm use --lts
+```
+
+**3. System tools** — `git`, and a C toolchain (`build-essential` on
+Debian/Ubuntu; Xcode Command Line Tools on macOS) for native build steps.
+
+> **Odd-kernel note:** on some Linux kernels the dev GUI needs
+> `AMBER_NO_SANDBOX=1 AMBER_SOFTWARE_GL=1` to render (documented in `CLAUDE.md`).
+
+### Build
+
+Clone, then build each half:
+
+```bash
+git clone https://github.com/chriskim2273/amber-ide.git
+cd amber-ide
+
+# Daemon + CLI (Rust)
+cargo build --workspace
+cargo test  --workspace
+
+# App (Electron)
 cd app
-npm install
+npm ci             # or: npm install
 npm run dev        # dev GUI
 npm run dist       # packaged AppImage (Linux) / dmg (macOS)
 ```
 
-### Releases
+### Before opening a PR
 
-Prebuilt macOS builds are attached to the [`v0.0.1`](https://github.com/chriskim2273/amber-ide/releases/tag/v0.0.1)
-release — an Apple Silicon `.dmg`, an Intel `.dmg`, and a universal (`x86_64` +
-`arm64`) standalone `amber` binary — built and added by **inbedby12**. The dmgs
-are unsigned, so on first launch right-click the app and choose **Open** to get
-past Gatekeeper.
+Mirror what CI checks — all must be green:
+
+```bash
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test  --workspace
+cd app && npm run typecheck && npx vitest run
+```
+
+Work in a git worktree, use conventional commits, and follow the working
+agreements in [`CLAUDE.md`](CLAUDE.md).
 
 The `amber` CLI also stands alone — attach to any session from a plain terminal:
 
