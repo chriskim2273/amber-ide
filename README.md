@@ -138,8 +138,14 @@ chmod +x amber-ide-*.AppImage
 ```
 
 First launch installs the `amber` daemon to `~/.local/bin` and a systemd user
-boot unit, so your sessions survive reboots. macOS builds: build from source
-(below) for now.
+boot unit, so your sessions survive reboots.
+
+**macOS (Apple Silicon + Intel):** grab the matching `.dmg` from
+[Releases](https://github.com/chriskim2273/amber-ide/releases/latest) —
+`amber-ide-*-arm64.dmg` for Apple Silicon, `amber-ide-*.dmg` for Intel (a
+universal standalone `amber` binary is attached too). These builds were built
+and added by **inbedby12**. They are unsigned, so on first launch right-click
+the app and choose **Open** to get past Gatekeeper.
 
 ## Contributing / building from source
 
