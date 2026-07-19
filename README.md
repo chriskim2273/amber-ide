@@ -1,5 +1,8 @@
 # amber
 
+[![Latest release](https://img.shields.io/github/v/release/chriskim2273/amber-ide)](https://github.com/chriskim2273/amber-ide/releases/latest)
+[![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue)](LICENSE)
+
 A terminal workspace (Warp/iTerm2-style) whose defining feature is **total
 session persistence**: every pane, tab, workspace, and running Claude Code
 conversation survives app crashes **and** machine reboots, restored exactly as
@@ -67,6 +70,20 @@ straight to a single xterm.js emulator.
 - `infra/daemon/` — systemd user unit, launchd agent, `install.sh`.
 - `scripts/dist.sh` — static/universal release builds.
 - `docs/superpowers/specs/` — design specs.
+
+## Download
+
+**Linux (x86_64):** grab the latest AppImage from
+[Releases](https://github.com/chriskim2273/amber-ide/releases/latest), then:
+
+```bash
+chmod +x amber-ide-*.AppImage
+./amber-ide-*.AppImage
+```
+
+First launch installs the `amber` daemon to `~/.local/bin` and a systemd user
+boot unit, so your sessions survive reboots. macOS builds: build from source
+(below) for now.
 
 ## Build
 
