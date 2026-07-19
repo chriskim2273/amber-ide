@@ -40,6 +40,30 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  rust-windows:
+    # Native msvc build of the `amber` binary — a real compile + LINK of the
+    # Windows path (named-pipe transport, ConPTY, the Win32 lifecycle FFI), the
+    # gate the Linux dev box (no MSVC linker) can only typecheck. `amber`'s own
+    # integration tests are Unix-gated (they use unix sockets / socketpair), so
+    # only amber-core (cross-platform) is tested here; the daemon/attach runtime
+    # behavior is verified manually on a Windows host.
+    name: rust (windows / msvc)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+      - name: Clippy (deny warnings)
+        run: cargo clippy -p amber -- -D warnings
+      - name: Build amber.exe
+        run: cargo build -p amber
+      - name: Test amber-core
+        run: cargo test -p amber-core
+
   app:
     name: app (typecheck + test)
     runs-on: ubuntu-latest
