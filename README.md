@@ -52,6 +52,62 @@ daemon (`amber`) that owns everything.
 No tmux, no double terminal emulation. Raw pty bytes stream over a unix socket
 straight to a single xterm.js emulator.
 
+## Features
+
+**Persistence**
+- Sessions survive **app crashes** (daemon outlives every client) and **machine
+  reboots** (snapshot on a timer + a final one on `SIGTERM`, restored on start —
+  no `send-keys` replay).
+- Capped raw-byte scrollback preserved and replayed on restore.
+- Split geometry, tab/workspace grouping, and pane titles all come back exactly.
+
+**Terminal & panes**
+- Real ptys owned by the daemon, raw bytes streamed to a single xterm.js +
+  WebGL emulator (DOM-renderer fallback on WebGL context loss).
+- Tabs and multiple workspaces, with a workspace switcher.
+- Binary split layout — interactive split, drag-to-resize dividers, close.
+- **Drag to rearrange panes** — drop on an edge to re-split, on the center to
+  swap two panes.
+- **Keyboard pane navigation** (Cmd/Ctrl+Shift+arrows) and a chord help overlay (`?`).
+- **Pane zoom** (Cmd/Ctrl+Shift+M) and per-pane **scrollback search**
+  (Cmd/Ctrl+Shift+F).
+- Live OSC pane titles, per-pane font-size chords, header context menu
+  (copy cwd, kind override).
+- **Freeze/park a pane** with a note — input blocked, blurred, activity
+  suppressed (display-only; daemon untouched).
+- Background-tab **activity dots**; disconnected/reconnect banners with
+  auto-backoff.
+- Tab + workspace rename, tab close, drag-to-reorder tabs.
+
+**Claude Code**
+- A Claude pane is supervised by `amber run` — it resumes the **exact**
+  conversation id across restarts, rotates the id as it changes, and falls back
+  to a shell so a pane never silently dies.
+- Run-state dots: claude / retrying / shell-fallback.
+
+**Browser pane**
+- A web-viewer pane kind (Electron `<webview>` + URL bar); its URL persists and
+  survives reboot via the sidecar. Popups open in the system browser.
+
+**Workspaces**
+- Save/load a whole workspace (structure + scrollback) to a portable
+  `.amberws` JSON file.
+
+**CLI (`amber`)** — works standalone from any terminal
+- `ls`, `create`, `attach` (newest or by name), `kill`, `rename`.
+- `attach` extras: `Ctrl-b d` tmux-style detach (remappable, `--no-prefix` to
+  disable), OSC terminal title, a bottom status bar, and refusal to nest inside
+  an existing amber pane.
+- `ctl doctor` / `status` / `install` / `uninstall` / `snapshot-now`.
+
+**Platform & packaging**
+- Linux AppImage / macOS dmg via electron-builder, with the static `amber`
+  binary bundled.
+- First run does a **cargo-free install** — copies `amber` to `~/.local/bin`
+  and writes a boot unit (systemd user unit on Linux, launchd agent on macOS).
+- Linux "Install desktop shortcut" — icon + `.desktop` entry with taskbar-pin
+  grouping.
+
 ## Stack
 
 - **Daemon/CLI:** Rust — one dependency-free `amber` binary (static musl on
