@@ -23,7 +23,8 @@ use windows_sys::Win32::System::Console::{
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, RegisterClassW,
-    TranslateMessage, HWND_MESSAGE, MSG, WM_ENDSESSION, WM_QUERYENDSESSION, WNDCLASSW,
+    TranslateMessage, MSG, WM_ENDSESSION, WM_QUERYENDSESSION, WNDCLASSW, WS_EX_TOOLWINDOW,
+    WS_OVERLAPPED,
 };
 
 type Callback = Box<dyn Fn() + Send + Sync + 'static>;
@@ -63,18 +64,22 @@ pub fn install_shutdown_handler<F: Fn() + Send + Sync + 'static>(cb: F) {
         wc.lpszClassName = class_name.as_ptr();
         RegisterClassW(&wc);
 
-        // A message-only window (HWND_MESSAGE parent) never renders but still
-        // receives WM_QUERYENDSESSION/WM_ENDSESSION.
+        // A hidden TOP-LEVEL window (parent = null). It is never shown
+        // (no ShowWindow) and WS_EX_TOOLWINDOW keeps it out of the taskbar/
+        // alt-tab, but — unlike a message-only HWND_MESSAGE window — it DOES
+        // receive the broadcast WM_QUERYENDSESSION/WM_ENDSESSION at logoff/
+        // shutdown, which message-only windows are excluded from. That is the
+        // whole point of this window (the SIGTERM-analog snapshot trigger).
         let hwnd = CreateWindowExW(
-            0,
+            WS_EX_TOOLWINDOW,
             class_name.as_ptr(),
             wide("amber").as_ptr(),
+            WS_OVERLAPPED,
             0,
             0,
             0,
             0,
-            0,
-            HWND_MESSAGE,
+            std::ptr::null_mut(),
             std::ptr::null_mut(),
             hinstance,
             std::ptr::null(),

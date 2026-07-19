@@ -9,10 +9,36 @@
 >
 > **Verification ceiling:** built on a Linux host with NO MSVC linker and NO
 > Windows runtime, so "done" here means: the Windows target **typechecks**
-> (`cargo check --target x86_64-pc-windows-msvc`), the Unix build + full test
-> suite stay green (no regression), and pure logic is unit-tested. Producing a
-> runnable `.exe` (needs the MSVC toolchain) and every live gate — the pipe↔Node
-> handshake, live GUI, reboot-torture — remain for the owner's Windows dual-boot.
+> (`cargo check --target x86_64-pc-windows-msvc`, no link), the Unix build + full
+> test suite stay green (no regression), clippy `-D warnings` is clean on both
+> targets, and pure logic is unit-tested. Producing a runnable `.exe` (needs the
+> MSVC toolchain — the added `windows-latest` CI job does the real link) and
+> every live gate — the pipe↔Node handshake, live GUI, reboot-torture — remain
+> for the owner's Windows dual-boot.
+>
+> **Known gaps found in review (not closed by the green gates):**
+> - **Reboot survival is degraded, not guaranteed.** The shutdown-snapshot
+>   handler (`winlifecycle.rs`) now uses a hidden **top-level** window (the first
+>   cut used `HWND_MESSAGE`, which is excluded from `WM_QUERYENDSESSION`/
+>   `WM_ENDSESSION` — a dead handler). Even corrected, the console-ctrl path is
+>   compromised because registering the window links user32 (which suppresses
+>   `CTRL_SHUTDOWN/LOGOFF` on the console handler). Until the top-level-window
+>   path is confirmed on real Windows, treat reboot survival as "lose ≤ the
+>   snapshot interval (~10 s)", NOT "lossless" — the periodic snapshot is the
+>   real backstop.
+> - **Open Decision #1 (windowless daemon) is UNRESOLVED in code.** The single
+>   `amber` binary is console-subsystem, so the HKCU Run-key autostart flashes a
+>   console at each logon. The app's own daemon spawn sets `windowsHide`, but the
+>   logon autostart does not. Needs the separate-`amberd.exe` / `windows_subsystem`
+>   decision (best made with Windows testing).
+> - **Pipe interop (R1) is unproven and diverges from research.** Transport uses
+>   `GenericFilePath` with a literal `\\.\pipe\...` string (research recommended
+>   `GenericNamespaced`). Both should yield the same Win32 pipe, but this is the
+>   exact handshake the skipped spike existed to prove — #1 runtime-failure
+>   candidate; test first on the dual-boot.
+> - **Phase 6 (freeze/park) NOT implemented** — returns a clear "not supported on
+>   Windows" error. Deferred (untestable here + touches the frozen protocol), but
+>   it is a real omission from "everything," not a closed item.
 >
 > **For agentic workers:** phases are milestones, each ending in working,
 > testable software. Phase 0 is a throwaway spike that MUST pass before any

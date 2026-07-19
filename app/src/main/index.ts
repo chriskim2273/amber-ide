@@ -128,7 +128,16 @@ async function installDaemon(): Promise<void> {
       await copyFile(amberBinary(), stable)
       const runKey = windowsRunKeyAddArgv(stable)
       await spawnOk(runKey.cmd, runKey.args).catch(() => {})
-      const child = spawn(stable, ['daemon'], { detached: true, stdio: 'ignore' })
+      // windowsHide suppresses the console window for THIS (app-initiated)
+      // launch. NOTE: the HKCU Run-key autostart at logon launches the
+      // console-subsystem exe directly and will briefly flash a console until
+      // Open Decision #1 (windowless daemon subsystem / separate amberd.exe) is
+      // resolved — see the Windows port spec.
+      const child = spawn(stable, ['daemon'], {
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: true,
+      })
       child.unref()
       return
     }
