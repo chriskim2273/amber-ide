@@ -343,7 +343,7 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   app 235 tests + typecheck + bundle green. **Live-verified** on an isolated
   private daemon: picker splits each kind, claude pane moved tab→ws (name
   `amber-1-1-2-…` → `amber-1-2-0-…` → `amber-2-1-0-…`) staying alive, shell moved
-  keeping scrollback + accepting input, browser pane moved across tabs.
+  keeping scrollback + accepting input, browser pane moved across tabs; a renamed session survives a daemon restart (restored from the store under the new name).
 
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**
