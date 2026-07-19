@@ -362,6 +362,120 @@ function main() {
   // keyboard between every keypress).
   $('keybar').addEventListener('mousedown', function (ev) { ev.preventDefault(); });
 
+  /* ---------- touch scrolling ---------- */
+
+  // xterm has no touch scrolling of its own: on a phone a drag inside the
+  // terminal selects text, so scrollback was unreachable. Translate a vertical
+  // one-finger drag into scrolling:
+  //   normal screen -> term.scrollLines() over the scrollback buffer
+  //   ALT screen    -> arrow keys, mirroring xterm's alternateScrollMode for the
+  //                    wheel; a full-screen TUI (claude, vim, less) has no
+  //                    scrollback of its own, so its own pager must do the work.
+  // Horizontal drags are left alone so #screen keeps panning when zoomed in.
+  // Two-finger gestures are left alone too (browser pinch-zoom).
+  var CELL_MIN = 8;              // guard against a 0-height cell before layout
+  var FLICK_DECAY = 0.94;        // per frame; ~1s of glide from a fast flick
+  var FLICK_MIN_LINES = 0.15;    // stop when a frame moves less than this
+  var touch = null, flick = 0, flickAcc = 0, flickTimer = null;
+
+  function cellPx() {
+    if (!term || !term.element) return 0;
+    var scr = term.element.querySelector('.xterm-screen');
+    var h = (scr ? scr.offsetHeight : 0) / (term.rows || 1);
+    if (!(h > CELL_MIN)) return 0;
+    // The stage is transform-scaled, so a finger travels fewer CSS px per line
+    // than the unscaled cell height.
+    var m = /matrix\(([\d.]+)/.exec(stageEl.style.transform || '');
+    return h * (m ? parseFloat(m[1]) : 1);
+  }
+
+  function altScreen() {
+    return !!(term && term.buffer && term.buffer.active && term.buffer.active.type === 'alternate');
+  }
+
+  // Positive `lines` scrolls DOWN (towards newer output), matching wheel sign.
+  function scrollLines(lines) {
+    if (!term || !lines) return;
+    if (!altScreen()) { term.scrollLines(lines); return; }
+    var appMode = !!(term.modes && term.modes.applicationCursorKeysMode);
+    var seq = arrowSeq(lines > 0 ? 'down' : 'up', appMode, false);
+    var n = Math.min(Math.abs(lines), 24); // cap one gesture's burst of keys
+    var out = '';
+    for (var i = 0; i < n; i++) out += seq;
+    if (out) sendBytes(ENC.encode(out));
+  }
+
+  function stopFlick() {
+    if (flickTimer) { cancelAnimationFrame(flickTimer); flickTimer = null; }
+    flick = 0;
+  }
+
+  // Glide after a flick: `flick` is lines-per-frame, decaying; fractional
+  // leftovers accumulate in `flickAcc` so slow tails still move a line now and
+  // then instead of stalling.
+  function runFlick() {
+    flickTimer = null;
+    if (Math.abs(flick) < FLICK_MIN_LINES) { flick = 0; flickAcc = 0; return; }
+    flickAcc += flick;
+    var whole = flickAcc > 0 ? Math.floor(flickAcc) : Math.ceil(flickAcc);
+    if (whole) { flickAcc -= whole; scrollLines(whole); }
+    flick *= FLICK_DECAY;
+    flickTimer = requestAnimationFrame(runFlick);
+  }
+
+  screenEl.addEventListener('touchstart', function (ev) {
+    stopFlick();
+    if (ev.touches.length !== 1) { touch = null; return; }
+    var t = ev.touches[0];
+    touch = { x: t.clientX, y: t.clientY, acc: 0, axis: null, last: t.clientY, t: Date.now(), v: 0 };
+  }, { passive: true });
+
+  screenEl.addEventListener('touchmove', function (ev) {
+    if (!touch || ev.touches.length !== 1) return;
+    var t = ev.touches[0];
+    var dx = t.clientX - touch.x, dy = t.clientY - touch.y;
+    // Lock the axis once, on the first meaningful movement: vertical scrolls the
+    // terminal, horizontal stays a native pan of #screen.
+    if (!touch.axis && (Math.abs(dx) > 6 || Math.abs(dy) > 6)) {
+      touch.axis = Math.abs(dy) > Math.abs(dx) ? 'y' : 'x';
+    }
+    if (touch.axis !== 'y') return;
+    var cell = cellPx();
+    if (!cell) return;
+    if (ev.cancelable) ev.preventDefault(); // don't also pan/rubber-band the page
+    var step = t.clientY - touch.last;
+    touch.last = t.clientY;
+    var now = Date.now(), dt = Math.max(1, now - touch.t);
+    touch.t = now;
+    touch.v = (-step / cell) / dt * 16; // lines per frame, for the flick
+    // Dragging the content DOWN reveals older output -> scroll up.
+    touch.acc += -step / cell;
+    var whole = touch.acc > 0 ? Math.floor(touch.acc) : Math.ceil(touch.acc);
+    if (whole) { touch.acc -= whole; scrollLines(whole); }
+  }, { passive: false });
+
+  screenEl.addEventListener('touchend', function () {
+    if (touch && touch.axis === 'y' && Math.abs(touch.v) > 0.4) {
+      flick = Math.max(-6, Math.min(6, touch.v));
+      flickTimer = requestAnimationFrame(runFlick);
+    }
+    touch = null;
+  }, { passive: true });
+  screenEl.addEventListener('touchcancel', function () { touch = null; stopFlick(); }, { passive: true });
+
+  // Trackpad/mouse wheel (desktop browser hitting the same UI): xterm handles
+  // the wheel itself on the normal screen, but the transform-scaled host can
+  // swallow it, so route it through the same path.
+  screenEl.addEventListener('wheel', function (ev) {
+    var cell = cellPx();
+    if (!term || !cell) return;
+    if (ev.cancelable) ev.preventDefault();
+    var px = ev.deltaMode === 1 ? ev.deltaY * cell : ev.deltaY;
+    var lines = px / cell;
+    var whole = lines > 0 ? Math.ceil(lines) : Math.floor(lines);
+    if (whole) scrollLines(whole);
+  }, { passive: false });
+
   window.addEventListener('resize', applyScale);
   window.addEventListener('orientationchange', function () { setTimeout(applyScale, 150); });
 
