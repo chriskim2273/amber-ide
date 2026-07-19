@@ -367,7 +367,10 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   watcher queue and risk evicting the app). Front end is vendored xterm UMD +
   hand-written HTML/CSS/JS embedded with `include_bytes!` (offline, no CDN, no
   bundler) with an on-screen key bar (Esc/Tab/sticky Ctrl/arrows honoring
-  `applicationCursorKeysMode`/^C). Deviation from spec §8: `/` + assets serve
+  `applicationCursorKeysMode`/^C) and touch scrolling (xterm ships none: a
+  one-finger vertical drag scrolls the scrollback with flick momentum, and on
+  the ALT screen it sends arrow keys instead — a TUI owns its own paging —
+  while horizontal drags keep panning the zoomed view). Deviation from spec §8: `/` + assets serve
   WITHOUT a cookie — a fragment token is only readable by JS on the served page,
   so the page must bootstrap first; the boundary is `/api/sessions` + `/ws`.
   Gates: Rust 214 tests ×2 + clippy clean + musl check + no openssl/tokio in the
