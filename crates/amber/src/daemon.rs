@@ -413,17 +413,48 @@ fn handle_control(
                 }
             });
         }
-        ControlMsg::Rename { .. } => {
-            // Deliberately unsupported (not silently ignored): a live claude
-            // session's supervisor is env-bound to its name (`amber run
-            // <name>` / AMBER_SESSION), so renaming would break precise
-            // resume until a supervisor-rebind mechanism exists.
-            let _ = write_frame(
-                writer,
-                &Frame::Control(ControlMsg::Error {
-                    msg: "rename is not supported yet".to_string(),
-                }),
-            );
+        ControlMsg::Rename { from, to } => {
+            // A cross-tab pane move: the tab is encoded in the session name, so
+            // the move IS a rename (core rule #2). The manager does the work
+            // (re-key + store move; claude respawns under the new name).
+            let info = match manager.rename(&from, &to) {
+                Ok(info) => info,
+                Err(e) => {
+                    let _ = write_frame(
+                        writer,
+                        &Frame::Control(ControlMsg::Error { msg: e.to_string() }),
+                    );
+                    return;
+                }
+            };
+            // Drop this connection's subscriptions under the OLD name. The
+            // forwarder thread bakes the session name into its `Data` frames, so
+            // re-keying the entry alone would keep shipping bytes under the dead
+            // name; the client re-attaches under the new name on the
+            // SessionsChanged below (the same path it already takes for a claude
+            // rename, whose PtySession is replaced outright).
+            //
+            // Known wart: another connection (e.g. a raw `amber attach`) still
+            // attached to a renamed SHELL keeps receiving Data under the old
+            // name and never sees an Exit. The app is the multiplexed connection
+            // that matters here — accepted.
+            subscriptions.retain(|(sess_name, sess, id)| {
+                if *sess_name == from {
+                    sess.unsubscribe(*id);
+                    false
+                } else {
+                    true
+                }
+            });
+            // The grouping signal (one-way flow): the old name goes, the new
+            // arrives. `Created` doubles as the success ack — deliberately
+            // reusing the existing variant rather than adding one, so the wire
+            // surface (and the app's decoder) is unchanged.
+            watchers.broadcast(&ControlMsg::SessionsChanged {
+                added: vec![info],
+                removed: vec![from],
+            });
+            let _ = write_frame(writer, &Frame::Control(ControlMsg::Created { name: to }));
         }
         // Hello and daemon->client-only variants: no-op. Well-formed but
         // meaningless here; ignore rather than tear down the connection.

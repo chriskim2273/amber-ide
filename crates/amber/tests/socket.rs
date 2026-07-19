@@ -364,17 +364,97 @@ fn attached_client_receives_exit_when_child_dies() {
 }
 
 #[test]
-fn rename_gets_an_explicit_unsupported_error() {
-    // Rename is deliberately unimplemented (a live claude session's
-    // supervisor is bound to its name); the daemon must say so instead of
-    // silently ignoring the request.
+fn rename_moves_a_live_shell_session_and_broadcasts_the_delta() {
+    // A cross-tab pane move IS a session rename (grouping is name-encoded).
+    // The daemon acks with `Created { name: to }` and tells watchers about the
+    // delta; the shell keeps running (no respawn).
     let (socket_path, _dir) = start_daemon();
     let mut stream = connect_with_retry(&socket_path);
     let mut decoder = Decoder::new();
 
     send(
         &mut stream,
-        &Frame::Control(ControlMsg::Rename { from: "a".into(), to: "b".into() }),
+        &Frame::Control(ControlMsg::Create {
+            name: "amber-1-1-0-mv".into(),
+            cwd: "/tmp".into(),
+            kind: "shell".into(),
+        }),
+    );
+    read_frame_until(
+        &mut stream,
+        &mut decoder,
+        |f| matches!(f, Frame::Control(ControlMsg::Created { name }) if name == "amber-1-1-0-mv"),
+        Duration::from_secs(5),
+    );
+
+    // A second connection watches, so we can assert the broadcast delta.
+    let mut watcher = connect_with_retry(&socket_path);
+    let mut wdec = Decoder::new();
+    send(&mut watcher, &Frame::Control(ControlMsg::WatchSessions));
+    read_frame_until(
+        &mut watcher,
+        &mut wdec,
+        |f| matches!(f, Frame::Control(ControlMsg::Sessions { .. })),
+        Duration::from_secs(5),
+    );
+
+    send(
+        &mut stream,
+        &Frame::Control(ControlMsg::Rename {
+            from: "amber-1-1-0-mv".into(),
+            to: "amber-1-2-0-mv".into(),
+        }),
+    );
+    read_frame_until(
+        &mut stream,
+        &mut decoder,
+        |f| matches!(f, Frame::Control(ControlMsg::Created { name }) if name == "amber-1-2-0-mv"),
+        Duration::from_secs(5),
+    );
+
+    let frame = read_frame_until(
+        &mut watcher,
+        &mut wdec,
+        |f| matches!(f, Frame::Control(ControlMsg::SessionsChanged { .. })),
+        Duration::from_secs(5),
+    );
+    match frame {
+        Frame::Control(ControlMsg::SessionsChanged { added, removed }) => {
+            assert_eq!(removed, vec!["amber-1-1-0-mv".to_string()]);
+            assert_eq!(added.len(), 1);
+            assert_eq!(added[0].name, "amber-1-2-0-mv");
+            assert!(added[0].alive, "the renamed shell must still be running");
+        }
+        _ => unreachable!(),
+    }
+
+    // The live table follows the rename.
+    send(&mut stream, &Frame::Control(ControlMsg::ListSessions));
+    let frame = read_frame_until(
+        &mut stream,
+        &mut decoder,
+        |f| matches!(f, Frame::Control(ControlMsg::SessionList { .. })),
+        Duration::from_secs(5),
+    );
+    match frame {
+        Frame::Control(ControlMsg::SessionList { names }) => {
+            assert!(names.contains(&"amber-1-2-0-mv".to_string()), "{names:?}");
+            assert!(!names.contains(&"amber-1-1-0-mv".to_string()), "{names:?}");
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn rename_of_an_unknown_or_colliding_session_is_refused() {
+    // Spec §7: never clobber another session, never invent one.
+    let (socket_path, _dir) = start_daemon();
+    let mut stream = connect_with_retry(&socket_path);
+    let mut decoder = Decoder::new();
+
+    send(
+        &mut stream,
+        &Frame::Control(ControlMsg::Rename { from: "ghost".into(), to: "elsewhere".into() }),
     );
     let frame = read_frame_until(
         &mut stream,
@@ -384,7 +464,59 @@ fn rename_gets_an_explicit_unsupported_error() {
     );
     match frame {
         Frame::Control(ControlMsg::Error { msg }) => {
-            assert!(msg.contains("rename"), "unexpected error: {msg}");
+            assert!(msg.contains("ghost"), "unexpected error: {msg}");
+        }
+        _ => unreachable!(),
+    }
+
+    for name in ["occupied-a", "occupied-b"] {
+        send(
+            &mut stream,
+            &Frame::Control(ControlMsg::Create {
+                name: name.into(),
+                cwd: "/tmp".into(),
+                kind: "shell".into(),
+            }),
+        );
+        read_frame_until(
+            &mut stream,
+            &mut decoder,
+            |f| matches!(f, Frame::Control(ControlMsg::Created { name: n }) if n == name),
+            Duration::from_secs(5),
+        );
+    }
+    send(
+        &mut stream,
+        &Frame::Control(ControlMsg::Rename {
+            from: "occupied-a".into(),
+            to: "occupied-b".into(),
+        }),
+    );
+    let frame = read_frame_until(
+        &mut stream,
+        &mut decoder,
+        |f| matches!(f, Frame::Control(ControlMsg::Error { .. })),
+        Duration::from_secs(5),
+    );
+    match frame {
+        Frame::Control(ControlMsg::Error { msg }) => {
+            assert!(msg.contains("occupied-b"), "unexpected error: {msg}");
+        }
+        _ => unreachable!(),
+    }
+
+    // Both sessions survived the refused rename.
+    send(&mut stream, &Frame::Control(ControlMsg::ListSessions));
+    let frame = read_frame_until(
+        &mut stream,
+        &mut decoder,
+        |f| matches!(f, Frame::Control(ControlMsg::SessionList { .. })),
+        Duration::from_secs(5),
+    );
+    match frame {
+        Frame::Control(ControlMsg::SessionList { names }) => {
+            assert!(names.contains(&"occupied-a".to_string()), "{names:?}");
+            assert!(names.contains(&"occupied-b".to_string()), "{names:?}");
         }
         _ => unreachable!(),
     }
@@ -444,20 +576,64 @@ fn kill_via_cli_removes_the_session() {
 }
 
 #[test]
-fn rename_via_cli_surfaces_daemon_error() {
-    // Rename is unsupported daemon-side; the CLI must surface that error to
-    // stderr and exit nonzero (the verb exists so the UX matches the spec).
+fn rename_via_cli_moves_the_session() {
+    // `amber rename <from> <to>` over the real socket must succeed and be
+    // independently visible; a rename of a nonexistent session must still
+    // surface the daemon's error (nonzero exit).
     let (socket_path, _dir) = start_daemon();
+    let mut stream = connect_with_retry(&socket_path);
+    let mut decoder = Decoder::new();
+    send(
+        &mut stream,
+        &Frame::Control(ControlMsg::Create {
+            name: "cli-mv".into(),
+            cwd: "/tmp".into(),
+            kind: "shell".into(),
+        }),
+    );
+    read_frame_until(
+        &mut stream,
+        &mut decoder,
+        |f| matches!(f, Frame::Control(ControlMsg::Created { .. })),
+        Duration::from_secs(5),
+    );
+
     let out = Command::new(env!("CARGO_BIN_EXE_amber"))
-        .args(["rename", "a", "b", "--socket"])
+        .args(["rename", "cli-mv", "cli-moved", "--socket"])
         .arg(&socket_path)
         .output()
         .unwrap();
-    assert!(!out.status.success(), "amber rename unexpectedly succeeded");
+    assert!(
+        out.status.success(),
+        "amber rename failed; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let mut probe = connect_with_retry(&socket_path);
+    let mut pdec = Decoder::new();
+    send(&mut probe, &Frame::Control(ControlMsg::ListSessions));
+    let frame = read_frame_until(
+        &mut probe,
+        &mut pdec,
+        |f| matches!(f, Frame::Control(ControlMsg::SessionList { .. })),
+        Duration::from_secs(5),
+    );
+    match frame {
+        Frame::Control(ControlMsg::SessionList { names }) => {
+            assert!(names.contains(&"cli-moved".to_string()), "{names:?}");
+            assert!(!names.contains(&"cli-mv".to_string()), "{names:?}");
+        }
+        _ => unreachable!(),
+    }
+
+    let out = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .args(["rename", "no-such-session", "whatever", "--socket"])
+        .arg(&socket_path)
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "renaming a ghost unexpectedly succeeded");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    // The daemon's exact message — proves we surfaced the server error, not a
-    // clap "unrecognized subcommand" (which also contains the word "rename").
-    assert!(stderr.contains("not supported"), "rename error not surfaced: {stderr}");
+    assert!(stderr.contains("no-such-session"), "daemon error not surfaced: {stderr}");
 }
 
 #[test]

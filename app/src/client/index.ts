@@ -28,6 +28,7 @@ process.parentPort.on('message', (event) => {
       const cmd = e.data as
         | { cmd: 'create'; name: string; cwd: string; sessionKind: string }
         | { cmd: 'kill'; name: string }
+        | { cmd: 'rename'; from: string; to: string }
         | { cmd: 'dumpBacklog'; name: string }
         | { cmd: 'suspend'; name: string }
         | { cmd: 'resume'; name: string }
@@ -35,6 +36,8 @@ process.parentPort.on('message', (event) => {
         conn.send({ type: 'control', msg: { kind: 'Create', name: cmd.name, cwd: cmd.cwd, sessionKind: cmd.sessionKind } })
       } else if (cmd.cmd === 'kill') {
         conn.send({ type: 'control', msg: { kind: 'Kill', name: cmd.name } })
+      } else if (cmd.cmd === 'rename') {
+        conn.send({ type: 'control', msg: { kind: 'Rename', from: cmd.from, to: cmd.to } })
       } else if (cmd.cmd === 'dumpBacklog') {
         conn.send({ type: 'control', msg: { kind: 'DumpBacklog', name: cmd.name } })
       } else if (cmd.cmd === 'suspend') {

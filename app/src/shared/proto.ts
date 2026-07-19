@@ -35,6 +35,7 @@ export type ControlMsg =
   | { kind: 'DumpBacklog'; name: string }
   | { kind: 'Backlog'; name: string; data: Uint8Array }
   | { kind: 'Kill'; name: string }
+  | { kind: 'Rename'; from: string; to: string }
   | { kind: 'Suspend'; name: string }
   | { kind: 'Resume'; name: string }
   | { kind: 'Resize'; name: string; cols: number; rows: number }
@@ -78,6 +79,8 @@ function msgToJson(m: ControlMsg): unknown {
       return { Backlog: { name: m.name, data: Array.from(m.data) } }
     case 'Kill':
       return { Kill: { name: m.name } }
+    case 'Rename':
+      return { Rename: { from: m.from, to: m.to } }
     case 'Suspend':
       return { Suspend: { name: m.name } }
     case 'Resume':
@@ -119,6 +122,7 @@ function jsonToMsg(v: unknown): ControlMsg {
       // serde encodes Vec<u8> as a JSON numeric array; rebuild the Uint8Array.
       case 'Backlog': return { kind: 'Backlog', name: body['name'] as string, data: Uint8Array.from(body['data'] as number[]) }
       case 'Kill': return { kind: 'Kill', name: body['name'] as string }
+      case 'Rename': return { kind: 'Rename', from: body['from'] as string, to: body['to'] as string }
       case 'Resize': return { kind: 'Resize', name: body['name'] as string, cols: body['cols'] as number, rows: body['rows'] as number }
       case 'SessionList': return { kind: 'SessionList', names: body['names'] as string[] }
       case 'Sessions': return { kind: 'Sessions', sessions: body['sessions'] as SessionInfo[] }

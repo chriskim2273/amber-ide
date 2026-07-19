@@ -540,6 +540,88 @@ impl SessionManager {
         Ok(dead)
     }
 
+    /// Rename a session — the daemon-side half of a cross-tab pane move (the
+    /// tab lives in the session name, core rule #2, so a move IS a rename).
+    /// Returns the renamed session's fresh [`SessionInfo`].
+    ///
+    /// A **shell** moves in place: same pty, same child, same scrollback — only
+    /// the key and the store files change. Its already-running shell keeps a now
+    /// stale `AMBER_SESSION` env; that only matters to a claude the user starts
+    /// BY HAND inside it (its SessionStart hook records under the old name until
+    /// the shell restarts) — accepted edge case.
+    ///
+    /// A **claude** session is respawned under the new name: its supervisor is
+    /// env-bound to its name (`amber run <name>`, fixed at spawn), so the child
+    /// is killed and re-spawned via the normal restore path. The migrated
+    /// `claude/<to>.json` makes it `--resume` the SAME conversation; claude is a
+    /// full-screen TUI, so the redraw is the only visible cost.
+    ///
+    /// The whole operation is done under the `sessions` lock so a concurrent
+    /// snapshot can never observe (or persist) a half-rename.
+    pub fn rename(&self, from: &str, to: &str) -> anyhow::Result<SessionInfo> {
+        Self::validate_name(to)?;
+        // Lock order matches `snapshot_inner` (sessions, then claude_absent) —
+        // reversing it would deadlock against the snapshot timer.
+        let mut sessions = self.sessions.lock().unwrap();
+        if sessions.contains_key(to) || self.store.read_session(to)?.is_some() {
+            anyhow::bail!("session already exists: {to}");
+        }
+        let sess = sessions
+            .remove(from)
+            .ok_or_else(|| anyhow::anyhow!("no such session: {from}"))?;
+        self.claude_absent.lock().unwrap().remove(from);
+
+        if let Err(e) = self.store.rename_session(from, to) {
+            sessions.insert(from.to_string(), sess); // leave the session as it was
+            return Err(e);
+        }
+
+        let meta = self
+            .store
+            .read_session(to)?
+            .ok_or_else(|| anyhow::anyhow!("renamed session {to} vanished from the store"))?;
+        let sess = if meta.kind == SessionKind::Claude {
+            // Deliberately keyed on the persisted kind, NOT on
+            // `kind || resume_as_claude`: a shell that merely HAS a hand-started
+            // claude inside it must not have its user's shell killed.
+            let size = sess.size();
+            let _ = sess.kill();
+            // If this spawn fails (pty/fork exhaustion — rare) the store is
+            // already consistent under `to`, so nothing is lost and the session
+            // comes back on the next daemon start; until then the client sees an
+            // Error and a stale `from` pane. Not worth an un-rename dance.
+            let fresh = self.restore_one(&meta)?;
+            if let Some((rows, cols)) = size {
+                let _ = fresh.resize(rows, cols);
+            }
+            fresh
+        } else {
+            // Only the name baked into the activity hook's closure is stale.
+            if let Some(watchers) = &self.watchers {
+                let watchers = Arc::clone(watchers);
+                let name = to.to_string();
+                sess.set_activity_hook(Box::new(move || {
+                    watchers.broadcast(&ControlMsg::Activity { name: name.clone() });
+                }));
+            }
+            sess
+        };
+        sessions.insert(to.to_string(), Arc::clone(&sess));
+
+        Ok(SessionInfo {
+            name: meta.name,
+            cwd: meta.cwd.to_string_lossy().into_owned(),
+            kind: match meta.kind {
+                SessionKind::Shell => "shell".to_string(),
+                SessionKind::Claude => "claude".to_string(),
+            },
+            alive: sess.is_alive(),
+            updated: meta.updated,
+            run_state: sess.run_state(),
+            claude_id: self.store.read_claude(to).ok().flatten().map(|c| c.session_id),
+        })
+    }
+
     /// Kill and forget a session, removing its persisted artifacts.
     pub fn remove(&self, name: &str) -> anyhow::Result<()> {
         if let Some(sess) = self.sessions.lock().unwrap().remove(name) {
@@ -756,6 +838,91 @@ mod tests {
         assert!(mgr.set_run_state("nope", "claude").is_err());
         // Invalid state string, even on a claude session.
         assert!(mgr.set_run_state("amber-1-1-1-c", "bogus").is_err());
+    }
+
+    #[test]
+    fn rename_rekeys_a_shell_session_and_keeps_its_child() {
+        // Spec §3.2: a shell moves tab in place — same pty, same child, same
+        // scrollback; only the key and the store files change.
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        mgr.create("amber-1-1-0-a", "/tmp", SessionKind::Shell).unwrap();
+        let before = mgr.session("amber-1-1-0-a").unwrap();
+
+        let info = mgr.rename("amber-1-1-0-a", "amber-1-2-0-a").unwrap();
+
+        assert_eq!(info.name, "amber-1-2-0-a");
+        assert_eq!(mgr.names(), vec!["amber-1-2-0-a".to_string()]);
+        let after = mgr.session("amber-1-2-0-a").unwrap();
+        assert!(Arc::ptr_eq(&before, &after), "shell must keep its live pty");
+        assert_eq!(before.pid(), after.pid(), "shell must keep its child");
+        assert!(after.is_alive());
+        assert!(dir.path().join("sessions/amber-1-2-0-a.json").exists());
+        assert!(!dir.path().join("sessions/amber-1-1-0-a.json").exists());
+    }
+
+    #[test]
+    fn rename_respawns_a_claude_session_under_the_new_name() {
+        // Spec §3.2: a claude supervisor is env-bound to its name, so a rename
+        // respawns it under the new name (same conversation resumes via the
+        // migrated claude/<to>.json) — a NEW child, preserving cwd.
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        mgr.create("amber-1-1-0-c", dir.path(), SessionKind::Claude).unwrap();
+        mgr.store
+            .write_claude(
+                "amber-1-1-0-c",
+                &amber_core::state::ClaudeMeta {
+                    session_id: "conv-42".to_string(),
+                    cwd: dir.path().to_path_buf(),
+                    updated: 1,
+                },
+            )
+            .unwrap();
+        let before = mgr.session("amber-1-1-0-c").unwrap();
+
+        let info = mgr.rename("amber-1-1-0-c", "amber-1-2-0-c").unwrap();
+
+        assert_eq!(info.name, "amber-1-2-0-c");
+        assert_eq!(info.kind, "claude");
+        assert_eq!(mgr.names(), vec!["amber-1-2-0-c".to_string()]);
+        let after = mgr.session("amber-1-2-0-c").unwrap();
+        assert!(!Arc::ptr_eq(&before, &after), "claude must be respawned");
+        assert_ne!(before.pid(), after.pid(), "claude must get a fresh child");
+        assert_eq!(
+            mgr.store.read_claude("amber-1-2-0-c").unwrap().unwrap().session_id,
+            "conv-42",
+            "the conversation id must follow the rename so --resume still works"
+        );
+        assert_eq!(
+            mgr.store.read_session("amber-1-2-0-c").unwrap().unwrap().cwd,
+            std::fs::canonicalize(dir.path()).unwrap_or_else(|_| dir.path().to_path_buf()),
+            "cwd preserved"
+        );
+    }
+
+    #[test]
+    fn rename_refuses_bad_target_missing_source_and_existing_target() {
+        // Spec §7: a rename must never clobber another session.
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        mgr.create("amber-1-1-0-a", "/tmp", SessionKind::Shell).unwrap();
+        mgr.create("amber-1-1-1-b", "/tmp", SessionKind::Shell).unwrap();
+
+        assert!(mgr.rename("ghost", "amber-1-2-0-z").is_err(), "missing source");
+        assert!(
+            mgr.rename("amber-1-1-0-a", "amber-1-1-1-b").is_err(),
+            "must not clobber an existing session"
+        );
+        assert!(mgr.rename("amber-1-1-0-a", "../evil").is_err(), "invalid target");
+        assert!(mgr.rename("amber-1-1-0-a", "").is_err(), "empty target");
+
+        // Every refusal leaves both sessions intact.
+        assert_eq!(
+            mgr.names(),
+            vec!["amber-1-1-0-a".to_string(), "amber-1-1-1-b".to_string()]
+        );
+        assert!(mgr.session("amber-1-1-1-b").unwrap().is_alive());
     }
 
     #[test]

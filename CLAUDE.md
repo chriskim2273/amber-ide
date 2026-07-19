@@ -315,6 +315,36 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   plan: `docs/superpowers/plans/2026-07-18-browser-pane.md`. Renderer components
   (`Browser`/`SplitView`) stay test-deferred (repo pattern).
 
+- [x] Split kind picker + cross-tab/ws pane move (2026-07-19) — **split**: the
+  pane header's ⬌/⬍ now open a shell/claude/browser picker (reuses the ctx-menu
+  state, so dismissal/clamping/pruning are shared) instead of silently using the
+  toolbar dropdown; the ctx-menu's "Split right…/down…" open the same picker.
+  **Move**: drag a pane's ⠿ grip onto a tab header, workspace pill, `+ Tab`, or
+  `+ ws` to move it there. Grouping is name-encoded (rule #2), so a daemon pane
+  moves by a REAL daemon `Rename` — implemented per
+  `docs/superpowers/specs/2026-07-18-cross-tab-move-design.md`:
+  `StateStore::rename_session` (moves sessions/claude/settings/scrollback
+  artifacts, rewrites the embedded name, ordered so a crash never leaves a
+  half-session), `SessionManager::rename` (re-key under the sessions lock, shell
+  renamed IN PLACE keeping its child + scrollback, claude respawned via
+  `restore_one` so its env-bound supervisor `--resume`s the same conversation),
+  daemon handler broadcasting `SessionsChanged{added:[to],removed:[from]}` with
+  `Created{name}` as the ack (no proto change — the app's decoder throws on
+  unknown keys). Spec §3.1 was wrong about the settings file (the hook command is
+  `<exe> hook`, no name inside) — it moves unchanged. App: `retargetPane`
+  (pure, tested), preload `renameSession` + client router + `proto.ts` `Rename`,
+  DOM-hit-tested drop targets with an imperative `.drop-target` highlight (a
+  React round-trip per mousemove would reconcile every terminal). Browser panes
+  have no daemon session, so they move by a sidecar entry edit (id kept); the
+  per-tab `reconcile` prunes the source leaf and appends the target one. Also
+  fixed a PRE-EXISTING `claude_supervise` flake (~50%/run: a fork from one test
+  thread inherits another's write fd to its fake-claude script → `ETXTBSY` on
+  exec; serialized with a test-file mutex). Gates: Rust 195 tests + clippy clean,
+  app 235 tests + typecheck + bundle green. **Live-verified** on an isolated
+  private daemon: picker splits each kind, claude pane moved tab→ws (name
+  `amber-1-1-2-…` → `amber-1-2-0-…` → `amber-2-1-0-…`) staying alive, shell moved
+  keeping scrollback + accepting input, browser pane moved across tabs.
+
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**
   `std::io::Read` (dedicated thread); `take_writer()` is one-shot;

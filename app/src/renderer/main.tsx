@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client'
 import { SplitView, type PaneMeta } from './SplitView'
 import { initialState, reduce, groupSessions, mergeBrowsers, tabDot, hasActivity, type DaemonEvent } from './store'
 import { deriveTab, shortCwd } from './tabView'
-import { formatName, makeId } from '../shared/names'
+import { formatName, makeId, retargetPane } from '../shared/names'
 import { formatBrowserName, isBrowserName } from '../shared/browserName'
 import { splitLeaf, setRatio, reconcile, leaves, moveLeaf, type Node } from './layout'
 import { emptyLayout, parseLayout, serializeLayout, orderTabs, moveTab, type LayoutFile, type TabLayout } from '../shared/layoutFile'
@@ -24,6 +24,7 @@ declare global {
       openPane: (session: string) => void
       createSession: (name: string, cwd: string, sessionKind: string) => void
       killSession: (name: string) => void
+      renameSession: (from: string, to: string) => void
       suspendSession: (name: string) => void
       resumeSession: (name: string) => void
       dumpBacklog: (name: string) => void
@@ -563,6 +564,32 @@ function App(): JSX.Element {
 
   const nextWs = (workspaces.reduce((m, w) => Math.max(m, w.ws), 0)) + 1
 
+  // Cross-group move: a pane was dropped on a tab header or a workspace pill.
+  // Grouping is name-encoded (rule #2), so a daemon pane moves by a real daemon
+  // Rename and the leaf follows one-way via SessionsChanged -> groupSessions ->
+  // reconcile (prunes the source-tab leaf, appends it in the target tab). Never
+  // an optimistic local tree edit. A browser pane has no daemon session — its
+  // grouping already lives in the sidecar, so it moves by an entry edit (id kept).
+  const moveTo = (paneId: string, target: { ws: number } | { tab: number }): void => {
+    const destWs = 'ws' in target ? target.ws : currentWs
+    const destTabs = workspaces.find((w) => w.ws === destWs)?.tabs ?? []
+    const destTab = 'tab' in target ? target.tab : (destTabs[0]?.tab ?? 1)
+    const destPanes = destTabs.find((t) => t.tab === destTab)?.panes ?? []
+    if (destPanes.some((p) => p.name === paneId)) return // already there — no-op
+    const ord = destPanes.reduce((m, p) => Math.max(m, p.ord), -1) + 1
+    if (isBrowserName(paneId)) {
+      setLayout((l) => {
+        const prev = l.browsers?.[paneId]
+        if (!prev) return l
+        return { ...l, browsers: { ...(l.browsers ?? {}), [paneId]: { ...prev, ws: destWs, tab: destTab, ord } } }
+      })
+    } else {
+      const to = retargetPane(paneId, { ws: destWs, tab: destTab, ord })
+      if (to && to !== paneId) window.amber.renameSession(paneId, to)
+    }
+    clearZoom()
+  }
+
   const openTab = (): void => { newPane(nextTab, 0); setActiveTab(nextTab) }
   // Create a pane in the displayed tab, or — when nothing exists yet — the very
   // first session at tab 1, ord 0 in the shown workspace. Shared by the toolbar
@@ -713,12 +740,14 @@ function App(): JSX.Element {
           }
           return (
             <button key={w.ws} className={'btn ws-pill' + (w.ws === (ws?.ws ?? -1) ? ' active' : '')}
-              aria-label={`workspace ${wsLabel ?? w.ws}`} title="double-click to rename"
+              data-drop-ws={w.ws}
+              aria-label={`workspace ${wsLabel ?? w.ws}`} title="double-click to rename · drop a pane here to move it"
               onClick={() => setActiveWs(w.ws)}
               onDoubleClick={() => setEditing({ kind: 'ws', id: w.ws })}>{wsLabel ?? w.ws}</button>
           )
         })}
-        <button className="btn btn-ghost"
+        <button className="btn btn-ghost" data-drop-ws={nextWs}
+          title="new workspace · drop a pane here to move it to a new workspace"
           onClick={() => {
             setActiveWs(nextWs)
             if (kind === 'browser') {
@@ -761,6 +790,7 @@ function App(): JSX.Element {
           const closeTab = (): void => t.panes.forEach((p) => closePane(p.name))
           return (
             <div key={t.tab} role="tab" aria-selected={isActive} tabIndex={0}
+              data-drop-tab={t.tab}
               className={'tab' + (isActive ? ' active' : '')}
               draggable={!isEditing}
               onClick={() => setActiveTab(t.tab)}
@@ -787,7 +817,8 @@ function App(): JSX.Element {
             </div>
           )
         })}
-        <button className="btn btn-ghost tab-add" onClick={openTab}>+ Tab</button>
+        <button className="btn btn-ghost tab-add" data-drop-tab={nextTab}
+          title="new tab · drop a pane here to move it to a new tab" onClick={openTab}>+ Tab</button>
       </div>
       <div className="pane-stage">
         {/* Keep-alive: render ONE SplitView per tab in the workspace, hiding the
@@ -846,6 +877,7 @@ function App(): JSX.Element {
                             clearZoom()
                           }}
                           onMove={(s, tgt, z) => { putTree(moveLeaf(layerTree, s, tgt, z)); clearZoom() }}
+                          onMoveTo={moveTo}
                           onClose={(paneId) => { closePane(paneId); clearZoom() }} />
                       : isActive
                         ? <button className="empty-cta" onClick={startPane}>
