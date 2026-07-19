@@ -88,6 +88,12 @@ mod imp {
         pub fn try_clone_writer(&self) -> io::Result<LocalWriter> {
             Ok(LocalWriter(self.0.try_clone()?))
         }
+
+        /// Bound writes on this stream (used by the fire-and-forget supervisor
+        /// run-state report so it never stalls supervision).
+        pub fn set_write_timeout(&self, d: Option<Duration>) -> io::Result<()> {
+            self.0.set_write_timeout(d)
+        }
     }
 
     impl LocalWriter {
@@ -209,6 +215,12 @@ mod imp {
                 io::ErrorKind::Unsupported,
                 "try_clone_writer is not supported on Windows named pipes",
             ))
+        }
+
+        /// No per-write timeout on named pipes (spec §D1); no-op so the
+        /// supervisor report path is identical across platforms.
+        pub fn set_write_timeout(&self, _d: Option<Duration>) -> io::Result<()> {
+            Ok(())
         }
     }
 

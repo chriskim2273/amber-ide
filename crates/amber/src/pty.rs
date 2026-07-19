@@ -315,13 +315,45 @@ impl PtySession {
             });
         }
 
-        // Waiter thread: record the exit code once the child dies.
+        // Waiter thread: `child.wait()` is the AUTHORITATIVE, cross-platform
+        // exit signal. It records the exit code AND drives subscriber teardown.
+        //
+        // On Unix, dropping the slave makes the reader see EOF on child exit,
+        // and the batcher flushes the final output tail and THEN clears
+        // subscribers — so teardown is already correct and the waiter must NOT
+        // clear (clearing here would race the batcher's tail flush and drop the
+        // last bytes; a regression the suffix test catches).
+        //
+        // On **Windows/ConPTY the reader does NOT hit EOF when the child
+        // exits** (the output pipe is held open by the pseudoconsole, not the
+        // child), so the batcher's clear never runs — the daemon forwarder's
+        // `rx.recv()` would block forever and the `Exit` frame would never
+        // fire, hanging the pane "alive" (spec §D2). There the waiter is the
+        // ONLY teardown trigger: after a short drain grace (so buffered output
+        // fans out first) it closes the subscriber channels itself.
         let exit = Arc::new(Mutex::new(None));
         {
             let exit = Arc::clone(&exit);
+            #[cfg(windows)]
+            let subs = Arc::clone(&subs);
+            #[cfg(windows)]
+            let reader_done = Arc::clone(&reader_done);
             thread::spawn(move || {
-                if let Ok(status) = child.wait() {
-                    *exit.lock().unwrap() = Some(status.exit_code() as i32);
+                let code = child.wait().ok().map(|s| s.exit_code() as i32);
+                // Record the exit code BEFORE closing channels: the daemon
+                // forwarder polls `exit_code()` once its channel closes, so the
+                // code must be visible before the close it reacts to.
+                if let Some(c) = code {
+                    *exit.lock().unwrap() = Some(c);
+                }
+                #[cfg(windows)]
+                {
+                    // Let the reader/batcher fan out any output buffered at
+                    // exit before we sever the channels (no EOF to sync on).
+                    thread::sleep(std::time::Duration::from_millis(100));
+                    let mut subs = subs.lock().unwrap();
+                    reader_done.store(true, Ordering::SeqCst);
+                    subs.clear();
                 }
             });
         }

@@ -3,7 +3,6 @@
 //! so a pane never silently dies.
 
 use std::io::Write;
-use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,6 +13,7 @@ use amber_core::proto::{self, ControlMsg, Frame};
 use amber_core::state::StateStore;
 
 use crate::claude;
+use crate::transport;
 
 /// Upper bound on a single fire-and-forget run-state report write. Reporting
 /// must NEVER stall supervision, so both the connect and the write are
@@ -213,6 +213,16 @@ fn classify_run(outcome: &std::io::Result<std::process::ExitStatus>) -> RunClass
                     None => {}
                 }
             }
+            #[cfg(windows)]
+            {
+                // Windows has no signals: a ^C'd console app exits with
+                // STATUS_CONTROL_C_EXIT (0xC000013A). Treat it as a user quit
+                // so claude ^C drops to a shell instead of retrying.
+                const CONTROL_C_EXIT: i32 = 0xC000013Au32 as i32;
+                if matches!(status.code(), Some(CONTROL_C_EXIT)) {
+                    return RunClass::UserInterrupt;
+                }
+            }
             // Not signal-terminated, so a real exit code is present. 130 is the
             // shell convention for "terminated by ^C" — claude's own quit path.
             if matches!(status.code(), Some(130)) {
@@ -253,7 +263,7 @@ fn report_run_state(socket: &Path, name: &str, state: &str) {
 }
 
 fn try_report_run_state(socket: &Path, name: &str, state: &str) -> anyhow::Result<()> {
-    let mut stream = UnixStream::connect(socket)?;
+    let mut stream = transport::connect(socket)?;
     stream.set_write_timeout(Some(REPORT_WRITE_TIMEOUT))?;
     let frame = proto::encode(&Frame::Control(ControlMsg::ReportRunState {
         name: name.to_string(),
@@ -308,8 +318,20 @@ pub fn run_session(root: &Path, name: &str, socket: &Path) -> anyhow::Result<()>
         // signals are ours. Registration is best-effort: a failure just means
         // freeze-to-free-RAM won't work for this pane (supervision is unaffected).
         let ctl = SuspendControl::new();
-        let _ = signal_hook::flag::register(signal_hook::consts::SIGUSR1, Arc::clone(&ctl.suspend));
-        let _ = signal_hook::flag::register(signal_hook::consts::SIGUSR2, Arc::clone(&ctl.resume));
+        // SIGUSR1/2 park/resume are Unix-only; on Windows the freeze/park flags
+        // are simply never set (feature disabled, spec §D7.3 / Phase 6) and
+        // supervision is unaffected.
+        #[cfg(unix)]
+        {
+            let _ = signal_hook::flag::register(
+                signal_hook::consts::SIGUSR1,
+                Arc::clone(&ctl.suspend),
+            );
+            let _ = signal_hook::flag::register(
+                signal_hook::consts::SIGUSR2,
+                Arc::clone(&ctl.resume),
+            );
+        }
 
         let report = |state: &str| report_run_state(socket, name, state);
         match supervise_claude(&claude_path, root, name, &cwd, &settings, 3, report, &ctl)? {
@@ -339,6 +361,16 @@ fn shell_fallback(cwd: &Path) -> anyhow::Result<()> {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
     let err = Command::new(&shell).arg("-l").current_dir(cwd).exec();
     Err(anyhow::anyhow!("failed to exec shell fallback {shell}: {err}"))
+}
+
+/// Windows has no `exec` (replace-process). Spawn the shell as a child, wait
+/// for it, and exit with its status — so the supervisor process ends when the
+/// fallback shell exits, the same pane lifecycle the Unix `exec` gives.
+#[cfg(windows)]
+fn shell_fallback(cwd: &Path) -> anyhow::Result<()> {
+    let shell = crate::platform::default_shell();
+    let status = Command::new(&shell).current_dir(cwd).status()?;
+    std::process::exit(status.code().unwrap_or(0));
 }
 
 #[cfg(test)]

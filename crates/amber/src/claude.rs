@@ -114,9 +114,34 @@ pub fn resolve_claude_with(shell: &str, login: bool, extra_env: &[(String, Strin
 
 /// Resolve claude via the user's login shell (the distribution-safe path — see
 /// spec §8; never trusts the daemon's own PATH).
+#[cfg(unix)]
 pub fn resolve_claude() -> Option<PathBuf> {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
     resolve_claude_with(&shell, true, &[])
+}
+
+/// Windows has no login shell. Resolve `claude` on PATH (the `which` crate
+/// honors `PATHEXT`, so it finds `claude.cmd`/`claude.exe`), then probe the two
+/// install locations that are commonly NOT on PATH: the native installer's
+/// `%USERPROFILE%\.local\bin\claude.exe` and npm's `%APPDATA%\npm\claude.cmd`.
+#[cfg(windows)]
+pub fn resolve_claude() -> Option<PathBuf> {
+    if let Ok(p) = which::which("claude") {
+        return Some(p);
+    }
+    if let Some(home) = crate::platform::home_dir() {
+        let p = home.join(".local").join("bin").join("claude.exe");
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        let p = PathBuf::from(appdata).join("npm").join("claude.cmd");
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
 }
 
 /// Pre-accept claude's interactive folder-trust dialog for `cwd`. A claude
@@ -127,8 +152,8 @@ pub fn resolve_claude() -> Option<PathBuf> {
 /// in `~/.claude.json` is exactly what accepting the dialog does. Best-effort:
 /// any failure leaves claude to prompt as usual.
 pub fn ensure_cwd_trusted(cwd: &Path) {
-    if let Ok(home) = std::env::var("HOME") {
-        trust_cwd_in(&PathBuf::from(home).join(".claude.json"), cwd);
+    if let Some(home) = crate::platform::home_dir() {
+        trust_cwd_in(&home.join(".claude.json"), cwd);
     }
 }
 
@@ -137,8 +162,8 @@ pub fn ensure_cwd_trusted(cwd: &Path) {
 /// amber shell also records its resume id (the per-session `--settings` hook
 /// only covers amber-launched claude). Idempotent and merge-preserving.
 pub fn ensure_global_claude_hook(hook_command: &str) {
-    if let Ok(home) = std::env::var("HOME") {
-        add_global_hook_in(&PathBuf::from(home).join(".claude").join("settings.json"), hook_command);
+    if let Some(home) = crate::platform::home_dir() {
+        add_global_hook_in(&home.join(".claude").join("settings.json"), hook_command);
     }
 }
 

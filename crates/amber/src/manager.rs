@@ -28,6 +28,7 @@ fn login_path() -> Option<&'static String> {
 /// Capture the user's login-shell PATH so spawned panes resolve tools (nvm/node,
 /// ~/.local/bin, …) that the daemon's minimal systemd PATH lacks — otherwise a
 /// pane's programs and claude's own hooks (which run `node`) fail.
+#[cfg(unix)]
 fn capture_login_path() -> Option<String> {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
     let out = std::process::Command::new(&shell)
@@ -44,6 +45,13 @@ fn capture_login_path() -> Option<String> {
     } else {
         Some(path)
     }
+}
+
+/// Windows has no login-shell PATH capture — the per-user daemon inherits the
+/// user's environment PATH directly, so panes get it without an overlay.
+#[cfg(windows)]
+fn capture_login_path() -> Option<String> {
+    None
 }
 
 pub struct SessionManager {
@@ -171,9 +179,7 @@ impl SessionManager {
         if cwd.is_absolute() && cwd.is_dir() {
             cwd.to_path_buf()
         } else {
-            std::env::var("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("/"))
+            crate::platform::home_dir().unwrap_or_else(|| PathBuf::from("."))
         }
     }
 
@@ -184,7 +190,7 @@ impl SessionManager {
     fn command_for(&self, kind: SessionKind, name: &str, cwd: &Path) -> anyhow::Result<CommandBuilder> {
         match kind {
             SessionKind::Shell => {
-                let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+                let shell = crate::platform::default_shell();
                 let mut cmd = CommandBuilder::new(shell);
                 cmd.cwd(cwd);
                 // A claude the user starts by hand in this shell inherits these,
@@ -463,17 +469,28 @@ impl SessionManager {
         let pid = sess
             .pid()
             .ok_or_else(|| anyhow::anyhow!("session {name} has no child pid"))?;
-        let sig = if resume { nix::libc::SIGUSR2 } else { nix::libc::SIGUSR1 };
-        // SAFETY: kill(2) with our own child's pid and a fixed valid signal;
-        // failure is reported via errno, never UB.
-        let rc = unsafe { nix::libc::kill(pid as nix::libc::pid_t, sig) };
-        if rc != 0 {
-            anyhow::bail!(
-                "failed to signal session {name}: {}",
-                std::io::Error::last_os_error()
-            );
+        #[cfg(unix)]
+        {
+            let sig = if resume { nix::libc::SIGUSR2 } else { nix::libc::SIGUSR1 };
+            // SAFETY: kill(2) with our own child's pid and a fixed valid signal;
+            // failure is reported via errno, never UB.
+            let rc = unsafe { nix::libc::kill(pid as nix::libc::pid_t, sig) };
+            if rc != 0 {
+                anyhow::bail!(
+                    "failed to signal session {name}: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            Ok(())
         }
-        Ok(())
+        // Windows has no per-process user signal (SIGUSR1/2). Freeze/park
+        // degrades gracefully to disabled until the supervisor control-channel
+        // lands (spec §D7.3 / Phase 6). Surface a clear error, don't panic.
+        #[cfg(windows)]
+        {
+            let _ = (pid, resume);
+            anyhow::bail!("freeze/park (suspend/resume) is not yet supported on Windows")
+        }
     }
 
     pub fn names(&self) -> Vec<String> {

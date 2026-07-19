@@ -6,6 +6,7 @@ pub mod claude;
 pub mod daemon;
 pub mod manager;
 pub mod procinfo;
+pub mod platform;
 pub mod pty;
 pub mod supervisor;
 pub mod transport;
