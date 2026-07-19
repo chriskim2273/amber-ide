@@ -16,6 +16,14 @@ So amber is built around one idea: **your sessions are not the app's to lose.**
 Close the app, crash the app, reboot the machine — the sessions keep going and
 come back where you left them.
 
+## Why "amber"
+
+Amber is fossilized tree resin — it traps whatever falls into it and preserves
+it, perfectly intact, for millions of years. An insect caught in amber looks
+exactly as it did the moment it was trapped. That's the whole idea here: your
+sessions get frozen in amber and come back exactly as they were, no matter what
+happens to the app or the machine.
+
 ## How it works
 
 The app is a disposable window. The real work happens in a long-lived Rust
