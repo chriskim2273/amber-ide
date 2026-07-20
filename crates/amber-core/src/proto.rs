@@ -51,6 +51,13 @@ pub struct SessionInfo {
     pub cols: u16,
     #[serde(default)]
     pub rows: u16,
+    /// The session's STABLE number — what `amber ls` prints and
+    /// `amber attach <n>` resolves (see `SessionMeta::slot`). Unlike a
+    /// position in the listing it never changes when another session dies.
+    /// `#[serde(default)]` keeps the wire back-compatible: peers that omit it
+    /// (an older daemon) decode as `0` = unassigned, which never resolves.
+    #[serde(default)]
+    pub slot: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -441,6 +448,7 @@ mod tests {
             claude_id: Some("sid-abc".into()),
             cols: 120,
             rows: 40,
+            slot: 3,
         };
         let full = Frame::Control(ControlMsg::Sessions { sessions: vec![info.clone()] });
         assert_eq!(roundtrip(&full), full);
@@ -499,6 +507,7 @@ mod tests {
             claude_id: None,
             cols: 80,
             rows: 24,
+            slot: 1,
         };
         let f = Frame::Control(ControlMsg::Sessions { sessions: vec![info] });
         assert_eq!(roundtrip(&f), f);
