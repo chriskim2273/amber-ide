@@ -20,6 +20,7 @@ import {
   stopDaemonCommand,
   stopDaemonFallbackCommand,
   bootUnitPath,
+  restartDaemonCommand,
 } from './serviceManager'
 import { backoffDelay, nextAttempt } from './clientSupervisor'
 import {
@@ -224,6 +225,60 @@ async function quitDaemonAndApp(win: BrowserWindow): Promise<void> {
   app.quit()
 }
 
+// Restart the daemon in place. Recovery path for a wedged daemon (and the way
+// to pick up a freshly installed binary) that does not make the user find a
+// terminal. Unlike "Quit amber daemon" the app keeps running: its client
+// reconnects on its own, panes re-attach, and sessions come back from the state
+// store — but the PROCESSES inside them are killed and restarted, so this is
+// confirmed first.
+async function restartDaemon(win: BrowserWindow): Promise<void> {
+  const confirm = await dialog.showMessageBox(win, {
+    type: 'warning',
+    buttons: ['Cancel', 'Restart daemon'],
+    defaultId: 0,
+    cancelId: 0,
+    title: 'Restart amber daemon',
+    message: 'Restart the amber daemon?',
+    detail:
+      'Sessions and their scrollback are restored from the state store, and a claude ' +
+      'pane resumes its conversation — but every process running inside a pane is ' +
+      'killed and restarted, so unsaved work in a running command is lost. ' +
+      'The app stays open and reconnects by itself.',
+  })
+  if (confirm.response !== 1) return
+
+  const home = process.env['HOME'] ?? '.'
+  const unit = bootUnitPath(process.platform, home)
+  // No installed boot unit => dev / unmanaged daemon. Don't guess at pids.
+  if (unit === null || !existsSync(unit)) {
+    await dialog.showMessageBox(win, {
+      type: 'info',
+      buttons: ['OK'],
+      title: 'Daemon not managed here',
+      message: 'No installed amber boot unit found.',
+      detail:
+        'The daemon was not installed via the app (dev mode or unmanaged), so it ' +
+        'cannot be restarted from here.',
+    })
+    return
+  }
+
+  const uid = process.getuid?.() ?? 0
+  const restart = restartDaemonCommand(process.platform, uid)
+  if (restart === null) return
+  try {
+    await spawnOk(restart.cmd, restart.args)
+  } catch (err) {
+    await dialog.showMessageBox(win, {
+      type: 'error',
+      buttons: ['OK'],
+      title: 'Restart failed',
+      message: 'Could not restart the amber daemon.',
+      detail: String(err),
+    })
+  }
+}
+
 // Linux desktop integration (spec: desktop-install-button design). Copies the
 // running AppImage to a STABLE path (launcher entry must survive the download
 // being deleted — same pattern as the daemon's ~/.local/bin/amber), installs
@@ -283,7 +338,11 @@ async function installDesktopShortcut(win: BrowserWindow): Promise<void> {
 // Minimal application menu. Keeps the standard macOS roles (app/Edit/Window) so
 // copy/paste and window management work; adds the explicit "Quit amber daemon"
 // item required by spec §3/§6. On Linux only that item plus the plain quit.
-function buildAppMenu(onQuitDaemon: () => void, onInstallDesktop: (() => void) | null): Menu {
+function buildAppMenu(
+  onQuitDaemon: () => void,
+  onInstallDesktop: (() => void) | null,
+  onRestartDaemon: () => void,
+): Menu {
   const isMac = process.platform === 'darwin'
   const template: MenuItemConstructorOptions[] = []
   // macOS appMenu already carries a plain "Quit amber-ide" (quits the app,
@@ -296,6 +355,7 @@ function buildAppMenu(onQuitDaemon: () => void, onInstallDesktop: (() => void) |
           { type: 'separator' } as MenuItemConstructorOptions,
         ]
       : []),
+    { label: 'Restart amber daemon', click: () => onRestartDaemon() },
     { label: 'Quit amber daemon', click: () => onQuitDaemon() },
   ]
   if (!isMac) submenu.push({ type: 'separator' }, { role: 'quit' })
@@ -349,6 +409,7 @@ async function main(): Promise<void> {
     buildAppMenu(
       () => { void quitDaemonAndApp(win) },
       canInstallDesktop ? () => { void installDesktopShortcut(win) } : null,
+      () => { void restartDaemon(win) },
     ),
   )
 

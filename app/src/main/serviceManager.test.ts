@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import {
+import { restartDaemonCommand,
   renderDaemonPlist,
   launchAgentPlistPath,
   launchctlBootstrapArgv,
@@ -107,5 +107,22 @@ describe('constants', () => {
   it('match the infra unit/label names', () => {
     expect(LAUNCHD_LABEL).toBe('com.amber-ide.daemon')
     expect(SYSTEMD_SERVICE).toBe('amber.service')
+  })
+})
+
+// Menu "Restart amber daemon": recovery path when the daemon wedges, without
+// making the user find a terminal. Linux restarts the unit; macOS `kickstart -k`
+// stops-and-restarts the agent in one call (a plain bootout would leave it down).
+describe('restartDaemonCommand', () => {
+  it('restarts the systemd user unit on linux', () => {
+    expect(restartDaemonCommand('linux', 1000))
+      .toEqual({ cmd: 'systemctl', args: ['--user', 'restart', 'amber.service'] })
+  })
+  it('kickstarts the launchd agent on macOS', () => {
+    expect(restartDaemonCommand('darwin', 501))
+      .toEqual({ cmd: 'launchctl', args: ['kickstart', '-k', 'gui/501/com.amber-ide.daemon'] })
+  })
+  it('is unsupported elsewhere', () => {
+    expect(restartDaemonCommand('win32', 0)).toBeNull()
   })
 })

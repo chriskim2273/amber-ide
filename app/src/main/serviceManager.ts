@@ -78,6 +78,23 @@ export function stopDaemonCommand(platform: NodeJS.Platform, uid: number): Argv 
   return null
 }
 
+// Restart the daemon in place — the app's recovery path for a wedged daemon
+// (menu: "Restart amber daemon"), and the way to pick up a newly installed
+// binary. Unlike `stopDaemonCommand` this leaves the daemon RUNNING: sessions
+// are restored from the state store, though the processes inside them are
+// killed and restarted (a claude pane resumes its conversation via its
+// supervisor). macOS `kickstart -k` stops and restarts in one call; a bootout
+// alone would leave the agent down.
+export function restartDaemonCommand(platform: NodeJS.Platform, uid: number): Argv | null {
+  if (platform === 'linux') {
+    return { cmd: 'systemctl', args: ['--user', 'restart', SYSTEMD_SERVICE] }
+  }
+  if (platform === 'darwin') {
+    return launchctlKickstartArgv(uid)
+  }
+  return null
+}
+
 // macOS fallback if `bootout` is unsupported on the running launchd.
 export function stopDaemonFallbackCommand(
   platform: NodeJS.Platform,
