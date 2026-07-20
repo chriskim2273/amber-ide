@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { sessionIndex, initialState, reduce, groupSessions, mergeBrowsers, paneDot, tabDot, hasActivity, type PaneModel, type WorkspaceModel } from './store'
+import { initialState, reduce, groupSessions, mergeBrowsers, paneDot, tabDot, hasActivity, type PaneModel, type WorkspaceModel } from './store'
 import type { SessionInfo } from '../shared/proto'
 
 describe('mergeBrowsers', () => {
@@ -203,20 +203,11 @@ describe('tabDot', () => {
   })
 })
 
-// `amber ls` prints a 1-based index over sessions SORTED BY NAME, with no alive
-// filter, and `amber attach <n>` resolves against that same order
-// (attach.rs::pick_by_index). The pane header shows this index, so it must be
-// derived exactly that way or it would send the user to the wrong session.
-describe('sessionIndex', () => {
-  const s = (name: string): { name: string } => ({ name })
-  it('numbers sessions 1-based in by-name order regardless of input order', () => {
-    expect(sessionIndex([s('amber-1-2-0-c'), s('amber-1-1-0-a'), s('amber-1-1-1-b')]))
-      .toEqual({ 'amber-1-1-0-a': 1, 'amber-1-1-1-b': 2, 'amber-1-2-0-c': 3 })
-  })
-  it('counts dead-not-yet-reaped sessions too (ls lists them)', () => {
-    expect(sessionIndex([s('amber-1-1-0-a'), s('amber-1-1-1-b')])['amber-1-1-1-b']).toBe(2)
-  })
-  it('is empty for no sessions', () => {
-    expect(sessionIndex([])).toEqual({})
+describe('groupSessions slot', () => {
+  it('carries the daemon-assigned slot onto the pane model', () => {
+    const st = reduce(initialState(), { kind: 'Sessions', sessions: [
+      { name: 'amber-1-1-0-a', cwd: '/x', kind: 'shell', alive: true, slot: 4 } as unknown as SessionInfo,
+    ] })
+    expect(groupSessions(st)[0]!.tabs[0]!.panes[0]!.slot).toBe(4)
   })
 })

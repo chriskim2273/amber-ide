@@ -43,6 +43,13 @@ pub struct SessionMeta {
     /// exists for wire/format completeness. Defaulted for older records.
     #[serde(default)]
     pub run_state: Option<String>,
+    /// Stable per-session number: what `amber ls` prints and `amber attach <n>`
+    /// resolves. Assigned lowest-free at creation, carried unchanged across a
+    /// rename and a daemon restart, and freed only when the session leaves the
+    /// live table. `0` = unassigned — older records predating this field, or a
+    /// hand-edited store; `SessionManager::restore` repairs those.
+    #[serde(default)]
+    pub slot: u32,
 }
 
 /// Metadata for a Claude sub-session, persisted as `claude/<name>.json`.
@@ -284,6 +291,7 @@ mod tests {
             updated: 1_700_000_000,
             resume_as_claude: false,
             run_state: None,
+            slot: 1,
         }
     }
 

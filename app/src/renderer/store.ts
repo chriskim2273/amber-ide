@@ -33,7 +33,7 @@ export type DaemonEvent =
   | { kind: 'MarkSeen'; names: string[] }
   // UI-originated: the user dismissed the daemon-error banner.
   | { kind: 'ClearError' }
-export interface PaneModel { name: string; cwd: string; kind: string; alive: boolean; ord: number; deadCode: number | null; runState?: string | undefined; claudeId?: string | undefined }
+export interface PaneModel { name: string; cwd: string; kind: string; alive: boolean; ord: number; deadCode: number | null; runState?: string | undefined; claudeId?: string | undefined; slot?: number | undefined }
 export interface TabModel { tab: number; panes: PaneModel[] }
 export interface WorkspaceModel { ws: number; tabs: TabModel[] }
 
@@ -101,25 +101,6 @@ export function reduce(state: AppState, ev: DaemonEvent): AppState {
     case 'ClearError':
       return state.error === null ? state : { ...state, error: null }
   }
-}
-
-// The `amber ls` index of every live session, keyed by name.
-//
-// CONTRACT (mirrors the daemon, do not "improve" it): `amber ls` sorts by NAME
-// and prints a 1-based index, with no alive filter — and `amber attach <n>`
-// resolves against that same by-name sort (crates/amber/src/attach.rs
-// `pick_by_index`, and `run_ls` in main.rs which sorts for exactly this reason).
-// The pane header shows this number so the user can attach to that pane from a
-// terminal, so any divergence here sends them to the WRONG session.
-//
-// The index is positional: creating or killing a session renumbers the ones
-// after it, exactly as `ls` does. App-local panes (browser/editor) have no
-// daemon session and therefore no index.
-export function sessionIndex(sessions: { name: string }[]): Record<string, number> {
-  const out: Record<string, number> = {}
-  const sorted = sessions.map((s) => s.name).sort()
-  sorted.forEach((name, i) => { out[name] = i + 1 })
-  return out
 }
 
 export interface KindDot { cls: string; label: string }
@@ -218,7 +199,7 @@ export function groupSessions(state: AppState): WorkspaceModel[] {
     const pane: PaneModel = {
       name: sess.name, cwd: sess.cwd, kind: sess.kind, alive: sess.alive,
       ord: p.ord, deadCode: sess.name in state.dead ? state.dead[sess.name]! : null,
-      runState: sess.run_state, claudeId: sess.claude_id,
+      runState: sess.run_state, claudeId: sess.claude_id, slot: sess.slot,
     }
     if (!wsMap.has(p.ws)) wsMap.set(p.ws, new Map())
     const tabs = wsMap.get(p.ws)!

@@ -87,24 +87,25 @@ describe('browser pane cross-tab move', () => {
 
 // The pane header leads with the `amber ls` index so the user can jump to it
 // with `amber attach <n>` from any terminal.
-describe('deriveTab index prefix', () => {
-  const idx = { 'amber-1-1-0-x': 3, 'amber-1-1-1-y': 7 }
-  it('prefixes the daemon pane title with its ls index', () => {
-    const { paneMeta } = deriveTab([pane({ name: 'amber-1-1-0-x' })], null, {}, {}, '/home/u', {}, idx)
+describe('deriveTab slot prefix', () => {
+  it('prefixes the daemon pane title with its stable slot', () => {
+    const { paneMeta } = deriveTab([pane({ name: 'amber-1-1-0-x', slot: 3 })], null, {}, {}, '/home/u')
     expect(paneMeta['amber-1-1-0-x']!.title).toBe('#3 ~/proj · shell')
   })
-  it('keeps an OSC title but still leads with the index', () => {
-    const { paneMeta } = deriveTab([pane({ name: 'amber-1-1-1-y' })], null,
-      {}, { 'amber-1-1-1-y': 'vim README' }, '/home/u', {}, idx)
+  it('keeps an OSC title but still leads with the slot', () => {
+    const { paneMeta } = deriveTab([pane({ name: 'amber-1-1-1-y', slot: 7 })], null,
+      {}, { 'amber-1-1-1-y': 'vim README' }, '/home/u')
     expect(paneMeta['amber-1-1-1-y']!.title).toBe('#7 vim README · shell')
   })
-  it('gives an app-local pane no index (it has no daemon session)', () => {
+  it('gives an app-local pane no slot (it has no daemon session)', () => {
     const { paneMeta } = deriveTab([pane({ name: 'editor-1-1-0-z', kind: 'editor', cwd: '' })],
-      null, {}, {}, '/home/u', {}, idx)
+      null, {}, {}, '/home/u')
     expect(paneMeta['editor-1-1-0-z']!.title).toBe('untitled · editor')
   })
-  it('omits the prefix when the index is unknown (session not in the list yet)', () => {
-    const { paneMeta } = deriveTab([pane({ name: 'amber-9-9-9-new' })], null, {}, {}, '/home/u', {}, idx)
+  it('omits the prefix when the daemon reports no slot (older daemon) rather than inventing one', () => {
+    const { paneMeta } = deriveTab([pane({ name: 'amber-9-9-9-new' })], null, {}, {}, '/home/u')
     expect(paneMeta['amber-9-9-9-new']!.title).toBe('~/proj · shell')
+    const zero = deriveTab([pane({ name: 'amber-9-9-9-zero', slot: 0 })], null, {}, {}, '/home/u')
+    expect(zero.paneMeta['amber-9-9-9-zero']!.title).toBe('~/proj · shell')
   })
 })

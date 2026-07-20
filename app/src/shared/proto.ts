@@ -11,6 +11,10 @@ export interface SessionInfo {
   // ordering key for "most recent". Optional on the wire (serde default 0);
   // the app does not use it today.
   updated?: number
+  // Stable per-session number owned by the daemon (spec
+  // 2026-07-19-stable-session-slots): what `amber ls` prints and what
+  // `amber attach <n>` resolves. Absent/0 from an older daemon.
+  slot?: number
   // Claude supervision phase for a claude session: 'claude' (running),
   // 'claude-retrying' (crashed, retrying), 'shell-fallback' (dropped to a
   // shell). Optional on the wire (serde default None → undefined); decode-only,

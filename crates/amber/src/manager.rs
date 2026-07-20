@@ -2,7 +2,7 @@
 //! between them and the [`StateStore`]. This is the piece that replaces
 //! tmux-resurrect (restore) and tmux-continuum (snapshot).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -91,6 +91,14 @@ fn decide_resume(current: bool, detected: bool, streak: u32, threshold: u32) -> 
             (true, next)
         }
     }
+}
+
+/// The lowest-free session slot: the smallest integer `>= 1` not in `used`
+/// (spec §3.2). Pure. Numbers stay small and a freed one may be reused by a
+/// LATER create — deliberately not a forever-unique id, which would grow
+/// without bound for a long-lived daemon.
+fn alloc_slot(used: &BTreeSet<u32>) -> u32 {
+    (1..).find(|n| !used.contains(n)).expect("session slots exhausted")
 }
 
 impl SessionManager {
@@ -255,6 +263,16 @@ impl SessionManager {
         // works across daemon restarts / reboots regardless of launch context.
         let cwd = Self::resolve_cwd(&cwd.into());
         let sess = self.spawn(kind, name, &cwd)?;
+        // Allocate + persist + insert under ONE lock hold, so two concurrent
+        // creates can't be handed the same slot.
+        let mut sessions = self.sessions.lock().unwrap();
+        let slot = match Self::used_slots(&self.store, &sessions) {
+            Ok(used) => alloc_slot(&used),
+            Err(e) => {
+                let _ = sess.kill();
+                return Err(e);
+            }
+        };
         let meta = SessionMeta {
             name: name.to_string(),
             cwd,
@@ -262,17 +280,33 @@ impl SessionManager {
             updated: Self::now(),
             resume_as_claude: false,
             run_state: None,
+            slot,
         };
         if let Err(e) = self.store.write_session(&meta) {
             // Don't leak the freshly-spawned child if persisting fails.
             let _ = sess.kill();
             return Err(e);
         }
-        self.sessions
-            .lock()
-            .unwrap()
-            .insert(name.to_string(), Arc::clone(&sess));
+        sessions.insert(name.to_string(), Arc::clone(&sess));
         Ok(sess)
+    }
+
+    /// Slots held by every session in the live table — **including one whose
+    /// child has exited but has not been reaped yet**. `ls`/`attach` have no
+    /// alive filter, so a dead-but-listed session is still addressable by its
+    /// number; handing that number to a new session would make `attach <n>`
+    /// ambiguous, which is the exact bug slots exist to remove. A slot frees
+    /// only when the session leaves the table (kill/reap).
+    fn used_slots(
+        store: &StateStore,
+        sessions: &HashMap<String, Arc<PtySession>>,
+    ) -> anyhow::Result<BTreeSet<u32>> {
+        Ok(store
+            .list_sessions()?
+            .into_iter()
+            .filter(|m| m.slot >= 1 && sessions.contains_key(&m.name))
+            .map(|m| m.slot)
+            .collect())
     }
 
     /// Flush every live session's scrollback + metadata to the state store.
@@ -350,10 +384,28 @@ impl SessionManager {
     /// failure) is logged and skipped — it must never abort the rest, which
     /// would leave the daemon dead on startup with zero sessions restored
     /// (mirrors [`StateStore::list_sessions`]' tolerance of corrupt JSON).
+    ///
+    /// Slots are restored from the store and **repaired in passing**: the store
+    /// is user-visible JSON that can predate the field (`slot: 0`) or be
+    /// hand-edited into duplicates, so an unassigned or already-taken slot is
+    /// reassigned lowest-free. Restore order is by name, so the repair is
+    /// deterministic; a failure to persist a repair is logged, never fatal.
     pub fn restore(&self) -> anyhow::Result<()> {
-        let metas = self.store.list_sessions()?;
+        let mut metas = self.store.list_sessions()?;
+        metas.sort_by(|a, b| a.name.cmp(&b.name));
         let mut sessions = self.sessions.lock().unwrap();
-        for meta in metas {
+        let mut used: BTreeSet<u32> = BTreeSet::new();
+        for mut meta in metas {
+            if meta.slot < 1 || !used.insert(meta.slot) {
+                meta.slot = alloc_slot(&used);
+                used.insert(meta.slot);
+                if let Err(e) = self.store.write_session(&meta) {
+                    eprintln!(
+                        "amber daemon: could not persist repaired slot for {}: {e}",
+                        meta.name
+                    );
+                }
+            }
             match self.restore_one(&meta) {
                 Ok(sess) => {
                     sessions.insert(meta.name.clone(), sess);
@@ -504,6 +556,7 @@ impl SessionManager {
                     claude_id: self.store.read_claude(&meta.name).ok().flatten().map(|c| c.session_id),
                     cols: sess.size().map(|(_, c)| c).unwrap_or(0),
                     rows: sess.size().map(|(r, _)| r).unwrap_or(0),
+                    slot: meta.slot,
                 })
             })
             .collect();
@@ -623,6 +676,9 @@ impl SessionManager {
             claude_id: self.store.read_claude(to).ok().flatten().map(|c| c.session_id),
             cols: sess.size().map(|(_, c)| c).unwrap_or(0),
             rows: sess.size().map(|(r, _)| r).unwrap_or(0),
+            // A rename carries the slot across unchanged (spec §2): the slot
+            // keys off the session, not its name.
+            slot: meta.slot,
         })
     }
 
@@ -793,6 +849,7 @@ mod tests {
                     updated: 1,
                     resume_as_claude: false,
                     run_state: None,
+                    slot: 0,
                 })
                 .unwrap();
         }
@@ -927,6 +984,142 @@ mod tests {
             vec!["amber-1-1-0-a".to_string(), "amber-1-1-1-b".to_string()]
         );
         assert!(mgr.session("amber-1-1-1-b").unwrap().is_alive());
+    }
+
+    // ---- stable slots (spec 2026-07-19) ---------------------------------
+
+    /// (name, slot) for every session in the live table, by name.
+    fn slots(mgr: &SessionManager) -> Vec<(String, u32)> {
+        mgr.session_infos()
+            .unwrap()
+            .into_iter()
+            .map(|i| (i.name, i.slot))
+            .collect()
+    }
+
+    #[test]
+    fn alloc_slot_takes_the_lowest_free_number() {
+        assert_eq!(alloc_slot(&BTreeSet::new()), 1);
+        assert_eq!(alloc_slot(&BTreeSet::from([1, 2, 4])), 3);
+        assert_eq!(alloc_slot(&BTreeSet::from([1, 2, 3])), 4);
+        assert_eq!(alloc_slot(&BTreeSet::from([2, 3])), 1);
+    }
+
+    #[test]
+    fn slots_are_stable_across_another_sessions_death() {
+        // THE regression this feature exists for: create three, kill the
+        // middle one, the other two keep their numbers (a positional index
+        // would have renumbered the third from 3 to 2).
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        for n in ["a", "b", "c"] {
+            mgr.create(n, "/tmp", SessionKind::Shell).unwrap();
+        }
+        assert_eq!(
+            slots(&mgr),
+            vec![("a".into(), 1), ("b".into(), 2), ("c".into(), 3)]
+        );
+
+        mgr.remove("b").unwrap();
+        assert_eq!(slots(&mgr), vec![("a".into(), 1), ("c".into(), 3)]);
+
+        // The freed number is reused by a LATER create (accepted tradeoff).
+        mgr.create("d", "/tmp", SessionKind::Shell).unwrap();
+        assert_eq!(
+            slots(&mgr),
+            vec![("a".into(), 1), ("c".into(), 3), ("d".into(), 2)]
+        );
+    }
+
+    #[test]
+    fn a_dead_but_unreaped_session_keeps_its_slot_reserved() {
+        // `ls`/`attach` have no alive filter, so a dead-but-listed session is
+        // still addressable — its slot must NOT be handed to a new session
+        // (that would make `attach <n>` ambiguous, the very bug this removes).
+        // The number frees only when the session leaves the table (reap).
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        mgr.create("dies", "/tmp", SessionKind::Shell).unwrap();
+        mgr.create("lives", "/tmp", SessionKind::Shell).unwrap();
+
+        mgr.write("dies", b"exit\n").unwrap();
+        let sess = mgr.session("dies").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while sess.is_alive() {
+            assert!(std::time::Instant::now() < deadline, "shell never exited");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        // Dead, but still in the table and still listed.
+        mgr.create("fresh", "/tmp", SessionKind::Shell).unwrap();
+        assert_eq!(
+            slots(&mgr),
+            vec![("dies".into(), 1), ("fresh".into(), 3), ("lives".into(), 2)],
+            "a dead-but-unreaped session must keep its slot reserved"
+        );
+
+        // Reaped: now the number is free for the next create.
+        assert_eq!(mgr.reap().unwrap(), vec!["dies".to_string()]);
+        mgr.create("after", "/tmp", SessionKind::Shell).unwrap();
+        assert_eq!(
+            slots(&mgr),
+            vec![("after".into(), 1), ("fresh".into(), 3), ("lives".into(), 2)]
+        );
+    }
+
+    #[test]
+    fn rename_carries_the_slot_across_unchanged() {
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        mgr.create("amber-1-1-0-a", "/tmp", SessionKind::Shell).unwrap();
+        mgr.create("amber-1-1-1-b", "/tmp", SessionKind::Shell).unwrap();
+
+        let info = mgr.rename("amber-1-1-1-b", "amber-1-2-0-b").unwrap();
+        assert_eq!(info.slot, 2, "a rename must not change the slot");
+        assert_eq!(
+            slots(&mgr),
+            vec![("amber-1-1-0-a".into(), 1), ("amber-1-2-0-b".into(), 2)]
+        );
+    }
+
+    #[test]
+    fn restore_keeps_stored_slots_and_repairs_missing_or_duplicate_ones() {
+        // The store is user-visible JSON: it can predate this feature (slot 0)
+        // or be hand-edited into duplicates. Restore must repair, never panic
+        // or abort, and do it deterministically (by-name order).
+        let dir = tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        let write = |name: &str, slot: u32| {
+            store
+                .write_session(&SessionMeta {
+                    name: name.to_string(),
+                    cwd: PathBuf::from("/tmp"),
+                    kind: SessionKind::Shell,
+                    updated: 1,
+                    resume_as_claude: false,
+                    run_state: None,
+                    slot,
+                })
+                .unwrap()
+        };
+        write("keeps", 7); // valid, must survive untouched
+        write("zero", 0); // predates slots -> repaired to the lowest free
+        write("dupe", 7); // collides with "keeps" -> repaired
+
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        mgr.restore().unwrap();
+
+        // By-name restore order: dupe, keeps, zero.
+        //   dupe takes 7 first (it is valid at that point),
+        //   keeps then collides and is repaired to 1,
+        //   zero is unassigned and takes 2.
+        assert_eq!(
+            slots(&mgr),
+            vec![("dupe".into(), 7), ("keeps".into(), 1), ("zero".into(), 2)]
+        );
+        // The repair is persisted, so it survives the next restart too.
+        assert_eq!(store.read_session("keeps").unwrap().unwrap().slot, 1);
+        assert_eq!(store.read_session("zero").unwrap().unwrap().slot, 2);
     }
 
     #[test]

@@ -425,6 +425,30 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   headlessly). NOTE: `npm install` is required after pulling this — it adds the
   CodeMirror 6 packages + `marked`.
 
+- [x] Stable session slots (2026-07-19) — replaces the positional index shipped
+  hours earlier: killing a session no longer renumbers the others. Spec:
+  `docs/superpowers/specs/2026-07-19-stable-session-slots-design.md`. The daemon
+  owns a `slot: u32` per session (`SessionMeta` + `SessionInfo`, both
+  `#[serde(default)]` so the wire stays additive), assigned **lowest-free**,
+  persisted, surviving a daemon restart and a `Rename`. `amber ls` prints the
+  slot and `amber attach <n>` resolves by it (`pick_by_slot`, deliberately with
+  NO positional fallback — a fallback would resurrect the ambiguity). The app no
+  longer computes a number at all (`sessionIndex` deleted): the slot rides
+  `SessionInfo` → `PaneModel` → the header, and a pane whose daemon reports slot
+  0/absent shows NO prefix rather than a wrong one. **Allocation dedupes against
+  every session the daemon still lists, dead-but-unreaped included** — `ls`, the
+  app and `attach` all keep listing a dead session until reap (that's the
+  "exited · close pane" overlay), so allocating against live-only would hand its
+  number to a new session and print two `#2`s. A slot frees on REMOVAL, not on
+  death. Gates: Rust 221 tests ×2 + clippy clean, app 357 tests + typecheck.
+  **Live-verified**: headers matched `ls`; killing the middle of three left the
+  others at #1/#3 in both CLI and app; a pane left dead-but-listed did NOT have
+  its number taken by the next create (it got #3, not the dead #2); slots
+  survived a daemon restart; `amber attach 3` typed into the pane whose header
+  read `#3`; an unknown slot errors with "no session with slot 9 (see `amber
+  ls`)". **A running daemon must be restarted to emit `slot`** — until then the
+  app sees 0 and shows no prefix.
+
 - [x] Pane `#index` in the header (2026-07-19) — each daemon pane's title leads
   with its `amber ls` index (`#3 ~/proj · shell`) so a pane can be reached from
   any terminal with `amber attach 3`. The index is derived by mirroring the

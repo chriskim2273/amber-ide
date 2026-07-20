@@ -149,15 +149,17 @@ pub fn pick_newest(sessions: &[proto::SessionInfo]) -> Option<&proto::SessionInf
         .max_by(|a, b| a.updated.cmp(&b.updated).then_with(|| a.name.cmp(&b.name)))
 }
 
-/// The session at 1-based `index` in the by-name sort — the exact ordering
-/// `amber ls` prints, so `amber attach <n>` selects the n-th listed session.
-/// No alive filter (matches `ls`, which lists every session). `None` for index
-/// 0 or out of range.
-pub fn pick_by_index(sessions: &[proto::SessionInfo], index: usize) -> Option<&proto::SessionInfo> {
-    let i = index.checked_sub(1)?;
-    let mut refs: Vec<&proto::SessionInfo> = sessions.iter().collect();
-    refs.sort_by(|a, b| a.name.cmp(&b.name));
-    refs.get(i).copied()
+/// The session holding `slot` — the STABLE number `amber ls` prints, so
+/// `amber attach <n>` always reaches the same session regardless of what else
+/// was created or killed. No alive filter (matches `ls`, which lists every
+/// session in the daemon's table). Deliberately NO positional fallback: falling
+/// back to "the n-th listed session" would resurrect exactly the ambiguity
+/// slots exist to remove. `0` is "unassigned" on the wire and never matches.
+pub fn pick_by_slot(sessions: &[proto::SessionInfo], slot: u32) -> Option<&proto::SessionInfo> {
+    if slot == 0 {
+        return None;
+    }
+    sessions.iter().find(|s| s.slot == slot)
 }
 
 /// One stdin chunk scanned for prefix commands (see [`scan_prefix`]).
@@ -883,6 +885,7 @@ mod tests {
             claude_id: None,
             cols: 80,
             rows: 24,
+            slot: 0,
         }
     }
 
@@ -929,16 +932,25 @@ mod tests {
     }
 
     #[test]
-    fn pick_by_index_matches_ls_order() {
-        // Given out-of-order input, indexing follows the by-name sort (== `ls`).
-        let s = [info("amber-c", true, 1), info("amber-a", false, 9), info("amber-b", true, 5)];
-        assert_eq!(pick_by_index(&s, 1).unwrap().name, "amber-a"); // sorted: a,b,c
-        assert_eq!(pick_by_index(&s, 2).unwrap().name, "amber-b");
-        assert_eq!(pick_by_index(&s, 3).unwrap().name, "amber-c"); // dead sessions still indexed
-        // 0 is invalid (1-based); past-the-end is None.
-        assert!(pick_by_index(&s, 0).is_none());
-        assert!(pick_by_index(&s, 4).is_none());
-        assert!(pick_by_index(&[], 1).is_none());
+    fn pick_by_slot_matches_the_sessions_own_number() {
+        // Slots are the session's OWN number, not its position: list order is
+        // irrelevant, and a gap (a killed session) stays a gap rather than
+        // renumbering everything after it.
+        let mut s =
+            [info("amber-c", true, 1), info("amber-a", false, 9), info("amber-b", true, 5)];
+        s[0].slot = 4;
+        s[1].slot = 1;
+        s[2].slot = 2;
+        assert_eq!(pick_by_slot(&s, 1).unwrap().name, "amber-a"); // dead, still addressable
+        assert_eq!(pick_by_slot(&s, 2).unwrap().name, "amber-b");
+        assert_eq!(pick_by_slot(&s, 4).unwrap().name, "amber-c");
+        // A free number resolves to nothing — deliberately NO positional
+        // fallback, which would resurrect the ambiguity slots exist to remove.
+        assert!(pick_by_slot(&s, 3).is_none());
+        assert!(pick_by_slot(&s, 5).is_none());
+        // 0 is "unassigned" on the wire (older daemon), never a match.
+        assert!(pick_by_slot(&s, 0).is_none());
+        assert!(pick_by_slot(&[], 1).is_none());
     }
 
     #[test]
