@@ -425,6 +425,18 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   headlessly). NOTE: `npm install` is required after pulling this — it adds the
   CodeMirror 6 packages + `marked`.
 
+- [x] Pane `#index` in the header (2026-07-19) — each daemon pane's title leads
+  with its `amber ls` index (`#3 ~/proj · shell`) so a pane can be reached from
+  any terminal with `amber attach 3`. The index is derived by mirroring the
+  daemon's contract EXACTLY — by-name sort, 1-based, no alive filter (`run_ls`
+  in main.rs and `attach::pick_by_index` both sort by name for this reason) — so
+  it is positional and renumbers on create/kill just like `ls`. Pure
+  `sessionIndex` in `store.ts` (TDD'd) feeds `deriveTab`; app-local panes
+  (browser/editor) have no daemon session and so no index. Gates: app 359 tests
+  + typecheck. **Live-verified** against a private daemon: headers showed #1/#2/#3
+  matching `amber ls`, killing session 1 renumbered both the CLI and the headers
+  identically, and `amber attach 2` typed into the pane whose header read `#2`.
+
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**
   `std::io::Read` (dedicated thread); `take_writer()` is one-shot;

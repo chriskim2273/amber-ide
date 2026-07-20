@@ -2,7 +2,7 @@ import { useCallback, useEffect, useReducer, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { SplitView, type PaneMeta } from './SplitView'
 import type { EditorApi } from './Editor'
-import { initialState, reduce, groupSessions, mergeBrowsers, mergeEditors, tabDot, hasActivity, type DaemonEvent } from './store'
+import { initialState, reduce, groupSessions, mergeBrowsers, mergeEditors, sessionIndex, tabDot, hasActivity, type DaemonEvent } from './store'
 import { deriveTab, shortCwd } from './tabView'
 import { formatName, makeId, retargetPane } from '../shared/names'
 import { formatBrowserName, isBrowserName } from '../shared/browserName'
@@ -287,7 +287,11 @@ function App(): JSX.Element {
   // layer map uses below — no drift). allLive is the UNFILTERED name set (keeps
   // the pending-split placement effect's `liveKey`).
   const allLive = tab?.panes.map((p) => p.name) ?? []
-  const { tree, paneMeta, deadCodes, liveIds } = deriveTab(tab?.panes ?? [], storedTree, pending, titles, home, state.mem)
+  // `amber ls` index per session, so a pane header can say `#3` and the user can
+  // reach that exact pane with `amber attach 3`. Derived from the FULL live
+  // session list (the index is global, not per tab/workspace).
+  const lsIndex = sessionIndex(state.sessions)
+  const { tree, paneMeta, deadCodes, liveIds } = deriveTab(tab?.panes ?? [], storedTree, pending, titles, home, state.mem, lsIndex)
 
   // Zoom (transient, per tab). Tab numbering restarts per workspace (every ws
   // has a tab 1), so the zoom map and the structural-clear ref are keyed by the
@@ -951,7 +955,7 @@ function App(): JSX.Element {
             : orderedTabs.map((t) => {
                 const isActive = t.tab === (tab?.tab ?? -1)
                 const stored = layout.workspaces[wsKey]?.tabs[String(t.tab)]?.tree ?? null
-                const d = isActive ? { tree, paneMeta, deadCodes } : deriveTab(t.panes, stored, pending, titles, home, state.mem)
+                const d = isActive ? { tree, paneMeta, deadCodes } : deriveTab(t.panes, stored, pending, titles, home, state.mem, lsIndex)
                 // `const` so the truthy-branch narrowing (Node|null -> Node) is kept
                 // inside the handler closures. Handlers operate on the layer's own
                 // tree; only the active layer is reachable (background is
