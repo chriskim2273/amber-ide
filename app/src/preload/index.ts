@@ -44,6 +44,30 @@ contextBridge.exposeInMainWorld('amber', {
   // menu, so the native copy role can't reach it).
   clipboardWrite: (text: string): void => ipcRenderer.send('clipboard-write', text),
   clipboardRead: (): Promise<string> => ipcRenderer.invoke('clipboard-read'),
+  editorOpenDialog: (): Promise<
+    { path: string; text: string; mtimeMs: number } | { path: string; error: string } | null
+  > => ipcRenderer.invoke('editor-open-dialog'),
+  editorRead: (path: string): Promise<{ text: string; mtimeMs: number } | { error: string }> =>
+    ipcRenderer.invoke('editor-read', path),
+  editorSave: (
+    path: string,
+    text: string,
+    expectedMtimeMs: number | null,
+  ): Promise<{ mtimeMs: number } | { conflict: true; mtimeMs: number } | { error: string }> =>
+    ipcRenderer.invoke('editor-save', path, text, expectedMtimeMs),
+  editorSaveDialog: (
+    suggestedName: string,
+    text: string,
+  ): Promise<{ path: string; mtimeMs: number } | { path: string; error: string } | null> =>
+    ipcRenderer.invoke('editor-save-dialog', suggestedName, text),
+  editorDraftWrite: (paneId: string, text: string): Promise<void> =>
+    ipcRenderer.invoke('editor-draft-write', paneId, text),
+  editorDraftRead: (paneId: string): Promise<string | null> =>
+    ipcRenderer.invoke('editor-draft-read', paneId),
+  editorDraftClear: (paneId: string): Promise<void> =>
+    ipcRenderer.invoke('editor-draft-clear', paneId),
+  editorInlineImages: (mdDir: string, html: string): Promise<{ html: string }> =>
+    ipcRenderer.invoke('editor-inline-images', mdDir, html),
 })
 
 // A transferred MessagePort cannot cross contextBridge; re-dispatch the live

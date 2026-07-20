@@ -34,7 +34,11 @@ export function deriveTab(
     if (p.deadCode !== null) deadCodes[p.name] = p.deadCode
     // Prefer a live OSC title over cwd; blank OSC 2 (some prompts) falls back.
     const osc = titles[p.name]
-    const lead = osc && osc.trim().length > 0 ? osc : shortCwd(p.cwd, home)
+    // An editor pane has no OSC stream: it reports its file name through the same
+    // title channel, and an unsaved buffer has neither that nor a cwd.
+    const lead = osc && osc.trim().length > 0
+      ? osc
+      : (p.kind === 'editor' ? (p.cwd ? shortCwd(p.cwd, home) : 'untitled') : shortCwd(p.cwd, home))
     // A claude pane that fell back to a shell is labelled as such, not "claude".
     const suffix = p.runState === 'shell-fallback' ? 'shell (claude exited)' : p.kind
     // Raw absolute cwd (not shortCwd) so the context-menu "copy cwd" resolves.

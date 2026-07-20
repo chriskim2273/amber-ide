@@ -110,6 +110,7 @@ export interface KindDot { cls: string; label: string }
 // amber = claude, pulsing amber = claude-retrying, gray = shell-fallback.
 export function paneDot(kind: string, runState: string | undefined): KindDot {
   if (kind === 'browser') return { cls: 'browser', label: 'browser' }
+  if (kind === 'editor') return { cls: 'editor', label: 'editor' }
   if (kind !== 'claude') return { cls: 'shell', label: 'shell' }
   switch (runState) {
     case 'claude-retrying': return { cls: 'claude-retrying', label: 'claude (retrying)' }
@@ -145,7 +146,29 @@ export function hasActivity(state: AppState, panes: PaneModel[], frozen?: Set<st
 // browser pane's {ws,tab} may be a grouping that has no daemon session at all,
 // so ws/tab entries are created on demand. Result stays sorted by ord.
 export function mergeBrowsers(workspaces: WorkspaceModel[], browsers: Record<string, BrowserEntry>): WorkspaceModel[] {
-  const entries = Object.entries(browsers)
+  return mergeLocalPanes(workspaces, browsers, 'browser')
+}
+
+// Editor panes (spec 2026-07-19) are the same class as browser panes: app-local,
+// sidecar-owned, no daemon session. `cwd` carries the file's directory so the
+// pane header/title can show something useful; an unsaved scratch pane has none.
+export function mergeEditors(
+  workspaces: WorkspaceModel[],
+  editors: Record<string, { ws: number; tab: number; ord: number; path: string | null }>,
+): WorkspaceModel[] {
+  return mergeLocalPanes(workspaces, editors, 'editor')
+}
+
+// Shared body of the two merges above: fold sidecar-owned panes into the grouped
+// model so they flow through deriveTab exactly like a daemon pane. Such a pane's
+// {ws,tab} may be a grouping with no daemon session at all, so ws/tab entries are
+// created on demand. Result stays sorted by ord.
+function mergeLocalPanes(
+  workspaces: WorkspaceModel[],
+  entriesMap: Record<string, { ws: number; tab: number; ord: number; path?: string | null }>,
+  kind: string,
+): WorkspaceModel[] {
+  const entries = Object.entries(entriesMap)
   if (entries.length === 0) return workspaces
   const wsMap = new Map<number, Map<number, PaneModel[]>>()
   for (const w of workspaces) {
@@ -157,7 +180,8 @@ export function mergeBrowsers(workspaces: WorkspaceModel[], browsers: Record<str
     if (!wsMap.has(b.ws)) wsMap.set(b.ws, new Map())
     const tabs = wsMap.get(b.ws)!
     if (!tabs.has(b.tab)) tabs.set(b.tab, [])
-    tabs.get(b.tab)!.push({ name, cwd: '', kind: 'browser', alive: true, ord: b.ord, deadCode: null })
+    const cwd = typeof b.path === 'string' ? b.path.slice(0, b.path.lastIndexOf('/') + 1) : ''
+    tabs.get(b.tab)!.push({ name, cwd, kind, alive: true, ord: b.ord, deadCode: null })
   }
   return [...wsMap.entries()].sort((a, b) => a[0] - b[0]).map(([ws, tabs]) => ({
     ws,

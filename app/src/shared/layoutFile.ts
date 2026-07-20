@@ -16,6 +16,22 @@ export interface FrozenEntry { note?: string }
 // with NO daemon session, keyed by a `browser-<ws>-<tab>-<ord>-<id>` paneId.
 // This map is the pane's entire existence — grouping (ws/tab/ord) + last URL.
 export interface BrowserEntry { ws: number; tab: number; ord: number; url: string }
+// `editors` are app-local file-editor panes (spec 2026-07-19): the same class as
+// `browsers` — a synthetic leaf with NO daemon session, keyed by an
+// `editor-<ws>-<tab>-<ord>-<id>` paneId. This map is the pane's entire
+// existence: grouping (ws/tab/ord) + the file path + per-pane view prefs.
+// `path: null` = an unsaved scratch buffer. Buffer TEXT never lives here (the
+// sidecar is small and rewritten often — drafts go to <state>/drafts/).
+export interface EditorEntry {
+  ws: number
+  tab: number
+  ord: number
+  path: string | null
+  view?: 'code' | 'split' | 'preview'
+  outline?: boolean
+  wrap?: boolean
+}
+export const RECENT_FILES_MAX = 20
 export interface LayoutFile {
   version: number
   activeWorkspace: number
@@ -23,6 +39,8 @@ export interface LayoutFile {
   fontSize?: number
   frozen?: Record<string, FrozenEntry>
   browsers?: Record<string, BrowserEntry>
+  editors?: Record<string, EditorEntry>
+  recentFiles?: string[] // most-recent-first, deduped, capped at RECENT_FILES_MAX
 }
 
 // Shape-guard the frozen map (Task 4 lesson): reject a non-object/array top
@@ -53,6 +71,41 @@ function parseBrowsers(v: unknown): Record<string, BrowserEntry> | undefined {
     }
   }
   return out
+}
+
+// Shape-guard the editors map (same lesson as parseBrowsers). Note `path` is
+// `string | null` — null is the legitimate unsaved-scratch case, NOT a malformed
+// entry. Optional view/outline/wrap are dropped individually when mistyped so a
+// hand-edited pref never costs the user the pane.
+function parseEditors(v: unknown): Record<string, EditorEntry> | undefined {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return undefined
+  const out: Record<string, EditorEntry> = {}
+  for (const [name, e] of Object.entries(v)) {
+    if (typeof e !== 'object' || e === null || Array.isArray(e)) continue
+    const { ws, tab, ord, path, view, outline, wrap } = e as Record<string, unknown>
+    if (typeof ws !== 'number' || typeof tab !== 'number' || typeof ord !== 'number') continue
+    if (!Number.isFinite(ws) || !Number.isFinite(tab) || !Number.isFinite(ord)) continue
+    if (typeof path !== 'string' && path !== null) continue
+    out[name] = {
+      ws, tab, ord, path,
+      ...(view === 'code' || view === 'split' || view === 'preview' ? { view } : {}),
+      ...(typeof outline === 'boolean' ? { outline } : {}),
+      ...(typeof wrap === 'boolean' ? { wrap } : {}),
+    }
+  }
+  return out
+}
+
+// Most-recent-first, deduped, capped. The invariant lives in the parser too so a
+// hand-edited sidecar can't grow the list without bound.
+function parseRecentFiles(v: unknown): string[] | undefined {
+  if (!Array.isArray(v)) return undefined
+  return [...new Set(v.filter((p): p is string => typeof p === 'string'))].slice(0, RECENT_FILES_MAX)
+}
+
+// Add a path to the recents list (most-recent-first, deduped, capped).
+export function pushRecent(list: string[] | undefined, path: string): string[] {
+  return [path, ...(list ?? []).filter((p) => p !== path)].slice(0, RECENT_FILES_MAX)
 }
 
 // Shape-guard each workspace's hand-editable display fields (same lesson as
@@ -126,6 +179,14 @@ export function parseLayout(text: string): LayoutFile {
       ...((): { browsers?: Record<string, BrowserEntry> } => {
         const b = parseBrowsers(v.browsers)
         return b ? { browsers: b } : {}
+      })(),
+      ...((): { editors?: Record<string, EditorEntry> } => {
+        const e = parseEditors(v.editors)
+        return e ? { editors: e } : {}
+      })(),
+      ...((): { recentFiles?: string[] } => {
+        const r = parseRecentFiles(v.recentFiles)
+        return r ? { recentFiles: r } : {}
       })(),
     }
   } catch {

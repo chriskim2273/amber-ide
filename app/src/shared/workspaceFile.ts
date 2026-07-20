@@ -1,7 +1,8 @@
 import type { Node } from '../renderer/layout'
 import { formatName } from './names'
 import { formatBrowserName } from './browserName'
-import type { LayoutFile, WsLayout, TabLayout, FrozenEntry, BrowserEntry } from './layoutFile'
+import { formatEditorName } from './editorName'
+import type { LayoutFile, WsLayout, TabLayout, FrozenEntry, BrowserEntry, EditorEntry } from './layoutFile'
 
 // The `.amberws` portable workspace file. Structure (grouping/tree/labels) +
 // per-pane scrollback, versioned. Tree leaves are file-local placeholders
@@ -10,12 +11,15 @@ export const WORKSPACE_VERSION = 1
 
 export interface WsPane {
   id: string // placeholder referenced by tree leaves (p0, p1…)
-  kind: string // 'shell' | 'claude' | 'browser' (app-local; stored verbatim)
+  kind: string // 'shell' | 'claude' | 'browser' | 'editor' (app-local kinds stored verbatim)
   cwd: string
   ord: number
   frozenNote?: string // presence (incl. '') = frozen; the value is the note
-  scrollback: string // base64; '' when no dump was captured (always '' for browser)
+  scrollback: string // base64; '' when no dump was captured (always '' for browser/editor)
   url?: string // browser panes only: the saved address
+  // Editor panes only: the file PATH. Contents are NEVER embedded — a loaded
+  // editor pane re-reads the file from disk. null = unsaved scratch buffer.
+  path?: string | null
 }
 export interface WsTab {
   tab: number
@@ -83,6 +87,9 @@ function parsePane(v: unknown): WsPane {
     // frozenNote is optional; drop it unless a string ('' is valid = frozen, no note).
     ...(typeof p['frozenNote'] === 'string' ? { frozenNote: p['frozenNote'] } : {}),
     ...(typeof p['url'] === 'string' ? { url: p['url'] } : {}),
+    // `path` is string | null; anything else (incl. missing) loads as a scratch
+    // buffer rather than failing the whole file.
+    ...('path' in p ? { path: typeof p['path'] === 'string' ? p['path'] : null } : {}),
   }
 }
 
@@ -165,7 +172,7 @@ export function treeFromPlaceholders(tree: Node | null, idToName: Record<string,
 // Narrow structural inputs (superset-compatible with store.ts's WorkspaceModel/
 // TabModel/PaneModel) so this module stays pure and never imports the renderer
 // store.
-export interface SavePane { name: string; cwd: string; kind: string; ord: number; url?: string }
+export interface SavePane { name: string; cwd: string; kind: string; ord: number; url?: string; path?: string | null }
 export interface SaveTab { tab: number; panes: SavePane[] }
 export interface SaveWorkspace { ws: number; tabs: SaveTab[] }
 
@@ -197,11 +204,14 @@ export function assembleSave(
           cwd: p.cwd,
           ord: p.ord,
           // Browser panes have no daemon scrollback; they carry a URL instead.
-          scrollback: p.kind === 'browser' ? '' : (dump ? toBase64(dump) : ''),
+          // Browser/editor panes are app-local: no daemon scrollback. They carry
+          // a URL / a file path instead.
+          scrollback: p.kind === 'browser' || p.kind === 'editor' ? '' : (dump ? toBase64(dump) : ''),
           // Frozen presence must survive even with no note → encode '' so the
           // pane still round-trips as frozen (presence, not truthiness).
           ...(fz ? { frozenNote: fz.note ?? '' } : {}),
           ...(p.kind === 'browser' ? { url: p.url ?? '' } : {}),
+          ...(p.kind === 'editor' ? { path: p.path ?? null } : {}),
         }
       })
       return {
@@ -232,6 +242,7 @@ export interface LoadPlan {
   frozen: Record<string, FrozenEntry> // keyed by minted session name
   scrollback: Record<string, Uint8Array> // keyed by minted session name
   browsers: Record<string, BrowserEntry> // app-local browser panes, keyed by minted browser id
+  editors: Record<string, EditorEntry> // app-local editor panes, keyed by minted editor id
   targetWorkspaces: number[] // ws numbers used, in doc order
 }
 
@@ -242,6 +253,7 @@ export function buildLoadPlan(doc: WorkspaceDoc, opts: LoadOptions): LoadPlan {
   const frozen: Record<string, FrozenEntry> = {}
   const scrollback: Record<string, Uint8Array> = {}
   const browsers: Record<string, BrowserEntry> = {}
+  const editors: Record<string, EditorEntry> = {}
   const targetWorkspaces: number[] = []
 
   doc.workspaces.forEach((ws, wsIdx) => {
@@ -257,6 +269,14 @@ export function buildLoadPlan(doc: WorkspaceDoc, opts: LoadOptions): LoadPlan {
           const bname = formatBrowserName({ ws: targetWs, tab: tab.tab, ord: pane.ord, id: opts.mintId() })
           idToName[pane.id] = bname
           browsers[bname] = { ws: targetWs, tab: tab.tab, ord: pane.ord, url: pane.url ?? '' }
+          continue
+        }
+        // Editor panes are app-local too (same class as browser): sidecar entry,
+        // no daemon session. Only the path is restored; contents come from disk.
+        if (pane.kind === 'editor') {
+          const ename = formatEditorName({ ws: targetWs, tab: tab.tab, ord: pane.ord, id: opts.mintId() })
+          idToName[pane.id] = ename
+          editors[ename] = { ws: targetWs, tab: tab.tab, ord: pane.ord, path: pane.path ?? null }
           continue
         }
         const name = formatName({ ws: targetWs, tab: tab.tab, ord: pane.ord, id: opts.mintId() })
@@ -279,7 +299,7 @@ export function buildLoadPlan(doc: WorkspaceDoc, opts: LoadOptions): LoadPlan {
     }
   })
 
-  return { creates, workspaces, frozen, scrollback, browsers, targetWorkspaces }
+  return { creates, workspaces, frozen, scrollback, browsers, editors, targetWorkspaces }
 }
 
 // Lowest free workspace number: one above the highest live number (gaps are NOT
@@ -311,6 +331,7 @@ export function planLoad(
     frozen: { ...firstPlan.frozen, ...restPlan.frozen },
     scrollback: { ...firstPlan.scrollback, ...restPlan.scrollback },
     browsers: { ...firstPlan.browsers, ...restPlan.browsers },
+    editors: { ...firstPlan.editors, ...restPlan.editors },
     targetWorkspaces: [...firstPlan.targetWorkspaces, ...restPlan.targetWorkspaces],
   }
 }

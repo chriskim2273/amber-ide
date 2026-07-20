@@ -16,16 +16,43 @@
   "build": {
     "appId": "com.amber-ide.app",
     "productName": "amber-ide",
-    "directories": { "output": "release" },
-    "files": ["out/**/*", "package.json"],
-    "extraResources": [
-      { "from": "resources/bin", "to": "bin", "filter": ["**/*"] },
-      { "from": "resources/icon.png", "to": "icon.png" }
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "out/**/*",
+      "package.json"
     ],
-    "linux": { "target": ["AppImage"], "category": "Development" },
+    "extraResources": [
+      {
+        "from": "resources/bin",
+        "to": "bin",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "resources/icon.png",
+        "to": "icon.png"
+      }
+    ],
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "category": "Development"
+    },
     "mac": {
       "category": "public.app-category.developer-tools",
-      "target": [{ "target": "dmg", "arch": ["arm64", "x64"] }]
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        }
+      ]
     }
   },
   "devDependencies": {
@@ -44,10 +71,20 @@
     "vitest": "^2.0.0"
   },
   "dependencies": {
+    "@codemirror/commands": "^6.10.4",
+    "@codemirror/lang-json": "^6.0.2",
+    "@codemirror/lang-markdown": "^6.5.1",
+    "@codemirror/language": "^6.12.4",
+    "@codemirror/lint": "^6.9.7",
+    "@codemirror/search": "^6.7.1",
+    "@codemirror/state": "^6.7.1",
+    "@codemirror/view": "^6.43.6",
+    "@lezer/highlight": "^1.2.3",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/addon-search": "^0.16.0",
     "@xterm/addon-webgl": "^0.19.0",
     "@xterm/xterm": "^6.0.0",
+    "marked": "^18.0.6",
     "react": "^18.3.0",
     "react-dom": "^18.3.0"
   }

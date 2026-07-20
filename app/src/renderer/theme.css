@@ -219,6 +219,8 @@ body {
 .tab .kind-dot.claude { background: var(--warn); }
 .tab .kind-dot.shell { background: var(--accent-2); }
 .tab .kind-dot.browser { background: var(--ok, #3fb950); }
+/* editor pane — app-local like a browser pane, distinct hue */
+.tab .kind-dot.editor { background: var(--accent, #7c6cff); }
 /* claude crashed and is retrying — pulsing amber draws the eye */
 .tab .kind-dot.claude-retrying { background: var(--warn); animation: pulse 1.2s ease-in-out infinite; }
 /* claude gave up / user quit — pane is a plain shell now (gray) */
@@ -322,6 +324,7 @@ body {
 .pane-header .kind-dot.shell { background: var(--accent-2); }
 /* app-local web viewer (green) */
 .pane-header .kind-dot.browser { background: var(--ok, #3fb950); }
+.pane-header .kind-dot.editor { background: var(--accent, #7c6cff); }
 
 /* Browser pane: address bar above the <webview>. */
 .browser-bar {

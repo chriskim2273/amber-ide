@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useReducer, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { SplitView, type PaneMeta } from './SplitView'
-import { initialState, reduce, groupSessions, mergeBrowsers, tabDot, hasActivity, type DaemonEvent } from './store'
+import type { EditorApi } from './Editor'
+import { initialState, reduce, groupSessions, mergeBrowsers, mergeEditors, tabDot, hasActivity, type DaemonEvent } from './store'
 import { deriveTab, shortCwd } from './tabView'
 import { formatName, makeId, retargetPane } from '../shared/names'
 import { formatBrowserName, isBrowserName } from '../shared/browserName'
+import { formatEditorName, isEditorName } from '../shared/editorName'
 import { splitLeaf, setRatio, reconcile, leaves, moveLeaf, type Node } from './layout'
 import { emptyLayout, parseLayout, serializeLayout, orderTabs, moveTab, type LayoutFile, type TabLayout } from '../shared/layoutFile'
 import {
@@ -38,6 +40,18 @@ declare global {
       revealPath: (abs: string) => void
       clipboardWrite: (text: string) => void
       clipboardRead: () => Promise<string>
+      // Editor pane file IO (spec 2026-07-19 §4) — all disk access lives in main.
+      editorOpenDialog: () => Promise<
+        { path: string; text: string; mtimeMs: number } | { path: string; error: string } | null>
+      editorRead: (path: string) => Promise<{ text: string; mtimeMs: number } | { error: string }>
+      editorSave: (path: string, text: string, expectedMtimeMs: number | null) =>
+        Promise<{ mtimeMs: number } | { conflict: true; mtimeMs: number } | { error: string }>
+      editorSaveDialog: (suggestedName: string, text: string) =>
+        Promise<{ path: string; mtimeMs: number } | { path: string; error: string } | null>
+      editorDraftWrite: (paneId: string, text: string) => Promise<void>
+      editorDraftRead: (paneId: string) => Promise<string | null>
+      editorDraftClear: (paneId: string) => Promise<void>
+      editorInlineImages: (mdDir: string, html: string) => Promise<{ html: string }>
     }
   }
 }
@@ -63,6 +77,9 @@ const SUSPEND_GRACE_MS = 30_000
 // Stable empty frozen map so `layout.frozen ?? EMPTY_FROZEN` doesn't mint a new
 // object every render (keeps SplitView's `frozen` prop referentially stable).
 const EMPTY_FROZEN: Record<string, { note?: string }> = {}
+// Stable empty editors map — same reason as EMPTY_FROZEN: a fresh {} every
+// render would defeat SplitView's memoized children.
+const EMPTY_EDITORS: NonNullable<LayoutFile['editors']> = {}
 // App-wide terminal font size, clamped to a sane range (integer px).
 function clampFont(n: number): number {
   return Math.max(8, Math.min(32, Math.round(n)))
@@ -106,7 +123,7 @@ function App(): JSX.Element {
   // Tab id currently being dragged for reorder (HTML5 drag; ref, not state, so
   // the drag gesture never re-renders the terminals).
   const dragTab = useRef<number | null>(null)
-  const [kind, setKind] = useState<'shell' | 'claude' | 'browser'>('shell')
+  const [kind, setKind] = useState<'shell' | 'claude' | 'browser' | 'editor'>('shell')
   // Absolute working directory for newly created panes (default $HOME). Sent
   // verbatim so a session restores in the SAME folder — a relative '.' would
   // drift to the daemon's cwd ($HOME under systemd) on restart.
@@ -120,6 +137,9 @@ function App(): JSX.Element {
   const [saveScopeOpen, setSaveScopeOpen] = useState(false)
   const [loadDoc, setLoadDoc] = useState<WorkspaceDoc | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
+  // A close blocked on unsaved work (spec §3.3): the pane stays until the user
+  // picks save / discard / cancel. Cancel ABORTS the close.
+  const [closeAsk, setCloseAsk] = useState<string | null>(null)
   // A load in flight: created sessions not yet all confirmed by the daemon. The
   // sidecar (trees/labels/frozen) + scrollback replay commit ONCE the daemon
   // confirms every created session AND (replace mode) the killed old panes are
@@ -189,7 +209,12 @@ function App(): JSX.Element {
   useEffect(() => {
     setTitles((prev) => {
       const live = new Set(sessions.map((s) => s.name))
-      const stale = Object.keys(prev).filter((n) => !live.has(n))
+      // App-local panes (browser/editor) are NEVER in the daemon's session list,
+      // so they must be exempt — otherwise the very next Sessions event deletes
+      // the title they just reported (an editor's file name, a page's title) and
+      // the header falls back to the cwd. Their own close path prunes them.
+      const stale = Object.keys(prev).filter((n) =>
+        !live.has(n) && !isBrowserName(n) && !isEditorName(n))
       if (stale.length === 0) return prev
       const next = { ...prev }
       for (const n of stale) delete next[n]
@@ -250,7 +275,7 @@ function App(): JSX.Element {
     return () => clearTimeout(id)
   }, [layout, bridgeReady, loaded])
 
-  const workspaces = mergeBrowsers(groupSessions(state), layout.browsers ?? {})
+  const workspaces = mergeEditors(mergeBrowsers(groupSessions(state), layout.browsers ?? {}), layout.editors ?? {})
   const ws = workspaces.find((w) => w.ws === activeWs) ?? workspaces[0]
   const tabs = ws?.tabs ?? []
   const tab = tabs.find((t) => t.tab === activeTab) ?? tabs[0]
@@ -452,7 +477,7 @@ function App(): JSX.Element {
             // Browser leaves are app-local (never a daemon session), so they must
             // survive the live-daemon filter — keep any browser id unconditionally.
             tabs[tabKey] = tl.tree
-              ? { ...tl, tree: reconcile(tl.tree, leaves(tl.tree).filter((n) => liveForFix.has(n) || isBrowserName(n))) }
+              ? { ...tl, tree: reconcile(tl.tree, leaves(tl.tree).filter((n) => liveForFix.has(n) || isBrowserName(n) || isEditorName(n))) }
               : tl
           }
           wsEntries[wsKey] = { ...wl, tabs }
@@ -461,6 +486,7 @@ function App(): JSX.Element {
       const next: LayoutFile = { ...l, workspaces: { ...l.workspaces, ...wsEntries } }
       if (Object.keys(plan.frozen).length) next.frozen = { ...(l.frozen ?? {}), ...plan.frozen }
       if (Object.keys(plan.browsers).length) next.browsers = { ...(l.browsers ?? {}), ...plan.browsers }
+      if (Object.keys(plan.editors ?? {}).length) next.editors = { ...(l.editors ?? {}), ...(plan.editors ?? {}) }
       return next
     })
     const first = plan.targetWorkspaces[0]
@@ -516,11 +542,11 @@ function App(): JSX.Element {
 
   // Esc dismisses the save-scope / load-mode dialogs.
   useEffect(() => {
-    if (!saveScopeOpen && !loadDoc) return
-    const h = (e: KeyboardEvent): void => { if (e.key === 'Escape') { setSaveScopeOpen(false); setLoadDoc(null) } }
+    if (!saveScopeOpen && !loadDoc && !closeAsk) return
+    const h = (e: KeyboardEvent): void => { if (e.key === 'Escape') { setSaveScopeOpen(false); setLoadDoc(null); setCloseAsk(null) } }
     window.addEventListener('keydown', h)
     return () => window.removeEventListener('keydown', h)
-  }, [saveScopeOpen, loadDoc])
+  }, [saveScopeOpen, loadDoc, closeAsk])
 
   if (!bridgeReady) return <p style={{ color: 'crimson', padding: 16 }}>preload bridge missing.</p>
 
@@ -540,27 +566,95 @@ function App(): JSX.Element {
     setLayout((l) => ({ ...l, browsers: { ...(l.browsers ?? {}), [name]: { ws: currentWs, tab: tabId, ord, url: '' } } }))
     return name
   }
+  // App-local editor pane (spec 2026-07-19) — same class as a browser pane: no
+  // daemon session, the sidecar entry IS the pane. Starts unsaved (path null).
+  const newEditor = (tabId: number, ord: number): string => {
+    const name = formatEditorName({ ws: currentWs, tab: tabId, ord, id: makeId() })
+    setLayout((l) => ({ ...l, editors: { ...(l.editors ?? {}), [name]: { ws: currentWs, tab: tabId, ord, path: null } } }))
+    return name
+  }
   const newPane = (tabId: number, ord: number): void => {
     if (kind === 'browser') { newBrowser(tabId, ord); return }
+    if (kind === 'editor') { newEditor(tabId, ord); return }
     window.amber.createSession(formatName({ ws: currentWs, tab: tabId, ord, id: makeId() }), cwd, kind)
   }
   // url-only view of the sidecar browsers map for SplitView (referentially stable
   // enough — a new object only when layout changes, which already re-renders).
   const browserUrls: Record<string, { url: string }> =
     Object.fromEntries(Object.entries(layout.browsers ?? {}).map(([k, v]) => [k, { url: v.url }]))
+  // Same shape for editor panes: the sidecar entry IS the pane (path + per-pane
+  // view state). SplitView feeds these straight to <Editor>.
+  const editorEntries = layout.editors ?? EMPTY_EDITORS
   // Close a pane: browser panes are purged from the sidecar (mergeBrowsers then
   // drops them → reconcile prunes the leaf); daemon panes go through Kill (the
   // reap broadcast prunes the leaf — one-way flow, no optimistic tree edit).
+  // Live editor handles, keyed by paneId (same pattern as SplitView's searchApis):
+  // the close guard needs a SYNCHRONOUS dirty read and an awaitable save.
+  const editorApis = useRef<Map<string, EditorApi>>(new Map())
+  const setEditorApi = useCallback((paneId: string, api: EditorApi | null): void => {
+    if (api) editorApis.current.set(paneId, api)
+    else editorApis.current.delete(paneId)
+  }, [])
+  // Dirty flags drive the pane header dot; kept separate from the API map so a
+  // dirty toggle re-renders while handle registration does not.
+  const [dirtyEditors, setDirtyEditors] = useState<Record<string, boolean>>({})
+  const setEditorDirty = useCallback((paneId: string, dirty: boolean): void => {
+    setDirtyEditors((d) => (!!d[paneId] === dirty ? d : { ...d, [paneId]: dirty }))
+  }, [])
+
+  // Force-close: the sidecar purge + draft clear, with no guard. Every guarded
+  // path funnels here once the user has decided.
+  const dropEditorPane = useCallback((paneId: string): void => {
+    editorApis.current.delete(paneId)
+    setTitles((t) => { if (!(paneId in t)) return t; const c = { ...t }; delete c[paneId]; return c })
+    window.amber.editorDraftClear(paneId)
+    setDirtyEditors((d) => { if (!(paneId in d)) return d; const c = { ...d }; delete c[paneId]; return c })
+    setLayout((l) => {
+      if (!l.editors?.[paneId]) return l
+      const rest = { ...l.editors }
+      delete rest[paneId]
+      return { ...l, editors: rest }
+    })
+  }, [])
+
   const closePane = (paneId: string): void => {
+    // Unsaved editor buffer: ask first. This covers ✕, the tab close button,
+    // and workspace-replace, because they all route through closePane.
+    if (isEditorName(paneId) && editorApis.current.get(paneId)?.isDirty()) {
+      setCloseAsk(paneId)
+      return
+    }
     if (isBrowserName(paneId)) {
+      setTitles((t) => { if (!(paneId in t)) return t; const c = { ...t }; delete c[paneId]; return c })
       setLayout((l) => {
         if (!l.browsers?.[paneId]) return l
         const rest = { ...l.browsers }
         delete rest[paneId]
         return { ...l, browsers: rest }
       })
+    } else if (isEditorName(paneId)) {
+      dropEditorPane(paneId)
     } else window.amber.killSession(paneId)
   }
+
+  // An editor pane reports its own state changes (opened path, md view mode,
+  // outline toggle, wrap) — the sidecar is the pane's only persistence, and it
+  // is what restores the file after a restart. Also feeds the recent-files list.
+  const setEditorState = useCallback((paneId: string, patch: { path?: string | null; view?: 'code' | 'split' | 'preview'; outline?: boolean; wrap?: boolean }): void => {
+    setLayout((l) => {
+      const prev = l.editors?.[paneId]
+      if (!prev) return l
+      const next = { ...prev, ...patch }
+      const recents = patch.path
+        ? [patch.path, ...(l.recentFiles ?? []).filter((f) => f !== patch.path)].slice(0, 20)
+        : l.recentFiles
+      return {
+        ...l,
+        editors: { ...(l.editors ?? {}), [paneId]: next },
+        ...(recents ? { recentFiles: recents } : {}),
+      }
+    })
+  }, [])
 
   const nextWs = (workspaces.reduce((m, w) => Math.max(m, w.ws), 0)) + 1
 
@@ -582,6 +676,14 @@ function App(): JSX.Element {
         const prev = l.browsers?.[paneId]
         if (!prev) return l
         return { ...l, browsers: { ...(l.browsers ?? {}), [paneId]: { ...prev, ws: destWs, tab: destTab, ord } } }
+      })
+    } else if (isEditorName(paneId)) {
+      // Sidecar edit, id KEPT — the pane's unsaved draft is keyed by paneId, so
+      // reminting the id here would strand a dirty buffer's draft file.
+      setLayout((l) => {
+        const prev = l.editors?.[paneId]
+        if (!prev) return l
+        return { ...l, editors: { ...(l.editors ?? {}), [paneId]: { ...prev, ws: destWs, tab: destTab, ord } } }
       })
     } else {
       const to = retargetPane(paneId, { ws: destWs, tab: destTab, ord })
@@ -624,7 +726,7 @@ function App(): JSX.Element {
     const wsList = scope === 'one' ? workspaces.filter((w) => w.ws === currentWs) : workspaces
     // Browser panes have no daemon session, so no backlog to dump — exclude them
     // (a dumpBacklog for a non-session would just draw an Error reply).
-    const names = wsList.flatMap((w) => w.tabs.flatMap((t) => t.panes.filter((p) => p.kind !== 'browser').map((p) => p.name)))
+    const names = wsList.flatMap((w) => w.tabs.flatMap((t) => t.panes.filter((p) => p.kind === 'shell' || p.kind === 'claude').map((p) => p.name)))
     const { dumps, stragglers } = await collectDumps(
       names,
       (n) => window.amber.dumpBacklog(n),
@@ -636,6 +738,7 @@ function App(): JSX.Element {
       tabs: w.tabs.map((t) => ({ tab: t.tab, panes: t.panes.map((p) => ({
         name: p.name, cwd: p.cwd, kind: p.kind, ord: p.ord,
         ...(p.kind === 'browser' ? { url: layoutRef.current.browsers?.[p.name]?.url ?? '' } : {}),
+        ...(p.kind === 'editor' ? { path: layoutRef.current.editors?.[p.name]?.path ?? null } : {}),
       })) })),
     }))
     const doc = assembleSave(scope, live, layoutRef.current, dumps)
@@ -676,7 +779,7 @@ function App(): JSX.Element {
       // Browser panes are purged from the sidecar (closePane); only real daemon
       // sessions are killed + gated on in pendingLoad.
       for (const t of cur?.tabs ?? []) for (const p of t.panes) {
-        if (isBrowserName(p.name)) closePane(p.name)
+        if (isBrowserName(p.name) || isEditorName(p.name)) closePane(p.name)
         else { window.amber.killSession(p.name); killed.push(p.name) }
       }
     }
@@ -750,9 +853,15 @@ function App(): JSX.Element {
           title="new workspace · drop a pane here to move it to a new workspace"
           onClick={() => {
             setActiveWs(nextWs)
+            // App-local kinds mint a sidecar entry; only daemon kinds create a
+            // session (an `editor`/`browser` kind sent to Create would be an
+            // invalid session kind → daemon Error banner and no pane).
             if (kind === 'browser') {
               const name = formatBrowserName({ ws: nextWs, tab: 1, ord: 0, id: makeId() })
               setLayout((l) => ({ ...l, browsers: { ...(l.browsers ?? {}), [name]: { ws: nextWs, tab: 1, ord: 0, url: '' } } }))
+            } else if (kind === 'editor') {
+              const name = formatEditorName({ ws: nextWs, tab: 1, ord: 0, id: makeId() })
+              setLayout((l) => ({ ...l, editors: { ...(l.editors ?? {}), [name]: { ws: nextWs, tab: 1, ord: 0, path: null } } }))
             } else window.amber.createSession(formatName({ ws: nextWs, tab: 1, ord: 0, id: makeId() }), cwd, kind)
             setActiveTab(1)
           }}>+ ws</button>
@@ -762,10 +871,11 @@ function App(): JSX.Element {
           onClick={() => void doLoad()}>📂</button>
         <div className="divider" />
         <span className="label">new</span>
-        <select className="select" value={kind} onChange={(e) => setKind(e.target.value as 'shell' | 'claude' | 'browser')}>
+        <select className="select" value={kind} onChange={(e) => setKind(e.target.value as 'shell' | 'claude' | 'browser' | 'editor')}>
           <option value="shell">shell</option>
           <option value="claude">claude</option>
           <option value="browser">browser</option>
+          <option value="editor">editor</option>
         </select>
         <span className="label">in</span>
         <button className="btn cwd-chip" title={`${cwd} — click to choose folder`}
@@ -862,11 +972,18 @@ function App(): JSX.Element {
                           onSetRatio={(path, r) => putTree(setRatio(layerTree, path, r))}
                           browsers={browserUrls}
                           onBrowserNav={setBrowserUrl}
+                          editors={editorEntries}
+                          onEditorPath={(id, path) => setEditorState(id, { path })}
+                          onEditorViewState={setEditorState}
+                          onEditorDirty={setEditorDirty}
+                          onEditorReady={setEditorApi}
                           onSplit={(paneId, dir, overrideKind) => {
-                            // Browser split: no daemon round-trip, so place the leaf NOW with
-                            // its requested direction (pending is only for daemon sessions).
-                            if ((overrideKind ?? kind) === 'browser') {
-                              const name = newBrowser(currentTab, nextOrd)
+                            // App-local splits (browser/editor): no daemon round-trip, so place
+                            // the leaf NOW with its requested direction (`pending` exists only
+                            // to position a leaf once the DAEMON confirms its session).
+                            const k = overrideKind ?? kind
+                            if (k === 'browser' || k === 'editor') {
+                              const name = k === 'browser' ? newBrowser(currentTab, nextOrd) : newEditor(currentTab, nextOrd)
                               putTree(splitLeaf(layerTree, paneId, dir, name))
                               clearZoom()
                               return
@@ -889,6 +1006,49 @@ function App(): JSX.Element {
                 )
               })}
       </div>
+      {closeAsk && (() => {
+        // Spec §3.3: closing a pane with unsaved work asks first, and Cancel
+        // ABORTS the close. Save routes through the pane's own save path, so a
+        // mtime conflict is resolved there; a failed/cancelled save keeps the
+        // pane open rather than losing the buffer.
+        const paneId = closeAsk
+        const name = layout.editors?.[paneId]?.path?.split('/').pop() ?? 'untitled'
+        // `discard` must go through the pane's own handle FIRST: the editor
+        // flushes its buffer to the draft file on unmount, so clearing the draft
+        // without telling the pane to discard would let that flush recreate it
+        // (verified live — the draft came back after a Discard close).
+        const finish = (discard: boolean): void => {
+          if (discard) editorApis.current.get(paneId)?.discardDraft()
+          setCloseAsk(null)
+          dropEditorPane(paneId)
+          clearZoom()
+        }
+        return (
+          <div className="help-overlay" onClick={() => setCloseAsk(null)}>
+            <div className="help-card dialog-card" role="dialog" aria-modal="true" aria-label="Unsaved changes"
+              onClick={(e) => e.stopPropagation()}>
+              <div className="help-head">
+                <span className="help-title">Unsaved changes</span>
+                <button className="icon-btn" aria-label="close" title="close" onClick={() => setCloseAsk(null)}>✕</button>
+              </div>
+              <div className="dialog-body">
+                <p className="dialog-text"><code>{name}</code> has unsaved changes.</p>
+                <div className="dialog-actions">
+                  <button className="btn btn-accent" onClick={() => {
+                    void (async () => {
+                      const ok = await editorApis.current.get(paneId)?.save()
+                      if (ok) finish(false)
+                      else setCloseAsk(null) // save cancelled/failed — keep the pane
+                    })()
+                  }}>Save and close</button>
+                  <button className="btn danger-btn" onClick={() => finish(true)}>Discard</button>
+                  <button className="btn btn-ghost" onClick={() => setCloseAsk(null)}>Cancel</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )
+      })()}
       {saveScopeOpen && (
         <div className="help-overlay" onClick={() => setSaveScopeOpen(false)}>
           <div className="help-card dialog-card" role="dialog" aria-modal="true" aria-label="Save workspace"
