@@ -26,7 +26,7 @@
 //!   `Arc<Mutex<UnixStream>>` SHARED with that connection's control-reply
 //!   writes (daemon.rs), so the forwarder may hold that mutex only for a
 //!   bounded time — after the timeout the socket is dead and every later
-//!   write on it fails fast instead of blocking; (2) a timed-out `write_all`
+//!   write on it fails fast instead of blocking; (2) a timed-out write
 //!   may have written a PARTIAL frame — the stream is no longer
 //!   frame-aligned, so it must not carry any further reply. The client sees
 //!   a dropped connection and reconnects (the app already auto-reconnects).
@@ -36,14 +36,13 @@
 //!
 //! Worst case for an unrelated thread contending on a wedged watcher's
 //! shared writer mutex while the WATCHER forwarder holds it: one
-//! `WRITE_TIMEOUT` wait, after which the socket errors immediately. This
-//! bound covers the watcher path only — the pty Output forwarders and
-//! control replies write through the same shared writer with untimed
-//! `write_all`, so a hold by THOSE writers is not bounded here. No watcher
-//! can block the broadcast caller or hold the shared writer beyond one
-//! `WRITE_TIMEOUT`.
+//! `WRITE_TIMEOUT` wait, after which the socket errors immediately. The pty
+//! Output forwarders and control replies write through the same shared writer
+//! and are bounded too, at the (looser) `daemon::CLIENT_WRITE_TIMEOUT` set on
+//! the connection — looser because those writes carry multi-MiB backlog
+//! replays. So every hold of the shared writer is bounded, and no watcher can
+//! block the broadcast caller.
 
-use std::io::Write;
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -140,14 +139,17 @@ fn forward(
         let Some(writer) = weak.upgrade() else { break };
         let mut s = writer.lock().unwrap();
         // Bounded hold of the shared mutex: the write can take at most
-        // WRITE_TIMEOUT. The timeout is scoped to this write and cleared
-        // before the mutex is released, so control-reply writes through the
-        // same mutex never observe it.
+        // WRITE_TIMEOUT. The tighter timeout is scoped to this write and the
+        // socket's PREVIOUS value restored afterwards — restored, not cleared,
+        // because the connection carries a `daemon::CLIENT_WRITE_TIMEOUT` and
+        // clearing it here would leave every later control-reply/Output write
+        // on this socket unbounded again. Saving the actual value also keeps
+        // this module independent of daemon.rs (unit-test pairs have none).
+        let prev = s.write_timeout().ok().flatten();
         let res = s
             .set_write_timeout(Some(WRITE_TIMEOUT))
-            .and_then(|()| s.write_all(&frame))
-            .and_then(|()| s.flush());
-        let _ = s.set_write_timeout(None);
+            .and_then(|()| crate::daemon::write_bounded(&mut s, &frame, WRITE_TIMEOUT));
+        let _ = s.set_write_timeout(prev);
         if res.is_err() {
             // Wedged (timeout) or dead. A timed-out write may have left a
             // partial frame on the stream — it is no longer frame-aligned —
@@ -170,7 +172,7 @@ fn forward(
 mod tests {
     use super::*;
     use amber_core::proto::Decoder;
-    use std::io::Read;
+    use std::io::{Read, Write};
     use std::time::Duration;
 
     fn read_one(stream: &mut UnixStream) -> Option<Frame> {

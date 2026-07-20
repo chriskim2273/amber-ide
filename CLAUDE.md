@@ -425,6 +425,38 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   headlessly). NOTE: `npm install` is required after pulling this — it adds the
   CodeMirror 6 packages + `marked`.
 
+- [x] Wedged-client freeze fix (2026-07-20) — **the daemon froze while idle**,
+  twice, taking every session AND the CLI with it; only a manual restart
+  recovered it. Root cause (the ticket CLAUDE.md had left open since the
+  2026-07-16 audit): `write_frame` did an UNTIMED `write_all` to a client. The
+  app is the sole subscriber of every pane, so one app connection that stopped
+  draining its socket permanently backpressured EVERY pty — and a fresh
+  `amber attach` hung too, because the pty reader sits in `deliver_chunk`'s
+  all-saturated retry over a pre-join subscriber snapshot and never picks up the
+  new subscriber. Fix: `CLIENT_WRITE_TIMEOUT` (8 s — the watcher path's 1 s is
+  right for control frames but this socket also carries a multi-MiB backlog
+  replay to a renderer) + `set_write_timeout` on the accepted stream + a new
+  `write_bounded`. **`SO_SNDTIMEO` alone is NOT enough and `write_all` is the
+  trap**: a timed-out unix write that queued part of its buffer returns a SHORT
+  COUNT, not an error, so `write_all` loops and restarts the kernel's clock
+  (measured: 8.97 s blocked on one 184 KB frame, then success). `write_bounded`
+  adds a wall-clock deadline so the bound is exactly one timeout. On timeout the
+  client is logged, `shutdown(Both)`, and dropped; the existing cleanup releases
+  its subscriptions, which is what un-sticks the pty (the reader's next
+  `try_send` sees `Disconnected` and prunes it). Also fixed a LATENT clobber:
+  `watchers.rs` reset `set_write_timeout(None)` after every broadcast, which
+  would have wiped the connection-level timeout on the first `SessionsChanged`
+  and silently defeated the whole fix — it now saves/restores the previous
+  value. Lock audit found NO daemon-wide lock-held blocking write (`broadcast`
+  is `try_send`-only; `manager` holds `sessions` across disk IO but never socket
+  IO; `pty` fan-out writes with both locks released) — the only lock-held client
+  write is the per-connection `SharedWriter`, now bounded. Gates: Rust 225 tests
+  ×2 + clippy clean. Regression test `crates/amber/tests/wedged_client.rs`
+  (verified to FAIL with the fix reverted): a victim that attaches and never
+  reads gets dropped, a healthy client keeps getting replies throughout, and a
+  third client then sees output produced AFTER the wedge — proving the pty
+  resumed.
+
 - [x] Dangling global-hook GC (2026-07-19) — `ensure_global_claude_hook` dedupes
   by exact command string, so every distinct amber binary path installed its OWN
   `SessionStart` entry in `~/.claude/settings.json`. Dev builds run out of git
