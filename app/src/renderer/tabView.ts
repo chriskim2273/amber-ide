@@ -27,6 +27,10 @@ export function deriveTab(
   titles: Record<string, string>,
   home: string,
   mem: Record<string, { rssKb: number; growing: boolean }> = {},
+  // `amber ls` index per session name (store.ts `sessionIndex`). Shown as the
+  // leading `#n` so a pane can be reached with `amber attach <n>` from a
+  // terminal. App-local panes (browser/editor) are absent from it by nature.
+  indices: Record<string, number> = {},
 ): DerivedTab {
   const deadCodes: Record<string, number> = {}
   const paneMeta: Record<string, PaneMeta> = {}
@@ -43,8 +47,9 @@ export function deriveTab(
     const suffix = p.runState === 'shell-fallback' ? 'shell (claude exited)' : p.kind
     // Raw absolute cwd (not shortCwd) so the context-menu "copy cwd" resolves.
     const m = mem[p.name]
+    const idx = indices[p.name]
     paneMeta[p.name] = {
-      kind: p.kind, title: `${lead} · ${suffix}`, cwd: p.cwd, runState: p.runState,
+      kind: p.kind, title: `${idx ? `#${idx} ` : ''}${lead} · ${suffix}`, cwd: p.cwd, runState: p.runState,
       rssKb: m?.rssKb, growing: m?.growing, claudeId: p.claudeId,
     }
   })
