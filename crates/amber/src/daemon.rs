@@ -12,6 +12,18 @@ use amber_core::state::SessionKind;
 use crate::manager::SessionManager;
 use crate::pty::PtySession;
 
+/// Upper bound on a single daemon->client write (`SO_SNDTIMEO`), set once per
+/// accepted connection so it covers EVERY write on that socket: control
+/// replies, the Attach backlog replay, and the per-attach Output data.
+///
+/// Why 8 s and not the watcher path's 1 s: this socket also carries a
+/// multi-MiB backlog replay to a renderer that only drains as fast as it
+/// paints, so a 1 s bound would sever healthy-but-busy clients. Nothing
+/// legitimate takes 8 s, though — the client only has to accept bytes into its
+/// socket buffer, not finish rendering them. A wedged client is dropped within
+/// 8 s; a slow one is not.
+pub const CLIENT_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
 /// Shared handle to a connection's write half — both the control-reply path
 /// and a per-attach output-forwarder thread write to it, so it must be
 /// mutex-guarded.
@@ -79,11 +91,71 @@ pub fn prepare_socket(path: &std::path::Path) -> anyhow::Result<UnixListener> {
     Ok(UnixListener::bind(path)?)
 }
 
+/// Write every byte, giving up after `timeout` in total.
+///
+/// `SO_SNDTIMEO` alone is NOT enough, and `write_all` makes it worse:
+/// - a unix-socket `write` that queues part of the buffer and then hits
+///   `SO_SNDTIMEO` returns a **short count, not an error** — indistinguishable
+///   from an ordinary short write;
+/// - `write_all` therefore loops and restarts the kernel's clock, so a wedged
+///   client can hold the caller for a multiple of the timeout (measured: ~2x
+///   on a 180 KiB frame).
+///
+/// So this checks a wall-clock deadline itself: the socket timeout stops any
+/// single `write` from blocking forever, and the deadline stops the retry loop
+/// from stacking timeouts. The bound is one `timeout`, full stop. A partial
+/// frame is fine — the caller severs the connection, so nothing ever reads the
+/// desynchronised stream.
+pub(crate) fn write_bounded(
+    w: &mut UnixStream,
+    mut buf: &[u8],
+    timeout: std::time::Duration,
+) -> std::io::Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    while !buf.is_empty() {
+        match w.write(buf) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(n) => buf = &buf[n..],
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+        if !buf.is_empty() && std::time::Instant::now() >= deadline {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+    }
+    Ok(())
+}
+
+/// Write one frame to a client. Every daemon->client write goes through here,
+/// so this is where "a client that stops reading must never wedge the daemon"
+/// is enforced: the connection carries a [`CLIENT_WRITE_TIMEOUT`]
+/// (`SO_SNDTIMEO`, set in [`handle_connection`]), and on timeout/error the
+/// socket is **shut down both ways**.
+///
+/// Shutdown, not just an error return, because:
+/// - a timed-out write may have emitted a PARTIAL frame — the stream is
+///   no longer frame-aligned and must not carry another byte;
+/// - it unblocks the connection's read thread (blocked in `read`), which then
+///   sees EOF and runs `handle_connection`'s cleanup, releasing every
+///   subscription this client held. That release is what lets a session whose
+///   only subscriber was the wedged client resume: the pty reader's next
+///   `try_send` sees the closed channel and prunes the dead subscriber instead
+///   of backpressuring the child forever.
+///
+/// The client reconnects (the app already auto-reconnects).
 fn write_frame(writer: &SharedWriter, frame: &Frame) -> anyhow::Result<()> {
     let bytes = proto::encode(frame);
     let mut w = writer.lock().unwrap();
-    w.write_all(&bytes)?;
-    w.flush()?;
+    let res = write_bounded(&mut w, &bytes, CLIENT_WRITE_TIMEOUT);
+    if let Err(e) = res {
+        let who = match frame {
+            Frame::Data { session, .. } => format!(" (session {session})"),
+            Frame::Control(_) => String::new(),
+        };
+        eprintln!("amber daemon: dropping client{who}: write failed: {e}");
+        let _ = w.shutdown(std::net::Shutdown::Both);
+        return Err(e.into());
+    }
     Ok(())
 }
 
@@ -112,6 +184,10 @@ fn handle_connection(
     watchers: Arc<crate::watchers::Watchers>,
     stream: UnixStream,
 ) -> anyhow::Result<()> {
+    // Bound EVERY write on this socket (see CLIENT_WRITE_TIMEOUT). SO_SNDTIMEO
+    // is a socket-level option, so setting it once here covers the read half's
+    // clone and the per-attach Output forwarders alike.
+    stream.set_write_timeout(Some(CLIENT_WRITE_TIMEOUT))?;
     let writer: SharedWriter = Arc::new(Mutex::new(stream.try_clone()?));
     let mut subscriptions: Subscriptions = Vec::new();
     let result = connection_loop(&manager, &watchers, &writer, stream, &mut subscriptions);
@@ -473,6 +549,30 @@ mod tests {
         assert!(!suppress_backlog(false, Some(SessionKind::Claude)));
         assert!(!suppress_backlog(false, Some(SessionKind::Shell)));
         assert!(!suppress_backlog(true, None));
+    }
+
+    #[test]
+    fn write_bounded_gives_up_after_one_timeout_on_a_non_reading_peer() {
+        // The bound must be ONE timeout even for a buffer far larger than the
+        // socket can take: a timed-out unix write returns a short count rather
+        // than an error, so a naive retry loop (`write_all`) would stack
+        // timeouts. Peer is never read from.
+        let (_peer, mut server) = UnixStream::pair().unwrap();
+        let timeout = std::time::Duration::from_millis(200);
+        server.set_write_timeout(Some(timeout)).unwrap();
+        let big = vec![0u8; 8 << 20];
+        let t0 = std::time::Instant::now();
+        let err = write_bounded(&mut server, &big, timeout).expect_err("wedged peer accepted 8 MiB");
+        assert!(
+            matches!(
+                err.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ),
+            "unexpected error: {err}"
+        );
+        // Generously above one timeout, far below the several it would take if
+        // the retry loop restarted the clock.
+        assert!(t0.elapsed() < std::time::Duration::from_secs(2), "took {:?}", t0.elapsed());
     }
 
     #[test]
