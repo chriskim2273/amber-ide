@@ -142,6 +142,20 @@ pub fn ensure_global_claude_hook(hook_command: &str) {
     }
 }
 
+/// True for `"<path> hook"` where `<path>` is an amber binary that is NOT on
+/// disk any more — i.e. a hook left behind by an amber that has been deleted
+/// (typically a dev build in a removed git worktree). Deliberately narrow: the
+/// command must be exactly two whitespace-separated words, the second `hook`,
+/// and the first must end in `amber`, so a user's unrelated SessionStart hook
+/// can never match.
+fn is_dangling_amber_hook(command: &str) -> bool {
+    let mut parts = command.split_whitespace();
+    let (Some(path), Some("hook"), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    Path::new(path).file_name().is_some_and(|f| f == "amber") && !Path::new(path).exists()
+}
+
 fn add_global_hook_in(config: &Path, hook_command: &str) {
     // Absent or unparseable file -> start fresh (created below). A file that
     // parses to valid JSON of the WRONG shape must be left untouched: warn and
@@ -183,6 +197,30 @@ fn add_global_hook_in(config: &Path, hook_command: &str) {
         return;
     }
     let arr = ss.as_array_mut().expect("SessionStart is an array here");
+
+    // Garbage-collect DANGLING amber hooks first. Dedup below is by exact
+    // command string, so every distinct binary path installs its own entry —
+    // a dev build run out of a git worktree adds one, and deleting that
+    // worktree leaves a hook claude fails on at EVERY session start ("hook
+    // error ... not found") until the user hand-edits this file. Self-heal
+    // instead: drop `<path> hook` entries whose `<path>` is an amber binary
+    // that no longer exists. Anything that isn't ours, and any amber binary
+    // still on disk, is left strictly alone.
+    for group in arr.iter_mut() {
+        let Some(hooks) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) else { continue };
+        hooks.retain(|h| {
+            let Some(cmd) = h.get("command").and_then(|c| c.as_str()) else { return true };
+            !is_dangling_amber_hook(cmd)
+        });
+    }
+    // A group emptied by that sweep was ours alone — drop the husk.
+    arr.retain(|group| {
+        group
+            .get("hooks")
+            .and_then(|h| h.as_array())
+            .map(|hs| !hs.is_empty())
+            .unwrap_or(true)
+    });
 
     // Already installed? Don't duplicate.
     let present = arr.iter().any(|group| {
@@ -350,6 +388,82 @@ mod tests {
         // Unrelated keys and existing projects survive the rewrite.
         assert_eq!(v["numStartups"], serde_json::json!(5));
         assert_eq!(v["projects"]["/existing"]["hasTrustDialogAccepted"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn add_global_hook_prunes_amber_hooks_whose_binary_is_gone() {
+        // Every distinct amber binary path appends its OWN SessionStart entry
+        // (dedup is by exact command string). A dev build run from a git
+        // worktree therefore leaves a dangling hook behind once that worktree
+        // is deleted, and claude then reports a failed SessionStart hook on
+        // every session start until the user hand-edits their settings.
+        // Installing must clean those up.
+        let dir = tempdir().unwrap();
+        let config = dir.path().join("settings.json");
+        let gone = dir.path().join("worktree/target/debug/amber");
+        std::fs::write(
+            &config,
+            serde_json::to_string(&serde_json::json!({
+                "hooks": { "SessionStart": [
+                    { "hooks": [ { "type": "command", "command": "~/.claude/hooks/unrelated" } ] },
+                    { "hooks": [ { "type": "command", "command": format!("{} hook", gone.display()) } ] }
+                ] } }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        add_global_hook_in(&config, "/usr/local/bin/amber hook");
+
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+        let cmds: Vec<String> = after["hooks"]["SessionStart"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["hooks"].as_array().unwrap().clone())
+            .map(|h| h["command"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            !cmds.iter().any(|c| c.starts_with(&gone.display().to_string())),
+            "the dangling amber hook must be pruned, got {cmds:?}"
+        );
+        assert!(cmds.iter().any(|c| c == "/usr/local/bin/amber hook"), "the new hook is installed");
+        assert!(
+            cmds.iter().any(|c| c == "~/.claude/hooks/unrelated"),
+            "a hook that is not ours is never touched, got {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn add_global_hook_keeps_amber_hooks_whose_binary_still_exists() {
+        // Only MISSING binaries are pruned — a second, live amber install
+        // (say ~/.local/bin plus a dev build) is the user's business.
+        let dir = tempdir().unwrap();
+        let config = dir.path().join("settings.json");
+        let live = dir.path().join("amber");
+        std::fs::write(&live, "#!/bin/sh\n").unwrap();
+        std::fs::write(
+            &config,
+            serde_json::to_string(&serde_json::json!({
+                "hooks": { "SessionStart": [
+                    { "hooks": [ { "type": "command", "command": format!("{} hook", live.display()) } ] }
+                ] } }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        add_global_hook_in(&config, "/usr/local/bin/amber hook");
+
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+        let cmds: Vec<String> = after["hooks"]["SessionStart"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["hooks"].as_array().unwrap().clone())
+            .map(|h| h["command"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(cmds.len(), 2, "the live existing hook and the new one both remain: {cmds:?}");
     }
 
     #[test]
