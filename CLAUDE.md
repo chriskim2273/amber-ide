@@ -425,6 +425,18 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   headlessly). NOTE: `npm install` is required after pulling this — it adds the
   CodeMirror 6 packages + `marked`.
 
+- [x] Dangling global-hook GC (2026-07-19) — `ensure_global_claude_hook` dedupes
+  by exact command string, so every distinct amber binary path installed its OWN
+  `SessionStart` entry in `~/.claude/settings.json`. Dev builds run out of git
+  worktrees therefore accumulated entries, and deleting a worktree left claude
+  failing that hook on EVERY session start ("hook error … not found") until the
+  user hand-edited the file. Installing now first prunes `<path> hook` entries
+  whose `<path>` is an amber binary no longer on disk (narrow match: exactly two
+  words, second is `hook`, first basename is `amber`, and the path is missing),
+  drops a group emptied by that sweep, and leaves every non-amber hook and every
+  still-existing amber binary strictly alone. TDD'd both ways (prunes the
+  dangling one + keeps a live one). Rust 223 tests, clippy clean.
+
 - [x] Stable session slots (2026-07-19) — replaces the positional index shipped
   hours earlier: killing a session no longer renumbers the others. Spec:
   `docs/superpowers/specs/2026-07-19-stable-session-slots-design.md`. The daemon
