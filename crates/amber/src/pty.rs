@@ -470,8 +470,31 @@ impl PtySession {
         self.exit_code().is_none()
     }
 
-    /// Terminate the child.
+    /// Terminate the child AND everything it started.
+    ///
+    /// Killing only the direct child leaves descendants behind. It mostly
+    /// looked fine because the child IS the pty's session leader, so its death
+    /// makes the kernel SIGHUP the terminal's foreground group — which takes an
+    /// ordinary background job down for free (measured: a plain `sleep &` dies
+    /// either way). What survived is the child that ignores that hangup: a
+    /// `nohup`ed dev server, a job that traps HUP. Those kept running with no
+    /// pane left to see them.
+    ///
+    /// The pty child is a session leader (the pty allocation calls `setsid`),
+    /// so its pgid equals its pid and one `killpg` reaches every descendant
+    /// that has not deliberately left the group. ESRCH (already gone/reaped) is
+    /// not an error. The direct-child kill still runs afterwards as the
+    /// fallback for a missing pid.
     pub fn kill(&self) -> anyhow::Result<()> {
+        #[cfg(unix)]
+        if let Some(pid) = self.pid {
+            use nix::sys::signal::{killpg, Signal};
+            use nix::unistd::Pid;
+            match killpg(Pid::from_raw(pid as i32), Signal::SIGKILL) {
+                Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+                Err(e) => eprintln!("amber: killpg({pid}) failed: {e}"),
+            }
+        }
         self.killer.lock().unwrap().kill()?;
         Ok(())
     }

@@ -200,6 +200,10 @@ impl StateStore {
     pub fn remove_session(&self, name: &str) -> anyhow::Result<()> {
         Self::remove_if_exists(&self.session_path(name))?;
         Self::remove_if_exists(&self.claude_path(name))?;
+        // The generated per-session claude settings file. Missed originally, so
+        // every killed claude pane left one behind forever — `rename_session`
+        // moves it, and only removal was blind to it.
+        Self::remove_if_exists(&self.claude_settings_path(name))?;
         Self::remove_if_exists(&self.scrollback_path(name))?;
         Ok(())
     }
@@ -564,12 +568,17 @@ mod tests {
             )
             .unwrap();
         store.write_scrollback("alpha", b"data").unwrap();
+        let settings = store.claude_settings_path("alpha");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        std::fs::write(&settings, b"{}").unwrap();
 
         store.remove_session("alpha").unwrap();
 
         assert_eq!(store.read_session("alpha").unwrap(), None);
         assert_eq!(store.read_claude("alpha").unwrap(), None);
         assert_eq!(store.read_scrollback("alpha").unwrap(), None);
+        // The settings file too — otherwise every killed claude pane leaks one.
+        assert!(!settings.exists());
     }
 
     #[test]
