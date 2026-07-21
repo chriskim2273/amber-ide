@@ -3,6 +3,7 @@ import { createRoot } from 'react-dom/client'
 import { SplitView, type PaneMeta } from './SplitView'
 import type { EditorApi } from './Editor'
 import { initialState, reduce, groupSessions, mergeBrowsers, mergeEditors, tabDot, hasActivity, type DaemonEvent } from './store'
+import { sessionRows } from './sessionRows'
 import { deriveTab, shortCwd } from './tabView'
 import { formatName, makeId, retargetPane } from '../shared/names'
 import { formatBrowserName, isBrowserName } from '../shared/browserName'
@@ -52,6 +53,8 @@ declare global {
       editorDraftRead: (paneId: string) => Promise<string | null>
       editorDraftClear: (paneId: string) => Promise<void>
       editorInlineImages: (mdDir: string, html: string) => Promise<{ html: string }>
+      // Session-cleanup dialog: conversation labels for claude session ids.
+      claudeNames: (entries: { id: string; cwd: string }[]) => Promise<Record<string, string>>
     }
   }
 }
@@ -140,6 +143,15 @@ function App(): JSX.Element {
   // A close blocked on unsaved work (spec §3.3): the pane stays until the user
   // picks save / discard / cancel. Cancel ABORTS the close.
   const [closeAsk, setCloseAsk] = useState<string | null>(null)
+  // A close of a TERMINAL pane, awaiting confirmation. Closing a pane kills its
+  // daemon session — the pty, the shell, and anything running in it — and that
+  // is not undoable, so it is asked rather than assumed.
+  const [killAsk, setKillAsk] = useState<string[] | null>(null)
+  // Session-cleanup dialog: open flag + the claude conversation labels fetched
+  // for it (main reads the transcripts; see claudeNames.ts).
+  const [sessionsOpen, setSessionsOpen] = useState(false)
+  const [claudeNames, setClaudeNames] = useState<Record<string, string>>({})
+  const [picked, setPicked] = useState<Set<string>>(new Set())
   // A load in flight: created sessions not yet all confirmed by the daemon. The
   // sidecar (trees/labels/frozen) + scrollback replay commit ONCE the daemon
   // confirms every created session AND (replace mode) the killed old panes are
@@ -542,11 +554,27 @@ function App(): JSX.Element {
 
   // Esc dismisses the save-scope / load-mode dialogs.
   useEffect(() => {
-    if (!saveScopeOpen && !loadDoc && !closeAsk) return
-    const h = (e: KeyboardEvent): void => { if (e.key === 'Escape') { setSaveScopeOpen(false); setLoadDoc(null); setCloseAsk(null) } }
+    if (!saveScopeOpen && !loadDoc && !closeAsk && !killAsk && !sessionsOpen) return
+    const h = (e: KeyboardEvent): void => {
+      if (e.key !== 'Escape') return
+      setSaveScopeOpen(false); setLoadDoc(null); setCloseAsk(null)
+      setKillAsk(null); setSessionsOpen(false)
+    }
     window.addEventListener('keydown', h)
     return () => window.removeEventListener('keydown', h)
-  }, [saveScopeOpen, loadDoc, closeAsk])
+  }, [saveScopeOpen, loadDoc, closeAsk, killAsk, sessionsOpen])
+
+  // Conversation labels for the cleanup dialog. Fetched when it opens (and on
+  // the session list changing while it is open) rather than kept live: it is a
+  // disk read per claude session, worth nothing until the dialog is on screen.
+  useEffect(() => {
+    if (!sessionsOpen) return
+    const wanted = sessions.flatMap((s) => (s.claude_id ? [{ id: s.claude_id, cwd: s.cwd }] : []))
+    if (!wanted.length) { setClaudeNames({}); return }
+    let live = true
+    void window.amber.claudeNames(wanted).then((n) => { if (live) setClaudeNames(n) })
+    return () => { live = false }
+  }, [sessionsOpen, sessions])
 
   if (!bridgeReady) return <p style={{ color: 'crimson', padding: 16 }}>preload bridge missing.</p>
 
@@ -634,7 +662,19 @@ function App(): JSX.Element {
       })
     } else if (isEditorName(paneId)) {
       dropEditorPane(paneId)
-    } else window.amber.killSession(paneId)
+    } else setKillAsk([paneId]) // terminal pane — killing its session is not undoable
+  }
+
+  // Close every pane of a tab. App-local panes go immediately (their own guards
+  // still apply); the terminal panes are confirmed ONCE for the whole tab —
+  // routing each through closePane would stack a dialog per pane.
+  const closeTabPanes = (panes: { name: string }[]): void => {
+    const terminals: string[] = []
+    for (const p of panes) {
+      if (isBrowserName(p.name) || isEditorName(p.name)) closePane(p.name)
+      else terminals.push(p.name)
+    }
+    if (terminals.length) setKillAsk(terminals)
   }
 
   // An editor pane reports its own state changes (opened path, md view mode,
@@ -869,6 +909,8 @@ function App(): JSX.Element {
           onClick={() => setSaveScopeOpen(true)}>💾</button>
         <button className="icon-btn ws-io" aria-label="load workspace from file" title="Load workspace…"
           onClick={() => void doLoad()}>📂</button>
+        <button className="icon-btn ws-io" aria-label="manage daemon sessions" title="Sessions — see and kill every live amber session"
+          onClick={() => setSessionsOpen(true)}>🧹</button>
         <div className="divider" />
         <span className="label">new</span>
         <select className="select" value={kind} onChange={(e) => setKind(e.target.value as 'shell' | 'claude' | 'browser' | 'editor')}>
@@ -897,7 +939,7 @@ function App(): JSX.Element {
           const tabLabel = layout.workspaces[wsKey]?.tabs[String(t.tab)]?.label
           // One-way close (rule #3): request a kill for every pane in the tab; the
           // tab vanishes when the daemon's removal events empty it. No local removal.
-          const closeTab = (): void => t.panes.forEach((p) => closePane(p.name))
+          const closeTab = (): void => closeTabPanes(t.panes)
           return (
             <div key={t.tab} role="tab" aria-selected={isActive} tabIndex={0}
               data-drop-tab={t.tab}
@@ -1043,6 +1085,109 @@ function App(): JSX.Element {
                   }}>Save and close</button>
                   <button className="btn danger-btn" onClick={() => finish(true)}>Discard</button>
                   <button className="btn btn-ghost" onClick={() => setCloseAsk(null)}>Cancel</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )
+      })()}
+      {killAsk && (() => {
+        // Closing a terminal pane KILLS its daemon session — the pty and
+        // everything running in it (a claude conversation, a dev server). The
+        // session is the durable thing in this app, so its destruction is
+        // confirmed, never inferred from a click on ✕.
+        // Rows come from the daemon's session list, not from the pane tree —
+        // the cleanup dialog routes here too, and it can select a session that
+        // no pane shows.
+        const names = new Set(killAsk)
+        const rows = sessionRows(sessions.filter((s) => names.has(s.name)), claudeNames)
+        return (
+          <div className="help-overlay" onClick={() => setKillAsk(null)}>
+            <div className="help-card dialog-card" role="dialog" aria-modal="true" aria-label="Kill session"
+              onClick={(e) => e.stopPropagation()}>
+              <div className="help-head">
+                <span className="help-title">{killAsk.length > 1 ? `Kill ${killAsk.length} sessions?` : 'Kill session?'}</span>
+                <button className="icon-btn" aria-label="close" title="close" onClick={() => setKillAsk(null)}>✕</button>
+              </div>
+              <div className="dialog-body">
+                <p className="dialog-text">
+                  Closing {killAsk.length > 1 ? 'these panes' : 'this pane'} kills the amber
+                  session{killAsk.length > 1 ? 's' : ''} and everything running inside.
+                </p>
+                <ul className="session-list">
+                  {rows.map((p) => (
+                    <li key={p.name} className="session-row">
+                      <span className="session-slot">{p.slot ? `#${p.slot}` : '—'}</span>
+                      <span className={'kind-dot ' + (p.kind === 'claude' ? 'claude' : 'shell')} title={p.kind} />
+                      <span className="session-main">
+                        <span className="session-name">{p.claudeName || p.cwd}</span>
+                        <span className="session-sub">{p.name}</span>
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+                <div className="dialog-actions">
+                  <button className="btn danger-btn" autoFocus onClick={() => {
+                    for (const n of killAsk) window.amber.killSession(n)
+                    setKillAsk(null)
+                    clearZoom()
+                  }}>Kill</button>
+                  <button className="btn btn-ghost" onClick={() => setKillAsk(null)}>Cancel</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )
+      })()}
+      {sessionsOpen && (() => {
+        // Every session the daemon still lists — including any that no pane can
+        // show. The daemon outlives the app by design (core rule #6), so
+        // sessions accumulate across quits with nothing in the UI that admits
+        // they exist; this is that place, and the only bulk way to end them.
+        const rows = sessionRows(sessions, claudeNames)
+        const toggle = (n: string): void =>
+          setPicked((p) => { const c = new Set(p); if (!c.delete(n)) c.add(n); return c })
+        return (
+          <div className="help-overlay" onClick={() => setSessionsOpen(false)}>
+            <div className="help-card dialog-card sessions-card" role="dialog" aria-modal="true" aria-label="Sessions"
+              onClick={(e) => e.stopPropagation()}>
+              <div className="help-head">
+                <span className="help-title">Sessions ({rows.length})</span>
+                <button className="icon-btn" aria-label="close" title="close" onClick={() => setSessionsOpen(false)}>✕</button>
+              </div>
+              <div className="dialog-body">
+                <p className="dialog-text">
+                  Every live amber session. These outlive the app on purpose — quitting never
+                  kills them. Killing one ends its pty and everything running in it.
+                </p>
+                <ul className="session-list">
+                  {rows.map((r) => (
+                    <li key={r.name} className={'session-row' + (picked.has(r.name) ? ' picked' : '')}>
+                      <input type="checkbox" checked={picked.has(r.name)}
+                        aria-label={`select ${r.name}`} onChange={() => toggle(r.name)} />
+                      <span className="session-slot">{r.slot ? `#${r.slot}` : '—'}</span>
+                      <span className={'kind-dot ' + (r.kind === 'claude' ? 'claude' : 'shell')}
+                        title={r.kind} />
+                      <span className="session-main">
+                        <span className="session-name">
+                          {r.claudeName || r.cwd}
+                          {!r.alive && <span className="session-tag dead"> exited</span>}
+                          {!r.inPane && <span className="session-tag" title="live in the daemon, but its name maps to no pane"> no pane</span>}
+                        </span>
+                        <span className="session-sub">
+                          {r.name}{r.ws !== null ? ` · ws ${r.ws} · tab ${r.tab}` : ''}
+                          {r.claudeName ? ` · ${r.cwd}` : ''}
+                        </span>
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+                <div className="dialog-actions">
+                  <button className="btn danger-btn" disabled={picked.size === 0}
+                    onClick={() => { setSessionsOpen(false); setKillAsk([...picked]); setPicked(new Set()) }}>
+                    Kill selected ({picked.size})
+                  </button>
+                  <button className="btn btn-ghost" onClick={() => setSessionsOpen(false)}>Close</button>
                 </div>
               </div>
             </div>

@@ -66,6 +66,9 @@ contextBridge.exposeInMainWorld('amber', {
     ipcRenderer.invoke('editor-draft-read', paneId),
   editorDraftClear: (paneId: string): Promise<void> =>
     ipcRenderer.invoke('editor-draft-clear', paneId),
+  // Session-cleanup dialog: conversation labels for claude session ids.
+  claudeNames: (entries: { id: string; cwd: string }[]): Promise<Record<string, string>> =>
+    ipcRenderer.invoke('claude-names', entries),
   editorInlineImages: (mdDir: string, html: string): Promise<{ html: string }> =>
     ipcRenderer.invoke('editor-inline-images', mdDir, html),
 })

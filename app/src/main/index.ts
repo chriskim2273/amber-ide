@@ -37,6 +37,7 @@ import {
   clearDraft,
   inlineImages,
 } from './editorFiles'
+import { claudeNames } from './claudeNames'
 import clientPath from '../client/index?modulePath'
 
 // A client child that stays up this long counts as a genuine run; a shorter
@@ -627,6 +628,16 @@ async function main(): Promise<void> {
     if (!p) return null
     return { path: p, ...(await readEditorFile(p)) }
   })
+  // Session-cleanup dialog: name each claude session by its conversation.
+  ipcMain.handle('claude-names', (_e, entries: unknown) =>
+    claudeNames(
+      Array.isArray(entries)
+        ? entries.flatMap((e) => {
+            const o = e as { id?: unknown; cwd?: unknown }
+            return typeof o?.id === 'string' ? [{ id: o.id, cwd: typeof o.cwd === 'string' ? o.cwd : '' }] : []
+          })
+        : [],
+    ))
   ipcMain.handle('editor-read', (_e, path: string) => readEditorFile(String(path)))
   ipcMain.handle('editor-save', (_e, path: string, text: string, expectedMtimeMs: number | null) =>
     saveEditorFile(String(path), String(text), typeof expectedMtimeMs === 'number' ? expectedMtimeMs : null))
