@@ -28,11 +28,6 @@ export interface SearchApi {
   // when the running program requested that mode (so multiline paste doesn't
   // submit line-by-line in claude/vim). Routes through onData → the port.
   paste(text: string): void
-  // Force a local re-fit + repaint (header refresh button). Re-syncs the pty
-  // size (SIGWINCH → program repaints) and repaints xterm's buffer — fixes a
-  // garbled/stale frame or a pane mis-sized by the shared-winsize flap. Does NOT
-  // re-attach to the daemon (no fresh backlog replay).
-  refresh(): void
 }
 
 // Search decoration colors. Like XTERM_THEME, the addon can't read CSS vars, so
@@ -170,11 +165,6 @@ export const Pane = memo(function Pane(
       // term.paste() emits through onData (registered below) → the live port,
       // and applies bracketed-paste framing when the program enabled it.
       paste: (text) => term.paste(text),
-      refresh: () => {
-        try { fit.fit() } catch { /* host mid-layout; ignore */ }
-        port?.postMessage({ resize: { cols: term.cols, rows: term.rows } })
-        term.refresh(0, Math.max(0, term.rows - 1))
-      },
     })
 
     // OSC 52 clipboard writes: a TUI sets the system clipboard by emitting

@@ -302,6 +302,14 @@ export function SplitView(props: {
   // REFERENTIALLY STABLE `onSearchReady` (per-paneId cached wrapper) that stashes
   // the delivered SearchApi in `searchApis` for the find bar to drive. A fresh
   // closure every render would defeat Pane's memo.
+  // ⟳ rebuild counter, per paneId. A wedged terminal (rows painted at the wrong
+  // offsets, halves swapped, frozen region) is a RENDERER desync, not wrong pty
+  // content — a re-fit + `term.refresh()` repaints the same broken frame. Bumping
+  // this changes the `Pane` key, so React unmounts it (disposing the Terminal and
+  // its WebGL context) and mounts a fresh one, which re-Attaches and rebuilds the
+  // screen from the daemon's raw backlog. Client-local by design: a resize nudge
+  // would SIGWINCH the pty, which is shared with `amber web` and every attach.
+  const [rebuild, setRebuild] = useState<Record<string, number>>({})
   const searchApis = useRef<Map<string, SearchApi>>(new Map())
   const searchReadyCbs = useRef<Map<string, (api: SearchApi) => void>>(new Map())
   const searchReadyFor = (paneId: string): ((api: SearchApi) => void) => {
@@ -323,6 +331,13 @@ export function SplitView(props: {
     for (const id of new Set([...searchApis.current.keys(), ...searchReadyCbs.current.keys()])) {
       if (!live.has(id)) { searchApis.current.delete(id); searchReadyCbs.current.delete(id) }
     }
+    setRebuild((r) => {
+      const stale = Object.keys(r).filter((id) => !live.has(id))
+      if (!stale.length) return r
+      const next = { ...r }
+      for (const id of stale) delete next[id]
+      return next
+    })
     setFindPane((p) => (p && !live.has(p) ? null : p))
     setMenu((m) => (m && !live.has(m.paneId) ? null : m))
     setNotePane((p) => (p && !live.has(p) ? null : p))
@@ -608,8 +623,8 @@ export function SplitView(props: {
               <div className="pane-actions">
                 <button className="icon-btn" aria-label="move pane" title="drag to move" onMouseDown={startPaneDrag(paneId)} style={{ cursor: 'grab' }}>⠿</button>
                 {!noTerm &&
-                  <button className="icon-btn" aria-label="refresh pane" title="force refresh (re-fit + repaint)"
-                    onClick={() => searchApis.current.get(paneId)?.refresh()}>⟳</button>}
+                  <button className="icon-btn" aria-label="refresh pane" title="force refresh (rebuild the terminal from the daemon)"
+                    onClick={() => setRebuild((r) => ({ ...r, [paneId]: (r[paneId] ?? 0) + 1 }))}>⟳</button>}
                 {!noTerm && meta?.claudeId &&
                   <button className="icon-btn" aria-label="reload claude session" title="reload claude — resume this conversation"
                     onClick={() => setReloadPane(paneId)}>↺claude</button>}
@@ -637,7 +652,7 @@ export function SplitView(props: {
                 : isBrowser
                 ? <Browser paneId={paneId} url={props.browsers[paneId]?.url ?? ''}
                     active={props.active && !hidden} onNav={props.onBrowserNav} onTitle={props.onPaneTitle} />
-                : <Pane session={paneId} epoch={props.epoch} portEpoch={props.portEpoch} activateSeq={activateSeq}
+                : <Pane key={`${paneId}:${rebuild[paneId] ?? 0}`} session={paneId} epoch={props.epoch} portEpoch={props.portEpoch} activateSeq={activateSeq}
                     fontSize={props.fontSize} cwd={meta?.cwd ?? ''} onTitle={titleCbFor(paneId)} onSearchReady={searchReadyFor(paneId)} />}
               {!noTerm && findPane === paneId && !isFrozen && searchApis.current.get(paneId) &&
                 <FindBar api={searchApis.current.get(paneId)!} focusSeq={findSeq}
