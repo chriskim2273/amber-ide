@@ -78,6 +78,39 @@ pub fn claude_descends_from_table(table: &[ProcEntry], root: u32) -> bool {
     false
 }
 
+/// Every descendant of `root` in `table`, deepest-last, EXCLUDING `root`.
+///
+/// This is what "kill the session" has to reach. Signalling the process group
+/// is not enough: an INTERACTIVE shell has job control on, so `cmd &` puts the
+/// job in a NEW process group that `killpg` on the pty child never touches
+/// (measured live — a `nohup sleep &` started in a pane outlived the pane).
+/// Parentage still links it, so the descendant walk finds it.
+///
+/// Pure over `table` — no syscalls, so the caller snapshots once and kills from
+/// that snapshot. A `seen` set bounds the walk against a malformed ppid cycle,
+/// and a self-parented entry is skipped so `root`'s own subtree can't loop.
+pub fn descendants_of(table: &[ProcEntry], root: u32) -> Vec<u32> {
+    use std::collections::{HashMap, HashSet, VecDeque};
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for e in table {
+        if e.pid != e.ppid {
+            children.entry(e.ppid).or_default().push(e.pid);
+        }
+    }
+    let mut out = Vec::new();
+    let mut seen: HashSet<u32> = HashSet::from([root]);
+    let mut q = VecDeque::from([root]);
+    while let Some(pid) = q.pop_front() {
+        for &kid in children.get(&pid).map(|v| v.as_slice()).unwrap_or(&[]) {
+            if seen.insert(kid) {
+                out.push(kid);
+                q.push_back(kid);
+            }
+        }
+    }
+    out
+}
+
 /// Sustained-growth (leak) detector over `samples` (oldest→newest RSS KiB).
 /// True when: enough samples, the newest exceeds the oldest by more than
 /// `min_growth_kb`, AND it never dipped by more than `noise_kb` along the way
@@ -333,6 +366,29 @@ mod tests {
     /// Like `e` but with an RSS (KiB) — for subtree_rss_kb tests.
     fn er(pid: u32, ppid: u32, rss_kb: u64) -> ProcEntry {
         ProcEntry { pid, ppid, comm: String::new(), rss_kb }
+    }
+
+    #[test]
+    fn descendants_finds_the_whole_tree_but_not_the_root() {
+        // root 100 -> 200 -> 300, plus sibling 201; 999 is unrelated.
+        let t = vec![er(100, 1, 0), er(200, 100, 0), er(300, 200, 0), er(201, 100, 0), er(999, 1, 0)];
+        let mut d = descendants_of(&t, 100);
+        d.sort_unstable();
+        assert_eq!(d, vec![200, 201, 300]);
+    }
+
+    #[test]
+    fn descendants_of_a_leaf_is_empty() {
+        assert!(descendants_of(&[er(100, 1, 0), er(200, 100, 0)], 200).is_empty());
+    }
+
+    #[test]
+    fn descendants_terminates_on_a_ppid_cycle() {
+        // 200 and 300 parent each other — a walk without `seen` would spin.
+        let t = vec![er(100, 1, 0), er(200, 100, 0), er(300, 200, 0), er(200, 300, 0)];
+        let mut d = descendants_of(&t, 100);
+        d.sort_unstable();
+        assert_eq!(d, vec![200, 300]);
     }
 
     #[test]

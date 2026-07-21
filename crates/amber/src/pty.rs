@@ -480,19 +480,34 @@ impl PtySession {
     /// `nohup`ed dev server, a job that traps HUP. Those kept running with no
     /// pane left to see them.
     ///
-    /// The pty child is a session leader (the pty allocation calls `setsid`),
-    /// so its pgid equals its pid and one `killpg` reaches every descendant
-    /// that has not deliberately left the group. ESRCH (already gone/reaped) is
-    /// not an error. The direct-child kill still runs afterwards as the
-    /// fallback for a missing pid.
+    /// Two sweeps, because neither alone is enough. The pty child is a session
+    /// leader (the pty allocation calls `setsid`), so its pgid equals its pid
+    /// and one `killpg` reaches the group — but an INTERACTIVE shell has job
+    /// control on, so `cmd &` starts a job in its OWN process group that the
+    /// group signal never touches (measured live: a `nohup sleep &` outlived
+    /// the pane). Parentage is what still links those, so a descendant sweep
+    /// follows, taken from a snapshot read BEFORE the first kill — killing the
+    /// child first reparents its tree to init and erases the links.
+    ///
+    /// ESRCH (already gone/reaped) is expected, not an error. The direct-child
+    /// kill still runs last, as the fallback for a missing pid.
     pub fn kill(&self) -> anyhow::Result<()> {
         #[cfg(unix)]
         if let Some(pid) = self.pid {
-            use nix::sys::signal::{killpg, Signal};
+            use nix::sys::signal::{kill, killpg, Signal};
             use nix::unistd::Pid;
+            // Snapshot the parentage BEFORE anything dies — killing the child
+            // first would reparent its tree to init and erase the links.
+            let strays = crate::procinfo::descendants_of(&crate::procinfo::process_table(), pid);
             match killpg(Pid::from_raw(pid as i32), Signal::SIGKILL) {
                 Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
                 Err(e) => eprintln!("amber: killpg({pid}) failed: {e}"),
+            }
+            // Anything the group signal missed: a job the interactive shell put
+            // in its own process group. Already-dead pids give ESRCH, which is
+            // the expected result for most of these.
+            for stray in strays {
+                let _ = kill(Pid::from_raw(stray as i32), Signal::SIGKILL);
             }
         }
         self.killer.lock().unwrap().kill()?;

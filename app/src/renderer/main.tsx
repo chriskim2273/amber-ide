@@ -1110,9 +1110,11 @@ function App(): JSX.Element {
                 <button className="icon-btn" aria-label="close" title="close" onClick={() => setKillAsk(null)}>✕</button>
               </div>
               <div className="dialog-body">
+                {/* Deliberately not "closing this pane…": the cleanup dialog
+                    routes here too, and it can select a session no pane shows. */}
                 <p className="dialog-text">
-                  Closing {killAsk.length > 1 ? 'these panes' : 'this pane'} kills the amber
-                  session{killAsk.length > 1 ? 's' : ''} and everything running inside.
+                  Ends the pty and everything running inside
+                  {killAsk.length > 1 ? ' each session' : ' it'}. This cannot be undone.
                 </p>
                 <ul className="session-list">
                   {rows.map((p) => (
