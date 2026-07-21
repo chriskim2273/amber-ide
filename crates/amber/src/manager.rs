@@ -66,6 +66,15 @@ pub struct SessionManager {
     /// drop a live claude pane back to a bare shell on the next restart; only a
     /// sustained absence downgrades. See `decide_resume`.
     claude_absent: Mutex<HashMap<String, u32>>,
+    /// Serialises snapshot against the operations that MOVE a session's stored
+    /// artifacts (remove/rename). The snapshot deliberately writes to disk with
+    /// `sessions` released — holding it there is what froze typing — so without
+    /// this a snapshot could write `scrollback/<name>.bin` for a session that
+    /// was removed or renamed a moment earlier, resurrecting a file nothing
+    /// will ever clean up. Taken OUTERMOST (before `sessions`), and never on
+    /// the `write()`/`resize()` path, so keystrokes still never wait on a
+    /// snapshot.
+    maintenance: Mutex<()>,
 }
 
 /// Consecutive absent periodic snapshots before `resume_as_claude` downgrades
@@ -115,6 +124,7 @@ impl SessionManager {
             socket: None,
             watchers: None,
             claude_absent: Mutex::new(HashMap::new()),
+            maintenance: Mutex::new(()),
         })
     }
 
@@ -327,13 +337,33 @@ impl SessionManager {
     }
 
     fn snapshot_inner(&self, is_final: bool) -> anyhow::Result<()> {
-        let sessions = self.sessions.lock().unwrap();
-        for (name, sess) in sessions.iter() {
+        let _maint = self.maintenance.lock().unwrap();
+        // Take a CHEAP COPY of the session handles and release the lock at once.
+        //
+        // This loop writes up to `scrollback_bytes` per session to disk and reads
+        // /proc; holding `sessions` across that blocks `write()` — the path an
+        // `Input` frame takes — so on a live daemon every snapshot froze typing
+        // for seconds while output (whose fan-out needs no lock) kept flowing.
+        // The sessions are `Arc`s, so cloning the map is a refcount bump each.
+        let handles: Vec<(String, Arc<PtySession>)> = {
+            let sessions = self.sessions.lock().unwrap();
+            self.claude_absent.lock().unwrap().retain(|k, _| sessions.contains_key(k));
+            sessions.iter().map(|(n, s)| (n.clone(), Arc::clone(s))).collect()
+        };
+
+        // One process-table scan for the whole snapshot, not one per session,
+        // and without the RSS reads the claude check never looks at. Skipped
+        // entirely for a final snapshot, which does not re-detect.
+        let table = if is_final || !handles.iter().any(|(_, s)| s.pid().is_some()) {
+            Vec::new()
+        } else {
+            crate::procinfo::process_table_lite()
+        };
+
+        for (name, sess) in &handles {
             self.store.write_scrollback(name, &sess.scrollback())?;
-            self.persist_live_cwd(name, sess, is_final);
+            self.persist_live_cwd(name, sess, is_final, &table);
         }
-        // Drop hysteresis counters for sessions that no longer exist (bounded).
-        self.claude_absent.lock().unwrap().retain(|k, _| sessions.contains_key(k));
         Ok(())
     }
 
@@ -343,7 +373,13 @@ impl SessionManager {
     /// are left alone — their cwd is the authoritative, pre-trusted folder the
     /// pane was created in, which `amber run` never `cd`s out of. `is_final`
     /// preserves `resume_as_claude` (see `snapshot_final`).
-    fn persist_live_cwd(&self, name: &str, sess: &PtySession, is_final: bool) {
+    fn persist_live_cwd(
+        &self,
+        name: &str,
+        sess: &PtySession,
+        is_final: bool,
+        table: &[crate::procinfo::ProcEntry],
+    ) {
         let Ok(Some(meta)) = self.store.read_session(name) else { return };
         if meta.kind != SessionKind::Shell {
             return;
@@ -356,7 +392,7 @@ impl SessionManager {
         let new_resume = if is_final {
             meta.resume_as_claude
         } else {
-            let detected = sess.is_running_claude();
+            let detected = sess.is_running_claude_in(table);
             let mut streaks = self.claude_absent.lock().unwrap();
             let streak = streaks.get(name).copied().unwrap_or(0);
             let (flag, next) =
@@ -615,8 +651,10 @@ impl SessionManager {
     /// snapshot can never observe (or persist) a half-rename.
     pub fn rename(&self, from: &str, to: &str) -> anyhow::Result<SessionInfo> {
         Self::validate_name(to)?;
-        // Lock order matches `snapshot_inner` (sessions, then claude_absent) —
-        // reversing it would deadlock against the snapshot timer.
+        // `maintenance` OUTERMOST, then sessions, then claude_absent — the same
+        // order `snapshot_inner` takes them. It keeps a concurrent snapshot from
+        // writing artifacts under `from` after they have been moved to `to`.
+        let _maint = self.maintenance.lock().unwrap();
         let mut sessions = self.sessions.lock().unwrap();
         if sessions.contains_key(to) || self.store.read_session(to)?.is_some() {
             anyhow::bail!("session already exists: {to}");
@@ -684,6 +722,10 @@ impl SessionManager {
 
     /// Kill and forget a session, removing its persisted artifacts.
     pub fn remove(&self, name: &str) -> anyhow::Result<()> {
+        // Held across the whole removal so a snapshot that is mid-write cannot
+        // recreate the artifacts this is deleting (lock order: maintenance
+        // before sessions, matching `snapshot_inner`).
+        let _maint = self.maintenance.lock().unwrap();
         // Bind the removed session to a local FIRST: on edition 2021 the
         // `lock()` temporary in `if let Some(x) = lock().remove(..)` lives to
         // the end of the if-let body, and `kill()` enumerates the process table

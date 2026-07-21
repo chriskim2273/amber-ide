@@ -138,6 +138,24 @@ pub fn is_growing(samples: &[u64], min_growth_kb: u64, noise_kb: u64) -> bool {
 
 #[cfg(target_os = "linux")]
 pub fn process_table() -> Vec<ProcEntry> {
+    process_table_inner(true)
+}
+
+/// The process table WITHOUT resident-set sizes (`rss_kb` is left 0).
+///
+/// Only the memory monitor needs RSS, and reading it is what the scan actually
+/// costs: `/proc/<pid>/smaps_rollup` makes the kernel walk a process's whole
+/// address space, which is brutal for the multi-GB ones (Electron, node). On a
+/// 781-process desktop, measured: 45 ms for pid/ppid/argv0, **446 ms** more for
+/// the RSS reads. Parentage-only callers (the ad-hoc-claude check, the kill
+/// sweep) pay 10× less by skipping them.
+#[cfg(target_os = "linux")]
+pub fn process_table_lite() -> Vec<ProcEntry> {
+    process_table_inner(false)
+}
+
+#[cfg(target_os = "linux")]
+fn process_table_inner(with_rss: bool) -> Vec<ProcEntry> {
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return Vec::new();
     };
@@ -148,7 +166,7 @@ pub fn process_table() -> Vec<ProcEntry> {
         };
         let Some(ppid) = read_ppid_linux(pid) else { continue };
         let comm = argv0_basename(pid).unwrap_or_default();
-        let rss_kb = read_rss_kb_linux(pid);
+        let rss_kb = if with_rss { read_rss_kb_linux(pid) } else { 0 };
         out.push(ProcEntry { pid, ppid, comm, rss_kb });
     }
     out
@@ -234,6 +252,13 @@ fn bsdinfo(pid: u32) -> Option<libc::proc_bsdinfo> {
     } else {
         None
     }
+}
+
+/// macOS has no `smaps_rollup` equivalent to skip — its table is already one
+/// `proc_pidinfo` per process — so "lite" is the same table.
+#[cfg(target_os = "macos")]
+pub fn process_table_lite() -> Vec<ProcEntry> {
+    process_table()
 }
 
 #[cfg(target_os = "macos")]
@@ -342,6 +367,11 @@ pub fn argv0_basename(pid: u32) -> Option<String> {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn process_table() -> Vec<ProcEntry> {
+    Vec::new()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn process_table_lite() -> Vec<ProcEntry> {
     Vec::new()
 }
 

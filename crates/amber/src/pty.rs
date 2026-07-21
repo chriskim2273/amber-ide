@@ -377,10 +377,18 @@ impl PtySession {
     /// restore. Backed by `procinfo` (Linux `/proc`, macOS `libc`); false on
     /// unsupported OSes.
     pub fn is_running_claude(&self) -> bool {
+        self.is_running_claude_in(&crate::procinfo::process_table_lite())
+    }
+
+    /// Same check against a CALLER-SUPPLIED table.
+    ///
+    /// The snapshot asks this for every session, and building the table is the
+    /// expensive part (a full `/proc` walk). Taking it once per snapshot instead
+    /// of once per session turns N scans into one — with a dozen panes that was
+    /// the difference between a ~3.5 s freeze and a few tens of milliseconds.
+    pub fn is_running_claude_in(&self, table: &[crate::procinfo::ProcEntry]) -> bool {
         match self.pid {
-            Some(pid) => {
-                crate::procinfo::claude_descends_from_table(&crate::procinfo::process_table(), pid)
-            }
+            Some(pid) => crate::procinfo::claude_descends_from_table(table, pid),
             None => false,
         }
     }
