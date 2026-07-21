@@ -506,6 +506,9 @@ impl PtySession {
             // Anything the group signal missed: a job the interactive shell put
             // in its own process group. Already-dead pids give ESRCH, which is
             // the expected result for most of these.
+            // ponytail: bare-pid kill, so a stray whose pid is recycled between
+            // the snapshot and here takes the signal instead. Microseconds wide
+            // on a desktop; use pidfd (Linux) / kqueue if that ever matters.
             for stray in strays {
                 let _ = kill(Pid::from_raw(stray as i32), Signal::SIGKILL);
             }

@@ -684,7 +684,13 @@ impl SessionManager {
 
     /// Kill and forget a session, removing its persisted artifacts.
     pub fn remove(&self, name: &str) -> anyhow::Result<()> {
-        if let Some(sess) = self.sessions.lock().unwrap().remove(name) {
+        // Bind the removed session to a local FIRST: on edition 2021 the
+        // `lock()` temporary in `if let Some(x) = lock().remove(..)` lives to
+        // the end of the if-let body, and `kill()` enumerates the process table
+        // (a full /proc walk). Holding `sessions` across that would stall
+        // session_infos(), the watcher broadcast and the snapshot timer.
+        let sess = self.sessions.lock().unwrap().remove(name);
+        if let Some(sess) = sess {
             let _ = sess.kill();
         }
         self.store.remove_session(name)?;
