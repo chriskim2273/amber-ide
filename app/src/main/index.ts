@@ -2,11 +2,11 @@ import { app, BrowserWindow, utilityProcess, MessageChannelMain, Menu, shell } f
 import type { MenuItemConstructorOptions } from 'electron'
 import { ipcMain, dialog, clipboard } from 'electron'
 import { fileURLToPath } from 'node:url'
-import { dirname, join, resolve as resolvePathJoin, isAbsolute } from 'node:path'
-import { homedir } from 'node:os'
+import { basename, dirname, join, resolve as resolvePathJoin, isAbsolute } from 'node:path'
+import { homedir, release as osRelease } from 'node:os'
 import { spawn } from 'node:child_process'
-import { readFile, writeFile, rename, mkdir, copyFile, chmod, realpath, stat } from 'node:fs/promises'
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { readFile, writeFile, rename, mkdir, copyFile, chmod, realpath, rm, stat } from 'node:fs/promises'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { resolveSocketPath } from '../shared/socketPath'
 import { pathCandidates } from '../shared/pathSel'
 import { ensureDaemon, probeSocket } from './daemonBoot'
@@ -38,6 +38,8 @@ import {
   inlineImages,
 } from './editorFiles'
 import { claudeNames } from './claudeNames'
+import { compatSignature, shouldUseCompat, COMPAT_SWITCHES } from './renderCompat'
+import { installBinary } from './installBinary'
 import clientPath from '../client/index?modulePath'
 
 // A client child that stays up this long counts as a genuine run; a shorter
@@ -52,35 +54,27 @@ function stateRoot(): string {
     : join(process.env['HOME'] ?? '.', '.local', 'state', 'amber-ide')
 }
 // Persisted marker: written after a detected GPU/renderer crash so the next
-// launch starts in compat mode directly (no crash-relaunch cycle).
+// launch starts in compat mode directly (no crash-relaunch cycle). It records
+// the environment the decision was made in, so it expires when that changes —
+// see renderCompat.ts for why a permanent marker was a bug.
 const compatFlagPath = join(stateRoot(), 'render-compat')
+const COMPAT_SIGNATURE = compatSignature(process.versions.electron ?? 'unknown', osRelease())
 
-// Compat mode = software GL + relaxed sandbox + kernel-shm workarounds. Needed
-// where Electron 43's Chromium can't do multi-process GPU/shm (e.g. kernel 6.17,
-// which traps faccessat2() in the child seccomp policy → bogus ESRCH on
-// /dev/shm and /tmp → renderer never paints). Triggered by an env override or
-// the persisted flag; on healthy machines it stays off (hardware GL + sandbox).
-// main() auto-detects a first-run crash, writes the flag, and relaunches.
-const compat =
-  !!process.env['AMBER_SOFTWARE_GL'] ||
-  !!process.env['AMBER_NO_SANDBOX'] ||
-  existsSync(compatFlagPath)
+function readCompatFlag(): string | null {
+  try {
+    return readFileSync(compatFlagPath, 'utf8')
+  } catch {
+    return null // absent (or unreadable, which is the same decision)
+  }
+}
+
+const compat = shouldUseCompat(process.env, readCompatFlag(), COMPAT_SIGNATURE)
 
 if (compat) {
-  // Software GL via ANGLE+SwiftShader (xterm still gets a real GL context), and
-  // disable vsync so keystrokes paint without a compositor-frame of latency.
-  app.commandLine.appendSwitch('use-gl', 'angle')
-  app.commandLine.appendSwitch('use-angle', 'swiftshader')
-  app.commandLine.appendSwitch('enable-unsafe-swiftshader')
-  app.commandLine.appendSwitch('disable-gpu-vsync')
-  app.commandLine.appendSwitch('disable-frame-rate-limit')
-  // Sandbox/shm/kernel workarounds (the faccessat2 seccomp trap lives in the
-  // zygote-set-up child namespace; --no-zygote is the one that actually fixes
-  // shm allocation on kernel 6.17).
-  app.commandLine.appendSwitch('no-sandbox')
-  app.commandLine.appendSwitch('disable-dev-shm-usage')
-  app.commandLine.appendSwitch('disable-seccomp-filter-sandbox')
-  app.commandLine.appendSwitch('no-zygote')
+  for (const [name, value] of COMPAT_SWITCHES) {
+    if (value === undefined) app.commandLine.appendSwitch(name)
+    else app.commandLine.appendSwitch(name, value)
+  }
   // The renderer reads this to pick xterm's DOM renderer over WebGL (WebGL on
   // SwiftShader is the input-lag source).
   process.env['AMBER_SOFTWARE_GL'] = '1'
@@ -132,8 +126,7 @@ async function installDaemon(): Promise<void> {
     // ephemeral AppImage/dmg mount path would break reboot survival.
     const stable = join(home, '.local', 'bin', 'amber')
     await mkdir(dirname(stable), { recursive: true })
-    await copyFile(amberBinary(), stable)
-    await chmod(stable, 0o755)
+    await installBinary(amberBinary(), stable)
 
     if (process.platform === 'linux') {
       const unitDir = join(home, '.config', 'systemd', 'user')
@@ -424,7 +417,7 @@ async function main(): Promise<void> {
     const enterCompat = (): void => {
       if (switching) return
       switching = true
-      try { mkdirSync(stateRoot(), { recursive: true }); writeFileSync(compatFlagPath, '1') } catch { /* ignore */ }
+      try { mkdirSync(stateRoot(), { recursive: true }); writeFileSync(compatFlagPath, COMPAT_SIGNATURE) } catch { /* ignore */ }
       app.relaunch()
       app.exit(0)
     }
