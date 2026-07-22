@@ -191,6 +191,14 @@ fn suspend_then_resume_parks_and_relaunches_claude() {
         fs::set_permissions(&claude_path, fs::Permissions::from_mode(0o755)).unwrap();
     }
     let settings = root.join("settings.json");
+    // The conversation the pane is in, as the SessionStart hook records it: the
+    // relaunch after a suspend must resume THIS id, not start a fresh chat.
+    StateStore::new(&root)
+        .write_claude(
+            "work",
+            &ClaudeMeta { session_id: "sid-frozen".to_string(), cwd: root.clone(), updated: 1 },
+        )
+        .unwrap();
     let ctl = SuspendControl::new();
     let phases = Arc::new(Mutex::new(Vec::<String>::new()));
 
@@ -220,6 +228,13 @@ fn suspend_then_resume_parks_and_relaunches_claude() {
         *phases.lock().unwrap(),
         vec!["claude".to_string(), "suspended".to_string(), "claude".to_string()],
         "expected start → suspended → relaunch, with the kill NOT counted as a crash"
+    );
+    let lines = log_lines(&root);
+    assert_eq!(lines.len(), 2);
+    assert!(
+        lines[1].contains("--resume") && lines[1].contains("sid-frozen"),
+        "unfreeze must resume the recorded conversation, got: {}",
+        lines[1]
     );
 }
 

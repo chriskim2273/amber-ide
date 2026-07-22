@@ -74,9 +74,6 @@ function toEvent(d: unknown): DaemonEvent | null {
 
 
 const DEFAULT_FONT_SIZE = 13
-// Slice 3: how long a claude pane stays frozen before the daemon kills its child
-// to free RAM (resumed on unfreeze). A brief freeze/unfreeze pays nothing.
-const SUSPEND_GRACE_MS = 30_000
 // Stable empty frozen map so `layout.frozen ?? EMPTY_FROZEN` doesn't mint a new
 // object every render (keeps SplitView's `frozen` prop referentially stable).
 const EMPTY_FROZEN: Record<string, { note?: string }> = {}
@@ -379,17 +376,17 @@ function App(): JSX.Element {
     return { ...l, workspaces: { ...l.workspaces, [wsKey]: { ...w, tabOrder: next } } }
   }), [wsKey, activeTab, tabs])
 
-  // Slice 3 freeze grace: per-pane pending suspend timers + the set of sessions
-  // currently suspended (child killed). Refs so scheduling never re-renders.
-  // `sessionsRef` gives freezePane the live kind without a dep on state.sessions.
-  const suspendTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
+  // Slice 3: the set of sessions currently suspended (child killed). Refs so
+  // tracking never re-renders. `sessionsRef` gives freezePane the live kind
+  // without a dep on state.sessions.
   const suspendedRef = useRef<Set<string>>(new Set())
   const sessionsRef = useRef(state.sessions)
   sessionsRef.current = state.sessions
 
   // Freeze/unfreeze a pane. The sidecar `frozen` map is display-only (rule #1/#3).
-  // For a CLAUDE pane, freezing ALSO schedules a daemon suspend after the grace:
-  // the daemon kills claude (frees RAM) and the supervisor resumes it on unfreeze.
+  // For a CLAUDE pane, freezing ALSO suspends it on the daemon immediately: the
+  // daemon kills claude (frees RAM) and the supervisor `--resume`s the same
+  // conversation on unfreeze.
   // An empty note is stored as `{}` (exactOptionalPropertyTypes) to keep it clean.
   const freezePane = useCallback((name: string, note: string): void => {
     setLayout((l) => {
@@ -398,13 +395,9 @@ function App(): JSX.Element {
       return { ...l, frozen: next }
     })
     const isClaude = sessionsRef.current.find((s) => s.name === name)?.kind === 'claude'
-    if (isClaude && !suspendTimers.current.has(name)) {
-      const t = setTimeout(() => {
-        window.amber.suspendSession(name)
-        suspendedRef.current.add(name)
-        suspendTimers.current.delete(name)
-      }, SUSPEND_GRACE_MS)
-      suspendTimers.current.set(name, t)
+    if (isClaude && !suspendedRef.current.has(name)) {
+      window.amber.suspendSession(name)
+      suspendedRef.current.add(name)
     }
   }, [])
   const unfreezePane = useCallback((name: string): void => {
@@ -414,10 +407,11 @@ function App(): JSX.Element {
       delete next[name]
       return { ...l, frozen: next }
     })
-    // Cancel a pending suspend; if the child was already killed, resume it.
-    const t = suspendTimers.current.get(name)
-    if (t) { clearTimeout(t); suspendTimers.current.delete(name) }
-    if (suspendedRef.current.has(name)) {
+    // The ref only knows about suspends THIS app process issued; after a restart
+    // the sidecar still says frozen but the ref is empty, so trust the daemon's
+    // run_state too (rule #1) or the pane would never come back.
+    const parked = sessionsRef.current.find((s) => s.name === name)?.run_state === 'suspended'
+    if (suspendedRef.current.has(name) || parked) {
       window.amber.resumeSession(name)
       suspendedRef.current.delete(name)
     }

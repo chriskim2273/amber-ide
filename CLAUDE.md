@@ -254,8 +254,9 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   (sidecar `fontSize`); per-pane scrollback search (`@xterm/addon-search`,
   Cmd/Ctrl+Shift+F); pane zoom (Cmd/Ctrl+Shift+M, zoom keyed `ws:tab`) +
   header context menu (kind-override split, copy cwd); freeze/park a pane
-  with a note (sidecar `frozen` map — display-only parking: input blocked +
-  blurred, activity suppressed, daemon untouched). Daemon: `ReportRunState`
+  with a note (sidecar `frozen` map — input blocked + blurred, activity
+  suppressed; superseded for claude panes by the freeze grace below, which
+  suspends the child after 30 s). Daemon: `ReportRunState`
   (supervisor fire-and-forget) + `SessionInfo.run_state` → claude panes show
   claude/retrying/shell-fallback dots; rate-limited (500 ms) `Activity`
   events on pty output → background-tab activity dots — both ride the
@@ -504,6 +505,28 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   + typecheck. **Live-verified** against a private daemon: headers showed #1/#2/#3
   matching `amber ls`, killing session 1 renumbered both the CLI and the headers
   identically, and `amber attach 2` typed into the pane whose header read `#2`.
+
+- [x] Freeze grace — suspend/resume claude (2026-07-19, commit 49c3d8c) —
+  freezing a **claude** pane frees its RAM: the app sends `Suspend`
+  immediately (the original 30 s `SUSPEND_GRACE_MS` timer was removed
+  2026-07-22 at the user's request — freeze means killed now, not eventually,
+  which also deleted the restart-inside-the-grace gap);
+  `manager.signal_suspend` SIGUSR1s the pane's `amber run`
+  supervisor, which kills claude, reports `run_state:"suspended"` (amber pane
+  dot → "suspended (RAM freed)") and idles holding the pty — session record,
+  pty and attachments all stay alive. Unfreeze sends `Resume` (SIGUSR2); the
+  supervisor resets `escalation`/`prev_id` so the resume ladder re-reads the
+  hook-recorded id and relaunches `claude --resume <id>` — the SAME
+  conversation, not a fresh one. The kill is NOT counted against the crash
+  budget. Non-claude/unknown sessions reply `Error`; shell panes freeze
+  display-only as before. (2026-07-22) unfreeze after an APP RESTART also
+  resumes: the in-memory `suspendedRef` is empty then, so `unfreezePane` falls
+  back to the daemon's `run_state === 'suspended'` (rule #1) instead of
+  leaving the pane parked forever. Gates: Rust 4 supervisor tests (the
+  suspend one now asserts the relaunch argv carries `--resume <recorded-id>` —
+  mutation-checked: it fails if the ladder escalates to Fresh) + clippy clean,
+  app 389 tests + typecheck. Live claude round-trip (freeze → real claude
+  killed → unfreeze → same conversation) still manual.
 
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**
