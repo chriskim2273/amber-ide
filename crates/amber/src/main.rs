@@ -22,8 +22,10 @@ use signal_hook::iterator::Signals;
 #[derive(Parser)]
 #[command(name = "amber", about = "amber session daemon + CLI")]
 struct Cli {
+    /// With no subcommand, `amber` is the tmux reflex: create a fresh shell
+    /// session in the current directory and attach to it.
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -199,7 +201,10 @@ fn resolve_socket(explicit: Option<PathBuf>) -> PathBuf {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    match cli.command {
+    let Some(command) = cli.command else {
+        return run_new(&resolve_socket(None));
+    };
+    match command {
         Command::Daemon { root, socket } => run_daemon(root, socket),
         Command::Attach { name, no_prefix, no_status, force, socket } => {
             run_attach(&resolve_socket(socket), name, no_prefix, no_status, force)
@@ -665,17 +670,76 @@ fn run_attach(
     attach::attach(socket, &name, res.prefix, want_bar)
 }
 
-/// Resolve the attach target and whether it is a shell session. With a name,
-/// looks that session up (an unknown name is left for the daemon to reject, and
-/// assumed shell); with no name, picks the most-recently-updated live session.
-fn resolve_target(socket: &Path, name: Option<String>) -> anyhow::Result<(String, bool)> {
-    let mut stream = UnixStream::connect(socket).map_err(|e| {
+/// Connect to the daemon, turning a bare ENOENT/ECONNREFUSED into the advice
+/// the user actually needs. Every interactive path (attach, bare `amber`) goes
+/// through it.
+fn connect_daemon(socket: &Path) -> anyhow::Result<UnixStream> {
+    UnixStream::connect(socket).map_err(|e| {
         anyhow::anyhow!(
             "cannot reach the amber daemon at {} ({e}) — is it running? \
              start it with `amber daemon` or the systemd/launchd service",
             socket.display()
         )
-    })?;
+    })
+}
+
+/// `amber` with no subcommand — the tmux reflex. Creates a shell session in the
+/// current directory and attaches to it, so the muscle memory of typing `tmux`
+/// works. Deliberately NOT "attach the newest session" (that is `amber attach`
+/// with no name): bare `tmux` always makes a new one.
+///
+/// The session is named `s<n>`, outside the app's `amber-<ws>-<tab>-<ord>-<id>`
+/// grammar, so it belongs to no workspace and no pane shows it — it is a CLI
+/// session. The app's Sessions dialog lists it as `no pane` with an Adopt
+/// button, which is the supported way to pull it onto the desktop.
+fn run_new(socket: &Path) -> anyhow::Result<()> {
+    // Same nesting guard as `attach`: two stacked raw clients fight over the
+    // detach prefix, and a shell inside a pane already has a session.
+    let force = std::env::var_os("AMBER_ALLOW_NEST").is_some();
+    let amber_session = std::env::var("AMBER_SESSION").ok().filter(|s| !s.is_empty());
+    if let Some(msg) = attach::nest_refusal(amber_session.as_deref(), force) {
+        eprintln!("[amber] {msg}");
+        std::process::exit(1);
+    }
+
+    let name = attach::next_session_name(&list_session_names(socket)?);
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    create_session(socket, &name, &cwd, "shell")?;
+
+    let env = std::env::var("AMBER_PREFIX").ok();
+    let res = attach::resolve_prefix(false, env.as_deref());
+    if let Some(w) = &res.warning {
+        eprintln!("[amber] {w}");
+    }
+    // Always a shell, so the status bar applies (it is suppressed for the
+    // full-screen TUI a claude session runs).
+    attach::attach(socket, &name, res.prefix, true)
+}
+
+/// Every session name the daemon holds — the pool `next_session_name` avoids.
+fn list_session_names(socket: &Path) -> anyhow::Result<Vec<String>> {
+    let mut stream = connect_daemon(socket)?;
+    stream.write_all(&proto::encode(&Frame::Control(ControlMsg::ListSessions)))?;
+
+    let mut decoder = Decoder::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        if let Some(Frame::Control(ControlMsg::SessionList { names })) = decoder.next_frame()? {
+            return Ok(names);
+        }
+        let n = stream.read(&mut buf)?;
+        if n == 0 {
+            anyhow::bail!("daemon closed the connection before replying");
+        }
+        decoder.feed(&buf[..n]);
+    }
+}
+
+/// Resolve the attach target and whether it is a shell session. With a name,
+/// looks that session up (an unknown name is left for the daemon to reject, and
+/// assumed shell); with no name, picks the most-recently-updated live session.
+fn resolve_target(socket: &Path, name: Option<String>) -> anyhow::Result<(String, bool)> {
+    let mut stream = connect_daemon(socket)?;
     stream.write_all(&proto::encode(&Frame::Control(ControlMsg::ListSessionsDetailed)))?;
 
     let mut decoder = Decoder::new();
@@ -777,7 +841,15 @@ fn run_rename(socket: &Path, from: &str, to: &str) -> anyhow::Result<()> {
 }
 
 fn run_create(socket: &Path, name: &str, cwd: &Path, kind: &str) -> anyhow::Result<()> {
-    let mut stream = UnixStream::connect(socket)?;
+    println!("created {}", create_session(socket, name, cwd, kind)?);
+    Ok(())
+}
+
+/// Create a session and return the name the daemon acked. Silent, because bare
+/// `amber` hands straight off to the raw client — a "created" line would just
+/// be scribbled over by the attach decoration.
+fn create_session(socket: &Path, name: &str, cwd: &Path, kind: &str) -> anyhow::Result<String> {
+    let mut stream = connect_daemon(socket)?;
     let request = Frame::Control(ControlMsg::Create {
         name: name.to_string(),
         cwd: cwd.to_string_lossy().to_string(),
@@ -789,10 +861,7 @@ fn run_create(socket: &Path, name: &str, cwd: &Path, kind: &str) -> anyhow::Resu
     let mut buf = [0u8; 8192];
     loop {
         match decoder.next_frame()? {
-            Some(Frame::Control(ControlMsg::Created { name })) => {
-                println!("created {name}");
-                return Ok(());
-            }
+            Some(Frame::Control(ControlMsg::Created { name })) => return Ok(name),
             Some(Frame::Control(ControlMsg::Error { msg })) => {
                 anyhow::bail!("create failed: {msg}");
             }
