@@ -528,6 +528,35 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   app 389 tests + typecheck. Live claude round-trip (freeze → real claude
   killed → unfreeze → same conversation) still manual.
 
+- [x] Adopt + bare `amber` (2026-07-23) — a CLI session and a pane are now the
+  same thing from both ends. **Adopt**: the 🧹 Sessions dialog already listed
+  sessions no pane can show (a name the grammar rejects belongs to no
+  workspace); rows tagged `no pane` gained an **Adopt** button that renames the
+  session into the current ws/tab at the next free ord. The rename IS the
+  adoption — grouping is name-encoded (rule #2), so the pane lands via
+  `SessionsChanged` → `groupSessions` → reconcile, the same path a
+  reboot-restored session takes; no sidecar write, no optimistic tree edit, no
+  daemon change. **Bare `amber`**: typing `amber` with no subcommand printed
+  clap's help; it now does what typing `tmux` does — create a shell session in
+  the CURRENT directory and attach to it (`command: Option<Command>` →
+  `run_new`). Deliberately not "attach the newest" (that is `amber attach` with
+  no name). Named `s<n>`, lowest free, holes reused: the `s` prefix keeps it out
+  of `amber attach <n>`'s way, where a bare integer means a SLOT — a session
+  literally named `3` would be unreachable by name. `s<n>` is outside the pane
+  grammar on purpose, so a CLI session stays a CLI session until the user adopts
+  it. Reuses attach's nesting refusal (`AMBER_SESSION` → refuse unless
+  `AMBER_ALLOW_NEST=1`), and `create_session`/`connect_daemon` were split out of
+  `run_create`/`resolve_target` so the bare path creates silently (a "created"
+  line would be scribbled over by the attach decoration) and gets the friendly
+  "is the daemon running?" error. Gates: Rust 226 tests + clippy clean, app 389
+  tests + typecheck. **Live-verified** on a private daemon: `work` showed `no
+  pane` + Adopt → click → daemon renamed it to `amber-1-1-1-<id>` (slot kept),
+  pane appeared, and `echo $$` gave a pid 50 s OLDER than the adopt — the child
+  was preserved, not respawned; bare `amber` created + attached `s2` in `/tmp`
+  with the status bar, `Ctrl-b d` detached clean, killing `s1` made the next
+  bare `amber` reuse `s1`, and running it inside a pane was refused by name.
+  Claude adoption rides the already-proven cross-tab rename path (not re-tested).
+
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**
   `std::io::Read` (dedicated thread); `take_writer()` is one-shot;
