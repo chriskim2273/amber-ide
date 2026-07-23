@@ -556,6 +556,14 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   with the status bar, `Ctrl-b d` detached clean, killing `s1` made the next
   bare `amber` reuse `s1`, and running it inside a pane was refused by name.
   Claude adoption rides the already-proven cross-tab rename path (not re-tested).
+  Also closed a PRE-EXISTING daemon hole the new naming made reachable:
+  `SessionManager::create` inserted unconditionally, so a `Create` on a live
+  name dropped that session's `Arc` out of the table and orphaned its child —
+  two racing bare `amber`s can pick the same `s<n>` off the same listing. Now
+  checked under the sessions lock (the loser's freshly spawned child is killed).
+  **Known non-parity with tmux:** bare `tmux` starts its server; bare `amber`
+  errors when the daemon is down (it is boot-managed, rule #6, so this only
+  bites a stopped daemon).
 
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**
