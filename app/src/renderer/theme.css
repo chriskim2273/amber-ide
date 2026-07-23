@@ -886,6 +886,8 @@ body {
   color: var(--text-faint);
 }
 .session-tag.dead { color: var(--danger); }
+/* Pushed to the row's right edge; only rendered for a session no pane shows. */
+.session-adopt { margin-left: auto; flex: none; padding: 2px 8px; font-size: 11px; }
 
 /* Floating "Open" button — appears at a pane text selection that resolves to a
    real path; reveals it in the OS file manager. Anchored over the terminal, so
