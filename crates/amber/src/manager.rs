@@ -276,6 +276,15 @@ impl SessionManager {
         // Allocate + persist + insert under ONE lock hold, so two concurrent
         // creates can't be handed the same slot.
         let mut sessions = self.sessions.lock().unwrap();
+        // Under the lock, because the name is chosen by the CALLER off an
+        // earlier listing (bare `amber` picks the lowest free `s<n>`), so two
+        // concurrent creates can land on the same one. Inserting would drop the
+        // live session's Arc out of the table and orphan its child — silent
+        // data loss. Refuse instead, and kill the child spawned for the loser.
+        if sessions.contains_key(name) {
+            let _ = sess.kill();
+            anyhow::bail!("session {name} already exists");
+        }
         let slot = match Self::used_slots(&self.store, &sessions) {
             Ok(used) => alloc_slot(&used),
             Err(e) => {
@@ -801,6 +810,24 @@ mod tests {
             !dir.path().parent().unwrap().join("evil.json").exists(),
             "traversal name escaped the state dir"
         );
+    }
+
+    #[test]
+    fn create_refuses_an_existing_name_and_leaves_the_live_session_alone() {
+        // Creating over a live name used to overwrite the table entry, orphaning
+        // the running child — reachable without meaning to now that bare `amber`
+        // picks its own `s<n>` from a listing (two racing invocations can choose
+        // the same one). A duplicate must be an error, and the ORIGINAL session
+        // must still be the one in the table.
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        mgr.create("s1", "/tmp", SessionKind::Shell).unwrap();
+        let first = mgr.session("s1").unwrap();
+
+        assert!(mgr.create("s1", "/tmp", SessionKind::Shell).is_err());
+        let still = mgr.session("s1").unwrap();
+        assert!(Arc::ptr_eq(&first, &still), "the live session was replaced");
+        assert_eq!(mgr.names().len(), 1);
     }
 
     #[test]

@@ -162,6 +162,18 @@ pub fn pick_by_slot(sessions: &[proto::SessionInfo], slot: u32) -> Option<&proto
     sessions.iter().find(|s| s.slot == slot)
 }
 
+/// The name a bare `amber` gives the session it creates: the lowest free
+/// `s<n>`, tmux's auto-numbering. Numbers are reused once a session is gone, so
+/// a long-lived daemon does not drift into `s47`. The `s` prefix is what keeps
+/// the name out of `amber attach <n>`'s way — a bare integer there means a
+/// SLOT, and a session literally named `3` would be unreachable by name.
+pub fn next_session_name(existing: &[String]) -> String {
+    (1..)
+        .map(|n| format!("s{n}"))
+        .find(|candidate| !existing.contains(candidate))
+        .expect("the range is unbounded, so some name is always free")
+}
+
 /// One stdin chunk scanned for prefix commands (see [`scan_prefix`]).
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ScanResult {
@@ -1093,6 +1105,16 @@ mod tests {
         assert!(nest_refusal(Some("work"), false).is_some());
         // --force / AMBER_ALLOW_NEST overrides.
         assert!(nest_refusal(Some("work"), true).is_none());
+    }
+
+    #[test]
+    fn next_session_name_takes_the_lowest_free_number() {
+        assert_eq!(next_session_name(&[]), "s1");
+        assert_eq!(next_session_name(&["s1".to_string(), "s2".to_string()]), "s3");
+        // A hole left by a killed session is reused, and names outside the
+        // `s<n>` family (app panes, hand-named sessions) never block one.
+        let taken = ["s1".to_string(), "s3".to_string(), "amber-1-1-0-x".to_string()];
+        assert_eq!(next_session_name(&taken), "s2");
     }
 
     // ---- session indicator: through the client event loop ---------------

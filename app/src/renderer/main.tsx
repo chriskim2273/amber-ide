@@ -1143,6 +1143,17 @@ function App(): JSX.Element {
         const rows = sessionRows(sessions, claudeNames)
         const toggle = (n: string): void =>
           setPicked((p) => { const c = new Set(p); if (!c.delete(n)) c.add(n); return c })
+        // Adopt a session no pane can show (`amber create foo`, or a name from
+        // some older grammar). Grouping is name-encoded (core rule #2), so the
+        // rename IS the adoption: the daemon's SessionsChanged puts it in the
+        // current tab, groupSessions buckets it, reconcile appends the leaf —
+        // the exact path a reboot-restored session takes. Non-destructive: a
+        // shell is renamed in place keeping its child + scrollback; a claude
+        // respawns and --resumes the same conversation.
+        const adopt = (n: string): void => {
+          window.amber.renameSession(n, formatName({ ws: currentWs, tab: currentTab, ord: nextOrd, id: makeId() }))
+          setSessionsOpen(false)
+        }
         return (
           <div className="help-overlay" onClick={() => setSessionsOpen(false)}>
             <div className="help-card dialog-card sessions-card" role="dialog" aria-modal="true" aria-label="Sessions"
@@ -1155,6 +1166,7 @@ function App(): JSX.Element {
                 <p className="dialog-text">
                   Every live amber session. These outlive the app on purpose — quitting never
                   kills them. Killing one ends its pty and everything running in it.
+                  One tagged <em>no pane</em> can be adopted into the current tab.
                 </p>
                 <ul className="session-list">
                   {rows.map((r) => (
@@ -1175,6 +1187,12 @@ function App(): JSX.Element {
                           {r.claudeName ? ` · ${r.cwd}` : ''}
                         </span>
                       </span>
+                      {!r.inPane && r.alive && (
+                        <button className="btn btn-ghost session-adopt"
+                          aria-label={`adopt ${r.name}`}
+                          title={`open as a pane in ws ${currentWs} · tab ${currentTab} (renames the session)`}
+                          onClick={() => adopt(r.name)}>Adopt</button>
+                      )}
                     </li>
                   ))}
                 </ul>
