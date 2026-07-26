@@ -565,6 +565,41 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   errors when the daemon is down (it is boot-managed, rule #6, so this only
   bites a stopped daemon).
 
+- [x] Grok session kind (2026-07-26) — a second supervised agent: `kind:"grok"`
+  is a pane whose pty runs `amber run <name> --kind grok`. Spec:
+  `docs/superpowers/specs/2026-07-26-grok-session-kind-design.md`. Much smaller
+  than claude support because grok's id does NOT rotate and amber can ASSIGN it:
+  `grok --session-id <uuid>` names a NEW conversation, so there is no
+  `SessionStart` hook, no per-session settings file, no global hook, nothing to
+  GC. The id is recorded in the SAME `claude/<name>.json` (rename/kill/adopt
+  already move that file — a `grok/` dir would have meant touching both).
+  Ladder rules that are not optional: a fresh start ALWAYS mints a new uuid
+  (grok errors "Session ID … is already in use", so re-passing the recorded one
+  fails instantly and burns the whole retry budget), and `--resume` is only
+  handed a UUID-shaped id (its value is OPTIONAL — a blank one silently resumes
+  the most recent conversation in the cwd, the hijack `--continue` was avoided
+  for). Resume gets **2 attempts** before minting a new conversation, unlike
+  claude's one: measured, a just-killed pane can 404 ("not found locally,
+  restoring from remote") on the 200 ms relaunch and resume fine right after.
+  The agent is passed on argv, NOT read from the store: `create` spawns the pty
+  before persisting metadata, so a supervisor that read `sessions/<name>.json`
+  races it — observed live launching **claude** for a grok pane. Kind-gated
+  sites now ask `SessionKind::is_agent()` / `isAgentKind()`: raw-client backlog
+  suppression, run-state reporting, suspend/resume, rename respawn, pane/tab
+  dots, `.amberws` dump filter (TypeScript catches none of the app ones — same
+  runtime-string class as the editor pass). run_state strings stay spelled
+  `claude*` for both agents (they name the phase, not the binary). Scope cuts:
+  no global grok hook, no hand-started-grok detection (`resume_as_claude` is
+  still claude-only), and the cleanup dialog's conversation labels read claude
+  transcripts only (a grok row falls back to its cwd). Gates: Rust 249 tests +
+  clippy clean, app 393 tests + typecheck + bundle. **Live-verified** on a
+  private daemon: minted `--session-id` launch, real turn, `kill -9` → `--resume
+  <same id>` with the conversation intact, daemon restart → restored as grok and
+  still intact, SIGUSR1/USR2 freeze→unfreeze, `amber rename` respawn; and in the
+  **live GUI** (xvfb+CDP): picker → pane with its own blue dot and header
+  `#1 grok · grok`, grok TUI rendered, typed prompt answered, OSC title live.
+  NOTE: a running daemon must be restarted before it accepts `kind:"grok"`.
+
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**
   `std::io::Read` (dedicated thread); `take_writer()` is one-shot;
