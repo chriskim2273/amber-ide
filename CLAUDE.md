@@ -621,12 +621,15 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   `XDG_STATE_HOME` + `--user-data-dir`, real X11 — xvfb cannot answer this, it has
   no GPU): hardware GL came up, no marker was written, GPU process idled at
   **28 %** vs the stuck app's 471 %. App 397 tests + typecheck green.
-  **Trigger identified (not amber's bug):** `~/lowpower/night-mode.sh:145` arms
-  PCI runtime PM on every device whose class is not `0x02*` (network) — but both
-  GPUs are class `0x030000`, so the nightly script sets `power/control=auto` on
-  the RTX 3070 and the iGPU. Verified live. That is what bounced the GPU. The
-  guard wants `0x03*` excluded too; amber's job is only to not condemn itself
-  when it happens.
+  **Trigger identified (not amber's bug):** `systemd-oomd`. At 03:53:56 it killed
+  processes in `amber.service` (18.6 G, memory-pressure Avg10 35.05 %); the
+  cascade then took Claude Desktop (03:54:43, `Killed`), Firefox's whole scope
+  and amber's GPU process (03:55:38). A first pass blamed the user's nightly
+  `~/lowpower/night-mode.sh` for arming PCI runtime PM on the GPUs — **wrong**:
+  `sudo` logged that script starting at 03:58:55, three minutes AFTER the crash,
+  and the RTX 3070's `power/runtime_suspended_time` is `0 ms` over 25.6 h of
+  uptime, so it never runtime-suspends at all (X drives it). Amber's job is only
+  to not condemn itself when the GPU process dies for reasons of its own.
   **Recovery for an already-stuck machine: `rm $XDG_STATE_HOME/amber-ide/render-compat`
   (default `~/.local/state/amber-ide/render-compat`) and restart the app** — the
   code fix prevents re-entry but cannot un-write an existing marker.
