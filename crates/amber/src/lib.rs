@@ -4,6 +4,7 @@
 pub mod attach;
 pub mod claude;
 pub mod daemon;
+pub mod grok;
 pub mod manager;
 pub mod procinfo;
 pub mod pty;

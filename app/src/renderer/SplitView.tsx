@@ -9,6 +9,13 @@ import { CLAUDE_SESSION_ID } from '../shared/ids'
 
 export interface PaneMeta { kind: string; title: string; cwd: string; runState?: string | undefined; rssKb?: number | undefined; growing?: boolean | undefined; claudeId?: string | undefined }
 
+/** Which agent binary a pane's recorded conversation id belongs to. Only a
+ *  `grok` pane is grok's; a shell pane with a recorded id got it from a
+ *  hand-started claude (the global SessionStart hook), so it stays claude. */
+export function agentOf(kind: string): 'claude' | 'grok' {
+  return kind === 'grok' ? 'grok' : 'claude'
+}
+
 // Compact memory label from resident KiB: "0" hidden by the caller; MB up to
 // ~1 GB, then GB with one decimal. Display-only.
 export function fmtMem(rssKb: number): string {
@@ -142,7 +149,7 @@ export function SplitView(props: {
   fontSize: number
   onPaneTitle: (session: string, title: string) => void
   onSetRatio: (path: Array<'a' | 'b'>, ratio: number) => void
-  onSplit: (paneId: string, dir: 'h' | 'v', kind?: 'shell' | 'claude' | 'browser' | 'editor') => void
+  onSplit: (paneId: string, dir: 'h' | 'v', kind?: 'shell' | 'claude' | 'grok' | 'browser' | 'editor') => void
   onMove: (sourceId: string, targetId: string, zone: Zone) => void
   // Cross-group move: the pane was dropped on a tab header (`{ tab }`) or a
   // workspace pill (`{ ws }`). Grouping is name-encoded, so App turns this into a
@@ -254,20 +261,26 @@ export function SplitView(props: {
     onFreeze(id, note)
   }
 
-  // Reload claude in a pane's shell: Ctrl-U (\x15) clears any stray input line,
-  // then `claude --resume` + Enter. `id` resumes that exact conversation; null
-  // omits the id so claude opens its own session picker (its full history).
+  // Reload the pane's agent in its shell: Ctrl-U (\x15) clears any stray input
+  // line, then `<agent> --resume` + Enter. `id` resumes that exact
+  // conversation; null omits it (claude opens its own session picker; grok
+  // takes the most recent conversation in the cwd).
   // SECURITY: the id is interpolated into a command line run in the pane's
   // SHELL, so it must be shape-validated first — a value with shell
-  // metacharacters (`; rm -rf ~`) would otherwise execute. Claude Code session
+  // metacharacters (`; rm -rf ~`) would otherwise execute. Both agents' session
   // ids are UUIDs; anything else is rejected (the command is not sent). It comes
   // from the store today, but this is the trust boundary, so validate at use.
-  const reloadClaude = (paneId: string, id: string | null): void => {
+  const reloadClaude = (paneId: string, id: string | null, kind: string): void => {
     if (id !== null && !CLAUDE_SESSION_ID.test(id)) { setReloadPane(null); return }
     const api = searchApis.current.get(paneId)
     if (api) {
       const flag = id ? ` --resume ${id}` : ' --resume'
-      api.insert(`\x15claude --dangerously-skip-permissions${flag}\n`)
+      // A grok id must never be handed to claude (and vice versa) — the
+      // recorded id lives in one store for both, so the KIND picks the binary.
+      const cmd = kind === 'grok'
+        ? `grok --permission-mode bypassPermissions${flag}`
+        : `claude --dangerously-skip-permissions${flag}`
+      api.insert(`\x15${cmd}\n`)
     }
     setReloadPane(null)
   }
@@ -626,8 +639,9 @@ export function SplitView(props: {
                   <button className="icon-btn" aria-label="refresh pane" title="force refresh (rebuild the terminal from the daemon)"
                     onClick={() => setRebuild((r) => ({ ...r, [paneId]: (r[paneId] ?? 0) + 1 }))}>⟳</button>}
                 {!noTerm && meta?.claudeId &&
-                  <button className="icon-btn" aria-label="reload claude session" title="reload claude — resume this conversation"
-                    onClick={() => setReloadPane(paneId)}>↺claude</button>}
+                  <button className="icon-btn" aria-label={`reload ${agentOf(meta.kind)} session`}
+                    title={`reload ${agentOf(meta.kind)} — resume this conversation`}
+                    onClick={() => setReloadPane(paneId)}>↺{agentOf(meta.kind)}</button>}
                 <button className="icon-btn" aria-label="split right" title="split right — choose kind"
                   onClick={(e) => openSplitPicker(paneId, 'h', e.currentTarget)}>⬌</button>
                 <button className="icon-btn" aria-label="split down" title="split down — choose kind"
@@ -675,14 +689,15 @@ export function SplitView(props: {
                   recorded conversation; "Pick session…" opens claude's own history
                   picker. Clears the input line first (Ctrl-U). */}
               {reloadPane === paneId && meta?.claudeId && !isFrozen &&
-                <div className="reload-claude-prompt" role="dialog" aria-label="reload claude">
-                  <div className="reload-claude-title">Reload claude in this pane?</div>
-                  <div className="reload-claude-sub">Clears the current line, then runs <code>claude --resume</code>.</div>
+                <div className="reload-claude-prompt" role="dialog" aria-label={`reload ${agentOf(meta.kind)}`}>
+                  <div className="reload-claude-title">Reload {agentOf(meta.kind)} in this pane?</div>
+                  <div className="reload-claude-sub">Clears the current line, then runs <code>{agentOf(meta.kind)} --resume</code>.</div>
                   <div className="reload-claude-actions">
-                    <button className="btn btn-accent" onClick={() => reloadClaude(paneId, meta.claudeId ?? null)}>
+                    <button className="btn btn-accent" onClick={() => reloadClaude(paneId, meta.claudeId ?? null, meta.kind)}>
                       Resume last <span className="reload-id">{meta.claudeId!.slice(0, 8)}…</span>
                     </button>
-                    <button className="btn" onClick={() => reloadClaude(paneId, null)} title="opens claude's own session list">
+                    <button className="btn" onClick={() => reloadClaude(paneId, null, meta.kind)}
+                      title={meta.kind === 'grok' ? "resumes the most recent conversation in this folder" : "opens claude's own session list"}>
                       Pick session…
                     </button>
                     <button className="btn btn-ghost" onClick={() => setReloadPane(null)}>Cancel</button>
@@ -724,13 +739,13 @@ export function SplitView(props: {
         const run = (fn: () => void) => (): void => { fn(); close() }
         const isZoomed = props.zoomedPane === paneId
         const isFrozen = props.frozen[paneId] !== undefined
-        // Kind picker variant: three kinds for the requested direction.
+        // Kind picker variant: every pane kind, for the requested direction.
         if (menu.split) {
           const dir = menu.split
           return (
             <div className="ctx-menu" role="menu" aria-label={dir === 'h' ? 'split right as' : 'split down as'}
               style={{ left: x, top: y }} onMouseDown={(e) => e.stopPropagation()}>
-              {(['shell', 'claude', 'browser', 'editor'] as const).map((k) => (
+              {(['shell', 'claude', 'grok', 'browser', 'editor'] as const).map((k) => (
                 <button key={k} className="ctx-item" role="menuitem"
                   onClick={run(() => props.onSplit(paneId, dir, k))}>{k}</button>
               ))}

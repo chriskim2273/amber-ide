@@ -2,7 +2,7 @@
 //! selection, bounded-retry crash handling) and the `amber hook` subcommand
 //! that records the rotating session id (spec §6.2, §8).
 
-use amber::supervisor::{supervise_claude, SuperviseOutcome, SuspendControl};
+use amber::supervisor::{supervise_agent, Agent, SuperviseOutcome, SuspendControl};
 use amber_core::state::{ClaudeMeta, StateStore};
 use std::fs;
 use std::io::Write;
@@ -54,7 +54,7 @@ fn wait_until(
     }
 }
 
-// `supervise_claude`'s reporter is invoked at each supervision transition; a
+// `supervise_agent`'s reporter is invoked at each supervision transition; a
 // `Mutex<Vec<String>>` records the exact phase sequence for assertions. The
 // closure borrows the vec immutably, so it can be read back after the call.
 
@@ -99,7 +99,7 @@ fn resume_after_first_run() {
     let phases = Mutex::new(Vec::<String>::new());
     let report = |s: &str| phases.lock().unwrap().push(s.to_string());
     let outcome =
-        supervise_claude(&claude_path, root, "work", cwd, &settings, 3, report, &SuspendControl::new()).unwrap();
+        supervise_agent(&Agent::Claude { settings: settings.clone() }, &claude_path, root, "work", cwd, 3, report, &SuspendControl::new()).unwrap();
     assert!(matches!(outcome, SuperviseOutcome::CleanExit));
     // A clean first run reports exactly one "claude" (start), no retry.
     assert_eq!(phases.lock().unwrap().clone(), vec!["claude".to_string()]);
@@ -125,7 +125,7 @@ fn resume_after_first_run() {
     // Second run: claude/<name>.json now present -> --resume sid-9.
     let report = |_s: &str| {};
     let outcome =
-        supervise_claude(&claude_path, root, "work", cwd, &settings, 3, report, &SuspendControl::new()).unwrap();
+        supervise_agent(&Agent::Claude { settings: settings.clone() }, &claude_path, root, "work", cwd, 3, report, &SuspendControl::new()).unwrap();
     assert!(matches!(outcome, SuperviseOutcome::CleanExit));
 
     let lines = log_lines(root);
@@ -146,7 +146,7 @@ fn crash_exhausts_to_outcome() {
     let phases = Mutex::new(Vec::<String>::new());
     let report = |s: &str| phases.lock().unwrap().push(s.to_string());
     let outcome =
-        supervise_claude(&claude_path, root, "work", cwd, &settings, 3, report, &SuspendControl::new()).unwrap();
+        supervise_agent(&Agent::Claude { settings: settings.clone() }, &claude_path, root, "work", cwd, 3, report, &SuspendControl::new()).unwrap();
     assert!(matches!(outcome, SuperviseOutcome::Exhausted));
 
     let lines = log_lines(root);
@@ -211,7 +211,7 @@ fn suspend_then_resume_parks_and_relaunches_claude() {
     );
     let handle = std::thread::spawn(move || {
         let report = |s: &str| ph2.lock().unwrap().push(s.to_string());
-        supervise_claude(&cp2, &root2, "work", &root2, &set2, 3, report, &ctl2).unwrap()
+        supervise_agent(&Agent::Claude { settings: set2.clone() }, &cp2, &root2, "work", &root2, 3, report, &ctl2).unwrap()
     });
 
     // Run #1 is up.

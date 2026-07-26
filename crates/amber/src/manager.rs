@@ -212,10 +212,17 @@ impl SessionManager {
                 cmd.env("AMBER_STATE_DIR", self.root.to_string_lossy().to_string());
                 Ok(cmd)
             }
-            SessionKind::Claude => {
+            // Both agents run the SAME `amber run <name>` supervisor; it reads
+            // the persisted kind to decide which binary to launch and how.
+            SessionKind::Claude | SessionKind::Grok => {
                 let exe = std::env::current_exe()?;
                 let mut cmd = CommandBuilder::new(exe);
-                cmd.args(["run", name]);
+                // The kind is passed EXPLICITLY, not looked up from the store:
+                // `create` spawns the pty before it persists the metadata (the
+                // slot is allocated under the sessions lock, which the spawn
+                // must stay outside of), so a supervisor that read the store
+                // would race it and fall back to the wrong agent.
+                cmd.args(["run", name, "--kind", kind.as_str()]);
                 cmd.cwd(cwd);
                 cmd.env("AMBER_STATE_DIR", self.root.to_string_lossy().to_string());
                 // Tell the supervisor where to report its phase back. If unset
@@ -476,10 +483,11 @@ impl SessionManager {
         if let Some(bytes) = scrollback {
             sess.preload(&bytes);
         }
-        // A restored claude session starts back in the `claude` phase; its
-        // freshly-spawned supervisor re-reports on any later transition. Any
-        // persisted run_state is deliberately discarded here.
-        if kind == SessionKind::Claude {
+        // A restored agent session starts back in the `claude` phase (the
+        // agent-neutral "running" state); its freshly-spawned supervisor
+        // re-reports on any later transition. Any persisted run_state is
+        // deliberately discarded here.
+        if kind.is_agent() {
             sess.set_run_state(Some("claude".to_string()));
         }
         Ok(sess)
@@ -509,53 +517,58 @@ impl SessionManager {
         self.store.read_session(name).ok().flatten().map(|m| m.kind)
     }
 
-    /// Record a claude session's supervision phase (from `ReportRunState`).
+    /// Record an agent session's supervision phase (from `ReportRunState`).
     /// Errors — surfaced to the client as an `Error` reply — if the session is
-    /// unknown, is not a claude session, or `state` is not one of the three
+    /// unknown, is not an agent session, or `state` is not one of the four
     /// allowed values. A restored hand-started claude (`resume_as_claude`) runs
-    /// the supervisor too, so it counts as claude here.
+    /// the supervisor too, so it counts as an agent here.
+    ///
+    /// The phase strings stay spelled `claude*` for every agent: they name the
+    /// supervision phase, not the binary, and grok's supervisor reports the
+    /// same four. Minting `grok-*` variants would mean new vocabulary here, in
+    /// the app's kind-dot, and in the tab label for no behaviour gain.
     pub fn set_run_state(&self, name: &str, state: &str) -> anyhow::Result<()> {
-        // "suspended" (Slice 3): claude parked by a freeze grace — child killed
-        // to free RAM, pty held idle, resumable.
+        // "suspended" (Slice 3): the agent parked by a freeze grace — child
+        // killed to free RAM, pty held idle, resumable.
         if !matches!(state, "claude" | "claude-retrying" | "shell-fallback" | "suspended") {
             anyhow::bail!("invalid run_state: {state}");
         }
         let sess = self
             .session(name)
             .ok_or_else(|| anyhow::anyhow!("no such session: {name}"))?;
-        let is_claude = self
+        let is_agent = self
             .store
             .read_session(name)
             .ok()
             .flatten()
-            .map(|m| m.kind == SessionKind::Claude || m.resume_as_claude)
+            .map(|m| m.kind.is_agent() || m.resume_as_claude)
             .unwrap_or(false);
-        if !is_claude {
-            anyhow::bail!("run_state applies only to claude sessions: {name}");
+        if !is_agent {
+            anyhow::bail!("run_state applies only to agent sessions: {name}");
         }
         sess.set_run_state(Some(state.to_string()));
         Ok(())
     }
 
-    /// Signal a claude session's supervisor (`amber run`) to suspend (SIGUSR1 —
-    /// kill claude, free its RAM, idle) or resume (SIGUSR2 — relaunch
-    /// `claude --resume`). Slice 3 freeze-to-free-RAM. Errors if the session is
-    /// unknown, not a claude session, or has no child pid. The supervisor
+    /// Signal an agent session's supervisor (`amber run`) to suspend (SIGUSR1 —
+    /// kill the agent, free its RAM, idle) or resume (SIGUSR2 — relaunch it
+    /// with `--resume`). Slice 3 freeze-to-free-RAM. Errors if the session is
+    /// unknown, not an agent session, or has no child pid. The supervisor
     /// reports the resulting phase back via `ReportRunState`, so this does not
     /// itself set run_state.
     pub fn signal_suspend(&self, name: &str, resume: bool) -> anyhow::Result<()> {
         let sess = self
             .session(name)
             .ok_or_else(|| anyhow::anyhow!("no such session: {name}"))?;
-        let is_claude = self
+        let is_agent = self
             .store
             .read_session(name)
             .ok()
             .flatten()
-            .map(|m| m.kind == SessionKind::Claude || m.resume_as_claude)
+            .map(|m| m.kind.is_agent() || m.resume_as_claude)
             .unwrap_or(false);
-        if !is_claude {
-            anyhow::bail!("suspend applies only to claude sessions: {name}");
+        if !is_agent {
+            anyhow::bail!("suspend applies only to agent sessions: {name}");
         }
         let pid = sess
             .pid()
@@ -591,10 +604,7 @@ impl SessionManager {
                 sessions.get(&meta.name).map(|sess| SessionInfo {
                     name: meta.name.clone(),
                     cwd: meta.cwd.to_string_lossy().into_owned(),
-                    kind: match meta.kind {
-                        SessionKind::Shell => "shell".to_string(),
-                        SessionKind::Claude => "claude".to_string(),
-                    },
+                    kind: meta.kind.as_str().to_string(),
                     alive: sess.is_alive(),
                     updated: meta.updated,
                     run_state: sess.run_state(),
@@ -682,10 +692,12 @@ impl SessionManager {
             .store
             .read_session(to)?
             .ok_or_else(|| anyhow::anyhow!("renamed session {to} vanished from the store"))?;
-        let sess = if meta.kind == SessionKind::Claude {
-            // Deliberately keyed on the persisted kind, NOT on
-            // `kind || resume_as_claude`: a shell that merely HAS a hand-started
-            // claude inside it must not have its user's shell killed.
+        let sess = if meta.kind.is_agent() {
+            // An agent pane is respawned so its supervisor re-binds to the new
+            // name (and resumes the same conversation). Deliberately keyed on
+            // the persisted kind, NOT on `kind || resume_as_claude`: a shell
+            // that merely HAS a hand-started claude inside it must not have its
+            // user's shell killed.
             let size = sess.size();
             let _ = sess.kill();
             // If this spawn fails (pty/fork exhaustion — rare) the store is
@@ -713,10 +725,7 @@ impl SessionManager {
         Ok(SessionInfo {
             name: meta.name,
             cwd: meta.cwd.to_string_lossy().into_owned(),
-            kind: match meta.kind {
-                SessionKind::Shell => "shell".to_string(),
-                SessionKind::Claude => "claude".to_string(),
-            },
+            kind: meta.kind.as_str().to_string(),
             alive: sess.is_alive(),
             updated: meta.updated,
             run_state: sess.run_state(),

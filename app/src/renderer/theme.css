@@ -217,12 +217,15 @@ body {
   background: var(--text-faint);
 }
 .tab .kind-dot.claude { background: var(--warn); }
+/* grok: its own hue so a glance tells the two agents apart. */
+.tab .kind-dot.grok { background: var(--grok, #8ab4f8); }
 .tab .kind-dot.shell { background: var(--accent-2); }
 .tab .kind-dot.browser { background: var(--ok, #3fb950); }
 /* editor pane — app-local like a browser pane, distinct hue */
 .tab .kind-dot.editor { background: var(--accent, #7c6cff); }
 /* claude crashed and is retrying — pulsing amber draws the eye */
 .tab .kind-dot.claude-retrying { background: var(--warn); animation: pulse 1.2s ease-in-out infinite; }
+.tab .kind-dot.grok-retrying { background: var(--grok, #8ab4f8); animation: pulse 1.2s ease-in-out infinite; }
 /* claude gave up / user quit — pane is a plain shell now (gray) */
 .tab .kind-dot.shell-fallback { background: var(--text-faint); }
 /* parked by a freeze grace — claude killed to free RAM, resumable (cyan) */
@@ -321,6 +324,7 @@ body {
   background: var(--text-faint); flex: none;
 }
 .pane-header .kind-dot.claude { background: var(--warn); }
+.pane-header .kind-dot.grok { background: var(--grok, #8ab4f8); }
 .pane-header .kind-dot.shell { background: var(--accent-2); }
 /* app-local web viewer (green) */
 .pane-header .kind-dot.browser { background: var(--ok, #3fb950); }
@@ -350,6 +354,7 @@ body {
 .browser-addr:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
 /* claude crashed and is retrying — pulsing amber draws the eye */
 .pane-header .kind-dot.claude-retrying { background: var(--warn); animation: pulse 1.2s ease-in-out infinite; }
+.pane-header .kind-dot.grok-retrying { background: var(--grok, #8ab4f8); animation: pulse 1.2s ease-in-out infinite; }
 /* claude gave up / user quit — pane is a plain shell now (gray) */
 .pane-header .kind-dot.shell-fallback { background: var(--text-faint); }
 /* parked by a freeze grace — claude killed to free RAM, resumable (cyan) */
@@ -876,6 +881,7 @@ body {
   background: var(--accent-2);
 }
 .session-row .kind-dot.claude { background: var(--warn); }
+.session-row .kind-dot.grok { background: var(--grok, #8ab4f8); }
 /* min-width:0 so the ellipsis below has something to clamp against. */
 .session-main { display: flex; flex-direction: column; min-width: 0; }
 .session-name, .session-sub { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

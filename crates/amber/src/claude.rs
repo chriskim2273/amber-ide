@@ -94,10 +94,21 @@ pub fn record_session(store: &StateStore, session_name: &str, hook_stdin: &str) 
 /// Resolve the claude binary through a shell, using an explicit env overlay
 /// (tests inject `PATH`). `login` selects `-lic` (user's real PATH) vs `-c`.
 pub fn resolve_claude_with(shell: &str, login: bool, extra_env: &[(String, String)]) -> Option<PathBuf> {
+    resolve_bin_with(shell, login, "claude", extra_env)
+}
+
+/// Resolve an agent binary by name through a shell. Shared by claude and grok:
+/// both must be found on the USER's PATH, not the daemon's (spec §8).
+pub fn resolve_bin_with(
+    shell: &str,
+    login: bool,
+    bin: &str,
+    extra_env: &[(String, String)],
+) -> Option<PathBuf> {
     let flag = if login { "-lic" } else { "-c" };
     let out = Command::new(shell)
         .arg(flag)
-        .arg("command -v claude")
+        .arg(format!("command -v {bin}"))
         .envs(extra_env.iter().cloned())
         .output()
         .ok()?;

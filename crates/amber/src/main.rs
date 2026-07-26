@@ -108,11 +108,14 @@ enum Command {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
-    /// Supervise a claude/shell session inside its pty (spawned by the
-    /// daemon as the Claude session's child process; not meant to be run
-    /// directly by users).
+    /// Supervise an agent session inside its pty (spawned by the daemon as the
+    /// agent session's child process; not meant to be run directly by users).
     Run {
         name: String,
+        /// Which agent to supervise: `claude` (default) or `grok`. Passed by
+        /// the daemon rather than read from the store, which the spawn races.
+        #[arg(long, default_value = "claude")]
+        kind: String,
     },
     /// `SessionStart` hook target invoked by claude itself; records the
     /// rotating session id from stdin (`AMBER_SESSION`/`AMBER_STATE_DIR`
@@ -127,8 +130,9 @@ enum Command {
 
 #[derive(Subcommand)]
 enum CtlAction {
-    /// Resolve the claude binary via your login shell and record it in config
-    /// (the distribution-safe path — never the daemon's own PATH; spec §8).
+    /// Resolve the agent binaries (claude, grok) via your login shell and
+    /// record them in config (the distribution-safe path — never the daemon's
+    /// own PATH; spec §8).
     Doctor {
         #[arg(long)]
         root: Option<PathBuf>,
@@ -218,7 +222,7 @@ fn main() -> anyhow::Result<()> {
         Command::Web { port, new_token, print_url, root, socket } => {
             run_web(root, socket, port, new_token, print_url)
         }
-        Command::Run { name } => run_supervisor(&name),
+        Command::Run { name, kind } => run_supervisor(&name, &kind),
         Command::Hook => run_hook(),
         Command::Ctl { action } => match action {
             CtlAction::Doctor { root } => run_doctor(root),
@@ -232,13 +236,25 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-/// Resolve claude via the login shell and persist the path in config, so the
-/// daemon (whose own PATH is stripped) always finds it. Fixes the exact class
-/// of bug that motivated this rearchitecture.
+/// Resolve the agent binaries via the login shell and persist their paths in
+/// config, so the daemon (whose own PATH is stripped) always finds them. Fixes
+/// the exact class of bug that motivated this rearchitecture.
 fn run_doctor(root: Option<PathBuf>) -> anyhow::Result<()> {
     let root = root.unwrap_or_else(default_root);
     std::fs::create_dir_all(&root)?;
     let store = StateStore::new(&root);
+
+    // grok is optional: a machine with only claude installed is a working
+    // amber, so a missing grok is reported but never fails the doctor.
+    if let Some(path) = amber::grok::resolve_grok() {
+        let mut cfg = store.load_config()?;
+        cfg.grok_path = Some(path.clone());
+        store.save_config(&cfg)?;
+        println!("grok:   {} (recorded in config)", path.display());
+    } else {
+        println!("grok:   not found via your login shell (grok panes will fall back to a shell)");
+    }
+
     match claude::resolve_claude() {
         Some(path) => {
             let mut cfg = store.load_config()?;
@@ -420,8 +436,8 @@ fn supervisor_socket() -> PathBuf {
         .unwrap_or_else(|| default_socket(&root))
 }
 
-fn run_supervisor(name: &str) -> anyhow::Result<()> {
-    supervisor::run_session(&supervisor_root(), name, &supervisor_socket())
+fn run_supervisor(name: &str, kind: &str) -> anyhow::Result<()> {
+    supervisor::run_session(&supervisor_root(), name, &supervisor_socket(), kind)
 }
 
 /// `SessionStart` hook: read the hook JSON from stdin and record the

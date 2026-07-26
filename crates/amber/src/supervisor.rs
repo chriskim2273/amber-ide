@@ -4,16 +4,16 @@
 
 use std::io::Write;
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use amber_core::proto::{self, ControlMsg, Frame};
-use amber_core::state::StateStore;
+use amber_core::state::{SessionKind, StateStore};
 
-use crate::claude;
+use crate::{claude, grok};
 
 /// Upper bound on a single fire-and-forget run-state report write. Reporting
 /// must NEVER stall supervision, so both the connect and the write are
@@ -26,6 +26,12 @@ const REPORT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const WAIT_POLL: Duration = Duration::from_millis(150);
 /// How often a parked (suspended) supervisor polls for the resume request.
 const IDLE_POLL: Duration = Duration::from_millis(250);
+
+/// How many consecutive launches may try to `--resume` grok's recorded
+/// conversation before the ladder gives up and starts a new one. See
+/// [`select_grok_start`] — a just-killed session can 404 once and then resume
+/// fine, so a single failure must not cost the conversation.
+const GROK_RESUME_ATTEMPTS: u32 = 2;
 
 /// Suspend/resume signalling for a claude session (Slice 3, freeze grace). The
 /// daemon sets `suspend` (SIGUSR1) to park claude — the supervisor kills it,
@@ -53,25 +59,47 @@ pub enum SuperviseOutcome {
     Exhausted,
 }
 
-/// Run `claude_path` in `cwd`, resuming the recorded session id (if any) or
-/// continuing the most recent conversation, retrying with exponential
-/// backoff on non-zero exit up to `max_attempts` times.
+/// Which coding agent a supervised session runs. Both share this module's
+/// retry/suspend/fallback machinery; only the argv differs — see
+/// [`claude::claude_argv`] and [`grok::grok_argv`].
+pub enum Agent {
+    /// claude, whose rotating session id is recorded by its `SessionStart` hook
+    /// into the generated per-session settings file at this path.
+    Claude { settings: PathBuf },
+    /// grok, whose session id amber assigns itself (`--session-id`).
+    Grok,
+}
+
+impl Agent {
+    fn label(&self) -> &'static str {
+        match self {
+            Agent::Claude { .. } => "claude",
+            Agent::Grok => "grok",
+        }
+    }
+}
+
+/// Run `agent_path` in `cwd`, resuming the recorded session id (if any) or
+/// starting a new conversation, retrying with exponential backoff on non-zero
+/// exit up to `max_attempts` times.
 ///
 /// `report` is invoked at each supervision transition with the phase string
-/// (`"claude"` on every (re)start, `"claude-retrying"` before a backoff). It
-/// is fire-and-forget from the loop's perspective — the closure must never
-/// block supervision (the socket-backed reporter used in production time-bounds
-/// its I/O and swallows errors); tests pass a recording closure to assert the
-/// exact transition sequence.
+/// (`"claude"` on every (re)start, `"claude-retrying"` before a backoff). Those
+/// strings are agent-NEUTRAL despite their spelling — grok reports them too, so
+/// the daemon's validation, the app's kind-dot, and the tab label need no new
+/// vocabulary. It is fire-and-forget from the loop's perspective — the closure
+/// must never block supervision (the socket-backed reporter used in production
+/// time-bounds its I/O and swallows errors); tests pass a recording closure to
+/// assert the exact transition sequence.
 // Eight params (the seven original + the suspend control). Grouping them into a
 // config struct would add ceremony without clarity here; the call sites are few.
 #[allow(clippy::too_many_arguments)]
-pub fn supervise_claude(
-    claude_path: &Path,
+pub fn supervise_agent(
+    agent: &Agent,
+    agent_path: &Path,
     root: &Path,
     name: &str,
     cwd: &Path,
-    settings: &Path,
     max_attempts: u32,
     report: impl Fn(&str),
     ctl: &SuspendControl,
@@ -90,8 +118,19 @@ pub fn supervise_claude(
             escalation = 0;
             prev_id = session_id.clone();
         }
-        let start = select_start(session_id.as_deref(), escalation);
-        let argv = claude::claude_argv(&start, settings);
+        let argv = match agent {
+            Agent::Claude { settings } => {
+                let start = select_start(session_id.as_deref(), escalation);
+                claude::claude_argv(&start, settings)
+            }
+            Agent::Grok => grok::grok_argv(&select_grok_start(
+                &store,
+                name,
+                cwd,
+                session_id.as_deref(),
+                escalation,
+            )?),
+        };
 
         // Entering (or re-entering) the running phase.
         report("claude");
@@ -101,7 +140,7 @@ pub fn supervise_claude(
         // transient ETXTBSY while the binary is replaced) counts against the
         // retry budget rather than aborting supervision ("a session never
         // silently dies", spec §6.2).
-        let outcome: std::io::Result<std::process::ExitStatus> = match Command::new(claude_path)
+        let outcome: std::io::Result<std::process::ExitStatus> = match Command::new(agent_path)
             .args(&argv)
             .current_dir(cwd)
             .env("AMBER_SESSION", name)
@@ -141,7 +180,7 @@ pub fn supervise_claude(
             return Ok(SuperviseOutcome::CleanExit);
         }
         if let Err(e) = &outcome {
-            eprintln!("amber: failed to launch claude for session {name}: {e}");
+            eprintln!("amber: failed to launch {} for session {name}: {e}", agent.label());
         }
 
         attempts += 1;
@@ -167,6 +206,55 @@ fn select_start(session_id: Option<&str>, escalation: u32) -> claude::ClaudeStar
     match (session_id, escalation) {
         (Some(id), 0) => claude::ClaudeStart::Resume(id.to_string()),
         _ => claude::ClaudeStart::Fresh,
+    }
+}
+
+/// Pick how to start `grok` for one attempt, and RECORD the id when starting a
+/// new conversation.
+///
+/// Grok has no `SessionStart` hook: amber names the conversation itself with
+/// `--session-id`, so the recording that claude gets from its hook has to
+/// happen here. Two rules that are not optional:
+///
+/// * a fresh start always mints a BRAND-NEW uuid — grok refuses an id that
+///   already exists ("Session ID … is already in use"), so re-passing the
+///   recorded one would fail instantly on every retry;
+/// * a recorded id is only resumed if it is UUID-shaped — `--resume` takes an
+///   optional value, and a blank/garbage one silently resumes the most recent
+///   conversation in the cwd, hijacking an unrelated session.
+///
+/// Unlike claude's ladder, resume is tried [`GROK_RESUME_ATTEMPTS`] times
+/// before giving up on the conversation. Measured on a killed pane: the first
+/// relaunch (200 ms later) can still fail with "not found locally, restoring
+/// from remote … 404" while the dead process's session files settle, yet the
+/// very same `--resume` succeeds moments after. Falling straight to `Fresh`
+/// there would silently abandon a live conversation over a transient miss.
+fn select_grok_start(
+    store: &StateStore,
+    name: &str,
+    cwd: &Path,
+    session_id: Option<&str>,
+    escalation: u32,
+) -> anyhow::Result<grok::GrokStart> {
+    match (session_id, escalation) {
+        (Some(id), e) if e < GROK_RESUME_ATTEMPTS && grok::is_session_id(id) => {
+            Ok(grok::GrokStart::Resume(id.to_string()))
+        }
+        _ => {
+            let id = grok::new_session_id();
+            store.write_claude(
+                name,
+                &amber_core::state::ClaudeMeta {
+                    session_id: id.clone(),
+                    cwd: cwd.to_path_buf(),
+                    updated: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                },
+            )?;
+            Ok(grok::GrokStart::Fresh(id))
+        }
     }
 }
 
@@ -268,35 +356,57 @@ fn try_report_run_state(socket: &Path, name: &str, state: &str) -> anyhow::Resul
 /// interactive shell (replacing this process) if claude is unresolvable or
 /// exhausts its retries. Runs inside the pty, so the child inherits the tty.
 /// `socket` is the daemon socket the supervisor reports its phase to.
-pub fn run_session(root: &Path, name: &str, socket: &Path) -> anyhow::Result<()> {
+pub fn run_session(root: &Path, name: &str, socket: &Path, kind: &str) -> anyhow::Result<()> {
     let store = StateStore::new(root);
     let mut cfg = store.load_config()?;
 
-    let claude_path = match cfg.claude_path.clone() {
+    let meta = store.read_session(name)?;
+    // Which agent this pane runs, from the DAEMON's own argv — deliberately not
+    // the store: `SessionManager::create` spawns the pty before persisting the
+    // metadata, so reading it here is a race that silently launches claude for
+    // a grok pane (observed). Anything unrecognised, including a hand-started
+    // supervisor, keeps the historical claude behaviour. A `Shell` session
+    // reaching here is a hand-started claude restored via `resume_as_claude`.
+    let is_grok = kind == SessionKind::Grok.as_str();
+
+    // The cached path is only trusted while it still EXISTS. Both agents ship
+    // self-updaters that can relocate their binary; without this check a stale
+    // cache makes every launch fail with ENOENT, and the pane drops to a shell
+    // permanently until someone runs `amber ctl doctor` by hand.
+    let cached = if is_grok { cfg.grok_path.clone() } else { cfg.claude_path.clone() };
+    let agent_path = match cached.filter(|p| p.exists()) {
         Some(p) => Some(p),
         None => {
-            let resolved = claude::resolve_claude();
-            if let Some(ref p) = resolved {
-                cfg.claude_path = Some(p.clone());
+            let resolved = if is_grok { grok::resolve_grok() } else { claude::resolve_claude() };
+            if let Some(p) = resolved.clone() {
+                if is_grok { cfg.grok_path = Some(p) } else { cfg.claude_path = Some(p) }
                 store.save_config(&cfg)?;
             }
             resolved
         }
     };
 
-    let cwd = store
-        .read_session(name)?
-        .map(|m| m.cwd)
-        .unwrap_or(std::env::current_dir()?);
+    let cwd = match meta.map(|m| m.cwd) {
+        Some(c) => c,
+        None => std::env::current_dir()?,
+    };
 
-    if let Some(claude_path) = claude_path {
-        // A detached claude blocks forever on the interactive folder-trust
-        // prompt for an untrusted cwd (never starting the session / recording
-        // the resume id). Pre-accept trust for this cwd.
-        claude::ensure_cwd_trusted(&cwd);
-        let current_exe = std::env::current_exe()?;
-        let hook_command = format!("{} hook", current_exe.display());
-        let settings = claude::write_settings(root, name, &hook_command)?;
+    if let Some(agent_path) = agent_path {
+        let agent = if is_grok {
+            // Grok records nothing on our behalf and has no folder-trust
+            // dialog to pre-accept: `--session-id` is the whole mechanism.
+            Agent::Grok
+        } else {
+            // A detached claude blocks forever on the interactive folder-trust
+            // prompt for an untrusted cwd (never starting the session /
+            // recording the resume id). Pre-accept trust for this cwd.
+            claude::ensure_cwd_trusted(&cwd);
+            let current_exe = std::env::current_exe()?;
+            let hook_command = format!("{} hook", current_exe.display());
+            Agent::Claude {
+                settings: claude::write_settings(root, name, &hook_command)?,
+            }
+        };
 
         // Both outcomes fall through to the shell. On a user quit (Ctrl-C /
         // clean exit) the pane becomes a plain login shell instead of closing;
@@ -312,16 +422,18 @@ pub fn run_session(root: &Path, name: &str, socket: &Path) -> anyhow::Result<()>
         let _ = signal_hook::flag::register(signal_hook::consts::SIGUSR2, Arc::clone(&ctl.resume));
 
         let report = |state: &str| report_run_state(socket, name, state);
-        match supervise_claude(&claude_path, root, name, &cwd, &settings, 3, report, &ctl)? {
+        match supervise_agent(&agent, &agent_path, root, name, &cwd, 3, report, &ctl)? {
             SuperviseOutcome::CleanExit => {}
             SuperviseOutcome::Exhausted => {
                 eprintln!(
-                    "amber: claude exhausted retries for session {name}; falling back to shell"
+                    "amber: {} exhausted retries for session {name}; falling back to shell",
+                    agent.label()
                 );
             }
         }
     } else {
-        eprintln!("amber: claude not found on PATH; falling back to shell");
+        let missing = if is_grok { "grok" } else { "claude" };
+        eprintln!("amber: {missing} not found on PATH; falling back to shell");
     }
 
     // The pane is now a plain shell (user quit, exhausted retries, or claude
@@ -375,6 +487,84 @@ mod tests {
         // of escalation.
         assert_eq!(select_start(None, 0), claude::ClaudeStart::Fresh);
         assert_eq!(select_start(None, 2), claude::ClaudeStart::Fresh);
+    }
+
+    #[test]
+    fn grok_resumes_a_recorded_uuid_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        let id = "9d5ed578-38af-420e-9cb5-80b0d0b68c77";
+        let start = select_grok_start(&store, "w", Path::new("/tmp"), Some(id), 0).unwrap();
+        assert_eq!(start, grok::GrokStart::Resume(id.to_string()));
+    }
+
+    #[test]
+    fn grok_mints_and_records_a_new_id_on_a_fresh_start() {
+        // No recorded id: mint one AND persist it, since grok has no hook to
+        // record it for us — otherwise the next launch could not resume.
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        let start = select_grok_start(&store, "w", Path::new("/tmp/proj"), None, 0).unwrap();
+        let grok::GrokStart::Fresh(id) = start else { panic!("expected a fresh start") };
+        let meta = store.read_claude("w").unwrap().unwrap();
+        assert_eq!(meta.session_id, id, "the minted id must be recorded");
+        assert_eq!(meta.cwd, Path::new("/tmp/proj"));
+    }
+
+    #[test]
+    fn grok_retries_resume_before_abandoning_the_conversation() {
+        // A just-crashed grok session can miss ONCE ("not found locally …
+        // 404") and resume fine on the next try. Escalation 1 must still
+        // resume; only after that does the ladder mint a new conversation.
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        let id = "9d5ed578-38af-420e-9cb5-80b0d0b68c77";
+        let start = select_grok_start(&store, "w", Path::new("/tmp"), Some(id), 1).unwrap();
+        assert_eq!(start, grok::GrokStart::Resume(id.to_string()));
+        assert!(
+            matches!(
+                select_grok_start(&store, "w", Path::new("/tmp"), Some(id), 2).unwrap(),
+                grok::GrokStart::Fresh(_)
+            ),
+            "the ladder must eventually start a new conversation"
+        );
+    }
+
+    #[test]
+    fn grok_never_reuses_an_id_after_a_failed_attempt() {
+        // THE grok-specific hazard: `--session-id` is rejected outright if the
+        // id already exists, so every escalated attempt must carry a brand-new
+        // uuid. Re-passing the recorded one would fail instantly and burn the
+        // whole retry budget without ever launching grok.
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        let recorded = "9d5ed578-38af-420e-9cb5-80b0d0b68c77";
+        let mut seen = vec![recorded.to_string()];
+        for escalation in GROK_RESUME_ATTEMPTS..GROK_RESUME_ATTEMPTS + 3 {
+            let start =
+                select_grok_start(&store, "w", Path::new("/tmp"), Some(recorded), escalation)
+                    .unwrap();
+            let grok::GrokStart::Fresh(id) = start else {
+                panic!("escalation {escalation} must start fresh, not resume")
+            };
+            assert!(!seen.contains(&id), "id {id} reused at escalation {escalation}");
+            seen.push(id);
+        }
+    }
+
+    #[test]
+    fn grok_refuses_a_malformed_recorded_id() {
+        // `--resume` takes an OPTIONAL value: handing it a non-uuid would
+        // resume whatever ran last in this cwd — an unrelated conversation.
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        for bad in ["", "latest", "not-a-uuid"] {
+            let start = select_grok_start(&store, "w", Path::new("/tmp"), Some(bad), 0).unwrap();
+            assert!(
+                matches!(start, grok::GrokStart::Fresh(_)),
+                "recorded id {bad:?} must not be resumed"
+            );
+        }
     }
 
     #[cfg(unix)]
