@@ -46,6 +46,36 @@ export function shouldUseCompat(
 }
 
 /**
+ * How long after launch a GPU/renderer death still counts as evidence that this
+ * machine cannot do hardware GL at all.
+ *
+ * The detector exists for ONE failure: Chromium can't bring up a working
+ * GPU/renderer on this box (the kernel-6.17 shm/seccomp trap), which shows up
+ * immediately at startup. It is NOT a general crash handler, and it was
+ * registered for the whole life of the process.
+ *
+ * Measured on a live machine: at 03:55:38 an X-server/NVIDIA glitch took out all
+ * 16 Firefox processes, hung Discord's web contents, and killed amber's GPU
+ * process ("GPU process exited unexpectedly: exit_code=512"). Amber read that as
+ * "no GPU here", wrote the sticky marker, and relaunched itself into SwiftShader
+ * — then burned ~11 cores for the next 23 hours with an idle RTX 3070 in the
+ * box. That is the "it gets laggy after a while" report: the app silently
+ * downgraded itself mid-session over an unrelated desktop-wide event.
+ */
+export const DETECT_WINDOW_MS = 20_000
+
+/**
+ * Does a process death say anything about this machine's GL support?
+ *
+ * A process the OS killed does not: an OOM kill is about memory pressure, and a
+ * plain kill is about whoever sent the signal. Neither is a reason to give up on
+ * the GPU. Paired with `DETECT_WINDOW_MS`, which is the load-bearing guard.
+ */
+export function compatWorthyReason(reason: string): boolean {
+  return reason !== 'clean-exit' && reason !== 'oom' && reason !== 'killed'
+}
+
+/**
  * Chromium switches for compat mode.
  *
  * Note what is NOT here: `disable-gpu-vsync` and `disable-frame-rate-limit`.

@@ -600,6 +600,31 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   `#1 grok · grok`, grok TUI rendered, typed prompt answered, OSC title live.
   NOTE: a running daemon must be restarted before it accepts `kind:"grok"`.
 
+- [x] Compat-mode false positive (2026-07-26) — **the "app gets laggy after a
+  while" bug**. Measured on the live box: the GPU process was burning **471 %
+  CPU while idle** (10 d 11 h of CPU in 22.9 h of wall clock, ~11 cores) with an
+  idle RTX 3070 in the machine; the renderer was at 17 % — so it was never a
+  React/xterm leak. The app was running SwiftShader. Why: at 03:55:38 an
+  X-server/NVIDIA glitch took out all 16 Firefox processes, hung Discord's web
+  contents, and killed amber's GPU process (`GPU process exited unexpectedly:
+  exit_code=512`). The compat detector's `child-process-gone`/`render-process-gone`
+  listeners were registered for the WHOLE session, so it read an unrelated
+  desktop-wide event as "this machine has no GPU", wrote the sticky
+  `<state>/render-compat` marker and relaunched itself into software GL —
+  marker mtime 03:55:39, relaunched pid started 03:55:41, and it stayed there for
+  the next 23 hours. The 2026-07-13 signature-expiry fix did NOT cover this: the
+  marker was written under the CURRENT kernel+Electron, so it was honoured. Fix:
+  the crash listeners are disarmed after `DETECT_WINDOW_MS` (20 s) — the failure
+  they exist for (the kernel-6.17 GPU-shm trap) manifests at startup, never at
+  hour 20 — and `compatWorthyReason` additionally ignores `oom`/`killed`, which
+  say nothing about GL. Verified with an isolated instance (private
+  `XDG_STATE_HOME` + `--user-data-dir`, real X11 — xvfb cannot answer this, it has
+  no GPU): hardware GL came up, no marker was written, GPU process idled at
+  **28 %** vs the stuck app's 471 %. App 401 tests + typecheck green.
+  **Recovery for an already-stuck machine: `rm $XDG_STATE_HOME/amber-ide/render-compat`
+  (default `~/.local/state/amber-ide/render-compat`) and restart the app** — the
+  code fix prevents re-entry but cannot un-write an existing marker.
+
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**
   `std::io::Read` (dedicated thread); `take_writer()` is one-shot;

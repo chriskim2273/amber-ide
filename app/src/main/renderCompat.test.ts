@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { compatSignature, shouldUseCompat, COMPAT_SWITCHES } from './renderCompat'
+import { compatSignature, shouldUseCompat, compatWorthyReason, COMPAT_SWITCHES, DETECT_WINDOW_MS } from './renderCompat'
 
 const SIG = compatSignature('43.1.0', '7.0.0-28-generic')
 
@@ -38,6 +38,33 @@ describe('shouldUseCompat', () => {
 
   it('env override beats a stale marker', () => {
     expect(shouldUseCompat({ AMBER_SOFTWARE_GL: '1' }, '1', SIG)).toBe(true)
+  })
+})
+
+describe('compatWorthyReason', () => {
+  it('accepts a genuine GPU/renderer failure to start', () => {
+    expect(compatWorthyReason('crashed')).toBe(true)
+    expect(compatWorthyReason('launch-failed')).toBe(true)
+  })
+
+  it('ignores an OS kill — it says nothing about GL support', () => {
+    // A renderer the kernel OOM-killed, or one killed by hand, used to write the
+    // sticky marker and condemn the machine to SwiftShader.
+    expect(compatWorthyReason('oom')).toBe(false)
+    expect(compatWorthyReason('killed')).toBe(false)
+  })
+
+  it('ignores a clean exit', () => {
+    expect(compatWorthyReason('clean-exit')).toBe(false)
+  })
+})
+
+describe('DETECT_WINDOW_MS', () => {
+  it('is a short startup window, not the whole session', () => {
+    // The load-bearing guard: a GPU crash HOURS into a session (an X-server or
+    // driver glitch) is not the kernel-6.17 bug and must never flip compat.
+    expect(DETECT_WINDOW_MS).toBeGreaterThan(0)
+    expect(DETECT_WINDOW_MS).toBeLessThanOrEqual(60_000)
   })
 })
 

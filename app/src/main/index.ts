@@ -38,7 +38,7 @@ import {
   inlineImages,
 } from './editorFiles'
 import { claudeNames } from './claudeNames'
-import { compatSignature, shouldUseCompat, COMPAT_SWITCHES } from './renderCompat'
+import { compatSignature, shouldUseCompat, compatWorthyReason, COMPAT_SWITCHES, DETECT_WINDOW_MS } from './renderCompat'
 import { installBinary } from './installBinary'
 import clientPath from '../client/index?modulePath'
 
@@ -412,6 +412,12 @@ async function main(): Promise<void> {
   // finishes loading, persist the compat flag and relaunch — the next start
   // applies the software-GL + sandbox workarounds. On healthy machines the page
   // loads, the timer clears, and this never fires.
+  //
+  // The crash listeners are DISARMED after DETECT_WINDOW_MS. They used to live
+  // for the whole session, so any later GPU death — an X-server or driver glitch
+  // that has nothing to do with amber — silently relaunched the app into
+  // software rendering and left it there. See renderCompat.ts for the measured
+  // case that cost ~11 cores for 23 hours.
   if (!compat) {
     let switching = false
     const enterCompat = (): void => {
@@ -421,12 +427,20 @@ async function main(): Promise<void> {
       app.relaunch()
       app.exit(0)
     }
+    const onRendererGone = (_e: unknown, d: { reason: string }): void => {
+      if (compatWorthyReason(d.reason)) enterCompat()
+    }
+    const onChildGone = (_e: unknown, d: { type: string; reason: string }): void => {
+      if (d.type === 'GPU' && compatWorthyReason(d.reason)) enterCompat()
+    }
     const loadTimer = setTimeout(enterCompat, 10000)
     win.webContents.once('did-finish-load', () => clearTimeout(loadTimer))
-    win.webContents.on('render-process-gone', enterCompat)
-    app.on('child-process-gone', (_e, d) => {
-      if (d.type === 'GPU' && d.reason !== 'clean-exit') enterCompat()
-    })
+    win.webContents.on('render-process-gone', onRendererGone)
+    app.on('child-process-gone', onChildGone)
+    setTimeout(() => {
+      if (!win.isDestroyed()) win.webContents.off('render-process-gone', onRendererGone)
+      app.off('child-process-gone', onChildGone)
+    }, DETECT_WINDOW_MS)
   }
 
   // CSP from the main process, not a static meta tag: dev needs Vite's HMR
