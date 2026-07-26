@@ -620,7 +620,13 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   say nothing about GL. Verified with an isolated instance (private
   `XDG_STATE_HOME` + `--user-data-dir`, real X11 — xvfb cannot answer this, it has
   no GPU): hardware GL came up, no marker was written, GPU process idled at
-  **28 %** vs the stuck app's 471 %. App 401 tests + typecheck green.
+  **28 %** vs the stuck app's 471 %. App 397 tests + typecheck green.
+  **Trigger identified (not amber's bug):** `~/lowpower/night-mode.sh:145` arms
+  PCI runtime PM on every device whose class is not `0x02*` (network) — but both
+  GPUs are class `0x030000`, so the nightly script sets `power/control=auto` on
+  the RTX 3070 and the iGPU. Verified live. That is what bounced the GPU. The
+  guard wants `0x03*` excluded too; amber's job is only to not condemn itself
+  when it happens.
   **Recovery for an already-stuck machine: `rm $XDG_STATE_HOME/amber-ide/render-compat`
   (default `~/.local/state/amber-ide/render-compat`) and restart the app** — the
   code fix prevents re-entry but cannot un-write an existing marker.
