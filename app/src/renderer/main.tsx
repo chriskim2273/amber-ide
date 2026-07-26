@@ -2,7 +2,7 @@ import { useCallback, useEffect, useReducer, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { SplitView, type PaneMeta } from './SplitView'
 import type { EditorApi } from './Editor'
-import { initialState, reduce, groupSessions, mergeBrowsers, mergeEditors, tabDot, hasActivity, type DaemonEvent } from './store'
+import { initialState, reduce, groupSessions, mergeBrowsers, mergeEditors, tabDot, hasActivity, isAgentKind, type DaemonEvent } from './store'
 import { sessionRows } from './sessionRows'
 import { deriveTab, shortCwd } from './tabView'
 import { formatName, makeId, retargetPane } from '../shared/names'
@@ -123,7 +123,7 @@ function App(): JSX.Element {
   // Tab id currently being dragged for reorder (HTML5 drag; ref, not state, so
   // the drag gesture never re-renders the terminals).
   const dragTab = useRef<number | null>(null)
-  const [kind, setKind] = useState<'shell' | 'claude' | 'browser' | 'editor'>('shell')
+  const [kind, setKind] = useState<'shell' | 'claude' | 'grok' | 'browser' | 'editor'>('shell')
   // Absolute working directory for newly created panes (default $HOME). Sent
   // verbatim so a session restores in the SAME folder — a relative '.' would
   // drift to the daemon's cwd ($HOME under systemd) on restart.
@@ -394,8 +394,8 @@ function App(): JSX.Element {
       const next = { ...(l.frozen ?? {}), [name]: n ? { note: n } : {} }
       return { ...l, frozen: next }
     })
-    const isClaude = sessionsRef.current.find((s) => s.name === name)?.kind === 'claude'
-    if (isClaude && !suspendedRef.current.has(name)) {
+    const isAgent = isAgentKind(sessionsRef.current.find((s) => s.name === name)?.kind ?? '')
+    if (isAgent && !suspendedRef.current.has(name)) {
       window.amber.suspendSession(name)
       suspendedRef.current.add(name)
     }
@@ -760,7 +760,7 @@ function App(): JSX.Element {
     const wsList = scope === 'one' ? workspaces.filter((w) => w.ws === currentWs) : workspaces
     // Browser panes have no daemon session, so no backlog to dump — exclude them
     // (a dumpBacklog for a non-session would just draw an Error reply).
-    const names = wsList.flatMap((w) => w.tabs.flatMap((t) => t.panes.filter((p) => p.kind === 'shell' || p.kind === 'claude').map((p) => p.name)))
+    const names = wsList.flatMap((w) => w.tabs.flatMap((t) => t.panes.filter((p) => p.kind === 'shell' || isAgentKind(p.kind)).map((p) => p.name)))
     const { dumps, stragglers } = await collectDumps(
       names,
       (n) => window.amber.dumpBacklog(n),
@@ -907,9 +907,10 @@ function App(): JSX.Element {
           onClick={() => setSessionsOpen(true)}>🧹</button>
         <div className="divider" />
         <span className="label">new</span>
-        <select className="select" value={kind} onChange={(e) => setKind(e.target.value as 'shell' | 'claude' | 'browser' | 'editor')}>
+        <select className="select" value={kind} onChange={(e) => setKind(e.target.value as 'shell' | 'claude' | 'grok' | 'browser' | 'editor')}>
           <option value="shell">shell</option>
           <option value="claude">claude</option>
+          <option value="grok">grok</option>
           <option value="browser">browser</option>
           <option value="editor">editor</option>
         </select>
@@ -1114,7 +1115,7 @@ function App(): JSX.Element {
                   {rows.map((p) => (
                     <li key={p.name} className="session-row">
                       <span className="session-slot">{p.slot ? `#${p.slot}` : '—'}</span>
-                      <span className={'kind-dot ' + (p.kind === 'claude' ? 'claude' : 'shell')} title={p.kind} />
+                      <span className={'kind-dot ' + (isAgentKind(p.kind) ? p.kind : 'shell')} title={p.kind} />
                       <span className="session-main">
                         <span className="session-name">{p.claudeName || p.cwd}</span>
                         <span className="session-sub">{p.name}</span>
@@ -1174,7 +1175,7 @@ function App(): JSX.Element {
                       <input type="checkbox" checked={picked.has(r.name)}
                         aria-label={`select ${r.name}`} onChange={() => toggle(r.name)} />
                       <span className="session-slot">{r.slot ? `#${r.slot}` : '—'}</span>
-                      <span className={'kind-dot ' + (r.kind === 'claude' ? 'claude' : 'shell')}
+                      <span className={'kind-dot ' + (isAgentKind(r.kind) ? r.kind : 'shell')}
                         title={r.kind} />
                       <span className="session-main">
                         <span className="session-name">

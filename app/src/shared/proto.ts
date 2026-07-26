@@ -15,13 +15,16 @@ export interface SessionInfo {
   // 2026-07-19-stable-session-slots): what `amber ls` prints and what
   // `amber attach <n>` resolves. Absent/0 from an older daemon.
   slot?: number
-  // Claude supervision phase for a claude session: 'claude' (running),
-  // 'claude-retrying' (crashed, retrying), 'shell-fallback' (dropped to a
-  // shell). Optional on the wire (serde default None → undefined); decode-only,
-  // forwarded wholesale through the client → renderer hops.
+  // Supervision phase for an AGENT session (kind 'claude' or 'grok'): 'claude'
+  // (running), 'claude-retrying' (crashed, retrying), 'shell-fallback' (dropped
+  // to a shell), 'suspended' (parked, RAM freed). The strings stay spelled
+  // `claude*` for every agent — they name the phase, not the binary. Optional on
+  // the wire (serde default None → undefined); decode-only, forwarded wholesale
+  // through the client → renderer hops.
   run_state?: string | undefined
-  // Last Claude Code session id recorded for this pane (SessionStart hook), if
-  // any. Powers the "reload claude" action (resume this exact conversation).
+  // Last agent conversation id recorded for this pane — claude's rotating id
+  // (from its SessionStart hook) or the uuid amber assigned a grok session.
+  // Powers the "reload claude" action (resume this exact conversation).
   // Optional on the wire (serde default None → undefined); decode-only.
   claude_id?: string | undefined
 }

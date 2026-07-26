@@ -163,18 +163,19 @@ fn parse_kind(kind: &str) -> anyhow::Result<SessionKind> {
     match kind {
         "shell" => Ok(SessionKind::Shell),
         "claude" => Ok(SessionKind::Claude),
+        "grok" => Ok(SessionKind::Grok),
         other => anyhow::bail!("unknown session kind: {other}"),
     }
 }
 
 /// Should this Attach suppress historical backlog replay? Spec §5: a plain
-/// terminal (raw client) cannot safely replay an alt-screen (claude)
+/// terminal (raw client) cannot safely replay an alt-screen (agent TUI)
 /// session's history — it relies on the child's next repaint instead.
 /// xterm.js clients (raw_client=false, a full emulator) and shell sessions
 /// always get the backlog. Unknown kind (missing metadata) replays too:
 /// losing scrollback is worse than a cosmetic glitch we cannot prove.
 fn suppress_backlog(raw_client: bool, kind: Option<SessionKind>) -> bool {
-    raw_client && kind == Some(SessionKind::Claude)
+    raw_client && kind.is_some_and(|k| k.is_agent())
 }
 
 /// Per-connection loop: decode frames from the read half, dispatch each one,
@@ -545,6 +546,10 @@ mod tests {
     #[test]
     fn backlog_suppressed_only_for_raw_client_on_claude_sessions() {
         assert!(suppress_backlog(true, Some(SessionKind::Claude)));
+        // grok is an alt-screen TUI too — same rule, or a raw `amber attach`
+        // repaints its history over a live full-screen UI.
+        assert!(suppress_backlog(true, Some(SessionKind::Grok)));
+        assert!(!suppress_backlog(false, Some(SessionKind::Grok)));
         assert!(!suppress_backlog(true, Some(SessionKind::Shell)));
         assert!(!suppress_backlog(false, Some(SessionKind::Claude)));
         assert!(!suppress_backlog(false, Some(SessionKind::Shell)));

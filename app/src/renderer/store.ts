@@ -105,31 +105,42 @@ export function reduce(state: AppState, ev: DaemonEvent): AppState {
 
 export interface KindDot { cls: string; label: string }
 
-// A pane's kind-dot appearance + tooltip, from its kind and claude run_state.
+// A supervised coding-agent pane — one whose daemon session runs `amber run`
+// and reports a run_state. The daemon's `SessionKind::is_agent`, mirrored: both
+// agents share every run_state behaviour (dots, freeze/suspend, tab label), and
+// the run_state vocabulary stays spelled `claude*` for both because it names
+// the supervision phase, not the binary.
+export function isAgentKind(kind: string): boolean {
+  return kind === 'claude' || kind === 'grok'
+}
+
+// A pane's kind-dot appearance + tooltip, from its kind and agent run_state.
 // Shared by the pane header and the tab bar so they downgrade identically:
 // amber = claude, pulsing amber = claude-retrying, gray = shell-fallback.
 export function paneDot(kind: string, runState: string | undefined): KindDot {
   if (kind === 'browser') return { cls: 'browser', label: 'browser' }
   if (kind === 'editor') return { cls: 'editor', label: 'editor' }
-  if (kind !== 'claude') return { cls: 'shell', label: 'shell' }
+  if (!isAgentKind(kind)) return { cls: 'shell', label: 'shell' }
   switch (runState) {
-    case 'claude-retrying': return { cls: 'claude-retrying', label: 'claude (retrying)' }
-    case 'shell-fallback': return { cls: 'shell-fallback', label: 'shell (claude exited)' }
-    // Slice 3: parked by a freeze grace — claude killed to free RAM, resumable.
+    case 'claude-retrying': return { cls: `${kind}-retrying`, label: `${kind} (retrying)` }
+    case 'shell-fallback': return { cls: 'shell-fallback', label: `shell (${kind} exited)` }
+    // Slice 3: parked by a freeze grace — the agent killed to free RAM, resumable.
     case 'suspended': return { cls: 'suspended', label: 'suspended (RAM freed)' }
-    default: return { cls: 'claude', label: 'claude' }
+    default: return { cls: kind, label: kind }
   }
 }
 
-// The tab bar's dot, aggregated over a tab's panes: no claude → shell; any
-// retrying claude → retrying (most attention-worthy); every claude fallen back
-// to a shell → shell-fallback (gray); otherwise → claude.
+// The tab bar's dot, aggregated over a tab's panes: no agent → shell; any
+// retrying agent → retrying (most attention-worthy); every agent fallen back
+// to a shell → shell-fallback (gray); otherwise → the agent. A tab whose agents
+// are all grok reads "grok"; a mixed tab is labelled with the older name.
 export function tabDot(panes: PaneModel[]): KindDot {
-  const claudes = panes.filter((p) => p.kind === 'claude')
-  if (claudes.length === 0) return { cls: 'shell', label: 'shell' }
-  if (claudes.some((p) => p.runState === 'claude-retrying')) return { cls: 'claude-retrying', label: 'claude (retrying)' }
-  if (claudes.every((p) => p.runState === 'shell-fallback')) return { cls: 'shell-fallback', label: 'shell (claude exited)' }
-  return { cls: 'claude', label: 'claude' }
+  const agents = panes.filter((p) => isAgentKind(p.kind))
+  if (agents.length === 0) return { cls: 'shell', label: 'shell' }
+  const k = agents.every((p) => p.kind === 'grok') ? 'grok' : 'claude'
+  if (agents.some((p) => p.runState === 'claude-retrying')) return { cls: `${k}-retrying`, label: `${k} (retrying)` }
+  if (agents.every((p) => p.runState === 'shell-fallback')) return { cls: 'shell-fallback', label: `shell (${k} exited)` }
+  return { cls: k, label: k }
 }
 
 // True if any of `panes` has output activity newer than it was last seen —

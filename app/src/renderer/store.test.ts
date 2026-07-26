@@ -185,6 +185,22 @@ describe('paneDot', () => {
   })
 })
 
+describe('paneDot grok', () => {
+  // grok is a supervised agent like claude: it reports the SAME run_state
+  // vocabulary (the strings name the supervision phase, not the binary), so it
+  // must get the full dot treatment rather than falling through to "shell".
+  it('maps run_state to dot + label', () => {
+    expect(paneDot('grok', undefined)).toEqual({ cls: 'grok', label: 'grok' })
+    expect(paneDot('grok', 'claude')).toEqual({ cls: 'grok', label: 'grok' })
+    expect(paneDot('grok', 'claude-retrying')).toEqual({ cls: 'grok-retrying', label: 'grok (retrying)' })
+    expect(paneDot('grok', 'shell-fallback')).toEqual({ cls: 'shell-fallback', label: 'shell (grok exited)' })
+    expect(paneDot('grok', 'suspended')).toEqual({ cls: 'suspended', label: 'suspended (RAM freed)' })
+  })
+  it('is not treated as an app-local kind', () => {
+    expect(paneDot('grok', undefined).cls).not.toBe('shell')
+  })
+})
+
 describe('tabDot', () => {
   it('no claude pane → shell', () => {
     expect(tabDot([pane('shell'), pane('shell')]).cls).toBe('shell')
@@ -200,6 +216,13 @@ describe('tabDot', () => {
   })
   it('a mix of fallen-back and running claude → claude', () => {
     expect(tabDot([pane('claude', 'shell-fallback'), pane('claude', 'claude')]).cls).toBe('claude')
+  })
+  it('an all-grok tab reads grok', () => {
+    expect(tabDot([pane('shell'), pane('grok', 'claude')])).toEqual({ cls: 'grok', label: 'grok' })
+    expect(tabDot([pane('grok', 'claude-retrying')]).cls).toBe('grok-retrying')
+  })
+  it('a grok pane still counts toward the tab dot in a mixed tab', () => {
+    expect(tabDot([pane('claude', 'shell-fallback'), pane('grok', 'claude')]).cls).toBe('claude')
   })
 })
 

@@ -3,8 +3,8 @@
 //! Layout under a root dir:
 //! ```text
 //! config.toml
-//! sessions/<name>.json     { name, cwd, kind: "shell"|"claude", updated }
-//! claude/<name>.json       { session_id, cwd, updated }
+//! sessions/<name>.json     { name, cwd, kind: "shell"|"claude"|"grok", updated }
+//! claude/<name>.json       { session_id, cwd, updated }   (grok ids live here too)
 //! scrollback/<name>.bin     raw bytes
 //! ```
 //! All writes are atomic: write to a `.tmp` file in the same directory as the
@@ -22,6 +22,28 @@ use serde::{Deserialize, Serialize};
 pub enum SessionKind {
     Shell,
     Claude,
+    Grok,
+}
+
+impl SessionKind {
+    /// True for a supervised coding-agent session — one whose pty runs
+    /// `amber run <name>` instead of a bare shell. These share every behaviour
+    /// that is about "an agent TUI on the alt screen", not about claude
+    /// specifically: backlog suppression for raw clients, run-state reporting,
+    /// suspend/resume. Adding a third agent means adding one arm here, not
+    /// hunting `== SessionKind::Claude` across the daemon.
+    pub fn is_agent(self) -> bool {
+        matches!(self, SessionKind::Claude | SessionKind::Grok)
+    }
+
+    /// The wire spelling (what `SessionInfo.kind` carries and the app matches on).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SessionKind::Shell => "shell",
+            SessionKind::Claude => "claude",
+            SessionKind::Grok => "grok",
+        }
+    }
 }
 
 /// Metadata for a session, persisted as `sessions/<name>.json`.
@@ -64,6 +86,11 @@ pub struct ClaudeMeta {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
     pub claude_path: Option<PathBuf>,
+    /// Resolved `grok` binary, cached the same way `claude_path` is (login-shell
+    /// resolution, never the daemon's own PATH). Defaulted so a config.toml
+    /// written before grok support still loads.
+    #[serde(default)]
+    pub grok_path: Option<PathBuf>,
     pub snapshot_interval_secs: u64,
     pub scrollback_bytes: usize,
 }
@@ -72,6 +99,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             claude_path: None,
+            grok_path: None,
             snapshot_interval_secs: 10,
             scrollback_bytes: 2 * 1024 * 1024,
         }
@@ -526,6 +554,38 @@ mod tests {
     }
 
     #[test]
+    fn config_written_before_grok_support_still_loads() {
+        // `grok_path` was added after this file format shipped; an existing
+        // config.toml has no such key and must still deserialize.
+        let dir = tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        fs::write(
+            dir.path().join("config.toml"),
+            b"claude_path = \"/usr/bin/claude\"\nsnapshot_interval_secs = 10\nscrollback_bytes = 2048\n",
+        )
+        .unwrap();
+
+        let cfg = store.load_config().unwrap();
+
+        assert_eq!(cfg.claude_path, Some(PathBuf::from("/usr/bin/claude")));
+        assert_eq!(cfg.grok_path, None);
+    }
+
+    #[test]
+    fn agent_kinds_are_the_supervised_ones() {
+        assert!(SessionKind::Claude.is_agent());
+        assert!(SessionKind::Grok.is_agent());
+        assert!(!SessionKind::Shell.is_agent());
+    }
+
+    #[test]
+    fn grok_kind_serializes_lowercase() {
+        // The wire/JSON spelling is what `parse_kind` and the app both use.
+        let json = serde_json::to_string(&SessionKind::Grok).unwrap();
+        assert_eq!(json, "\"grok\"");
+    }
+
+    #[test]
     fn config_corrupt_is_err() {
         let dir = tempdir().unwrap();
         let store = StateStore::new(dir.path());
@@ -542,6 +602,7 @@ mod tests {
         let store = StateStore::new(dir.path());
         let cfg = Config {
             claude_path: Some(PathBuf::from("/usr/local/bin/claude")),
+            grok_path: Some(PathBuf::from("/usr/local/bin/grok")),
             snapshot_interval_secs: 42,
             scrollback_bytes: 4096,
         };

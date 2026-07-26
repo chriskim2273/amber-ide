@@ -39,8 +39,9 @@ export function deriveTab(
     const lead = osc && osc.trim().length > 0
       ? osc
       : (p.kind === 'editor' ? (p.cwd ? shortCwd(p.cwd, home) : 'untitled') : shortCwd(p.cwd, home))
-    // A claude pane that fell back to a shell is labelled as such, not "claude".
-    const suffix = p.runState === 'shell-fallback' ? 'shell (claude exited)' : p.kind
+    // An agent pane that fell back to a shell is labelled as such, not by its
+    // kind (`shell (claude exited)` / `shell (grok exited)`).
+    const suffix = p.runState === 'shell-fallback' ? `shell (${p.kind} exited)` : p.kind
     // Raw absolute cwd (not shortCwd) so the context-menu "copy cwd" resolves.
     const m = mem[p.name]
     // The daemon owns this number (`SessionInfo.slot`) — the app must never

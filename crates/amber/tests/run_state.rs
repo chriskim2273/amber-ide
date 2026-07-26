@@ -119,7 +119,7 @@ fn report_run_state_stores_broadcasts_and_validates() {
     );
     let err = read_control_until(&mut b, |m| matches!(m, ControlMsg::Error { .. }));
     match err {
-        ControlMsg::Error { msg } => assert!(msg.contains("claude"), "unexpected error: {msg}"),
+        ControlMsg::Error { msg } => assert!(msg.contains("agent"), "unexpected error: {msg}"),
         other => panic!("expected Error, got {other:?}"),
     }
 }
