@@ -369,29 +369,20 @@ pub fn run_session(root: &Path, name: &str, socket: &Path, kind: &str) -> anyhow
     // reaching here is a hand-started claude restored via `resume_as_claude`.
     let is_grok = kind == SessionKind::Grok.as_str();
 
-    let agent_path = if is_grok {
-        match cfg.grok_path.clone() {
-            Some(p) => Some(p),
-            None => {
-                let resolved = grok::resolve_grok();
-                if let Some(ref p) = resolved {
-                    cfg.grok_path = Some(p.clone());
-                    store.save_config(&cfg)?;
-                }
-                resolved
+    // The cached path is only trusted while it still EXISTS. Both agents ship
+    // self-updaters that can relocate their binary; without this check a stale
+    // cache makes every launch fail with ENOENT, and the pane drops to a shell
+    // permanently until someone runs `amber ctl doctor` by hand.
+    let cached = if is_grok { cfg.grok_path.clone() } else { cfg.claude_path.clone() };
+    let agent_path = match cached.filter(|p| p.exists()) {
+        Some(p) => Some(p),
+        None => {
+            let resolved = if is_grok { grok::resolve_grok() } else { claude::resolve_claude() };
+            if let Some(p) = resolved.clone() {
+                if is_grok { cfg.grok_path = Some(p) } else { cfg.claude_path = Some(p) }
+                store.save_config(&cfg)?;
             }
-        }
-    } else {
-        match cfg.claude_path.clone() {
-            Some(p) => Some(p),
-            None => {
-                let resolved = claude::resolve_claude();
-                if let Some(ref p) = resolved {
-                    cfg.claude_path = Some(p.clone());
-                    store.save_config(&cfg)?;
-                }
-                resolved
-            }
+            resolved
         }
     };
 

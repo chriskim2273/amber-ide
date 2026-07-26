@@ -89,7 +89,7 @@ class of miss the editor-pane pass recorded.
 
 ## Verification
 
-Rust 249 tests + clippy clean; app 393 tests + typecheck + bundle. Live on a
+Rust 245 tests + clippy clean; app 393 tests + typecheck + bundle. Live on a
 private daemon: create → `grok --permission-mode bypassPermissions --session-id
 <minted>`, id recorded; a real conversation turn; `kill -9` → relaunch as
 `--resume <same id>` with the conversation intact; daemon SIGTERM + restart →

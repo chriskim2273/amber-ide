@@ -591,7 +591,7 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   `claude*` for both agents (they name the phase, not the binary). Scope cuts:
   no global grok hook, no hand-started-grok detection (`resume_as_claude` is
   still claude-only), and the cleanup dialog's conversation labels read claude
-  transcripts only (a grok row falls back to its cwd). Gates: Rust 249 tests +
+  transcripts only (a grok row falls back to its cwd). Gates: Rust 245 tests +
   clippy clean, app 393 tests + typecheck + bundle. **Live-verified** on a
   private daemon: minted `--session-id` launch, real turn, `kill -9` → `--resume
   <same id>` with the conversation intact, daemon restart → restored as grok and
