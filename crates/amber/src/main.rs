@@ -270,6 +270,28 @@ fn run_doctor(root: Option<PathBuf>) -> anyhow::Result<()> {
     }
 }
 
+/// Print (and consume) `last-crash-report.json` if the last boot found the
+/// previous shutdown unclean and lost sessions restoring. Best-effort: a
+/// missing/corrupt report is silently skipped, never fatal to `status`.
+fn print_crash_report() {
+    let path = default_root().join("last-crash-report.json");
+    let Ok(body) = std::fs::read_to_string(&path) else { return };
+    let _ = std::fs::remove_file(&path);
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else { return };
+    let lost = v["lost_sessions"].as_array().map(|a| a.len()).unwrap_or(0);
+    if lost == 0 {
+        return;
+    }
+    println!("⚠ last daemon start followed an unclean shutdown — {lost} session(s) lost:");
+    if let Some(names) = v["lost_sessions"].as_array() {
+        for name in names {
+            if let Some(s) = name.as_str() {
+                println!("    {s}");
+            }
+        }
+    }
+}
+
 /// Connect to the daemon and report liveness + session count.
 fn run_status(socket: &Path) -> anyhow::Result<()> {
     match UnixStream::connect(socket) {
@@ -282,6 +304,7 @@ fn run_status(socket: &Path) -> anyhow::Result<()> {
                     decoder.next_frame()?
                 {
                     println!("daemon: up ({}) — {} session(s)", socket.display(), names.len());
+                    print_crash_report();
                     return Ok(());
                 }
                 let n = stream.read(&mut buf)?;
@@ -293,6 +316,7 @@ fn run_status(socket: &Path) -> anyhow::Result<()> {
         }
         Err(_) => {
             println!("daemon: unreachable at {}", socket.display());
+            print_crash_report();
             std::process::exit(1);
         }
     }
@@ -519,7 +543,7 @@ fn run_daemon(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Result<
     // Global claude SessionStart hook: lets a hand-started claude in a shell
     // record its resume id too (best-effort; the per-session hook covers
     // amber-launched claude).
-    if let Ok(exe) = std::env::current_exe() {
+    if let Ok(exe) = amber::manager::resolve_current_exe() {
         claude::ensure_global_claude_hook(&format!("{} hook", exe.display()));
     }
     manager.restore()?;
@@ -613,6 +637,9 @@ fn run_daemon(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Result<
                 if let Err(e) = manager.snapshot_final() {
                     eprintln!("amber daemon: final snapshot failed: {e}");
                 }
+                if let Err(e) = manager.mark_clean_shutdown() {
+                    eprintln!("amber daemon: could not mark clean shutdown: {e}");
+                }
                 std::process::exit(0);
             }
         });
@@ -621,6 +648,35 @@ fn run_daemon(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Result<
     eprintln!("amber daemon: listening on {}", socket_path.display());
     let daemon = Daemon::new(Arc::clone(&manager), Arc::clone(&watchers));
     daemon.serve(listener)
+}
+
+/// `/home/me/proj` → `~/proj`, so the cwd column stays readable. Exact `$HOME`
+/// becomes `~`; an unrelated path (or an empty `$HOME`) is left alone.
+fn shorten_home(path: &str, home: &str) -> String {
+    if home.is_empty() {
+        return path.to_string();
+    }
+    if path == home {
+        return "~".to_string();
+    }
+    match path.strip_prefix(home) {
+        Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+        _ => path.to_string(),
+    }
+}
+
+/// The trailing `(…)` note on an `amber ls` row — shown only when it says
+/// something the `kind` column does not. A dead-but-unreaped session still
+/// lists (that is what backs the app's "exited · close pane" overlay), so
+/// without this a corpse and a live shell print identically.
+fn ls_status(s: &proto::SessionInfo) -> String {
+    if !s.alive {
+        return "  (exited)".to_string();
+    }
+    match &s.run_state {
+        Some(state) if *state != s.kind => format!("  ({state})"),
+        _ => String::new(),
+    }
 }
 
 fn run_ls(socket: &Path) -> anyhow::Result<()> {
@@ -636,9 +692,24 @@ fn run_ls(socket: &Path) -> anyhow::Result<()> {
             // dies. Listing ORDER stays by name — stable and readable — and the
             // slot column is width-padded to the widest slot.
             sessions.sort_by(|a, b| a.name.cmp(&b.name));
+            let home = std::env::var("HOME").unwrap_or_default();
             let w = sessions.iter().map(|s| s.slot).max().unwrap_or(0).to_string().len();
-            for s in &sessions {
-                println!("{:>w$}  {}", s.slot, s.name, w = w);
+            let nw = sessions.iter().map(|s| s.name.len()).max().unwrap_or(0);
+            let cwds: Vec<String> = sessions.iter().map(|s| shorten_home(&s.cwd, &home)).collect();
+            let cw = cwds.iter().map(|c| c.len()).max().unwrap_or(0);
+            for (s, cwd) in sessions.iter().zip(&cwds) {
+                let status = ls_status(s);
+                println!(
+                    "{:>w$}  {:<nw$}  {:<cw$}  {}{}",
+                    s.slot,
+                    s.name,
+                    cwd,
+                    s.kind,
+                    status,
+                    w = w,
+                    nw = nw,
+                    cw = cw
+                );
             }
             return Ok(());
         }
@@ -888,5 +959,47 @@ fn create_session(socket: &Path, name: &str, cwd: &Path, kind: &str) -> anyhow::
             anyhow::bail!("daemon closed the connection before replying");
         }
         decoder.feed(&buf[..n]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(kind: &str, alive: bool, run_state: Option<&str>) -> proto::SessionInfo {
+        proto::SessionInfo {
+            name: "amber-1-1-0-abc".to_string(),
+            cwd: "/home/me/proj".to_string(),
+            kind: kind.to_string(),
+            alive,
+            updated: 0,
+            run_state: run_state.map(str::to_string),
+            claude_id: None,
+            cols: 80,
+            rows: 24,
+            slot: 1,
+        }
+    }
+
+    #[test]
+    fn shorten_home_rewrites_only_real_home_prefixes() {
+        assert_eq!(shorten_home("/home/me/proj", "/home/me"), "~/proj");
+        assert_eq!(shorten_home("/home/me", "/home/me"), "~");
+        // Not a path-component boundary — must not become `~ta/x`.
+        assert_eq!(shorten_home("/home/meta/x", "/home/me"), "/home/meta/x");
+        assert_eq!(shorten_home("/tmp", "/home/me"), "/tmp");
+        assert_eq!(shorten_home("/home/me/proj", ""), "/home/me/proj");
+    }
+
+    #[test]
+    fn ls_status_flags_dead_and_off_kind_run_states() {
+        assert_eq!(ls_status(&info("shell", false, None)), "  (exited)");
+        // Dead wins: a run_state is stale once the child is gone.
+        assert_eq!(ls_status(&info("claude", false, Some("claude"))), "  (exited)");
+        assert_eq!(ls_status(&info("shell", true, None)), "");
+        // Redundant with the kind column.
+        assert_eq!(ls_status(&info("claude", true, Some("claude"))), "");
+        assert_eq!(ls_status(&info("claude", true, Some("suspended"))), "  (suspended)");
+        assert_eq!(ls_status(&info("grok", true, Some("shell-fallback"))), "  (shell-fallback)");
     }
 }

@@ -17,6 +17,31 @@ use crate::watchers::Watchers;
 const DEFAULT_ROWS: u16 = 24;
 const DEFAULT_COLS: u16 = 80;
 
+/// `current_exe()` returns a `<path> (deleted)`-suffixed string, forever, once
+/// this process's own backing binary inode is unlinked (e.g. an in-place
+/// `cp`/`mv` reinstall while the daemon stayed up) — the kernel bakes that
+/// suffix into `/proc/self/exe`'s target text. That literal string doesn't
+/// exist on the filesystem, so every subsequent claude/grok spawn using it
+/// fails permanently for this process's lifetime, even after the reinstall
+/// finishes and a valid binary sits at the original path again. If the exe
+/// itself is gone but the plain path (suffix stripped) is a real file, use
+/// that instead of the poisoned reading.
+pub fn resolve_current_exe() -> anyhow::Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    if exe.exists() {
+        return Ok(exe);
+    }
+    Ok(repair_deleted_exe(&exe).unwrap_or(exe))
+}
+
+/// If `path` carries the kernel's `" (deleted)"` suffix and the underlying
+/// path (suffix stripped) exists on disk, return it. Pure/testable half of
+/// [`resolve_current_exe`].
+fn repair_deleted_exe(path: &Path) -> Option<PathBuf> {
+    let repaired = PathBuf::from(path.to_str()?.strip_suffix(" (deleted)")?);
+    repaired.exists().then_some(repaired)
+}
+
 /// The user's login-shell PATH, captured ONCE per process (it doesn't change).
 /// Computing it per-manager would spawn a login shell on every `new()`, which
 /// under the parallel test run overloads fork/exec.
@@ -215,7 +240,7 @@ impl SessionManager {
             // Both agents run the SAME `amber run <name>` supervisor; it reads
             // the persisted kind to decide which binary to launch and how.
             SessionKind::Claude | SessionKind::Grok => {
-                let exe = std::env::current_exe()?;
+                let exe = resolve_current_exe()?;
                 let mut cmd = CommandBuilder::new(exe);
                 // The kind is passed EXPLICITLY, not looked up from the store:
                 // `create` spawns the pty before it persists the metadata (the
@@ -443,10 +468,18 @@ impl SessionManager {
     /// reassigned lowest-free. Restore order is by name, so the repair is
     /// deterministic; a failure to persist a repair is logged, never fatal.
     pub fn restore(&self) -> anyhow::Result<()> {
+        // Written on a clean SIGTERM/SIGINT exit (main.rs), consumed here.
+        // Still present at startup means this boot follows an unclean death
+        // (SIGKILL, oomd, power loss) rather than a normal restart/reinstall.
+        let marker = self.root.join("clean-shutdown");
+        let clean_shutdown = marker.exists();
+        let _ = std::fs::remove_file(&marker);
+
         let mut metas = self.store.list_sessions()?;
         metas.sort_by(|a, b| a.name.cmp(&b.name));
         let mut sessions = self.sessions.lock().unwrap();
         let mut used: BTreeSet<u32> = BTreeSet::new();
+        let mut lost = Vec::new();
         for mut meta in metas {
             if meta.slot < 1 || !used.insert(meta.slot) {
                 meta.slot = alloc_slot(&used);
@@ -464,9 +497,26 @@ impl SessionManager {
                 }
                 Err(e) => {
                     eprintln!("amber daemon: restore skipped session {}: {e}", meta.name);
+                    lost.push(meta.name.clone());
                 }
             }
         }
+        if !clean_shutdown && !lost.is_empty() {
+            let report = serde_json::json!({
+                "timestamp": Self::now(),
+                "lost_sessions": lost,
+            });
+            if let Ok(body) = serde_json::to_string_pretty(&report) {
+                let _ = std::fs::write(self.root.join("last-crash-report.json"), body);
+            }
+        }
+        Ok(())
+    }
+
+    /// Called on a clean SIGTERM/SIGINT exit, right after the final snapshot
+    /// — arms the next boot's clean/unclean detection in [`Self::restore`].
+    pub fn mark_clean_shutdown(&self) -> anyhow::Result<()> {
+        std::fs::write(self.root.join("clean-shutdown"), Self::now().to_string())?;
         Ok(())
     }
 
@@ -761,7 +811,91 @@ impl SessionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
+
+    /// Persist a shell session's metadata directly (no live spawn) with an
+    /// unreadable scrollback file, so `restore_one` fails on the read step —
+    /// a real, spawn-independent way to force a restore loss.
+    fn seed_unrestorable_session(root: &Path, name: &str) {
+        let store = StateStore::new(root);
+        store
+            .write_session(&SessionMeta {
+                name: name.to_string(),
+                cwd: PathBuf::from("/"),
+                kind: SessionKind::Shell,
+                updated: 0,
+                resume_as_claude: false,
+                run_state: None,
+                slot: 1,
+            })
+            .unwrap();
+        store.write_scrollback(name, b"junk").unwrap();
+        let path = root.join("scrollback").join(format!("{name}.bin"));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    }
+
+    #[test]
+    fn restore_writes_crash_report_after_unclean_shutdown_with_losses() {
+        let dir = tempdir().unwrap();
+        seed_unrestorable_session(dir.path(), "victim");
+
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        // No mark_clean_shutdown() call — this boot looks like a crash.
+        mgr.restore().unwrap();
+
+        let report = dir.path().join("last-crash-report.json");
+        let body = std::fs::read_to_string(&report).expect("crash report written");
+        assert!(body.contains("victim"));
+    }
+
+    #[test]
+    fn restore_stays_silent_after_a_clean_shutdown() {
+        let dir = tempdir().unwrap();
+        seed_unrestorable_session(dir.path(), "victim");
+
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        mgr.mark_clean_shutdown().unwrap();
+        mgr.restore().unwrap();
+
+        // A loss right after a CLEAN shutdown isn't a crash — don't cry wolf.
+        assert!(!dir.path().join("last-crash-report.json").exists());
+    }
+
+    #[test]
+    fn clean_shutdown_marker_is_single_use() {
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        mgr.mark_clean_shutdown().unwrap();
+        assert!(dir.path().join("clean-shutdown").exists());
+        mgr.restore().unwrap();
+        assert!(!dir.path().join("clean-shutdown").exists());
+    }
+
+    #[test]
+    fn repair_deleted_exe_strips_suffix_when_path_reappears() {
+        let dir = tempdir().unwrap();
+        let real = dir.path().join("amber");
+        std::fs::write(&real, b"stand-in binary").unwrap();
+        let ghost = PathBuf::from(format!("{} (deleted)", real.display()));
+        assert_eq!(repair_deleted_exe(&ghost), Some(real));
+    }
+
+    #[test]
+    fn repair_deleted_exe_none_when_path_never_comes_back() {
+        let dir = tempdir().unwrap();
+        let ghost = PathBuf::from(format!("{}/amber (deleted)", dir.path().display()));
+        assert_eq!(repair_deleted_exe(&ghost), None);
+    }
+
+    #[test]
+    fn repair_deleted_exe_none_without_the_suffix() {
+        // A path that just plain doesn't exist (no reinstall race) must not
+        // be misread as a deleted-and-reinstalled binary.
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("amber");
+        assert_eq!(repair_deleted_exe(&missing), None);
+    }
 
     #[test]
     fn decide_resume_upgrades_immediately_on_detection() {

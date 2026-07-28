@@ -401,7 +401,7 @@ pub fn run_session(root: &Path, name: &str, socket: &Path, kind: &str) -> anyhow
             // prompt for an untrusted cwd (never starting the session /
             // recording the resume id). Pre-accept trust for this cwd.
             claude::ensure_cwd_trusted(&cwd);
-            let current_exe = std::env::current_exe()?;
+            let current_exe = crate::manager::resolve_current_exe()?;
             let hook_command = format!("{} hook", current_exe.display());
             Agent::Claude {
                 settings: claude::write_settings(root, name, &hook_command)?,
