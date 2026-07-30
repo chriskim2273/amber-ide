@@ -71,6 +71,54 @@ fn capture_login_path() -> Option<String> {
     }
 }
 
+/// Graphical-session env for spawned panes, read FRESH from the systemd user
+/// manager on every spawn (Linux only).
+///
+/// The daemon is boot-started, BEFORE the graphical session imports `DISPLAY`
+/// into the user manager, so the daemon's own env has none — and a pane
+/// inherits the daemon's env. Anything in a pane that talks to the display
+/// server therefore fails; the one that bites is `claude`'s image paste, which
+/// shells out to `xclip`/`wl-paste` (`Can't open display`, stderr swallowed by
+/// its own `2>/dev/null`), so Ctrl-V silently pastes nothing. Same class as
+/// `login_path()` above: the daemon's minimal systemd env is not the env a
+/// pane needs.
+///
+/// Read per spawn and deliberately NOT cached: at boot restore the manager env
+/// is still empty, and a cache would freeze that for the daemon's whole life.
+/// This way a pane created after login gets the live values, and an X restart
+/// self-heals for panes created after it. No systemd / non-zero exit / missing
+/// key degrades to exactly today's behaviour (nothing is set — never an empty
+/// `DISPLAY=`, which fails differently and worse than absent).
+#[cfg(target_os = "linux")]
+fn display_env() -> Vec<(String, String)> {
+    const KEYS: [&str; 3] = ["DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY"];
+    let out = std::process::Command::new("systemctl")
+        .args(["--user", "show-environment"])
+        .output();
+    match out {
+        Ok(out) if out.status.success() => {
+            pick_env(&String::from_utf8_lossy(&out.stdout), &KEYS)
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Pull an allowlist of `KEY=VALUE` lines out of an environment block. systemd
+/// quotes a value that needs it, so surrounding quotes are stripped; an empty
+/// value is dropped rather than exported blank.
+#[cfg(target_os = "linux")]
+fn pick_env(block: &str, keys: &[&str]) -> Vec<(String, String)> {
+    block
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .filter(|(k, _)| keys.contains(k))
+        .filter_map(|(k, v)| {
+            let v = v.trim().trim_matches('"');
+            (!v.is_empty()).then(|| (k.to_string(), v.to_string()))
+        })
+        .collect()
+}
+
 pub struct SessionManager {
     store: StateStore,
     cfg: Config,
@@ -273,6 +321,13 @@ impl SessionManager {
         // (node) resolve, not just the daemon's minimal systemd PATH.
         if let Some(path) = login_path() {
             cmd.env("PATH", path);
+        }
+        // Give panes the graphical session's display vars — a pane's clipboard
+        // tools (claude's image paste: `xclip`/`wl-paste`) are unreachable
+        // without them. See `display_env`.
+        #[cfg(target_os = "linux")]
+        for (k, v) in display_env() {
+            cmd.env(k, v);
         }
         let sess = Arc::new(PtySession::spawn(
             cmd,
@@ -813,6 +868,31 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
+
+    /// The display allowlist: takes only the wanted keys, unquotes a systemd
+    /// quoted value, and drops an empty one (a blank `DISPLAY=` fails
+    /// differently — and worse — than no `DISPLAY` at all).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn picks_display_env_from_a_manager_block() {
+        let block = "LANG=en_US.UTF-8\n\
+                     DISPLAY=:1\n\
+                     XAUTHORITY=\"/run/user/1000/.mutter-Xwaylandauth.ABC123\"\n\
+                     WAYLAND_DISPLAY=\n\
+                     PATH=/usr/bin\n\
+                     not-an-assignment\n";
+        let got = pick_env(block, &["DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY"]);
+        assert_eq!(
+            got,
+            vec![
+                ("DISPLAY".to_string(), ":1".to_string()),
+                (
+                    "XAUTHORITY".to_string(),
+                    "/run/user/1000/.mutter-Xwaylandauth.ABC123".to_string()
+                ),
+            ]
+        );
+    }
 
     /// Persist a shell session's metadata directly (no live spawn) with an
     /// unreadable scrollback file, so `restore_one` fails on the read step —

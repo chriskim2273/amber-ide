@@ -634,6 +634,44 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   (default `~/.local/state/amber-ide/render-compat`) and restart the app** — the
   code fix prevents re-entry but cannot un-write an existing marker.
 
+- [x] Pane display env (2026-07-29) — **image paste into a claude pane did
+  nothing**. Claude Code reads the clipboard ITSELF: on Linux it shells out to
+  `xclip -selection clipboard -t TARGETS -o … || wl-paste -l …`, then extracts
+  with `xclip -t image/png -o > <tmp>`. Those run inside the pane, so they
+  inherit the DAEMON's env — and the daemon is boot-started (`WantedBy=
+  default.target` + linger) BEFORE the graphical session imports `DISPLAY` into
+  the systemd user manager, so it has no `DISPLAY`/`WAYLAND_DISPLAY`/
+  `XAUTHORITY` at all (measured on the live box: every pane child had zero
+  display vars). `xclip` then dies with `Can't open display: (null)` into
+  claude's own `2>/dev/null` — a silent no-op, no error anywhere. **Why it
+  "sometimes" worked:** the systemd user manager DOES have `DISPLAY=:1` after
+  login, so a daemon (re)started during a graphical session — the app's
+  "Restart amber daemon", or a hand-started dev daemon — spawns panes that CAN
+  reach the clipboard; only the boot-started daemon can't. Fix: `spawn()` sets
+  an allowlist (`DISPLAY`/`WAYLAND_DISPLAY`/`XAUTHORITY`) read from
+  `systemctl --user show-environment` — same choke point and same class as the
+  existing `login_path()`/`TERM` fixes (the daemon's minimal systemd env is not
+  the env a pane needs). Read PER SPAWN, never cached: at boot restore the
+  manager env is still empty and a cache would freeze that for the daemon's
+  life; per-spawn also self-heals after an X restart for later panes. A missing
+  key is left UNSET (never `DISPLAY=`, which fails differently and worse); no
+  systemd / non-zero exit degrades to today's behaviour; `cfg(target_os =
+  "linux")` only (macOS `pbpaste` needs no env from the Aqua-domain launchd
+  agent). Shelling out to `systemctl` is deliberate — rule #8 is about linking,
+  not invoking, and `login_path()` already shells out to the login shell.
+  Gates: Rust 254 tests + clippy clean. **Live-verified** against a private
+  daemon started with `env -u DISPLAY -u WAYLAND_DISPLAY -u XAUTHORITY` (the
+  boot condition): in-pane `xclip -t TARGETS -o` succeeds with the fix and
+  prints `Can't open display: (null)` with it reverted (`$DISPLAY` empty).
+  **A running daemon must be restarted to pick this up** — a live pane's env is
+  frozen, so `systemctl --user restart amber` (or the app menu item) is the
+  immediate mitigation on an already-running machine. Ctrl-Shift-V (amber's own
+  paste chord) still pastes TEXT only — an image clipboard is a no-op there;
+  plain Ctrl-V is the gesture that works (it forwards `^V` to claude, which does
+  its own clipboard read). Not fixed, upstream: claude's probe accepts
+  jpeg/gif/webp but extraction only tries png then bmp, so a JPEG-only clipboard
+  still silently fails.
+
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**
   `std::io::Read` (dedicated thread); `take_writer()` is one-shot;
