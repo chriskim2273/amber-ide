@@ -75,7 +75,7 @@ pub struct WsLayout {
 /// sidecar is treated as incompatible and returns an empty layout (same as the
 /// TS parser). If version is missing, it's treated as 0 (pre-versioning), which
 /// also returns empty — matching `layoutFile.ts:165` behavior.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct LayoutFile {
     #[serde(default)]
     pub version: u32,
@@ -85,6 +85,19 @@ pub struct LayoutFile {
     pub workspaces: HashMap<String, WsLayout>,
     #[serde(default)]
     pub frozen: HashMap<String, FrozenEntry>,
+}
+
+impl Default for LayoutFile {
+    /// Returns an empty layout matching `layoutFile.ts:158-160 emptyLayout()`.
+    /// Version 1, activeWorkspace 1, empty workspaces and frozen map.
+    fn default() -> Self {
+        LayoutFile {
+            version: 1,
+            active_workspace: 1,
+            workspaces: HashMap::new(),
+            frozen: HashMap::new(),
+        }
+    }
 }
 
 /// Read `<root>/ui-layout.json`. A missing, unreadable or malformed sidecar is
@@ -180,13 +193,19 @@ mod tests {
     fn a_missing_or_malformed_sidecar_degrades_to_empty_rather_than_erroring() {
         let dir = tempfile::tempdir().unwrap();
         // Missing entirely.
-        assert!(load(dir.path()).workspaces.is_empty());
+        let f = load(dir.path());
+        assert!(f.workspaces.is_empty());
+        assert_eq!(f.active_workspace, 1, "degraded layout has activeWorkspace == 1");
         // Present but not JSON.
         std::fs::write(dir.path().join("ui-layout.json"), b"{ this is not json").unwrap();
-        assert!(load(dir.path()).workspaces.is_empty());
+        let f = load(dir.path());
+        assert!(f.workspaces.is_empty());
+        assert_eq!(f.active_workspace, 1, "degraded layout has activeWorkspace == 1");
         // Present, valid JSON, wrong shape.
         std::fs::write(dir.path().join("ui-layout.json"), b"[1,2,3]").unwrap();
-        assert!(load(dir.path()).workspaces.is_empty());
+        let f = load(dir.path());
+        assert!(f.workspaces.is_empty());
+        assert_eq!(f.active_workspace, 1, "degraded layout has activeWorkspace == 1");
     }
 
     #[test]
@@ -222,5 +241,27 @@ mod tests {
         assert_eq!(f.active_workspace, 1, "activeWorkspace defaults to 1");
         let ws = f.workspaces.get("1").expect("ws 1");
         assert_eq!(ws.active_tab, 1, "activeTab defaults to 1");
+    }
+
+    #[test]
+    fn rejects_incompatible_version_2_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        // Valid LayoutFile shape with one workspace, but version 2 (incompatible).
+        let v2_sidecar = r#"{"version": 2, "activeWorkspace": 1, "workspaces": {"1": {"activeTab": 1, "tabs": {}}}}"#;
+        std::fs::write(dir.path().join("ui-layout.json"), v2_sidecar).unwrap();
+        let f = load(dir.path());
+        assert!(f.workspaces.is_empty(), "version 2 sidecar rejected");
+        assert_eq!(f.active_workspace, 1, "degraded to empty with activeWorkspace == 1");
+    }
+
+    #[test]
+    fn rejects_sidecar_with_missing_version_key() {
+        let dir = tempfile::tempdir().unwrap();
+        // Valid LayoutFile shape with one workspace, but no version key (defaults to 0, invalid).
+        let no_version_sidecar = r#"{"activeWorkspace": 1, "workspaces": {"1": {"activeTab": 1, "tabs": {}}}}"#;
+        std::fs::write(dir.path().join("ui-layout.json"), no_version_sidecar).unwrap();
+        let f = load(dir.path());
+        assert!(f.workspaces.is_empty(), "missing version sidecar rejected");
+        assert_eq!(f.active_workspace, 1, "degraded to empty with activeWorkspace == 1");
     }
 }
