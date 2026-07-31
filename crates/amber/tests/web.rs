@@ -424,3 +424,89 @@ fn the_mosaic_is_behind_the_cookie_boundary() {
     assert!(!body.contains("layout"), "layout leaked to a forged cookie: {body}");
 }
 
+#[test]
+fn a_forged_resize_from_the_browser_never_reaches_the_pty() {
+    let f = fixture();
+    let name = f.create_session();
+    let cookie = f.login();
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            f.get("/api/sessions", Some(&cookie)).2.contains(&name)
+        }),
+        "hub never saw the session"
+    );
+    let before: serde_json::Value =
+        serde_json::from_str(&f.get("/api/sessions", Some(&cookie)).2).unwrap();
+    let (cols, rows) = (
+        before["sessions"][0]["cols"].as_u64().unwrap(),
+        before["sessions"][0]["rows"].as_u64().unwrap(),
+    );
+
+    let stream = TcpStream::connect(f.addr).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let uri: tungstenite::http::Uri = format!("ws://{}/ws", f.addr).parse().unwrap();
+    let req = tungstenite::ClientRequestBuilder::new(uri).with_header("Cookie", cookie.clone());
+    let (mut ws, _) = tungstenite::client::client(req, stream).unwrap();
+    ws.send(tungstenite::Message::Text(
+        format!(r#"{{"t":"resize","name":"{name}","cols":40,"rows":10}}"#).into(),
+    ))
+    .unwrap();
+    // Give the server more than a poll tick to act on it if it were going to.
+    std::thread::sleep(Duration::from_secs(3));
+
+    let after: serde_json::Value =
+        serde_json::from_str(&f.get("/api/sessions", Some(&cookie)).2).unwrap();
+    assert_eq!(after["sessions"][0]["cols"].as_u64().unwrap(), cols, "pty was resized");
+    assert_eq!(after["sessions"][0]["rows"].as_u64().unwrap(), rows, "pty was resized");
+    assert_eq!(after["sessions"][0]["alive"], true, "session died");
+}
+
+#[test]
+fn create_and_kill_from_the_browser_reach_the_daemon() {
+    let f = fixture();
+    let existing = f.create_session();
+    let cookie = f.login();
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            f.get("/api/sessions", Some(&cookie)).2.contains(&existing)
+        }),
+        "hub never saw the session"
+    );
+
+    let stream = TcpStream::connect(f.addr).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let uri: tungstenite::http::Uri = format!("ws://{}/ws", f.addr).parse().unwrap();
+    let req = tungstenite::ClientRequestBuilder::new(uri).with_header("Cookie", cookie.clone());
+    let (mut ws, _) = tungstenite::client::client(req, stream).unwrap();
+
+    let made = "amber-1-1-9-webmade";
+    let cwd = f.dir.path().to_string_lossy().into_owned();
+    ws.send(tungstenite::Message::Text(
+        format!(r#"{{"t":"create","name":"{made}","cwd":"{cwd}","kind":"shell"}}"#).into(),
+    ))
+    .unwrap();
+    assert!(
+        wait_until(Duration::from_secs(15), || {
+            f.get("/api/sessions", Some(&cookie)).2.contains(made)
+        }),
+        "browser Create never reached the daemon"
+    );
+
+    ws.send(tungstenite::Message::Text(
+        format!(r#"{{"t":"kill","name":"{made}"}}"#).into(),
+    ))
+    .unwrap();
+    assert!(
+        wait_until(Duration::from_secs(15), || {
+            let body = f.get("/api/sessions", Some(&cookie)).2;
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            v["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|s| s["name"] != made || s["alive"] == false)
+        }),
+        "browser Kill never reached the daemon"
+    );
+}
+
