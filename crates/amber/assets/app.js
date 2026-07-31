@@ -26,6 +26,13 @@ function parseName(name) {
   return m ? { ws: +m[1], tab: +m[2], ord: +m[3], id: m[4] } : null;
 }
 
+var idCounter = 0;
+function makeId() {
+  idCounter = (idCounter + 1) % 0xffff;
+  // Time + counter: unique within a page load, no crypto needed.
+  return (Date.now().toString(36) + idCounter.toString(36)).replace(/[^a-z0-9]/g, '');
+}
+
 // Last two path segments, `~` for $HOME-ish prefixes we can't know — keep it dumb.
 function shortCwd(cwd) {
   if (!cwd) return '';
@@ -145,6 +152,17 @@ function main() {
     renderTabBar(ws, tab);
     mosaicEl.textContent = '';
     mosaicEl.appendChild(renderNode(tab.tree));
+
+    // Panes this client asked for that the server has not confirmed yet.
+    Object.keys(pending).forEach(function (name) {
+      var p = parseName(name);
+      if (!p || p.ws !== curWs || p.tab !== curTab) return;
+      if (sessionByName(name)) { delete pending[name]; return; }
+      var ph = document.createElement('div');
+      ph.className = 'tile pending';
+      ph.textContent = 'starting…';
+      mosaicEl.appendChild(ph);
+    });
   }
 
   function pill(text, on, click) {
@@ -172,6 +190,26 @@ function main() {
         curTab = t.tab; renderList();
       }));
     });
+
+    var add = pill('+ pane', false, function () {
+      var kind = window.prompt('kind: shell, claude or grok', 'shell');
+      if (!kind) return;
+      var s = sessionByName(firstPaneOf(ws, cur)) || sessions[0];
+      newPane(kind.trim(), (s && s.cwd) || '/');
+    });
+    add.classList.add('pill-add');
+    tabBarEl.appendChild(add);
+  }
+
+  // cwd for a new pane: the tab's first pane, falling back to any session.
+  function firstPaneOf(ws, tab) {
+    var found = null;
+    (function walk(n) {
+      if (!n || found) return;
+      if (n.kind === 'leaf') { found = n.paneId; return; }
+      walk(n.a); walk(n.b);
+    })(tab.tree);
+    return found;
   }
 
   // The tree the server sent, drawn as nested flexbox at its real ratios.
@@ -189,6 +227,24 @@ function main() {
 
   function sessionByName(name) {
     return sessions.filter(function (x) { return x.name === name; })[0] || null;
+  }
+
+  // Lowest ord not taken by a live session in this ws/tab. Needs the live
+  // `sessions` closure, so unlike `parseName`/`makeId` this can't be a
+  // top-level pure helper.
+  function freeOrd(ws, tab) {
+    var used = {};
+    sessions.forEach(function (s) {
+      var p = parseName(s.name);
+      if (p && p.ws === ws && p.tab === tab) used[p.ord] = true;
+    });
+    var n = 0;
+    while (used[n]) n++;
+    return n;
+  }
+
+  function paneName(ws, tab, ord, id) {
+    return 'amber-' + ws + '-' + tab + '-' + ord + '-' + (id || makeId());
   }
 
   function tile(paneId) {
@@ -219,6 +275,29 @@ function main() {
     tag.textContent = !s.alive ? 'exited'
       : (s.run_state && s.run_state !== 'claude') ? s.run_state
       : (s.kind || 'shell');
+
+    var menu = document.createElement('span');
+    menu.className = 'tile-menu';
+    menu.textContent = '⋯';
+    menu.addEventListener('click', function (e) {
+      e.stopPropagation();          // don't open the terminal
+      var agent = s.kind === 'claude' || s.kind === 'grok';
+      var choices = ['close'];
+      if (agent) choices.push(s.run_state === 'suspended' ? 'unfreeze' : 'freeze');
+      choices.push('move to tab…');
+      var pick = window.prompt(paneId + '\n' + choices.join(' / '), choices[0]);
+      if (pick === 'close') killPane(paneId);
+      else if (pick === 'freeze') setFrozen(paneId, true);
+      else if (pick === 'unfreeze') setFrozen(paneId, false);
+      else if (pick && pick.indexOf('move') === 0) {
+        var t = window.prompt('move to tab number', String(curTab));
+        if (t === null) return;
+        var tabNum = parseInt(t, 10);
+        if (isNaN(tabNum)) { banner('invalid tab number', 'warn'); return; }
+        movePane(paneId, curWs, tabNum);
+      }
+    });
+    head.appendChild(menu);
 
     el.appendChild(head);
     el.appendChild(title);
@@ -401,6 +480,50 @@ function main() {
     if (open && ws && ws.readyState === 1) ws.send(bytes);
   }
 
+  /* ---------- pane gestures ---------- */
+  // create/kill/move/suspend/resume are the ONLY browser messages the server
+  // accepts (Task 4's whitelist in web.rs); everything else it silently
+  // ignores. Deliberately no `resize` here and none is ever added — a pty's
+  // winsize is shared with the desktop app's panes.
+
+  function control(obj) {
+    if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
+  }
+
+  // The tree is NEVER edited locally (core rule: the mosaic is server-driven,
+  // per Task 5) — the server's next `sessions` push is the only thing that
+  // adds, removes or moves a pane. `pending` only draws a placeholder tile so
+  // a tap feels answered; it never touches `layout`.
+  var pending = {};   // paneName -> expiry ms
+
+  var CREATE_KINDS = { shell: 1, claude: 1, grok: 1 };
+
+  function newPane(kind, cwd) {
+    // Mirrors the server's CREATE_KINDS check (web.rs) so a bad kind banners
+    // instead of silently no-opping.
+    if (!CREATE_KINDS[kind]) { banner('kind must be shell, claude or grok', 'warn'); return; }
+    var name = paneName(curWs, curTab, freeOrd(curWs, curTab));
+    pending[name] = Date.now() + 3000;
+    control({ t: 'create', name: name, cwd: cwd, kind: kind });
+    renderList();
+    setTimeout(function () { delete pending[name]; renderList(); }, 3000);
+  }
+
+  function killPane(name) { control({ t: 'kill', name: name }); }
+
+  function movePane(name, ws, tab) {
+    var p = parseName(name);
+    if (!p) return;
+    control({ t: 'move', from: name, to: paneName(ws, tab, freeOrd(ws, tab), p.id) });
+  }
+
+  // suspend/resume are refused server-side for anything that isn't kind
+  // claude/grok; gated client-side too (see the `agent` check in `tile()`'s
+  // menu) so the control is never even offered on a shell pane.
+  function setFrozen(name, frozen) {
+    control({ t: frozen ? 'suspend' : 'resume', name: name });
+  }
+
   function connect() {
     clearTimeout(reconnectTimer);
     var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -431,7 +554,13 @@ function main() {
       if (msg.t === 'sessions') { sessions = msg.sessions || []; layout = msg.layout || null; renderList(); syncGeom(); }
       else if (msg.t === 'exit') {
         if (msg.name === open && term) term.write('\r\n\x1b[33m[session exited: ' + msg.code + ']\x1b[0m\r\n');
-      } else if (msg.t === 'error') banner(msg.msg || 'error', 'error');
+      } else if (msg.t === 'error') {
+        // `Hub::error_msg` (web.rs) broadcasts to EVERY connected client with
+        // no correlation id — with two phones/tabs open, a gesture rejected
+        // for one shows this toast on both. Accepted, out of scope here.
+        banner(msg.msg || 'error', 'warn');
+        setTimeout(function () { banner(''); }, 6000);
+      }
     };
 
     ws.onclose = function () {

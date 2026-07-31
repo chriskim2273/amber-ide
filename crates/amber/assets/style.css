@@ -223,3 +223,6 @@ html, body {
 .tile-slot { font-variant-numeric: tabular-nums; color: #9a9aa8; font-size: 12px; }
 .tile-title { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tile-tag { font-size: 11px; color: #9a9aa8; }
+.tile.pending { opacity: 0.6; font-style: italic; align-items: center; justify-content: center; }
+.tile-menu { margin-left: auto; padding: 0 4px; color: #9a9aa8; }
+.pill-add { border-style: dashed; }
