@@ -118,6 +118,13 @@ export const Pane = memo(function Pane(
   // Set on a reconnect so the NEXT backlog message re-runs the reset (the
   // daemon replays a fresh backlog on every re-Attach, re-enabling mouse modes).
   const rearmRef = useRef(false)
+  // True once this Pane has consumed one Attach backlog. A LATER backlog is a
+  // RE-attach replay of history the terminal already shows, so it must clear
+  // first — see the `term.reset()` in the port handler. Deliberately not armed
+  // for the first attach of the pane's life: a `.amberws` load stages replay
+  // bytes into the terminal BEFORE the port is wired, and clearing would wipe
+  // exactly the history that load exists to restore.
+  const attachedOnceRef = useRef(false)
   // Re-acquire the pane's MessagePort. Points at the live mount-effect closure;
   // called when the client utilityProcess restarts (portEpoch) and the old port
   // is dead.
@@ -276,12 +283,24 @@ export const Pane = memo(function Pane(
       port.onmessage = (ev) => {
         const m = ev.data as { data?: Uint8Array }
         if (!m.data) return
+        // The daemon replays the FULL scrollback on every Attach, in one frame.
+        // This message is that replay when the port is fresh (`!sawBacklog`) or
+        // a reconnect armed the flag.
+        const isBacklog = !sawBacklog || rearmRef.current
+        // A re-attach replays history this terminal ALREADY shows, so without a
+        // clear each reconnect appended a duplicate copy — cosmetically wrong,
+        // and it grew the buffer by up to a full backlog every time until
+        // xterm's own scrollback limit evicted it. reset() (not clear()) because
+        // the replay re-executes raw escape codes and must start from a known
+        // state; it also subsumes MOUSE_RESET, which is kept for the first
+        // backlog, where we deliberately do NOT reset.
+        if (isBacklog && attachedOnceRef.current) term.reset()
         term.write(m.data) // xterm.write accepts Uint8Array (UTF-8)
-        // First backlog after (re)attach: clear stale mouse modes.
-        if (!sawBacklog || rearmRef.current) {
+        if (isBacklog) {
           sawBacklog = true
           rearmRef.current = false
-          term.write(MOUSE_RESET)
+          attachedOnceRef.current = true
+          term.write(MOUSE_RESET) // clear mouse modes the replayed bytes re-enabled
         }
       }
       port.start()

@@ -99,21 +99,36 @@ fn dump_backlog_returns_ring_bytes_and_errors_on_unknown() {
     // DumpBacklog on a fresh connection: the reply Backlog carries the ring,
     // whose bytes must END WITH the marker (the ring may prepend the shell
     // prompt / command echo, but the marker is the last output).
+    // The reply is a BINARY `Frame::Backlog` (tag 2), not `ControlMsg::Backlog`:
+    // as a control message the bytes were serde-JSON'd into a numeric array, so
+    // a 2 MiB ring became ~8 MB of decimal text on the wire.
     let req = UnixStream::connect(&sock).unwrap();
     send(&req, ControlMsg::DumpBacklog { name: "amber-1-1-0-a".into() });
     let mut r = req.try_clone().unwrap();
-    let reply = read_control_until(&mut r, |m| matches!(m, ControlMsg::Backlog { .. }));
-    match reply {
-        ControlMsg::Backlog { name, data } => {
-            assert_eq!(name, "amber-1-1-0-a");
-            assert!(
-                data.windows(10).any(|w| w == b"DUMPMARKER"),
-                "backlog missing marker; got {:?}",
-                String::from_utf8_lossy(&data)
-            );
+    r.set_read_timeout(Some(Duration::from_secs(8))).unwrap();
+    let mut dec = Decoder::new();
+    let mut buf = [0u8; 65536];
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let (name, data) = 'dump: loop {
+        // `if let`, not `while let`: every arm below leaves the loop, so a
+        // while-let body could never complete an iteration (clippy::never_loop).
+        if let Some(frame) = dec.next_frame().unwrap() {
+            match frame {
+                Frame::Backlog { session, bytes } => break 'dump (session, bytes),
+                other => panic!("expected a Backlog frame, got {other:?}"),
+            }
         }
-        other => panic!("expected Backlog, got {other:?}"),
-    }
+        assert!(Instant::now() < deadline, "no Backlog reply");
+        let n = r.read(&mut buf).expect("dump read");
+        assert!(n > 0, "connection closed before the Backlog reply");
+        dec.feed(&buf[..n]);
+    };
+    assert_eq!(name, "amber-1-1-0-a");
+    assert!(
+        data.windows(10).any(|w| w == b"DUMPMARKER"),
+        "backlog missing marker; got {:?}",
+        String::from_utf8_lossy(&data)
+    );
 
     // Unknown session -> Error.
     let bad = UnixStream::connect(&sock).unwrap();

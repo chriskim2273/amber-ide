@@ -149,7 +149,9 @@ fn write_frame(writer: &SharedWriter, frame: &Frame) -> anyhow::Result<()> {
     let res = write_bounded(&mut w, &bytes, CLIENT_WRITE_TIMEOUT);
     if let Err(e) = res {
         let who = match frame {
-            Frame::Data { session, .. } => format!(" (session {session})"),
+            Frame::Data { session, .. } | Frame::Backlog { session, .. } => {
+                format!(" (session {session})")
+            }
             Frame::Control(_) => String::new(),
         };
         eprintln!("amber daemon: dropping client{who}: write failed: {e}");
@@ -249,6 +251,10 @@ fn handle_frame(
                 eprintln!("amber daemon: write to session {session} failed: {e}");
             }
         }
+        // Daemon -> client only. A client sending one is well-formed but
+        // meaningless here; ignore rather than tear down the connection (same
+        // rule as the daemon-only ControlMsg variants).
+        Frame::Backlog { .. } => {}
     }
 }
 
@@ -441,8 +447,12 @@ fn handle_control(
             // lesson). One frame: ring cap ≪ MAX_FRAME_LEN, no chunking.
             let writer = Arc::clone(writer);
             thread::spawn(move || {
-                let data = sess.scrollback();
-                let _ = write_frame(&writer, &Frame::Control(ControlMsg::Backlog { name, data }));
+                let bytes = sess.scrollback();
+                // A dedicated binary frame, not `ControlMsg::Backlog`: as a
+                // control message the bytes went through serde-JSON as a numeric
+                // array, so a 2 MiB ring became ~8 MB of decimal text here and a
+                // 2-million-element array on the client — per pane, per save.
+                let _ = write_frame(&writer, &Frame::Backlog { session: name, bytes });
             });
         }
         ControlMsg::Snapshot => {

@@ -66,7 +66,9 @@ describe('Connection', () => {
     // this uncaught exception would kill the utilityProcess; with it, the socket
     // is destroyed and the existing close -> reconnect path takes over with a
     // fresh Decoder, so `open` fires a second time.
-    daemon.pushRaw(new Uint8Array([0, 0, 0, 1, 2])) // len=1, tag=2 (unknown)
+    // Tag 9 — deliberately NOT 2, which this test used to use: 2 is now
+    // TAG_BACKLOG (a real frame), so it no longer throws.
+    daemon.pushRaw(new Uint8Array([0, 0, 0, 1, 9])) // len=1, tag=9 (unknown)
     await waitFor(() => (opens >= 2 ? true : null), 5000)
     expect(opens).toBeGreaterThanOrEqual(2)
     conn.close()

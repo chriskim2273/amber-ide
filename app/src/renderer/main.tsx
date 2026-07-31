@@ -232,8 +232,39 @@ function App(): JSX.Element {
     })
   }, [sessions])
 
+  // Coalescing buffer for the two HIGH-FREQUENCY daemon events.
+  //
+  // `Activity` fires up to 2/s per session and `MemoryStat` every 3 s per
+  // session; each was dispatched on its own IPC task, so each forced a full App
+  // render — which rebuilds groupSessions/mergeBrowsers/mergeEditors and calls
+  // deriveTab once PER KEEP-ALIVE LAYER, not just the visible tab. At the box's
+  // 19 sessions that is ~45 full-tree renders per second while completely idle.
+  // `Pane` is memoized so terminals are not reconciled, but everything else in
+  // that path is garbage.
+  //
+  // Both events only drive a tab-bar dot and a header MB label — nothing that
+  // needs sub-second latency. Buffer them and flush on a timer: React 18 batches
+  // the dispatches inside the timeout into ONE render, so N events cost one
+  // pass. Session lifecycle, Exit and Error stay IMMEDIATE — those are low-rate
+  // and user-visible.
+  const evBuf = useRef<DaemonEvent[]>([])
+  const evTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  useEffect(() => () => { if (evTimer.current) clearTimeout(evTimer.current) }, [])
+
   useEffect(() => {
     if (!bridgeReady) return
+    const COALESCE_MS = 250
+    const flush = (): void => {
+      evTimer.current = null
+      const evs = evBuf.current
+      evBuf.current = []
+      for (const e of evs) dispatch(e)
+    }
+    const dispatchEvent = (ev: DaemonEvent): void => {
+      if (ev.kind !== 'Activity' && ev.kind !== 'Memory') { dispatch(ev); return }
+      evBuf.current.push(ev)
+      if (evTimer.current === null) evTimer.current = setTimeout(flush, COALESCE_MS)
+    }
     window.amber.onDaemonEvent((d) => {
       // Backlog replies are routed to the pending dump resolver by name (not
       // through the store reducer) — a save is waiting on collectDumps for them.
@@ -263,7 +294,7 @@ function App(): JSX.Element {
       // The client utilityProcess was relaunched: its old pane ports are dead,
       // so ask every Pane to re-acquire from the new child.
       if ((d as { childRestart?: boolean }).childRestart) setChildEpoch((e) => e + 1)
-      const ev = toEvent(d); if (ev) dispatch(ev)
+      const ev = toEvent(d); if (ev) dispatchEvent(ev)
       if (ev?.kind === 'Sessions') setSawSessions(true)
     })
     void window.amber.loadLayout().then((text) => {

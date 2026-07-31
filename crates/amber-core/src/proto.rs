@@ -106,8 +106,14 @@ pub enum ControlMsg {
     /// (forwarder path) — a multi-MiB `data` must never block control frames
     /// multiplexed on the same socket (backlog head-of-line lesson).
     DumpBacklog { name: String },
-    /// Daemon -> client: the requested session's full scrollback bytes, in one
-    /// frame (ring cap ≤2 MiB ≪ 64 MiB frame cap, so no chunking).
+    /// Daemon -> client: the requested session's full scrollback bytes.
+    ///
+    /// **Superseded by [`Frame::Backlog`] (wire tag 2) and no longer emitted.**
+    /// As a control message the bytes were serde-JSON, i.e. a numeric array —
+    /// a 2 MiB scrollback became ~8 MB of decimal text, built here and parsed
+    /// into a 2-million-element array on the client, per pane, per workspace
+    /// save. Retained as a DECODE path only, so a new client still understands
+    /// an older daemon.
     Backlog { name: String, data: Vec<u8> },
     /// Client -> daemon: opt this connection in to pushed session-change events.
     WatchSessions,
@@ -146,6 +152,17 @@ pub enum ControlMsg {
 pub enum Frame {
     Control(ControlMsg),
     Data { session: String, bytes: Vec<u8> },
+    /// Daemon -> client: a one-shot scrollback dump (reply to `DumpBacklog`).
+    ///
+    /// Same body layout as [`Frame::Data`], and for the same reason: raw bytes
+    /// belong on the wire verbatim. It used to ride `ControlMsg::Backlog`,
+    /// whose serde-JSON turned a 2 MiB ring into ~8 MB of decimal text on the
+    /// daemon and a 2-million-element JS array on the client.
+    ///
+    /// A separate tag rather than reusing `Data` because `Data` is pty output
+    /// bound for a pane's terminal; a dump is a reply to a request and must not
+    /// be written into the pane.
+    Backlog { session: String, bytes: Vec<u8> },
 }
 
 /// Outcome of a lenient decode ([`Decoder::next_decoded`]). Distinguishes a
@@ -162,6 +179,7 @@ pub enum Decoded {
 
 const TAG_CONTROL: u8 = 0;
 const TAG_DATA: u8 = 1;
+const TAG_BACKLOG: u8 = 2;
 
 /// Maximum accepted frame body length. Generously above the largest
 /// legitimate frame (a full 2 MiB scrollback backlog in one `Data` frame);
@@ -180,8 +198,8 @@ pub fn encode(frame: &Frame) -> Vec<u8> {
             let json = serde_json::to_vec(msg).expect("ControlMsg serializes");
             body.extend_from_slice(&json);
         }
-        Frame::Data { session, bytes } => {
-            body.push(TAG_DATA);
+        Frame::Data { session, bytes } | Frame::Backlog { session, bytes } => {
+            body.push(if matches!(frame, Frame::Data { .. }) { TAG_DATA } else { TAG_BACKLOG });
             let name = session.as_bytes();
             body.extend_from_slice(&(name.len() as u16).to_be_bytes());
             body.extend_from_slice(name);
@@ -261,7 +279,7 @@ impl Decoder {
                 // skippable frame rather than tearing down the connection.
                 Err(e) => Decoded::UndecodableControl(anyhow::Error::new(e)),
             },
-            TAG_DATA => {
+            TAG_DATA | TAG_BACKLOG => {
                 if rest.len() < 2 {
                     anyhow::bail!("truncated data frame header");
                 }
@@ -271,7 +289,11 @@ impl Decoder {
                 }
                 let session = std::str::from_utf8(&rest[2..2 + name_len])?.to_string();
                 let bytes = rest[2 + name_len..].to_vec();
-                Decoded::Frame(Frame::Data { session, bytes })
+                Decoded::Frame(if tag == TAG_DATA {
+                    Frame::Data { session, bytes }
+                } else {
+                    Frame::Backlog { session, bytes }
+                })
             }
             other => anyhow::bail!("unknown frame tag {other}"),
         };
@@ -298,6 +320,41 @@ mod tests {
         let mut out = (body.len() as u32).to_be_bytes().to_vec();
         out.extend_from_slice(&body);
         out
+    }
+
+    #[test]
+    fn backlog_frame_roundtrips_raw_bytes_on_its_own_tag() {
+        // A scrollback dump rides its own binary tag, NOT ControlMsg::Backlog:
+        // as a control message the bytes were serde-JSON'd into a numeric array,
+        // turning a 2 MiB ring into ~8 MB of decimal text.
+        let f = Frame::Backlog {
+            session: "amber-1-1-0-a".to_string(),
+            bytes: vec![0, 27, 91, 50, 74, 255, 0, 10],
+        };
+        assert_eq!(roundtrip(&f), f);
+        // Tag 2, and the body layout matches Data's (u16 name_len | name | raw).
+        let wire = encode(&f);
+        assert_eq!(wire[4], 2, "backlog must use its own tag");
+    }
+
+    #[test]
+    fn backlog_and_data_with_identical_payloads_stay_distinct() {
+        // They share a body layout, so a decode that ignored the tag would
+        // silently write a scrollback dump into the pane's terminal.
+        let session = "s".to_string();
+        let bytes = vec![1, 2, 3];
+        let d = Frame::Data { session: session.clone(), bytes: bytes.clone() };
+        let b = Frame::Backlog { session, bytes };
+        assert_ne!(encode(&d), encode(&b));
+        assert_eq!(roundtrip(&d), d);
+        assert_eq!(roundtrip(&b), b);
+    }
+
+    #[test]
+    fn backlog_frame_survives_a_zero_length_payload() {
+        // A pane with no scrollback yet: name present, zero bytes.
+        let f = Frame::Backlog { session: "s".to_string(), bytes: Vec::new() };
+        assert_eq!(roundtrip(&f), f);
     }
 
     #[test]

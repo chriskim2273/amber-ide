@@ -9,6 +9,13 @@ let controlPort: Electron.MessagePortMain | null = null
 
 conn.on('frame', (f: Frame) => {
   if (f.type === 'control') controlPort?.postMessage({ frame: f })
+  // A scrollback dump now arrives on its own BINARY tag (no JSON numeric array
+  // on the wire), but the renderer's dump-correlation path is unchanged: hand it
+  // over in the shape it already matches on. This hop is a MessagePort, so the
+  // bytes ride structured clone — no serialisation either way.
+  else if (f.type === 'backlog') {
+    controlPort?.postMessage({ frame: { type: 'control', msg: { kind: 'Backlog', name: f.session, data: f.bytes } } })
+  }
 })
 conn.on('open', () => {
   controlPort?.postMessage({ status: 'connected' })

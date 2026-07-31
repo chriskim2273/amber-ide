@@ -158,6 +158,49 @@ describe('proto', () => {
     expect(d.buffered()).toBe(0)
   })
 
+  it('roundtrips a backlog frame on its own binary tag', () => {
+    // A scrollback dump no longer rides ControlMsg.Backlog, whose serde form is
+    // a JSON numeric array: a 2 MiB ring arrived as ~8 MB of decimal text and
+    // was parsed into a 2-million-element Array before Uint8Array.from.
+    const f: Frame = { type: 'backlog', session: 'amber-1-1-0-a', bytes: new Uint8Array([0, 27, 91, 255, 10]) }
+    expect(roundtrip(f)).toEqual(f)
+    expect(encode(f)[4]).toBe(2) // TAG_BACKLOG
+  })
+
+  it('keeps backlog and data frames distinct with identical payloads', () => {
+    // Same body layout, so a decode that ignored the tag would write a
+    // scrollback dump straight into the pane's terminal.
+    const bytes = new Uint8Array([1, 2, 3])
+    const d: Frame = { type: 'data', session: 's', bytes }
+    const b: Frame = { type: 'backlog', session: 's', bytes }
+    expect(encode(d)).not.toEqual(encode(b))
+    expect(roundtrip(d)).toEqual(d)
+    expect(roundtrip(b)).toEqual(b)
+  })
+
+  it('still decodes a legacy JSON Backlog control message', () => {
+    // Back-compat: a NEW app talking to an OLDER daemon must still understand
+    // the numeric-array form.
+    const f: Frame = { type: 'control', msg: { kind: 'Backlog', name: 's', data: new Uint8Array([7, 8]) } }
+    expect(roundtrip(f)).toEqual(f)
+  })
+
+  it('rejects a truncated data/backlog frame instead of reading past it', () => {
+    // The read buffer is intentionally over-sized for reuse, so a corrupt length
+    // prefix must be caught explicitly — otherwise the name header is read from
+    // whatever bytes happen to follow, and the frame decodes to a garbage
+    // session name rather than an error.
+    for (const tag of [1, 2]) {
+      const d = new Decoder()
+      d.feed(new Uint8Array([0, 0, 0, 1, tag])) // len=1: tag only, no name header
+      expect(() => d.next()).toThrow(/truncated/)
+    }
+    // Name length that runs past the frame's own end.
+    const d = new Decoder()
+    d.feed(new Uint8Array([0, 0, 0, 3, 1, 0, 200])) // len=3, nameLen=200
+    expect(() => d.next()).toThrow(/truncated/)
+  })
+
   it('decodes several frames from one chunk', () => {
     // The cursor must advance frame-to-frame within a single fed chunk.
     const a: Frame = { type: 'data', session: 'a', bytes: new Uint8Array([1, 2]) }

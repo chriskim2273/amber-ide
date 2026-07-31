@@ -58,9 +58,17 @@ export type ControlMsg =
 export type Frame =
   | { type: 'control'; msg: ControlMsg }
   | { type: 'data'; session: string; bytes: Uint8Array }
+  // One-shot scrollback dump (reply to DumpBacklog). Its own binary tag, same
+  // body layout as `data` — it used to ride ControlMsg.Backlog, whose serde
+  // encoding is a JSON numeric array, so a 2 MiB ring arrived as ~8 MB of text
+  // and was parsed into a 2-million-element Array before Uint8Array.from.
+  // Separate from `data` because `data` is pty output bound for a terminal; a
+  // dump is a reply and must never be written into the pane.
+  | { type: 'backlog'; session: string; bytes: Uint8Array }
 
 const TAG_CONTROL = 0
 const TAG_DATA = 1
+const TAG_BACKLOG = 2
 const MAX_FRAME_LEN = 64 * 1024 * 1024
 
 // ControlMsg <-> serde-externally-tagged JSON value.
@@ -155,7 +163,7 @@ export function encode(frame: Frame): Uint8Array {
   } else {
     const name = new TextEncoder().encode(frame.session)
     body = new Uint8Array(1 + 2 + name.length + frame.bytes.length)
-    body[0] = TAG_DATA
+    body[0] = frame.type === 'data' ? TAG_DATA : TAG_BACKLOG
     new DataView(body.buffer).setUint16(1, name.length, false)
     body.set(name, 3)
     body.set(frame.bytes, 3 + name.length)
@@ -243,14 +251,21 @@ export class Decoder {
       const json = new TextDecoder().decode(this.buf.subarray(body + 1, end))
       return { type: 'control', msg: jsonToMsg(JSON.parse(json)) }
     }
-    if (tag === TAG_DATA) {
+    if (tag === TAG_DATA || tag === TAG_BACKLOG) {
+      // Bounds-check the name header against THIS frame, mirroring the Rust
+      // decoder's "truncated data frame" bails. The read buffer is over-sized
+      // for reuse, so without these a corrupt length prefix would read past the
+      // frame into unrelated (or uninitialised) bytes and yield a garbage
+      // session name instead of an error.
+      if (end - body < 3) throw new Error('truncated data frame header')
       const nameLen = view.getUint16(body + 1, false)
       const nameEnd = body + 3 + nameLen
+      if (nameEnd > end) throw new Error('truncated data frame name')
       const session = new TextDecoder().decode(this.buf.subarray(body + 3, nameEnd))
       // slice(), not subarray(): the payload outlives this call (it is posted to
       // the renderer), and the shared buffer is reused by later frames.
       const bytes = this.buf.slice(nameEnd, end)
-      return { type: 'data', session, bytes }
+      return { type: tag === TAG_DATA ? 'data' : 'backlog', session, bytes }
     }
     throw new Error(`unknown frame tag ${tag}`)
   }

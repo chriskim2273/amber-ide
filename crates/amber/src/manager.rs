@@ -1127,16 +1127,37 @@ mod tests {
         let mgr = SessionManager::new(dir.path()).unwrap();
         mgr.create("idle", "/tmp", SessionKind::Shell).unwrap();
         let sess = mgr.session("idle").unwrap();
-        // Let the shell's prompt (if any) settle into the ring first, so the
-        // "unchanged" window below really is unchanged.
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        // Wait for the shell's startup output (prompt, rc-file noise) to STOP,
+        // rather than sleeping a fixed span: under a loaded parallel test run a
+        // slow shell can emit its prompt after any constant we would pick, and
+        // then the second snapshot is *correctly* not a skip. Poll the ring's
+        // write counter until it holds still.
+        let mut last = sess.scrollback_written();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            let now = sess.scrollback_written();
+            if now == last {
+                break;
+            }
+            last = now;
+            assert!(std::time::Instant::now() < deadline, "shell never went quiet");
+        }
 
         mgr.snapshot().unwrap();
         let path = dir.path().join("scrollback").join("idle.bin");
         assert!(path.exists(), "first snapshot must write the scrollback");
         std::fs::remove_file(&path).unwrap();
 
+        let before = sess.scrollback_written();
         mgr.snapshot().unwrap();
+        // Precondition, checked explicitly so a late byte reports itself instead
+        // of masquerading as a failure of the skip.
+        assert_eq!(
+            before,
+            sess.scrollback_written(),
+            "the session emitted output between the two snapshots — not an idle window"
+        );
         assert!(
             !path.exists(),
             "an idle session's unchanged scrollback was rewritten"
