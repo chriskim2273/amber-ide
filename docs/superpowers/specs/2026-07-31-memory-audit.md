@@ -366,7 +366,17 @@ so it was exercised end to end:
 - **daemon restarted** under the running app: the disconnected banner appeared
   and then cleared, the pane restored, input still reached the pty
   (`MARKER_GAMMA_AFTER_DAEMON_RESTART`), and **no daemon-error banner appeared**
-  at any point.
+  at any point;
+- **client utilityProcess `kill -9`'d** — the one changed path the other gestures
+  miss. It matters because `Pane`'s `portEpoch` re-acquire runs *without* an
+  unmount, so no `closePane` fires and `attach()`'s "close the port you
+  supersede" is the only cleanup — and that port belongs to a process that is
+  already dead. If `MessagePortMain.close()` were missing or threw there, the
+  throw would land in the new child's `parentPort` handler and kill it, and the
+  resulting crash-relaunch would be easy to mistake for a clean pass. Observed:
+  exactly one relaunch (pid 1093584 → 1103624, then **stable**), no
+  `TypeError`/throw in the app log, no error banner, and the pane accepted input
+  again (`AFTER_CLIENT_CRASH`).
 
 Not provable from the GUI: that the client's port map is actually empty after a
 detach (it has no observable surface from the renderer). That property is pinned
