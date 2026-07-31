@@ -701,6 +701,7 @@ impl Hub {
                 }
                 inner.layout_dirty = false;
                 inner.sessions = sessions;
+                inner.layout = Self::render_layout(&inner.file, &inner.sessions);
                 let msg = Self::sessions_msg(&inner.sessions, &inner.layout);
                 Self::queue(&mut inner, |_| true, msg);
             }
@@ -781,6 +782,7 @@ fn run_daemon_link(hub: Arc<Hub>) {
                 let mut inner = hub.inner.lock().unwrap();
                 inner.daemon = None;
                 inner.sessions.clear();
+                inner.layout.clear();
                 // An empty session list with a stale non-empty layout would be
                 // incoherent (every leaf it names is now unreachable); "" here
                 // renders as `"layout":null`, matching the empty session list.

@@ -91,6 +91,7 @@ function main() {
   var reconnectTimer = 0;
   var sessions = [];
   var layout = null;      // server-rendered mosaic, or null (fall back to the flat list)
+  var frozen = {};        // paneId -> true, rebuilt from layout.frozen on every push
   var curWs = null;       // selected workspace id, null = follow the server's activeWorkspace
   var curTab = null;      // selected tab id within curWs
   var open = null;        // session name currently open (survives reconnects)
@@ -130,6 +131,8 @@ function main() {
   // to no workspaces at all), the workspace/tab/tile mosaic otherwise.
   function renderList() {
     countEl.textContent = sessions.length ? sessions.length + ' session' + (sessions.length === 1 ? '' : 's') : '';
+    frozen = {};
+    (layout && layout.frozen || []).forEach(function (name) { frozen[name] = true; });
     if (!layout || !layout.workspaces || !layout.workspaces.length) {
       wsBarEl.hidden = tabBarEl.hidden = mosaicEl.hidden = true;
       listEl.hidden = false;
@@ -249,9 +252,10 @@ function main() {
 
   function tile(paneId) {
     var s = sessionByName(paneId);
+    var isFrozen = !!frozen[paneId];
     var el = document.createElement('button');
     el.type = 'button';
-    el.className = 'tile' + (s && !s.alive ? ' dead' : '');
+    el.className = 'tile' + (s && !s.alive ? ' dead' : '') + (isFrozen ? ' frozen' : '');
     el.dataset.pane = paneId;
     if (!s) { el.textContent = paneId; return el; }   // server/session race — next push fixes it
 
@@ -265,6 +269,15 @@ function main() {
     dot.title = s.kind || 'shell';
     head.appendChild(slot);
     head.appendChild(dot);
+    if (isFrozen) {
+      // Display-only (spec §6.1: the mosaic shows it, cannot change it); the
+      // tile stays tappable — a shell freeze is display-only on the daemon too.
+      var fz = document.createElement('span');
+      fz.className = 'tile-frozen';
+      fz.textContent = '❄';
+      fz.title = 'frozen';
+      head.appendChild(fz);
+    }
 
     var title = document.createElement('span');
     title.className = 'tile-title';
@@ -514,6 +527,7 @@ function main() {
   function movePane(name, ws, tab) {
     var p = parseName(name);
     if (!p) return;
+    if (ws === p.ws && tab === p.tab) return; // no-op move: don't kill+respawn a live agent for nothing
     control({ t: 'move', from: name, to: paneName(ws, tab, freeOrd(ws, tab), p.id) });
   }
 

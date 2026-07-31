@@ -219,6 +219,8 @@ html, body {
   font: inherit; overflow: hidden;
 }
 .tile.dead { opacity: 0.5; }
+.tile.frozen { border-color: #4d9fff; }
+.tile-frozen { color: #4d9fff; font-size: 12px; }
 .tile-head { display: flex; align-items: center; gap: 6px; }
 .tile-slot { font-variant-numeric: tabular-nums; color: #9a9aa8; font-size: 12px; }
 .tile-title { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

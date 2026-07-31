@@ -120,6 +120,16 @@ pub fn load(root: &Path) -> LayoutFile {
 
 use amber_core::proto::SessionInfo;
 
+/// Digits-only `u32` parse. `str::parse::<u32>` accepts a leading `+`
+/// (`from_str_radix` strips it), which the JS grammar this mirrors
+/// (`^amber-(\d+)-…`) does not — `"+1".parse::<u32>()` is `Ok(1)`.
+fn num(s: &str) -> Option<u32> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
+}
+
 /// `amber-<ws>-<tab>-<ord>-<id>` → `(ws, tab, ord)`.
 ///
 /// Hand-rolled rather than a regex: `regex` is not a dependency and this is the
@@ -129,9 +139,9 @@ use amber_core::proto::SessionInfo;
 pub fn parse_pane_name(name: &str) -> Option<(u32, u32, u32)> {
     let rest = name.strip_prefix("amber-")?;
     let mut it = rest.split('-');
-    let ws = it.next()?.parse().ok()?;
-    let tab = it.next()?.parse().ok()?;
-    let ord = it.next()?.parse().ok()?;
+    let ws = num(it.next()?)?;
+    let tab = num(it.next()?)?;
+    let ord = num(it.next()?)?;
     let id = it.next()?;
     if it.next().is_some() || id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric()) {
         return None;
@@ -306,9 +316,15 @@ pub fn render(f: &LayoutFile, sessions: &[SessionInfo]) -> serde_json::Value {
         }));
     }
 
+    // Names only, never the `note` strings — a note is arbitrary user text with
+    // the same "no reason to cross the web boundary" argument as `recentFiles`.
+    let mut frozen_names: Vec<&str> = f.frozen.keys().map(|s| s.as_str()).collect();
+    frozen_names.sort_unstable();
+
     serde_json::json!({
         "activeWorkspace": f.active_workspace,
         "workspaces": out_ws,
+        "frozen": frozen_names,
     })
 }
 
@@ -487,6 +503,15 @@ mod tests {
         assert_eq!(tab2["tab"], 2);
         let tree = &tab2["tree"];
         assert_eq!(tree["kind"], "split");
+        // The surviving split keeps the sidecar's own dir/ratio (0.6) — proves
+        // sidecar pass-through into the emitted JSON, not just `append_leaf`'s
+        // constant.
+        assert_eq!(tree["dir"], "h");
+        assert!(
+            (tree["ratio"].as_f64().unwrap() - 0.6).abs() < 1e-6,
+            "ratio {}",
+            tree["ratio"]
+        );
         assert_eq!(tree["a"]["paneId"], "amber-1-2-0-bb");
         // The nested split is gone: b is now the surviving sibling leaf.
         assert_eq!(tree["b"]["kind"], "leaf");
@@ -527,6 +552,14 @@ mod tests {
         let v = render(&f, &[sess("amber-1-1-0-aa"), sess("amber-1-1-1-new")]);
         let tree = &v["workspaces"][0]["tabs"][0]["tree"];
         assert_eq!(tree["kind"], "split");
+        // `append_leaf`'s documented constants, asserted on the EMITTED JSON —
+        // not just the deserialized `Node` — so deleting them fails a test.
+        assert_eq!(tree["dir"], "h");
+        assert!(
+            (tree["ratio"].as_f64().unwrap() - 0.66).abs() < 1e-6,
+            "ratio {}",
+            tree["ratio"]
+        );
         assert_eq!(tree["a"]["paneId"], "amber-1-1-0-aa");
         assert_eq!(tree["b"]["paneId"], "amber-1-1-1-new");
     }
@@ -574,5 +607,21 @@ mod tests {
         assert_eq!(parse_pane_name("amber-1-2-3-ab-cd"), None);
         assert_eq!(parse_pane_name("amber-1-2-3-"), None);
         assert_eq!(parse_pane_name("amber-x-2-3-ab"), None);
+        // `"+1".parse::<u32>()` is `Ok(1)` (from_str_radix strips a leading `+`);
+        // the JS `^amber-(\d+)-…` grammar this mirrors has no such leniency.
+        assert_eq!(parse_pane_name("amber-+1-2-3-ab"), None);
+    }
+
+    #[test]
+    fn frozen_names_are_emitted_but_notes_never_are() {
+        let f: LayoutFile = serde_json::from_str(SIDECAR).unwrap();
+        let v = render(&f, &[sess("amber-1-1-0-aa")]);
+        let frozen = v["frozen"].as_array().expect("frozen array");
+        assert!(
+            frozen.iter().any(|n| n == "amber-1-1-0-aa"),
+            "frozen session name missing: {frozen:?}"
+        );
+        let s = v.to_string();
+        assert!(!s.contains("parked"), "note text leaked into the payload: {s}");
     }
 }
