@@ -35,11 +35,13 @@ fn fixture() -> Fixture {
     let token = web::load_or_create_token(dir.path(), true).unwrap();
     let tcp = web::bind(0).unwrap();
     let addr = tcp.local_addr().unwrap();
+    let root = dir.path().to_path_buf();
     {
         let sock = sock.clone();
+        let root = root.clone();
         let token = token.clone();
         std::thread::spawn(move || {
-            let _ = web::serve(tcp, sock, token);
+            let _ = web::serve(tcp, sock, root, token);
         });
     }
     Fixture { dir, sock, addr, token }
@@ -104,7 +106,11 @@ impl Fixture {
 
     /// Create a session on the private daemon and return its name.
     fn create_session(&self) -> String {
-        let name = "amber-1-1-0-web".to_string();
+        self.create_named("amber-1-1-0-web")
+    }
+
+    fn create_named(&self, name: &str) -> String {
+        let name = name.to_string();
         let mut s = UnixStream::connect(&self.sock).unwrap();
         s.write_all(&proto::encode(&Frame::Control(ControlMsg::Create {
             name: name.clone(),
@@ -209,7 +215,7 @@ fn good_token_yields_a_cookie_that_lists_daemon_sessions_with_real_geometry() {
     // (spec §4), so the listing must report the live winsize, not a guess.
     let geometry = |body: &str| -> (u64, u64) {
         let v: serde_json::Value = serde_json::from_str(body).unwrap();
-        let s = &v.as_array().unwrap()[0];
+        let s = &v["sessions"].as_array().unwrap()[0];
         (s["cols"].as_u64().unwrap(), s["rows"].as_u64().unwrap())
     };
     let (cols, rows) = geometry(&body);
@@ -299,5 +305,208 @@ fn token_file_is_0600_and_stable_until_regenerated() {
     assert_eq!(meta.permissions().mode() & 0o777, 0o600);
     let c = web::load_or_create_token(dir.path(), true).unwrap();
     assert_ne!(a, c, "--new-token must rotate the token");
+}
+
+#[test]
+fn sessions_response_carries_the_mosaic_and_the_slot() {
+    let f = fixture();
+    let name = f.create_session();
+    let cookie = f.login();
+
+    std::fs::write(
+        f.dir.path().join("ui-layout.json"),
+        format!(
+            r#"{{"version":1,"activeWorkspace":1,"workspaces":{{"1":{{"activeTab":1,"label":"main","tabs":{{
+               "1":{{"label":"api","tree":{{"kind":"split","dir":"h","ratio":0.7,
+                 "a":{{"kind":"leaf","paneId":"{name}"}},
+                 "b":{{"kind":"leaf","paneId":"editor-1-1-1-zz"}}}}}}}}}}}}}}"#
+        ),
+    )
+    .unwrap();
+
+    let mut body = String::new();
+    let ok = wait_until(Duration::from_secs(10), || {
+        let (status, _, b) = f.get("/api/sessions", Some(&cookie));
+        body = b;
+        if !status.contains("200") {
+            return false;
+        }
+        let v: serde_json::Value = match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        // "kind"=="leaf" alone is also produced by the transient fallback
+        // render (the sidecar not loaded yet, session appended as a bare
+        // leaf) — checking the label too, which only the real sidecar
+        // carries, is what actually proves the mosaic loaded and pruned.
+        v["layout"]["workspaces"][0]["label"] == "main"
+            && v["layout"]["workspaces"][0]["tabs"][0]["tree"]["kind"] == "leaf"
+    });
+    assert!(ok, "mosaic never appeared / editor leaf never pruned: {body}");
+
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(v["sessions"].is_array(), "{body}");
+    assert_eq!(v["layout"]["workspaces"][0]["tabs"][0]["tree"]["paneId"], name.as_str());
+    assert_eq!(v["layout"]["workspaces"][0]["label"], "main");
+    assert_eq!(v["layout"]["workspaces"][0]["tabs"][0]["label"], "api");
+    assert!(
+        v["sessions"][0]["slot"].as_u64().is_some(),
+        "sessions listing has no slot: {body}"
+    );
+}
+
+#[test]
+fn a_sidecar_only_change_still_reaches_the_browser() {
+    let f = fixture();
+    let a = f.create_named("amber-1-1-0-aa");
+    let b = f.create_named("amber-1-1-1-bb");
+    let cookie = f.login();
+    let write_layout = |ratio: &str| {
+        std::fs::write(
+            f.dir.path().join("ui-layout.json"),
+            format!(
+                r#"{{"version":1,"activeWorkspace":1,"workspaces":{{"1":{{"activeTab":1,"tabs":{{
+                   "1":{{"tree":{{"kind":"split","dir":"h","ratio":{ratio},
+                     "a":{{"kind":"leaf","paneId":"{a}"}},
+                     "b":{{"kind":"leaf","paneId":"{b}"}}}}}}}}}}}}}}"#
+            ),
+        )
+        .unwrap();
+    };
+    let served_ratio = |body: &str| -> Option<f64> {
+        let v: serde_json::Value = serde_json::from_str(body).ok()?;
+        v["layout"]["workspaces"][0]["tabs"][0]["tree"]["ratio"].as_f64()
+    };
+
+    write_layout("0.3");
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            served_ratio(&f.get("/api/sessions", Some(&cookie)).2)
+                .is_some_and(|r| (r - 0.3).abs() < 1e-6)
+        }),
+        "first layout never served"
+    );
+
+    let stream = TcpStream::connect(f.addr).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+    let uri: tungstenite::http::Uri = format!("ws://{}/ws", f.addr).parse().unwrap();
+    let req = tungstenite::ClientRequestBuilder::new(uri).with_header("Cookie", cookie.clone());
+    let (mut ws, _) = tungstenite::client::client(req, stream).unwrap();
+
+    write_layout("0.8");
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut saw = false;
+    while Instant::now() < deadline && !saw {
+        if let Ok(tungstenite::Message::Text(t)) = ws.read() {
+            if t.contains("\"t\":\"sessions\"") {
+                let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+                if v["layout"]["workspaces"][0]["tabs"][0]["tree"]["ratio"]
+                    .as_f64()
+                    .is_some_and(|r| (r - 0.8).abs() < 1e-6)
+                {
+                    saw = true;
+                }
+            }
+        }
+    }
+    assert!(saw, "a sidecar-only change never pushed to the browser");
+}
+
+#[test]
+fn the_mosaic_is_behind_the_cookie_boundary() {
+    let f = fixture();
+    let (status, _, body) = f.get("/api/sessions", None);
+    assert!(status.contains("401"), "{status}");
+    assert!(!body.contains("layout"), "layout leaked to an unauthenticated caller: {body}");
+    let (status, _, body) = f.get("/api/sessions", Some("amber_web=forged"));
+    assert!(status.contains("401"), "{status}");
+    assert!(!body.contains("layout"), "layout leaked to a forged cookie: {body}");
+}
+
+#[test]
+fn a_forged_resize_from_the_browser_never_reaches_the_pty() {
+    let f = fixture();
+    let name = f.create_session();
+    let cookie = f.login();
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            f.get("/api/sessions", Some(&cookie)).2.contains(&name)
+        }),
+        "hub never saw the session"
+    );
+    let before: serde_json::Value =
+        serde_json::from_str(&f.get("/api/sessions", Some(&cookie)).2).unwrap();
+    let (cols, rows) = (
+        before["sessions"][0]["cols"].as_u64().unwrap(),
+        before["sessions"][0]["rows"].as_u64().unwrap(),
+    );
+
+    let stream = TcpStream::connect(f.addr).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let uri: tungstenite::http::Uri = format!("ws://{}/ws", f.addr).parse().unwrap();
+    let req = tungstenite::ClientRequestBuilder::new(uri).with_header("Cookie", cookie.clone());
+    let (mut ws, _) = tungstenite::client::client(req, stream).unwrap();
+    ws.send(tungstenite::Message::Text(
+        format!(r#"{{"t":"resize","name":"{name}","cols":40,"rows":10}}"#).into(),
+    ))
+    .unwrap();
+    // Give the server more than a poll tick to act on it if it were going to.
+    std::thread::sleep(Duration::from_secs(3));
+
+    let after: serde_json::Value =
+        serde_json::from_str(&f.get("/api/sessions", Some(&cookie)).2).unwrap();
+    assert_eq!(after["sessions"][0]["cols"].as_u64().unwrap(), cols, "pty was resized");
+    assert_eq!(after["sessions"][0]["rows"].as_u64().unwrap(), rows, "pty was resized");
+    assert_eq!(after["sessions"][0]["alive"], true, "session died");
+}
+
+#[test]
+fn create_and_kill_from_the_browser_reach_the_daemon() {
+    let f = fixture();
+    let existing = f.create_session();
+    let cookie = f.login();
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            f.get("/api/sessions", Some(&cookie)).2.contains(&existing)
+        }),
+        "hub never saw the session"
+    );
+
+    let stream = TcpStream::connect(f.addr).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let uri: tungstenite::http::Uri = format!("ws://{}/ws", f.addr).parse().unwrap();
+    let req = tungstenite::ClientRequestBuilder::new(uri).with_header("Cookie", cookie.clone());
+    let (mut ws, _) = tungstenite::client::client(req, stream).unwrap();
+
+    let made = "amber-1-1-9-webmade";
+    let cwd = f.dir.path().to_string_lossy().into_owned();
+    ws.send(tungstenite::Message::Text(
+        format!(r#"{{"t":"create","name":"{made}","cwd":"{cwd}","kind":"shell"}}"#).into(),
+    ))
+    .unwrap();
+    assert!(
+        wait_until(Duration::from_secs(15), || {
+            f.get("/api/sessions", Some(&cookie)).2.contains(made)
+        }),
+        "browser Create never reached the daemon"
+    );
+
+    ws.send(tungstenite::Message::Text(
+        format!(r#"{{"t":"kill","name":"{made}"}}"#).into(),
+    ))
+    .unwrap();
+    assert!(
+        wait_until(Duration::from_secs(15), || {
+            let body = f.get("/api/sessions", Some(&cookie)).2;
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            v["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|s| s["name"] != made || s["alive"] == false)
+        }),
+        "browser Kill never reached the daemon"
+    );
 }
 

@@ -748,6 +748,101 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   before, 2 → 0 with the broken attempt), `dumpBacklog` returned a real
   `Uint8Array`, MB labels still live, input still reaches the pty, no banner.
 
+- [x] Remote mosaic (2026-07-31) — `amber web` is no longer terminal-only: it
+  renders the workspace/tab/split tree, not just a flat session list. Spec:
+  `docs/superpowers/specs/2026-07-31-remote-mosaic-web-design.md` (status
+  header updated to match this entry). The editor-pane spec's §1 "the phone UI
+  stays terminal-only" narrows to "renders no editor/browser panes" — those
+  leaves are pruned and their parent split collapses onto the surviving
+  sibling, same as a killed session. **No new route**: `GET /api/sessions`
+  changed shape from a bare array to `{sessions, layout}`, and `session_json`
+  gained `slot` (`SessionInfo.slot`, the same number `amber attach <n>`
+  resolves) — one payload, one auth boundary, one poll, both the initial paint
+  and every `{t:"sessions"}` push. A second reader of `<state>/ui-layout.json`
+  now exists in Rust, read-only (`crates/amber/src/mosaic.rs`): parsed with
+  serde (`Node` as an internally-tagged `kind`/`paneId` enum through
+  `Box<Node>`), pruned and collapsed server-side so the front end (hand-written
+  JS, no bundler, no test runner) only ever draws an already-correct tree —
+  `LayoutFile::default()` on a missing/malformed sidecar, matching the
+  desktop's own equal-splits fallback (core rule #3). **The prune rule is a
+  property of the daemon's session list — "drop any leaf that is not a live
+  daemon session" — never a list of known id prefixes ( `browser-*`/
+  `editor-*` are pruned by construction, not by name-checking).** So a fourth
+  app-local pane kind needs **zero** Rust change here — the one place this
+  feature is immune to the runtime-string bug class that bit the editor pass
+  (`isBrowserName`/`kind==='browser'` checks TypeScript can't catch). Only a
+  new `WsLayout`/`TabLayout` field the mosaic must display, or a change to the
+  `Node` shape, would need a matching Rust change; neither has happened in the
+  sidecar's history. §3.1's trap: `Hub::on_frame` returns early when the
+  session set is unchanged, but a divider drag/tab rename/workspace switch on
+  the desktop changes only the sidecar with the session set byte-identical —
+  so `HubInner` now caches both the parsed sidecar and the serialized mosaic
+  JSON behind a two-field comparison (`layout_dirty`), and the push fires when
+  *either* changed. Sidecar IO runs on the 1 s poll thread, never the daemon
+  read thread (same discipline as the backlog/watcher fixes). Full parity from
+  the browser — Create/Kill/Rename/Suspend/Resume — with **no sidecar write,
+  ever**: every gesture is name-encoded (rule #2) and fire-and-forget, routing
+  through the daemon so the desktop app's own reconcile draws the result; a
+  pending tile covers the gap until the next 1 s push or 3 s, whichever first.
+  The browser whitelist now reaches those five message types and **still**
+  never reaches `Resize` (one pty, one shared winsize — a laptop-sized resize
+  would corrupt a live claude TUI on the desktop), `Snapshot`, `DumpBacklog` or
+  `ReportRunState`. `Suspend`/`Resume` are gated to agent sessions both
+  client-side (menu doesn't offer them for a shell) and server-side
+  (`is_agent`, the real boundary). Behaviour change worth recording:
+  `Open`/`Close` now validate against the daemon's **full** listed set
+  including dead-but-unreaped sessions, where they previously used an
+  alive-only filter — matches the desktop's "exited · close pane" overlay.
+  Gates: Rust 289 tests + clippy clean (`--workspace --all-targets -D
+  warnings`); **the app's TypeScript suite was NOT run — this pass touches
+  zero TypeScript.** **Live-verified** on an isolated private daemon + private
+  `amber web` (playwright): a stale editor leaf pruned with its split
+  collapsing onto the survivor, a sidecar-unrecorded session appended at the
+  documented `dir:"h"`/`ratio:0.66`, `tabOrder` honoured, ws/tab labels
+  rendered, no `recentFiles`/`editors` leak into the payload, the real split
+  ratio in the DOM (0.65/0.35 from 465px/248px), a **sidecar-only** change
+  (label edit, session set untouched) propagating in 0.46 s (the §3.1 trap,
+  proven fixed), tap-to-zoom attaching and showing real pty output, `+ pane`
+  creating a real session the daemon confirms (`amber ls`), the tile menu's
+  close killing it and pruning the tree, "move to tab" renaming a session on
+  the real daemon with its id preserved, all four forbidden control messages
+  (`resize`/`snapshot`/`dumpbacklog`/`reportrunstate`) forged down the live
+  socket refused — geometry unchanged at 80×24, session alive — and the
+  sidecar **deleted** outright still producing a name-derived mosaic rather
+  than `null` (core rule #3 holding under total sidecar loss). **Not
+  verified live:** the agent freeze/unfreeze round trip — no agent binary was
+  available in the private instance; Rust-tested only (the suspend/resume
+  control-message construction and the `is_agent` gate). **A running `amber
+  web` must be restarted to serve the mosaic** (old code still returns the
+  bare array). **Still open (two, both cosmetic):** `activeTab` is emitted as
+  `0` for a workspace absent from the sidecar even though tabs are 1-based
+  (observed live: the front end falls through to the first tab rather than a
+  real active one); and sidecar-unknown panes append in lexicographic rather
+  than numeric ord order, so `ord>=10` sorts wrong. **Closed by the
+  whole-branch review's fix wave** (the review caught what the per-task ones
+  structurally could not): `frozen` was parsed, tested and then never emitted
+  or rendered, leaving spec §4.1/§6.1 asserting a state dot that did not
+  exist — `render()` now emits `frozen` as **names only** (a note is arbitrary
+  user text, same argument as `recentFiles`) and a frozen tile carries a
+  marker while staying tappable; `parse_pane_name` accepted a leading `+` on
+  numeric fields (`str::parse::<u32>` strips it) where the JS
+  `^amber-(\d+)-…` regex does not — reachable not just via `amber create
+  "amber-+1-2-3-ab"` on the CLI but from the browser via `{"t":"create"}`,
+  the actual security-boundary path this function guards
+  (`Create.name`/`Rename.to` validation in `web.rs`), now rejected by a
+  digits-only `num()` helper; `append_leaf`'s `dir:"h"`/`ratio:0.66` and
+  `node_json`'s `dir`/`ratio` keys were asserted only against the
+  deserialized `Node`, never the emitted JSON, so deleting them left every
+  test green while the mosaic silently degraded to `app.js`'s fallback
+  (`n.dir === 'v' ? 'v' : 'h'`, `n.ratio || 0.5` — always-horizontal 50/50, a
+  geometry divergence from the desktop, not a renderer break); `on_frame`'s
+  `Sessions` arm pushed a layout rendered against the PREVIOUS session set,
+  so the phone showed the flat list for ~1 s at every connect; `inner.layout`
+  survived daemon loss, so a page loaded in that window got a stale mosaic
+  against an empty session list; and a "move to tab N" while already on tab N
+  passed server validation and made `manager::rename` kill and respawn a live
+  agent for zero layout change.
+
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**
   `std::io::Read` (dedicated thread); `take_writer()` is one-shot;

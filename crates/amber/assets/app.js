@@ -26,6 +26,13 @@ function parseName(name) {
   return m ? { ws: +m[1], tab: +m[2], ord: +m[3], id: m[4] } : null;
 }
 
+var idCounter = 0;
+function makeId() {
+  idCounter = (idCounter + 1) % 0xffff;
+  // Time + counter: unique within a page load, no crypto needed.
+  return (Date.now().toString(36) + idCounter.toString(36)).replace(/[^a-z0-9]/g, '');
+}
+
 // Last two path segments, `~` for $HOME-ish prefixes we can't know — keep it dumb.
 function shortCwd(cwd) {
   if (!cwd) return '';
@@ -75,6 +82,7 @@ function main() {
   var $ = function (id) { return document.getElementById(id); };
   var viewList = $('view-list'), viewTerm = $('view-term');
   var listEl = $('list'), countEl = $('list-count'), bannerEl = $('banner');
+  var wsBarEl = $('ws-bar'), tabBarEl = $('tab-bar'), mosaicEl = $('mosaic');
   var screenEl = $('screen'), sizerEl = $('sizer'), stageEl = $('stage'), hostEl = $('host');
   var titleEl = $('term-title'), ctrlBtn = $('k-ctrl');
 
@@ -82,6 +90,10 @@ function main() {
   var attempt = 0;
   var reconnectTimer = 0;
   var sessions = [];
+  var layout = null;      // server-rendered mosaic, or null (fall back to the flat list)
+  var frozen = {};        // paneId -> true, rebuilt from layout.frozen on every push
+  var curWs = null;       // selected workspace id, null = follow the server's activeWorkspace
+  var curTab = null;      // selected tab id within curWs
   var open = null;        // session name currently open (survives reconnects)
   var freshBacklog = false; // next binary frame is the replayed scrollback
   var term = null;
@@ -113,10 +125,201 @@ function main() {
     bannerEl.hidden = false;
   }
 
-  /* ---------- session list ---------- */
+  /* ---------- session list / mosaic ---------- */
 
+  // Dispatcher: the flat list when the server has no sidecar (or it renders
+  // to no workspaces at all), the workspace/tab/tile mosaic otherwise.
   function renderList() {
     countEl.textContent = sessions.length ? sessions.length + ' session' + (sessions.length === 1 ? '' : 's') : '';
+    frozen = {};
+    (layout && layout.frozen || []).forEach(function (name) { frozen[name] = true; });
+    if (!layout || !layout.workspaces || !layout.workspaces.length) {
+      wsBarEl.hidden = tabBarEl.hidden = mosaicEl.hidden = true;
+      listEl.hidden = false;
+      return renderFlatList();
+    }
+    listEl.hidden = true;
+    wsBarEl.hidden = tabBarEl.hidden = mosaicEl.hidden = false;
+
+    // Resolve the selection against what the server actually sent — the desktop
+    // can close the ws/tab we were looking at at any moment.
+    var wss = layout.workspaces;
+    var ws = wss.filter(function (w) { return w.ws === curWs; })[0];
+    if (!ws) ws = wss.filter(function (w) { return w.ws === layout.activeWorkspace; })[0] || wss[0];
+    curWs = ws.ws;
+    var tab = ws.tabs.filter(function (t) { return t.tab === curTab; })[0];
+    if (!tab) tab = ws.tabs.filter(function (t) { return t.tab === ws.activeTab; })[0] || ws.tabs[0];
+    curTab = tab.tab;
+
+    renderWsBar(wss, ws);
+    renderTabBar(ws, tab);
+    mosaicEl.textContent = '';
+    mosaicEl.appendChild(renderNode(tab.tree));
+
+    // Panes this client asked for that the server has not confirmed yet.
+    Object.keys(pending).forEach(function (name) {
+      var p = parseName(name);
+      if (!p || p.ws !== curWs || p.tab !== curTab) return;
+      if (sessionByName(name)) { delete pending[name]; return; }
+      var ph = document.createElement('div');
+      ph.className = 'tile pending';
+      ph.textContent = 'starting…';
+      mosaicEl.appendChild(ph);
+    });
+  }
+
+  function pill(text, on, click) {
+    var b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'pill' + (on ? ' on' : '');
+    b.textContent = text;
+    b.addEventListener('click', click);
+    return b;
+  }
+
+  function renderWsBar(wss, cur) {
+    wsBarEl.textContent = '';
+    wss.forEach(function (w) {
+      wsBarEl.appendChild(pill(w.label || ('ws ' + w.ws), w.ws === cur.ws, function () {
+        curWs = w.ws; curTab = null; renderList();
+      }));
+    });
+  }
+
+  function renderTabBar(ws, cur) {
+    tabBarEl.textContent = '';
+    ws.tabs.forEach(function (t) {
+      tabBarEl.appendChild(pill(t.label || ('tab ' + t.tab), t.tab === cur.tab, function () {
+        curTab = t.tab; renderList();
+      }));
+    });
+
+    var add = pill('+ pane', false, function () {
+      var kind = window.prompt('kind: shell, claude or grok', 'shell');
+      if (!kind) return;
+      var s = sessionByName(firstPaneOf(ws, cur)) || sessions[0];
+      newPane(kind.trim(), (s && s.cwd) || '/');
+    });
+    add.classList.add('pill-add');
+    tabBarEl.appendChild(add);
+  }
+
+  // cwd for a new pane: the tab's first pane, falling back to any session.
+  function firstPaneOf(ws, tab) {
+    var found = null;
+    (function walk(n) {
+      if (!n || found) return;
+      if (n.kind === 'leaf') { found = n.paneId; return; }
+      walk(n.a); walk(n.b);
+    })(tab.tree);
+    return found;
+  }
+
+  // The tree the server sent, drawn as nested flexbox at its real ratios.
+  function renderNode(n) {
+    if (!n) return document.createElement('div');
+    if (n.kind === 'leaf') return tile(n.paneId);
+    var box = document.createElement('div');
+    box.className = 'split ' + (n.dir === 'v' ? 'v' : 'h');
+    var a = renderNode(n.a), b = renderNode(n.b);
+    var r = Math.min(0.95, Math.max(0.05, n.ratio || 0.5));
+    a.style.flex = r; b.style.flex = 1 - r;
+    box.appendChild(a); box.appendChild(b);
+    return box;
+  }
+
+  function sessionByName(name) {
+    return sessions.filter(function (x) { return x.name === name; })[0] || null;
+  }
+
+  // Lowest ord not taken by a live session in this ws/tab. Needs the live
+  // `sessions` closure, so unlike `parseName`/`makeId` this can't be a
+  // top-level pure helper.
+  function freeOrd(ws, tab) {
+    var used = {};
+    sessions.forEach(function (s) {
+      var p = parseName(s.name);
+      if (p && p.ws === ws && p.tab === tab) used[p.ord] = true;
+    });
+    var n = 0;
+    while (used[n]) n++;
+    return n;
+  }
+
+  function paneName(ws, tab, ord, id) {
+    return 'amber-' + ws + '-' + tab + '-' + ord + '-' + (id || makeId());
+  }
+
+  function tile(paneId) {
+    var s = sessionByName(paneId);
+    var isFrozen = !!frozen[paneId];
+    var el = document.createElement('button');
+    el.type = 'button';
+    el.className = 'tile' + (s && !s.alive ? ' dead' : '') + (isFrozen ? ' frozen' : '');
+    el.dataset.pane = paneId;
+    if (!s) { el.textContent = paneId; return el; }   // server/session race — next push fixes it
+
+    var head = document.createElement('span');
+    head.className = 'tile-head';
+    var slot = document.createElement('span');
+    slot.className = 'tile-slot';
+    slot.textContent = s.slot ? '#' + s.slot : '';
+    var dot = document.createElement('span');
+    dot.className = 'dot k-' + (s.kind || 'shell');
+    dot.title = s.kind || 'shell';
+    head.appendChild(slot);
+    head.appendChild(dot);
+    if (isFrozen) {
+      // Display-only (spec §6.1: the mosaic shows it, cannot change it); the
+      // tile stays tappable — a shell freeze is display-only on the daemon too.
+      var fz = document.createElement('span');
+      fz.className = 'tile-frozen';
+      fz.textContent = '❄';
+      fz.title = 'frozen';
+      head.appendChild(fz);
+    }
+
+    var title = document.createElement('span');
+    title.className = 'tile-title';
+    title.textContent = shortCwd(s.cwd);
+
+    var tag = document.createElement('span');
+    tag.className = 'tile-tag';
+    tag.textContent = !s.alive ? 'exited'
+      : (s.run_state && s.run_state !== 'claude') ? s.run_state
+      : (s.kind || 'shell');
+
+    var menu = document.createElement('span');
+    menu.className = 'tile-menu';
+    menu.textContent = '⋯';
+    menu.addEventListener('click', function (e) {
+      e.stopPropagation();          // don't open the terminal
+      var agent = s.kind === 'claude' || s.kind === 'grok';
+      var choices = ['close'];
+      if (agent) choices.push(s.run_state === 'suspended' ? 'unfreeze' : 'freeze');
+      choices.push('move to tab…');
+      var pick = window.prompt(paneId + '\n' + choices.join(' / '), choices[0]);
+      if (pick === 'close') killPane(paneId);
+      else if (pick === 'freeze') setFrozen(paneId, true);
+      else if (pick === 'unfreeze') setFrozen(paneId, false);
+      else if (pick && pick.indexOf('move') === 0) {
+        var t = window.prompt('move to tab number', String(curTab));
+        if (t === null) return;
+        var tabNum = parseInt(t, 10);
+        if (isNaN(tabNum)) { banner('invalid tab number', 'warn'); return; }
+        movePane(paneId, curWs, tabNum);
+      }
+    });
+    head.appendChild(menu);
+
+    el.appendChild(head);
+    el.appendChild(title);
+    el.appendChild(tag);
+    el.addEventListener('click', function () { openSession(paneId); });
+    return el;
+  }
+
+  function renderFlatList() {
     listEl.textContent = '';
     if (!sessions.length) {
       var empty = document.createElement('p');
@@ -290,6 +493,51 @@ function main() {
     if (open && ws && ws.readyState === 1) ws.send(bytes);
   }
 
+  /* ---------- pane gestures ---------- */
+  // create/kill/move/suspend/resume are the ONLY browser messages the server
+  // accepts (Task 4's whitelist in web.rs); everything else it silently
+  // ignores. Deliberately no `resize` here and none is ever added — a pty's
+  // winsize is shared with the desktop app's panes.
+
+  function control(obj) {
+    if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
+  }
+
+  // The tree is NEVER edited locally (core rule: the mosaic is server-driven,
+  // per Task 5) — the server's next `sessions` push is the only thing that
+  // adds, removes or moves a pane. `pending` only draws a placeholder tile so
+  // a tap feels answered; it never touches `layout`.
+  var pending = {};   // paneName -> expiry ms
+
+  var CREATE_KINDS = { shell: 1, claude: 1, grok: 1 };
+
+  function newPane(kind, cwd) {
+    // Mirrors the server's CREATE_KINDS check (web.rs) so a bad kind banners
+    // instead of silently no-opping.
+    if (!CREATE_KINDS[kind]) { banner('kind must be shell, claude or grok', 'warn'); return; }
+    var name = paneName(curWs, curTab, freeOrd(curWs, curTab));
+    pending[name] = Date.now() + 3000;
+    control({ t: 'create', name: name, cwd: cwd, kind: kind });
+    renderList();
+    setTimeout(function () { delete pending[name]; renderList(); }, 3000);
+  }
+
+  function killPane(name) { control({ t: 'kill', name: name }); }
+
+  function movePane(name, ws, tab) {
+    var p = parseName(name);
+    if (!p) return;
+    if (ws === p.ws && tab === p.tab) return; // no-op move: don't kill+respawn a live agent for nothing
+    control({ t: 'move', from: name, to: paneName(ws, tab, freeOrd(ws, tab), p.id) });
+  }
+
+  // suspend/resume are refused server-side for anything that isn't kind
+  // claude/grok; gated client-side too (see the `agent` check in `tile()`'s
+  // menu) so the control is never even offered on a shell pane.
+  function setFrozen(name, frozen) {
+    control({ t: frozen ? 'suspend' : 'resume', name: name });
+  }
+
   function connect() {
     clearTimeout(reconnectTimer);
     var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -317,10 +565,16 @@ function main() {
       }
       var msg;
       try { msg = JSON.parse(ev.data); } catch (e) { return; }
-      if (msg.t === 'sessions') { sessions = msg.sessions || []; renderList(); syncGeom(); }
+      if (msg.t === 'sessions') { sessions = msg.sessions || []; layout = msg.layout || null; renderList(); syncGeom(); }
       else if (msg.t === 'exit') {
         if (msg.name === open && term) term.write('\r\n\x1b[33m[session exited: ' + msg.code + ']\x1b[0m\r\n');
-      } else if (msg.t === 'error') banner(msg.msg || 'error', 'error');
+      } else if (msg.t === 'error') {
+        // `Hub::error_msg` (web.rs) broadcasts to EVERY connected client with
+        // no correlation id — with two phones/tabs open, a gesture rejected
+        // for one shows this toast on both. Accepted, out of scope here.
+        banner(msg.msg || 'error', 'warn');
+        setTimeout(function () { banner(''); }, 6000);
+      }
     };
 
     ws.onclose = function () {
@@ -504,7 +758,13 @@ function main() {
       banner('Not signed in — open the link from the QR code.', 'error');
       return;
     }
-    if (r.ok) { try { sessions = await r.json(); } catch (e) {} }
+    if (r.ok) {
+      try {
+        var d = await r.json();
+        sessions = (d && d.sessions) || [];
+        layout = (d && d.layout) || null;
+      } catch (e) {}
+    }
     renderList();
     connect();
   })();

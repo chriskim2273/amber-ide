@@ -39,11 +39,14 @@
 //! - **The browser can never resize a pty** (spec §4). A pty's winsize is
 //!   shared with the desktop app, so a phone-driven resize would reflow the
 //!   user's live panes and corrupt a claude TUI. [`map_browser_msg`] is the
-//!   ONLY path from a browser message to a daemon control message, and it
-//!   emits nothing but `Attach`/`Detach`.
-//! - **The browser can never change which sessions exist** (spec §5):
-//!   `Create`/`Kill`/`Rename`/`Suspend`/`Resume`/`DumpBacklog`/`Snapshot` are
-//!   unreachable from [`map_browser_msg`] by construction.
+//!   ONLY path from a browser message to a daemon control message, and there
+//!   is no `BrowserMsg` variant that can produce a `Resize`.
+//! - **The browser can create/kill/move/suspend/resume panes, validated at
+//!   the boundary** (pane-parity pass): `Create`/`Kill`/`Rename`/`Suspend`/
+//!   `Resume` are reachable, but only ever CONSTRUCTED from a validated name/
+//!   kind/cwd — never passed through. `Resize`, `Snapshot`, `DumpBacklog` and
+//!   `ReportRunState` remain unreachable from [`map_browser_msg`] by
+//!   construction (no `BrowserMsg` variant parses to them).
 //! - A large `Attach` backlog is delivered on the per-client writer thread,
 //!   never on the shared daemon-read thread (the backlog head-of-line lesson
 //!   in CLAUDE.md).
@@ -61,6 +64,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use amber_core::proto::{self, ControlMsg, Decoder, Frame, SessionInfo};
+
+use crate::mosaic;
 
 // ---- constant-time comparison ------------------------------------------
 
@@ -195,40 +200,64 @@ pub fn origin_ok(origin: Option<&str>, host: Option<&str>, fwd_host: Option<&str
 
 // ---- browser message → daemon control ----------------------------------
 
-/// The complete set of browser-originated control messages (spec §5).
+/// The complete set of browser-originated control messages (spec §5, widened
+/// by the pane-parity pass).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BrowserMsg {
     Open { name: String },
     Close { name: String },
+    Create { name: String, cwd: String, kind: String },
+    Kill { name: String },
+    Move { from: String, to: String },
+    Suspend { name: String },
+    Resume { name: String },
 }
 
 /// Parse a browser control (JSON text) frame. `None` for malformed JSON, an
-/// unknown `t`, or a missing/!string `name` — the caller ignores it.
+/// unknown `t`, or a missing/!string field — the caller ignores it.
 pub fn parse_browser_msg(text: &str) -> Option<BrowserMsg> {
     let v: serde_json::Value = serde_json::from_str(text).ok()?;
-    let name = || v.get("name")?.as_str().map(str::to_string);
+    let f = |k: &str| v.get(k)?.as_str().map(str::to_string);
     match v.get("t")?.as_str()? {
-        "open" => Some(BrowserMsg::Open { name: name()? }),
-        "close" => Some(BrowserMsg::Close { name: name()? }),
-        // Anything else — including a hand-crafted `resize`/`kill` — has no
+        "open" => Some(BrowserMsg::Open { name: f("name")? }),
+        "close" => Some(BrowserMsg::Close { name: f("name")? }),
+        "create" => Some(BrowserMsg::Create { name: f("name")?, cwd: f("cwd")?, kind: f("kind")? }),
+        "kill" => Some(BrowserMsg::Kill { name: f("name")? }),
+        "move" => Some(BrowserMsg::Move { from: f("from")?, to: f("to")? }),
+        "suspend" => Some(BrowserMsg::Suspend { name: f("name")? }),
+        "resume" => Some(BrowserMsg::Resume { name: f("name")? }),
+        // Anything else — including a hand-crafted `resize`/`snapshot` — has no
         // representation here, so it can never reach the daemon.
         _ => None,
     }
 }
 
+/// Valid `Create` kinds. A pty runs a shell or `amber run <name> [--kind grok]`
+/// and nothing else — `Create` carries no argv, so this is the entire surface.
+const CREATE_KINDS: [&str; 3] = ["shell", "claude", "grok"];
+
 /// The ONLY mapping from a browser message to daemon control messages
-/// (spec §5). `open` is this connection's currently-open session; `live` is
-/// the daemon's current session-name set.
+/// (spec §5, widened by the pane-parity pass). `open` is this connection's
+/// currently-open session; `sessions` is the daemon's current session set.
 ///
-/// By construction this returns nothing but `Detach` and `Attach`: there is no
-/// path from any browser input to `Create`, `Kill`, `Rename`, **`Resize`**,
-/// `Suspend`, `Resume`, `DumpBacklog` or `Snapshot`.
-pub fn map_browser_msg(msg: &BrowserMsg, open: Option<&str>, live: &[String]) -> Vec<ControlMsg> {
+/// Every arm CONSTRUCTS its `ControlMsg` from validated parts; nothing from
+/// the browser is passed through. By construction there is no path from any
+/// browser input to **`Resize`**, `Snapshot`, `DumpBacklog` or
+/// `ReportRunState`.
+pub fn map_browser_msg(
+    msg: &BrowserMsg,
+    open: Option<&str>,
+    sessions: &[SessionInfo],
+) -> Vec<ControlMsg> {
+    let live = |n: &str| sessions.iter().any(|s| s.name == n);
+    let is_agent = |n: &str| {
+        sessions.iter().any(|s| s.name == n && (s.kind == "claude" || s.kind == "grok"))
+    };
     // Exhaustive match: adding a browser message forces a decision here, so a
     // forbidden control can never become reachable by accident.
     match msg {
         BrowserMsg::Open { name } => {
-            if !live.iter().any(|n| n == name) {
+            if !live(name) {
                 return Vec::new();
             }
             let mut out = Vec::new();
@@ -241,10 +270,46 @@ pub fn map_browser_msg(msg: &BrowserMsg, open: Option<&str>, live: &[String]) ->
             out
         }
         BrowserMsg::Close { name } => {
-            if !live.iter().any(|n| n == name) {
+            if !live(name) {
                 return Vec::new();
             }
             vec![ControlMsg::Detach { name: name.clone() }]
+        }
+        BrowserMsg::Create { name, cwd, kind } => {
+            // Grammar first: a name outside it belongs to no workspace, and
+            // `s<n>` would shadow the bare-`amber` CLI namespace.
+            if mosaic::parse_pane_name(name).is_none()
+                || live(name)
+                || !CREATE_KINDS.contains(&kind.as_str())
+                || !Path::new(cwd).is_dir()
+            {
+                return Vec::new();
+            }
+            vec![ControlMsg::Create { name: name.clone(), cwd: cwd.clone(), kind: kind.clone() }]
+        }
+        BrowserMsg::Kill { name } => {
+            if !live(name) {
+                return Vec::new();
+            }
+            vec![ControlMsg::Kill { name: name.clone() }]
+        }
+        BrowserMsg::Move { from, to } => {
+            if !live(from) || mosaic::parse_pane_name(to).is_none() || live(to) {
+                return Vec::new();
+            }
+            vec![ControlMsg::Rename { from: from.clone(), to: to.clone() }]
+        }
+        BrowserMsg::Suspend { name } => {
+            if !is_agent(name) {
+                return Vec::new();
+            }
+            vec![ControlMsg::Suspend { name: name.clone() }]
+        }
+        BrowserMsg::Resume { name } => {
+            if !is_agent(name) {
+                return Vec::new();
+            }
+            vec![ControlMsg::Resume { name: name.clone() }]
         }
     }
 }
@@ -425,12 +490,16 @@ struct HubInner {
     /// Write half of the single daemon connection; `None` while unreachable.
     daemon: Option<UnixStream>,
     sessions: Vec<SessionInfo>,
+    file: mosaic::LayoutFile,
+    layout: String,
+    layout_dirty: bool,
     clients: Vec<Client>,
 }
 
 /// The single daemon connection, multiplexed across every browser client.
 pub struct Hub {
     socket: PathBuf,
+    root: PathBuf,
     inner: Mutex<HubInner>,
     next_id: AtomicU64,
 }
@@ -446,30 +515,52 @@ fn session_json(s: &SessionInfo) -> serde_json::Value {
         // resizes (spec §4) — a guess would corrupt an alt-screen claude TUI.
         "cols": s.cols,
         "rows": s.rows,
+        "slot": s.slot,
     })
 }
 
 impl Hub {
-    fn new(socket: PathBuf) -> Arc<Self> {
+    fn new(socket: PathBuf, root: PathBuf) -> Arc<Self> {
         Arc::new(Hub {
             socket,
-            inner: Mutex::new(HubInner { daemon: None, sessions: Vec::new(), clients: Vec::new() }),
+            root,
+            inner: Mutex::new(HubInner {
+                daemon: None,
+                sessions: Vec::new(),
+                file: mosaic::LayoutFile::default(),
+                layout: String::new(),
+                layout_dirty: false,
+                clients: Vec::new(),
+            }),
             next_id: AtomicU64::new(0),
         })
     }
 
-    /// JSON array for `GET /api/sessions`.
+    /// JSON body for `GET /api/sessions`: `{"sessions":[…],"layout":{…}}`.
     fn sessions_json(&self) -> String {
         let inner = self.inner.lock().unwrap();
-        let list: Vec<_> = inner.sessions.iter().map(session_json).collect();
-        serde_json::to_string(&list).unwrap_or_else(|_| "[]".into())
+        Self::payload(&inner.sessions, &inner.layout)
     }
 
-    fn sessions_msg(sessions: &[SessionInfo]) -> Out {
+    fn payload(sessions: &[SessionInfo], layout: &str) -> String {
         let list: Vec<_> = sessions.iter().map(session_json).collect();
+        let layout: serde_json::Value =
+            serde_json::from_str(layout).unwrap_or(serde_json::Value::Null);
+        serde_json::to_string(&serde_json::json!({ "sessions": list, "layout": layout }))
+            .unwrap_or_else(|_| r#"{"sessions":[],"layout":null}"#.into())
+    }
+
+    fn sessions_msg(sessions: &[SessionInfo], layout: &str) -> Out {
+        let list: Vec<_> = sessions.iter().map(session_json).collect();
+        let layout: serde_json::Value =
+            serde_json::from_str(layout).unwrap_or(serde_json::Value::Null);
         Out::Text(Arc::new(
-            serde_json::json!({ "t": "sessions", "sessions": list }).to_string(),
+            serde_json::json!({ "t": "sessions", "sessions": list, "layout": layout }).to_string(),
         ))
+    }
+
+    fn render_layout(file: &mosaic::LayoutFile, sessions: &[SessionInfo]) -> String {
+        serde_json::to_string(&mosaic::render(file, sessions)).unwrap_or_else(|_| "null".into())
     }
 
     fn error_msg(msg: &str) -> Out {
@@ -483,7 +574,7 @@ impl Hub {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = sync_channel(CLIENT_QUEUE_DEPTH);
         let mut inner = self.inner.lock().unwrap();
-        let _ = tx.try_send(Self::sessions_msg(&inner.sessions));
+        let _ = tx.try_send(Self::sessions_msg(&inner.sessions, &inner.layout));
         if inner.daemon.is_none() {
             let _ = tx.try_send(Self::error_msg("daemon unreachable"));
         }
@@ -548,11 +639,9 @@ impl Hub {
         // Unknown `t` / malformed JSON: ignored, never an error that closes.
         let Some(msg) = parse_browser_msg(text) else { return };
         let mut inner = self.inner.lock().unwrap();
-        let live: Vec<String> =
-            inner.sessions.iter().filter(|s| s.alive).map(|s| s.name.clone()).collect();
         let Some(pos) = inner.clients.iter().position(|c| c.id == id) else { return };
         let previous = inner.clients[pos].open.clone();
-        let controls = map_browser_msg(&msg, previous.as_deref(), &live);
+        let controls = map_browser_msg(&msg, previous.as_deref(), &inner.sessions);
         if controls.is_empty() {
             let err = Self::error_msg("no such session");
             Self::queue(&mut inner, |c| c.id == id, err);
@@ -561,6 +650,11 @@ impl Hub {
         inner.clients[pos].open = match &msg {
             BrowserMsg::Open { name } => Some(name.clone()),
             BrowserMsg::Close { .. } => None,
+            BrowserMsg::Create { .. }
+            | BrowserMsg::Kill { .. }
+            | BrowserMsg::Move { .. }
+            | BrowserMsg::Suspend { .. }
+            | BrowserMsg::Resume { .. } => previous,
         };
         for control in controls {
             if let ControlMsg::Detach { name } = &control {
@@ -599,12 +693,16 @@ impl Hub {
             }
             Frame::Control(ControlMsg::Sessions { sessions }) => {
                 // Unchanged is the common case for the geometry poll — don't
-                // churn every browser with an identical push.
-                if inner.sessions == sessions {
+                // churn every browser with an identical push, UNLESS the
+                // sidecar changed underneath us (layout_dirty), since the
+                // mosaic depends on the session set even when it's identical.
+                if inner.sessions == sessions && !inner.layout_dirty {
                     return;
                 }
+                inner.layout_dirty = false;
                 inner.sessions = sessions;
-                let msg = Self::sessions_msg(&inner.sessions);
+                inner.layout = Self::render_layout(&inner.file, &inner.sessions);
+                let msg = Self::sessions_msg(&inner.sessions, &inner.layout);
                 Self::queue(&mut inner, |_| true, msg);
             }
             Frame::Control(ControlMsg::SessionsChanged { added, removed }) => {
@@ -612,7 +710,8 @@ impl Hub {
                     !removed.contains(&s.name) && !added.iter().any(|a| a.name == s.name)
                 });
                 inner.sessions.extend(added);
-                let msg = Self::sessions_msg(&inner.sessions);
+                inner.layout = Self::render_layout(&inner.file, &inner.sessions);
+                let msg = Self::sessions_msg(&inner.sessions, &inner.layout);
                 Self::queue(&mut inner, |_| true, msg);
             }
             Frame::Control(ControlMsg::Exit { name, code }) => {
@@ -683,7 +782,11 @@ fn run_daemon_link(hub: Arc<Hub>) {
                 let mut inner = hub.inner.lock().unwrap();
                 inner.daemon = None;
                 inner.sessions.clear();
-                let sessions = Hub::sessions_msg(&[]);
+                inner.layout.clear();
+                // An empty session list with a stale non-empty layout would be
+                // incoherent (every leaf it names is now unreachable); "" here
+                // renders as `"layout":null`, matching the empty session list.
+                let sessions = Hub::sessions_msg(&[], "");
                 Hub::queue(&mut inner, |_| true, sessions);
                 let err = Hub::error_msg("daemon unreachable");
                 Hub::queue(&mut inner, |_| true, err);
@@ -708,9 +811,16 @@ pub fn bind(port: u16) -> std::io::Result<TcpListener> {
 }
 
 /// Serve until the listener errors. `daemon_socket` is the amber daemon's unix
-/// socket; `token` is the shared secret from `<state>/web-token`.
-pub fn serve(listener: TcpListener, daemon_socket: PathBuf, token: String) -> anyhow::Result<()> {
-    let hub = Hub::new(daemon_socket);
+/// socket; `root` is the state root the app's `ui-layout.json` sidecar lives
+/// in (read-only, polled — never written here); `token` is the shared secret
+/// from `<state>/web-token`.
+pub fn serve(
+    listener: TcpListener,
+    daemon_socket: PathBuf,
+    root: PathBuf,
+    token: String,
+) -> anyhow::Result<()> {
+    let hub = Hub::new(daemon_socket, root);
     {
         let hub = Arc::clone(&hub);
         thread::spawn(move || run_daemon_link(hub));
@@ -720,14 +830,24 @@ pub fn serve(listener: TcpListener, daemon_socket: PathBuf, token: String) -> an
     // the desktop app broadcasts NO SessionsChanged, so the cache would go
     // stale and the phone would paint an alt-screen TUI onto the wrong grid.
     // A 1 s `ListSessionsDetailed` (one tiny control frame) refreshes it; the
-    // reply only reaches browsers when the set actually changed.
+    // reply only reaches browsers when the set actually changed. The same tick
+    // also re-reads the `ui-layout.json` sidecar — file IO happens ONLY here,
+    // never on the shared daemon read thread (`on_frame`), which just re-renders
+    // the cached `LayoutFile` when the session set changes.
     // ponytail: polling here, not a new daemon broadcast — a divider drag emits
     // resizes far faster than the bounded watcher queue should carry.
     {
         let hub = Arc::clone(&hub);
         thread::spawn(move || loop {
             thread::sleep(GEOMETRY_POLL);
+            let file = mosaic::load(&hub.root);
             let mut inner = hub.inner.lock().unwrap();
+            let rendered = Hub::render_layout(&file, &inner.sessions);
+            if rendered != inner.layout {
+                inner.layout = rendered;
+                inner.layout_dirty = true;
+            }
+            inner.file = file;
             if inner.daemon.is_some() {
                 Hub::write_daemon(&mut inner, &Frame::Control(ControlMsg::ListSessionsDetailed));
             }
@@ -991,8 +1111,25 @@ mod tests {
         ));
     }
 
+    /// Build a `SessionInfo` for the tests below with only the fields the
+    /// mapping logic reads set meaningfully.
+    fn s(name: &str, kind: &str) -> SessionInfo {
+        SessionInfo {
+            name: name.into(),
+            cwd: "/tmp".into(),
+            kind: kind.into(),
+            alive: true,
+            updated: 0,
+            run_state: None,
+            claude_id: None,
+            cols: 80,
+            rows: 24,
+            slot: 1,
+        }
+    }
+
     #[test]
-    fn parse_browser_msg_accepts_only_open_and_close() {
+    fn parse_browser_msg_accepts_the_whole_whitelist() {
         assert_eq!(
             parse_browser_msg(r#"{"t":"open","name":"amber-1-1-0-a"}"#),
             Some(BrowserMsg::Open { name: "amber-1-1-0-a".into() })
@@ -1001,12 +1138,35 @@ mod tests {
             parse_browser_msg(r#"{"t":"close","name":"s"}"#),
             Some(BrowserMsg::Close { name: "s".into() })
         );
+        assert_eq!(
+            parse_browser_msg(r#"{"t":"create","name":"s","cwd":"/tmp","kind":"shell"}"#),
+            Some(BrowserMsg::Create { name: "s".into(), cwd: "/tmp".into(), kind: "shell".into() })
+        );
+        assert_eq!(
+            parse_browser_msg(r#"{"t":"kill","name":"s"}"#),
+            Some(BrowserMsg::Kill { name: "s".into() })
+        );
+        assert_eq!(
+            parse_browser_msg(r#"{"t":"move","from":"s","to":"t"}"#),
+            Some(BrowserMsg::Move { from: "s".into(), to: "t".into() })
+        );
+        assert_eq!(
+            parse_browser_msg(r#"{"t":"suspend","name":"s"}"#),
+            Some(BrowserMsg::Suspend { name: "s".into() })
+        );
+        assert_eq!(
+            parse_browser_msg(r#"{"t":"resume","name":"s"}"#),
+            Some(BrowserMsg::Resume { name: "s".into() })
+        );
         for junk in [
             "",
             "not json",
             "[]",
-            r#"{"t":"resize","cols":80,"rows":24}"#,
-            r#"{"t":"kill","name":"s"}"#,
+            r#"{"t":"resize","name":"s","cols":80,"rows":24}"#,
+            r#"{"t":"rename","from":"s","to":"t"}"#,
+            r#"{"t":"snapshot"}"#,
+            r#"{"t":"dumpbacklog","name":"s"}"#,
+            r#"{"t":"reportrunstate","name":"s","state":"claude"}"#,
             r#"{"t":"open"}"#,
             r#"{"t":"open","name":123}"#,
             r#"{"name":"s"}"#,
@@ -1015,25 +1175,24 @@ mod tests {
         }
     }
 
-    /// Every control message the browser must never be able to cause (spec §5
-    /// + §4). This is the single most important invariant in the feature.
+    /// Every control message the browser must never be able to cause (spec §4,
+    /// widened by the pane-parity pass). This is the single most important
+    /// invariant in the feature: a pty's winsize is shared with the desktop
+    /// app, and `Snapshot`/`DumpBacklog`/`ReportRunState` are
+    /// daemon/supervisor-internal.
     fn is_forbidden(msg: &ControlMsg) -> bool {
         matches!(
             msg,
-            ControlMsg::Create { .. }
-                | ControlMsg::Kill { .. }
-                | ControlMsg::Rename { .. }
-                | ControlMsg::Resize { .. }
-                | ControlMsg::Suspend { .. }
-                | ControlMsg::Resume { .. }
+            ControlMsg::Resize { .. }
                 | ControlMsg::DumpBacklog { .. }
                 | ControlMsg::Snapshot
+                | ControlMsg::ReportRunState { .. }
         )
     }
 
     #[test]
     fn map_browser_msg_attaches_and_detaches_only() {
-        let live = vec!["s".to_string(), "t".to_string()];
+        let live = [s("s", "shell"), s("t", "shell")];
         // open with nothing open -> just Attach.
         assert_eq!(
             map_browser_msg(&BrowserMsg::Open { name: "s".into() }, None, &live),
@@ -1064,18 +1223,132 @@ mod tests {
         // A browser naming a session the daemon does not have must not reach
         // the daemon at all (spec §5: "only for a name currently in the live
         // session list").
-        let live = vec!["s".to_string()];
+        let live = [s("s", "shell")];
         assert!(map_browser_msg(&BrowserMsg::Open { name: "ghost".into() }, None, &live).is_empty());
         assert!(map_browser_msg(&BrowserMsg::Close { name: "ghost".into() }, None, &live)
             .is_empty());
     }
 
     #[test]
+    fn create_requires_the_pane_grammar_and_a_known_kind() {
+        let live = [s("amber-1-1-0-aa", "shell")];
+        let mk = |name: &str, kind: &str| {
+            map_browser_msg(
+                &BrowserMsg::Create { name: name.into(), cwd: "/tmp".into(), kind: kind.into() },
+                None,
+                &live,
+            )
+        };
+        assert_eq!(mk("amber-1-1-1-bb", "shell").len(), 1);
+        assert_eq!(mk("amber-1-1-1-bb", "grok").len(), 1);
+        // Outside the pane grammar: no pane could ever show it, and `s<n>`
+        // would shadow the bare-`amber` CLI namespace.
+        assert!(mk("s3", "shell").is_empty());
+        assert!(mk("amber-1-1-1-bb!", "shell").is_empty());
+        assert!(mk("browser-1-1-1-bb", "shell").is_empty());
+        // Unknown kind.
+        assert!(mk("amber-1-1-1-bb", "bash").is_empty());
+        // A name that is already live.
+        assert!(mk("amber-1-1-0-aa", "shell").is_empty());
+    }
+
+    #[test]
+    fn create_requires_an_existing_cwd() {
+        let live: [SessionInfo; 0] = [];
+        let out = map_browser_msg(
+            &BrowserMsg::Create {
+                name: "amber-1-1-0-aa".into(),
+                cwd: "/definitely/not/a/real/dir".into(),
+                kind: "shell".into(),
+            },
+            None,
+            &live,
+        );
+        assert!(out.is_empty(), "a non-existent cwd must be refused: {out:?}");
+    }
+
+    #[test]
+    fn kill_and_move_only_touch_live_sessions_and_valid_targets() {
+        let live = [s("amber-1-1-0-aa", "shell")];
+        assert!(matches!(
+            map_browser_msg(&BrowserMsg::Kill { name: "amber-1-1-0-aa".into() }, None, &live)
+                .as_slice(),
+            [ControlMsg::Kill { .. }]
+        ));
+        assert!(map_browser_msg(&BrowserMsg::Kill { name: "nope".into() }, None, &live).is_empty());
+
+        assert!(matches!(
+            map_browser_msg(
+                &BrowserMsg::Move { from: "amber-1-1-0-aa".into(), to: "amber-2-1-0-aa".into() },
+                None,
+                &live
+            )
+            .as_slice(),
+            [ControlMsg::Rename { .. }]
+        ));
+        // Target outside the grammar.
+        assert!(map_browser_msg(
+            &BrowserMsg::Move { from: "amber-1-1-0-aa".into(), to: "s9".into() },
+            None,
+            &live
+        )
+        .is_empty());
+        // Source not live.
+        assert!(map_browser_msg(
+            &BrowserMsg::Move { from: "ghost".into(), to: "amber-2-1-0-aa".into() },
+            None,
+            &live
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn suspend_and_resume_are_refused_for_non_agent_sessions() {
+        let live =
+            [s("amber-1-1-0-aa", "shell"), s("amber-1-1-1-bb", "claude"), s("amber-1-1-2-cc", "grok")];
+        for kind_name in ["amber-1-1-1-bb", "amber-1-1-2-cc"] {
+            assert_eq!(
+                map_browser_msg(&BrowserMsg::Suspend { name: kind_name.into() }, None, &live).len(),
+                1,
+                "agent {kind_name} should suspend"
+            );
+            assert_eq!(
+                map_browser_msg(&BrowserMsg::Resume { name: kind_name.into() }, None, &live).len(),
+                1,
+                "agent {kind_name} should resume"
+            );
+        }
+        // A shell has no supervisor to signal — refuse before the daemon has to.
+        assert!(
+            map_browser_msg(&BrowserMsg::Suspend { name: "amber-1-1-0-aa".into() }, None, &live)
+                .is_empty()
+        );
+        assert!(
+            map_browser_msg(&BrowserMsg::Resume { name: "amber-1-1-0-aa".into() }, None, &live)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn resize_and_the_other_forbidden_controls_remain_unreachable() {
+        // There is no BrowserMsg that parses to them, so no mapping exists.
+        for text in [
+            r#"{"t":"resize","name":"amber-1-1-0-aa","cols":40,"rows":20}"#,
+            r#"{"t":"snapshot"}"#,
+            r#"{"t":"dumpbacklog","name":"amber-1-1-0-aa"}"#,
+            r#"{"t":"reportrunstate","name":"amber-1-1-0-aa","state":"claude"}"#,
+        ] {
+            assert!(parse_browser_msg(text).is_none(), "{text} parsed");
+        }
+    }
+
+    #[test]
     fn no_browser_input_can_reach_a_forbidden_control_message() {
         // Exhaustive over the parseable surface: every JSON the browser could
         // send, crossed with every open-state and live-set, must never produce
-        // Resize/Create/Kill/Rename/Suspend/Resume/DumpBacklog/Snapshot.
-        let live = ["s".to_string(), "t".to_string()];
+        // Resize/Snapshot/DumpBacklog/ReportRunState, and every message it DOES
+        // produce is one of the widened whitelist's variants.
+        let live = [s("s", "shell"), s("t", "shell")];
         let texts = [
             r#"{"t":"open","name":"s"}"#,
             r#"{"t":"open","name":"ghost"}"#,
@@ -1085,6 +1358,7 @@ mod tests {
             r#"{"t":"kill","name":"s"}"#,
             r#"{"t":"create","name":"s","cwd":"/tmp","kind":"shell"}"#,
             r#"{"t":"rename","from":"s","to":"t"}"#,
+            r#"{"t":"move","from":"s","to":"amber-1-1-0-aa"}"#,
             r#"{"t":"suspend","name":"s"}"#,
             r#"{"t":"resume","name":"s"}"#,
             r#"{"t":"dumpbacklog","name":"s"}"#,
@@ -1099,7 +1373,16 @@ mod tests {
                     for out in map_browser_msg(&msg, open, set) {
                         assert!(!is_forbidden(&out), "{text:?} produced {out:?}");
                         assert!(
-                            matches!(out, ControlMsg::Attach { .. } | ControlMsg::Detach { .. }),
+                            matches!(
+                                out,
+                                ControlMsg::Attach { .. }
+                                    | ControlMsg::Detach { .. }
+                                    | ControlMsg::Create { .. }
+                                    | ControlMsg::Kill { .. }
+                                    | ControlMsg::Rename { .. }
+                                    | ControlMsg::Suspend { .. }
+                                    | ControlMsg::Resume { .. }
+                            ),
                             "{text:?} produced non-whitelisted {out:?}"
                         );
                     }

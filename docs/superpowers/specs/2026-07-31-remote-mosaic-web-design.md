@@ -1,7 +1,65 @@
 # Remote mosaic — the workspace over `amber web`
 
 **Date:** 2026-07-31
-**Status:** designed, not implemented.
+**Status:** implemented, `feat/remote-mosaic` (commits `f4a2608..0a984d9`,
+worktree `/home/poyto/Projects/amber-ide-remote-mosaic`). Rust 289 tests +
+clippy clean (`--workspace --all-targets -D warnings`); the app's TypeScript
+suite was not run — this plan touches zero TypeScript. See the CLAUDE.md
+"Remote mosaic (2026-07-31)" entry for the full record; summary below.
+
+**Deviations from this design, found during implementation:**
+- §8's Rust test file itself needed two fixes, not the implementation: an
+  `f32`→`f64` ratio widening broke exact-equality assertions, and a
+  wait-condition on `kind=="leaf"` was also satisfied by a transient
+  pre-sidecar fallback render, so a `label=="main"` check was added to make
+  the test wait for the real state.
+- An extra `sessions_msg` call site in `run_daemon_link`'s daemon-loss branch
+  was not enumerated by §3; it now passes `""` for a coherent `"layout":null`.
+- §2.4's reconciliation append order is lexicographic by session name, not
+  numeric by `ord` — parked as a known-open minor finding (see CLAUDE.md),
+  not fixed in this pass.
+- §7.3's `Kill.name`/`Rename.from` validation (and the browser `Open`/`Close`
+  gestures generally) now check against the daemon's **full** listed session
+  set, including dead-but-unreaped sessions, rather than an alive-only filter
+  — a behaviour change beyond what §7.3 specified, chosen to match the
+  desktop's "exited · close pane" overlay.
+- Front-end deviations from the plan's literal snippets (all in
+  `crates/amber/assets/app.js`): `freeOrd`/`paneName` live inside `main()`
+  next to `sessionByName` rather than top-level beside `parseName`, because
+  `freeOrd` reads the closure-scoped live `sessions` array; `newPane` adds a
+  client-side `CREATE_KINDS` allowlist so an invalid kind banners instead of
+  silently no-op-ing; the "move to tab" prompt gained a null/NaN guard so a
+  cancelled or garbage prompt banners instead of sending a malformed target
+  name; `index.html` was left untouched since every new element (the `⋯`
+  menu, the `+ pane` pill, the pending tile) is built dynamically in JS like
+  the existing ones.
+- Five findings from Task 2's review were parked under a user directive to
+  defer to a single end-of-plan review wave; that wave did not happen within
+  this plan's scope, so they remain open. Listed in full in the CLAUDE.md
+  entry (two "Important": the untested `dir`/`ratio` append/serialize keys,
+  and `parse_pane_name` accepting a leading `+` that the JS regex rejects;
+  three "Minor": `activeTab` defaulting to `0` for a sidecar-absent workspace,
+  lexicographic vs. numeric append ordering, and unproven `sort_by_key`
+  stability reliance).
+
+**Live-verified** (isolated private daemon + private `amber web`, playwright):
+pruning + split-collapse, the §2.4 append at `dir:"h"`/`ratio:0.66`,
+`tabOrder` + labels, no `recentFiles`/`editors` leak, the real split ratio in
+the DOM, a sidecar-only change (§3.1's trap) propagating in 0.46 s,
+tap-to-zoom showing real pty output, `+ pane` creating a real session, the
+tile menu's close killing it, "move to tab" renaming it on the real daemon
+with its id preserved, all four forbidden control messages
+(`resize`/`snapshot`/`dumpbacklog`/`reportrunstate`) forged down the live
+socket and refused (geometry unchanged at 80×24, session alive), and the
+sidecar deleted outright still producing a name-derived mosaic rather than
+`null`. **Left manual:** the agent freeze/unfreeze round trip (§8's "a
+suspended claude unfrozen from the browser resumes the same conversation") —
+no agent binary was available in the private verification instance;
+Rust-tested only. §8's "desktop app and browser attached simultaneously,
+neither reflows the other" was not separately re-verified in this pass (it is
+inherited unchanged from the shipped mobile design per this spec's own
+framing, §5).
+
 **Depends on:** `2026-07-19-amber-web-mobile-design.md` (shipped) — this spec
 extends that server and inherits every one of its security decisions unchanged
 except the control whitelist (§6).

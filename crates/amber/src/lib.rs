@@ -6,6 +6,7 @@ pub mod claude;
 pub mod daemon;
 pub mod grok;
 pub mod manager;
+pub mod mosaic;
 pub mod procinfo;
 pub mod pty;
 pub mod supervisor;

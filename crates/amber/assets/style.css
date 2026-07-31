@@ -194,3 +194,37 @@ html, body {
   background: var(--accent-soft);
   border-color: var(--accent);
 }
+
+/* ---- mosaic ---- */
+.ws-bar, .tab-bar { display: flex; gap: 6px; overflow-x: auto; padding: 6px 10px; }
+.tab-bar { padding-top: 0; }
+.pill {
+  flex: 0 0 auto; padding: 5px 11px; border-radius: 999px;
+  border: 1px solid #2a2a35; background: #16161d; color: #c8c8d2;
+  font: inherit; font-size: 13px;
+}
+.pill.on { background: #7c6cff; border-color: #7c6cff; color: #fff; }
+
+.mosaic { display: flex; flex: 1 1 auto; padding: 0 10px 10px; min-height: 0; }
+.mosaic > * { flex: 1 1 auto; }
+.split { display: flex; gap: 6px; min-width: 0; min-height: 0; }
+.split.h { flex-direction: row; }
+.split.v { flex-direction: column; }
+.split > * { min-width: 0; min-height: 0; }
+
+.tile {
+  display: flex; flex-direction: column; gap: 4px; justify-content: space-between;
+  padding: 8px; border-radius: 8px; text-align: left;
+  border: 1px solid #2a2a35; background: #12121a; color: #e6e6ec;
+  font: inherit; overflow: hidden;
+}
+.tile.dead { opacity: 0.5; }
+.tile.frozen { border-color: #4d9fff; }
+.tile-frozen { color: #4d9fff; font-size: 12px; }
+.tile-head { display: flex; align-items: center; gap: 6px; }
+.tile-slot { font-variant-numeric: tabular-nums; color: #9a9aa8; font-size: 12px; }
+.tile-title { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tile-tag { font-size: 11px; color: #9a9aa8; }
+.tile.pending { opacity: 0.6; font-style: italic; align-items: center; justify-content: center; }
+.tile-menu { margin-left: auto; padding: 0 4px; color: #9a9aa8; }
+.pill-add { border-style: dashed; }
