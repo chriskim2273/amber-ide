@@ -428,6 +428,15 @@ impl PtySession {
         self.ring.lock().unwrap().snapshot()
     }
 
+    /// Total bytes ever written into this session's scrollback ring (monotonic).
+    /// The snapshot timer compares it against the value it last persisted to
+    /// skip both the clone and the disk write for an unchanged session — see
+    /// `SessionManager::snapshot_inner`. Cheap: a lock and a counter read, never
+    /// a copy of the ring.
+    pub fn scrollback_written(&self) -> u64 {
+        self.ring.lock().unwrap().written()
+    }
+
     /// Seed the ring with persisted history (used on restore, before live output).
     pub fn preload(&self, bytes: &[u8]) {
         self.ring.lock().unwrap().push(bytes);

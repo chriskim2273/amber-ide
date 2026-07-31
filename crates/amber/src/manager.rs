@@ -139,6 +139,13 @@ pub struct SessionManager {
     /// drop a live claude pane back to a bare shell on the next restart; only a
     /// sustained absence downgrades. See `decide_resume`.
     claude_absent: Mutex<HashMap<String, u32>>,
+    /// Per-session ring write-counter as of the last scrollback we successfully
+    /// persisted. A session whose counter is unchanged has an unchanged
+    /// scrollback, so the next snapshot skips it entirely — no 2 MiB clone, no
+    /// atomic file rewrite. Measured before this: 18 full rings meant 36 MiB
+    /// cloned AND 36 MiB written every 10 s, almost all of it identical bytes.
+    /// Pruned alongside `claude_absent` so a removed session leaves nothing.
+    persisted_scrollback: Mutex<HashMap<String, u64>>,
     /// Serialises snapshot against the operations that MOVE a session's stored
     /// artifacts (remove/rename). The snapshot deliberately writes to disk with
     /// `sessions` released — holding it there is what froze typing — so without
@@ -197,6 +204,7 @@ impl SessionManager {
             socket: None,
             watchers: None,
             claude_absent: Mutex::new(HashMap::new()),
+            persisted_scrollback: Mutex::new(HashMap::new()),
             maintenance: Mutex::new(()),
         })
     }
@@ -444,6 +452,10 @@ impl SessionManager {
         let handles: Vec<(String, Arc<PtySession>)> = {
             let sessions = self.sessions.lock().unwrap();
             self.claude_absent.lock().unwrap().retain(|k, _| sessions.contains_key(k));
+            self.persisted_scrollback
+                .lock()
+                .unwrap()
+                .retain(|k, _| sessions.contains_key(k));
             sessions.iter().map(|(n, s)| (n.clone(), Arc::clone(s))).collect()
         };
 
@@ -457,9 +469,34 @@ impl SessionManager {
         };
 
         for (name, sess) in &handles {
-            self.store.write_scrollback(name, &sess.scrollback())?;
+            self.persist_scrollback_if_changed(name, sess)?;
             self.persist_live_cwd(name, sess, is_final, &table);
         }
+        Ok(())
+    }
+
+    /// Write `name`'s scrollback — unless nothing has been pushed into its ring
+    /// since the last time we wrote it.
+    ///
+    /// The ring's `written()` counter is monotonic and counts PUSHED bytes, so
+    /// an unchanged counter means byte-identical contents; skipping is a pure
+    /// no-op on what ends up on disk, and reboot survival (core rule #6) is
+    /// untouched. What it removes is the per-tick 2 MiB clone + atomic rewrite
+    /// for a pane that printed nothing — which, on the measured box, was
+    /// essentially all of them.
+    ///
+    /// The counter is recorded only on a SUCCESSFUL write, so a failed snapshot
+    /// is retried on the next tick rather than silently skipped forever.
+    fn persist_scrollback_if_changed(&self, name: &str, sess: &PtySession) -> anyhow::Result<()> {
+        let written = sess.scrollback_written();
+        if self.persisted_scrollback.lock().unwrap().get(name) == Some(&written) {
+            return Ok(());
+        }
+        self.store.write_scrollback(name, &sess.scrollback())?;
+        self.persisted_scrollback
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), written);
         Ok(())
     }
 
@@ -1074,6 +1111,48 @@ mod tests {
         mgr.snapshot().unwrap();
         let meta = mgr.store.read_session("sh").unwrap().unwrap();
         assert_eq!(meta.cwd, target, "snapshot did not capture the cd'd dir");
+    }
+
+    #[test]
+    fn snapshot_skips_a_session_whose_scrollback_did_not_change() {
+        // The snapshot ran every 10 s and unconditionally cloned + rewrote every
+        // ring. Measured live: 18 sessions all at their 2 MiB cap = 36 MiB of
+        // transient allocation AND 36 MiB of disk writes every tick (~3.6 MB/s
+        // forever) for panes that were idle. An unchanged ring must cost nothing.
+        //
+        // Observed directly rather than via mtime (too coarse to be non-flaky):
+        // delete the file after the first snapshot; if the second snapshot skips
+        // the write, it stays deleted.
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        mgr.create("idle", "/tmp", SessionKind::Shell).unwrap();
+        let sess = mgr.session("idle").unwrap();
+        // Let the shell's prompt (if any) settle into the ring first, so the
+        // "unchanged" window below really is unchanged.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        mgr.snapshot().unwrap();
+        let path = dir.path().join("scrollback").join("idle.bin");
+        assert!(path.exists(), "first snapshot must write the scrollback");
+        std::fs::remove_file(&path).unwrap();
+
+        mgr.snapshot().unwrap();
+        assert!(
+            !path.exists(),
+            "an idle session's unchanged scrollback was rewritten"
+        );
+
+        // ...and real output must still be persisted: the skip is keyed on the
+        // ring's monotonic write counter, not on a timer.
+        let before = sess.scrollback_written();
+        sess.write(b"printf SNAPSHOT_MARKER\n").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while sess.scrollback_written() == before {
+            assert!(std::time::Instant::now() < deadline, "no output reached the ring");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        mgr.snapshot().unwrap();
+        assert!(path.exists(), "a changed scrollback must still be persisted");
     }
 
     #[test]
