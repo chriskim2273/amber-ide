@@ -122,6 +122,7 @@ function main() {
   // Dispatcher: the flat list when the server has no sidecar (or it renders
   // to no workspaces at all), the workspace/tab/tile mosaic otherwise.
   function renderList() {
+    countEl.textContent = sessions.length ? sessions.length + ' session' + (sessions.length === 1 ? '' : 's') : '';
     if (!layout || !layout.workspaces || !layout.workspaces.length) {
       wsBarEl.hidden = tabBarEl.hidden = mosaicEl.hidden = true;
       listEl.hidden = false;
@@ -227,7 +228,6 @@ function main() {
   }
 
   function renderFlatList() {
-    countEl.textContent = sessions.length ? sessions.length + ' session' + (sessions.length === 1 ? '' : 's') : '';
     listEl.textContent = '';
     if (!sessions.length) {
       var empty = document.createElement('p');
