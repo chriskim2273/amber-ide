@@ -500,15 +500,19 @@ fn leaves(n: &Node, out: &mut Vec<String>) {
     }
 }
 
-/// Append `pane_id` as an even split of the whole tree (the equal-splits
-/// fallback the desktop app uses for a leaf the sidecar never recorded).
+/// Append `pane_id` against the whole tree, for a leaf the sidecar never
+/// recorded. Byte-for-byte the desktop app's own rule — `reconcile` in
+/// `app/src/renderer/layout.ts:169-181` appends `{dir:'h', ratio:0.66,
+/// a: tree, b: leaf}`. Matching it exactly is the point: this is the
+/// reboot-restored / just-created case, and the mosaic must not visibly
+/// disagree with the desktop about it.
 fn append_leaf(tree: Option<Node>, pane_id: &str) -> Node {
     let leaf = Node::Leaf { pane_id: pane_id.to_string() };
     match tree {
         None => leaf,
         Some(t) => Node::Split {
             dir: "h".into(),
-            ratio: 0.5,
+            ratio: 0.66,
             a: Box::new(t),
             b: Box::new(leaf),
         },
@@ -685,6 +689,38 @@ In `crates/amber/tests/web.rs`, update the fixture to pass the root (the tempdir
 
 adding `let root = dir.path().to_path_buf();` above the spawn block, cloned like `sock`.
 
+The fixture also needs to make more than one session. Split `create_session` so
+the name is a parameter, keeping the existing no-arg caller working:
+
+```rust
+    /// Create a session on the private daemon and return its name.
+    fn create_session(&self) -> String {
+        self.create_named("amber-1-1-0-web")
+    }
+
+    fn create_named(&self, name: &str) -> String {
+        let name = name.to_string();
+        let mut s = UnixStream::connect(&self.sock).unwrap();
+        s.write_all(&proto::encode(&Frame::Control(ControlMsg::Create {
+            name: name.clone(),
+            cwd: self.dir.path().to_string_lossy().into_owned(),
+            kind: "shell".into(),
+        })))
+        .unwrap();
+        let mut dec = proto::Decoder::new();
+        let mut buf = [0u8; 8192];
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        loop {
+            if let Some(Frame::Control(ControlMsg::Created { .. })) = dec.next_frame().unwrap() {
+                return name;
+            }
+            let n = s.read(&mut buf).unwrap();
+            assert!(n > 0);
+            dec.feed(&buf[..n]);
+        }
+    }
+```
+
 Then update the shape assertion in `good_token_yields_a_cookie_that_lists_daemon_sessions_with_real_geometry` — `/api/sessions` is no longer a bare array:
 
 ```rust
@@ -752,7 +788,11 @@ fn a_sidecar_only_change_still_reaches_the_browser() {
     // unchanged. Dragging a divider on the desktop rewrites ui-layout.json with
     // an IDENTICAL session set — that must still push.
     let f = fixture();
-    let name = f.create_session();
+    // TWO distinct panes: a tree with the same paneId twice is a shape the
+    // desktop app can never produce, and the prune walk would treat it
+    // specially. This must be a tree that really exists.
+    let a = f.create_named("amber-1-1-0-aa");
+    let b = f.create_named("amber-1-1-1-bb");
     let cookie = f.login();
     let write_layout = |ratio: &str| {
         std::fs::write(
@@ -760,16 +800,23 @@ fn a_sidecar_only_change_still_reaches_the_browser() {
             format!(
                 r#"{{"version":1,"activeWorkspace":1,"workspaces":{{"1":{{"activeTab":1,"tabs":{{
                    "1":{{"tree":{{"kind":"split","dir":"h","ratio":{ratio},
-                     "a":{{"kind":"leaf","paneId":"{name}"}},
-                     "b":{{"kind":"leaf","paneId":"{name}"}}}}}}}}}}}}}}"#
+                     "a":{{"kind":"leaf","paneId":"{a}"}},
+                     "b":{{"kind":"leaf","paneId":"{b}"}}}}}}}}}}}}}}"#
             ),
         )
         .unwrap();
     };
+    // Assert on the PARSED ratio at a known path, never a substring — a
+    // substring match would pass on any push that merely contained "0.8".
+    let served_ratio = |body: &str| -> Option<f64> {
+        let v: serde_json::Value = serde_json::from_str(body).ok()?;
+        v["layout"]["workspaces"][0]["tabs"][0]["tree"]["ratio"].as_f64()
+    };
+
     write_layout("0.3");
     assert!(
         wait_until(Duration::from_secs(10), || {
-            f.get("/api/sessions", Some(&cookie)).2.contains("0.3")
+            served_ratio(&f.get("/api/sessions", Some(&cookie)).2) == Some(0.3)
         }),
         "first layout never served"
     );
@@ -787,8 +834,11 @@ fn a_sidecar_only_change_still_reaches_the_browser() {
     let mut saw = false;
     while Instant::now() < deadline && !saw {
         if let Ok(tungstenite::Message::Text(t)) = ws.read() {
-            if t.contains("\"t\":\"sessions\"") && t.contains("0.8") {
-                saw = true;
+            if t.contains("\"t\":\"sessions\"") {
+                let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+                if v["layout"]["workspaces"][0]["tabs"][0]["tree"]["ratio"].as_f64() == Some(0.8) {
+                    saw = true;
+                }
             }
         }
     }
@@ -827,24 +877,29 @@ Add `slot` to `session_json`:
         "slot": s.slot,
 ```
 
-Give `HubInner` a cached mosaic and a root:
+Replace the `HubInner` / `Hub` / `Hub::new` trio wholesale — here is the
+complete final form of all three, so nothing is assembled from fragments:
 
 ```rust
 struct HubInner {
     /// Write half of the single daemon connection; `None` while unreachable.
     daemon: Option<UnixStream>,
     sessions: Vec<SessionInfo>,
+    /// Last parsed `ui-layout.json`. Cached so `on_frame` can re-render the
+    /// mosaic against a changed session set without touching the filesystem.
+    file: mosaic::LayoutFile,
     /// Serialized mosaic (`mosaic::render`). Cached because it must be
     /// COMPARED, not just sent: a sidecar-only change leaves `sessions`
     /// byte-identical, and `on_frame`'s early return would swallow it.
     layout: String,
+    /// Set by the poll thread when the re-read mosaic differs from `layout`;
+    /// cleared by the `Sessions` arm once it has pushed. This is the ONLY
+    /// thing that makes a divider drag reach the browser.
+    layout_dirty: bool,
     clients: Vec<Client>,
 }
-```
 
-`Hub` gains the state root:
-
-```rust
+/// The single daemon connection, multiplexed across every browser client.
 pub struct Hub {
     socket: PathBuf,
     /// State root holding `ui-layout.json`. Read ONLY, and only from the poll
@@ -854,9 +909,27 @@ pub struct Hub {
     inner: Mutex<HubInner>,
     next_id: AtomicU64,
 }
-```
 
-Update `Hub::new(socket, root)` to store both and initialise `layout: String::new()`.
+impl Hub {
+    fn new(socket: PathBuf, root: PathBuf) -> Arc<Self> {
+        Arc::new(Hub {
+            socket,
+            root,
+            inner: Mutex::new(HubInner {
+                daemon: None,
+                sessions: Vec::new(),
+                file: mosaic::LayoutFile::default(),
+                layout: String::new(),
+                layout_dirty: false,
+                clients: Vec::new(),
+            }),
+            next_id: AtomicU64::new(0),
+        })
+    }
+    // ... the rest of the existing impl block is unchanged except for the
+    // methods listed below.
+}
+```
 
 Make the two payload builders take the cached layout:
 
@@ -906,7 +979,7 @@ Recompute the mosaic wherever the session set changes, and make the `Sessions` a
             }
 ```
 
-That needs a `layout_dirty: bool` on `HubInner` (init `false`), set by the poll thread when the re-read mosaic differs from the cached one. `SessionsChanged` recomputes the mosaic inline from the new session set, since the tree depends on it:
+`SessionsChanged` recomputes the mosaic inline from the new session set, since the tree depends on it:
 
 ```rust
             Frame::Control(ControlMsg::SessionsChanged { added, removed }) => {
@@ -923,15 +996,7 @@ That needs a `layout_dirty: bool` on `HubInner` (init `false`), set by the poll 
             }
 ```
 
-So `HubInner` also caches the parsed sidecar:
-
-```rust
-    /// Last parsed `ui-layout.json`. Kept so `on_frame` can re-render the
-    /// mosaic against a changed session set without touching the filesystem.
-    file: mosaic::LayoutFile,
-```
-
-and a small helper:
+and a small helper on `impl Hub`:
 
 ```rust
     fn render_layout(file: &mosaic::LayoutFile, sessions: &[SessionInfo]) -> String {
@@ -960,7 +1025,16 @@ Finally, the poll thread in `serve` re-reads the sidecar each tick, before askin
         });
 ```
 
-Add `use crate::mosaic;` at the top of `web.rs`, change `serve`'s signature to take `root: PathBuf` and pass it to `Hub::new`, and update `crates/amber/src/main.rs:524`:
+Add `use crate::mosaic;` at the top of `web.rs`. Confirm the path import covers
+both types this task and Task 4 need — `web.rs` uses `PathBuf` in `Hub` and
+`&Path` in `load_or_create_token`, so the line must read:
+
+```rust
+use std::path::{Path, PathBuf};
+```
+
+Change `serve`'s signature to take `root: PathBuf` and pass it to
+`Hub::new(daemon_socket, root)`, then update `crates/amber/src/main.rs:524`:
 
 ```rust
     amber::web::serve(listener, socket, root, token)
@@ -1826,10 +1900,13 @@ Append a `- [x] Remote mosaic (2026-07-31) — …` entry matching the file's ex
 ```bash
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-cd app && npm run typecheck && npm test
+cd app && npm install && npm run typecheck && npm test
 ```
 
 The app suite must be untouched by this work — it is listed to prove that.
+`npm install` first: a fresh worktree has no `node_modules`, and a
+missing-module error there is a setup artefact, **not** a regression from this
+plan (which touches no TypeScript at all).
 
 - [ ] **Step 4: Commit**
 
