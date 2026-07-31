@@ -75,6 +75,7 @@ function main() {
   var $ = function (id) { return document.getElementById(id); };
   var viewList = $('view-list'), viewTerm = $('view-term');
   var listEl = $('list'), countEl = $('list-count'), bannerEl = $('banner');
+  var wsBarEl = $('ws-bar'), tabBarEl = $('tab-bar'), mosaicEl = $('mosaic');
   var screenEl = $('screen'), sizerEl = $('sizer'), stageEl = $('stage'), hostEl = $('host');
   var titleEl = $('term-title'), ctrlBtn = $('k-ctrl');
 
@@ -82,6 +83,9 @@ function main() {
   var attempt = 0;
   var reconnectTimer = 0;
   var sessions = [];
+  var layout = null;      // server-rendered mosaic, or null (fall back to the flat list)
+  var curWs = null;       // selected workspace id, null = follow the server's activeWorkspace
+  var curTab = null;      // selected tab id within curWs
   var open = null;        // session name currently open (survives reconnects)
   var freshBacklog = false; // next binary frame is the replayed scrollback
   var term = null;
@@ -113,9 +117,116 @@ function main() {
     bannerEl.hidden = false;
   }
 
-  /* ---------- session list ---------- */
+  /* ---------- session list / mosaic ---------- */
 
+  // Dispatcher: the flat list when the server has no sidecar (or it renders
+  // to no workspaces at all), the workspace/tab/tile mosaic otherwise.
   function renderList() {
+    if (!layout || !layout.workspaces || !layout.workspaces.length) {
+      wsBarEl.hidden = tabBarEl.hidden = mosaicEl.hidden = true;
+      listEl.hidden = false;
+      return renderFlatList();
+    }
+    listEl.hidden = true;
+    wsBarEl.hidden = tabBarEl.hidden = mosaicEl.hidden = false;
+
+    // Resolve the selection against what the server actually sent — the desktop
+    // can close the ws/tab we were looking at at any moment.
+    var wss = layout.workspaces;
+    var ws = wss.filter(function (w) { return w.ws === curWs; })[0];
+    if (!ws) ws = wss.filter(function (w) { return w.ws === layout.activeWorkspace; })[0] || wss[0];
+    curWs = ws.ws;
+    var tab = ws.tabs.filter(function (t) { return t.tab === curTab; })[0];
+    if (!tab) tab = ws.tabs.filter(function (t) { return t.tab === ws.activeTab; })[0] || ws.tabs[0];
+    curTab = tab.tab;
+
+    renderWsBar(wss, ws);
+    renderTabBar(ws, tab);
+    mosaicEl.textContent = '';
+    mosaicEl.appendChild(renderNode(tab.tree));
+  }
+
+  function pill(text, on, click) {
+    var b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'pill' + (on ? ' on' : '');
+    b.textContent = text;
+    b.addEventListener('click', click);
+    return b;
+  }
+
+  function renderWsBar(wss, cur) {
+    wsBarEl.textContent = '';
+    wss.forEach(function (w) {
+      wsBarEl.appendChild(pill(w.label || ('ws ' + w.ws), w.ws === cur.ws, function () {
+        curWs = w.ws; curTab = null; renderList();
+      }));
+    });
+  }
+
+  function renderTabBar(ws, cur) {
+    tabBarEl.textContent = '';
+    ws.tabs.forEach(function (t) {
+      tabBarEl.appendChild(pill(t.label || ('tab ' + t.tab), t.tab === cur.tab, function () {
+        curTab = t.tab; renderList();
+      }));
+    });
+  }
+
+  // The tree the server sent, drawn as nested flexbox at its real ratios.
+  function renderNode(n) {
+    if (!n) return document.createElement('div');
+    if (n.kind === 'leaf') return tile(n.paneId);
+    var box = document.createElement('div');
+    box.className = 'split ' + (n.dir === 'v' ? 'v' : 'h');
+    var a = renderNode(n.a), b = renderNode(n.b);
+    var r = Math.min(0.95, Math.max(0.05, n.ratio || 0.5));
+    a.style.flex = r; b.style.flex = 1 - r;
+    box.appendChild(a); box.appendChild(b);
+    return box;
+  }
+
+  function sessionByName(name) {
+    return sessions.filter(function (x) { return x.name === name; })[0] || null;
+  }
+
+  function tile(paneId) {
+    var s = sessionByName(paneId);
+    var el = document.createElement('button');
+    el.type = 'button';
+    el.className = 'tile' + (s && !s.alive ? ' dead' : '');
+    el.dataset.pane = paneId;
+    if (!s) { el.textContent = paneId; return el; }   // server/session race — next push fixes it
+
+    var head = document.createElement('span');
+    head.className = 'tile-head';
+    var slot = document.createElement('span');
+    slot.className = 'tile-slot';
+    slot.textContent = s.slot ? '#' + s.slot : '';
+    var dot = document.createElement('span');
+    dot.className = 'dot k-' + (s.kind || 'shell');
+    dot.title = s.kind || 'shell';
+    head.appendChild(slot);
+    head.appendChild(dot);
+
+    var title = document.createElement('span');
+    title.className = 'tile-title';
+    title.textContent = shortCwd(s.cwd);
+
+    var tag = document.createElement('span');
+    tag.className = 'tile-tag';
+    tag.textContent = !s.alive ? 'exited'
+      : (s.run_state && s.run_state !== 'claude') ? s.run_state
+      : (s.kind || 'shell');
+
+    el.appendChild(head);
+    el.appendChild(title);
+    el.appendChild(tag);
+    el.addEventListener('click', function () { openSession(paneId); });
+    return el;
+  }
+
+  function renderFlatList() {
     countEl.textContent = sessions.length ? sessions.length + ' session' + (sessions.length === 1 ? '' : 's') : '';
     listEl.textContent = '';
     if (!sessions.length) {
@@ -317,7 +428,7 @@ function main() {
       }
       var msg;
       try { msg = JSON.parse(ev.data); } catch (e) { return; }
-      if (msg.t === 'sessions') { sessions = msg.sessions || []; renderList(); syncGeom(); }
+      if (msg.t === 'sessions') { sessions = msg.sessions || []; layout = msg.layout || null; renderList(); syncGeom(); }
       else if (msg.t === 'exit') {
         if (msg.name === open && term) term.write('\r\n\x1b[33m[session exited: ' + msg.code + ']\x1b[0m\r\n');
       } else if (msg.t === 'error') banner(msg.msg || 'error', 'error');
@@ -504,7 +615,13 @@ function main() {
       banner('Not signed in — open the link from the QR code.', 'error');
       return;
     }
-    if (r.ok) { try { sessions = await r.json(); } catch (e) {} }
+    if (r.ok) {
+      try {
+        var d = await r.json();
+        sessions = (d && d.sessions) || [];
+        layout = (d && d.layout) || null;
+      } catch (e) {}
+    }
     renderList();
     connect();
   })();
