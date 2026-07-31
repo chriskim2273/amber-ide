@@ -23,7 +23,10 @@ describe('proto', () => {
   })
 
   it('encodes control JSON externally-tagged to match serde', () => {
-    // Attach{name} -> {"Attach":{"name":"a"}}; body = [tag=0][json]
+    // Attach{name} -> {"Attach":{"name":"a"}}; body = [tag=0][json]. The app
+    // never sets `raw_client` or `preview` (mosaic-tile attach, spec
+    // 2026-08-01), so both are omitted and the daemon's `#[serde(default)]`
+    // decodes the absence as false for each.
     const f: Frame = { type: 'control', msg: { kind: 'Attach', name: 'a' } }
     const wire = encode(f)
     const bodyLen = new DataView(wire.buffer).getUint32(0, false)

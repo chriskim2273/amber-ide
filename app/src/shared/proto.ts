@@ -84,6 +84,10 @@ function msgToJson(m: ControlMsg): unknown {
     case 'Create':
       return { Create: { name: m.name, cwd: m.cwd, kind: m.sessionKind } }
     case 'Attach':
+      // `preview` (mosaic tile attach, spec 2026-08-01), like `raw_client`
+      // above it, is never set by the Electron app — it always wants the
+      // full backlog — so it is simply omitted; the daemon's
+      // `#[serde(default)]` decodes the absence as `false`.
       return { Attach: { name: m.name } }
     case 'Detach':
       return { Detach: { name: m.name } }

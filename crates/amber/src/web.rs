@@ -266,7 +266,7 @@ pub fn map_browser_msg(
                     out.push(ControlMsg::Detach { name: prev.to_string() });
                 }
             }
-            out.push(ControlMsg::Attach { name: name.clone(), raw_client: false });
+            out.push(ControlMsg::Attach { name: name.clone(), raw_client: false, preview: false });
             out
         }
         BrowserMsg::Close { name } => {
@@ -774,7 +774,7 @@ fn run_daemon_link(hub: Arc<Hub>) {
                     for name in reattach {
                         Hub::write_daemon(
                             &mut inner,
-                            &Frame::Control(ControlMsg::Attach { name, raw_client: false }),
+                            &Frame::Control(ControlMsg::Attach { name, raw_client: false, preview: false }),
                         );
                     }
                 }
@@ -1196,20 +1196,20 @@ mod tests {
         // open with nothing open -> just Attach.
         assert_eq!(
             map_browser_msg(&BrowserMsg::Open { name: "s".into() }, None, &live),
-            vec![ControlMsg::Attach { name: "s".into(), raw_client: false }]
+            vec![ControlMsg::Attach { name: "s".into(), raw_client: false, preview: false }]
         );
         // open while another is open -> switch (Detach old, Attach new).
         assert_eq!(
             map_browser_msg(&BrowserMsg::Open { name: "t".into() }, Some("s"), &live),
             vec![
                 ControlMsg::Detach { name: "s".into() },
-                ControlMsg::Attach { name: "t".into(), raw_client: false },
+                ControlMsg::Attach { name: "t".into(), raw_client: false, preview: false },
             ]
         );
         // re-open the same session -> no churn.
         assert_eq!(
             map_browser_msg(&BrowserMsg::Open { name: "s".into() }, Some("s"), &live),
-            vec![ControlMsg::Attach { name: "s".into(), raw_client: false }]
+            vec![ControlMsg::Attach { name: "s".into(), raw_client: false, preview: false }]
         );
         // close -> Detach.
         assert_eq!(

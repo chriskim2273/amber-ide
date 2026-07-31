@@ -155,6 +155,23 @@ impl Ring {
     pub fn written(&self) -> u64 {
         self.written
     }
+
+    /// The last `n` bytes, trimmed forward to just after the first `\n` in the
+    /// cut window so a preview never begins mid-escape-sequence. If the ring
+    /// holds `n` bytes or fewer, everything is returned untrimmed — there was
+    /// no arbitrary cut, so nothing to protect against. If a cut window
+    /// contains no `\n`, it is returned unchanged rather than as nothing.
+    pub fn tail(&self, n: usize) -> Vec<u8> {
+        let all = self.snapshot();
+        if all.len() <= n {
+            return all;
+        }
+        let window = &all[all.len() - n..];
+        match window.iter().position(|&b| b == b'\n') {
+            Some(i) => window[i + 1..].to_vec(),
+            None => window.to_vec(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -308,6 +325,76 @@ mod tests {
         assert_eq!(r.written(), 8);
         r.push(b"");
         assert_eq!(r.written(), 8, "an empty push is not a change");
+    }
+
+    #[test]
+    fn tail_of_empty_ring_is_empty() {
+        let r = Ring::new(16);
+        assert_eq!(r.tail(8), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn tail_of_zero_is_empty() {
+        let mut r = Ring::new(16);
+        r.push(b"hello");
+        assert_eq!(r.tail(0), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn tail_returns_everything_untrimmed_when_ring_holds_n_or_fewer_bytes() {
+        let mut r = Ring::new(16);
+        r.push(b"hi\nthere"); // 8 bytes, contains a \n, must NOT be trimmed
+        assert_eq!(r.tail(8), b"hi\nthere");
+        assert_eq!(r.tail(100), b"hi\nthere");
+    }
+
+    #[test]
+    fn tail_trims_forward_to_after_the_first_newline_in_the_cut_window() {
+        let mut r = Ring::new(64);
+        r.push(b"abcd\nefghij"); // 11 bytes total
+        // tail(8) window = last 8 bytes = "d\nefghij"; the \n sits at window
+        // index 1 (not index 0), so this also proves the trim is forward-from
+        // -the-newline, not just "drop the first byte".
+        assert_eq!(r.tail(8), b"efghij");
+    }
+
+    #[test]
+    fn tail_returns_the_last_n_bytes() {
+        let mut r = Ring::new(64);
+        r.push(b"0123456789");
+        assert_eq!(r.tail(4), b"6789");
+    }
+
+    #[test]
+    fn tail_with_no_newline_in_window_returns_window_unchanged() {
+        let mut r = Ring::new(64);
+        r.push(b"xxxxxxxxxx"); // no newlines anywhere
+        assert_eq!(r.tail(4), b"xxxx");
+    }
+
+    #[test]
+    fn tail_works_after_the_ring_has_wrapped() {
+        // The case a naive slice on the raw (unlinearised) buffer gets wrong.
+        let cap = 8;
+        let mut r = Ring::new(cap);
+        r.push(b"abcdefgh"); // exactly full, head back at 0
+        r.push(b"ijk"); // wraps: overwrites a,b,c -> ring is "defghijk"
+        assert_eq!(r.snapshot(), b"defghijk");
+        // tail(4) of "defghijk" = "hijk", no \n -> unchanged
+        assert_eq!(r.tail(4), b"hijk");
+        // full ring (8 bytes) requested with n=8 -> untrimmed passthrough
+        assert_eq!(r.tail(8), b"defghijk");
+    }
+
+    #[test]
+    fn tail_trim_after_wrap_with_newline_in_window() {
+        let cap = 8;
+        let mut r = Ring::new(cap);
+        r.push(b"ab\ncdefg"); // fills to cap, head at 0
+        r.push(b"hij"); // wraps: overwrites a,b,\n -> ring is "cdefghij"
+        assert_eq!(r.snapshot(), b"cdefghij");
+        // no newline left in the ring at all now
+        assert_eq!(r.tail(5), b"fghij");
     }
 
     #[test]

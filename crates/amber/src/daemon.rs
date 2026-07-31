@@ -288,7 +288,7 @@ fn handle_control(
             let names = manager.names();
             let _ = write_frame(writer, &Frame::Control(ControlMsg::SessionList { names }));
         }
-        ControlMsg::Attach { name, raw_client } => {
+        ControlMsg::Attach { name, raw_client, preview: _preview } => {
             let Some(sess) = manager.session(&name) else {
                 let _ = write_frame(
                     writer,
