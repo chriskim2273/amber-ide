@@ -34,13 +34,25 @@ suite was not run — this plan touches zero TypeScript. See the CLAUDE.md
   menu, the `+ pane` pill, the pending tile) is built dynamically in JS like
   the existing ones.
 - Five findings from Task 2's review were parked under a user directive to
-  defer to a single end-of-plan review wave; that wave did not happen within
-  this plan's scope, so they remain open. Listed in full in the CLAUDE.md
-  entry (two "Important": the untested `dir`/`ratio` append/serialize keys,
-  and `parse_pane_name` accepting a leading `+` that the JS regex rejects;
-  three "Minor": `activeTab` defaulting to `0` for a sidecar-absent workspace,
-  lexicographic vs. numeric append ordering, and unproven `sort_by_key`
-  stability reliance).
+  defer to a single end-of-plan review wave. **That wave ran** (whole-branch
+  review, 2026-07-31) and closed the two "Important" ones — the untested
+  `dir`/`ratio` append/serialize keys, and `parse_pane_name` accepting a
+  leading `+` that the JS regex rejects (reachable from the browser via
+  `{"t":"create"}`, i.e. on the security boundary §7.3 describes). It also
+  found what no per-task review could: `frozen` was parsed, tested, and then
+  never emitted or rendered, so §4.1's "a state dot ... `frozen` for shells"
+  and §6.1's "The mosaic **shows** it" were unimplemented — `render()` now
+  emits `frozen` as **names only** (a note is arbitrary user text, the same
+  argument that keeps `recentFiles` off the wire) and a frozen tile carries a
+  marker while staying tappable. Plus four one-liners: the `Sessions` arm
+  pushed a layout rendered against the previous session set; `inner.layout`
+  survived daemon loss; and a same-tab "move" made `manager::rename` kill and
+  respawn a live agent for zero layout change. **Still open, both cosmetic:**
+  `activeTab` defaulting to `0` for a sidecar-absent workspace, and
+  lexicographic vs. numeric append ordering. (The third parked Minor,
+  "unproven `sort_by_key` stability", was closed as a non-issue — it is
+  documented stable, and the numeric-sort-then-stable-re-sort reproduces
+  `orderTabs` exactly.)
 
 **Live-verified** (isolated private daemon + private `amber web`, playwright):
 pruning + split-collapse, the §2.4 append at `dir:"h"`/`ratio:0.66`,
