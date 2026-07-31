@@ -314,7 +314,30 @@ subtrees, so it could take the parentage-only `process_table_lite()` and then re
 `smaps_rollup` for just those pids. Not fixed here (it is the monitor's own cost,
 not a leak, and it belongs with a monitor-cadence review).
 
-### 10. Not measured
+### 10. Every reconnect appends a duplicate backlog into every live terminal
+
+Observed during this pass's live verification (not previously written down).
+`Connection`'s `open` handler calls `router.reattachAll()`, and the daemon
+replays the **full** scrollback on every `Attach`. On a daemon reconnect the
+`Pane` does *not* unmount — its `Terminal` is deliberately preserved — so the
+replayed backlog is appended to a buffer that already contains those bytes.
+
+Visible in the verification screenshot: after one daemon restart, `MARKER_ALPHA`
+and `MARKER_BETA_AFTER_REATTACH` each appear twice.
+
+Pre-existing, not a regression from these fixes (`Pane.tsx`'s `rearmRef` comment
+already notes "the daemon replays a fresh backlog on every re-Attach"). It is
+listed here because it is memory-relevant, not just cosmetic: each reconnect
+grows every live terminal's buffer by up to a full 2 MiB backlog until xterm's
+own scrollback limit evicts it, so a flappy daemon inflates renderer memory in
+steps.
+
+The honest fix is for the app to clear the terminal before replaying a
+re-Attach backlog (it already knows a re-Attach is happening — that is exactly
+what `rearmRef` tracks). Not done here: it changes what the user sees on
+reconnect, and belongs with the `MOUSE_RESET` logic it would sit next to.
+
+### 11. Not measured
 
 - **Per-`Terminal` renderer footprint.** Keep-alive keeps every visited tab's
   panes mounted within the active workspace (`main.tsx:988-1044`,
@@ -325,6 +348,29 @@ not a leak, and it belongs with a monitor-cadence review).
 - **CodeMirror undo history** per editor pane. Bounded by CM6's history depth but
   proportional to edit volume on files up to the 8 MiB cap. Not observed to be a
   problem.
+
+## Live verification (GUI, this box)
+
+Driven headless (xvfb + CDP) against an **isolated** private daemon (private
+`XDG_RUNTIME_DIR`/`XDG_STATE_HOME` + private `--user-data-dir`), so the user's
+real daemon and its 19 live sessions were never touched.
+
+The detach wiring is the risky part of this pass — a mistake there kills panes —
+so it was exercised end to end:
+
+- two panes created, typed into, output echoed back (`MARKER_ALPHA`);
+- **workspace switch away and back**, which unmounts every pane and is therefore
+  the gesture that now fires `Detach`: panes came back with their scrollback
+  intact and still accepted input (`MARKER_BETA_AFTER_REATTACH`);
+- pane closed via the kill dialog: pruned cleanly, no error banner;
+- **daemon restarted** under the running app: the disconnected banner appeared
+  and then cleared, the pane restored, input still reached the pty
+  (`MARKER_GAMMA_AFTER_DAEMON_RESTART`), and **no daemon-error banner appeared**
+  at any point.
+
+Not provable from the GUI: that the client's port map is actually empty after a
+detach (it has no observable surface from the renderer). That property is pinned
+by the `Router` unit tests instead — `attachedCount()` exists for exactly that.
 
 ## Things checked and found clean
 

@@ -672,6 +672,59 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   jpeg/gif/webp but extraction only tries png then bmp, so a JPEG-only clipboard
   still silently fails.
 
+- [x] Memory audit (2026-07-31) — full-repo leak + allocation audit across the
+  daemon/CLI and the app (main, client utilityProcess, renderer). Report:
+  `docs/superpowers/specs/2026-07-31-memory-audit.md` (every finding classified
+  unbounded-growth / bounded-overshoot / churn, with what was deliberately NOT
+  changed and why). Baseline measured on the live box: daemon 106 MB RSS at 19
+  sessions, cgroup `memory.current` 15.65 GB — of which ~7 GB is claude children,
+  so **the child processes remain the uncontrolled memory**, as the 2026-07-17
+  monitor design said. **Two real leaks, both app-side:** `Router.detach()` had
+  ZERO callers, so the client's port map grew for the app's whole life (session
+  names are never reused), every entry pinned a live `MessagePortMain`, and
+  `reattachAll()` re-`Attach`ed long-dead names on every reconnect — each drawing
+  a daemon `Error: no such session` into the red banner — while the daemon kept
+  streaming closed panes into portless channels. Wired the close path (Pane
+  unmount → preload → main → client → `detach`, which now closes the port);
+  `attach` also closes a port it supersedes (one leaked per re-acquire). **Ring
+  was not a ring:** a `Vec` + `drain(..overflow)`, so every push at cap memmoved
+  the whole ~2 MiB — a cost fixed at ~cap regardless of push size, so worst for
+  the trickling panes the daemon spends its life on (measured 256 B pushes:
+  49 µs → 0.035 µs, **1498×**; 256 KiB: 11×). It also retained exactly **2.00×**
+  cap, which is ~2 MB/session of heap ADDRESS SPACE (`VmData` 148→125 MB at 12
+  full rings) — **not** RSS, which moved only ~130 KB/session; an early draft
+  claimed RSS and was wrong, and the end-to-end measurement is what caught it.
+  Now a true circular buffer (geometric growth `reserve_exact`-clamped to cap, so
+  an idle pane still costs nothing, then in-place wrapping). **The snapshot timer
+  rewrote every scrollback file every 10 s regardless of change** — 36 MiB cloned
+  + 36 MiB written per tick (~3.6 MB/s forever) for idle panes; `Ring::written()`
+  now gates it (bytes on disk byte-identical, so reboot survival untouched;
+  counter recorded only on a successful write, so a failure retries). Verified
+  live: 12/12 files rewritten per idle tick → **0/12**. **App frame decoding was
+  O(n²):** `Decoder.feed` reallocated the whole buffer per socket chunk —
+  instrumented at **36.70 MB copied to receive one 2.00 MB frame (17.5×)**, on
+  the path every pane's output takes; a read cursor + compaction gives 5.94 MB
+  (2.97×). Tests pin the two ways that fix could become a different bug (consumed
+  bytes must really be reclaimed; the payload must still be COPIED out, never a
+  view onto a buffer compaction rewrites). Gates: Rust **261** tests ×2 + clippy
+  clean, app **404** tests + typecheck + bundle. **Live-verified** headless
+  (xvfb+CDP) against an isolated private daemon — the detach wiring is the risky
+  part, so: workspace switch away/back (the gesture that unmounts panes and fires
+  `Detach`) restored panes with scrollback and input intact, pane kill pruned
+  cleanly, and a daemon restart under the running app reconnected with **no error
+  banner**. Deliberately NOT changed (see the report): the `Backlog` JSON
+  numeric-array encoding (~8 MB of text per 2 MiB dump, but a two-language wire
+  change fired only on a user gesture); `deliver_chunk`'s per-subscriber copy
+  (the common case is ONE subscriber, and it sits on the backpressure invariants);
+  the renderer re-render storm from `Activity`+`MemoryStat` (~45 full-tree renders
+  /s at 19 sessions — a React architecture change, its own slice); and xterm
+  scrollback depth / background-terminal eviction, which trade the app's defining
+  keep-alive behaviour for RSS and so are a question for the user, not a
+  unilateral change. Also newly recorded (pre-existing, not a regression): every
+  reconnect replays a full backlog into a terminal that already has it, so a
+  flappy daemon inflates renderer memory in 2 MiB steps per pane.
+  **A running daemon must be restarted to pick up the ring + snapshot changes.**
+
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**
   `std::io::Read` (dedicated thread); `take_writer()` is one-shot;
