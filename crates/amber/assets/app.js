@@ -445,10 +445,18 @@ function main() {
     if (!w || !h) return;
     stageEl.style.width = w + 'px';
     stageEl.style.height = h + 'px';
-    var scale = (screenEl.clientWidth / w) * zoom;
+    // Fit-to-width SHRINKS a grid too wide for the screen; it must never
+    // MAGNIFY one that already fits. This started as a phone-only client, where
+    // fit-width is always < 1 and the clamp is invisible. On a laptop it
+    // inverts: an 80-col session is ~640px natural against a 1440px viewport,
+    // so the old unclamped `clientWidth / w` blew it up 2.25x and the text came
+    // out huge. Cap the baseline at 1 = natural cell size; `zoom` is still the
+    // user's override in both directions.
+    var scale = Math.min(screenEl.clientWidth / w, 1) * zoom;
     stageEl.style.transform = 'scale(' + scale + ')';
     sizerEl.style.width = w * scale + 'px';
     sizerEl.style.height = h * scale + 'px';
+    // Centring is already handled by `#sizer { margin: auto }` in style.css.
   }
 
   function setZoom(z) {
