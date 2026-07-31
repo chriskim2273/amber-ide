@@ -814,24 +814,34 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   available in the private instance; Rust-tested only (the suspend/resume
   control-message construction and the `is_agent` gate). **A running `amber
   web` must be restarted to serve the mosaic** (old code still returns the
-  bare array). **Still open, parked during the single-review-wave pass and not
-  yet revisited:** `append_leaf`'s `dir:"h"`/`ratio:0.66` and `node_json`'s
-  `dir`/`ratio` keys were asserted only against the deserialized `Node`, not
-  the emitted JSON, so deleting them left every test green while the mosaic
-  silently degraded to `app.js`'s fallback (`n.dir === 'v' ? 'v' : 'h'`,
-  `n.ratio || 0.5` — always-horizontal 50/50, a geometry divergence from the
-  desktop, not a renderer break) — fixed in the 2026-07-31 fix wave, both
-  tests now assert `dir`/`ratio` on the emitted JSON directly; `activeTab` is
-  emitted as `0` for a workspace absent from the sidecar even though tabs are
-  1-based (observed live: the front end fell through to the first tab rather
-  than a real active one); sidecar-unknown panes append in lexicographic
-  rather than numeric ord order (`ord>=10` sorts wrong). Also fixed in that
-  pass: `parse_pane_name` accepted a leading `+` on numeric fields
-  (`str::parse::<u32>` strips it) where the JS `^amber-(\d+)-…` regex does
-  not — reachable not just via `amber create "amber-+1-2-3-ab"` on the CLI
-  but from the browser via `{"t":"create"}`, the actual security-boundary
-  path this function guards (`Create.name`/`Rename.to` validation in
-  `web.rs`); now rejected by a digits-only `num()` helper.
+  bare array). **Still open (two, both cosmetic):** `activeTab` is emitted as
+  `0` for a workspace absent from the sidecar even though tabs are 1-based
+  (observed live: the front end falls through to the first tab rather than a
+  real active one); and sidecar-unknown panes append in lexicographic rather
+  than numeric ord order, so `ord>=10` sorts wrong. **Closed by the
+  whole-branch review's fix wave** (the review caught what the per-task ones
+  structurally could not): `frozen` was parsed, tested and then never emitted
+  or rendered, leaving spec §4.1/§6.1 asserting a state dot that did not
+  exist — `render()` now emits `frozen` as **names only** (a note is arbitrary
+  user text, same argument as `recentFiles`) and a frozen tile carries a
+  marker while staying tappable; `parse_pane_name` accepted a leading `+` on
+  numeric fields (`str::parse::<u32>` strips it) where the JS
+  `^amber-(\d+)-…` regex does not — reachable not just via `amber create
+  "amber-+1-2-3-ab"` on the CLI but from the browser via `{"t":"create"}`,
+  the actual security-boundary path this function guards
+  (`Create.name`/`Rename.to` validation in `web.rs`), now rejected by a
+  digits-only `num()` helper; `append_leaf`'s `dir:"h"`/`ratio:0.66` and
+  `node_json`'s `dir`/`ratio` keys were asserted only against the
+  deserialized `Node`, never the emitted JSON, so deleting them left every
+  test green while the mosaic silently degraded to `app.js`'s fallback
+  (`n.dir === 'v' ? 'v' : 'h'`, `n.ratio || 0.5` — always-horizontal 50/50, a
+  geometry divergence from the desktop, not a renderer break); `on_frame`'s
+  `Sessions` arm pushed a layout rendered against the PREVIOUS session set,
+  so the phone showed the flat list for ~1 s at every connect; `inner.layout`
+  survived daemon loss, so a page loaded in that window got a stale mosaic
+  against an empty session list; and a "move to tab N" while already on tab N
+  passed server validation and made `manager::rename` kill and respawn a live
+  agent for zero layout change.
 
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**
