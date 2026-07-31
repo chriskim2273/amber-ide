@@ -62,6 +62,8 @@ use std::time::{Duration, Instant};
 
 use amber_core::proto::{self, ControlMsg, Decoder, Frame, SessionInfo};
 
+use crate::mosaic;
+
 // ---- constant-time comparison ------------------------------------------
 
 /// Compare two secrets without an early-exit data dependency on their
@@ -425,12 +427,16 @@ struct HubInner {
     /// Write half of the single daemon connection; `None` while unreachable.
     daemon: Option<UnixStream>,
     sessions: Vec<SessionInfo>,
+    file: mosaic::LayoutFile,
+    layout: String,
+    layout_dirty: bool,
     clients: Vec<Client>,
 }
 
 /// The single daemon connection, multiplexed across every browser client.
 pub struct Hub {
     socket: PathBuf,
+    root: PathBuf,
     inner: Mutex<HubInner>,
     next_id: AtomicU64,
 }
@@ -446,30 +452,52 @@ fn session_json(s: &SessionInfo) -> serde_json::Value {
         // resizes (spec §4) — a guess would corrupt an alt-screen claude TUI.
         "cols": s.cols,
         "rows": s.rows,
+        "slot": s.slot,
     })
 }
 
 impl Hub {
-    fn new(socket: PathBuf) -> Arc<Self> {
+    fn new(socket: PathBuf, root: PathBuf) -> Arc<Self> {
         Arc::new(Hub {
             socket,
-            inner: Mutex::new(HubInner { daemon: None, sessions: Vec::new(), clients: Vec::new() }),
+            root,
+            inner: Mutex::new(HubInner {
+                daemon: None,
+                sessions: Vec::new(),
+                file: mosaic::LayoutFile::default(),
+                layout: String::new(),
+                layout_dirty: false,
+                clients: Vec::new(),
+            }),
             next_id: AtomicU64::new(0),
         })
     }
 
-    /// JSON array for `GET /api/sessions`.
+    /// JSON body for `GET /api/sessions`: `{"sessions":[…],"layout":{…}}`.
     fn sessions_json(&self) -> String {
         let inner = self.inner.lock().unwrap();
-        let list: Vec<_> = inner.sessions.iter().map(session_json).collect();
-        serde_json::to_string(&list).unwrap_or_else(|_| "[]".into())
+        Self::payload(&inner.sessions, &inner.layout)
     }
 
-    fn sessions_msg(sessions: &[SessionInfo]) -> Out {
+    fn payload(sessions: &[SessionInfo], layout: &str) -> String {
         let list: Vec<_> = sessions.iter().map(session_json).collect();
+        let layout: serde_json::Value =
+            serde_json::from_str(layout).unwrap_or(serde_json::Value::Null);
+        serde_json::to_string(&serde_json::json!({ "sessions": list, "layout": layout }))
+            .unwrap_or_else(|_| r#"{"sessions":[],"layout":null}"#.into())
+    }
+
+    fn sessions_msg(sessions: &[SessionInfo], layout: &str) -> Out {
+        let list: Vec<_> = sessions.iter().map(session_json).collect();
+        let layout: serde_json::Value =
+            serde_json::from_str(layout).unwrap_or(serde_json::Value::Null);
         Out::Text(Arc::new(
-            serde_json::json!({ "t": "sessions", "sessions": list }).to_string(),
+            serde_json::json!({ "t": "sessions", "sessions": list, "layout": layout }).to_string(),
         ))
+    }
+
+    fn render_layout(file: &mosaic::LayoutFile, sessions: &[SessionInfo]) -> String {
+        serde_json::to_string(&mosaic::render(file, sessions)).unwrap_or_else(|_| "null".into())
     }
 
     fn error_msg(msg: &str) -> Out {
@@ -483,7 +511,7 @@ impl Hub {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = sync_channel(CLIENT_QUEUE_DEPTH);
         let mut inner = self.inner.lock().unwrap();
-        let _ = tx.try_send(Self::sessions_msg(&inner.sessions));
+        let _ = tx.try_send(Self::sessions_msg(&inner.sessions, &inner.layout));
         if inner.daemon.is_none() {
             let _ = tx.try_send(Self::error_msg("daemon unreachable"));
         }
@@ -599,12 +627,15 @@ impl Hub {
             }
             Frame::Control(ControlMsg::Sessions { sessions }) => {
                 // Unchanged is the common case for the geometry poll — don't
-                // churn every browser with an identical push.
-                if inner.sessions == sessions {
+                // churn every browser with an identical push, UNLESS the
+                // sidecar changed underneath us (layout_dirty), since the
+                // mosaic depends on the session set even when it's identical.
+                if inner.sessions == sessions && !inner.layout_dirty {
                     return;
                 }
+                inner.layout_dirty = false;
                 inner.sessions = sessions;
-                let msg = Self::sessions_msg(&inner.sessions);
+                let msg = Self::sessions_msg(&inner.sessions, &inner.layout);
                 Self::queue(&mut inner, |_| true, msg);
             }
             Frame::Control(ControlMsg::SessionsChanged { added, removed }) => {
@@ -612,7 +643,8 @@ impl Hub {
                     !removed.contains(&s.name) && !added.iter().any(|a| a.name == s.name)
                 });
                 inner.sessions.extend(added);
-                let msg = Self::sessions_msg(&inner.sessions);
+                inner.layout = Self::render_layout(&inner.file, &inner.sessions);
+                let msg = Self::sessions_msg(&inner.sessions, &inner.layout);
                 Self::queue(&mut inner, |_| true, msg);
             }
             Frame::Control(ControlMsg::Exit { name, code }) => {
@@ -683,7 +715,10 @@ fn run_daemon_link(hub: Arc<Hub>) {
                 let mut inner = hub.inner.lock().unwrap();
                 inner.daemon = None;
                 inner.sessions.clear();
-                let sessions = Hub::sessions_msg(&[]);
+                // An empty session list with a stale non-empty layout would be
+                // incoherent (every leaf it names is now unreachable); "" here
+                // renders as `"layout":null`, matching the empty session list.
+                let sessions = Hub::sessions_msg(&[], "");
                 Hub::queue(&mut inner, |_| true, sessions);
                 let err = Hub::error_msg("daemon unreachable");
                 Hub::queue(&mut inner, |_| true, err);
@@ -708,9 +743,16 @@ pub fn bind(port: u16) -> std::io::Result<TcpListener> {
 }
 
 /// Serve until the listener errors. `daemon_socket` is the amber daemon's unix
-/// socket; `token` is the shared secret from `<state>/web-token`.
-pub fn serve(listener: TcpListener, daemon_socket: PathBuf, token: String) -> anyhow::Result<()> {
-    let hub = Hub::new(daemon_socket);
+/// socket; `root` is the state root the app's `ui-layout.json` sidecar lives
+/// in (read-only, polled — never written here); `token` is the shared secret
+/// from `<state>/web-token`.
+pub fn serve(
+    listener: TcpListener,
+    daemon_socket: PathBuf,
+    root: PathBuf,
+    token: String,
+) -> anyhow::Result<()> {
+    let hub = Hub::new(daemon_socket, root);
     {
         let hub = Arc::clone(&hub);
         thread::spawn(move || run_daemon_link(hub));
@@ -720,14 +762,24 @@ pub fn serve(listener: TcpListener, daemon_socket: PathBuf, token: String) -> an
     // the desktop app broadcasts NO SessionsChanged, so the cache would go
     // stale and the phone would paint an alt-screen TUI onto the wrong grid.
     // A 1 s `ListSessionsDetailed` (one tiny control frame) refreshes it; the
-    // reply only reaches browsers when the set actually changed.
+    // reply only reaches browsers when the set actually changed. The same tick
+    // also re-reads the `ui-layout.json` sidecar — file IO happens ONLY here,
+    // never on the shared daemon read thread (`on_frame`), which just re-renders
+    // the cached `LayoutFile` when the session set changes.
     // ponytail: polling here, not a new daemon broadcast — a divider drag emits
     // resizes far faster than the bounded watcher queue should carry.
     {
         let hub = Arc::clone(&hub);
         thread::spawn(move || loop {
             thread::sleep(GEOMETRY_POLL);
+            let file = mosaic::load(&hub.root);
             let mut inner = hub.inner.lock().unwrap();
+            let rendered = Hub::render_layout(&file, &inner.sessions);
+            if rendered != inner.layout {
+                inner.layout = rendered;
+                inner.layout_dirty = true;
+            }
+            inner.file = file;
             if inner.daemon.is_some() {
                 Hub::write_daemon(&mut inner, &Frame::Control(ControlMsg::ListSessionsDetailed));
             }

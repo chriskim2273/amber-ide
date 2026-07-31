@@ -521,7 +521,7 @@ fn run_web(
         eprintln!("amber web: run `amber web --print-url` in a terminal for the login URL");
     }
     eprintln!("amber web: expose it to your tailnet with: tailscale serve --bg {port}");
-    amber::web::serve(listener, socket, token)
+    amber::web::serve(listener, socket, root, token)
 }
 
 fn run_daemon(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Result<()> {
