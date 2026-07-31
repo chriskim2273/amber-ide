@@ -33,7 +33,9 @@ describe('Router', () => {
     expect(conn.sent.filter((f) => f.type === 'control' && f.msg.kind === 'Attach')).toHaveLength(2)
 
     conn.emit({ type: 'data', session: 'sA', bytes: new Uint8Array([1, 2, 3]) })
-    expect(portA.posted).toEqual([{ data: new Uint8Array([1, 2, 3]) }])
+    // First frame after an Attach is the daemon's scrollback replay, so it
+    // carries the backlog tag (see the dedicated tests below).
+    expect(portA.posted).toEqual([{ data: new Uint8Array([1, 2, 3]), backlog: true }])
     expect(portB.posted).toEqual([])
   })
 
@@ -117,7 +119,45 @@ describe('Router', () => {
     expect(router.attachedCount()).toBe(1)
     conn.emit({ type: 'data', session: 's', bytes: new Uint8Array([7]) })
     expect(first.posted).toEqual([])
-    expect(second.posted).toEqual([{ data: new Uint8Array([7]) }])
+    expect(second.posted).toEqual([{ data: new Uint8Array([7]), backlog: true }])
+  })
+
+  it('tags only the first data frame after an Attach as the backlog', () => {
+    // The daemon replays the whole scrollback as ONE Data frame in reply to
+    // Attach, before any live output. The renderer must clear before a RE-attach
+    // replay (or history duplicates) but must never clear on live output (that
+    // wipes the pane — observed live when the renderer tried to infer it).
+    const conn = new FakeConn()
+    const router = new Router(conn)
+    const port = new FakePort()
+    router.attach('s', port)
+
+    conn.emit({ type: 'data', session: 's', bytes: new Uint8Array([1]) })
+    conn.emit({ type: 'data', session: 's', bytes: new Uint8Array([2]) })
+    expect(port.posted).toEqual([
+      { data: new Uint8Array([1]), backlog: true },
+      { data: new Uint8Array([2]) },
+    ])
+  })
+
+  it('re-arms the backlog tag on every reattachAll', () => {
+    // A reconnect re-Attaches, so a fresh replay follows and must be tagged
+    // again — this is the path where a missed tag duplicated history.
+    const conn = new FakeConn()
+    const router = new Router(conn)
+    const port = new FakePort()
+    router.attach('s', port)
+    conn.emit({ type: 'data', session: 's', bytes: new Uint8Array([1]) })
+    conn.emit({ type: 'data', session: 's', bytes: new Uint8Array([2]) })
+    port.posted.length = 0
+
+    router.reattachAll()
+    conn.emit({ type: 'data', session: 's', bytes: new Uint8Array([3]) })
+    conn.emit({ type: 'data', session: 's', bytes: new Uint8Array([4]) })
+    expect(port.posted).toEqual([
+      { data: new Uint8Array([3]), backlog: true },
+      { data: new Uint8Array([4]) },
+    ])
   })
 
   it('detaching an unknown session is a no-op', () => {

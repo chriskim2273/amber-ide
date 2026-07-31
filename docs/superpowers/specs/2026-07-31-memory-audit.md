@@ -1,8 +1,9 @@
 # Memory Audit — daemon + app
 
 **Date:** 2026-07-31
-**Status:** audit complete; findings 1, 2, 2b, 3, 4 fixed in this pass, 5–10
-reported only
+**Status:** audit complete. Findings 1, 2, 2b, 3, 4 fixed in the first pass;
+5, 7 and 10 fixed in a follow-up the user asked for. 6, 8, 9 and the per-Terminal
+footprint are reported only — the reasons are recorded with each.
 
 **Result of the fixes, measured end-to-end** (12 sessions, every ring driven to
 its 2 MiB cap, isolated daemon, old binary vs new):
@@ -240,7 +241,7 @@ still persisted on the next tick.
 
 ## C — churn and architecture (reported, not changed)
 
-### 5. `Backlog` encodes `Vec<u8>` as a JSON numeric array
+### 5. `Backlog` encoded `Vec<u8>` as a JSON numeric array — FIXED
 
 `ControlMsg::Backlog { name, data: Vec<u8> }` (`proto.rs:111`) is serde-JSON, so
 a 2 MiB scrollback serialises to a JSON array of ~2 million decimal numbers —
@@ -248,9 +249,21 @@ roughly **8 MB of text**, built with `serde_json::to_vec` on the daemon and
 parsed into a 2-million-element JS array before `Uint8Array.from` on the client
 (`proto.ts`, `case 'Backlog'`). Per pane, per workspace save.
 
-Not fixed: it is the wire format in two languages, and it fires only on an
-explicit user gesture. If it becomes a problem, the fix is a dedicated binary
-tag (like `Data`) rather than base64 — `Data` already proves the pattern.
+Fixed on the user's call: a dedicated binary frame tag (2), same body layout as
+`Data` and distinct from it because a dump is a *reply* and must never be written
+into the pane. The client→renderer hop keeps the old message shape — it is a
+MessagePort, so structured clone, no serialisation either way.
+`ControlMsg::Backlog` is retained as a DECODE path so a new client still
+understands an older daemon.
+
+Two things the tests caught and that were fixed rather than worked around: the
+connection test used tag 2 as its "unknown tag" (now a real frame), and the TS
+decoder did not bounds-check a truncated data frame the way Rust does — with the
+new reused read buffer, a corrupt length prefix would read past the frame and
+yield a garbage session name instead of an error.
+
+Verified live end to end: `dumpBacklog` from the renderer returned a real
+`Uint8Array` with the right session name.
 
 ### 6. Every `Data` frame is copied twice more than it needs to be
 
@@ -268,7 +281,7 @@ get right (`slow_subscriber_backpressures_producer`,
 `stalled_subscriber_does_not_freeze_healthy_subscriber`, `wedged_client.rs`).
 Worth doing only with a measured multi-subscriber workload to justify it.
 
-### 7. Renderer re-render storm from `Activity` + `MemoryStat`
+### 7. Renderer re-render storm from `Activity` + `MemoryStat` — FIXED
 
 The daemon emits `Activity` at up to 2/s/session (`pty.rs:41`) and `MemoryStat`
 at 1 per 3 s per session (`main.rs:595`). Both are dispatched into the `App`
@@ -283,10 +296,19 @@ other object allocated in that path is garbage. This is a plausible mechanism fo
 "the app gets laggy after a while" independent of the already-fixed SwiftShader
 cause.
 
-Not fixed: it is a React architecture change (split the high-frequency
-activity/memory state out of the main reducer into a separate context or an
-external store with `useSyncExternalStore`, so only the badge subscribes), not a
-leak fix. Should be its own slice with a before/after measurement.
+Fixed on the user's call, with the cheap lever rather than the architectural one:
+both events only drive a tab dot and a header MB label, so neither needs
+sub-second latency. They are buffered and flushed on a 250 ms timer, and React 18
+batches the dispatches inside that timeout into **one** render — so N events cost
+one pass instead of N. Session lifecycle, `Exit` and `Error` stay immediate.
+
+Not done: moving that state out of the main reducer entirely
+(`useSyncExternalStore`, so only the badge subscribes), which would stop even the
+one render from touching the whole tree. The throttle gets most of the benefit for
+~15 lines; the split is worth doing only if a measurement says the residual
+matters.
+
+Verified live: the per-pane MB label still updates, and no daemon event is lost.
 
 ### 8. `session_infos()` does ~2 file reads per session under the sessions lock
 
@@ -332,10 +354,23 @@ grows every live terminal's buffer by up to a full 2 MiB backlog until xterm's
 own scrollback limit evicts it, so a flappy daemon inflates renderer memory in
 steps.
 
-The honest fix is for the app to clear the terminal before replaying a
-re-Attach backlog (it already knows a re-Attach is happening — that is exactly
-what `rearmRef` tracks). Not done here: it changes what the user sees on
-reconnect, and belongs with the `MOUSE_RESET` logic it would sit next to.
+**Fixed, after one wrong attempt worth recording.** The first attempt reused the
+existing `rearmRef` heuristic — "the next message after a reconnect is the
+backlog" — and reset the terminal on it. Live-tested against a real daemon
+restart, the pane went **blank**: the replay arrives on its own IPC task and can
+beat React's reconnect effect, so the reset landed on a *later* frame and wiped
+history the daemon still held. A reset is not a benign thing to fire on a guess,
+which is what `MOUSE_RESET` had been getting away with.
+
+The real fix puts the decision where the fact actually lives: the **client**
+sends the `Attach`, so the first `Data` frame it sees for that session afterwards
+*is* the replay. `Router` now tags exactly that frame (`{data, backlog: true}`)
+and `Pane` resets only on a tagged frame — and only if it has already consumed
+one backlog, so a `.amberws` load's staged replay is never wiped. `rearmRef` is
+gone; the mouse reset rides the same exact signal.
+
+Verified live: marker count after a daemon restart is **2 → 2** (it was 2 → 4
+before the fix, and 2 → 0 with the broken first attempt).
 
 ### 11. Not measured
 
@@ -408,10 +443,13 @@ Recorded so the next audit does not re-derive them:
 - `write_bounded` / `CLIENT_WRITE_TIMEOUT` mean no client can pin daemon buffers
   indefinitely (the 2026-07-20 wedged-client fix holds).
 
-## Open question for the user
+## Open question for the user — ANSWERED: leave it
 
 Reducing the app's dominant footprint means one of two things, and both trade
-away product behaviour rather than fixing a defect:
+away product behaviour rather than fixing a defect. **The user chose to leave
+both alone**, on the grounds that no reading was ever taken of the real running
+app — optimising an unmeasured number is how you trade a feature for nothing.
+Recorded here so the next pass does not re-open it without a measurement first:
 
 1. **Lower xterm's `scrollback`** (currently the library default) — less
    in-terminal history per pane. The daemon's 2 MiB raw ring is unaffected, so a

@@ -706,8 +706,8 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   the path every pane's output takes; a read cursor + compaction gives 5.94 MB
   (2.97×). Tests pin the two ways that fix could become a different bug (consumed
   bytes must really be reclaimed; the payload must still be COPIED out, never a
-  view onto a buffer compaction rewrites). Gates: Rust **261** tests ×2 + clippy
-  clean, app **404** tests + typecheck + bundle. **Live-verified** headless
+  view onto a buffer compaction rewrites). Gates: Rust **264** tests ×3 + clippy
+  clean, app **410** tests + typecheck + bundle. **Live-verified** headless
   (xvfb+CDP) against an isolated private daemon — the detach wiring is the risky
   part, so: workspace switch away/back (the gesture that unmounts panes and fires
   `Detach`) restored panes with scrollback and input intact, pane kill pruned
@@ -724,6 +724,30 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   reconnect replays a full backlog into a terminal that already has it, so a
   flappy daemon inflates renderer memory in 2 MiB steps per pane.
   **A running daemon must be restarted to pick up the ring + snapshot changes.**
+  **Follow-ups the user then asked for (same pass):** (a) `Activity`/`MemoryStat`
+  are buffered and flushed on a 250 ms timer — React 18 batches the dispatches
+  inside the timeout, so N events cost ONE render instead of N (lifecycle/Exit/
+  Error stay immediate); (b) a re-attach backlog now RESETS the terminal first,
+  killing the duplicate-history growth — **the first attempt at this was wrong
+  and live-testing caught it**: reusing the `rearmRef` "next message after a
+  reconnect" heuristic made the reset land on a LATER frame and blank the pane
+  (marker count 2 → 0) because the replay arrives on its own IPC task and beats
+  React's reconnect effect. A reset is not safe to fire on a guess the way
+  `MOUSE_RESET` was. Fixed by putting the decision where the fact lives: the
+  CLIENT sends the Attach, so it tags the first following `Data` frame
+  (`{data, backlog:true}`); `Pane` resets only on a tagged frame, and only after
+  it has consumed one backlog (so a `.amberws` staged replay is never wiped).
+  `rearmRef` deleted. (c) `DumpBacklog` replies on a new BINARY frame tag 2
+  instead of `ControlMsg::Backlog`, whose serde form is a JSON numeric array
+  (~8 MB of decimal text per 2 MiB ring, both ends, per pane per save);
+  `ControlMsg::Backlog` kept as a decode-only path so a new client still reads an
+  older daemon. Two tests caught real things here and were fixed, not worked
+  around: the connection test used tag 2 as its "unknown tag", and the TS decoder
+  lacked Rust's truncated-frame bounds checks — with the new reused read buffer a
+  corrupt length prefix would have read past the frame into a garbage session
+  name. **Live-verified**: marker count across a daemon restart 2 → 2 (was 2 → 4
+  before, 2 → 0 with the broken attempt), `dumpBacklog` returned a real
+  `Uint8Array`, MB labels still live, input still reaches the pty, no banner.
 
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**

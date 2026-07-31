@@ -115,9 +115,6 @@ export const Pane = memo(function Pane(
   onTitleRef.current = onTitle
   const onSearchReadyRef = useRef(onSearchReady)
   onSearchReadyRef.current = onSearchReady
-  // Set on a reconnect so the NEXT backlog message re-runs the reset (the
-  // daemon replays a fresh backlog on every re-Attach, re-enabling mouse modes).
-  const rearmRef = useRef(false)
   // True once this Pane has consumed one Attach backlog. A LATER backlog is a
   // RE-attach replay of history the terminal already shows, so it must clear
   // first — see the `term.reset()` in the port handler. Deliberately not armed
@@ -279,26 +276,27 @@ export const Pane = memo(function Pane(
       port?.close() // drop the previous (now-dead) port on a re-acquire
       port = e.ports[0]
       portRef.current = port
-      let sawBacklog = false
       port.onmessage = (ev) => {
-        const m = ev.data as { data?: Uint8Array }
+        const m = ev.data as { data?: Uint8Array; backlog?: boolean }
         if (!m.data) return
-        // The daemon replays the FULL scrollback on every Attach, in one frame.
-        // This message is that replay when the port is fresh (`!sawBacklog`) or
-        // a reconnect armed the flag.
-        const isBacklog = !sawBacklog || rearmRef.current
+        // `backlog` is set by the client (router.ts) on the first Data frame
+        // after an Attach — the daemon's one-frame scrollback replay. It is NOT
+        // inferred here: "the first message after a reconnect" races the frame
+        // itself, and a reset that lands on a later frame wipes a live pane
+        // instead of de-duplicating it (observed on a real daemon restart —
+        // the pane went blank while the daemon still held the history).
+        const isBacklog = m.backlog === true
         // A re-attach replays history this terminal ALREADY shows, so without a
         // clear each reconnect appended a duplicate copy — cosmetically wrong,
         // and it grew the buffer by up to a full backlog every time until
         // xterm's own scrollback limit evicted it. reset() (not clear()) because
         // the replay re-executes raw escape codes and must start from a known
-        // state; it also subsumes MOUSE_RESET, which is kept for the first
-        // backlog, where we deliberately do NOT reset.
+        // state. Skipped for the pane's FIRST backlog: a `.amberws` load stages
+        // replay bytes before the port is wired, and clearing would wipe exactly
+        // the history that load exists to restore.
         if (isBacklog && attachedOnceRef.current) term.reset()
         term.write(m.data) // xterm.write accepts Uint8Array (UTF-8)
         if (isBacklog) {
-          sawBacklog = true
-          rearmRef.current = false
           attachedOnceRef.current = true
           term.write(MOUSE_RESET) // clear mouse modes the replayed bytes re-enabled
         }
@@ -362,13 +360,13 @@ export const Pane = memo(function Pane(
     acquireRef.current()
   }, [portEpoch])
 
-  // On reconnect (epoch increments): re-arm the mouse reset for the fresh
-  // backlog, and nudge a resize so an alt-screen TUI (claude — whose screen
-  // isn't in scrollback) repaints. Staggered because claude may still be
-  // re-resuming when the socket comes back.
+  // On reconnect (epoch increments): nudge a resize so an alt-screen TUI
+  // (claude — whose screen isn't in scrollback) repaints. Staggered because
+  // claude may still be re-resuming when the socket comes back. The mouse-mode
+  // reset is no longer armed here — the client tags the actual backlog frame
+  // (`m.backlog`), which is exact where this was a guess that raced it.
   useEffect(() => {
     if (epoch === 0) return
-    rearmRef.current = true
     const nudge = (): void => {
       const term = termRef.current, fit = fitRef.current, port = portRef.current
       if (!term || !port) return

@@ -17,11 +17,24 @@ type Outbound = { data: Uint8Array } | { resize: { cols: number; rows: number } 
 
 export class Router {
   private readonly ports = new Map<string, PortLike>()
+  // Sessions whose next Data frame is an Attach backlog replay.
+  //
+  // The daemon replays the whole scrollback as ONE Data frame, before any live
+  // output, in response to Attach — so "the first Data frame after an Attach"
+  // identifies the replay exactly. The renderer needs that fact (a re-attach
+  // replays history the terminal already shows, so it must clear first) and
+  // cannot derive it: guessing "the next message after a reconnect" races the
+  // frame itself, and getting it wrong wipes a live pane. We send the Attach, so
+  // we are the one place that knows for certain.
+  private readonly awaitingBacklog = new Set<string>()
 
   constructor(private readonly conn: ConnLike) {
     this.conn.on('frame', (f) => {
       if (f.type === 'data') {
-        this.ports.get(f.session)?.postMessage({ data: f.bytes })
+        const port = this.ports.get(f.session)
+        if (!port) return
+        const backlog = this.awaitingBacklog.delete(f.session)
+        port.postMessage(backlog ? { data: f.bytes, backlog: true } : { data: f.bytes })
       }
     })
   }
@@ -42,13 +55,17 @@ export class Router {
       }
     })
     port.start()
-    this.conn.send({ type: 'control', msg: { kind: 'Attach', name: session } })
+    this.sendAttach(session)
   }
 
   reattachAll(): void {
-    for (const session of this.ports.keys()) {
-      this.conn.send({ type: 'control', msg: { kind: 'Attach', name: session } })
-    }
+    for (const session of this.ports.keys()) this.sendAttach(session)
+  }
+
+  /** Attach, and arm the backlog tag for the reply that follows. */
+  private sendAttach(session: string): void {
+    this.awaitingBacklog.add(session)
+    this.conn.send({ type: 'control', msg: { kind: 'Attach', name: session } })
   }
 
   /**
@@ -67,6 +84,7 @@ export class Router {
     if (!port) return // unknown/already detached: no port to close, nothing to tell the daemon
     port.close()
     this.ports.delete(session)
+    this.awaitingBacklog.delete(session)
     this.conn.send({ type: 'control', msg: { kind: 'Detach', name: session } })
   }
 
