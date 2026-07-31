@@ -712,15 +712,14 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   part, so: workspace switch away/back (the gesture that unmounts panes and fires
   `Detach`) restored panes with scrollback and input intact, pane kill pruned
   cleanly, and a daemon restart under the running app reconnected with **no error
-  banner**. Deliberately NOT changed (see the report): the `Backlog` JSON
-  numeric-array encoding (~8 MB of text per 2 MiB dump, but a two-language wire
-  change fired only on a user gesture); `deliver_chunk`'s per-subscriber copy
-  (the common case is ONE subscriber, and it sits on the backpressure invariants);
-  the renderer re-render storm from `Activity`+`MemoryStat` (~45 full-tree renders
-  /s at 19 sessions — a React architecture change, its own slice); and xterm
-  scrollback depth / background-terminal eviction, which trade the app's defining
-  keep-alive behaviour for RSS and so are a question for the user, not a
-  unilateral change. Also newly recorded (pre-existing, not a regression): every
+  banner**. Deliberately NOT changed (see the report for the reasoning):
+  `deliver_chunk`'s per-subscriber copy (the common case is ONE subscriber, and
+  it sits on the backpressure invariants); `session_infos()`'s ~2 file reads per
+  session under the sessions lock, on every control gesture; the memory monitor's
+  full `/proc` walk every 3 s; and **xterm scrollback depth /
+  background-terminal eviction — the user's explicit call to leave alone**, since
+  no reading was ever taken of the real running app and they trade the defining
+  keep-alive behaviour for RSS. Also newly recorded (pre-existing, not a regression): every
   reconnect replays a full backlog into a terminal that already has it, so a
   flappy daemon inflates renderer memory in 2 MiB steps per pane.
   **A running daemon must be restarted to pick up the ring + snapshot changes.**
