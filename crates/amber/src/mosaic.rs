@@ -45,9 +45,17 @@ pub struct TabLayout {
     pub label: Option<String>,
 }
 
+fn default_active_tab() -> u32 {
+    1
+}
+
+fn default_active_workspace() -> u32 {
+    1
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct WsLayout {
-    #[serde(default, rename = "activeTab")]
+    #[serde(default = "default_active_tab", rename = "activeTab")]
     pub active_tab: u32,
     #[serde(default)]
     pub tabs: HashMap<String, TabLayout>,
@@ -62,9 +70,16 @@ pub struct WsLayout {
 /// `browsers`, `editors`, `fontSize` and `recentFiles` are deliberately NOT
 /// deserialized — the mosaic renders no app-local panes, and `recentFiles` is a
 /// list of arbitrary host paths with no business crossing the web boundary.
+///
+/// `version` must be 1 (the current LAYOUT_VERSION). If present and not 1, the
+/// sidecar is treated as incompatible and returns an empty layout (same as the
+/// TS parser). If version is missing, it's treated as 0 (pre-versioning), which
+/// also returns empty — matching `layoutFile.ts:165` behavior.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct LayoutFile {
-    #[serde(default, rename = "activeWorkspace")]
+    #[serde(default)]
+    pub version: u32,
+    #[serde(default = "default_active_workspace", rename = "activeWorkspace")]
     pub active_workspace: u32,
     #[serde(default)]
     pub workspaces: HashMap<String, WsLayout>,
@@ -76,11 +91,18 @@ pub struct LayoutFile {
 /// NOT an error: it degrades to empty, which renders as the equal-splits
 /// fallback the desktop app itself uses. Core rule #3 — grouping must be
 /// reconstructable from session names alone.
+///
+/// Version validation: if the sidecar's version is present and not 1, it is
+/// treated as incompatible and returns empty (matching `layoutFile.ts:165`).
+/// If version is missing, it defaults to 0, which is also treated as invalid.
 pub fn load(root: &Path) -> LayoutFile {
-    std::fs::read_to_string(root.join(LAYOUT_FILE))
+    match std::fs::read_to_string(root.join(LAYOUT_FILE))
         .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .and_then(|s| serde_json::from_str::<LayoutFile>(&s).ok())
+    {
+        Some(layout) if layout.version == 1 => layout,
+        _ => LayoutFile::default(),
+    }
 }
 
 #[cfg(test)]
@@ -178,11 +200,27 @@ mod tests {
 
     #[test]
     fn parses_this_machines_real_sidecar_if_present() {
-        let Some(home) = std::env::var_os("HOME") else { return };
+        let Some(home) = std::env::var_os("HOME") else {
+            eprintln!("skipped: no sidecar at $HOME/.local/state/amber-ide/ui-layout.json (HOME not set)");
+            return;
+        };
         let p = std::path::Path::new(&home).join(".local/state/amber-ide/ui-layout.json");
-        let Ok(raw) = std::fs::read_to_string(&p) else { return };
+        let Ok(raw) = std::fs::read_to_string(&p) else {
+            eprintln!("skipped: no sidecar at {}", p.display());
+            return;
+        };
         let f: LayoutFile = serde_json::from_str(&raw)
             .unwrap_or_else(|e| panic!("real sidecar {} failed to parse: {e}", p.display()));
+        eprintln!("parsed real sidecar at {}: {} workspaces", p.display(), f.workspaces.len());
         assert!(!f.workspaces.is_empty(), "real sidecar has no workspaces");
+    }
+
+    #[test]
+    fn defaults_active_tab_and_workspace_to_1_when_missing() {
+        let sidecar_no_defaults = r#"{"version": 1, "workspaces": {"1": {"tabs": {}}}}"#;
+        let f: LayoutFile = serde_json::from_str(sidecar_no_defaults).unwrap();
+        assert_eq!(f.active_workspace, 1, "activeWorkspace defaults to 1");
+        let ws = f.workspaces.get("1").expect("ws 1");
+        assert_eq!(ws.active_tab, 1, "activeTab defaults to 1");
     }
 }
