@@ -128,6 +128,15 @@ struct LayoutFile {
 }
 ```
 
+`Node` is an **internally tagged** enum — the sidecar writes
+`{"kind":"leaf","paneId":"…"}`, tag alongside payload — so `tag = "kind"` plus
+`rename_all = "lowercase"` (serde defaults variant names to `Leaf`/`Split`) plus
+the explicit `paneId` rename are all load-bearing. Internally tagged enums
+deserialize through a buffering `ContentDeserializer`; the recursion through
+`Box<Node>` is the part to prove rather than assume, so **the first test written
+is a round-trip of a real `~/.local/state/amber-ide/ui-layout.json`** — before
+any prune logic exists.
+
 `browsers`, `editors`, `fontSize` and `recentFiles` are deliberately **not**
 deserialized. `recentFiles` in particular is a list of arbitrary host file paths
 and there is no reason to move it across the boundary.
@@ -167,10 +176,13 @@ A daemon session whose name parses as a pane (`amber-<ws>-<tab>-<ord>-<id>`) but
 which appears in no tab tree — a reboot-restored session, an adopted CLI
 session, or one this spec's own `Create` just made — is appended to its
 name-encoded tab as an extra leaf, split evenly. Same reconciliation the desktop
-app performs. A session whose name does not parse as a pane (e.g. a bare
-`amber` session `s2`) belongs to no workspace and is listed in a **flat
-"unassigned" section** below the workspaces, tappable, with an **Adopt** action
-(§6.3).
+app performs, and it is what makes a pane created from the browser (§6) appear
+immediately without any sidecar write.
+
+A session whose name does **not** parse as a pane — a bare `amber` CLI session
+`s2`, or anything else outside the grammar — belongs to no workspace and is
+**not shown**. Adopting those is the desktop 🧹 Sessions dialog's job and is a
+separate surface (its own list, its own empty state); see §9.
 
 ## 3. Data flow
 
@@ -254,8 +266,7 @@ daemon and lets the desktop app's own reconcile update the tree:
 |---|---|---|
 | new pane | `Create { name, cwd, kind }` | name encodes the target ws/tab → `SessionsChanged` → `groupSessions` → reconcile appends the leaf |
 | close pane | `Kill { name }` | kill/reap broadcast prunes the leaf |
-| move pane | `Rename { from, to }` | the proven adopt / cross-tab-move path (`2026-07-18-cross-tab-move-design.md`) |
-| adopt a CLI session | `Rename { from, to }` | same path; `to` is the current ws/tab at the next free ord |
+| move pane | `Rename { from, to }` | the proven cross-tab-move path (`2026-07-18-cross-tab-move-design.md`) |
 | unfreeze an agent | `Resume { name }` | supervisor relaunches `--resume <recorded-id>` — the same conversation |
 | freeze an agent | `Suspend { name }` | supervisor kills the child, `run_state: "suspended"`, RAM freed |
 
@@ -283,8 +294,24 @@ no dependencies) — the front end is hand-written already.
 `ord` is chosen as the lowest free ord within the target ws/tab, computed from
 the live session list the client already polls. Two clients can race to the same
 ord; the daemon's `SessionManager::create` already rejects a `Create` on a live
-name under the sessions lock (closed 2026-07-23), so the loser gets an `Error`
-and retries with a re-read list.
+name under the sessions lock (closed 2026-07-23), so exactly one wins.
+
+### 6.2.1 No error channel — the poll is the truth
+
+The shipped browser protocol has no server→browser error path (`open`/`close`
+plus raw binary), and this spec does not add one. Every parity gesture is
+**fire-and-forget**; the 1 s `/api/sessions` poll is the sole confirmation.
+
+This is core rule #3 applied literally: the client never optimistically creates,
+destroys or renames anything locally, so there is nothing to roll back when a
+gesture fails. A `Create` that loses a race, a `Kill` on an already-reaped
+session, a `Rename` the daemon refuses — all look identical to the front end:
+the tree simply does not change.
+
+The front end shows a **pending tile** in the target slot on `Create` and clears
+it after 3 poll ticks if the session has not appeared. That is the entire error
+UX, and it costs no protocol surface. If failures turn out to be common enough
+to need a reason, an error channel is a later, separate decision.
 
 ### 6.3 cwd
 
@@ -400,8 +427,9 @@ puts the logic in Rust.
 
 Divider drag, tab/workspace rename, font size, `.amberws` save/load, browser and
 editor panes, `Resize` in any form, live terminal content in tiles, smallest-
-client-wins pty sizing, `ssh -L` + Electron on the laptop, and **any write to
-`ui-layout.json` from the web client**.
+client-wins pty sizing, `ssh -L` + Electron on the laptop, a server→browser
+error channel, **adopting non-pane sessions from the phone** (§2.4), and **any
+write to `ui-layout.json` from the web client**.
 
 ## 10. Consequences for `CLAUDE.md`
 
@@ -409,6 +437,18 @@ On landing, the build-status entry must record: the web client is no longer
 terminal-only (the editor-pane spec's "the phone UI stays terminal-only" is
 narrowed to "renders no editor/browser panes"); the browser control whitelist now
 reaches `Create`/`Kill`/`Rename`/`Suspend`/`Resume` while **still** never
-reaching `Resize`; and a second reader of `ui-layout.json` now exists in Rust,
-so a future field added to `layoutFile.ts` that this reader must see needs a
-matching Rust change.
+reaching `Resize`; and a second reader of `ui-layout.json` now exists in Rust.
+
+On that second reader, be precise about what does and does not drift. The prune
+rule is *"drop any leaf that is not a live daemon session"* — stated as a
+property of the daemon's session list, never as a list of known id prefixes. So
+**a fourth app-local pane kind needs zero Rust change**: it is pruned by
+construction, exactly like `browser-*` and `editor-*`. That is deliberate, and
+it is the one place this feature is immune to the runtime-string class of bug
+that bit the editor pass (`isBrowserName` / `kind === 'browser'` checks
+TypeScript does not catch, the missed `+ ws` branch).
+
+What *does* need a matching Rust change is narrower: a new field in
+`WsLayout`/`TabLayout` that the mosaic must display (a per-tab colour, say), or
+a change to the `Node` shape itself. Neither has happened in the sidecar's
+history; every change so far has been additive and optional.
