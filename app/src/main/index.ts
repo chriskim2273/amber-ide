@@ -543,6 +543,15 @@ async function main(): Promise<void> {
     win.webContents.postMessage('pane-port', { session }, [rPort])
   })
 
+  // A Pane unmounted: tell the client to close that pane's port, forget the
+  // session and Detach from the daemon. Without this the client's port map grew
+  // for the app's whole life (names are never reused), each entry pinning a live
+  // MessagePortMain, and every reconnect re-Attached long-dead names — which the
+  // daemon answers with an Error the app shows in its red banner.
+  ipcMain.on('close-pane', (_e, session: string) => {
+    child?.postMessage({ kind: 'pane-close', session })
+  })
+
   // Resolve a terminal selection to an EXISTING absolute path so the pane's
   // floating "Open" button only shows for real files/dirs. Relative selections
   // resolve against the pane's cwd; ~ expands; surrounding quotes and a trailing

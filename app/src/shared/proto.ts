@@ -166,32 +166,90 @@ export function encode(frame: Frame): Uint8Array {
   return out
 }
 
+// Growth headroom for the accumulation buffer. Doubling (clamped to what is
+// actually needed) keeps feed() amortized O(1) per byte.
+const DECODER_MIN_CAPACITY = 64 * 1024
+
+/**
+ * Streaming frame decoder. Bytes accumulate in a buffer with an explicit read
+ * cursor; `next()` returns frames as they complete.
+ *
+ * The cursor is not a micro-optimisation. The previous form allocated a whole
+ * new `Uint8Array` of (buffered + chunk) on EVERY socket chunk, which made
+ * assembling one large frame quadratic: measured, a 2 MiB Attach backlog
+ * arriving in 64 KiB chunks copied **36.7 MB** through the allocator to receive
+ * 2 MB. Every pane's output flows through here in the utilityProcess, so that
+ * was the app's single largest source of garbage.
+ *
+ * Two rules keep it honest, both covered by tests:
+ * - consumed bytes are actually reclaimed (a cursor alone would retain every
+ *   frame ever received — a leak, not a fix);
+ * - the frame payload is still COPIED out, never a view onto the shared buffer.
+ *   A view would alias bytes that later frames overwrite during compaction, and
+ *   these arrays are handed straight to xterm and across MessagePorts.
+ */
 export class Decoder {
   private buf = new Uint8Array(0)
+  // Bytes before this offset are consumed; bytes in [read, write) are pending.
+  private read = 0
+  private write = 0
 
   feed(chunk: Uint8Array): void {
-    const next = new Uint8Array(this.buf.length + chunk.length)
-    next.set(this.buf, 0)
-    next.set(chunk, this.buf.length)
+    this.reserve(chunk.length)
+    this.buf.set(chunk, this.write)
+    this.write += chunk.length
+  }
+
+  /** Pending (received, not yet decoded) bytes. Observable so the reclaim rule is testable. */
+  buffered(): number {
+    return this.write - this.read
+  }
+
+  /** Make room for `additional` bytes, reclaiming consumed space first. */
+  private reserve(additional: number): void {
+    if (this.write + additional <= this.buf.length) return
+    const pending = this.write - this.read
+    // Sliding the pending bytes down is enough whenever consumed space covers
+    // the request — the common steady state, and it allocates nothing.
+    if (pending + additional <= this.buf.length) {
+      this.buf.copyWithin(0, this.read, this.write)
+      this.read = 0
+      this.write = pending
+      return
+    }
+    const cap = Math.max(DECODER_MIN_CAPACITY, this.buf.length * 2, pending + additional)
+    const next = new Uint8Array(cap)
+    next.set(this.buf.subarray(this.read, this.write), 0)
     this.buf = next
+    this.read = 0
+    this.write = pending
   }
 
   next(): Frame | null {
-    if (this.buf.length < 4) return null
-    const len = new DataView(this.buf.buffer, this.buf.byteOffset, 4).getUint32(0, false)
+    if (this.buffered() < 4) return null
+    const view = new DataView(this.buf.buffer, this.buf.byteOffset, this.buf.length)
+    const len = view.getUint32(this.read, false)
     if (len > MAX_FRAME_LEN) throw new Error(`frame length ${len} exceeds max`)
-    if (this.buf.length < 4 + len) return null
-    const body = this.buf.slice(4, 4 + len)
-    this.buf = this.buf.slice(4 + len)
-    const tag = body[0]
+    if (this.buffered() < 4 + len) return null
+    const body = this.read + 4 // first byte of the body (the tag)
+    const end = body + len
+    this.read = end
+    // Fully drained: reset to the front so a quiet connection holds no cursor
+    // drift and the next feed() needs no compaction.
+    if (this.read === this.write) { this.read = 0; this.write = 0 }
+
+    const tag = this.buf[body]
     if (tag === TAG_CONTROL) {
-      const json = new TextDecoder().decode(body.slice(1))
+      const json = new TextDecoder().decode(this.buf.subarray(body + 1, end))
       return { type: 'control', msg: jsonToMsg(JSON.parse(json)) }
     }
     if (tag === TAG_DATA) {
-      const nameLen = new DataView(body.buffer, body.byteOffset + 1, 2).getUint16(0, false)
-      const session = new TextDecoder().decode(body.slice(3, 3 + nameLen))
-      const bytes = body.slice(3 + nameLen)
+      const nameLen = view.getUint16(body + 1, false)
+      const nameEnd = body + 3 + nameLen
+      const session = new TextDecoder().decode(this.buf.subarray(body + 3, nameEnd))
+      // slice(), not subarray(): the payload outlives this call (it is posted to
+      // the renderer), and the shared buffer is reused by later frames.
+      const bytes = this.buf.slice(nameEnd, end)
       return { type: 'data', session, bytes }
     }
     throw new Error(`unknown frame tag ${tag}`)

@@ -13,6 +13,8 @@ contextBridge.exposeInMainWorld('amber', {
   onDaemonEvent: (cb: (data: unknown) => void) =>
     ipcRenderer.on('daemon-event', (_e, data) => cb(data)),
   openPane: (session: string) => ipcRenderer.send('open-pane', session),
+  // Pane unmounted: release its client-side port + daemon subscription.
+  closePane: (session: string) => ipcRenderer.send('close-pane', session),
   createSession: (name: string, cwd: string, sessionKind: string) =>
     ipcRenderer.send('daemon-command', { cmd: 'create', name, cwd, sessionKind }),
   killSession: (name: string) => ipcRenderer.send('daemon-command', { cmd: 'kill', name }),

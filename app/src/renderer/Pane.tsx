@@ -308,6 +308,13 @@ export const Pane = memo(function Pane(
       ro.disconnect()
       resultsSub.dispose()
       port?.close()
+      // Release the CLIENT side too. Closing our end alone left the
+      // utilityProcess holding its half forever (its port map is keyed by
+      // session name, which is never reused), and left the daemon streaming
+      // this pane's output into a port with no reader. React runs every
+      // unmount cleanup in a commit before any mount effect, so on a ⟳ rebuild
+      // (key change) this Detach still precedes the new Pane's Attach.
+      window.amber.closePane(session)
       term.dispose()
       termRef.current = null
       fitRef.current = null

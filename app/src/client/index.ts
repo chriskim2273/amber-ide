@@ -19,7 +19,12 @@ conn.on('open', () => {
 conn.on('close', () => controlPort?.postMessage({ status: 'disconnected' }))
 
 process.parentPort.on('message', (event) => {
-  const msg = event.data as { kind: 'control' } | { kind: 'pane'; session: string }
+  const msg = event.data as
+    | { kind: 'control' }
+    | { kind: 'pane'; session: string }
+    | { kind: 'pane-close'; session: string }
+  // A pane going away carries no port — it releases the one we already hold.
+  if (msg.kind === 'pane-close') { router.detach(msg.session); return }
   const [port] = event.ports
   if (!port) return
   if (msg.kind === 'control') {

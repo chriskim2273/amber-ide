@@ -25,6 +25,7 @@ declare global {
       softwareGl: boolean
       onDaemonEvent: (cb: (d: unknown) => void) => void
       openPane: (session: string) => void
+      closePane: (session: string) => void
       createSession: (name: string, cwd: string, sessionKind: string) => void
       killSession: (name: string) => void
       renameSession: (from: string, to: string) => void

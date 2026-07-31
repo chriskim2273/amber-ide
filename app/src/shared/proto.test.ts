@@ -105,4 +105,70 @@ describe('proto', () => {
     d.feed(bad)
     expect(() => d.next()).toThrow()
   })
+
+  it('does not re-copy the pending buffer on every feed', () => {
+    // feed() used to allocate a whole new Uint8Array of (buffered + chunk) per
+    // socket chunk, so accumulating one big frame was O(n^2): a 2 MiB Attach
+    // backlog arriving in 64 KiB chunks copied ~32 MB through the allocator to
+    // receive 2 MB. That is the utilityProcess's single largest garbage source.
+    //
+    // Asserted by counting bytes copied, which is the property that matters and
+    // is stable across implementations: total copying to assemble one frame must
+    // stay within a small constant multiple of the frame, not scale with the
+    // square of the chunk count.
+    const CHUNK = 64 * 1024
+    const CHUNKS = 32
+    const payload = new Uint8Array(CHUNK * CHUNKS)
+    const wire = encode({ type: 'data', session: 's', bytes: payload })
+
+    let copied = 0
+    const realSet = Uint8Array.prototype.set
+    // Count every bulk copy the decoder performs while assembling the frame.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    ;(Uint8Array.prototype as any).set = function (this: Uint8Array, src: ArrayLike<number>, off?: number) {
+      copied += (src as ArrayLike<number>).length ?? 0
+      return realSet.call(this, src as never, off as never)
+    }
+    try {
+      const d = new Decoder()
+      for (let i = 0; i < wire.length; i += CHUNK) d.feed(wire.subarray(i, i + CHUNK))
+      const out = d.next()
+      expect(out?.type).toBe('data')
+    } finally {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ;(Uint8Array.prototype as any).set = realSet
+    }
+    // Quadratic assembly copies ~CHUNKS/2 x the payload (~32 MB here). Linear
+    // assembly copies it a small number of times. 4x is generous headroom that
+    // still fails hard on the old behaviour.
+    expect(copied).toBeLessThan(wire.length * 4)
+  })
+
+  it('releases buffered memory once frames are consumed', () => {
+    // A read cursor alone would leak: the underlying buffer would keep every
+    // frame ever received. Consumed bytes must actually be reclaimed, or a
+    // long-lived pane connection grows without bound.
+    const d = new Decoder()
+    const f: Frame = { type: 'data', session: 's', bytes: new Uint8Array(64 * 1024) }
+    for (let i = 0; i < 50; i++) {
+      d.feed(encode(f))
+      expect(d.next()).not.toBeNull()
+      expect(d.next()).toBeNull()
+    }
+    expect(d.buffered()).toBe(0)
+  })
+
+  it('decodes several frames from one chunk', () => {
+    // The cursor must advance frame-to-frame within a single fed chunk.
+    const a: Frame = { type: 'data', session: 'a', bytes: new Uint8Array([1, 2]) }
+    const b: Frame = { type: 'control', msg: { kind: 'Activity', name: 'x' } }
+    const wa = encode(a), wb = encode(b)
+    const both = new Uint8Array(wa.length + wb.length)
+    both.set(wa, 0); both.set(wb, wa.length)
+    const d = new Decoder()
+    d.feed(both)
+    expect(d.next()).toEqual(a)
+    expect(d.next()).toEqual(b)
+    expect(d.next()).toBeNull()
+  })
 })

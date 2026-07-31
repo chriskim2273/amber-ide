@@ -12,10 +12,12 @@ class FakeConn {
 
 class FakePort implements PortLike {
   posted: unknown[] = []
+  closed = false
   private cb: ((e: { data: unknown }) => void) | null = null
   postMessage(m: unknown): void { this.posted.push(m) }
   on(_e: 'message', cb: (e: { data: unknown }) => void): void { this.cb = cb }
   start(): void {}
+  close(): void { this.closed = true }
   fromRenderer(data: unknown): void { this.cb?.({ data }) }
 }
 
@@ -60,5 +62,68 @@ describe('Router', () => {
     router.reattachAll()
     const attaches = conn.sent.filter((f) => f.type === 'control' && f.msg.kind === 'Attach')
     expect(attaches).toHaveLength(2)
+  })
+
+  it('detach drops the session, closes its port and tells the daemon', () => {
+    // `detach()` had NO callers, so every session ever opened stayed in the map
+    // with a live MessagePortMain — an unbounded leak in a process that is meant
+    // to outlive every pane.
+    const conn = new FakeConn()
+    const router = new Router(conn)
+    const port = new FakePort()
+    router.attach('s', port)
+    conn.sent.length = 0
+
+    router.detach('s')
+
+    expect(port.closed).toBe(true)
+    expect(conn.sent).toEqual([{ type: 'control', msg: { kind: 'Detach', name: 's' } }])
+    expect(router.attachedCount()).toBe(0)
+    // Data for a detached session must go nowhere, not to a dead port.
+    conn.emit({ type: 'data', session: 's', bytes: new Uint8Array([1]) })
+    expect(port.posted).toEqual([])
+  })
+
+  it('a detached session is not re-Attached on reconnect', () => {
+    // reattachAll() fired for every name the router had ever seen. A closed
+    // pane's name draws `Error: no such session` from the daemon, which the app
+    // surfaces in its red error banner — so a reconnect after a long session
+    // popped errors for panes the user closed hours earlier.
+    const conn = new FakeConn()
+    const router = new Router(conn)
+    router.attach('gone', new FakePort())
+    router.attach('live', new FakePort())
+    router.detach('gone')
+    conn.sent.length = 0
+
+    router.reattachAll()
+
+    expect(conn.sent).toEqual([{ type: 'control', msg: { kind: 'Attach', name: 'live' } }])
+  })
+
+  it('re-attaching a session closes the port it supersedes', () => {
+    // Every re-acquire (client relaunch, workspace switch) brokers a fresh
+    // MessageChannelMain. Overwriting the map entry without closing the old one
+    // leaked a port per re-acquire.
+    const conn = new FakeConn()
+    const router = new Router(conn)
+    const first = new FakePort()
+    const second = new FakePort()
+    router.attach('s', first)
+    router.attach('s', second)
+
+    expect(first.closed).toBe(true)
+    expect(second.closed).toBe(false)
+    expect(router.attachedCount()).toBe(1)
+    conn.emit({ type: 'data', session: 's', bytes: new Uint8Array([7]) })
+    expect(first.posted).toEqual([])
+    expect(second.posted).toEqual([{ data: new Uint8Array([7]) }])
+  })
+
+  it('detaching an unknown session is a no-op', () => {
+    const conn = new FakeConn()
+    const router = new Router(conn)
+    router.detach('never-attached')
+    expect(conn.sent).toEqual([])
   })
 })
