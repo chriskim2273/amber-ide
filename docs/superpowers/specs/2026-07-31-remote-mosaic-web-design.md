@@ -186,19 +186,49 @@ separate surface (its own list, its own empty state); see §9.
 
 ## 3. Data flow
 
-The layout rides the **existing `/api/sessions` poll**, which already runs at
-1 s. One payload, one timer, no new polling loop.
+**Correcting an earlier draft of this spec:** the browser does not poll. The
+shipped mechanism is the *server* polling the *daemon* every `GEOMETRY_POLL`
+(1 s, `web.rs:407/729`) with `ListSessionsDetailed`, and pushing
+`{t:"sessions", sessions}` over the WebSocket **only when the set actually
+changed** (`Hub::on_frame`, `web.rs:600-609`). `GET /api/sessions` is a one-shot
+fetch used for the initial paint.
 
-The shipped design polls rather than making the daemon broadcast, and that
-reasoning holds here verbatim: a divider drag would flood the bounded watcher
-queue and risk evicting the desktop app. Nothing in this feature adds a
-broadcast.
+So the layout must ride **both**:
 
-The sidecar is a few KB; it is re-read per tick and re-serialised unconditionally.
-No mtime caching, no ETag — measure before adding either.
+- the `GET /api/sessions` body (initial paint), and
+- the `{t:"sessions"}` WebSocket push (live updates).
 
-The initial paint is the front end firing that same request once immediately
-rather than waiting for the first tick — not a second route.
+### 3.1 The change-detection trap
+
+`on_frame` returns early when `inner.sessions == sessions`. A **sidecar-only**
+change — dragging a divider on the desktop, renaming a tab, switching workspace —
+alters `ui-layout.json` while the session set is byte-identical, so today's early
+return would swallow it and the mosaic would never update.
+
+Fix: the sidecar is re-read on the same 1 s tick and cached on `HubInner`
+alongside `sessions`. The push fires when **either** the session set or the
+serialized layout changed. Concretely, `HubInner` gains `layout: String` (the
+serialized mosaic JSON) and the comparison becomes a two-field one.
+
+Reading the sidecar on the poll thread rather than in `on_frame` keeps file IO
+off the shared daemon read thread — the same discipline the backlog and watcher
+fixes established (`CLAUDE.md`: the read thread must never block).
+
+The sidecar is a few KB; it is re-read per tick and re-serialised
+unconditionally, then compared as a string. No mtime caching, no ETag — measure
+before adding either.
+
+### 3.2 Response shape
+
+`GET /api/sessions` currently returns a bare JSON **array**. It becomes an
+object:
+
+```json
+{ "sessions": [ … ], "layout": { … } }
+```
+
+`{t:"sessions"}` already carries a `sessions` key, so it simply gains `layout`
+alongside it. Both shapes change together, and `app.js` is the only consumer.
 
 ## 4. Views
 
@@ -209,7 +239,9 @@ split tree rendered as nested flexbox at the sidecar's real `ratio` values.
 
 Each leaf is a **tile**, carrying:
 
-- `#slot` (`SessionInfo.slot` — the same number `amber attach <n>` resolves),
+- `#slot` (`SessionInfo.slot` — the same number `amber attach <n>` resolves).
+  **`session_json` does not emit `slot` today** (`web.rs:438-450`); it must be
+  added, one line, additive,
 - the live OSC title, falling back to `cwd`,
 - kind (shell / claude / grok),
 - a state dot: `run_state` for agents (claude / retrying / shell-fallback /
@@ -296,22 +328,31 @@ the live session list the client already polls. Two clients can race to the same
 ord; the daemon's `SessionManager::create` already rejects a `Create` on a live
 name under the sessions lock (closed 2026-07-23), so exactly one wins.
 
-### 6.2.1 No error channel — the poll is the truth
+### 6.2.1 The error channel already exists
 
-The shipped browser protocol has no server→browser error path (`open`/`close`
-plus raw binary), and this spec does not add one. Every parity gesture is
-**fire-and-forget**; the 1 s `/api/sessions` poll is the sole confirmation.
+**Correcting an earlier draft of this spec:** there *is* a server→browser error
+path. `Hub::on_frame` maps `ControlMsg::Error` to `{t:"error", msg}` and queues
+it to every client (`web.rs:624-627`); `Hub::error_msg` builds it. So a daemon
+refusal — a `Create` that lost a race, a `Kill` on an already-reaped session, a
+`Rename` the daemon rejects — already surfaces with its real reason. No new
+protocol surface is needed; the front end only has to display it.
 
-This is core rule #3 applied literally: the client never optimistically creates,
-destroys or renames anything locally, so there is nothing to roll back when a
-gesture fails. A `Create` that loses a race, a `Kill` on an already-reaped
-session, a `Rename` the daemon refuses — all look identical to the front end:
-the tree simply does not change.
+One caveat inherited from the shipped design: `Error` is broadcast to **all**
+clients, not routed to the one that caused it, because the daemon's `Error`
+frame carries no correlation id. With one phone that is invisible. With two, a
+spurious toast on the other client is the cost. Adding correlation is a proto
+change and is **out of scope** — the mosaic is self-correcting either way (§6.2.2).
 
-The front end shows a **pending tile** in the target slot on `Create` and clears
-it after 3 poll ticks if the session has not appeared. That is the entire error
-UX, and it costs no protocol surface. If failures turn out to be common enough
-to need a reason, an error channel is a later, separate decision.
+### 6.2.2 The tree is never optimistic
+
+Independently of the error channel, every parity gesture is **fire-and-forget**
+with respect to the tree. This is core rule #3 applied literally: the client
+never creates, destroys or renames anything locally, so there is nothing to roll
+back when a gesture fails. The 1 s push is the sole source of truth for pane
+existence.
+
+The front end shows a **pending tile** in the target slot on `Create`, cleared
+when the session appears or after 3 s, whichever comes first.
 
 ### 6.3 cwd
 
@@ -397,10 +438,15 @@ not fixed.
   omitted, not emitted empty; a workspace whose every tab prunes away is omitted.
 - reconcile: a daemon session absent from the sidecar is appended to its
   name-encoded tab; a non-pane name lands in the unassigned section.
+- change detection: a sidecar-only edit (identical session set, different tree)
+  produces a push; two identical ticks produce none. This is §3.1's trap and is
+  the single most likely thing to be got wrong.
 - auth: the shipped `/api/sessions` tests (401 unauthenticated, 401 forged
   cookie, 429 while throttled — where a *good* token is refused while throttled)
   already cover the layout payload, since it rides that response. Extend them to
   assert the `layout` field is absent from every rejected response body.
+- response shape: `GET /api/sessions` returns an object with `sessions` and
+  `layout`, not the bare array it returns today.
 - whitelist: a browser message carrying `Resize` / `Snapshot` / `DumpBacklog`
   JSON reaches the daemon as nothing, and the target session's geometry is
   untouched afterwards.
@@ -427,9 +473,9 @@ puts the logic in Rust.
 
 Divider drag, tab/workspace rename, font size, `.amberws` save/load, browser and
 editor panes, `Resize` in any form, live terminal content in tiles, smallest-
-client-wins pty sizing, `ssh -L` + Electron on the laptop, a server→browser
-error channel, **adopting non-pane sessions from the phone** (§2.4), and **any
-write to `ui-layout.json` from the web client**.
+client-wins pty sizing, `ssh -L` + Electron on the laptop, per-client error
+correlation (§6.2.1), **adopting non-pane sessions from the phone** (§2.4), and
+**any write to `ui-layout.json` from the web client**.
 
 ## 10. Consequences for `CLAUDE.md`
 
