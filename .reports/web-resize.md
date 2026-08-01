@@ -2,7 +2,7 @@
 
 **Status:** done. Gates green, live-verified.
 
-**Commit:** (see `git log -1` on `feat/web-resize` — filled in after commit below)
+**Commit:** `78d488c254b98df18cc809a573795bf80f901d7` (branch `feat/web-resize`)
 
 ## Summary
 
