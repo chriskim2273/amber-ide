@@ -5,8 +5,8 @@ Date: 2026-08-01. Spec: `docs/superpowers/specs/2026-08-01-amber-ide-as-a-webapp
 ## Verdict: **YES**
 
 `app/src/renderer/Pane.tsx` is byte-for-byte unmodified. A real daemon session
-(`amber-1-1-0-aa`, a bash shell) rendered live in a real Chromium tab via the
-real React renderer, and a keystroke typed in the browser reached the real
+(a bash shell, e.g. `amber-1-1-0-cc`) rendered live in a real Chromium tab via
+the real React renderer, and a keystroke typed in the browser reached the real
 pty, was evaluated by the real shell, and its output came back into the same
 xterm instance. The §2.2 MessageChannel claim holds.
 
@@ -82,15 +82,24 @@ one connection without a server change. This was sufficient for the spike
   (`<state>/scrollback/<session>.bin`) contains the exact same transcript
   including the evaluated result, proving the bytes really went through the
   daemon's pty, not just the browser's local echo.
-- **Reconnect exercised live**, not just reasoned about: typed four markers
-  (`marker_A`..`marker_D`) into a fresh session, used
-  `page.context().setOffline(true/false)` (a real Playwright network drop,
-  not a guess) to force the shim's WebSocket to close and reconnect mid-test,
-  then typed a marker after the reconnect. Every marker appears **exactly
-  once**, in order, both in the rendered terminal and in the daemon's own
-  scrollback file (`grep -c` of all four names → 8 = 4 commands × echo+output,
-  no duplicates) — see "what fought me" below for the two real bugs this run
-  caught and fixed.
+- **Reconnect exercised live, with a real severed connection — not
+  `page.context().setOffline()`.** First pass used `setOffline()`, but that
+  turned out not to actually close an already-established Chromium
+  WebSocket (confirmed: the app's own "disconnected" banner never appeared,
+  and after re-enabling network the console showed zero connection-error
+  entries — i.e. the socket plausibly never dropped, which would have made
+  "no duplication" a vacuous pass). Redone properly: killed the `amber web`
+  **process** (a genuine TCP close), waited for the app's real
+  `daemon disconnected — reconnecting…` banner to appear (confirmed present),
+  restarted `amber web`, re-exchanged the token for a fresh cookie (a process
+  restart invalidates the in-memory auth session — expected, unrelated to the
+  shim), and waited for the banner to clear (confirmed gone — genuinely
+  reconnected). Typed a marker before, during-the-gap, and after; every
+  marker appears **exactly once** in both the rendered terminal and the
+  daemon's own scrollback file (`grep -c` of all three names → 6 = 3 × echo+
+  output, no duplicates) — see "what fought me" below for the two real bugs
+  this exercise caught and fixed, and "what's next" for a related gap it
+  surfaced but did not fix.
 - Only console message throughout the final run: a harmless `favicon.ico`
   404. No renderer exceptions, no stub was hit on the mount/interaction path
   exercised.
@@ -194,6 +203,29 @@ one connection without a server change. This was sufficient for the spike
    for the verdict (DOM renderer is a correctness-neutral fallback), but the
    real build needs this served from the bootstrap JSON per spec §3, probed
    for real GPU support the way the Electron main process does.
+6. **A second, distinct untagged-backlog path exists and was confirmed live:
+   `amber web`'s own reconnect to the *daemon*.** `run_daemon_link` (web.rs)
+   re-sends `Attach` for every client's open session whenever *it* reconnects
+   to the daemon — entirely independent of whether the browser's own
+   WebSocket ever dropped. The shim only arms `awaitingBacklog` when the
+   browser sends `{t:'open'}`, so this path's backlog reply arrives untagged.
+   Reproduced by killing only the **daemon** process (not `amber web`) while
+   the browser tab stayed connected throughout (its banner correctly showed
+   `daemon error: daemon unreachable`, never "disconnected"): after
+   restarting the daemon, the terminal gained one extra, un-reset prompt line
+   it hadn't earned — real content, not a rendering artifact, but *not* the
+   full-history duplication the tagged-reconnect bug would have caused,
+   because a fresh child process was spawned by the daemon and only its own
+   new prompt was genuinely-new bytes on this run. Whether that stays this
+   mild depends on how much real output happened between the daemon's last
+   snapshot and its death, and on whether a dead program had left mouse
+   tracking on (`MOUSE_RESET` also doesn't fire on this path) — so treat it as
+   confirmed-real, not confirmed-small. Options for the next task: have
+   `amber web` emit a text frame (e.g. `{"t":"reattached","name":…}`) before
+   replaying so the shim can tag it, or have the shim re-send `{t:'open'}`
+   itself when it sees the `sessions` push that follows a
+   `daemon unreachable` error clearing. Either way this is a shim/server fix,
+   not a `Pane.tsx` fix — it doesn't touch the verdict.
 
 ## Cleanup
 
