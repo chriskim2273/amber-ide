@@ -2,6 +2,8 @@
 
 **Status:** done.
 
+**Commit:** `07f668f` — fix(web): follow the pty's real grid instead of fitting to the browser box
+
 **Root cause (given, confirmed, not re-investigated):** in the web build,
 `Pane.tsx`'s `FitAddon` resized the local xterm grid to fit the browser's box,
 then tried to push that as the pty's size — `app/src/web/amber.ts`'s
@@ -104,31 +106,48 @@ Additional checks, all passing:
 - Typed a distinct command (`echo PANE2_MARKER_$((1+1))`) into pane 2: the
   output (`PANE2_MARKER_2`) appeared only in pane 2, pane 1's untouched
   `ls -la` output stayed put — keystrokes route to the correct pty.
+- **Backlog-vs-geometry race, on a real reload (not just a fresh pane):** ran
+  `ls -la /usr/bin | head -40` in BOTH panes, then reloaded the whole page
+  (`about:blank` then back), forcing every pane through a fresh mount →
+  `Attach` → backlog replay. Immediately after the reload, both panes showed
+  the clean 80-col-wrapped backlog with no garbling, and `.xterm-screen`
+  measured `cols:80,rows:24` in both. Geometry wins the race as reasoned (the
+  `sessions_msg` is queued at connection-accept, before the client's `{t:'open'}`
+  even reaches the server to trigger the `Attach` that produces the backlog),
+  and this reload test is the one that would have caught it if it hadn't.
 - Cleaned up: killed the private daemon + `amber web`, removed
   `/tmp/geomfix`. The user's real daemon (`amber daemon`, `amber web --port
   7717`, and its supervised claude sessions) was never touched.
 
 ## Concerns
 
-- **Mouse-click cell precision inside a scaled pane is not pixel-exact.**
-  Verified against the actual `@xterm/xterm` source: `MouseService.getCoords`
-  divides a click's `getBoundingClientRect()`-relative offset (which DOES
-  reflect our CSS `transform: scale()`, i.e. screen space) by
-  `CharSizeService`'s measured cell width (which uses `offsetWidth`, i.e.
-  layout space, NOT affected by the transform). At `scale ≠ 1` these two are
-  inconsistent, so a mouse click/drag-select or a mouse-tracking TUI (e.g.
-  `htop`) can land on the wrong cell in a scaled web pane. This is the exact
-  same tradeoff the mobile client already accepted (it avoids the problem
-  entirely by not using xterm's own mouse handling — custom touch-scroll and
-  an on-screen key bar instead). Task's explicit checklist items — "clickable
-  and focusable" and "keystroke reaches the right pty" — are unaffected
-  (focus/routing isn't coordinate-based) and were verified live above; I did
-  not build extra coordinate-correction machinery for this, since it wasn't
-  in the verification checklist and would have meant deviating from "copy the
-  mobile pattern." Flagging in case click-drag text selection or a
-  mouse-tracking TUI in a scaled web pane needs pixel-exact behavior later —
-  fixable by switching the scale mechanism from `transform` to the CSS `zoom`
-  property (which scales layout too, so both measurements move together), a
-  bigger and more invasive change than this fix warranted.
+- **Mouse-click cell precision inside a scaled pane is measurably off — not
+  just a theoretical risk.** Root cause, verified against the actual
+  `@xterm/xterm` source: `MouseService.getCoords` divides a click's
+  `getBoundingClientRect()`-relative offset (which DOES reflect our CSS
+  `transform: scale()`, i.e. screen space) by `CharSizeService`'s measured
+  cell width (which uses `offsetWidth`, i.e. layout space, unaffected by the
+  transform). At `scale ≠ 1` these disagree by exactly the scale factor.
+  Measured live in the 0.668-scaled narrow pane (`getBoundingClientRect`
+  418px / natural `offsetWidth` 626px): dispatching a real double-click at
+  the visual screen position of column 70 (the tail of
+  `apt-extracttemplates`, row `-rwxr-xr-x  1 root root        23008 Oct 22  2024 apt-extracttemplates`)
+  selected **`2024`** — the word actually sitting at columns 45–48 — matching
+  the predicted `column × scale` (70 × 0.668 ≈ 47) almost exactly. So a
+  drag-select or a mouse-tracking TUI (e.g. `htop`) inside a scaled web pane
+  will visibly misfire, proportionally worse the more a pane is shrunk. This
+  is the same tradeoff the mobile client already accepted (it avoids the
+  problem by not using xterm's native mouse handling at all — custom
+  touch-scroll and an on-screen key bar instead). The task's own checklist —
+  "clickable and focusable", "keystroke reaches the right pty" — is
+  unaffected (focus/routing isn't coordinate-based) and was verified live
+  above; I did not build coordinate-correction machinery for this, since it
+  wasn't in the verification checklist and would mean deviating from "copy
+  the mobile pattern" for a desktop-only interaction gap. Named upgrade path,
+  **not attempted here**: switch the scale mechanism from CSS `transform` to
+  the CSS `zoom` property, which scales layout too so `offsetWidth` and
+  `getBoundingClientRect` move together and the mismatch disappears —
+  untested here because compatibility of `zoom`-driven `offsetWidth` across
+  engines needs its own verification pass, not a guess.
 - The web bundle's `main-*.js` chunk is >500 KB (pre-existing vite warning,
   unrelated to this change).
