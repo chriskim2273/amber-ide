@@ -965,12 +965,52 @@ fn handle_conn(mut stream: TcpStream, hub: &Arc<Hub>, auth: &Arc<Auth>) -> anyho
             stream.flush()?;
             ws_session(stream, hub)
         }
+        // SPIKE ONLY (2026-08-01 webapp-pivot spike, proving-order item 1 in
+        // the spec): serves `app/out/web/` straight off disk, read per-request,
+        // relative to the daemon's CWD. This is NOT the real bundle-serving
+        // design (spec §2.3) — that's `build.rs` generating a static
+        // `include_bytes!` table so the binary stays self-contained/offline;
+        // that's proving-order item 4, not built here. Same-origin as
+        // everything else in this file on purpose: a cross-origin page would
+        // fail both the WS `Origin` check and the `SameSite=Strict` cookie.
+        ("GET", "/app") | ("GET", "/app/") => match spike_web_asset("index.html") {
+            Some((body, ctype)) => Ok(respond(&mut stream, "200 OK", ctype, &[], &body)?),
+            None => Ok(respond(
+                &mut stream,
+                "404 Not Found",
+                "",
+                &[],
+                b"web bundle not built - run `npm run build:web` in app/",
+            )?),
+        },
+        ("GET", p) if p.starts_with("/assets/") => match spike_web_asset(p) {
+            Some((body, ctype)) => Ok(respond(&mut stream, "200 OK", ctype, &[], &body)?),
+            None => Ok(respond(&mut stream, "404 Not Found", "", &[], b"")?),
+        },
         ("GET", path) => match asset(path) {
             Some((body, ctype)) => Ok(respond(&mut stream, "200 OK", ctype, &[], body)?),
             None => Ok(respond(&mut stream, "404 Not Found", "", &[], b"")?),
         },
         _ => Ok(respond(&mut stream, "405 Method Not Allowed", "", &[], b"")?),
     }
+}
+
+/// SPIKE ONLY — see the call site. Reads a file out of `app/out/web/` relative
+/// to CWD; `rel` is a request path (`/assets/x.js` or `index.html`), so a
+/// leading `/` is stripped and any `..` component is refused.
+fn spike_web_asset(rel: &str) -> Option<(Vec<u8>, &'static str)> {
+    if rel.contains("..") {
+        return None;
+    }
+    let path = Path::new("app/out/web").join(rel.trim_start_matches('/'));
+    let ctype = if rel.ends_with(".js") {
+        CT_JS
+    } else if rel.ends_with(".css") {
+        CT_CSS
+    } else {
+        CT_HTML
+    };
+    std::fs::read(&path).ok().map(|b| (b, ctype))
 }
 
 /// Pump one browser WebSocket. Reads happen here; ALL writes happen on a
