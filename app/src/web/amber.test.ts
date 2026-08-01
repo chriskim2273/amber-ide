@@ -90,7 +90,8 @@ describe('PaneLink', () => {
     expect(socket.sent).toEqual([new Uint8Array([97, 98])])
   })
 
-  it('never sends a resize, no matter what the port receives (spec §4/§6)', () => {
+  it('forwards a resize from the port as {t:"resize"} on this pane\'s own socket, debounced', () => {
+    vi.useFakeTimers()
     const socket = new FakeSocket()
     socket.open()
     const port = new FakePort()
@@ -98,6 +99,39 @@ describe('PaneLink', () => {
     socket.sent.length = 0
 
     port.fromRenderer({ resize: { cols: 100, rows: 40 } })
+    expect(socket.sent).toEqual([]) // not yet — debounced
+    vi.advanceTimersByTime(300)
+    expect(socket.sent).toEqual([JSON.stringify({ t: 'resize', name: 's1', cols: 100, rows: 40 })])
+  })
+
+  it('collapses a burst of resizes (a divider drag) into one send of the SETTLED size', () => {
+    vi.useFakeTimers()
+    const socket = new FakeSocket()
+    socket.open()
+    const port = new FakePort()
+    new PaneLink('s1', () => socket, port, () => {})
+    socket.sent.length = 0
+
+    port.fromRenderer({ resize: { cols: 90, rows: 30 } })
+    vi.advanceTimersByTime(100)
+    port.fromRenderer({ resize: { cols: 95, rows: 32 } })
+    vi.advanceTimersByTime(100)
+    port.fromRenderer({ resize: { cols: 100, rows: 40 } })
+    vi.advanceTimersByTime(300)
+    expect(socket.sent).toEqual([JSON.stringify({ t: 'resize', name: 's1', cols: 100, rows: 40 })])
+  })
+
+  it('a pending debounced resize is dropped, not sent late, once close() tears the pane down', () => {
+    vi.useFakeTimers()
+    const socket = new FakeSocket()
+    socket.open()
+    const port = new FakePort()
+    const link = new PaneLink('s1', () => socket, port, () => {})
+    socket.sent.length = 0
+
+    port.fromRenderer({ resize: { cols: 100, rows: 40 } })
+    link.close()
+    vi.advanceTimersByTime(300)
     expect(socket.sent).toEqual([])
   })
 
@@ -121,66 +155,6 @@ describe('PaneLink', () => {
     socket.emit(JSON.stringify({ t: 'error', msg: 'x' }))
     socket.emit(JSON.stringify({ t: 'activity', name: 's1' }))
     expect(port.posted).toEqual([])
-  })
-
-  it('posts its own session\'s live cols/rows down the port as a geom message', () => {
-    const socket = new FakeSocket()
-    socket.open()
-    const port = new FakePort()
-    new PaneLink('s1', () => socket, port, () => {})
-
-    socket.emit(JSON.stringify({
-      t: 'sessions',
-      sessions: [{ name: 'other', cols: 999, rows: 999 }, { name: 's1', cols: 80, rows: 24 }],
-    }))
-    expect(port.posted).toEqual([{ geom: { cols: 80, rows: 24 } }])
-  })
-
-  it('does not repost geom when a later sessions push reports the same cols/rows', () => {
-    const socket = new FakeSocket()
-    socket.open()
-    const port = new FakePort()
-    new PaneLink('s1', () => socket, port, () => {})
-
-    socket.emit(JSON.stringify({ t: 'sessions', sessions: [{ name: 's1', cols: 80, rows: 24 }] }))
-    socket.emit(JSON.stringify({ t: 'sessions', sessions: [{ name: 's1', cols: 80, rows: 24 }] }))
-    expect(port.posted).toEqual([{ geom: { cols: 80, rows: 24 } }])
-  })
-
-  it('reposts geom when the desktop app resizes the pty (a later sessions push changes cols/rows)', () => {
-    const socket = new FakeSocket()
-    socket.open()
-    const port = new FakePort()
-    new PaneLink('s1', () => socket, port, () => {})
-
-    socket.emit(JSON.stringify({ t: 'sessions', sessions: [{ name: 's1', cols: 80, rows: 24 }] }))
-    socket.emit(JSON.stringify({ t: 'sessions', sessions: [{ name: 's1', cols: 120, rows: 40 }] }))
-    expect(port.posted).toEqual([
-      { geom: { cols: 80, rows: 24 } },
-      { geom: { cols: 120, rows: 40 } },
-    ])
-  })
-
-  it('never posts geom for a dead session (cols/rows 0) or one not in the list', () => {
-    const socket = new FakeSocket()
-    socket.open()
-    const port = new FakePort()
-    new PaneLink('s1', () => socket, port, () => {})
-
-    socket.emit(JSON.stringify({ t: 'sessions', sessions: [{ name: 's1', cols: 0, rows: 0 }] }))
-    socket.emit(JSON.stringify({ t: 'sessions', sessions: [{ name: 'other', cols: 80, rows: 24 }] }))
-    expect(port.posted).toEqual([])
-  })
-
-  it('a geom-carrying sessions push never itself causes a resize (or anything else) to be sent to the socket', () => {
-    const socket = new FakeSocket()
-    socket.open()
-    const port = new FakePort()
-    new PaneLink('s1', () => socket, port, () => {})
-    socket.sent.length = 0
-
-    socket.emit(JSON.stringify({ t: 'sessions', sessions: [{ name: 's1', cols: 100, rows: 30 }] }))
-    expect(socket.sent).toEqual([])
   })
 
   it('close() closes the port and socket and sends no control message', () => {

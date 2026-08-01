@@ -459,8 +459,60 @@ fn the_mosaic_is_behind_the_cookie_boundary() {
     assert!(!body.contains("layout"), "layout leaked to a forged cookie: {body}");
 }
 
+/// Open a `/ws` connection with `cookie` already attached (the WebSocket
+/// upgrade requires the auth cookie, same as every other data route).
+fn ws_connect(f: &Fixture, cookie: &str) -> tungstenite::WebSocket<TcpStream> {
+    let stream = TcpStream::connect(f.addr).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let uri: tungstenite::http::Uri = format!("ws://{}/ws", f.addr).parse().unwrap();
+    let req = tungstenite::ClientRequestBuilder::new(uri).with_header("Cookie", cookie.to_string());
+    tungstenite::client::client(req, stream).unwrap().0
+}
+
 #[test]
-fn a_forged_resize_from_the_browser_never_reaches_the_pty() {
+fn a_valid_browser_resize_reaches_the_pty_within_bounds() {
+    // 2026-08-01 decision: the browser may now resize its own pty (reversing
+    // the earlier "never resize" rule) — validated at `map_browser_msg`.
+    let f = fixture();
+    let name = f.create_session();
+    let cookie = f.login();
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            f.get("/api/sessions", Some(&cookie)).2.contains(&name)
+        }),
+        "hub never saw the session"
+    );
+    let before: serde_json::Value =
+        serde_json::from_str(&f.get("/api/sessions", Some(&cookie)).2).unwrap();
+    let (cols, rows) = (
+        before["sessions"][0]["cols"].as_u64().unwrap(),
+        before["sessions"][0]["rows"].as_u64().unwrap(),
+    );
+    let (new_cols, new_rows) = (cols + 17, rows + 3);
+
+    let mut ws = ws_connect(&f, &cookie);
+    ws.send(tungstenite::Message::Text(
+        format!(r#"{{"t":"resize","name":"{name}","cols":{new_cols},"rows":{new_rows}}}"#).into(),
+    ))
+    .unwrap();
+
+    let resized = wait_until(Duration::from_secs(10), || {
+        let (_, _, b) = f.get("/api/sessions", Some(&cookie));
+        let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+        v["sessions"][0]["cols"].as_u64() == Some(new_cols)
+            && v["sessions"][0]["rows"].as_u64() == Some(new_rows)
+    });
+    assert!(resized, "a valid in-bounds browser resize never reached the pty");
+    let after: serde_json::Value =
+        serde_json::from_str(&f.get("/api/sessions", Some(&cookie)).2).unwrap();
+    assert_eq!(after["sessions"][0]["alive"], true, "session died");
+}
+
+#[test]
+fn an_out_of_bounds_browser_resize_is_rejected() {
+    // A browser window crushed to nothing must not be able to shrink the pty
+    // to something degenerate (1x1 SIGWINCHes every full-screen program into
+    // repainting garbage, and corrupts the desktop's layout on return).
     let f = fixture();
     let name = f.create_session();
     let cookie = f.login();
@@ -477,13 +529,9 @@ fn a_forged_resize_from_the_browser_never_reaches_the_pty() {
         before["sessions"][0]["rows"].as_u64().unwrap(),
     );
 
-    let stream = TcpStream::connect(f.addr).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    let uri: tungstenite::http::Uri = format!("ws://{}/ws", f.addr).parse().unwrap();
-    let req = tungstenite::ClientRequestBuilder::new(uri).with_header("Cookie", cookie.clone());
-    let (mut ws, _) = tungstenite::client::client(req, stream).unwrap();
+    let mut ws = ws_connect(&f, &cookie);
     ws.send(tungstenite::Message::Text(
-        format!(r#"{{"t":"resize","name":"{name}","cols":40,"rows":10}}"#).into(),
+        format!(r#"{{"t":"resize","name":"{name}","cols":1,"rows":1}}"#).into(),
     ))
     .unwrap();
     // Give the server more than a poll tick to act on it if it were going to.
@@ -491,8 +539,8 @@ fn a_forged_resize_from_the_browser_never_reaches_the_pty() {
 
     let after: serde_json::Value =
         serde_json::from_str(&f.get("/api/sessions", Some(&cookie)).2).unwrap();
-    assert_eq!(after["sessions"][0]["cols"].as_u64().unwrap(), cols, "pty was resized");
-    assert_eq!(after["sessions"][0]["rows"].as_u64().unwrap(), rows, "pty was resized");
+    assert_eq!(after["sessions"][0]["cols"].as_u64().unwrap(), cols, "pty was resized out of bounds");
+    assert_eq!(after["sessions"][0]["rows"].as_u64().unwrap(), rows, "pty was resized out of bounds");
     assert_eq!(after["sessions"][0]["alive"], true, "session died");
 }
 

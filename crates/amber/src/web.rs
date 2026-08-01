@@ -18,6 +18,10 @@
 //!   connection. One open session per connection; `open` while another is
 //!   open switches (`Detach` old, `Attach` new).
 //! - `{"t":"close","name":"<session>"}` — detach it.
+//! - `{"t":"resize","name":"..","cols":n,"rows":n}` — resize that session's
+//!   pty (2026-08-01 decision reversing the earlier "never resize" rule; see
+//!   Invariants below). Ignored (no-op, no error) for a session that isn't
+//!   currently live, or for cols/rows outside [`map_browser_msg`]'s bounds.
 //! - a BINARY frame — raw input bytes for this connection's currently-open
 //!   session. With no open session it is ignored.
 //!
@@ -26,8 +30,11 @@
 //! - `{"t":"sessions","sessions":[{"name","kind","cwd","run_state","alive",
 //!   "cols","rows"}]}` — sent once on connect and on every change (including
 //!   an empty list when the daemon is unreachable). `cols`/`rows` are the
-//!   pty's LIVE winsize: the phone renders at that geometry because it may
-//!   never resize (spec §4).
+//!   pty's LIVE winsize: the hand-written phone client (`assets/app.js`)
+//!   renders at that geometry and never sends a resize of its own (spec §4 of
+//!   the mobile design) — the newer React-renderer web build reads this the
+//!   same way the Electron client does (session-list display), not to drive
+//!   its own pane geometry.
 //! - `{"t":"exit","name":"..","code":n}`
 //! - `{"t":"error","msg":".."}`
 //!
@@ -36,17 +43,28 @@
 //!
 //! # Invariants
 //!
-//! - **The browser can never resize a pty** (spec §4). A pty's winsize is
-//!   shared with the desktop app, so a phone-driven resize would reflow the
-//!   user's live panes and corrupt a claude TUI. [`map_browser_msg`] is the
-//!   ONLY path from a browser message to a daemon control message, and there
-//!   is no `BrowserMsg` variant that can produce a `Resize`.
-//! - **The browser can create/kill/move/suspend/resume panes, validated at
-//!   the boundary** (pane-parity pass): `Create`/`Kill`/`Rename`/`Suspend`/
-//!   `Resume` are reachable, but only ever CONSTRUCTED from a validated name/
-//!   kind/cwd — never passed through. `Resize`, `Snapshot`, `DumpBacklog` and
-//!   `ReportRunState` remain unreachable from [`map_browser_msg`] by
-//!   construction (no `BrowserMsg` variant parses to them).
+//! - **The browser may resize a pty (2026-08-01 decision, reversing the
+//!   earlier "never resize" rule)** — the real React renderer's web build no
+//!   longer pins its xterm grid to the pty and shrinks its font to fit;
+//!   instead it resizes the pty to fit ITS pane, exactly like the Electron
+//!   desktop client. Accepted cost: a pty's winsize is shared with the
+//!   desktop app, so a browser-driven resize reflows the desktop's live
+//!   panes while the user is away from it — the desktop re-fits its own
+//!   panes on return and a running TUI repaints on the SIGWINCH, so this is
+//!   judged self-healing. [`map_browser_msg`] is the ONLY path from a browser
+//!   message to a daemon control message; its `Resize` arm is the one place
+//!   that constructs `ControlMsg::Resize`, and only after checking the
+//!   session is live and `cols`/`rows` are within [`RESIZE_MIN_COLS`]..=
+//!   [`RESIZE_MAX_COLS`] / [`RESIZE_MIN_ROWS`]..=[`RESIZE_MAX_ROWS`] — a
+//!   crushed/backgrounded browser window must not be able to shrink a pty to
+//!   something degenerate that corrupts the desktop's layout when it returns.
+//! - **The browser can create/kill/move/suspend/resume/resize panes,
+//!   validated at the boundary** (pane-parity pass, widened by the resize
+//!   reversal above): `Create`/`Kill`/`Rename`/`Suspend`/`Resume`/`Resize` are
+//!   reachable, but only ever CONSTRUCTED from validated parts — never passed
+//!   through. `Snapshot` and `ReportRunState` remain unreachable from
+//!   [`map_browser_msg`] by construction (no `BrowserMsg` variant parses to
+//!   them).
 //! - A large `Attach` backlog is delivered on the per-client writer thread,
 //!   never on the shared daemon-read thread (the backlog head-of-line lesson
 //!   in CLAUDE.md).
@@ -215,6 +233,10 @@ pub enum BrowserMsg {
     /// One-shot scrollback dump request (spec §3 "Backlog" row). Reply rides
     /// its own `backlogReply` marker + a binary frame — see [`Hub::on_frame`].
     DumpBacklog { name: String },
+    /// The browser resizing its own pty (2026-08-01 decision). `cols`/`rows`
+    /// are untrusted wire input — [`map_browser_msg`] is what bounds-checks
+    /// them before they can become a [`ControlMsg::Resize`].
+    Resize { name: String, cols: u16, rows: u16 },
 }
 
 /// Parse a browser control (JSON text) frame. `None` for malformed JSON, an
@@ -231,11 +253,30 @@ pub fn parse_browser_msg(text: &str) -> Option<BrowserMsg> {
         "suspend" => Some(BrowserMsg::Suspend { name: f("name")? }),
         "resume" => Some(BrowserMsg::Resume { name: f("name")? }),
         "dumpBacklog" => Some(BrowserMsg::DumpBacklog { name: f("name")? }),
-        // Anything else — including a hand-crafted `resize`/`snapshot` — has no
-        // representation here, so it can never reach the daemon.
+        "resize" => Some(BrowserMsg::Resize {
+            name: f("name")?,
+            cols: v.get("cols")?.as_u64().and_then(|n| u16::try_from(n).ok())?,
+            rows: v.get("rows")?.as_u64().and_then(|n| u16::try_from(n).ok())?,
+        }),
+        // Anything else — including a hand-crafted `snapshot`/`reportrunstate`
+        // — has no representation here, so it can never reach the daemon.
         _ => None,
     }
 }
+
+/// Bounds on a browser-requested pty resize (2026-08-01 decision), enforced in
+/// [`map_browser_msg`]. Floor: a browser window crushed to nothing (minimized,
+/// a backgrounded/`display:none` tab, a mid-layout transient) must not be able
+/// to shrink the pty to something degenerate — 10 cols / 4 rows is comfortably
+/// below any real split (the layout's own minimum ratio, 0.05, still leaves
+/// far more than this on a normal viewport) but well above a 1x1 that would
+/// SIGWINCH every full-screen program into repainting garbage. Ceiling: 1000
+/// cols / 300 rows is far beyond any real display, so it only rejects a
+/// broken/hostile client rather than a legitimate huge monitor.
+const RESIZE_MIN_COLS: u16 = 10;
+const RESIZE_MAX_COLS: u16 = 1000;
+const RESIZE_MIN_ROWS: u16 = 4;
+const RESIZE_MAX_ROWS: u16 = 300;
 
 /// Valid `Create` kinds. A pty runs a shell or `amber run <name> [--kind grok]`
 /// and nothing else — `Create` carries no argv, so this is the entire surface.
@@ -246,8 +287,11 @@ const CREATE_KINDS: [&str; 3] = ["shell", "claude", "grok"];
 /// currently-open session; `sessions` is the daemon's current session set.
 ///
 /// Every arm CONSTRUCTS its `ControlMsg` from validated parts; nothing from
-/// the browser is passed through. By construction there is no path from any
-/// browser input to **`Resize`**, `Snapshot` or `ReportRunState`.
+/// the browser is passed through unchecked. By construction there is no path
+/// from any browser input to `Snapshot` or `ReportRunState`; `Resize` IS
+/// reachable (2026-08-01 decision) but only for a live session and only
+/// within [`RESIZE_MIN_COLS`]..=[`RESIZE_MAX_COLS`] /
+/// [`RESIZE_MIN_ROWS`]..=[`RESIZE_MAX_ROWS`].
 pub fn map_browser_msg(
     msg: &BrowserMsg,
     open: Option<&str>,
@@ -320,6 +364,15 @@ pub fn map_browser_msg(
                 return Vec::new();
             }
             vec![ControlMsg::DumpBacklog { name: name.clone() }]
+        }
+        BrowserMsg::Resize { name, cols, rows } => {
+            if !live(name)
+                || !(RESIZE_MIN_COLS..=RESIZE_MAX_COLS).contains(cols)
+                || !(RESIZE_MIN_ROWS..=RESIZE_MAX_ROWS).contains(rows)
+            {
+                return Vec::new();
+            }
+            vec![ControlMsg::Resize { name: name.clone(), cols: *cols, rows: *rows }]
         }
     }
 }
@@ -695,7 +748,8 @@ impl Hub {
             | BrowserMsg::Move { .. }
             | BrowserMsg::Suspend { .. }
             | BrowserMsg::Resume { .. }
-            | BrowserMsg::DumpBacklog { .. } => previous,
+            | BrowserMsg::DumpBacklog { .. }
+            | BrowserMsg::Resize { .. } => previous,
         };
         for control in controls {
             if let ControlMsg::Detach { name } = &control {
@@ -1385,11 +1439,14 @@ mod tests {
             parse_browser_msg(r#"{"t":"resume","name":"s"}"#),
             Some(BrowserMsg::Resume { name: "s".into() })
         );
+        assert_eq!(
+            parse_browser_msg(r#"{"t":"resize","name":"s","cols":80,"rows":24}"#),
+            Some(BrowserMsg::Resize { name: "s".into(), cols: 80, rows: 24 })
+        );
         for junk in [
             "",
             "not json",
             "[]",
-            r#"{"t":"resize","name":"s","cols":80,"rows":24}"#,
             r#"{"t":"rename","from":"s","to":"t"}"#,
             r#"{"t":"snapshot"}"#,
             r#"{"t":"dumpbacklog","name":"s"}"#,
@@ -1397,21 +1454,29 @@ mod tests {
             r#"{"t":"open"}"#,
             r#"{"t":"open","name":123}"#,
             r#"{"name":"s"}"#,
+            // resize with a non-numeric or out-of-u16-range cols/rows must
+            // not parse at all (never a BrowserMsg carrying garbage that
+            // `map_browser_msg` then has to bounds-check).
+            r#"{"t":"resize","name":"s","cols":"wide","rows":24}"#,
+            r#"{"t":"resize","name":"s","cols":999999,"rows":24}"#,
+            r#"{"t":"resize","name":"s","rows":24}"#,
         ] {
             assert_eq!(parse_browser_msg(junk), None, "must ignore {junk:?}");
         }
     }
 
     /// Every control message the browser must never be able to cause (spec §4,
-    /// widened by the pane-parity pass). This is the single most important
-    /// invariant in the feature: a pty's winsize is shared with the desktop
-    /// app, and `Snapshot`/`DumpBacklog`/`ReportRunState` are
-    /// daemon/supervisor-internal.
+    /// widened by the pane-parity pass and the 2026-08-01 resize reversal).
+    /// `Snapshot`/`ReportRunState` are daemon/supervisor-internal; `Resize` is
+    /// deliberately NOT here any more — it is validated (live + bounds), not
+    /// forbidden — see `map_browser_msg_resize_validates_session_and_bounds`.
     fn is_forbidden(msg: &ControlMsg) -> bool {
         // `DumpBacklog` is deliberately NOT here: the 2026-08-01 webapp pivot
         // widened the whitelist to include it (spec §3 "Backlog" row) behind
-        // its own `live(name)` gate in `map_browser_msg`.
-        matches!(msg, ControlMsg::Resize { .. } | ControlMsg::Snapshot | ControlMsg::ReportRunState { .. })
+        // its own `live(name)` gate in `map_browser_msg`. `Resize` is
+        // deliberately NOT here either, as of the 2026-08-01 resize reversal:
+        // it is validated (live + bounds), not forbidden.
+        matches!(msg, ControlMsg::Snapshot | ControlMsg::ReportRunState { .. })
     }
 
     #[test]
@@ -1576,10 +1641,11 @@ mod tests {
     }
 
     #[test]
-    fn resize_and_the_other_forbidden_controls_remain_unreachable() {
+    fn snapshot_and_reportrunstate_remain_unreachable() {
         // There is no BrowserMsg that parses to them, so no mapping exists.
+        // (`resize` used to be in this list — it now parses, see
+        // `map_browser_msg_resize_validates_session_and_bounds` for its gate.)
         for text in [
-            r#"{"t":"resize","name":"amber-1-1-0-aa","cols":40,"rows":20}"#,
             r#"{"t":"snapshot"}"#,
             r#"{"t":"dumpbacklog","name":"amber-1-1-0-aa"}"#,
             r#"{"t":"reportrunstate","name":"amber-1-1-0-aa","state":"claude"}"#,
@@ -1589,11 +1655,80 @@ mod tests {
     }
 
     #[test]
+    fn map_browser_msg_resize_validates_session_and_bounds() {
+        let live = [s("s", "shell")];
+        // Live session, in-bounds size -> reaches the daemon, constructed
+        // (not passed through) from the validated name/cols/rows.
+        assert_eq!(
+            map_browser_msg(&BrowserMsg::Resize { name: "s".into(), cols: 80, rows: 24 }, None, &live),
+            vec![ControlMsg::Resize { name: "s".into(), cols: 80, rows: 24 }]
+        );
+        // Dead/unknown session -> nothing reaches the daemon.
+        assert!(map_browser_msg(
+            &BrowserMsg::Resize { name: "ghost".into(), cols: 80, rows: 24 },
+            None,
+            &live
+        )
+        .is_empty());
+        // Below the floor (a crushed/backgrounded browser window) -> rejected,
+        // never clamped up to something plausible-looking.
+        assert!(map_browser_msg(
+            &BrowserMsg::Resize { name: "s".into(), cols: 1, rows: 1 },
+            None,
+            &live
+        )
+        .is_empty());
+        assert!(map_browser_msg(
+            &BrowserMsg::Resize { name: "s".into(), cols: RESIZE_MIN_COLS - 1, rows: 24 },
+            None,
+            &live
+        )
+        .is_empty());
+        assert!(map_browser_msg(
+            &BrowserMsg::Resize { name: "s".into(), cols: 80, rows: RESIZE_MIN_ROWS - 1 },
+            None,
+            &live
+        )
+        .is_empty());
+        // Above the ceiling -> rejected.
+        assert!(map_browser_msg(
+            &BrowserMsg::Resize { name: "s".into(), cols: RESIZE_MAX_COLS + 1, rows: 24 },
+            None,
+            &live
+        )
+        .is_empty());
+        assert!(map_browser_msg(
+            &BrowserMsg::Resize { name: "s".into(), cols: 80, rows: RESIZE_MAX_ROWS + 1 },
+            None,
+            &live
+        )
+        .is_empty());
+        // Exactly at the floor/ceiling -> accepted (inclusive bounds).
+        assert_eq!(
+            map_browser_msg(
+                &BrowserMsg::Resize { name: "s".into(), cols: RESIZE_MIN_COLS, rows: RESIZE_MIN_ROWS },
+                None,
+                &live
+            ),
+            vec![ControlMsg::Resize { name: "s".into(), cols: RESIZE_MIN_COLS, rows: RESIZE_MIN_ROWS }]
+        );
+        assert_eq!(
+            map_browser_msg(
+                &BrowserMsg::Resize { name: "s".into(), cols: RESIZE_MAX_COLS, rows: RESIZE_MAX_ROWS },
+                None,
+                &live
+            ),
+            vec![ControlMsg::Resize { name: "s".into(), cols: RESIZE_MAX_COLS, rows: RESIZE_MAX_ROWS }]
+        );
+    }
+
+    #[test]
     fn no_browser_input_can_reach_a_forbidden_control_message() {
         // Exhaustive over the parseable surface: every JSON the browser could
         // send, crossed with every open-state and live-set, must never produce
-        // Resize/Snapshot/DumpBacklog/ReportRunState, and every message it DOES
-        // produce is one of the widened whitelist's variants.
+        // Snapshot/ReportRunState, and every message it DOES produce is one of
+        // the widened whitelist's variants — Resize included, but ONLY within
+        // `map_browser_msg`'s bounds (checked in the loop below).
         let live = [s("s", "shell"), s("t", "shell")];
         let texts = [
             r#"{"t":"open","name":"s"}"#,
@@ -1630,9 +1765,20 @@ mod tests {
                                     | ControlMsg::Suspend { .. }
                                     | ControlMsg::Resume { .. }
                                     | ControlMsg::DumpBacklog { .. }
+                                    | ControlMsg::Resize { .. }
                             ),
                             "{text:?} produced non-whitelisted {out:?}"
                         );
+                        // A Resize that DID make it out must be within bounds —
+                        // the whitelist match above only checks the variant,
+                        // not that map_browser_msg actually enforced its gate.
+                        if let ControlMsg::Resize { cols, rows, .. } = out {
+                            assert!(
+                                (RESIZE_MIN_COLS..=RESIZE_MAX_COLS).contains(&cols)
+                                    && (RESIZE_MIN_ROWS..=RESIZE_MAX_ROWS).contains(&rows),
+                                "{text:?} produced an out-of-bounds Resize {cols}x{rows}"
+                            );
+                        }
                     }
                 }
             }
