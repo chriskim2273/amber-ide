@@ -8,9 +8,9 @@ state) is untouched — no daemon/protocol change.
 
 ## Commits
 
-- `0407016` feat(layout): compare-and-swap the ui-layout.json sidecar (spec §6)
+- `9531a48` feat(layout): compare-and-swap the ui-layout.json sidecar (spec §6)
 
-(single commit; `git log --oneline -1` on `feat/live-tiles` after this change)
+(single commit on `feat/live-tiles`)
 
 ## Test summary
 
