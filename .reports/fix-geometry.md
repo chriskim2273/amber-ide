@@ -237,3 +237,81 @@ Cleaned up again: private daemon + `amber web --port 7799` under
 `/tmp/gzfix` killed and removed; confirmed the user's real daemon
 (`amber daemon`, `amber web --port 7717`, and all 14 running claude sessions)
 untouched throughout.
+
+### Additional check: does the `[fontSize]` effect's ordering make things worse?
+
+A reviewer flagged a real question before accepting "harmless simplification
+either way": `Pane.tsx`'s `[fontSize]` effect sets `term.options.fontSize =
+fontSize` (which makes xterm re-measure its cell size) *before* the
+`serverGeomRef.current` branch calls `rescale()` — so under `zoom`, that
+re-measurement happens while the OLD zoom value is still live on `stage`,
+unlike under `transform` where timing never mattered because `transform`
+touched no measurement at all. Checked by grepping the shipped
+`@xterm/xterm` bundle rather than assuming: the entire bundle has exactly one
+`getBoundingClientRect().width` call, and it's in `AccessibilityManager`
+(screen-reader row alignment), unrelated to mouse/cell math. The actual cell
+width comes from `CharSizeService`/`_measure`, both of which read
+`.offsetWidth` on a hidden measuring element. Since Concern 1 already
+established `offsetWidth` never reflects the ambient `zoom` (not even for the
+zoomed element's own box), that measurement is zoom-invariant by construction
+— re-measuring with a stale zoom in effect can't corrupt it.
+
+Verified live (respun the same private daemon + sidecar split, dispatched the
+`font-bigger` chord as a synthetic `KeyboardEvent` while both panes were
+scaled): both panes' `.xterm-screen` natural `offsetWidth` moved together
+(626px → 674px) — no divergence, no corruption. The click-mapping mismatch
+**persists as the exact same predictable formula** (`selected col = clicked
+col × current effective scale`) rather than becoming inconsistent or
+undefined: with the bigger font the container-vs-natural-size ratio changed
+for BOTH panes (taller/wider cells no longer fit either box at 1×), so the
+**wide pane — previously scale ≈ 1 and therefore unaffected — now also
+mis-selects** (clicked col 70 → selected "2024" at col 45, scale ≈0.654,
+70×0.654≈45.8) and the narrow pane's mismatch tracks its own new scale
+(≈0.326 → col 70 → col 23, a whitespace run). So: the fontSize-ordering
+question is answered — it introduces no new/worse failure mode — but it
+surfaces a sharper framing of Concern 1: **"no regression where it already
+worked" is conditional on the pane staying at scale 1**, and any split ratio
+or font size that pushes a pane below 1× (in EITHER axis) puts it in the same
+broken bucket, including panes that started out fine.
+
+### Incidental bug noticed, not fixed (separate from this task)
+
+Every mouse selection change in the web build throws in the console:
+`window.amber.resolvePath: not available in the web build`, from
+`Pane.tsx`'s `term.onSelectionChange` handler (used for the "Open in file
+manager" floating button) — `app/src/web/install.ts` doesn't implement
+`resolvePath` at all, only Electron's preload does. This is almost certainly
+why the very first synthetic double-click after each fresh page load in this
+session consistently produced an empty selection overlay and every
+double-click after it worked fine: the uncaught exception aborts the
+handler-chain synchronously, and xterm's own visual-selection update
+apparently races/depends on that same chain not being interrupted the first
+time (subsequent clicks stopped hitting whatever cold-start path triggers
+it). Not touched here — out of scope for the mouse-precision regression —
+but worth a ticket, since it means every plain click in the web build
+currently logs an uncaught error.
+
+### Keep vs. revert — open question for the user
+
+The `zoom` swap is committed (`4359243`) and is a legitimate simplification on
+its own terms (one scaling mechanism instead of two, no functional
+regression demonstrated anywhere: geometry, keystroke routing, and the
+fontSize path all check out). But it delivers **no actual fix** for the
+mouse-click regression this task exists to close — Concern 1 is unresolved,
+just as it was on `transform`. Options, not chosen here:
+1. Keep `zoom` as committed (arguably still the better mechanism going
+   forward, and matches "the named upgrade path"), and separately pursue a
+   coordinate fix — e.g. divide the click offset by `Element.currentCSSZoom`
+   before column math, which means carrying a small patch against xterm since
+   `MouseService`/`CharSizeService` know nothing about zoom.
+2. Revert `Pane.tsx` to the `transform`-based commit (`07f668f`) and keep only
+   this report's findings — since `zoom` demonstrably doesn't solve the
+   problem it was reached for, transform is no worse and is one less new
+   mechanism in the codebase.
+3. Sidestep scaling entirely: shrink `term.options.fontSize` until the
+   natural 80×24 box fits the container (quantized steps, letterboxing the
+   slack) so the effective scale is always 1 and xterm's own click math stays
+   internally consistent by construction, at the cost of a non-full-bleed
+   render in odd-sized panes.
+Not picking one of these without direction, per the instruction to stop and
+report a concrete `zoom` problem rather than silently choosing a third path.
