@@ -65,6 +65,7 @@ use std::time::{Duration, Instant};
 
 use amber_core::proto::{self, ControlMsg, Decoder, Frame, SessionInfo};
 
+use crate::layout_cas;
 use crate::mosaic;
 
 // ---- constant-time comparison ------------------------------------------
@@ -1068,6 +1069,45 @@ fn handle_conn(mut stream: TcpStream, hub: &Arc<Hub>, auth: &Arc<Auth>) -> anyho
             let home = std::env::var("HOME").ok().filter(|h| !h.is_empty()).unwrap_or_else(|| "/".into());
             let body = serde_json::json!({ "home": home }).to_string();
             Ok(respond(&mut stream, "200 OK", CT_JSON, &[], body.as_bytes())?)
+        }
+        // Layout CAS (spec 2026-08-01 §6): the browser and the desktop app
+        // are both writers of `ui-layout.json` now, so reads/writes go
+        // through `layout_cas`, which re-checks the version under the same
+        // call that renames the file into place — never a plain overwrite.
+        ("GET", "/api/layout") => {
+            if !auth.valid_cookie(&req) {
+                return Ok(respond(&mut stream, "401 Unauthorized", "", &[], b"")?);
+            }
+            let loaded = layout_cas::load(&hub.root);
+            let body = serde_json::json!({ "text": loaded.text, "version": loaded.version }).to_string();
+            Ok(respond(&mut stream, "200 OK", CT_JSON, &[], body.as_bytes())?)
+        }
+        ("POST", "/api/layout") => {
+            if !auth.valid_cookie(&req) {
+                return Ok(respond(&mut stream, "401 Unauthorized", "", &[], b"")?);
+            }
+            let Ok(body) = serde_json::from_slice::<serde_json::Value>(&req.body) else {
+                return Ok(respond(&mut stream, "400 Bad Request", "", &[], b"")?);
+            };
+            let Some(text) = body.get("text").and_then(|v| v.as_str()) else {
+                return Ok(respond(&mut stream, "400 Bad Request", "", &[], b"")?);
+            };
+            let version = body.get("version").and_then(|v| v.as_str());
+            match layout_cas::save(&hub.root, text, version) {
+                layout_cas::SaveResult::Ok { version } => {
+                    let out = serde_json::json!({ "ok": true, "version": version }).to_string();
+                    Ok(respond(&mut stream, "200 OK", CT_JSON, &[], out.as_bytes())?)
+                }
+                layout_cas::SaveResult::Conflict { text, version } => {
+                    let out =
+                        serde_json::json!({ "conflict": true, "text": text, "version": version }).to_string();
+                    Ok(respond(&mut stream, "409 Conflict", CT_JSON, &[], out.as_bytes())?)
+                }
+                layout_cas::SaveResult::Error(e) => {
+                    let out = serde_json::json!({ "error": e }).to_string();
+                    Ok(respond(&mut stream, "500 Internal Server Error", CT_JSON, &[], out.as_bytes())?)
+                }
+            }
         }
         ("GET", "/ws") => {
             if !auth.valid_cookie(&req) {

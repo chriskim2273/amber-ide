@@ -27,6 +27,8 @@
 // ever delivered to the connection with that session `open`) and its own
 // `backlog` replay tag.
 
+import type { LoadLayoutResult, SaveLayoutResult, LayoutVersion } from '../shared/layoutFile'
+
 export interface SocketLike {
   send(data: string | Uint8Array): void
   close(): void
@@ -309,6 +311,13 @@ export interface AmberDeps {
   clipboard: { writeText: (text: string) => Promise<void>; readText: () => Promise<string> }
   home: string
   softwareGl: boolean
+  // Layout CAS (spec 2026-08-01 §6), injected so this file stays fetch-free
+  // and testable with fakes (the rest of the file's discipline). The real
+  // implementations (install.ts) round-trip `/api/layout` on `amber web`
+  // (crates/amber/src/web.rs), behind the same cookie boundary as
+  // `/api/sessions`.
+  layoutGet: () => Promise<LoadLayoutResult>
+  layoutSave: (text: string, version: LayoutVersion) => Promise<SaveLayoutResult>
 }
 
 function notImplemented(name: string): () => never {
@@ -373,18 +382,12 @@ export function createAmber(deps: AmberDeps): Window['amber'] {
     },
     clipboardRead: (): Promise<string> => deps.clipboard.readText(),
 
-    // --- §6 (layout CAS) not built here — see the follow-up task named
-    // below. Left as inert no-ops (not stubs: the mount effect calls both
-    // unconditionally, and a thrown error here would break every load).
-    // TODO(webapp-layout-cas): implement compare-and-swap per spec §6
-    // (docs/superpowers/specs/2026-08-01-amber-ide-as-a-webapp-design.md).
-    // The eventual `saveLayout` MUST preserve the sidecar's `browsers`/
-    // `editors` maps (spec §7) — those panes have no daemon session, so a
-    // naive "write whatever the renderer's current tree says" implementation
-    // would silently prune every desktop-only pane on the web build's first
-    // write.
-    loadLayout: (): Promise<string | null> => Promise.resolve(null),
-    saveLayout: (): Promise<void> => Promise.resolve(),
+    // --- layout CAS (spec §6): thin passthrough to the injected HTTP hooks.
+    // `main.tsx`'s persist effect is what actually implements the CAS retry/
+    // merge (mergeLayout) — this file only needs to round-trip the wire
+    // shape, exactly like every other method here.
+    loadLayout: (): Promise<LoadLayoutResult> => deps.layoutGet(),
+    saveLayout: (text, version): Promise<SaveLayoutResult> => deps.layoutSave(text, version),
 
     // --- §7 cuts + native dialogs: visible-throw stubs, never a silent no-op
     saveWorkspaceFile: notImplemented('saveWorkspaceFile'),

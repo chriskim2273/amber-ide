@@ -4,6 +4,7 @@
 // `createAmber` directly against fakes.
 
 import { createAmber, type SocketLike, type PortLike } from './amber'
+import type { LoadLayoutResult, SaveLayoutResult, LayoutVersion } from '../shared/layoutFile'
 
 function wsUrl(): string {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
@@ -33,6 +34,40 @@ function probeSoftwareGl(): boolean {
   return true
 }
 
+// Layout CAS (spec §6): thin `fetch` wrappers over `/api/layout` — the same
+// cookie-gated route family as `/api/sessions`/`/api/bootstrap`. `amber.ts`
+// stays fetch-free; `main.tsx`'s persist effect does the actual CAS retry/
+// merge and only needs these two calls to behave like the Electron preload's
+// `ipcRenderer.invoke('layout-load'/'layout-save', …)`.
+async function layoutGet(): Promise<LoadLayoutResult> {
+  try {
+    const r = await fetch('/api/layout', { credentials: 'same-origin' })
+    if (!r.ok) return { text: null, version: null }
+    const body = (await r.json()) as Partial<LoadLayoutResult>
+    return { text: body.text ?? null, version: body.version ?? null }
+  } catch {
+    return { text: null, version: null }
+  }
+}
+
+async function layoutSave(text: string, version: LayoutVersion): Promise<SaveLayoutResult> {
+  try {
+    const r = await fetch('/api/layout', {
+      method: 'POST',
+      credentials: 'same-origin',
+      body: JSON.stringify({ text, version }),
+    })
+    const body = (await r.json().catch(() => null)) as
+      | { ok?: boolean; conflict?: boolean; text?: string | null; version?: LayoutVersion; error?: string }
+      | null
+    if (r.status === 200 && body?.ok) return { ok: true, version: body.version ?? null }
+    if (r.status === 409 && body?.conflict) return { conflict: true, text: body.text ?? null, version: body.version ?? null }
+    return { error: body?.error ?? `HTTP ${r.status}` }
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : String(e) }
+  }
+}
+
 /** Install `window.amber`. Must run with `home` already known — `main.tsx`
  * reads `homeDir` via a lazy `useState` initializer that runs exactly once,
  * so a placeholder patched in later would permanently stick every new pane's
@@ -53,5 +88,7 @@ export function installAmber(home: string): void {
     },
     home,
     softwareGl: probeSoftwareGl(),
+    layoutGet,
+    layoutSave,
   })
 }

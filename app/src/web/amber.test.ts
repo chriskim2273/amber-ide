@@ -175,6 +175,8 @@ describe('PaneLink', () => {
       clipboard: { writeText: () => Promise.resolve(), readText: () => Promise.resolve('') },
       home: '/home/x',
       softwareGl: false,
+      layoutGet: () => Promise.resolve({ text: null, version: null }),
+      layoutSave: () => Promise.resolve({ ok: true, version: null }),
     }
     const amber = createAmber(deps)
     amber.openPane('s1')
@@ -262,6 +264,8 @@ describe('createAmber', () => {
       clipboard: { writeText: () => Promise.resolve(), readText: () => Promise.resolve('clip') },
       home: '/home/x',
       softwareGl: false,
+      layoutGet: () => Promise.resolve({ text: null, version: null }),
+      layoutSave: () => Promise.resolve({ ok: true, version: null }),
       ...overrides,
     }
   }
@@ -329,10 +333,22 @@ describe('createAmber', () => {
     await expect(amber.clipboardRead()).resolves.toBe('hi')
   })
 
-  it('loadLayout/saveLayout are inert no-ops (CAS is a follow-up task)', async () => {
-    const amber = createAmber(deps())
-    await expect(amber.loadLayout()).resolves.toBeNull()
-    await expect(amber.saveLayout('anything')).resolves.toBeUndefined()
+  it('loadLayout/saveLayout are a thin passthrough to the injected HTTP hooks', async () => {
+    const layoutGet = vi.fn(() => Promise.resolve({ text: '{"a":1}', version: 'v1' }))
+    const layoutSave = vi.fn((text: string, version: string | null) =>
+      Promise.resolve({ ok: true as const, version: text + version }))
+    const amber = createAmber(deps({ layoutGet, layoutSave }))
+
+    await expect(amber.loadLayout()).resolves.toEqual({ text: '{"a":1}', version: 'v1' })
+    await expect(amber.saveLayout('{"b":2}', 'v1')).resolves.toEqual({ ok: true, version: '{"b":2}v1' })
+    expect(layoutSave).toHaveBeenCalledWith('{"b":2}', 'v1')
+  })
+
+  it('surfaces a saveLayout conflict verbatim (the caller merges, not this file)', async () => {
+    const layoutSave = vi.fn(() =>
+      Promise.resolve({ conflict: true as const, text: 'on-disk', version: 'v2' }))
+    const amber = createAmber(deps({ layoutSave }))
+    await expect(amber.saveLayout('mine', 'v1')).resolves.toEqual({ conflict: true, text: 'on-disk', version: 'v2' })
   })
 
   it('every §7/native-dialog stub rejects visibly instead of silently resolving', () => {
