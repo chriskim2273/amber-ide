@@ -251,19 +251,26 @@ export const Pane = memo(function Pane(
 
     // Web-geometry mode only (serverGeomRef set): fit the terminal's REAL
     // cell box into the container on both axes, never magnifying past natural
-    // size, via a CSS transform — never a resize. Mirrors `applyScale` in the
+    // size, via CSS `zoom` — never a resize. Mirrors `applyScale` in the
     // mobile client (`crates/amber/assets/app.js`), including the never-
     // magnify clamp (fixed there in 32e863e after an 80-col grid blew up 2.25x
-    // on a laptop-width viewport). `transform-origin: 0 0` (set in the JSX
-    // below) keeps the scaled box pinned to the container's top-left corner,
-    // matching where `sizer`/`stage` are actually laid out, so the visible
-    // terminal lines up with its own hit-testable box (no dead click zone).
+    // on a laptop-width viewport). `zoom` (not `transform: scale()`) is
+    // deliberate: `transform` is paint-only, so it left `getBoundingClientRect`
+    // (screen space) and xterm's own `offsetWidth` cell-size measurement
+    // (layout space, unaffected by transform) disagreeing by exactly the scale
+    // factor — every click landed on the wrong cell. `zoom` scales the layout
+    // box itself, so both agree and xterm's mouse math needs no patching.
     const rescale = (): void => {
       const geom = serverGeomRef.current
       const sizer = sizerRef.current, stage = stageRef.current, container = containerRef.current
       const el = term.element
       if (!geom || !sizer || !stage || !container || !el) return
       if (!container.clientWidth || !container.clientHeight) return
+      // Reset zoom before measuring: unlike transform, zoom IS layout-affecting
+      // and cascades to descendants, so a zoom left over from a previous
+      // rescale would already be baked into `.xterm-screen`'s offsetWidth/
+      // Height — measuring without resetting first would compound every call.
+      stage.style.zoom = '1'
       const scr = el.querySelector('.xterm-screen') as HTMLElement | null
       const w = scr ? scr.offsetWidth : el.offsetWidth
       const h = scr ? scr.offsetHeight : el.offsetHeight
@@ -271,7 +278,7 @@ export const Pane = memo(function Pane(
       const scale = Math.min(container.clientWidth / w, container.clientHeight / h, 1)
       stage.style.width = `${w}px`
       stage.style.height = `${h}px`
-      stage.style.transform = `scale(${scale})`
+      stage.style.zoom = String(scale)
       sizer.style.width = `${w * scale}px`
       sizer.style.height = `${h * scale}px`
     }
@@ -499,11 +506,11 @@ export const Pane = memo(function Pane(
     <div ref={containerRef} style={{ position: 'relative', width: '100%', height: '100%', background: 'var(--bg)', display: 'flex', overflow: 'hidden' }}>
       {/* `sizer` is sized in JS (rescale, above) to the SCALED box and centred
           via `margin: auto` in this flex container; `stage` is sized to the
-          terminal's real (unscaled) cell box and transform-scaled to fit —
+          terminal's real (unscaled) cell box and CSS-`zoom`-scaled to fit —
           both stay 100%/100% identity, matching plain passthrough divs, until
           web-geometry mode sets explicit pixel sizes. */}
       <div ref={sizerRef} style={{ margin: 'auto', flex: 'none', width: '100%', height: '100%' }}>
-        <div ref={stageRef} style={{ width: '100%', height: '100%', transformOrigin: '0 0' }}>
+        <div ref={stageRef} style={{ width: '100%', height: '100%' }}>
           <div ref={hostRef} style={{ width: '100%', height: '100%' }} />
         </div>
       </div>

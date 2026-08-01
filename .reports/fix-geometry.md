@@ -151,3 +151,89 @@ Additional checks, all passing:
   engines needs its own verification pass, not a guess.
 - The web bundle's `main-*.js` chunk is >500 KB (pre-existing vite warning,
   unrelated to this change).
+
+## Follow-up (2026-08-01) — tried the named upgrade path (`zoom`), it does not fix Concern 1
+
+**Status: code changed, mouse bug NOT fixed. Stopping here to report per explicit
+instruction, rather than reverting or picking a third option.**
+
+**What changed:** `app/src/renderer/Pane.tsx`'s `rescale()` now sets
+`stage.style.zoom = String(scale)` instead of `stage.style.transform =
+'scale(...)'`, and the `transform-origin: 0 0` that existed only to anchor the
+transform's origin was removed from the JSX. `sizer`'s manual `w*scale`/`h*scale`
+sizing was kept unchanged (still needed — see below). This is the only file
+touched, matching the original fix's footprint. Gates all still green:
+`npm run typecheck`, `npm test` (451 passed / 1 pre-existing skip, unchanged),
+`cargo test --workspace` (313 passed — Rust untouched by either pass),
+`cargo clippy --workspace --all-targets -- -D warnings` (clean), `npm run
+build:web` (clean, same pre-existing >500 KB chunk warning).
+
+**Why `zoom` was expected to fix it:** `MouseService.getCoords` divides a
+click's `getBoundingClientRect()`-relative offset by `CharSizeService`'s
+measured cell width, which reads `offsetWidth`. With `transform`, the click
+offset is in screen space (transform-affected) and the cell width is in layout
+space (transform-*un*affected) — they disagree by the scale factor. `zoom` was
+supposed to make both layout-affecting, so they'd agree.
+
+**What live testing actually found, verified against real Chromium (Playwright's
+bundled browser), not assumed:** `zoom` does NOT make a descendant's own
+`offsetWidth` reflect its ancestor's zoom, and — more surprising — it does not
+even make the *zoomed element's own* `offsetWidth` reflect its *own* zoom.
+Measured directly on the narrow pane's `stage` div (the element with
+`style="zoom: 0.667732"` set on it directly, not a descendant):
+  - `stage.offsetWidth` → **626** (the authored, un-zoomed value)
+  - `stage.getBoundingClientRect().width` → **418** (626 × 0.667732, the
+    on-screen/viewport value)
+So the exact same class of unit mismatch that `transform` produced (a
+screen-space number divided by a layout-space number) exists just as much
+under `zoom` in this Chromium — `offsetWidth`/`clientWidth` stay in the
+element's own un-zoomed CSS-pixel terms; only `getBoundingClientRect` (and
+mouse event `clientX`/`clientY`) reflect the zoomed/on-screen size. (This
+matches why the DOM has a dedicated `Element.currentCSSZoom` accessor for
+code that wants to compensate — its existence is itself evidence that
+`offsetWidth` does not self-correct for zoom. xterm's shipped `CharSizeService`
+does not know about `currentCSSZoom` and was not going to be patched here.)
+
+**Reproduced the exact same failure, both before and after, on identical
+live conditions** (same private daemon, same 70/30 sidecar split, same
+`ls -la /usr/bin | head -40` backlog, same row 22
+`-rwxr-xr-x  1 root root        23008 Oct 22  2024 apt-extracttemplates`,
+same synthetic double-click methodology — a `MouseEvent('mousedown', {detail:
+2, clientX, clientY})` dispatched at the visual screen position of column 70,
+since xterm keys single/double/triple-click handling off `event.detail` on
+`mousedown`, not off a native `dblclick`; verified by reading the resulting
+`.xterm-selection` overlay div's `left`/`width` and mapping back through the
+row's own text, rather than trusting a value from inside the closed-over
+`Terminal` instance, which isn't reachable from outside React):
+
+| | clicked column | selected columns | selected text |
+|---|---|---|---|
+| **before** (`transform`, re-measured fresh via `git stash`, same page/build/daemon) | 70 | 45–48 | `2024` |
+| **after** (`zoom`, this pass) | 70 | 45–48 | `2024` |
+
+Wide pane (scale ≈ 1, both versions): clicked column 70 → selected column 70
+(startCol reported by the same script) — correct in both, confirming no
+regression where it already worked, exactly as before.
+
+Also re-confirmed on the final (`zoom`) build: both panes' `/api/sessions`
+still report `cols:80,rows:24` (the pty untouched); a distinct marker typed
+into the narrow pane (`echo ZOOM_MARKER_6`) appeared only in that pane's
+terminal, not the wide one (keystroke routing intact).
+
+**Left in place as instructed:** the `zoom` swap is kept in the tree (not
+reverted to `transform`) — per the task's explicit instruction to stop and
+report a concrete `zoom` rendering problem rather than reverting or picking a
+third option myself. It is a legitimate, harmless simplification either way
+(one CSS mechanism instead of two, `transform-origin` cruft removed) but it is
+**not a fix for the mouse-click regression** — that regression is unresolved
+and needs a decision from the user: patch xterm-side (e.g. feed
+`currentCSSZoom` into `CharSizeService`, or hand-correct `MouseService`'s
+computed column by dividing out the zoom before column math — both mean
+carrying a patched xterm), accept the tradeoff as documented in Concern 1
+above (same as the mobile client), or something else. Not attempted here
+without direction, per the same instruction.
+
+Cleaned up again: private daemon + `amber web --port 7799` under
+`/tmp/gzfix` killed and removed; confirmed the user's real daemon
+(`amber daemon`, `amber web --port 7717`, and all 14 running claude sessions)
+untouched throughout.
