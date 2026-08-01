@@ -315,3 +315,230 @@ just as it was on `transform`. Options, not chosen here:
    render in odd-sized panes.
 Not picking one of these without direction, per the instruction to stop and
 report a concrete `zoom` problem rather than silently choosing a third path.
+
+## Follow-up (2026-08-01) — option 3 chosen: font-shrink, no scaling at all
+
+**Status: done. The mouse bug is fixed.**
+
+Both prior attempts scaled a terminal whose own measurements assume it is
+unscaled (`transform` leaves `offsetWidth` in layout space while clicks land
+in screen space; `zoom` turned out not to update `offsetWidth` either, in this
+Chromium). This pass removes the scale factor from the equation instead of
+trying to correct for it: render the pty's 80×24 grid at whatever font size
+makes it fit — never scaled — so `MouseService`'s click math and
+`CharSizeService`'s `offsetWidth` are reading the same untransformed layout
+and agree by construction.
+
+**What changed**, all in `app/src/renderer/Pane.tsx` (the only renderer file
+touched, matching every prior pass's footprint):
+
+- `rescale` (CSS transform/zoom) is gone. In its place, `fitFont`: resizes the
+  local xterm buffer to the pty's real cols/rows (unchanged from before), then
+  shrinks `term.options.fontSize` — never past the user's configured size
+  (32e863e's never-magnify rule) — until the terminal's own natural
+  `.xterm-screen` box fits the container on both axes. Cell size scales
+  ~linearly with fontSize, but xterm rounds its own cell math
+  (`Math.round`/`ceil`/`floor` in the DOM renderer's `_updateDimensions` —
+  read from the real shipped bundle, not assumed) — so the approach is:
+  measure at the user's configured size, compute the fit ratio, apply it,
+  **re-measure once and correct** (never assume the linear estimate was
+  exact), then apply the corrected size. Two measurements, one correction,
+  matching the task's spec exactly — not an open-ended search.
+- `MIN_FONT_SIZE = 8` is the shrink floor — chosen to mirror `main.tsx`'s
+  existing `clampFont` floor (the smallest size a user can already configure
+  via the font-size chord) rather than invent a new number. Below it a pane
+  clips (the container already had `overflow:hidden`) rather than rendering
+  illegible text; no new scroll/letterbox machinery was needed for this.
+- Fractional font sizes are used as computed, never quantized (confirmed live
+  below: 8.69525px).
+- The `sizerRef`/`stageRef` wrapper divs are deleted — with no transform/zoom,
+  they had no remaining purpose. `hostRef` sits directly in `containerRef`;
+  `fitFont`'s final measurement sizes `host` to the terminal's fitted natural
+  box (in the axis that fit exactly) and the container's
+  `alignItems/justifyContent: center` (added; harmless for Electron, where
+  `host` is always 100%/100%) letterboxes whichever axis had slack.
+- Electron path: `serverGeomRef` stays null there forever (nothing ever posts
+  a `geom` port message on that client), so every `fitFont`/`fitFontRef` call
+  site is gated behind the same `if (serverGeomRef.current)` branch as
+  before — FitAddon's `fit()` is untouched, byte-for-byte.
+- The font-size-bump effect was reordered: it now checks `serverGeomRef`
+  **first** and calls `fitFontRef.current()` unconditionally when set, before
+  the Electron-only equality guard. In web mode `term.options.fontSize` holds
+  the *shrunk-to-fit* value, not the user's configured one, so the old
+  `term.options.fontSize === fontSize` guard would almost always have been
+  false and set the raw target size directly — bypassing the fit and
+  reintroducing exactly the "bigger font breaks a previously-fine pane"
+  regression the last pass found. Confirmed fixed live below.
+
+**`resolvePath` fix** (`app/src/web/amber.ts`): was `notImplemented('resolvePath')`
+— a synchronous throw — called from `Pane.tsx`'s `onSelectionChange` on
+**every** mouse selection in the web build (confirmed as a real, live,
+reproducible error in this pass, not just theoretical). `main.tsx`'s declared
+contract is `Promise<string | null>` and `Pane.tsx` already handles
+`abs ? {...} : null`, so `null` is the documented "cannot resolve" result —
+changed to `(): Promise<string | null> => Promise.resolve(null)` with a
+comment marking path resolution as desktop-only. `amber.test.ts`'s stub-throws
+list dropped `resolvePath`; a new test asserts it resolves to `null`.
+
+### Gate
+
+- `cd app && npm run typecheck` — clean.
+- `npm test` — 452 passed, 1 pre-existing skip (net +1 over the prior pass:
+  removed the `resolvePath`-throws case from the stub list, added a
+  `resolvePath`-resolves-null test).
+- `cargo test --workspace` — 313 passed (Rust untouched).
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+- `npm run build:web` — clean (same pre-existing >500 KB chunk warning).
+
+### Live verification
+
+Isolated private daemon (`/tmp/gfrun` runtime dir, `/tmp/gfstate` state dir,
+short-path recipe from the `verify-isolated-dev-instance` memory) + `amber
+web --port 7801` + two fresh `amber create` shell sessions
+(`amber-1-1-1-wide`, `amber-1-1-2-narrow`) under a hand-written
+`ui-layout.json` sidecar splitting them 70/30 (`dir:"h"`, same shape as every
+prior pass) — never the user's real daemon/app (port 7717, 17 sessions
+including the 14 claude ones, confirmed alive and untouched throughout via
+`amber ls` after cleanup). Driven with the Playwright MCP browser at
+1400×900, authenticated via the token URL fragment
+(`/app#t=<token>` → `bootstrapAuth()` → cookie), same as `amber web`'s real
+flow.
+
+**Note:** the first navigation attempt reused a Chromium disk cache from an
+earlier pass's identical `127.0.0.1:7799` origin and served a **stale**
+bundle (old `install-*.js` hash, still throwing on `resolvePath`) despite a
+fresh build on disk — switching to an unused port (7801) got a clean fetch.
+Not a product bug, just a test-harness gotcha worth flagging for whoever runs
+this recipe next.
+
+**Mouse click precision — the core ask.** Ran `ls -la /usr/bin | head -40` in
+both panes, then double-clicked (via `page.mouse.dblclick`, a real trusted
+double-click, not a hand-rolled `detail:2` `MouseEvent` — that path turned out
+inert here, xterm's selection-service listener sits on `.element` and a
+synthetic dispatch never produced a selection div despite bubbling correctly;
+not investigated further since Playwright's native dblclick is the more
+faithful test anyway) at the row `-rwxr-xr-x  1 root root  23008 Oct 22  2024
+apt-extracttemplates` (row 22, identical in both panes):
+
+| pane | clicked col | selected cols | selected text |
+|---|---|---|---|
+| wide (scale-1, unshrunk) | 65 | 50–69 | `apt-extracttemplates` |
+| narrow (shrunk to fit) | 65 | 50–69 | `apt-extracttemplates` |
+| wide | 70 | 50–69 | `apt-extracttemplates` |
+| narrow | 70 | 50–69 | `apt-extracttemplates` |
+
+Both clicked columns (65 and 70) land inside the word's true span (50–69) in
+**both** panes, identically — the word actually under the cursor, not a
+distant one. (Column 70 sits exactly one past the word's last character in
+this particular row — a double-click there landing on the adjacent word is
+expected boundary behavior, not the bug: the old bug's signature was a
+*consistent, large* offset proportional to `1/scale` — e.g. 70→47 — not a
+same-word boundary case. This was cross-checked directly against the
+`.xterm-selection` div's own `left`/`width` inline style, read relative to
+`.xterm-screen`'s own coordinate space, not just the DOM overlay's screen
+position.) One measurement gotcha hit and fixed: reading the selection
+DOM immediately after `dblclick()` raced xterm's redraw (selection-render
+looked stale, one boundary case flip observed); adding a 150 ms wait before
+reading made every repeat consistent — a test-harness timing issue, not a
+product bug.
+
+**Font-size bump — the regression the last pass found.** Dispatched the
+`font-bigger` chord (`Ctrl+Shift+=`, Linux binding) three times (font 13→16).
+Wide pane's rendered font legitimately grew to 16px (`getComputedStyle`
+confirmed) since it had room to spare; narrow pane's fitted font recomputed
+independently, still bound by its container. Re-ran the same click test
+(cols 65 and 70, both panes) **after** the bump: identical result — both
+panes select `apt-extracttemplates` (cols 50–69) in both cases. No
+regression, unlike the `zoom`/`transform` passes where a font bump pushed the
+previously-fine wide pane into the same broken bucket.
+
+**Geometry**: `/api/sessions` reported `cols:80,rows:24` for both sessions,
+both before and after the font bump — the pty's real grid, never touched.
+
+**Final font sizes**: wide pane **16px** (grown from the default 13 after
+3 chord presses — legitimately at the user's configured size, no shrink
+needed); narrow pane **8.69525px** (fractional, not quantized — shrunk to fit
+its container; sits just above the `MIN_FONT_SIZE=8` floor at this split
+ratio/viewport, without hitting it).
+
+**Keystroke routing**: typed `echo NARROW_MARKER_$((3+3))` into the narrow
+pane; `NARROW_MARKER_6` appeared only in that pane's terminal, not the wide
+one.
+
+**`resolvePath` console check**: zero `resolvePath` errors across every
+selection/double-click performed in this session (previously: one per
+selection change, unconditionally). The only console error throughout was an
+unrelated `favicon.ico` 404.
+
+Cleaned up: killed the private daemon + both `amber web` instances (7799 —
+the stale-cache one — and 7801), removed `/tmp/gfrun`, `/tmp/gfstate`,
+`/tmp/geomfix2`. Confirmed via `amber ls` against the real daemon afterward:
+17 sessions, all alive, untouched throughout.
+
+### Review catch: resize was gated behind the container-size bail
+
+A pre-commit review caught a real ordering bug the two-visible-panes live test
+above could not have exercised: `fitFont` originally bailed on
+`!cw || !ch` (empty container — e.g. a `display:none` background tab, per
+this codebase's own tab keep-alive design) **before** the `term.resize()`
+call. A backgrounded pane's `PaneLink` keeps its WebSocket open and keeps
+receiving `geom` pushes (the mount effect never re-runs while merely hidden),
+so a divider drag on the desktop app while a web tab was in the background
+would resize the pty but leave the hidden pane's local buffer at the OLD
+cols/rows — output would keep streaming in wrapped at the new width into a
+buffer sized for the old one. That is the exact garbling class this whole
+task exists to close, reintroduced by refactor ordering. Fixed by hoisting
+the `term.resize()` call above the zero-size bail — the grid follows the pty
+unconditionally; only the font-fit math needs a laid-out container.
+
+**Live-verified with a THIRD isolated instance** (`/tmp/gfrun2`/`/tmp/gfstate2`,
+`amber web --port 7802`), specifically targeting this case: a two-tab sidecar
+(tab 1: the wide/narrow split; tab 2: a solo pane), switched to tab 2 in the
+browser (confirmed via `getComputedStyle(...).display === 'none'` up the
+wide/narrow panes' ancestor chain), then resized `amber-1-1-1-wide`'s pty to
+120×40 **while backgrounded** — driven from a real controlling pty
+(`pty.fork()` + `TIOCSWINSZ` ioctl on the master, which delivers a real
+kernel `SIGWINCH` to `amber attach`'s foreground process group, which forwards
+a `Resize` control message; confirmed via `stty size` inside that same attach
+session). While still on tab 2, the hidden wide pane's `.xterm-rows` already
+had **40 row divs** (narrow/solo stayed at 24) — proof the buffer followed the
+pty immediately, without waiting for the tab to become visible. Switching back
+to tab 1 rendered cleanly at 120×40 with no garbling (`stty size` output
+`40 120` displayed correctly), `.xterm-screen` measured 939×720px (matches
+626×432 natural-at-font-13 scaled by 120/80, 40/24 exactly — still fits the
+978×792 container without needing to shrink the font, confirming the
+non-regression case too). Cleaned up the same way as the other passes;
+real daemon confirmed alive and untouched (`amber ls`, 17+ sessions) both
+before and after.
+
+### Concerns / residual
+
+- **Per-resize cost.** `fitFont` does up to 3 `term.options.fontSize` writes
+  and 3 forced `.xterm-screen` layout reads per call, and each fontSize write
+  runs xterm's full `CharSizeService.measure → handleCharSizeChanged →
+  _updateDimensions` path (restyles every row element, clears the width
+  cache). It runs from the `ResizeObserver`, i.e. potentially once per frame
+  per pane during a live divider drag — where the old `rescale` was a single
+  style write untouched by any of that. Not measured under a live drag in
+  this pass (the isolated-daemon setup has no desktop-app divider to drag);
+  if it's ever felt as jank, the cheap fix is caching the natural
+  (unshrunk) box per `(cols, rows, userMax)` so a pure container resize with
+  the same pty grid and font ceiling skips straight to the ratio, without
+  round-tripping through the userMax reset. Not built pre-emptively — no
+  evidence yet that it's needed.
+- The font-fit floor (`MIN_FONT_SIZE=8`) means a pane squeezed narrower than
+  ~80 cols at 8px (a genuinely tiny split) will clip rather than shrink
+  further. Not exercised live in this pass (the 70/30 split at 1400px never
+  got that narrow) — the container's pre-existing `overflow:hidden` plus the
+  `safe center` alignment (added specifically so a below-floor pane clips
+  symmetrically instead of a plain `center` overflowing asymmetrically and
+  eating column 0 off the left edge) is what makes this safe, not new
+  fit-logic.
+- `sizerRef`/`stageRef` are gone entirely; anyone looking for the old
+  transform/zoom scaling code won't find it — this is intentional per the
+  task ("do not leave two mechanisms"), noted here so it isn't mistaken for
+  an incomplete diff.
+- Did not re-verify the `.amberws` staged-replay interaction or the
+  reconnect/backlog-race path from the original pass — out of scope for this
+  font-fit swap (no code on those paths changed; `fitFont` is called from the
+  same call sites `rescale` was).

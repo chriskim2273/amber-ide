@@ -417,7 +417,6 @@ describe('createAmber', () => {
       () => amber.saveWorkspaceFile('{}', 'x.amberws'),
       () => amber.openWorkspaceFile(),
       () => amber.pickFolder(),
-      () => amber.resolvePath('/', 'x'),
       () => amber.revealPath('/x'),
       () => amber.editorOpenDialog(),
       () => amber.editorRead('/x'),
@@ -432,5 +431,10 @@ describe('createAmber', () => {
     for (const call of stubs) {
       expect(call, `${call.toString()} did not throw`).toThrow('not available in the web build')
     }
+  })
+
+  it('resolvePath declines to null instead of throwing (hot path: every mouse selection)', async () => {
+    const amber = createAmber(deps())
+    await expect(amber.resolvePath('/', 'x')).resolves.toBeNull()
   })
 })

@@ -433,7 +433,14 @@ export function createAmber(deps: AmberDeps): Window['amber'] {
     saveWorkspaceFile: notImplemented('saveWorkspaceFile'),
     openWorkspaceFile: notImplemented('openWorkspaceFile'),
     pickFolder: notImplemented('pickFolder'),
-    resolvePath: notImplemented('resolvePath'),
+    // Path resolution is desktop-only (main-process fs.stat) — but unlike the
+    // stubs above this sits on a hot interaction path (every selection change
+    // in Pane.tsx calls it), so a synchronous throw here was an uncaught
+    // exception on every mouse selection in the web build. `null` is the
+    // documented "cannot resolve" result (see main.tsx's declared
+    // `Promise<string | null>` contract and Pane.tsx's `abs ? ... : null`
+    // handling) — decline gracefully instead of throwing.
+    resolvePath: (): Promise<string | null> => Promise.resolve(null),
     revealPath: notImplemented('revealPath'),
     editorOpenDialog: notImplemented('editorOpenDialog'),
     editorRead: notImplemented('editorRead'),

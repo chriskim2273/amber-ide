@@ -83,6 +83,12 @@ const XTERM_THEME = {
 // after each backlog; a live program re-asserts what it needs on redraw.
 const MOUSE_RESET = '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l'
 
+// Legible floor for the web build's shrink-to-fit (below, `fitFont`). Mirrors
+// main.tsx's `clampFont` floor (the smallest size a user can configure via the
+// font-size chord anyway) rather than inventing a separate number — below
+// this a pane clips/scrolls instead of rendering illegible text.
+const MIN_FONT_SIZE = 8
+
 // Memoized: SplitView re-renders on every drag-hover mousemove. `session`/
 // `epoch` are primitives, so memo keeps a drag from reconciling every terminal
 // (honors "xterm instances live outside React reconciliation").
@@ -92,13 +98,6 @@ export const Pane = memo(function Pane(
     { session: string; epoch: number; portEpoch: number; activateSeq: number; fontSize: number; cwd: string; onTitle?: (title: string) => void; onSearchReady?: (api: SearchApi) => void },
 ): JSX.Element {
   const containerRef = useRef<HTMLDivElement>(null)
-  // `sizerRef`/`stageRef` wrap `hostRef` for the web build's follow-the-pty
-  // rendering (see `serverGeomRef` below). In Electron — and in the web build
-  // before the pty's geometry has arrived — both stay their default 100%/100%
-  // identity size with no transform, so `hostRef` fills `containerRef` exactly
-  // as it always did and FitAddon's `fit()` behaves unchanged.
-  const sizerRef = useRef<HTMLDivElement>(null)
-  const stageRef = useRef<HTMLDivElement>(null)
   const hostRef = useRef<HTMLDivElement>(null)
   // Floating "Open" button state: shown when the current selection resolves to a
   // real path (main-process stat). `path` is the abs path revealed on click.
@@ -137,14 +136,19 @@ export const Pane = memo(function Pane(
   // Electron's client never sends one, so this stays null there forever and
   // every branch below that checks it takes the untouched Electron path).
   // Non-null means: don't let FitAddon drive this pane's cols/rows — follow
-  // the server's grid and CSS-scale the rendered size instead (spec — a pty's
+  // the server's grid and shrink the FONT to fit instead (spec — a pty's
   // winsize is shared with the desktop app's panes, so the web build must
-  // never resize it; matches `syncGeom`/`applyScale` in the mobile client,
-  // `crates/amber/assets/app.js`).
+  // never resize it). Deliberately NOT a CSS transform/zoom scale: both were
+  // tried and both left xterm's own mouse math wrong (`MouseService` divides
+  // a screen-space click offset by a layout-space `offsetWidth` cell
+  // measurement — `transform` never touches layout, and Chromium's `zoom`
+  // turned out not to update `offsetWidth` either, measured live). Shrinking
+  // the font instead keeps the effective scale factor at exactly 1 — nothing
+  // is transformed, so there is no unit mismatch to correct.
   const serverGeomRef = useRef<{ cols: number; rows: number } | null>(null)
-  // Re-fit the scaled stage to the container (web-geometry mode only). Points
-  // at the live mount-effect closure, called from the later effects below.
-  const rescaleRef = useRef<() => void>(() => {})
+  // Re-fit the font to the container (web-geometry mode only). Points at the
+  // live mount-effect closure, called from the later effects below.
+  const fitFontRef = useRef<() => void>(() => {})
 
   useEffect(() => {
     const host = hostRef.current
@@ -249,59 +253,79 @@ export const Pane = memo(function Pane(
       port?.postMessage({ resize: { cols: term.cols, rows: term.rows } })
     }
 
-    // Web-geometry mode only (serverGeomRef set): fit the terminal's REAL
-    // cell box into the container on both axes, never magnifying past natural
-    // size, via CSS `zoom` — never a resize. Mirrors `applyScale` in the
-    // mobile client (`crates/amber/assets/app.js`), including the never-
-    // magnify clamp (fixed there in 32e863e after an 80-col grid blew up 2.25x
-    // on a laptop-width viewport). `zoom` (not `transform: scale()`) is
-    // deliberate: `transform` is paint-only, so it left `getBoundingClientRect`
-    // (screen space) and xterm's own `offsetWidth` cell-size measurement
-    // (layout space, unaffected by transform) disagreeing by exactly the scale
-    // factor — every click landed on the wrong cell. `zoom` scales the layout
-    // box itself, so both agree and xterm's mouse math needs no patching.
-    const rescale = (): void => {
+    // Web-geometry mode only (serverGeomRef set): resize the LOCAL xterm
+    // buffer to the pty's real cols/rows (never posting a resize back down
+    // the port), then shrink `term.options.fontSize` — never magnifying past
+    // the user's configured size, mirroring the never-magnify clamp fixed in
+    // 32e863e — until the terminal's own natural cell box fits the container
+    // on both axes. The scale factor this leaves in play is always exactly
+    // 1: nothing is transformed/zoomed, so `MouseService`'s click math and
+    // `CharSizeService`'s `offsetWidth` measurement are reading the same
+    // un-transformed layout, and they agree by construction. Below
+    // `MIN_FONT_SIZE` the pane just clips (container has `overflow:hidden`)
+    // rather than rendering illegible text.
+    //
+    // Cell size scales ~linearly with fontSize, but xterm rounds its own cell
+    // math (Math.round/ceil/floor in `_updateDimensions`) — so the linear
+    // ratio is an estimate, not exact. Measure, apply, re-measure, correct
+    // once; never assume the first computation is exact. The final measure
+    // also sizes `host` to the terminal's now-fitted natural box so the
+    // container's flex centering can letterbox the non-binding axis.
+    const fitFont = (): void => {
       const geom = serverGeomRef.current
-      const sizer = sizerRef.current, stage = stageRef.current, container = containerRef.current
+      const container = containerRef.current
       const el = term.element
-      if (!geom || !sizer || !stage || !container || !el) return
-      if (!container.clientWidth || !container.clientHeight) return
-      // Reset zoom before measuring: unlike transform, zoom IS layout-affecting
-      // and cascades to descendants, so a zoom left over from a previous
-      // rescale would already be baked into `.xterm-screen`'s offsetWidth/
-      // Height — measuring without resetting first would compound every call.
-      stage.style.zoom = '1'
-      const scr = el.querySelector('.xterm-screen') as HTMLElement | null
-      const w = scr ? scr.offsetWidth : el.offsetWidth
-      const h = scr ? scr.offsetHeight : el.offsetHeight
-      if (!w || !h) return
-      const scale = Math.min(container.clientWidth / w, container.clientHeight / h, 1)
-      stage.style.width = `${w}px`
-      stage.style.height = `${h}px`
-      stage.style.zoom = String(scale)
-      sizer.style.width = `${w * scale}px`
-      sizer.style.height = `${h * scale}px`
+      if (!geom || !container || !el) return
+      // Follow the pty's grid UNCONDITIONALLY, before the zero-size bail below:
+      // a backgrounded pane's container is `display:none` (clientWidth 0) but
+      // still receives `geom` pushes while hidden (a divider drag resizes the
+      // pty regardless of which tab is visible) — if the resize were gated on
+      // having a laid-out container, a hidden pane's buffer would keep the OLD
+      // cols/rows while the pty (and its output) moved to the new ones, i.e.
+      // exactly the garbling class this task exists to close. Only the FONT
+      // fit below needs a real container size; the buffer never does.
+      if (term.cols !== geom.cols || term.rows !== geom.rows) term.resize(geom.cols, geom.rows)
+      const cw = container.clientWidth, ch = container.clientHeight
+      if (!cw || !ch) return
+      const userMax = fontSizeRef.current
+      const measure = (): { w: number; h: number } => {
+        const scr = el.querySelector('.xterm-screen') as HTMLElement | null
+        return { w: scr?.offsetWidth ?? 0, h: scr?.offsetHeight ?? 0 }
+      }
+      const clamp = (n: number): number => Math.max(MIN_FONT_SIZE, Math.min(userMax, n))
+      // Reset to the user's configured size before measuring: a stale fontSize
+      // left over from a previous fit would compound rounding error.
+      term.options.fontSize = userMax
+      let m = measure()
+      if (!m.w || !m.h) return
+      let size = clamp(userMax * Math.min(cw / m.w, ch / m.h))
+      term.options.fontSize = size
+      m = measure() // re-measure once — don't trust the linear ratio was exact
+      if (m.w && m.h) {
+        size = clamp(size * Math.min(cw / m.w, ch / m.h))
+        term.options.fontSize = size
+        m = measure()
+      }
+      if (m.w && m.h) { host.style.width = `${m.w}px`; host.style.height = `${m.h}px` }
     }
-    rescaleRef.current = rescale
+    fitFontRef.current = fitFont
 
     // Learn the pty's real grid from a `geom` port message (web build only —
-    // see `serverGeomRef`'s doc comment). Resizes the LOCAL xterm buffer to
-    // match — never posts a resize back down the port — then rescales.
+    // see `serverGeomRef`'s doc comment).
     const applyServerGeom = (g: { cols: number; rows: number }): void => {
       serverGeomRef.current = g
-      if (term.cols !== g.cols || term.rows !== g.rows) term.resize(g.cols, g.rows)
-      rescale()
+      fitFont()
     }
 
     const ro = new ResizeObserver(() => {
-      if (serverGeomRef.current) rescale()
+      if (serverGeomRef.current) fitFont()
       else sendResize()
     })
     // Observe the OUTER container, not `host`: in web-geometry mode `host`'s
     // own size follows the pty's fixed grid (unrelated to the container), so
-    // it would stop firing on a divider drag right when `rescale` needs it.
-    // In Electron/pre-geometry mode host tracks container 1:1 (the wrapper
-    // divs are identity-sized), so this observes the same resizes as before.
+    // it would stop firing on a divider drag right when `fitFont` needs it.
+    // In Electron/pre-geometry mode host tracks container 1:1 (no explicit
+    // size is ever set on it), so this observes the same resizes as before.
     if (containerRef.current) ro.observe(containerRef.current)
     const focus = (): void => term.focus()
 
@@ -379,7 +403,7 @@ export const Pane = memo(function Pane(
         }
       }
       port.start()
-      if (serverGeomRef.current) rescale()
+      if (serverGeomRef.current) fitFont()
       else sendResize()
       term.focus()
     }
@@ -451,8 +475,8 @@ export const Pane = memo(function Pane(
       term.write(MOUSE_RESET)
       // Web-geometry mode: there's no local fit to redo (the grid follows the
       // pty, not the container) and posting a resize would be a no-op anyway
-      // (dropped — see amber.ts) — just re-fit the scaled stage.
-      if (serverGeomRef.current) { rescaleRef.current(); return }
+      // (dropped — see amber.ts) — just re-fit the font.
+      if (serverGeomRef.current) { fitFontRef.current(); return }
       try { fit?.fit() } catch { /* ignore */ }
       port.postMessage({ resize: { cols: term.cols, rows: term.rows } })
     }
@@ -469,7 +493,7 @@ export const Pane = memo(function Pane(
     if (activateSeq === 0) return
     const term = termRef.current
     if (!term) return
-    if (serverGeomRef.current) rescaleRef.current()
+    if (serverGeomRef.current) fitFontRef.current()
     else { try { fitRef.current?.fit() } catch { /* host mid-layout; ignore */ } }
     term.refresh(0, Math.max(0, term.rows - 1))
   }, [activateSeq])
@@ -481,12 +505,18 @@ export const Pane = memo(function Pane(
   //
   // Web-geometry mode: the grid stays exactly what the pty reports regardless
   // of font size (resizing it here would be a local guess the server never
-  // asked for) — only the cell pixel size changed, so just rescale the stage.
+  // asked for) — `fitFont` reads this same `fontSize` prop (via `fontSizeRef`)
+  // as its "never exceed" ceiling and re-fits from there. Checked FIRST and
+  // unconditionally (this effect only runs when `fontSize` actually changed):
+  // in web mode `term.options.fontSize` usually holds the shrunk-to-fit value,
+  // not the user's configured one, so the equality guard below would almost
+  // always be false and set the raw target size directly — bypassing the fit.
   useEffect(() => {
     const term = termRef.current
-    if (!term || term.options.fontSize === fontSize) return
+    if (!term) return
+    if (serverGeomRef.current) { fitFontRef.current(); return }
+    if (term.options.fontSize === fontSize) return
     term.options.fontSize = fontSize
-    if (serverGeomRef.current) { rescaleRef.current(); return }
     const host = hostRef.current
     if (host && (host.clientWidth === 0 || host.clientHeight === 0)) return
     try { fitRef.current?.fit() } catch { /* host has zero size mid-layout; ignore */ }
@@ -503,17 +533,19 @@ export const Pane = memo(function Pane(
       }
     : undefined
   return (
-    <div ref={containerRef} style={{ position: 'relative', width: '100%', height: '100%', background: 'var(--bg)', display: 'flex', overflow: 'hidden' }}>
-      {/* `sizer` is sized in JS (rescale, above) to the SCALED box and centred
-          via `margin: auto` in this flex container; `stage` is sized to the
-          terminal's real (unscaled) cell box and CSS-`zoom`-scaled to fit —
-          both stay 100%/100% identity, matching plain passthrough divs, until
-          web-geometry mode sets explicit pixel sizes. */}
-      <div ref={sizerRef} style={{ margin: 'auto', flex: 'none', width: '100%', height: '100%' }}>
-        <div ref={stageRef} style={{ width: '100%', height: '100%' }}>
-          <div ref={hostRef} style={{ width: '100%', height: '100%' }} />
-        </div>
-      </div>
+    <div ref={containerRef} style={{ position: 'relative', width: '100%', height: '100%', background: 'var(--bg)', display: 'flex', alignItems: 'safe center', justifyContent: 'safe center', overflow: 'hidden' }}>
+      {/* `host` stays 100%/100% identity (matching a plain passthrough div)
+          until web-geometry mode's `fitFont` sets an explicit pixel size —
+          the terminal's real (unscaled, font-shrunk) box, no transform/zoom
+          on it anywhere. `alignItems`/`justifyContent: safe center` above
+          then letterboxes whichever axis wasn't the binding constraint —
+          `safe` (not plain `center`) so a pane squeezed below `MIN_FONT_SIZE`
+          (host bigger than container in both axes) clips symmetrically
+          rather than centering into an overflow that eats column 0 off the
+          left edge. In Electron (and before geometry arrives) host fills the
+          container exactly as before, so centering a 100%-sized item is a
+          no-op either way. */}
+      <div ref={hostRef} style={{ width: '100%', height: '100%', flexShrink: 0 }} />
       {openBtn &&
         <button
           className="open-path-btn"
