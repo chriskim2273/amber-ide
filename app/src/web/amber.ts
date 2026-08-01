@@ -1,204 +1,405 @@
-// Web-build shim: installs `window.amber` backed by the `amber web` server
+// Web-build shim: builds `window.amber` (the exact contract `main.tsx`
+// declares — see its `declare global` block) backed by `amber web`
 // (crates/amber/src/web.rs) instead of the Electron preload bridge.
 //
-// Spike per docs/superpowers/specs/2026-08-01-amber-ide-as-a-webapp-design.md
-// §2.2/§8. Only the mount path + the pane MessageChannel path are real; every
-// other method is a visible-throw stub (§3: "must reject visibly, never
-// silently no-op") — this file intentionally does NOT build layout CAS,
-// session lifecycle, editor/browser panes, or native dialogs. See the spike
-// report (`.reports/spike.md`) for what's next.
+// Spec: docs/superpowers/specs/2026-08-01-amber-ide-as-a-webapp-design.md.
+// This file is PURE — no `WebSocket`/`MessageChannel`/`window`/`navigator`
+// reference of its own, only the `SocketLike`/`PortLike` interfaces below
+// (mirroring `app/src/client/router.ts`'s injectable shape) — so it is
+// testable under vitest's `node` environment with fakes, the way
+// `router.test.ts` tests `Router` with `FakeConn`/`FakePort`. The real
+// WebSocket/MessageChannel/`window.postMessage` wiring lives in `install.ts`,
+// which this module never imports and no test imports.
 //
-// --- The one wire-protocol wrinkle that matters here -----------------------
+// --- Two WebSockets, not one (spec §4a: "One WebSocket per pane") ----------
 // `amber web`'s `Client.open` (web.rs) is a single `Option<String>` per
-// WebSocket connection, and a raw BINARY frame carries NO session id — it is
-// implicitly "whatever this connection currently has open" (confirmed by
-// reading `Hub::queue`/`Hub::on_frame` in web.rs and the mobile `app.js`,
-// which only ever has one pane open at a time for exactly this reason).
-// `openPane` calls therefore all share ONE WebSocket and ONE "currently open"
-// slot: opening a second pane while a first is open causes the server to
-// Detach the first (see `map_browser_msg`'s `BrowserMsg::Open` arm). That's
-// fine for this spike (one pane, proving the MessageChannel claim) but is NOT
-// yet a multi-pane transport — widening `Client.open` to a set (spec §4) is
-// required before this shim can hold more than one live pane at a time.
+// connection, and a raw BINARY frame carries NO session id — it is implicitly
+// "whatever THIS connection currently has open". So one pane = one dedicated
+// `/ws` connection (`PaneLink`), and everything that ISN'T pane data (session
+// lifecycle, the daemon event stream, one-shot backlog dumps) rides a single
+// separate `/ws` connection that never opens anything (`ControlLink`). This
+// also means only `ControlLink` ever calls `dispatch()` for `sessions`/
+// `error`/`activity`/`memory` — those are broadcast to EVERY connection
+// server-side, so if every `PaneLink` also dispatched them the app would see
+// N duplicate copies of the same event (and worse: `main.tsx` CONSUMES an
+// `Error` while a dump is pending — a second copy would both resolve the dump
+// AND draw a spurious red banner). `PaneLink` only ever forwards `exit` (only
+// ever delivered to the connection with that session `open`) and its own
+// `backlog` replay tag.
 
-type DaemonEventCb = (d: unknown) => void
+export interface SocketLike {
+  send(data: string | Uint8Array): void
+  close(): void
+  readonly readyState: number
+  onopen: (() => void) | null
+  onclose: (() => void) | null
+  onerror: (() => void) | null
+  onmessage: ((e: { data: unknown }) => void) | null
+}
+// Mirrors `WebSocket.OPEN` (a real `WebSocket`'s `readyState` numbering) so
+// `install.ts`'s real sockets and this module's checks agree without either
+// side importing the DOM lib's `WebSocket` type.
+export const SOCKET_OPEN = 1
 
-function throwNotImplemented(name: string): () => never {
-  return () => {
-    throw new Error(`window.amber.${name}: not implemented in the web-build spike`)
+export interface PortLike {
+  postMessage(m: unknown): void
+  close(): void
+  start(): void
+  onmessage: ((e: { data: unknown }) => void) | null
+}
+
+const RECONNECT_MS = 1000 // ponytail: fixed retry, no backoff ladder — matches the spike; revisit if flapping in practice
+
+// ---- wire message shapes (pure parsing) ------------------------------------
+
+export type ServerMsg =
+  | { t: 'sessions'; sessions: unknown }
+  | { t: 'exit'; name: string; code: number }
+  | { t: 'error'; msg: string }
+  | { t: 'backlog'; name: string }
+  | { t: 'backlogReply'; name: string }
+  | { t: 'activity'; name: string }
+  | { t: 'memory'; name: string; rss_kb: number; growing: boolean }
+
+/** Parse one JSON text frame from `amber web`. `null` for anything this
+ * shim has no use for (malformed JSON, an unknown `t`). */
+export function parseServerMsg(text: string): ServerMsg | null {
+  let raw: Record<string, unknown>
+  try {
+    raw = JSON.parse(text) as Record<string, unknown>
+  } catch {
+    return null
+  }
+  switch (raw['t']) {
+    case 'sessions':
+      return { t: 'sessions', sessions: raw['sessions'] ?? [] }
+    case 'exit':
+      return { t: 'exit', name: raw['name'] as string, code: raw['code'] as number }
+    case 'error':
+      return { t: 'error', msg: raw['msg'] as string }
+    case 'backlog':
+      return { t: 'backlog', name: raw['name'] as string }
+    case 'backlogReply':
+      return { t: 'backlogReply', name: raw['name'] as string }
+    case 'activity':
+      return { t: 'activity', name: raw['name'] as string }
+    case 'memory':
+      return {
+        t: 'memory',
+        name: raw['name'] as string,
+        rss_kb: (raw['rss_kb'] as number) ?? 0,
+        growing: (raw['growing'] as boolean) ?? false,
+      }
+    default:
+      return null
   }
 }
 
-let ws!: WebSocket
-let onEvent: DaemonEventCb | null = null
-// `connect()` runs at module load, before React has mounted and called
-// `onDaemonEvent` — and the server pushes an initial `sessions` message the
-// instant the WS connects (`Hub::add_client`), which can easily win that race
-// on localhost. Buffer until a real listener registers so that first push (the
-// one `sawSessions` depends on) is never silently dropped.
-const pending: unknown[] = []
-function dispatch(ev: unknown): void {
-  if (onEvent) onEvent(ev)
-  else pending.push(ev)
-}
-// The one session this connection has open, and the port wired to it. See the
-// file-header note: the server has exactly one "open" slot per connection.
-let openSession: string | null = null
-let openPort: MessagePort | null = null
-// Set right after sending `{t:'open'}` (fresh or reconnect re-attach); cleared
-// on the very next BINARY frame. Per-session Attach ordering on one pipe
-// guarantees that next frame IS the backlog reply — same guarantee the
-// Electron client's `router.ts` `awaitingBacklog` relies on. This is NOT the
-// "first frame after a reconnect" heuristic CLAUDE.md records as having
-// blanked a live pane (that one guessed from wall-clock proximity, racing the
-// frame itself); this one is keyed by the specific `open` we just sent, so it
-// cannot land on the wrong frame. Pane.tsx reads `m.backlog` to reset() before
-// a re-attach replay and to clear stale mouse-tracking modes after any replay
-// — without tagging it, every reconnect would duplicate history forever and
-// leave dead mouse-reporting on (see Pane.tsx's `attachedOnceRef`/`MOUSE_RESET`).
-let awaitingBacklog = false
-const sendQueue: string[] = []
-// True once the WS has connected at least once. `openPane`'s own
-// `sendControl` already queues (and will flush) the FIRST `{t:'open'}` for a
-// newly-opened pane, so `onopen` must not resend it a second time on that
-// first connection — found live: a fresh pane opened before the socket
-// finished connecting got Attached TWICE (the queued send + onopen's
-// unconditional resend), doubling its backlog. `onopen` only needs to
-// resend on a REAL reconnect, when nothing is queued for it anymore.
-let everConnected = false
-
-function sendControl(msg: unknown): void {
-  const text = JSON.stringify(msg)
-  if (ws.readyState === WebSocket.OPEN) ws.send(text)
-  else sendQueue.push(text)
-}
-
-function connect(): void {
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
-  ws = new WebSocket(`${proto}//${location.host}/ws`)
-  ws.binaryType = 'arraybuffer'
-
-  ws.onopen = (): void => {
-    dispatch({ status: 'connected' })
-    for (const m of sendQueue.splice(0)) ws.send(m)
-    // Reconnect (not the first connect — see `everConnected`) while a pane is
-    // open: re-attach it (mirrors app.js's `open` re-send) — this re-attach
-    // gets a fresh backlog reply too.
-    if (everConnected && openSession) {
-      sendControl({ t: 'open', name: openSession })
-      awaitingBacklog = true
-    }
-    everConnected = true
-  }
-  ws.onclose = (): void => {
-    dispatch({ status: 'disconnected' })
-    setTimeout(connect, 1000) // ponytail: fixed 1s retry, no backoff ladder — fine for a spike
-  }
-  ws.onerror = (): void => { try { ws.close() } catch { /* onclose handles retry */ } }
-
-  ws.onmessage = (ev: MessageEvent<string | ArrayBuffer>): void => {
-    if (typeof ev.data !== 'string') {
-      // Raw pty output for the ONE currently-open session (no session id rides
-      // the frame — see the file header). Shape matches what Pane.tsx's port
-      // handler expects: `{data, backlog?}` — see `awaitingBacklog` above.
-      const backlog = awaitingBacklog
-      awaitingBacklog = false
-      const data = new Uint8Array(ev.data)
-      openPort?.postMessage(backlog ? { data, backlog: true } : { data })
-      return
-    }
-    let msg: Record<string, unknown>
-    try {
-      msg = JSON.parse(ev.data) as Record<string, unknown>
-    } catch {
-      return
-    }
-    // Translate web.rs's `{t:...}` shape into the `{frame:{type:'control',
-    // msg:{kind:...}}}` shape `main.tsx`'s `toEvent` expects (mirrors the
-    // Electron client's daemon-event payload, which forwards amber-core's
-    // ControlMsg verbatim).
-    if (msg['t'] === 'sessions') {
-      dispatch({ frame: { type: 'control', msg: { kind: 'Sessions', sessions: msg['sessions'] ?? [] } } })
-    } else if (msg['t'] === 'exit') {
-      dispatch({ frame: { type: 'control', msg: { kind: 'Exit', name: msg['name'], code: msg['code'] } } })
-    } else if (msg['t'] === 'error') {
-      dispatch({ frame: { type: 'control', msg: { kind: 'Error', msg: msg['msg'] } } })
-    }
-    // 'sessions' is also the daemon's "connected" heartbeat for this spike —
-    // no separate ack needed.
+/** Map a broadcast-class `ServerMsg` to the `{frame:{type:'control',msg:{kind:...}}}`
+ * shape `main.tsx`'s `toEvent` (and the Electron client's `daemon-event`)
+ * expect. `exit`/`backlog`/`backlogReply` are excluded on purpose: `exit` is
+ * handled by `PaneLink` (it needs no translation help, just a name/code
+ * passthrough), and the backlog messages need the binary payload that
+ * arrives in a separate frame — see `ControlLink`. */
+export function toDaemonEvent(
+  m: Extract<ServerMsg, { t: 'sessions' | 'error' | 'activity' | 'memory' }>,
+): unknown {
+  switch (m.t) {
+    case 'sessions':
+      return { frame: { type: 'control', msg: { kind: 'Sessions', sessions: m.sessions } } }
+    case 'error':
+      return { frame: { type: 'control', msg: { kind: 'Error', msg: m.msg } } }
+    case 'activity':
+      return { frame: { type: 'control', msg: { kind: 'Activity', name: m.name } } }
+    case 'memory':
+      return {
+        frame: {
+          type: 'control',
+          msg: { kind: 'MemoryStat', name: m.name, rss_kb: m.rss_kb, growing: m.growing },
+        },
+      }
   }
 }
-connect()
 
-window.amber = {
-  // Headless/CDP-safe default: skip xterm's WebGL addon. A real build would
-  // probe GPU support the way the Electron main process does; out of scope here.
-  softwareGl: true,
-  homeDir: '/tmp',
-  onDaemonEvent: (cb): void => {
-    onEvent = cb
-    for (const ev of pending.splice(0)) cb(ev)
-  },
+function toBytes(data: unknown): Uint8Array {
+  return data instanceof Uint8Array ? data : new Uint8Array(data as ArrayBufferLike)
+}
 
-  // --- §2.2: the load-bearing MessageChannel path -------------------------
-  openPane: (session: string): void => {
-    const channel = new MessageChannel()
-    openPort?.close()
-    openSession = session
-    openPort = channel.port1
-    openPort.onmessage = (e: MessageEvent): void => {
-      const m = e.data as { data?: Uint8Array; resize?: unknown }
-      // `resize` MUST stay unreachable (spec §4 — a pty's winsize is shared
-      // with the desktop app); only keystroke bytes are forwarded.
-      if (m.data && ws.readyState === WebSocket.OPEN) {
-        ws.send(m.data instanceof Uint8Array ? m.data : new Uint8Array(m.data))
+// ---- ControlLink: session lifecycle + the daemon event stream -------------
+
+/** The one non-pane WebSocket: session lifecycle commands (create/kill/
+ * rename/suspend/resume/dumpBacklog) out, and the `onDaemonEvent` stream in.
+ * Never sends `{t:'open'}` — it has nothing to Attach, so it never receives
+ * pty `Data`/`backlog` either. */
+export class ControlLink {
+  private socket: SocketLike
+  private readonly sendQueue: string[] = []
+  /** Names awaiting a `DumpBacklog` payload, FIFO. The hub processes one
+   * client's queue strictly in order (`Client.tx` is a single bounded
+   * channel), so a `backlogReply` marker and the binary that follows it are
+   * always adjacent even with two dumps in flight for different sessions —
+   * shifting the oldest pending name off this queue when the binary arrives
+   * pairs them correctly without needing the marker to repeat the name past
+   * matching a set of one. */
+  private readonly dumpPending: string[] = []
+
+  constructor(
+    private readonly connectSocket: () => SocketLike,
+    private readonly dispatch: (ev: unknown) => void,
+  ) {
+    this.socket = connectSocket()
+    this.wire()
+  }
+
+  private wire(): void {
+    const s = this.socket
+    s.onopen = (): void => {
+      this.dispatch({ status: 'connected' })
+      for (const m of this.sendQueue.splice(0)) s.send(m)
+    }
+    s.onclose = (): void => {
+      this.dispatch({ status: 'disconnected' })
+      setTimeout(() => {
+        this.socket = this.connectSocket()
+        this.wire()
+      }, RECONNECT_MS)
+    }
+    s.onerror = (): void => {
+      try {
+        s.close()
+      } catch {
+        /* onclose handles the retry */
       }
     }
-    channel.port1.start()
-    window.postMessage({ amberPanePort: true, session }, '*', [channel.port2])
-    sendControl({ t: 'open', name: session })
-    awaitingBacklog = true
-  },
-  closePane: (session: string): void => {
-    sendControl({ t: 'close', name: session })
-    if (openSession === session) {
-      openPort?.close()
-      openPort = null
-      openSession = null
-      awaitingBacklog = false
+    s.onmessage = (e: { data: unknown }): void => {
+      if (typeof e.data !== 'string') {
+        const name = this.dumpPending.shift()
+        if (name !== undefined) {
+          this.dispatch({
+            frame: { type: 'control', msg: { kind: 'Backlog', name, data: toBytes(e.data) } },
+          })
+        }
+        return
+      }
+      const msg = parseServerMsg(e.data)
+      if (!msg) return
+      if (msg.t === 'backlogReply') {
+        this.dumpPending.push(msg.name)
+        return
+      }
+      // `backlog` (the Attach-replay tag) and `exit` never reach this
+      // connection — it never opens anything — but ignore rather than
+      // assume, matching the "unknown t is ignored" discipline `app.js` and
+      // `parse_browser_msg` already use.
+      if (msg.t === 'backlog' || msg.t === 'exit') return
+      this.dispatch(toDaemonEvent(msg))
     }
-  },
+  }
 
-  // --- native browser API, not a stub (spec §3: "Clipboard" row) ---------
-  clipboardWrite: (text: string): void => { void navigator.clipboard.writeText(text) },
-  clipboardRead: (): Promise<string> => navigator.clipboard.readText(),
-
-  // --- §6 (layout CAS) not built — benign no-op so the mount effect (which
-  // calls loadLayout/saveLayout unconditionally) doesn't throw on startup.
-  loadLayout: (): Promise<string | null> => Promise.resolve(null),
-  saveLayout: (): Promise<void> => Promise.resolve(),
-
-  // --- everything else: out of scope for this spike, visible-throw -------
-  createSession: throwNotImplemented('createSession'),
-  killSession: throwNotImplemented('killSession'),
-  renameSession: throwNotImplemented('renameSession'),
-  suspendSession: throwNotImplemented('suspendSession'),
-  resumeSession: throwNotImplemented('resumeSession'),
-  dumpBacklog: throwNotImplemented('dumpBacklog'),
-  saveWorkspaceFile: throwNotImplemented('saveWorkspaceFile'),
-  openWorkspaceFile: throwNotImplemented('openWorkspaceFile'),
-  pickFolder: throwNotImplemented('pickFolder'),
-  resolvePath: throwNotImplemented('resolvePath'),
-  revealPath: throwNotImplemented('revealPath'),
-  editorOpenDialog: throwNotImplemented('editorOpenDialog'),
-  editorRead: throwNotImplemented('editorRead'),
-  editorSave: throwNotImplemented('editorSave'),
-  editorSaveDialog: throwNotImplemented('editorSaveDialog'),
-  editorDraftWrite: throwNotImplemented('editorDraftWrite'),
-  editorDraftRead: throwNotImplemented('editorDraftRead'),
-  editorDraftClear: throwNotImplemented('editorDraftClear'),
-  editorInlineImages: throwNotImplemented('editorInlineImages'),
-  claudeNames: throwNotImplemented('claudeNames'),
+  send(msg: unknown): void {
+    const text = JSON.stringify(msg)
+    if (this.socket.readyState === SOCKET_OPEN) this.socket.send(text)
+    else this.sendQueue.push(text)
+  }
 }
 
-export {} // force module scope (this file has no imports of its own)
+// ---- PaneLink: one dedicated connection per open pane ----------------------
+
+/** One pane's dedicated `/ws` connection + the `MessageChannel` port bridged
+ * to it (spec §2.2/§4a). Reproduces the preload's `pane-port` contract
+ * exactly: raw pty bytes flow to `port.postMessage`, keystrokes flow back as
+ * binary sends — `Pane.tsx` needs no changes to consume either end. */
+export class PaneLink {
+  private socket: SocketLike
+  private awaitingBacklog = false
+  // Set by our own `close()`. Without this, `close()`'s own `socket.close()`
+  // fires `onclose` like any other drop and schedules a reconnect — a pane
+  // deliberately closed (unmount/workspace-switch) would resurrect a zombie
+  // socket a second later, the exact leak task 2 warns about.
+  private closed = false
+
+  constructor(
+    private readonly session: string,
+    private readonly connectSocket: () => SocketLike,
+    private readonly port: PortLike,
+    private readonly onExit: (name: string, code: number) => void,
+  ) {
+    this.socket = connectSocket()
+    this.wire()
+    this.port.onmessage = (e: { data: unknown }): void => {
+      const m = e.data as { data?: Uint8Array }
+      // `resize` MUST stay unreachable (spec §4/§6 — a pty's winsize is
+      // shared with the desktop app; a browser-driven resize would reflow
+      // live work). Only keystroke bytes are ever forwarded; anything else
+      // (notably a `{resize:{cols,rows}}` message `Pane.tsx` also sends) is
+      // silently dropped here, by construction — there is no branch that
+      // could turn it into a send.
+      if (m.data && this.socket.readyState === SOCKET_OPEN) {
+        this.socket.send(m.data instanceof Uint8Array ? m.data : new Uint8Array(m.data))
+      }
+    }
+    this.port.start()
+  }
+
+  private wire(): void {
+    const s = this.socket
+    const session = this.session
+    s.onopen = (): void => {
+      // Sent on EVERY (re)connect, first one included — there is no separate
+      // "queued open at construction time" path competing with it, which is
+      // what let the spike's `everConnected` guard exist to fix a double-
+      // Attach in the first place. One trigger, one send.
+      s.send(JSON.stringify({ t: 'open', name: session }))
+    }
+    s.onclose = (): void => {
+      if (this.closed) return
+      setTimeout(() => {
+        this.socket = this.connectSocket()
+        this.wire()
+      }, RECONNECT_MS)
+    }
+    s.onerror = (): void => {
+      try {
+        s.close()
+      } catch {
+        /* onclose handles the retry */
+      }
+    }
+    s.onmessage = (e: { data: unknown }): void => {
+      if (typeof e.data !== 'string') {
+        const backlog = this.awaitingBacklog
+        this.awaitingBacklog = false
+        this.port.postMessage(backlog ? { data: toBytes(e.data), backlog: true } : { data: toBytes(e.data) })
+        return
+      }
+      const msg = parseServerMsg(e.data)
+      if (!msg) return
+      if (msg.t === 'backlog') {
+        this.awaitingBacklog = true
+        return
+      }
+      if (msg.t === 'exit') {
+        this.onExit(msg.name, msg.code)
+        return
+      }
+      // sessions/error/activity/memory/backlogReply: `ControlLink`'s job,
+      // not this connection's — see the file header.
+    }
+  }
+
+  /** Tear down this pane: close the port, then the socket. No `{t:'close'}`
+   * send — simply closing the connection makes the server's own
+   * `remove_client` -> `detach_if_unwanted` do the identical Detach, and a
+   * `{t:'close'}` after the daemon has already forgotten the session (or
+   * before the very first `open` lands) would just draw a spurious
+   * "no such session" error back at nobody. */
+  close(): void {
+    this.closed = true
+    this.port.close()
+    this.socket.close()
+  }
+}
+
+// ---- window.amber -----------------------------------------------------------
+
+export interface AmberDeps {
+  connectSocket: () => SocketLike
+  newChannel: () => { port1: PortLike; port2: unknown }
+  postPanePort: (session: string, port2: unknown) => void
+  clipboard: { writeText: (text: string) => Promise<void>; readText: () => Promise<string> }
+  home: string
+  softwareGl: boolean
+}
+
+function notImplemented(name: string): () => never {
+  return () => {
+    throw new Error(`window.amber.${name}: not available in the web build`)
+  }
+}
+
+/** Build the full `window.amber` contract (the exact shape `main.tsx`
+ * declares globally) over `deps`. Kept separate from `install.ts` so this
+ * whole file stays free of `WebSocket`/`MessageChannel`/`window` and is
+ * importable under vitest's `node` environment. */
+export function createAmber(deps: AmberDeps): Window['amber'] {
+  let onEvent: ((d: unknown) => void) | null = null
+  const pending: unknown[] = []
+  const dispatch = (ev: unknown): void => {
+    if (onEvent) onEvent(ev)
+    else pending.push(ev)
+  }
+
+  const control = new ControlLink(deps.connectSocket, dispatch)
+  const panes = new Map<string, PaneLink>()
+
+  return {
+    softwareGl: deps.softwareGl,
+    homeDir: deps.home,
+
+    onDaemonEvent: (cb): void => {
+      onEvent = cb
+      for (const ev of pending.splice(0)) cb(ev)
+    },
+
+    // --- §2.2/§4a: the pane MessageChannel path, one socket per pane -------
+    openPane: (session): void => {
+      // A remount (workspace switch) before the old pane's close lands must
+      // not leak a second socket+port for the same name — mirrors the
+      // Electron client's `router.ts::attach`.
+      panes.get(session)?.close()
+      const channel = deps.newChannel()
+      const link = new PaneLink(session, deps.connectSocket, channel.port1, (name, code) =>
+        dispatch({ frame: { type: 'control', msg: { kind: 'Exit', name, code } } }),
+      )
+      panes.set(session, link)
+      deps.postPanePort(session, channel.port2)
+    },
+    closePane: (session): void => {
+      panes.get(session)?.close()
+      panes.delete(session)
+    },
+
+    // --- session lifecycle: existing browser whitelist ----------------------
+    createSession: (name, cwd, sessionKind): void => control.send({ t: 'create', name, cwd, kind: sessionKind }),
+    killSession: (name): void => control.send({ t: 'kill', name }),
+    renameSession: (from, to): void => control.send({ t: 'move', from, to }),
+    suspendSession: (name): void => control.send({ t: 'suspend', name }),
+    resumeSession: (name): void => control.send({ t: 'resume', name }),
+    dumpBacklog: (name): void => control.send({ t: 'dumpBacklog', name }),
+
+    // --- native browser API, not a stub (spec §3 "Clipboard" row) ----------
+    clipboardWrite: (text): void => {
+      void deps.clipboard.writeText(text)
+    },
+    clipboardRead: (): Promise<string> => deps.clipboard.readText(),
+
+    // --- §6 (layout CAS) not built here — see the follow-up task named
+    // below. Left as inert no-ops (not stubs: the mount effect calls both
+    // unconditionally, and a thrown error here would break every load).
+    // TODO(webapp-layout-cas): implement compare-and-swap per spec §6
+    // (docs/superpowers/specs/2026-08-01-amber-ide-as-a-webapp-design.md).
+    // The eventual `saveLayout` MUST preserve the sidecar's `browsers`/
+    // `editors` maps (spec §7) — those panes have no daemon session, so a
+    // naive "write whatever the renderer's current tree says" implementation
+    // would silently prune every desktop-only pane on the web build's first
+    // write.
+    loadLayout: (): Promise<string | null> => Promise.resolve(null),
+    saveLayout: (): Promise<void> => Promise.resolve(),
+
+    // --- §7 cuts + native dialogs: visible-throw stubs, never a silent no-op
+    saveWorkspaceFile: notImplemented('saveWorkspaceFile'),
+    openWorkspaceFile: notImplemented('openWorkspaceFile'),
+    pickFolder: notImplemented('pickFolder'),
+    resolvePath: notImplemented('resolvePath'),
+    revealPath: notImplemented('revealPath'),
+    editorOpenDialog: notImplemented('editorOpenDialog'),
+    editorRead: notImplemented('editorRead'),
+    editorSave: notImplemented('editorSave'),
+    editorSaveDialog: notImplemented('editorSaveDialog'),
+    editorDraftWrite: notImplemented('editorDraftWrite'),
+    editorDraftRead: notImplemented('editorDraftRead'),
+    editorDraftClear: notImplemented('editorDraftClear'),
+    editorInlineImages: notImplemented('editorInlineImages'),
+    claudeNames: notImplemented('claudeNames'),
+  }
+}

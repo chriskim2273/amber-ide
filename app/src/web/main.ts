@@ -1,3 +1,5 @@
+import './desktop-only.css'
+
 // Web build entry point.
 //
 // Auth bootstrap (mirrors `crates/amber/assets/app.js`'s `boot()` — the
@@ -19,10 +21,28 @@ async function bootstrapAuth(): Promise<void> {
   }
 }
 
+// `homeDir` (spec §3 "Env" row) must be a real value BEFORE `window.amber` is
+// installed: `main.tsx` reads it via `useState(() => window.amber?.homeDir ??
+// '/')`, a lazy initializer that runs exactly ONCE — patching it in after the
+// fact would permanently stick every pane's default cwd at whatever
+// placeholder was there first, and `map_browser_msg`'s `Path::new(cwd)
+// .is_dir()` check would then happily create sessions rooted at it.
+async function fetchBootstrap(): Promise<{ home: string }> {
+  try {
+    const r = await fetch('/api/bootstrap', { credentials: 'same-origin' })
+    if (!r.ok) return { home: '/' }
+    return (await r.json()) as { home: string }
+  } catch {
+    return { home: '/' }
+  }
+}
+
 void (async (): Promise<void> => {
   await bootstrapAuth()
+  const boot = await fetchBootstrap()
   // Install the shim BEFORE the renderer runs (main.tsx reads `window.amber`
   // synchronously — bridgeReady check, homeDir initializer).
-  await import('./amber')
+  const { installAmber } = await import('./install')
+  installAmber(boot.home)
   await import('../renderer/main')
 })()
