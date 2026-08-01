@@ -104,6 +104,45 @@ clean; `npm test` 432 passed / 1 pre-existing skip (30 files, 22 new in
 - `app/src/web/desktop-only.css` — new, CSS-only placeholder.
 - `app/src/web/amber.test.ts` — new, 22 cases.
 
+## Verification beyond the gate
+
+- **Mutation-checked task 1's headline claim.** Temporarily reverted the one
+  `write_daemon_tracking` call inside `run_daemon_link`'s reattach loop back
+  to plain `write_daemon` and re-ran
+  `daemon_reconnect_reattach_tags_its_backlog_reply`: it failed exactly as
+  predicted, panicking in `recv_out`'s 5 s "browser client queue starved"
+  timeout (the untagged reconnect never sends a `backlog` marker, so
+  `expect_backlog` blocks forever) rather than tripping its own deadline
+  assert — confirms the test is exercising the fix, not passing vacuously.
+  Reverted back; `git diff` on the file is clean again.
+- **`softwareGl` corrected after review**, not left as the initial draft:
+  the first pass had `install.ts` probe real WebGL support and pass `false`
+  through on any capable browser — a regression the spike deliberately
+  avoided (it hardcoded `true` and said outright that WebGL was "never
+  exercised in a browser"). `Pane.tsx` opens one WebGL context per pane, and
+  browsers cap concurrent contexts (~16 in Chrome, oldest evicted past the
+  cap); a busy workspace would have silently exercised the context-loss/
+  DOM-fallback path for the first time ever, transport-scope work having no
+  business flipping that on. `probeSoftwareGl()` now always returns `true`
+  (DOM renderer, correctness-neutral per the spike) with a comment naming
+  what unlocks flipping it — a real `canvas.getContext('webgl')` probe,
+  once a live-GUI pass has exercised WebGL contention across many
+  simultaneously open panes.
+- **`/api/bootstrap` gates and content now tested**, not just added: it's in
+  `unauthenticated_data_routes_and_ws_are_refused` (no cookie / forged
+  cookie → 401, same as `/api/sessions`) and a new
+  `bootstrap_carries_a_non_empty_home_behind_the_cookie` pins that `home` is
+  never served empty. That test exists because `std::env::var("HOME")` can
+  legitimately be `""` under a boot-managed `amber web` (the repo's own
+  2026-07-29 display-env history), and `main.tsx`'s `?? '/'` fallback does
+  **not** rescue an empty string (only null/undefined) — an empty `home`
+  would have become `cwd: ""`, silently failing `map_browser_msg`'s
+  `Path::new(cwd).is_dir()` gate on every `+ Pane` with no visible error.
+  Fixed on both ends: the server falls back to `"/"` when `HOME` is
+  unset/empty, and `fetchBootstrap` in `main.ts` additionally guards with
+  `body.home || '/'` (matching preload's own `homeArg || '/'` pattern)
+  in case a future server regresses this.
+
 ## Concerns
 
 - `dump_pending`/`pending_backlog` are cleared on a daemon disconnect
@@ -113,12 +152,22 @@ clean; `npm test` 432 passed / 1 pre-existing skip (30 files, 22 new in
 - `PaneLink`/`ControlLink` reconnect on a fixed 1 s timer, no backoff ladder
   — matches the spike's existing behavior, ponytail-flagged in the code as
   the corner cut.
+- Two browser tabs with the SAME session open both match `Hub::queue`'s
+  `open == session` filter, so a `backlog` marker minted for one tab's fresh
+  attach also reaches the other tab's `PaneLink`, which will `term.reset()`
+  its own terminal even though nothing attached on ITS connection. Content
+  repaints correctly right after (the daemon's backlog replay still lands
+  correctly on the connection that actually attached), so this is a visible
+  flicker, not corruption — but it's a web-only divergence from Electron
+  (one port per session there, never two consumers of the same pty). Not
+  fixed; a real cross-tab-same-session scenario is uncommon and out of this
+  task's scope.
 - Live-GUI verification (a real browser against a private daemon) was not
   re-run in this pass — the spike already proved the MessageChannel/render
   path end-to-end; this pass is transport-surface work verified by the
   Rust/vitest gates plus a clean `npm run build:web`. Flagging in case the
   next pass wants a live pass before this goes further (e.g. before wiring
-  the CAS layout task).
+  the CAS layout task, or before flipping `softwareGl`'s probe back on).
 - `app/out/web/` build artifacts were produced locally to verify the bundle
   stays clean (no `require(`/electron refs) and were left in place
   (gitignored, not committed).
