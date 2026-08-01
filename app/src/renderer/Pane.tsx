@@ -92,6 +92,13 @@ export const Pane = memo(function Pane(
     { session: string; epoch: number; portEpoch: number; activateSeq: number; fontSize: number; cwd: string; onTitle?: (title: string) => void; onSearchReady?: (api: SearchApi) => void },
 ): JSX.Element {
   const containerRef = useRef<HTMLDivElement>(null)
+  // `sizerRef`/`stageRef` wrap `hostRef` for the web build's follow-the-pty
+  // rendering (see `serverGeomRef` below). In Electron — and in the web build
+  // before the pty's geometry has arrived — both stay their default 100%/100%
+  // identity size with no transform, so `hostRef` fills `containerRef` exactly
+  // as it always did and FitAddon's `fit()` behaves unchanged.
+  const sizerRef = useRef<HTMLDivElement>(null)
+  const stageRef = useRef<HTMLDivElement>(null)
   const hostRef = useRef<HTMLDivElement>(null)
   // Floating "Open" button state: shown when the current selection resolves to a
   // real path (main-process stat). `path` is the abs path revealed on click.
@@ -126,6 +133,18 @@ export const Pane = memo(function Pane(
   // called when the client utilityProcess restarts (portEpoch) and the old port
   // is dead.
   const acquireRef = useRef<() => void>(() => {})
+  // The pty's live grid, learned from a `geom` port message (web build only —
+  // Electron's client never sends one, so this stays null there forever and
+  // every branch below that checks it takes the untouched Electron path).
+  // Non-null means: don't let FitAddon drive this pane's cols/rows — follow
+  // the server's grid and CSS-scale the rendered size instead (spec — a pty's
+  // winsize is shared with the desktop app's panes, so the web build must
+  // never resize it; matches `syncGeom`/`applyScale` in the mobile client,
+  // `crates/amber/assets/app.js`).
+  const serverGeomRef = useRef<{ cols: number; rows: number } | null>(null)
+  // Re-fit the scaled stage to the container (web-geometry mode only). Points
+  // at the live mount-effect closure, called from the later effects below.
+  const rescaleRef = useRef<() => void>(() => {})
 
   useEffect(() => {
     const host = hostRef.current
@@ -229,8 +248,54 @@ export const Pane = memo(function Pane(
       try { fit.fit() } catch { /* host has zero size mid-layout; ignore */ }
       port?.postMessage({ resize: { cols: term.cols, rows: term.rows } })
     }
-    const ro = new ResizeObserver(() => sendResize())
-    ro.observe(host)
+
+    // Web-geometry mode only (serverGeomRef set): fit the terminal's REAL
+    // cell box into the container on both axes, never magnifying past natural
+    // size, via a CSS transform — never a resize. Mirrors `applyScale` in the
+    // mobile client (`crates/amber/assets/app.js`), including the never-
+    // magnify clamp (fixed there in 32e863e after an 80-col grid blew up 2.25x
+    // on a laptop-width viewport). `transform-origin: 0 0` (set in the JSX
+    // below) keeps the scaled box pinned to the container's top-left corner,
+    // matching where `sizer`/`stage` are actually laid out, so the visible
+    // terminal lines up with its own hit-testable box (no dead click zone).
+    const rescale = (): void => {
+      const geom = serverGeomRef.current
+      const sizer = sizerRef.current, stage = stageRef.current, container = containerRef.current
+      const el = term.element
+      if (!geom || !sizer || !stage || !container || !el) return
+      if (!container.clientWidth || !container.clientHeight) return
+      const scr = el.querySelector('.xterm-screen') as HTMLElement | null
+      const w = scr ? scr.offsetWidth : el.offsetWidth
+      const h = scr ? scr.offsetHeight : el.offsetHeight
+      if (!w || !h) return
+      const scale = Math.min(container.clientWidth / w, container.clientHeight / h, 1)
+      stage.style.width = `${w}px`
+      stage.style.height = `${h}px`
+      stage.style.transform = `scale(${scale})`
+      sizer.style.width = `${w * scale}px`
+      sizer.style.height = `${h * scale}px`
+    }
+    rescaleRef.current = rescale
+
+    // Learn the pty's real grid from a `geom` port message (web build only —
+    // see `serverGeomRef`'s doc comment). Resizes the LOCAL xterm buffer to
+    // match — never posts a resize back down the port — then rescales.
+    const applyServerGeom = (g: { cols: number; rows: number }): void => {
+      serverGeomRef.current = g
+      if (term.cols !== g.cols || term.rows !== g.rows) term.resize(g.cols, g.rows)
+      rescale()
+    }
+
+    const ro = new ResizeObserver(() => {
+      if (serverGeomRef.current) rescale()
+      else sendResize()
+    })
+    // Observe the OUTER container, not `host`: in web-geometry mode `host`'s
+    // own size follows the pty's fixed grid (unrelated to the container), so
+    // it would stop firing on a divider drag right when `rescale` needs it.
+    // In Electron/pre-geometry mode host tracks container 1:1 (the wrapper
+    // divs are identity-sized), so this observes the same resizes as before.
+    if (containerRef.current) ro.observe(containerRef.current)
     const focus = (): void => term.focus()
 
     // Input goes to whatever the CURRENT port is. Registered ONCE — re-running it
@@ -277,7 +342,12 @@ export const Pane = memo(function Pane(
       port = e.ports[0]
       portRef.current = port
       port.onmessage = (ev) => {
-        const m = ev.data as { data?: Uint8Array; backlog?: boolean }
+        const m = ev.data as { data?: Uint8Array; backlog?: boolean; geom?: { cols: number; rows: number } }
+        // Web build only (see `serverGeomRef`): the pty's real grid, learned
+        // with no prop plumbing through main.tsx — Electron's client never
+        // sends this. Handled before the `!m.data` guard: a `geom` message
+        // carries no pty bytes of its own.
+        if (m.geom) applyServerGeom(m.geom)
         if (!m.data) return
         // `backlog` is set by the client (router.ts) on the first Data frame
         // after an Attach — the daemon's one-frame scrollback replay. It is NOT
@@ -302,7 +372,8 @@ export const Pane = memo(function Pane(
         }
       }
       port.start()
-      sendResize()
+      if (serverGeomRef.current) rescale()
+      else sendResize()
       term.focus()
     }
 
@@ -370,8 +441,12 @@ export const Pane = memo(function Pane(
     const nudge = (): void => {
       const term = termRef.current, fit = fitRef.current, port = portRef.current
       if (!term || !port) return
-      try { fit?.fit() } catch { /* ignore */ }
       term.write(MOUSE_RESET)
+      // Web-geometry mode: there's no local fit to redo (the grid follows the
+      // pty, not the container) and posting a resize would be a no-op anyway
+      // (dropped — see amber.ts) — just re-fit the scaled stage.
+      if (serverGeomRef.current) { rescaleRef.current(); return }
+      try { fit?.fit() } catch { /* ignore */ }
       port.postMessage({ resize: { cols: term.cols, rows: term.rows } })
     }
     const t1 = setTimeout(nudge, 600)
@@ -387,7 +462,8 @@ export const Pane = memo(function Pane(
     if (activateSeq === 0) return
     const term = termRef.current
     if (!term) return
-    try { fitRef.current?.fit() } catch { /* host mid-layout; ignore */ }
+    if (serverGeomRef.current) rescaleRef.current()
+    else { try { fitRef.current?.fit() } catch { /* host mid-layout; ignore */ } }
     term.refresh(0, Math.max(0, term.rows - 1))
   }, [activateSeq])
 
@@ -395,10 +471,15 @@ export const Pane = memo(function Pane(
   // [session] effect doesn't re-run, so the Terminal instance persists — we just
   // retune its options and refit (cell size changed → new cols/rows → SIGWINCH
   // the pty). Skips a degenerate 0-size host (see sendResize).
+  //
+  // Web-geometry mode: the grid stays exactly what the pty reports regardless
+  // of font size (resizing it here would be a local guess the server never
+  // asked for) — only the cell pixel size changed, so just rescale the stage.
   useEffect(() => {
     const term = termRef.current
     if (!term || term.options.fontSize === fontSize) return
     term.options.fontSize = fontSize
+    if (serverGeomRef.current) { rescaleRef.current(); return }
     const host = hostRef.current
     if (host && (host.clientWidth === 0 || host.clientHeight === 0)) return
     try { fitRef.current?.fit() } catch { /* host has zero size mid-layout; ignore */ }
@@ -415,8 +496,17 @@ export const Pane = memo(function Pane(
       }
     : undefined
   return (
-    <div ref={containerRef} style={{ position: 'relative', width: '100%', height: '100%', background: 'var(--bg)' }}>
-      <div ref={hostRef} style={{ width: '100%', height: '100%' }} />
+    <div ref={containerRef} style={{ position: 'relative', width: '100%', height: '100%', background: 'var(--bg)', display: 'flex', overflow: 'hidden' }}>
+      {/* `sizer` is sized in JS (rescale, above) to the SCALED box and centred
+          via `margin: auto` in this flex container; `stage` is sized to the
+          terminal's real (unscaled) cell box and transform-scaled to fit —
+          both stay 100%/100% identity, matching plain passthrough divs, until
+          web-geometry mode sets explicit pixel sizes. */}
+      <div ref={sizerRef} style={{ margin: 'auto', flex: 'none', width: '100%', height: '100%' }}>
+        <div ref={stageRef} style={{ width: '100%', height: '100%', transformOrigin: '0 0' }}>
+          <div ref={hostRef} style={{ width: '100%', height: '100%' }} />
+        </div>
+      </div>
       {openBtn &&
         <button
           className="open-path-btn"
