@@ -361,7 +361,12 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   Create/Kill/Rename/Suspend/Resume/DumpBacklog/Snapshot, and none can reach
   `Resize`** (a pty's winsize is shared with the desktop panes, so a phone-sized
   resize would reflow live work and corrupt a claude TUI — the front end has no
-  fit addon and scales/pans in CSS instead). `SessionInfo` gained `cols`/`rows`
+  fit addon and scales/pans in CSS instead). **As of this writing (2026-07-19)**
+  — `Create`/`Kill`/`Rename`/`Suspend`/`Resume`/`DumpBacklog` were widened onto
+  this same whitelist by the 2026-07-31 "Remote mosaic" entry below, and
+  `Resize` by the 2026-08-01 "Browser pty resize" entry below (bounded, not
+  unconditional); `Snapshot`/`ReportRunState` remain unreachable to this day.
+  `SessionInfo` gained `cols`/`rows`
   (serde-default, additive) so the phone renders at the session's REAL grid and
   follows it live; `/api/sessions` polls the daemon at 1 s rather than making the
   daemon broadcast on every `Resize` (a divider drag would flood the bounded

@@ -2,7 +2,10 @@
 
 **Status:** done. Gates green, live-verified.
 
-**Commit:** `78d488c254b98df18cc809a573795bf80f901d7` (branch `feat/web-resize`)
+**Commit:** `78d488c254b98df18cc809a573795bf80f901d78` (the feature commit;
+branch `feat/web-resize`). HEAD is `6167949d7915d973181177fbb040fe80c30481ba`,
+a docs-only follow-up filling in this SHA — no code changed after
+`78d488c`.
 
 ## Summary
 
@@ -145,15 +148,47 @@ pane box. Verified in a real browser at 1400×900 (Playwright).
   `amber ls` against the real daemon afterward: 17 sessions, all listed,
   untouched throughout.
 
+## No resize ping-pong (why two writers on one shared winsize is safe)
+
+Worth stating explicitly since "two clients can now resize the same pty" is
+the first thing a reviewer worries about: neither client resizes *in
+response to* a pty size change — each only resizes in response to *its own
+container* changing. Electron's `sendResize` fires from `ResizeObserver` on
+its own host element; the web build's `PaneLink` forwards a resize that
+originated the same way, from `Pane.tsx`'s own `ResizeObserver`. Neither
+side ever reads `SessionInfo.cols/rows` and reacts to it by resizing (the
+one thing that read `sessions` pushes for geometry — the now-deleted
+`findSessionGeom`/`geom` relay — is exactly what got removed). So there is
+no feedback loop: the desktop can still resize while the browser is open
+(and vice versa) without the two fighting over the winsize in a cycle, only
+each "winning" until the other's container changes again — which is the
+accepted tradeoff, not a bug.
+
 ## Concerns
 
-- The out-of-bounds rejection path (`cols:1,rows:1` etc.) is covered by the
-  Rust unit/integration tests but was not separately re-verified against the
-  live browser in this pass (no reason to expect a different result than the
-  automated `an_out_of_bounds_browser_resize_is_rejected` test, which drives
-  the identical code path over a real WebSocket).
+- **Out-of-bounds rejection is silent-drop by construction, verified by
+  inspection rather than a fresh browser run** (no daemon respin needed to
+  confirm this — it follows directly from code already read during this
+  pass): when `map_browser_msg` returns an empty vec, `Hub::handle_browser`
+  queues `error_msg("no such session")` back to whichever client id sent the
+  message — and a resize now arrives on the pane's own dedicated socket, not
+  `ControlLink`. `PaneLink.wire()`'s `s.onmessage` only branches on
+  `msg.t === 'backlog'` and `msg.t === 'exit'`; every other `t` (including
+  `error`) falls through to the trailing comment with no action — never
+  `dispatch()`ed, never surfaced as a banner. So a rejected/out-of-bounds
+  resize from a crushed or backgrounded pane is silently absorbed exactly
+  like a normal accepted one is silently applied: no red banner fires on
+  every resize a background tab's `ResizeObserver` happens to emit while
+  shrunk. This is closed by construction, not merely untested.
 - Bundle size warning (`main-*.js` > 500 KB) is pre-existing and unrelated.
 - The hand-written mobile UI (`assets/app.js`, spec
   `2026-07-19-amber-web-mobile-design.md`) still never sends a resize of its
   own — untouched, out of scope. The protocol-level capability is now shared
   infrastructure, but only the new React-renderer web build exercises it.
+  That spec's own §4/§5 text ("the phone NEVER sends `Resize`") describes v1
+  scope as shipped and is not retroactively rewritten, consistent with how
+  the pre-existing "Remote mosaic" CLAUDE.md entry already widened the same
+  whitelist for five other message types without editing that spec file —
+  CLAUDE.md (the living summary) carries the correction instead, and now has
+  two annotated superseded-claim pointers (the "Remote mosaic" entry and the
+  original "phone browser access" entry) rather than a silent contradiction.
