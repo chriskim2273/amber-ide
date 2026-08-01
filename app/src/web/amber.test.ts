@@ -123,6 +123,66 @@ describe('PaneLink', () => {
     expect(port.posted).toEqual([])
   })
 
+  it('posts its own session\'s live cols/rows down the port as a geom message', () => {
+    const socket = new FakeSocket()
+    socket.open()
+    const port = new FakePort()
+    new PaneLink('s1', () => socket, port, () => {})
+
+    socket.emit(JSON.stringify({
+      t: 'sessions',
+      sessions: [{ name: 'other', cols: 999, rows: 999 }, { name: 's1', cols: 80, rows: 24 }],
+    }))
+    expect(port.posted).toEqual([{ geom: { cols: 80, rows: 24 } }])
+  })
+
+  it('does not repost geom when a later sessions push reports the same cols/rows', () => {
+    const socket = new FakeSocket()
+    socket.open()
+    const port = new FakePort()
+    new PaneLink('s1', () => socket, port, () => {})
+
+    socket.emit(JSON.stringify({ t: 'sessions', sessions: [{ name: 's1', cols: 80, rows: 24 }] }))
+    socket.emit(JSON.stringify({ t: 'sessions', sessions: [{ name: 's1', cols: 80, rows: 24 }] }))
+    expect(port.posted).toEqual([{ geom: { cols: 80, rows: 24 } }])
+  })
+
+  it('reposts geom when the desktop app resizes the pty (a later sessions push changes cols/rows)', () => {
+    const socket = new FakeSocket()
+    socket.open()
+    const port = new FakePort()
+    new PaneLink('s1', () => socket, port, () => {})
+
+    socket.emit(JSON.stringify({ t: 'sessions', sessions: [{ name: 's1', cols: 80, rows: 24 }] }))
+    socket.emit(JSON.stringify({ t: 'sessions', sessions: [{ name: 's1', cols: 120, rows: 40 }] }))
+    expect(port.posted).toEqual([
+      { geom: { cols: 80, rows: 24 } },
+      { geom: { cols: 120, rows: 40 } },
+    ])
+  })
+
+  it('never posts geom for a dead session (cols/rows 0) or one not in the list', () => {
+    const socket = new FakeSocket()
+    socket.open()
+    const port = new FakePort()
+    new PaneLink('s1', () => socket, port, () => {})
+
+    socket.emit(JSON.stringify({ t: 'sessions', sessions: [{ name: 's1', cols: 0, rows: 0 }] }))
+    socket.emit(JSON.stringify({ t: 'sessions', sessions: [{ name: 'other', cols: 80, rows: 24 }] }))
+    expect(port.posted).toEqual([])
+  })
+
+  it('a geom-carrying sessions push never itself causes a resize (or anything else) to be sent to the socket', () => {
+    const socket = new FakeSocket()
+    socket.open()
+    const port = new FakePort()
+    new PaneLink('s1', () => socket, port, () => {})
+    socket.sent.length = 0
+
+    socket.emit(JSON.stringify({ t: 'sessions', sessions: [{ name: 's1', cols: 100, rows: 30 }] }))
+    expect(socket.sent).toEqual([])
+  })
+
   it('close() closes the port and socket and sends no control message', () => {
     const socket = new FakeSocket()
     socket.open()
@@ -357,7 +417,6 @@ describe('createAmber', () => {
       () => amber.saveWorkspaceFile('{}', 'x.amberws'),
       () => amber.openWorkspaceFile(),
       () => amber.pickFolder(),
-      () => amber.resolvePath('/', 'x'),
       () => amber.revealPath('/x'),
       () => amber.editorOpenDialog(),
       () => amber.editorRead('/x'),
@@ -372,5 +431,10 @@ describe('createAmber', () => {
     for (const call of stubs) {
       expect(call, `${call.toString()} did not throw`).toThrow('not available in the web build')
     }
+  })
+
+  it('resolvePath declines to null instead of throwing (hot path: every mouse selection)', async () => {
+    const amber = createAmber(deps())
+    await expect(amber.resolvePath('/', 'x')).resolves.toBeNull()
   })
 })

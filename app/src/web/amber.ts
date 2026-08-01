@@ -25,7 +25,14 @@
 // `Error` while a dump is pending — a second copy would both resolve the dump
 // AND draw a spurious red banner). `PaneLink` only ever forwards `exit` (only
 // ever delivered to the connection with that session `open`) and its own
-// `backlog` replay tag.
+// `backlog` replay tag — plus one more thing, privately: it also reads ITS
+// OWN session's live `cols`/`rows` out of every `sessions` push (the server
+// sends one immediately on connect, and again whenever a session's winsize
+// changes — e.g. the desktop app dragging a divider) and posts a `geom`
+// message down the pane's own port. This is never `dispatch()`ed — `main.tsx`
+// never sees it — so it can't create the N-copies problem above; it is purely
+// how `Pane.tsx` learns the pty's real grid without a resize ever reaching the
+// server (see the port-message handling below, and `Pane.tsx`'s port.onmessage).
 
 import type { LoadLayoutResult, SaveLayoutResult, LayoutVersion } from '../shared/layoutFile'
 
@@ -127,6 +134,23 @@ function toBytes(data: unknown): Uint8Array {
   return data instanceof Uint8Array ? data : new Uint8Array(data as ArrayBufferLike)
 }
 
+/** Pull `{cols,rows}` for `name` out of a `sessions` push's list (each entry
+ * mirrors `amber-core::proto::SessionInfo` — see `session_json` in web.rs).
+ * `null` when the session isn't in the list, or hasn't a real winsize yet (a
+ * dead session reports `cols`/`rows` 0 — see the daemon's doc comment on
+ * `SessionInfo.cols`). */
+function findSessionGeom(sessions: unknown, name: string): { cols: number; rows: number } | null {
+  if (!Array.isArray(sessions)) return null
+  for (const raw of sessions as unknown[]) {
+    const s = raw as { name?: unknown; cols?: unknown; rows?: unknown }
+    if (s.name !== name) continue
+    return typeof s.cols === 'number' && typeof s.rows === 'number' && s.cols > 0 && s.rows > 0
+      ? { cols: s.cols, rows: s.rows }
+      : null
+  }
+  return null
+}
+
 // ---- ControlLink: session lifecycle + the daemon event stream -------------
 
 /** The one non-pane WebSocket: session lifecycle commands (create/kill/
@@ -214,6 +238,10 @@ export class ControlLink {
 export class PaneLink {
   private socket: SocketLike
   private awaitingBacklog = false
+  // Last geometry posted down the port, so an unchanged `sessions` push (the
+  // common case — it also carries every OTHER session's fields) doesn't spam
+  // a redundant `geom` message on every poll tick.
+  private lastGeom: { cols: number; rows: number } | null = null
   // Set by our own `close()`. Without this, `close()`'s own `socket.close()`
   // fires `onclose` like any other drop and schedules a reconnect — a pane
   // deliberately closed (unmount/workspace-switch) would resurrect a zombie
@@ -284,8 +312,20 @@ export class PaneLink {
         this.onExit(msg.name, msg.code)
         return
       }
-      // sessions/error/activity/memory/backlogReply: `ControlLink`'s job,
-      // not this connection's — see the file header.
+      if (msg.t === 'sessions') {
+        // The pty's live winsize (spec — this connection may never resize
+        // it), forwarded down the port so `Pane.tsx` can follow it instead of
+        // fitting the local grid to the browser's box. Never `dispatch()`ed —
+        // see the file header — so this can't duplicate onto `main.tsx`.
+        const g = findSessionGeom(msg.sessions, session)
+        if (g && (this.lastGeom?.cols !== g.cols || this.lastGeom?.rows !== g.rows)) {
+          this.lastGeom = g
+          this.port.postMessage({ geom: g })
+        }
+        return
+      }
+      // error/activity/memory/backlogReply: `ControlLink`'s job, not this
+      // connection's — see the file header.
     }
   }
 
@@ -393,7 +433,14 @@ export function createAmber(deps: AmberDeps): Window['amber'] {
     saveWorkspaceFile: notImplemented('saveWorkspaceFile'),
     openWorkspaceFile: notImplemented('openWorkspaceFile'),
     pickFolder: notImplemented('pickFolder'),
-    resolvePath: notImplemented('resolvePath'),
+    // Path resolution is desktop-only (main-process fs.stat) — but unlike the
+    // stubs above this sits on a hot interaction path (every selection change
+    // in Pane.tsx calls it), so a synchronous throw here was an uncaught
+    // exception on every mouse selection in the web build. `null` is the
+    // documented "cannot resolve" result (see main.tsx's declared
+    // `Promise<string | null>` contract and Pane.tsx's `abs ? ... : null`
+    // handling) — decline gracefully instead of throwing.
+    resolvePath: (): Promise<string | null> => Promise.resolve(null),
     revealPath: notImplemented('revealPath'),
     editorOpenDialog: notImplemented('editorOpenDialog'),
     editorRead: notImplemented('editorRead'),
