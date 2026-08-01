@@ -361,7 +361,12 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   Create/Kill/Rename/Suspend/Resume/DumpBacklog/Snapshot, and none can reach
   `Resize`** (a pty's winsize is shared with the desktop panes, so a phone-sized
   resize would reflow live work and corrupt a claude TUI — the front end has no
-  fit addon and scales/pans in CSS instead). `SessionInfo` gained `cols`/`rows`
+  fit addon and scales/pans in CSS instead). **As of this writing (2026-07-19)**
+  — `Create`/`Kill`/`Rename`/`Suspend`/`Resume`/`DumpBacklog` were widened onto
+  this same whitelist by the 2026-07-31 "Remote mosaic" entry below, and
+  `Resize` by the 2026-08-01 "Browser pty resize" entry below (bounded, not
+  unconditional); `Snapshot`/`ReportRunState` remain unreachable to this day.
+  `SessionInfo` gained `cols`/`rows`
   (serde-default, additive) so the phone renders at the session's REAL grid and
   follows it live; `/api/sessions` polls the daemon at 1 s rather than making the
   daemon broadcast on every `Resize` (a divider drag would flood the bounded
@@ -785,9 +790,10 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   through the daemon so the desktop app's own reconcile draws the result; a
   pending tile covers the gap until the next 1 s push or 3 s, whichever first.
   The browser whitelist now reaches those five message types and **still**
-  never reaches `Resize` (one pty, one shared winsize — a laptop-sized resize
-  would corrupt a live claude TUI on the desktop), `Snapshot`, `DumpBacklog` or
-  `ReportRunState`. `Suspend`/`Resume` are gated to agent sessions both
+  never reaches `Snapshot`, `DumpBacklog` or `ReportRunState` (superseded
+  2026-08-01 for `Resize` — see the "browser pty resize" entry below: it is
+  now reachable, validated and bounded, not forbidden). `Suspend`/`Resume` are
+  gated to agent sessions both
   client-side (menu doesn't offer them for a shell) and server-side
   (`is_agent`, the real boundary). Behaviour change worth recording:
   `Open`/`Close` now validate against the daemon's **full** listed set
@@ -842,6 +848,42 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   against an empty session list; and a "move to tab N" while already on tab N
   passed server validation and made `manager::rename` kill and respawn a live
   agent for zero layout change.
+
+- [x] Browser pty resize (2026-08-01) — reverses the web-renderer pivot's
+  "the browser can never resize a pty" rule (spec
+  `docs/superpowers/specs/2026-08-01-amber-ide-as-a-webapp-design.md` §4), on
+  the user's explicit decision: their use case is working from the laptop
+  *instead of* the desktop, not peeking at a desktop someone is using, so a
+  desktop reflow while they're away is an accepted cost — the desktop re-fits
+  its own panes on return and a running TUI repaints on the SIGWINCH the
+  desktop already triggers on every divider drag. Deletes the workaround the
+  old rule forced (`.reports/fix-geometry.md`): the web build no longer pins
+  its xterm grid to the pty's cols/rows and shrinks the font to fit
+  (`fitFont`, `serverGeomRef`, the `{geom}` port relay, `MIN_FONT_SIZE`, the
+  letterboxing container styles) — all deleted rather than layered on.
+  **`app/src/renderer/Pane.tsx` is now byte-identical to its pre-workaround
+  version**: zero web-specific branching, confirmed with a diff against the
+  commit before the workaround landed. The web build takes the exact same
+  `FitAddon` path as Electron. `crates/amber/src/web.rs` gains
+  `BrowserMsg::Resize` and a `map_browser_msg` arm that constructs
+  `ControlMsg::Resize` only for a session the daemon currently lists and only
+  for `cols`/`rows` inside `RESIZE_MIN_COLS..=RESIZE_MAX_COLS` /
+  `RESIZE_MIN_ROWS..=RESIZE_MAX_ROWS` (10..=1000 / 4..=300 — the floor is
+  comfortably below any real split but well above the 1x1 a crushed/
+  backgrounded browser window could otherwise send, which would SIGWINCH a
+  full-screen program into repainting garbage and corrupt the desktop's
+  layout on return; the ceiling only rejects a broken/hostile client).
+  `app/src/web/amber.ts`'s `PaneLink` forwards `Pane.tsx`'s
+  `{resize:{cols,rows}}` port message as `{"t":"resize",...}` on the pane's
+  own socket, debounced 300 ms to match `main.tsx`'s existing layout-write
+  debounce ("only the settled size matters" — reused rather than a second
+  policy) so a divider drag doesn't fire one over the wire per animation
+  frame. The tests that used to assert `Resize` was categorically
+  unreachable were converted, not deleted, to assert the new guarantee
+  (reachable only via the validated arm, only within bounds; `Snapshot`/
+  `ReportRunState` still categorically unreachable). Gates: Rust 315 tests +
+  clippy clean, app 449 tests + typecheck + `build:web` green. **Live-verified**
+  full report: `.reports/web-resize.md`.
 
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**

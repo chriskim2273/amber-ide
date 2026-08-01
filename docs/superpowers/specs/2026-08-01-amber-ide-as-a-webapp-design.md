@@ -157,11 +157,32 @@ Because each connection carries exactly one session, **input is still gated on
 that connection's single `open`** — the existing server-side guarantee is
 untouched, not widened. A pane can only ever receive input for itself.
 
-Unchanged and non-negotiable: **`Resize` remains unreachable.** The renderer
-DOES call resize paths in Electron; the shim must drop them. A pty's winsize is
-shared, and a browser-driven resize would reflow the user's desktop panes. This
-is the one place the shim must deliberately diverge from the preload's
-behaviour, and it needs its own test.
+**Reversed 2026-08-01 (user decision): `Resize` is now reachable.** The
+original build of this spec had the shim drop every resize the renderer sent,
+because a pty's winsize is shared with the desktop app and a browser-driven
+resize would reflow the user's live desktop panes. That held while the web
+build pinned its xterm grid to the pty and shrank its font to fit — which
+produced its own bug (`docs/superpowers/specs` history, `.reports/web-resize.md`):
+panes clipped vertically or wasted ~25% of their width, and the font-shrink
+path had a defect where it never actually applied a shrunk size.
+The user's real use case is working from the laptop *instead of* the desktop,
+not peeking at a desktop someone else is actively using — so the reflow is an
+accepted cost, not a bug: the desktop app re-fits its own panes when it
+regains focus, and a running claude/ink TUI repaints on the SIGWINCH the
+desktop already triggers on every divider drag. The renderer now runs the
+IDENTICAL `FitAddon` path in both builds (`Pane.tsx` needed **zero**
+web-specific branching to get there — the whole geometry workaround was
+deleted, not layered on). `Pane.tsx`'s `{resize:{cols,rows}}` port message is
+forwarded by `amber.ts`'s `PaneLink` as `{"t":"resize",...}`, debounced
+(300 ms, matching the layout-write debounce's "only the settled size
+matters" policy) so a divider drag doesn't fire one over the wire per
+animation frame. `crates/amber/src/web.rs`'s `map_browser_msg` is still the
+ONLY path from a browser message to a daemon control message, and its
+`Resize` arm validates the session is live and `cols`/`rows` are within
+`RESIZE_MIN_COLS..=RESIZE_MAX_COLS` / `RESIZE_MIN_ROWS..=RESIZE_MAX_ROWS`
+(10..=1000 / 4..=300) — a crushed/backgrounded browser window can no longer
+shrink the pty to something degenerate. `Snapshot` and `ReportRunState`
+remain unreachable, unchanged.
 
 ### 4.1 Known bug the spike surfaced
 
@@ -171,12 +192,6 @@ cannot tell it is a replay, so history duplicates. Observed live: an extra
 unearned prompt line after a daemon-only restart. This predates the pivot and
 affects the shipped mobile UI too. Fix it before building further on the
 transport.
-
-Unchanged and non-negotiable: **`Resize` remains unreachable.** The renderer
-DOES call resize paths in Electron; the shim must drop them. A pty's winsize is
-shared, and a browser-driven resize would reflow the user's desktop panes. This
-is the one place the shim must deliberately diverge from the preload's
-behaviour, and it needs its own test.
 
 ## 5. Security
 
@@ -256,12 +271,15 @@ The pivot is only worth continuing if §2.2 holds. Prove it before anything else
 
 - **Rust:** the generated asset table serves every bundle file with correct
   content types; an absent `app/out/web/` falls back cleanly; multi-open input
-  routing reaches the right pty and *only* that one; `Resize` still unreachable
-  from every shim-shaped message; layout CAS rejects a stale version.
+  routing reaches the right pty and *only* that one; a `Resize` reaches the pty
+  only for a live session and only within bounds, while `Snapshot` and
+  `ReportRunState` stay unreachable from every shim-shaped message; layout CAS
+  rejects a stale version.
 - **TypeScript:** the shim is testable without a browser — pure message
   mapping. Test that `openPane` posts an `amberPanePort` message with a real
-  port, that binary frames route to the right port, that input routes back, and
-  that no code path emits a resize.
+  port, that binary frames route to the right port, that input routes back,
+  and that a `{resize:{cols,rows}}` port message is forwarded as `{"t":"resize",...}`
+  on the pane's own socket, debounced.
 - **Live:** the real renderer in a browser against a private daemon — pane
   renders, accepts input, split/drag/close work, divider drag persists, a
   concurrent desktop-app edit produces a conflict that resolves rather than

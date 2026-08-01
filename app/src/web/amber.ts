@@ -25,14 +25,17 @@
 // `Error` while a dump is pending — a second copy would both resolve the dump
 // AND draw a spurious red banner). `PaneLink` only ever forwards `exit` (only
 // ever delivered to the connection with that session `open`) and its own
-// `backlog` replay tag — plus one more thing, privately: it also reads ITS
-// OWN session's live `cols`/`rows` out of every `sessions` push (the server
-// sends one immediately on connect, and again whenever a session's winsize
-// changes — e.g. the desktop app dragging a divider) and posts a `geom`
-// message down the pane's own port. This is never `dispatch()`ed — `main.tsx`
-// never sees it — so it can't create the N-copies problem above; it is purely
-// how `Pane.tsx` learns the pty's real grid without a resize ever reaching the
-// server (see the port-message handling below, and `Pane.tsx`'s port.onmessage).
+// `backlog` replay tag.
+//
+// --- Resize (2026-08-01 decision reversing the earlier "never resize" rule) -
+// The browser MAY now resize its own pty: `Pane.tsx`'s FitAddon path runs
+// unmodified (same as Electron), and its `{resize:{cols,rows}}` port message
+// is forwarded here as a `{t:'resize',...}` JSON send on the pane's own
+// socket, debounced (`RESIZE_DEBOUNCE_MS`) so a divider drag doesn't fire one
+// over the wire per animation frame — see `PaneLink`'s port handler.
+// `crates/amber/src/web.rs`'s `map_browser_msg` is the actual trust boundary
+// (session must be live, cols/rows within sane bounds); this file just
+// forwards, it does not validate.
 
 import type { LoadLayoutResult, SaveLayoutResult, LayoutVersion } from '../shared/layoutFile'
 
@@ -58,6 +61,9 @@ export interface PortLike {
 }
 
 const RECONNECT_MS = 1000 // ponytail: fixed retry, no backoff ladder — matches the spike; revisit if flapping in practice
+// Matches main.tsx's layout-write debounce (see `PaneLink`'s doc comment) —
+// same "only the settled size matters" policy, reused rather than a second number.
+const RESIZE_DEBOUNCE_MS = 300
 
 // ---- wire message shapes (pure parsing) ------------------------------------
 
@@ -132,23 +138,6 @@ export function toDaemonEvent(
 
 function toBytes(data: unknown): Uint8Array {
   return data instanceof Uint8Array ? data : new Uint8Array(data as ArrayBufferLike)
-}
-
-/** Pull `{cols,rows}` for `name` out of a `sessions` push's list (each entry
- * mirrors `amber-core::proto::SessionInfo` — see `session_json` in web.rs).
- * `null` when the session isn't in the list, or hasn't a real winsize yet (a
- * dead session reports `cols`/`rows` 0 — see the daemon's doc comment on
- * `SessionInfo.cols`). */
-function findSessionGeom(sessions: unknown, name: string): { cols: number; rows: number } | null {
-  if (!Array.isArray(sessions)) return null
-  for (const raw of sessions as unknown[]) {
-    const s = raw as { name?: unknown; cols?: unknown; rows?: unknown }
-    if (s.name !== name) continue
-    return typeof s.cols === 'number' && typeof s.rows === 'number' && s.cols > 0 && s.rows > 0
-      ? { cols: s.cols, rows: s.rows }
-      : null
-  }
-  return null
 }
 
 // ---- ControlLink: session lifecycle + the daemon event stream -------------
@@ -238,10 +227,12 @@ export class ControlLink {
 export class PaneLink {
   private socket: SocketLike
   private awaitingBacklog = false
-  // Last geometry posted down the port, so an unchanged `sessions` push (the
-  // common case — it also carries every OTHER session's fields) doesn't spam
-  // a redundant `geom` message on every poll tick.
-  private lastGeom: { cols: number; rows: number } | null = null
+  // Debounces the pane's own `{resize:{cols,rows}}` port message (below) —
+  // cleared and restarted on every one, so only the size the drag SETTLES on
+  // reaches the wire. Mirrors main.tsx's 300 ms "no write mid-drag" layout
+  // debounce (same policy: only the settled value matters), reused rather
+  // than inventing a second number.
+  private resizeTimer: ReturnType<typeof setTimeout> | null = null
   // Set by our own `close()`. Without this, `close()`'s own `socket.close()`
   // fires `onclose` like any other drop and schedules a reconnect — a pane
   // deliberately closed (unmount/workspace-switch) would resurrect a zombie
@@ -257,15 +248,23 @@ export class PaneLink {
     this.socket = connectSocket()
     this.wire()
     this.port.onmessage = (e: { data: unknown }): void => {
-      const m = e.data as { data?: Uint8Array }
-      // `resize` MUST stay unreachable (spec §4/§6 — a pty's winsize is
-      // shared with the desktop app; a browser-driven resize would reflow
-      // live work). Only keystroke bytes are ever forwarded; anything else
-      // (notably a `{resize:{cols,rows}}` message `Pane.tsx` also sends) is
-      // silently dropped here, by construction — there is no branch that
-      // could turn it into a send.
+      const m = e.data as { data?: Uint8Array; resize?: { cols: number; rows: number } }
       if (m.data && this.socket.readyState === SOCKET_OPEN) {
         this.socket.send(m.data instanceof Uint8Array ? m.data : new Uint8Array(m.data))
+      }
+      // The browser may now resize its own pty (2026-08-01 decision reversing
+      // the earlier "never resize" rule — see the file header). Debounced:
+      // `crates/amber/src/web.rs`'s `map_browser_msg` is the actual bounds/
+      // liveness check, this just paces the wire.
+      if (m.resize) {
+        const { cols, rows } = m.resize
+        if (this.resizeTimer !== null) clearTimeout(this.resizeTimer)
+        this.resizeTimer = setTimeout(() => {
+          this.resizeTimer = null
+          if (this.socket.readyState === SOCKET_OPEN) {
+            this.socket.send(JSON.stringify({ t: 'resize', name: this.session, cols, rows }))
+          }
+        }, RESIZE_DEBOUNCE_MS)
       }
     }
     this.port.start()
@@ -312,20 +311,8 @@ export class PaneLink {
         this.onExit(msg.name, msg.code)
         return
       }
-      if (msg.t === 'sessions') {
-        // The pty's live winsize (spec — this connection may never resize
-        // it), forwarded down the port so `Pane.tsx` can follow it instead of
-        // fitting the local grid to the browser's box. Never `dispatch()`ed —
-        // see the file header — so this can't duplicate onto `main.tsx`.
-        const g = findSessionGeom(msg.sessions, session)
-        if (g && (this.lastGeom?.cols !== g.cols || this.lastGeom?.rows !== g.rows)) {
-          this.lastGeom = g
-          this.port.postMessage({ geom: g })
-        }
-        return
-      }
-      // error/activity/memory/backlogReply: `ControlLink`'s job, not this
-      // connection's — see the file header.
+      // sessions/error/activity/memory/backlogReply: `ControlLink`'s job, not
+      // this connection's — see the file header.
     }
   }
 
@@ -337,6 +324,7 @@ export class PaneLink {
    * "no such session" error back at nobody. */
   close(): void {
     this.closed = true
+    if (this.resizeTimer !== null) clearTimeout(this.resizeTimer)
     this.port.close()
     this.socket.close()
   }
