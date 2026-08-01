@@ -51,7 +51,7 @@
 //!   never on the shared daemon-read thread (the backlog head-of-line lesson
 //!   in CLAUDE.md).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::OpenOptionsExt;
@@ -65,6 +65,7 @@ use std::time::{Duration, Instant};
 
 use amber_core::proto::{self, ControlMsg, Decoder, Frame, SessionInfo};
 
+use crate::layout_cas;
 use crate::mosaic;
 
 // ---- constant-time comparison ------------------------------------------
@@ -211,6 +212,9 @@ pub enum BrowserMsg {
     Move { from: String, to: String },
     Suspend { name: String },
     Resume { name: String },
+    /// One-shot scrollback dump request (spec §3 "Backlog" row). Reply rides
+    /// its own `backlogReply` marker + a binary frame — see [`Hub::on_frame`].
+    DumpBacklog { name: String },
 }
 
 /// Parse a browser control (JSON text) frame. `None` for malformed JSON, an
@@ -226,6 +230,7 @@ pub fn parse_browser_msg(text: &str) -> Option<BrowserMsg> {
         "move" => Some(BrowserMsg::Move { from: f("from")?, to: f("to")? }),
         "suspend" => Some(BrowserMsg::Suspend { name: f("name")? }),
         "resume" => Some(BrowserMsg::Resume { name: f("name")? }),
+        "dumpBacklog" => Some(BrowserMsg::DumpBacklog { name: f("name")? }),
         // Anything else — including a hand-crafted `resize`/`snapshot` — has no
         // representation here, so it can never reach the daemon.
         _ => None,
@@ -242,8 +247,7 @@ const CREATE_KINDS: [&str; 3] = ["shell", "claude", "grok"];
 ///
 /// Every arm CONSTRUCTS its `ControlMsg` from validated parts; nothing from
 /// the browser is passed through. By construction there is no path from any
-/// browser input to **`Resize`**, `Snapshot`, `DumpBacklog` or
-/// `ReportRunState`.
+/// browser input to **`Resize`**, `Snapshot` or `ReportRunState`.
 pub fn map_browser_msg(
     msg: &BrowserMsg,
     open: Option<&str>,
@@ -266,7 +270,7 @@ pub fn map_browser_msg(
                     out.push(ControlMsg::Detach { name: prev.to_string() });
                 }
             }
-            out.push(ControlMsg::Attach { name: name.clone(), raw_client: false });
+            out.push(ControlMsg::Attach { name: name.clone(), raw_client: false, preview: false });
             out
         }
         BrowserMsg::Close { name } => {
@@ -310,6 +314,12 @@ pub fn map_browser_msg(
                 return Vec::new();
             }
             vec![ControlMsg::Resume { name: name.clone() }]
+        }
+        BrowserMsg::DumpBacklog { name } => {
+            if !live(name) {
+                return Vec::new();
+            }
+            vec![ControlMsg::DumpBacklog { name: name.clone() }]
         }
     }
 }
@@ -473,7 +483,7 @@ const GEOMETRY_POLL: Duration = Duration::from_secs(1);
 
 /// One queued frame for a browser client. `Arc` so a broadcast clones a
 /// pointer, not the payload.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum Out {
     Text(Arc<String>),
     Binary(Arc<Vec<u8>>),
@@ -494,6 +504,17 @@ struct HubInner {
     layout: String,
     layout_dirty: bool,
     clients: Vec<Client>,
+    /// Session names whose next `Frame::Data` is an `Attach` backlog replay
+    /// (2026-08-01 webapp-pivot §4.1 fix). Populated by
+    /// [`Hub::write_daemon_tracking`], the ONE place an `Attach` is ever sent
+    /// — whether from a browser `Open` or from `run_daemon_link`'s own
+    /// reconnect re-attach — so both paths get the same tag instead of only
+    /// the browser-initiated one.
+    pending_backlog: HashSet<String>,
+    /// Client ids awaiting a `DumpBacklog` reply, keyed by session name (a
+    /// `Frame::Backlog` carries no client id, so this is the only way to
+    /// route the one-shot reply back to whoever asked).
+    dump_pending: HashMap<String, Vec<u64>>,
 }
 
 /// The single daemon connection, multiplexed across every browser client.
@@ -531,6 +552,8 @@ impl Hub {
                 layout: String::new(),
                 layout_dirty: false,
                 clients: Vec::new(),
+                pending_backlog: HashSet::new(),
+                dump_pending: HashMap::new(),
             }),
             next_id: AtomicU64::new(0),
         })
@@ -612,6 +635,23 @@ impl Hub {
         }
     }
 
+    /// [`write_daemon`], plus: if `frame` is an `Attach`, remember that this
+    /// session's next `Frame::Data` is the backlog replay (2026-08-01
+    /// webapp-pivot §4.1). The daemon always sends the backlog as the first
+    /// `Data` frame after an `Attach` (`daemon.rs`'s subscribe-then-forward
+    /// ordering), so whichever code sends the `Attach` is the one place that
+    /// can know this for certain — never a "next message after X" guess. This
+    /// is the ONLY place `Attach` is written (both a browser `Open` and
+    /// `run_daemon_link`'s own reconnect re-attach route through it), so both
+    /// get tagged, not just the browser-initiated one. Mirrors the Electron
+    /// client's `router.ts::sendAttach`/`awaitingBacklog`.
+    fn write_daemon_tracking(inner: &mut HubInner, frame: &Frame) {
+        if let Frame::Control(ControlMsg::Attach { name, .. }) = frame {
+            inner.pending_backlog.insert(name.clone());
+        }
+        Self::write_daemon(inner, frame);
+    }
+
     /// Queue `msg` to every client matching `want`, evicting any whose queue
     /// is full or whose writer thread is gone. Never blocks.
     fn queue(inner: &mut HubInner, want: impl Fn(&Client) -> bool, msg: Out) {
@@ -654,7 +694,8 @@ impl Hub {
             | BrowserMsg::Kill { .. }
             | BrowserMsg::Move { .. }
             | BrowserMsg::Suspend { .. }
-            | BrowserMsg::Resume { .. } => previous,
+            | BrowserMsg::Resume { .. }
+            | BrowserMsg::DumpBacklog { .. } => previous,
         };
         for control in controls {
             if let ControlMsg::Detach { name } = &control {
@@ -663,7 +704,14 @@ impl Hub {
                     continue;
                 }
             }
-            Self::write_daemon(&mut inner, &Frame::Control(control));
+            // Correlate this client to the ONE-SHOT Backlog reply the daemon
+            // will send for a DumpBacklog — `on_frame`'s `Frame::Backlog` arm
+            // has no other way to know who asked (unlike pty `Data`, which
+            // routes by whichever client has the session `open`).
+            if let ControlMsg::DumpBacklog { name } = &control {
+                inner.dump_pending.entry(name.clone()).or_default().push(id);
+            }
+            Self::write_daemon_tracking(&mut inner, &Frame::Control(control));
         }
     }
 
@@ -688,8 +736,41 @@ impl Hub {
         let mut inner = self.inner.lock().unwrap();
         match frame {
             Frame::Data { session, bytes } => {
+                // §4.1 fix: this session's next Data frame after an Attach we
+                // ourselves sent (browser `Open` OR our own daemon-reconnect
+                // re-attach — see `write_daemon_tracking`) is the backlog
+                // replay. Tag it with a marker text frame first so the
+                // browser-side shim can reset() before it, exactly like the
+                // Electron client's `router.ts` already does for its own
+                // connection.
+                if inner.pending_backlog.remove(&session) {
+                    let marker = Out::Text(Arc::new(
+                        serde_json::json!({ "t": "backlog", "name": session.clone() })
+                            .to_string(),
+                    ));
+                    Self::queue(
+                        &mut inner,
+                        |c| c.open.as_deref() == Some(session.as_str()),
+                        marker,
+                    );
+                }
                 let msg = Out::Binary(Arc::new(bytes));
                 Self::queue(&mut inner, |c| c.open.as_deref() == Some(session.as_str()), msg);
+            }
+            Frame::Backlog { session, bytes } => {
+                // Reply to a browser `DumpBacklog` (spec §3 "Backlog" row) —
+                // routed back to whichever client id(s) asked, not by `open`
+                // (a `DumpBacklog` needs no Attach and this connection may
+                // have nothing open at all).
+                let Some(ids) = inner.dump_pending.remove(&session) else { return };
+                let marker = Out::Text(Arc::new(
+                    serde_json::json!({ "t": "backlogReply", "name": session }).to_string(),
+                ));
+                let payload = Out::Binary(Arc::new(bytes));
+                for id in ids {
+                    Self::queue(&mut inner, |c| c.id == id, marker.clone());
+                    Self::queue(&mut inner, |c| c.id == id, payload.clone());
+                }
             }
             Frame::Control(ControlMsg::Sessions { sessions }) => {
                 // Unchanged is the common case for the geometry poll — don't
@@ -724,7 +805,24 @@ impl Hub {
                 let out = Self::error_msg(&msg);
                 Self::queue(&mut inner, |_| true, out);
             }
-            // Activity / MemoryStat / acks: nothing the phone UI needs.
+            // Broadcast like Sessions/Error. The web-app shim (spec 2026-08-01
+            // §3 "the same event stream the Electron client emits") only lets
+            // its ONE control connection forward these into `onDaemonEvent` —
+            // every per-pane connection ignores them — so this reaching every
+            // client here does not fan out into duplicate app-level events.
+            // The hand-written mobile UI (`app.js`) ignores unknown `t`s.
+            Frame::Control(ControlMsg::Activity { name }) => {
+                let out = Out::Text(Arc::new(serde_json::json!({ "t": "activity", "name": name }).to_string()));
+                Self::queue(&mut inner, |_| true, out);
+            }
+            Frame::Control(ControlMsg::MemoryStat { name, rss_kb, growing }) => {
+                let out = Out::Text(Arc::new(
+                    serde_json::json!({ "t": "memory", "name": name, "rss_kb": rss_kb, "growing": growing })
+                        .to_string(),
+                ));
+                Self::queue(&mut inner, |_| true, out);
+            }
+            // Acks (Created/Killed/SessionList/…): nothing the UI needs.
             _ => {}
         }
     }
@@ -772,9 +870,15 @@ fn run_daemon_link(hub: Arc<Hub>) {
                     reattach.sort();
                     reattach.dedup();
                     for name in reattach {
-                        Hub::write_daemon(
+                        // §4.1 fix: this reconnect's re-attach is exactly the
+                        // path that used to arrive untagged (`amber web`
+                        // reconnecting to the DAEMON, independent of any
+                        // browser event) — route it through the same tracked
+                        // write a browser `Open` uses so its backlog reply
+                        // gets tagged too.
+                        Hub::write_daemon_tracking(
                             &mut inner,
-                            &Frame::Control(ControlMsg::Attach { name, raw_client: false }),
+                            &Frame::Control(ControlMsg::Attach { name, raw_client: false, preview: false }),
                         );
                     }
                 }
@@ -783,6 +887,14 @@ fn run_daemon_link(hub: Arc<Hub>) {
                 inner.daemon = None;
                 inner.sessions.clear();
                 inner.layout.clear();
+                // Bounded hygiene: an Attach/DumpBacklog that never got its
+                // reply because the daemon died mid-flight would otherwise
+                // leak its entry forever. Reattaching on the next reconnect
+                // (above) re-inserts pending_backlog fresh; a dropped
+                // DumpBacklog is not retried, so its client-side caller times
+                // out on its own (same as any other daemon-unreachable gap).
+                inner.pending_backlog.clear();
+                inner.dump_pending.clear();
                 // An empty session list with a stale non-empty layout would be
                 // incoherent (every leaf it names is now unreachable); "" here
                 // renders as `"layout":null`, matching the empty session list.
@@ -938,6 +1050,65 @@ fn handle_conn(mut stream: TcpStream, hub: &Arc<Hub>, auth: &Arc<Auth>) -> anyho
             let body = hub.sessions_json();
             Ok(respond(&mut stream, "200 OK", CT_JSON, &[], body.as_bytes())?)
         }
+        // Bootstrap for the real-renderer web build (spec 2026-08-01 §3 "Env"
+        // row): `homeDir` must be a value, not a probe — a browser has no
+        // notion of a server-side home directory. `softwareGl` is NOT served
+        // here; the shim probes WebGL support itself (a browser-local fact
+        // the server cannot know), unlike Electron's main process which reads
+        // its OWN compat marker.
+        ("GET", "/api/bootstrap") => {
+            if !auth.valid_cookie(&req) {
+                return Ok(respond(&mut stream, "401 Unauthorized", "", &[], b"")?);
+            }
+            // A boot-managed `amber web` can start with a minimal env (the
+            // 2026-07-29 display-env lesson — this repo has been bitten by
+            // exactly this class of gap before). An empty `home` would become
+            // `cwd: ""` client-side, silently failing `map_browser_msg`'s
+            // `Path::new(cwd).is_dir()` gate on every `+ Pane` with no visible
+            // error — never serve it empty.
+            let home = std::env::var("HOME").ok().filter(|h| !h.is_empty()).unwrap_or_else(|| "/".into());
+            let body = serde_json::json!({ "home": home }).to_string();
+            Ok(respond(&mut stream, "200 OK", CT_JSON, &[], body.as_bytes())?)
+        }
+        // Layout CAS (spec 2026-08-01 §6): the browser and the desktop app
+        // are both writers of `ui-layout.json` now, so reads/writes go
+        // through `layout_cas`, which re-checks the version under the same
+        // call that renames the file into place — never a plain overwrite.
+        ("GET", "/api/layout") => {
+            if !auth.valid_cookie(&req) {
+                return Ok(respond(&mut stream, "401 Unauthorized", "", &[], b"")?);
+            }
+            let loaded = layout_cas::load(&hub.root);
+            let body = serde_json::json!({ "text": loaded.text, "version": loaded.version }).to_string();
+            Ok(respond(&mut stream, "200 OK", CT_JSON, &[], body.as_bytes())?)
+        }
+        ("POST", "/api/layout") => {
+            if !auth.valid_cookie(&req) {
+                return Ok(respond(&mut stream, "401 Unauthorized", "", &[], b"")?);
+            }
+            let Ok(body) = serde_json::from_slice::<serde_json::Value>(&req.body) else {
+                return Ok(respond(&mut stream, "400 Bad Request", "", &[], b"")?);
+            };
+            let Some(text) = body.get("text").and_then(|v| v.as_str()) else {
+                return Ok(respond(&mut stream, "400 Bad Request", "", &[], b"")?);
+            };
+            let version = body.get("version").and_then(|v| v.as_str());
+            match layout_cas::save(&hub.root, text, version) {
+                layout_cas::SaveResult::Ok { version } => {
+                    let out = serde_json::json!({ "ok": true, "version": version }).to_string();
+                    Ok(respond(&mut stream, "200 OK", CT_JSON, &[], out.as_bytes())?)
+                }
+                layout_cas::SaveResult::Conflict { text, version } => {
+                    let out =
+                        serde_json::json!({ "conflict": true, "text": text, "version": version }).to_string();
+                    Ok(respond(&mut stream, "409 Conflict", CT_JSON, &[], out.as_bytes())?)
+                }
+                layout_cas::SaveResult::Error(e) => {
+                    let out = serde_json::json!({ "error": e }).to_string();
+                    Ok(respond(&mut stream, "500 Internal Server Error", CT_JSON, &[], out.as_bytes())?)
+                }
+            }
+        }
         ("GET", "/ws") => {
             if !auth.valid_cookie(&req) {
                 return Ok(respond(&mut stream, "401 Unauthorized", "", &[], b"")?);
@@ -965,12 +1136,68 @@ fn handle_conn(mut stream: TcpStream, hub: &Arc<Hub>, auth: &Arc<Auth>) -> anyho
             stream.flush()?;
             ws_session(stream, hub)
         }
+        // SPIKE ONLY (2026-08-01 webapp-pivot spike, proving-order item 1 in
+        // the spec): serves the built bundle off disk, read per-request, from
+        // `<state-root>/web/` (installed) or `app/out/web/` (dev). This is NOT
+        // the real bundle-serving design (spec §2.3) — that's `build.rs`
+        // generating a static `include_bytes!` table so the binary stays
+        // self-contained/offline; that's proving-order item 4. Same-origin as
+        // everything else in this file on purpose: a cross-origin page would
+        // fail both the WS `Origin` check and the `SameSite=Strict` cookie.
+        ("GET", "/app") | ("GET", "/app/") => match web_asset(&hub.root, "index.html") {
+            Some((body, ctype)) => Ok(respond(&mut stream, "200 OK", ctype, &[], &body)?),
+            None => Ok(respond(
+                &mut stream,
+                "404 Not Found",
+                "",
+                &[],
+                b"web bundle not built - run `npm run build:web` in app/",
+            )?),
+        },
+        ("GET", p) if p.starts_with("/assets/") => match web_asset(&hub.root, p) {
+            Some((body, ctype)) => Ok(respond(&mut stream, "200 OK", ctype, &[], &body)?),
+            None => Ok(respond(&mut stream, "404 Not Found", "", &[], b"")?),
+        },
         ("GET", path) => match asset(path) {
             Some((body, ctype)) => Ok(respond(&mut stream, "200 OK", ctype, &[], body)?),
             None => Ok(respond(&mut stream, "404 Not Found", "", &[], b"")?),
         },
         _ => Ok(respond(&mut stream, "405 Method Not Allowed", "", &[], b"")?),
     }
+}
+
+/// Serve one file of the built web bundle. `rel` is a request path
+/// (`/assets/x.js` or `index.html`), so a leading `/` is stripped and any `..`
+/// component is refused.
+///
+/// Two locations, in order:
+///   1. `<state-root>/web/` — the INSTALLED bundle. This is the one that works
+///      under systemd, where the service's CWD is `/` and a relative path
+///      resolves to nothing.
+///   2. `app/out/web/` relative to CWD — the dev path, so `npm run build:web`
+///      plus `cargo run` still works from a checkout.
+///
+/// Still interim with respect to spec §2.3, which wants `build.rs` to generate
+/// a static `include_bytes!` table so the binary stays self-contained and
+/// offline. That is proving-order item 4. Until then a packaged binary must
+/// have the bundle installed alongside it.
+fn web_asset(root: &Path, rel: &str) -> Option<(Vec<u8>, &'static str)> {
+    if rel.contains("..") {
+        return None;
+    }
+    let rel = rel.trim_start_matches('/');
+    let path = {
+        let installed = root.join("web").join(rel);
+        if installed.is_file() { installed } else { Path::new("app/out/web").join(rel) }
+    };
+    let ctype = if rel.ends_with(".js") {
+        CT_JS
+    } else if rel.ends_with(".css") {
+        CT_CSS
+    } else {
+        CT_HTML
+    };
+    std::fs::read(&path).ok().map(|b| (b, ctype))
 }
 
 /// Pump one browser WebSocket. Reads happen here; ALL writes happen on a
@@ -1181,13 +1408,10 @@ mod tests {
     /// app, and `Snapshot`/`DumpBacklog`/`ReportRunState` are
     /// daemon/supervisor-internal.
     fn is_forbidden(msg: &ControlMsg) -> bool {
-        matches!(
-            msg,
-            ControlMsg::Resize { .. }
-                | ControlMsg::DumpBacklog { .. }
-                | ControlMsg::Snapshot
-                | ControlMsg::ReportRunState { .. }
-        )
+        // `DumpBacklog` is deliberately NOT here: the 2026-08-01 webapp pivot
+        // widened the whitelist to include it (spec §3 "Backlog" row) behind
+        // its own `live(name)` gate in `map_browser_msg`.
+        matches!(msg, ControlMsg::Resize { .. } | ControlMsg::Snapshot | ControlMsg::ReportRunState { .. })
     }
 
     #[test]
@@ -1196,20 +1420,20 @@ mod tests {
         // open with nothing open -> just Attach.
         assert_eq!(
             map_browser_msg(&BrowserMsg::Open { name: "s".into() }, None, &live),
-            vec![ControlMsg::Attach { name: "s".into(), raw_client: false }]
+            vec![ControlMsg::Attach { name: "s".into(), raw_client: false, preview: false }]
         );
         // open while another is open -> switch (Detach old, Attach new).
         assert_eq!(
             map_browser_msg(&BrowserMsg::Open { name: "t".into() }, Some("s"), &live),
             vec![
                 ControlMsg::Detach { name: "s".into() },
-                ControlMsg::Attach { name: "t".into(), raw_client: false },
+                ControlMsg::Attach { name: "t".into(), raw_client: false, preview: false },
             ]
         );
         // re-open the same session -> no churn.
         assert_eq!(
             map_browser_msg(&BrowserMsg::Open { name: "s".into() }, Some("s"), &live),
-            vec![ControlMsg::Attach { name: "s".into(), raw_client: false }]
+            vec![ControlMsg::Attach { name: "s".into(), raw_client: false, preview: false }]
         );
         // close -> Detach.
         assert_eq!(
@@ -1330,6 +1554,28 @@ mod tests {
     }
 
     #[test]
+    fn dump_backlog_is_gated_on_liveness_like_kill() {
+        let live = [s("amber-1-1-0-aa", "shell")];
+        assert_eq!(
+            parse_browser_msg(r#"{"t":"dumpBacklog","name":"amber-1-1-0-aa"}"#),
+            Some(BrowserMsg::DumpBacklog { name: "amber-1-1-0-aa".into() })
+        );
+        assert!(matches!(
+            map_browser_msg(
+                &BrowserMsg::DumpBacklog { name: "amber-1-1-0-aa".into() },
+                None,
+                &live
+            )
+            .as_slice(),
+            [ControlMsg::DumpBacklog { name }] if name == "amber-1-1-0-aa"
+        ));
+        assert!(
+            map_browser_msg(&BrowserMsg::DumpBacklog { name: "ghost".into() }, None, &live).is_empty(),
+            "a dump request for a dead/unknown session must not reach the daemon"
+        );
+    }
+
+    #[test]
     fn resize_and_the_other_forbidden_controls_remain_unreachable() {
         // There is no BrowserMsg that parses to them, so no mapping exists.
         for text in [
@@ -1362,6 +1608,7 @@ mod tests {
             r#"{"t":"suspend","name":"s"}"#,
             r#"{"t":"resume","name":"s"}"#,
             r#"{"t":"dumpbacklog","name":"s"}"#,
+            r#"{"t":"dumpBacklog","name":"s"}"#,
             r#"{"t":"snapshot"}"#,
             r#"{"t":"input","name":"s","data":"eA=="}"#,
             "garbage",
@@ -1382,6 +1629,7 @@ mod tests {
                                     | ControlMsg::Rename { .. }
                                     | ControlMsg::Suspend { .. }
                                     | ControlMsg::Resume { .. }
+                                    | ControlMsg::DumpBacklog { .. }
                             ),
                             "{text:?} produced non-whitelisted {out:?}"
                         );
@@ -1389,6 +1637,144 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Reads whole `Frame`s off a raw fake-daemon connection, keeping the
+    /// `Decoder`'s state across calls (two frames can arrive in one `read()`).
+    struct FrameReader<'a> {
+        // A shared reference (not `&mut`): `UnixStream` implements `Read` for
+        // `&UnixStream` too, so this can coexist with `conn_write`'s own `&
+        // UnixStream` borrows of the same connection instead of fighting over
+        // exclusive access.
+        stream: &'a UnixStream,
+        dec: Decoder,
+    }
+    impl<'a> FrameReader<'a> {
+        fn new(stream: &'a UnixStream) -> Self {
+            Self { stream, dec: Decoder::new() }
+        }
+        fn next(&mut self) -> Frame {
+            let mut buf = [0u8; 4096];
+            loop {
+                if let Some(f) = self.dec.next_frame().unwrap() {
+                    return f;
+                }
+                let n = self.stream.read(&mut buf).unwrap();
+                assert!(n > 0, "fake daemon connection closed unexpectedly");
+                self.dec.feed(&buf[..n]);
+            }
+        }
+    }
+
+    fn recv_out(rx: &Receiver<Out>) -> Out {
+        rx.recv_timeout(Duration::from_secs(5)).expect("browser client queue starved")
+    }
+
+    /// `serde_json::json!` does not guarantee key order, so assert on parsed
+    /// structure rather than the literal string.
+    fn is_backlog_marker(text: &str, name: &str) -> bool {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else { return false };
+        v["t"] == "backlog" && v["name"] == name
+    }
+
+    /// Drain `rx` up to the `backlog` marker for `name`, tolerating whatever
+    /// else the hub also broadcasts in between (e.g. the `sessions`/`error`
+    /// pair a daemon disconnect fires) — this test cares only that the marker
+    /// itself is present and correctly paired with the payload that follows.
+    fn expect_backlog(rx: &Receiver<Out>, name: &str) -> Vec<u8> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(Instant::now() < deadline, "backlog marker for {name} never arrived");
+            if let Out::Text(t) = recv_out(rx) {
+                if is_backlog_marker(&t, name) {
+                    break;
+                }
+            }
+        }
+        match recv_out(rx) {
+            Out::Binary(b) => b.as_ref().clone(),
+            other => panic!("expected the backlog payload right after its marker, got {other:?}"),
+        }
+    }
+
+    /// 2026-08-01 webapp-pivot §4.1 regression: `amber web` re-Attaches on ITS
+    /// OWN reconnect to the daemon, independent of any browser event, and that
+    /// path used to arrive untagged — the browser couldn't tell it was a
+    /// replay, so history duplicated (confirmed live: an extra unearned prompt
+    /// line after a daemon-only restart). Drives a fake daemon by hand (a raw
+    /// `UnixListener`, not the real `Daemon`/`SessionManager`) so the
+    /// disconnect/reconnect is deterministic rather than racing a real child
+    /// process. Revert `write_daemon_tracking`'s use in `run_daemon_link` (i.e.
+    /// go back to plain `write_daemon` there) and this test fails on the
+    /// second `backlog` assertion.
+    #[test]
+    fn daemon_reconnect_reattach_tags_its_backlog_reply() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("fake-daemon.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+
+        let hub = Hub::new(sock, dir.path().to_path_buf());
+        {
+            let hub = Arc::clone(&hub);
+            thread::spawn(move || run_daemon_link(hub));
+        }
+
+        // --- First "daemon" connection ---------------------------------
+        let (conn, _) = listener.accept().unwrap();
+        conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut r1 = FrameReader::new(&conn);
+
+        conn_write(&conn, &Frame::Control(ControlMsg::Sessions { sessions: vec![s("s1", "shell")] }));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !hub.inner.lock().unwrap().sessions.iter().any(|x| x.name == "s1") {
+            assert!(Instant::now() < deadline, "hub never learned about s1");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let (id, rx) = hub.add_client();
+        // The initial push `add_client` queues before any Attach happens.
+        match recv_out(&rx) {
+            Out::Text(t) => assert!(t.contains("\"t\":\"sessions\""), "{t}"),
+            other => panic!("expected the initial sessions push, got {other:?}"),
+        }
+
+        hub.handle_browser(id, r#"{"t":"open","name":"s1"}"#);
+        // `run_daemon_link` already wrote a `WatchSessions` the moment it
+        // connected (before any client existed) — skip past it to the Attach
+        // the just-issued Open produced.
+        loop {
+            if matches!(r1.next(), Frame::Control(ControlMsg::Attach { name, .. }) if name == "s1") {
+                break;
+            }
+        }
+        conn_write(&conn, &Frame::Data { session: "s1".into(), bytes: b"first-backlog".to_vec() });
+        assert_eq!(expect_backlog(&rx, "s1"), b"first-backlog");
+
+        // --- The daemon dies and a fresh connection replaces it, with NO
+        // browser-side event at all: this is the bug's exact trigger. ------
+        drop(r1);
+        drop(conn);
+        let (conn2, _) = listener.accept().unwrap();
+        conn2.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut r2 = FrameReader::new(&conn2);
+        // `run_daemon_link` sends WatchSessions before re-attaching every
+        // session a client still has open — skip past it.
+        loop {
+            if matches!(r2.next(), Frame::Control(ControlMsg::Attach { name, .. }) if name == "s1") {
+                break;
+            }
+        }
+        conn_write(&conn2, &Frame::Data { session: "s1".into(), bytes: b"replayed-after-restart".to_vec() });
+
+        // The fix: the browser gets the SAME tagged marker for this
+        // reconnect-driven re-attach as it did for the browser-initiated one
+        // (tolerating the "daemon unreachable" sessions/error pair the
+        // disconnect itself broadcasts first).
+        assert_eq!(expect_backlog(&rx, "s1"), b"replayed-after-restart");
+    }
+
+    fn conn_write(mut stream: &UnixStream, frame: &Frame) {
+        stream.write_all(&proto::encode(frame)).unwrap();
     }
 
     #[test]

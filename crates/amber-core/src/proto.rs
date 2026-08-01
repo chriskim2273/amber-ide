@@ -74,6 +74,14 @@ pub enum ControlMsg {
         name: String,
         #[serde(default)]
         raw_client: bool,
+        /// A small mosaic tile, not a full view. Agent sessions get NO backlog
+        /// plus a bounded repaint nudge; shell sessions get a bounded tail of
+        /// the ring only (`Ring::tail`). `#[serde(default)]` keeps the wire
+        /// backward compatible: a client that omits it (older binaries, the
+        /// Electron app, which never sets it) decodes as `false` = today's
+        /// full-backlog attach.
+        #[serde(default)]
+        preview: bool,
     },
     Detach { name: String },
     Resize { name: String, cols: u16, rows: u16 },
@@ -401,7 +409,7 @@ mod tests {
 
     #[test]
     fn control_frame_roundtrips() {
-        let f = Frame::Control(ControlMsg::Attach { name: "a".into(), raw_client: true });
+        let f = Frame::Control(ControlMsg::Attach { name: "a".into(), raw_client: true, preview: false });
         assert_eq!(roundtrip(&f), f);
     }
 
@@ -411,7 +419,17 @@ mod tests {
         // send Attach without `raw_client`; they must decode as the
         // full-backlog behavior, not an error.
         let msg: ControlMsg = serde_json::from_str(r#"{"Attach":{"name":"a"}}"#).unwrap();
-        assert_eq!(msg, ControlMsg::Attach { name: "a".into(), raw_client: false });
+        assert_eq!(msg, ControlMsg::Attach { name: "a".into(), raw_client: false, preview: false });
+    }
+
+    #[test]
+    fn attach_without_preview_field_defaults_to_false() {
+        // Same back-compat guarantee for the new field: an older client (or an
+        // older binary's own recorded fixtures) that never heard of `preview`
+        // must still decode, as `false` = today's full-backlog attach.
+        let msg: ControlMsg =
+            serde_json::from_str(r#"{"Attach":{"name":"a","raw_client":true}}"#).unwrap();
+        assert_eq!(msg, ControlMsg::Attach { name: "a".into(), raw_client: true, preview: false });
     }
 
     #[test]

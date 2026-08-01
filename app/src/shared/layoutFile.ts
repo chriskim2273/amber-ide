@@ -159,6 +159,95 @@ export function emptyLayout(): LayoutFile {
   return { version: LAYOUT_VERSION, activeWorkspace: 1, workspaces: {} }
 }
 
+// ---- CAS (compare-and-swap) types, shared by main/index.ts, preload,
+// main.tsx and the web shim (spec 2026-08-01 §6). `version` is the sidecar
+// file's exact previous content, not a derived digest (mtimeMs + byte length
+// — the spec's first idea — collides trivially: two writes landing in the
+// same host millisecond, or two edits of identical byte length, e.g. a split
+// ratio's last digit flipping, e.g. `0.500000` -> `0.500001`. A false version
+// match there is a silent clobber, exactly what CAS exists to prevent. The
+// sidecar is a few KB (~3.2 KB measured on a real install), so comparing full
+// content costs nothing a hash would meaningfully save, and content equality
+// cannot false-positive. Each writer only ever compares ITS OWN token against
+// its own re-read, so the two independent implementations (this file's
+// Node-side IO and `crates/amber/src/layout_cas.rs`'s Rust IO) never need to
+// agree on an algorithm — only on the wire shape below.
+export type LayoutVersion = string | null
+export interface LoadLayoutResult { text: string | null; version: LayoutVersion }
+export type SaveLayoutResult =
+  | { ok: true; version: LayoutVersion }
+  | { conflict: true; text: string | null; version: LayoutVersion }
+  | { error: string }
+
+function isPlainObj(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v)
+}
+
+// Order-independent structural equality (JSON.stringify would false-positive
+// on same-content-different-key-order objects, which would wrongly reject a
+// remote edit during a merge below — see merge3).
+function deepEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true
+  if (Array.isArray(a) || Array.isArray(b)) {
+    return Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((v, i) => deepEqual(v, b[i]))
+  }
+  if (isPlainObj(a) && isPlainObj(b)) {
+    const ak = Object.keys(a)
+    return ak.length === Object.keys(b).length && ak.every((k) => Object.hasOwn(b, k) && deepEqual(a[k], b[k]))
+  }
+  return false
+}
+
+/**
+ * Generic 3-way JSON merge (spec §6: "re-apply the mutation against the fresh
+ * tree, not blindly re-write the stale one"). `base` is what the edit started
+ * from, `local` is that edit applied, `remote` is what's on disk now (the
+ * other writer's change since `base`). Recurses into plain objects key by
+ * key; arrays and primitives are leaves.
+ *
+ * Per key: if `local` didn't change it since `base`, take `remote`'s value
+ * (including a deletion) — accepting the other writer's edit. Otherwise keep
+ * `local`'s, recursing one level deeper when both sides are still plain
+ * objects — so e.g. the browser editing workspace 2's tree and the desktop
+ * editing workspace 1's tree both survive even though they share the
+ * top-level `workspaces` key, and this is schema-agnostic (works the same
+ * for `browsers`/`editors`/`frozen`/anything added later), which is what
+ * makes it safe against silently dropping a desktop-only pane.
+ *
+ * ponytail: a genuine double-edit of the exact same leaf (rare — two clients
+ * dragging the same divider inside one retry window) resolves to `local` —
+ * good enough for a bounded, rare race; escalate to a finer-grained merge
+ * only if that's observed to bite in practice.
+ */
+function merge3(base: unknown, local: unknown, remote: unknown): unknown {
+  if (deepEqual(local, remote)) return local
+  if (isPlainObj(base) && isPlainObj(local) && isPlainObj(remote)) {
+    const keys = new Set([...Object.keys(base), ...Object.keys(local), ...Object.keys(remote)])
+    const out: Record<string, unknown> = {}
+    for (const k of keys) {
+      const changedLocally = !deepEqual(local[k], base[k])
+      if (!changedLocally) {
+        if (Object.hasOwn(remote, k)) out[k] = remote[k]
+        continue // remote also lacks the key -> stays absent
+      }
+      if (!Object.hasOwn(local, k)) continue // local deleted this key -> respect the deletion
+      out[k] = merge3(base[k], local[k], remote[k])
+    }
+    return out
+  }
+  return local // leaf-level: this changed locally and the three-way check above already ruled out local === remote
+}
+
+/**
+ * Reconcile a CAS conflict. `base` is the tree the in-flight edit started
+ * from, `local` is that edit applied, `remote` is what's on disk now. Runs
+ * the generic merge then re-validates through `parseLayout`'s shape guards —
+ * never trust a merged object's shape blindly.
+ */
+export function mergeLayout(base: LayoutFile, local: LayoutFile, remote: LayoutFile): LayoutFile {
+  return parseLayout(JSON.stringify(merge3(base, local, remote)))
+}
+
 export function parseLayout(text: string): LayoutFile {
   try {
     const v = JSON.parse(text) as Partial<LayoutFile>

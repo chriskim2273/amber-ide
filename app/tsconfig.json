@@ -12,5 +12,5 @@
     "skipLibCheck": true,
     "types": ["node"]
   },
-  "include": ["src/shared", "src/renderer", "src/preload"]
+  "include": ["src/shared", "src/renderer", "src/preload", "src/web"]
 }

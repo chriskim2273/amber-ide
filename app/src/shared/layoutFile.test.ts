@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { emptyLayout, parseLayout, serializeLayout, orderTabs, moveTab, pushRecent, LAYOUT_VERSION, type LayoutFile } from './layoutFile'
+import { emptyLayout, parseLayout, serializeLayout, orderTabs, moveTab, pushRecent, mergeLayout, LAYOUT_VERSION, type LayoutFile } from './layoutFile'
 
 describe('layout editors map', () => {
   it('round-trips valid entries (incl. all optional fields)', () => {
@@ -223,5 +223,80 @@ describe('moveTab', () => {
   })
   it('is a no-op when an id is missing', () => {
     expect(moveTab([1, 2, 3], 9, 2)).toEqual([1, 2, 3])
+  })
+})
+
+describe('mergeLayout (spec §6 CAS conflict retry)', () => {
+  const leaf = (paneId: string): LayoutFile['workspaces'][string]['tabs'][string]['tree'] =>
+    ({ kind: 'leaf', paneId })
+
+  it('merges edits to two different workspaces made from the same base', () => {
+    const base: LayoutFile = {
+      version: 1, activeWorkspace: 1,
+      workspaces: {
+        '1': { activeTab: 1, tabs: { '1': { tree: leaf('a') } } },
+        '2': { activeTab: 1, tabs: { '1': { tree: leaf('b') } } },
+      },
+    }
+    // local (e.g. the browser) only touched ws 1.
+    const local: LayoutFile = {
+      ...base,
+      workspaces: { ...base.workspaces, '1': { activeTab: 1, tabs: { '1': { tree: leaf('a-edited') } } } },
+    }
+    // remote (e.g. the desktop) only touched ws 2, written while local's edit was in flight.
+    const remote: LayoutFile = {
+      ...base,
+      workspaces: { ...base.workspaces, '2': { activeTab: 1, tabs: { '1': { tree: leaf('b-edited') } } } },
+    }
+    const merged = mergeLayout(base, local, remote)
+    expect(merged.workspaces['1']?.tabs['1']?.tree).toEqual(leaf('a-edited'))
+    expect(merged.workspaces['2']?.tabs['1']?.tree).toEqual(leaf('b-edited'))
+  })
+
+  it('never prunes desktop-only browser/editor panes the web build cannot create', () => {
+    // Reproduces the exact risk the spec calls out (§7): a web client's local
+    // tree has no browsers/editors at all (it never created any), and while
+    // its save was in flight the desktop added one of each. A naive
+    // "overwrite with local" retry would silently destroy them.
+    const base: LayoutFile = {
+      version: 1, activeWorkspace: 1,
+      workspaces: { '1': { activeTab: 1, tabs: { '1': { tree: leaf('a') } } } },
+    }
+    const local: LayoutFile = {
+      ...base,
+      workspaces: { '1': { activeTab: 1, tabs: { '1': { tree: leaf('a-edited-by-browser') } } } },
+    }
+    const remote: LayoutFile = {
+      ...base,
+      browsers: { 'browser-1-1-1-x': { ws: 1, tab: 1, ord: 1, url: 'https://example.com' } },
+      editors: { 'editor-1-1-2-y': { ws: 1, tab: 1, ord: 2, path: '/tmp/notes.md' } },
+    }
+    const merged = mergeLayout(base, local, remote)
+    expect(merged.workspaces['1']?.tabs['1']?.tree).toEqual(leaf('a-edited-by-browser'))
+    expect(merged.browsers).toEqual(remote.browsers)
+    expect(merged.editors).toEqual(remote.editors)
+  })
+
+  it('accepts a remote deletion the local side never touched', () => {
+    const base: LayoutFile = { version: 1, activeWorkspace: 1, workspaces: {}, frozen: { s1: {}, s2: {} } }
+    const local: LayoutFile = { ...base, activeWorkspace: 2 } // unrelated local edit
+    const remote: LayoutFile = { ...base, frozen: { s1: {} } } // desktop un-froze s2
+    const merged = mergeLayout(base, local, remote)
+    expect(merged.activeWorkspace).toBe(2)
+    expect(merged.frozen).toEqual({ s1: {} })
+  })
+
+  it('a genuine same-leaf double-edit resolves to local (documented ponytail tradeoff)', () => {
+    const base: LayoutFile = { version: 1, activeWorkspace: 1, workspaces: {}, fontSize: 14 }
+    const local: LayoutFile = { ...base, fontSize: 16 }
+    const remote: LayoutFile = { ...base, fontSize: 18 }
+    expect(mergeLayout(base, local, remote).fontSize).toBe(16)
+  })
+
+  it('is a no-op when local and remote ended up identical', () => {
+    const base = emptyLayout()
+    const local: LayoutFile = { ...base, fontSize: 16 }
+    const remote: LayoutFile = { ...base, fontSize: 16 }
+    expect(mergeLayout(base, local, remote)).toEqual(local)
   })
 })

@@ -1,4 +1,5 @@
 import { ipcRenderer, contextBridge } from 'electron'
+import type { LoadLayoutResult, SaveLayoutResult } from '../shared/layoutFile'
 
 // This preload runs SANDBOXED — no node builtins, no `process.env`. Both would
 // throw/return-empty and kill the bridge. Values come from `additionalArguments`
@@ -29,8 +30,12 @@ contextBridge.exposeInMainWorld('amber', {
   // panes carry a real absolute cwd, not a relative '.' that drifts on restore.
   homeDir: homeArg || '/',
   pickFolder: (): Promise<string | null> => ipcRenderer.invoke('pick-folder'),
-  loadLayout: (): Promise<string | null> => ipcRenderer.invoke('layout-load'),
-  saveLayout: (text: string): Promise<void> => ipcRenderer.invoke('layout-save', text),
+  // CAS (spec 2026-08-01 §6): `layout-load`/`layout-save` return a version
+  // token alongside the text; `saveLayout` must supply it back so main can
+  // detect a concurrent write (from `amber web`) and reject a stale one.
+  loadLayout: (): Promise<LoadLayoutResult> => ipcRenderer.invoke('layout-load'),
+  saveLayout: (text: string, version: string | null): Promise<SaveLayoutResult> =>
+    ipcRenderer.invoke('layout-save', text, version),
   // Portable `.amberws` workspace files via native OS dialogs. Save returns true
   // on write, false on cancel; open returns the file text or null on cancel.
   saveWorkspaceFile: (json: string, suggestedName: string): Promise<boolean> =>

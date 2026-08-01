@@ -72,7 +72,7 @@ fn dump_backlog_returns_ring_bytes_and_errors_on_unknown() {
     // Wait until the marker has landed in the ring (drain a throwaway attach).
     {
         let mut drain = UnixStream::connect(&sock).unwrap();
-        send(&drain, ControlMsg::Attach { name: "amber-1-1-0-a".into(), raw_client: false });
+        send(&drain, ControlMsg::Attach { name: "amber-1-1-0-a".into(), raw_client: false, preview: false });
         drain.set_read_timeout(Some(Duration::from_secs(8))).unwrap();
         let mut dec = Decoder::new();
         let mut buf = [0u8; 65536];

@@ -38,6 +38,7 @@ import {
   inlineImages,
 } from './editorFiles'
 import { claudeNames } from './claudeNames'
+import { loadLayoutFile, saveLayoutFile } from './layoutIO'
 import { compatSignature, shouldUseCompat, compatWorthyReason, COMPAT_SWITCHES, DETECT_WINDOW_MS } from './renderCompat'
 import { installBinary } from './installBinary'
 import clientPath from '../client/index?modulePath'
@@ -592,16 +593,13 @@ async function main(): Promise<void> {
     return r.canceled || r.filePaths.length === 0 ? null : r.filePaths[0]
   })
 
-  ipcMain.handle('layout-load', async () => {
-    try { return await readFile(layoutPath(), 'utf8') } catch { return null }
-  })
-  ipcMain.handle('layout-save', async (_e, text: string) => {
-    const p = layoutPath()
-    await mkdir(dirname(p), { recursive: true })
-    const tmp = p + '.tmp'
-    await writeFile(tmp, text)
-    await rename(tmp, p)
-  })
+  // CAS (spec 2026-08-01 §6): the sidecar now has two writers (this process
+  // and `amber web`'s Rust side), so a plain read/write would let whichever
+  // writes last silently discard the other's edit. `layoutIO.ts` does the
+  // actual version check under the same call that does the atomic rename.
+  ipcMain.handle('layout-load', async () => loadLayoutFile(layoutPath()))
+  ipcMain.handle('layout-save', async (_e, text: string, version: string | null) =>
+    saveLayoutFile(layoutPath(), text, version))
 
   // Portable workspace file: native save dialog + atomic write (layout-save
   // precedent). Returns true on write, false on cancel.

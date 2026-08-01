@@ -5,6 +5,7 @@ pub mod attach;
 pub mod claude;
 pub mod daemon;
 pub mod grok;
+pub mod layout_cas;
 pub mod manager;
 pub mod mosaic;
 pub mod procinfo;

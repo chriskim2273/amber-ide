@@ -1,0 +1,408 @@
+// Web-build shim: builds `window.amber` (the exact contract `main.tsx`
+// declares — see its `declare global` block) backed by `amber web`
+// (crates/amber/src/web.rs) instead of the Electron preload bridge.
+//
+// Spec: docs/superpowers/specs/2026-08-01-amber-ide-as-a-webapp-design.md.
+// This file is PURE — no `WebSocket`/`MessageChannel`/`window`/`navigator`
+// reference of its own, only the `SocketLike`/`PortLike` interfaces below
+// (mirroring `app/src/client/router.ts`'s injectable shape) — so it is
+// testable under vitest's `node` environment with fakes, the way
+// `router.test.ts` tests `Router` with `FakeConn`/`FakePort`. The real
+// WebSocket/MessageChannel/`window.postMessage` wiring lives in `install.ts`,
+// which this module never imports and no test imports.
+//
+// --- Two WebSockets, not one (spec §4a: "One WebSocket per pane") ----------
+// `amber web`'s `Client.open` (web.rs) is a single `Option<String>` per
+// connection, and a raw BINARY frame carries NO session id — it is implicitly
+// "whatever THIS connection currently has open". So one pane = one dedicated
+// `/ws` connection (`PaneLink`), and everything that ISN'T pane data (session
+// lifecycle, the daemon event stream, one-shot backlog dumps) rides a single
+// separate `/ws` connection that never opens anything (`ControlLink`). This
+// also means only `ControlLink` ever calls `dispatch()` for `sessions`/
+// `error`/`activity`/`memory` — those are broadcast to EVERY connection
+// server-side, so if every `PaneLink` also dispatched them the app would see
+// N duplicate copies of the same event (and worse: `main.tsx` CONSUMES an
+// `Error` while a dump is pending — a second copy would both resolve the dump
+// AND draw a spurious red banner). `PaneLink` only ever forwards `exit` (only
+// ever delivered to the connection with that session `open`) and its own
+// `backlog` replay tag.
+
+import type { LoadLayoutResult, SaveLayoutResult, LayoutVersion } from '../shared/layoutFile'
+
+export interface SocketLike {
+  send(data: string | Uint8Array): void
+  close(): void
+  readonly readyState: number
+  onopen: (() => void) | null
+  onclose: (() => void) | null
+  onerror: (() => void) | null
+  onmessage: ((e: { data: unknown }) => void) | null
+}
+// Mirrors `WebSocket.OPEN` (a real `WebSocket`'s `readyState` numbering) so
+// `install.ts`'s real sockets and this module's checks agree without either
+// side importing the DOM lib's `WebSocket` type.
+export const SOCKET_OPEN = 1
+
+export interface PortLike {
+  postMessage(m: unknown): void
+  close(): void
+  start(): void
+  onmessage: ((e: { data: unknown }) => void) | null
+}
+
+const RECONNECT_MS = 1000 // ponytail: fixed retry, no backoff ladder — matches the spike; revisit if flapping in practice
+
+// ---- wire message shapes (pure parsing) ------------------------------------
+
+export type ServerMsg =
+  | { t: 'sessions'; sessions: unknown }
+  | { t: 'exit'; name: string; code: number }
+  | { t: 'error'; msg: string }
+  | { t: 'backlog'; name: string }
+  | { t: 'backlogReply'; name: string }
+  | { t: 'activity'; name: string }
+  | { t: 'memory'; name: string; rss_kb: number; growing: boolean }
+
+/** Parse one JSON text frame from `amber web`. `null` for anything this
+ * shim has no use for (malformed JSON, an unknown `t`). */
+export function parseServerMsg(text: string): ServerMsg | null {
+  let raw: Record<string, unknown>
+  try {
+    raw = JSON.parse(text) as Record<string, unknown>
+  } catch {
+    return null
+  }
+  switch (raw['t']) {
+    case 'sessions':
+      return { t: 'sessions', sessions: raw['sessions'] ?? [] }
+    case 'exit':
+      return { t: 'exit', name: raw['name'] as string, code: raw['code'] as number }
+    case 'error':
+      return { t: 'error', msg: raw['msg'] as string }
+    case 'backlog':
+      return { t: 'backlog', name: raw['name'] as string }
+    case 'backlogReply':
+      return { t: 'backlogReply', name: raw['name'] as string }
+    case 'activity':
+      return { t: 'activity', name: raw['name'] as string }
+    case 'memory':
+      return {
+        t: 'memory',
+        name: raw['name'] as string,
+        rss_kb: (raw['rss_kb'] as number) ?? 0,
+        growing: (raw['growing'] as boolean) ?? false,
+      }
+    default:
+      return null
+  }
+}
+
+/** Map a broadcast-class `ServerMsg` to the `{frame:{type:'control',msg:{kind:...}}}`
+ * shape `main.tsx`'s `toEvent` (and the Electron client's `daemon-event`)
+ * expect. `exit`/`backlog`/`backlogReply` are excluded on purpose: `exit` is
+ * handled by `PaneLink` (it needs no translation help, just a name/code
+ * passthrough), and the backlog messages need the binary payload that
+ * arrives in a separate frame — see `ControlLink`. */
+export function toDaemonEvent(
+  m: Extract<ServerMsg, { t: 'sessions' | 'error' | 'activity' | 'memory' }>,
+): unknown {
+  switch (m.t) {
+    case 'sessions':
+      return { frame: { type: 'control', msg: { kind: 'Sessions', sessions: m.sessions } } }
+    case 'error':
+      return { frame: { type: 'control', msg: { kind: 'Error', msg: m.msg } } }
+    case 'activity':
+      return { frame: { type: 'control', msg: { kind: 'Activity', name: m.name } } }
+    case 'memory':
+      return {
+        frame: {
+          type: 'control',
+          msg: { kind: 'MemoryStat', name: m.name, rss_kb: m.rss_kb, growing: m.growing },
+        },
+      }
+  }
+}
+
+function toBytes(data: unknown): Uint8Array {
+  return data instanceof Uint8Array ? data : new Uint8Array(data as ArrayBufferLike)
+}
+
+// ---- ControlLink: session lifecycle + the daemon event stream -------------
+
+/** The one non-pane WebSocket: session lifecycle commands (create/kill/
+ * rename/suspend/resume/dumpBacklog) out, and the `onDaemonEvent` stream in.
+ * Never sends `{t:'open'}` — it has nothing to Attach, so it never receives
+ * pty `Data`/`backlog` either. */
+export class ControlLink {
+  private socket: SocketLike
+  private readonly sendQueue: string[] = []
+  /** Names awaiting a `DumpBacklog` payload, FIFO. The hub processes one
+   * client's queue strictly in order (`Client.tx` is a single bounded
+   * channel), so a `backlogReply` marker and the binary that follows it are
+   * always adjacent even with two dumps in flight for different sessions —
+   * shifting the oldest pending name off this queue when the binary arrives
+   * pairs them correctly without needing the marker to repeat the name past
+   * matching a set of one. */
+  private readonly dumpPending: string[] = []
+
+  constructor(
+    private readonly connectSocket: () => SocketLike,
+    private readonly dispatch: (ev: unknown) => void,
+  ) {
+    this.socket = connectSocket()
+    this.wire()
+  }
+
+  private wire(): void {
+    const s = this.socket
+    s.onopen = (): void => {
+      this.dispatch({ status: 'connected' })
+      for (const m of this.sendQueue.splice(0)) s.send(m)
+    }
+    s.onclose = (): void => {
+      this.dispatch({ status: 'disconnected' })
+      setTimeout(() => {
+        this.socket = this.connectSocket()
+        this.wire()
+      }, RECONNECT_MS)
+    }
+    s.onerror = (): void => {
+      try {
+        s.close()
+      } catch {
+        /* onclose handles the retry */
+      }
+    }
+    s.onmessage = (e: { data: unknown }): void => {
+      if (typeof e.data !== 'string') {
+        const name = this.dumpPending.shift()
+        if (name !== undefined) {
+          this.dispatch({
+            frame: { type: 'control', msg: { kind: 'Backlog', name, data: toBytes(e.data) } },
+          })
+        }
+        return
+      }
+      const msg = parseServerMsg(e.data)
+      if (!msg) return
+      if (msg.t === 'backlogReply') {
+        this.dumpPending.push(msg.name)
+        return
+      }
+      // `backlog` (the Attach-replay tag) and `exit` never reach this
+      // connection — it never opens anything — but ignore rather than
+      // assume, matching the "unknown t is ignored" discipline `app.js` and
+      // `parse_browser_msg` already use.
+      if (msg.t === 'backlog' || msg.t === 'exit') return
+      this.dispatch(toDaemonEvent(msg))
+    }
+  }
+
+  send(msg: unknown): void {
+    const text = JSON.stringify(msg)
+    if (this.socket.readyState === SOCKET_OPEN) this.socket.send(text)
+    else this.sendQueue.push(text)
+  }
+}
+
+// ---- PaneLink: one dedicated connection per open pane ----------------------
+
+/** One pane's dedicated `/ws` connection + the `MessageChannel` port bridged
+ * to it (spec §2.2/§4a). Reproduces the preload's `pane-port` contract
+ * exactly: raw pty bytes flow to `port.postMessage`, keystrokes flow back as
+ * binary sends — `Pane.tsx` needs no changes to consume either end. */
+export class PaneLink {
+  private socket: SocketLike
+  private awaitingBacklog = false
+  // Set by our own `close()`. Without this, `close()`'s own `socket.close()`
+  // fires `onclose` like any other drop and schedules a reconnect — a pane
+  // deliberately closed (unmount/workspace-switch) would resurrect a zombie
+  // socket a second later, the exact leak task 2 warns about.
+  private closed = false
+
+  constructor(
+    private readonly session: string,
+    private readonly connectSocket: () => SocketLike,
+    private readonly port: PortLike,
+    private readonly onExit: (name: string, code: number) => void,
+  ) {
+    this.socket = connectSocket()
+    this.wire()
+    this.port.onmessage = (e: { data: unknown }): void => {
+      const m = e.data as { data?: Uint8Array }
+      // `resize` MUST stay unreachable (spec §4/§6 — a pty's winsize is
+      // shared with the desktop app; a browser-driven resize would reflow
+      // live work). Only keystroke bytes are ever forwarded; anything else
+      // (notably a `{resize:{cols,rows}}` message `Pane.tsx` also sends) is
+      // silently dropped here, by construction — there is no branch that
+      // could turn it into a send.
+      if (m.data && this.socket.readyState === SOCKET_OPEN) {
+        this.socket.send(m.data instanceof Uint8Array ? m.data : new Uint8Array(m.data))
+      }
+    }
+    this.port.start()
+  }
+
+  private wire(): void {
+    const s = this.socket
+    const session = this.session
+    s.onopen = (): void => {
+      // Sent on EVERY (re)connect, first one included — there is no separate
+      // "queued open at construction time" path competing with it, which is
+      // what let the spike's `everConnected` guard exist to fix a double-
+      // Attach in the first place. One trigger, one send.
+      s.send(JSON.stringify({ t: 'open', name: session }))
+    }
+    s.onclose = (): void => {
+      if (this.closed) return
+      setTimeout(() => {
+        this.socket = this.connectSocket()
+        this.wire()
+      }, RECONNECT_MS)
+    }
+    s.onerror = (): void => {
+      try {
+        s.close()
+      } catch {
+        /* onclose handles the retry */
+      }
+    }
+    s.onmessage = (e: { data: unknown }): void => {
+      if (typeof e.data !== 'string') {
+        const backlog = this.awaitingBacklog
+        this.awaitingBacklog = false
+        this.port.postMessage(backlog ? { data: toBytes(e.data), backlog: true } : { data: toBytes(e.data) })
+        return
+      }
+      const msg = parseServerMsg(e.data)
+      if (!msg) return
+      if (msg.t === 'backlog') {
+        this.awaitingBacklog = true
+        return
+      }
+      if (msg.t === 'exit') {
+        this.onExit(msg.name, msg.code)
+        return
+      }
+      // sessions/error/activity/memory/backlogReply: `ControlLink`'s job,
+      // not this connection's — see the file header.
+    }
+  }
+
+  /** Tear down this pane: close the port, then the socket. No `{t:'close'}`
+   * send — simply closing the connection makes the server's own
+   * `remove_client` -> `detach_if_unwanted` do the identical Detach, and a
+   * `{t:'close'}` after the daemon has already forgotten the session (or
+   * before the very first `open` lands) would just draw a spurious
+   * "no such session" error back at nobody. */
+  close(): void {
+    this.closed = true
+    this.port.close()
+    this.socket.close()
+  }
+}
+
+// ---- window.amber -----------------------------------------------------------
+
+export interface AmberDeps {
+  connectSocket: () => SocketLike
+  newChannel: () => { port1: PortLike; port2: unknown }
+  postPanePort: (session: string, port2: unknown) => void
+  clipboard: { writeText: (text: string) => Promise<void>; readText: () => Promise<string> }
+  home: string
+  softwareGl: boolean
+  // Layout CAS (spec 2026-08-01 §6), injected so this file stays fetch-free
+  // and testable with fakes (the rest of the file's discipline). The real
+  // implementations (install.ts) round-trip `/api/layout` on `amber web`
+  // (crates/amber/src/web.rs), behind the same cookie boundary as
+  // `/api/sessions`.
+  layoutGet: () => Promise<LoadLayoutResult>
+  layoutSave: (text: string, version: LayoutVersion) => Promise<SaveLayoutResult>
+}
+
+function notImplemented(name: string): () => never {
+  return () => {
+    throw new Error(`window.amber.${name}: not available in the web build`)
+  }
+}
+
+/** Build the full `window.amber` contract (the exact shape `main.tsx`
+ * declares globally) over `deps`. Kept separate from `install.ts` so this
+ * whole file stays free of `WebSocket`/`MessageChannel`/`window` and is
+ * importable under vitest's `node` environment. */
+export function createAmber(deps: AmberDeps): Window['amber'] {
+  let onEvent: ((d: unknown) => void) | null = null
+  const pending: unknown[] = []
+  const dispatch = (ev: unknown): void => {
+    if (onEvent) onEvent(ev)
+    else pending.push(ev)
+  }
+
+  const control = new ControlLink(deps.connectSocket, dispatch)
+  const panes = new Map<string, PaneLink>()
+
+  return {
+    softwareGl: deps.softwareGl,
+    homeDir: deps.home,
+
+    onDaemonEvent: (cb): void => {
+      onEvent = cb
+      for (const ev of pending.splice(0)) cb(ev)
+    },
+
+    // --- §2.2/§4a: the pane MessageChannel path, one socket per pane -------
+    openPane: (session): void => {
+      // A remount (workspace switch) before the old pane's close lands must
+      // not leak a second socket+port for the same name — mirrors the
+      // Electron client's `router.ts::attach`.
+      panes.get(session)?.close()
+      const channel = deps.newChannel()
+      const link = new PaneLink(session, deps.connectSocket, channel.port1, (name, code) =>
+        dispatch({ frame: { type: 'control', msg: { kind: 'Exit', name, code } } }),
+      )
+      panes.set(session, link)
+      deps.postPanePort(session, channel.port2)
+    },
+    closePane: (session): void => {
+      panes.get(session)?.close()
+      panes.delete(session)
+    },
+
+    // --- session lifecycle: existing browser whitelist ----------------------
+    createSession: (name, cwd, sessionKind): void => control.send({ t: 'create', name, cwd, kind: sessionKind }),
+    killSession: (name): void => control.send({ t: 'kill', name }),
+    renameSession: (from, to): void => control.send({ t: 'move', from, to }),
+    suspendSession: (name): void => control.send({ t: 'suspend', name }),
+    resumeSession: (name): void => control.send({ t: 'resume', name }),
+    dumpBacklog: (name): void => control.send({ t: 'dumpBacklog', name }),
+
+    // --- native browser API, not a stub (spec §3 "Clipboard" row) ----------
+    clipboardWrite: (text): void => {
+      void deps.clipboard.writeText(text)
+    },
+    clipboardRead: (): Promise<string> => deps.clipboard.readText(),
+
+    // --- layout CAS (spec §6): thin passthrough to the injected HTTP hooks.
+    // `main.tsx`'s persist effect is what actually implements the CAS retry/
+    // merge (mergeLayout) — this file only needs to round-trip the wire
+    // shape, exactly like every other method here.
+    loadLayout: (): Promise<LoadLayoutResult> => deps.layoutGet(),
+    saveLayout: (text, version): Promise<SaveLayoutResult> => deps.layoutSave(text, version),
+
+    // --- §7 cuts + native dialogs: visible-throw stubs, never a silent no-op
+    saveWorkspaceFile: notImplemented('saveWorkspaceFile'),
+    openWorkspaceFile: notImplemented('openWorkspaceFile'),
+    pickFolder: notImplemented('pickFolder'),
+    resolvePath: notImplemented('resolvePath'),
+    revealPath: notImplemented('revealPath'),
+    editorOpenDialog: notImplemented('editorOpenDialog'),
+    editorRead: notImplemented('editorRead'),
+    editorSave: notImplemented('editorSave'),
+    editorSaveDialog: notImplemented('editorSaveDialog'),
+    editorDraftWrite: notImplemented('editorDraftWrite'),
+    editorDraftRead: notImplemented('editorDraftRead'),
+    editorDraftClear: notImplemented('editorDraftClear'),
+    editorInlineImages: notImplemented('editorInlineImages'),
+    claudeNames: notImplemented('claudeNames'),
+  }
+}

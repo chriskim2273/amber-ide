@@ -91,6 +91,15 @@ impl Fixture {
         ))
     }
 
+    fn post(&self, path: &str, cookie: Option<&str>, body: &str) -> (String, Vec<String>, String) {
+        let c = cookie.map(|c| format!("Cookie: {c}\r\n")).unwrap_or_default();
+        self.request(&format!(
+            "POST {path} HTTP/1.1\r\nHost: {}\r\n{c}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            self.addr,
+            body.len()
+        ))
+    }
+
     /// Authenticate and return the `amber_web=<id>` cookie pair.
     fn login(&self) -> String {
         let (status, headers, _) = self.post_auth(&self.token);
@@ -150,6 +159,13 @@ fn unauthenticated_data_routes_and_ws_are_refused() {
     assert!(status.contains("401"), "expected 401, got {status}");
     let (status, _, _) = f.get("/api/sessions", Some("amber_web=forged"));
     assert!(status.contains("401"), "forged cookie accepted: {status}");
+    // /api/bootstrap (homeDir for the real-renderer web build) is gated the
+    // same way as /api/sessions — the token now reaches a much larger API
+    // (spec §5), and this is the one new route this pass added.
+    let (status, _, _) = f.get("/api/bootstrap", None);
+    assert!(status.contains("401"), "bootstrap leaked without a cookie: {status}");
+    let (status, _, _) = f.get("/api/bootstrap", Some("amber_web=forged"));
+    assert!(status.contains("401"), "bootstrap accepted a forged cookie: {status}");
     // The WebSocket upgrade is gated the same way (no cookie -> no 101).
     let (status, _, _) = f.request(&format!(
         "GET /ws HTTP/1.1\r\nHost: {}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
@@ -171,6 +187,25 @@ fn static_assets_are_public_so_the_page_can_exchange_its_token() {
     }
     let (status, _, _) = f.get("/nope", None);
     assert!(status.contains("404"), "{status}");
+}
+
+#[test]
+fn bootstrap_carries_a_non_empty_home_behind_the_cookie() {
+    let f = fixture();
+    let cookie = f.login();
+    let (status, _, body) = f.get("/api/bootstrap", Some(&cookie));
+    assert!(status.contains("200"), "{status}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let home = v["home"].as_str().unwrap_or("");
+    // A boot-managed `amber web` can start with a minimal/empty env (the
+    // 2026-07-29 display-env lesson: this repo has been bitten by exactly
+    // this class of gap before). `main.tsx`'s `homeDir` fallback is `?? '/'`,
+    // which does NOT rescue an empty string (only null/undefined) — so an
+    // empty `home` here would silently become `cwd: ""` and every `+ Pane`
+    // would 404 out of `map_browser_msg`'s `Path::new(cwd).is_dir()` gate
+    // with no visible error (the "wrong shape looks like a dead button"
+    // failure this whole task exists to avoid).
+    assert!(!home.is_empty(), "bootstrap must never serve an empty home: {body}");
 }
 
 #[test]
@@ -459,6 +494,94 @@ fn a_forged_resize_from_the_browser_never_reaches_the_pty() {
     assert_eq!(after["sessions"][0]["cols"].as_u64().unwrap(), cols, "pty was resized");
     assert_eq!(after["sessions"][0]["rows"].as_u64().unwrap(), rows, "pty was resized");
     assert_eq!(after["sessions"][0]["alive"], true, "session died");
+}
+
+// ---- layout CAS (spec 2026-08-01 §6) ---------------------------------------
+
+#[test]
+fn layout_routes_are_behind_the_same_cookie_boundary_as_sessions() {
+    let f = fixture();
+    let (status, _, _) = f.get("/api/layout", None);
+    assert!(status.contains("401"), "{status}");
+    let (status, _, _) = f.get("/api/layout", Some("amber_web=forged"));
+    assert!(status.contains("401"), "{status}");
+    let (status, _, _) = f.post("/api/layout", None, r#"{"text":"{}","version":null}"#);
+    assert!(status.contains("401"), "{status}");
+}
+
+#[test]
+fn layout_load_reports_null_then_a_real_version_after_a_save() {
+    let f = fixture();
+    let cookie = f.login();
+    let (status, _, body) = f.get("/api/layout", Some(&cookie));
+    assert!(status.contains("200"), "{status}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(v["text"].is_null(), "expected no sidecar yet: {body}");
+    assert!(v["version"].is_null(), "{body}");
+
+    let (status, _, body) = f.post("/api/layout", Some(&cookie), r#"{"text":"{\"v\":1}","version":null}"#);
+    assert!(status.contains("200"), "{status}: {body}");
+    let saved: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(saved["ok"], true);
+    assert_eq!(saved["version"], "{\"v\":1}");
+
+    let (_, _, body) = f.get("/api/layout", Some(&cookie));
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["text"], "{\"v\":1}");
+    assert_eq!(v["version"], "{\"v\":1}");
+}
+
+#[test]
+fn layout_save_rejects_a_stale_version_and_returns_409_with_fresh_content() {
+    let f = fixture();
+    let cookie = f.login();
+    f.post("/api/layout", Some(&cookie), r#"{"text":"v1","version":null}"#);
+    // Still claims the file didn't exist — stale relative to the write above.
+    let (status, _, body) = f.post("/api/layout", Some(&cookie), r#"{"text":"stale","version":null}"#);
+    assert!(status.contains("409"), "{status}: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["conflict"], true);
+    assert_eq!(v["text"], "v1");
+    assert_eq!(v["version"], "v1");
+}
+
+/// The genuine interleaving over HTTP: two independent GETs of the same
+/// version, then a write from each — the second (now stale) must be
+/// rejected without clobbering the first writer's content, exactly the
+/// desktop-vs-browser race spec §6 exists to fix.
+#[test]
+fn a_stale_http_writer_is_rejected_after_a_concurrent_write_lands() {
+    let f = fixture();
+    let cookie = f.login();
+    f.post("/api/layout", Some(&cookie), r#"{"text":"v0","version":null}"#);
+
+    let (_, _, body_a) = f.get("/api/layout", Some(&cookie));
+    let (_, _, body_b) = f.get("/api/layout", Some(&cookie));
+    assert_eq!(body_a, body_b, "two independent reads of the same state must agree");
+    let version_a: serde_json::Value = serde_json::from_str(&body_a).unwrap();
+    let version_b: serde_json::Value = serde_json::from_str(&body_b).unwrap();
+
+    let (status_b, _, resp_b) = f.post(
+        "/api/layout",
+        Some(&cookie),
+        &format!(r#"{{"text":"v1-from-b","version":{}}}"#, version_b["version"]),
+    );
+    assert!(status_b.contains("200"), "b's write should succeed: {resp_b}");
+
+    // A's version is now stale — the file moved out from under it.
+    let (status_a, _, resp_a) = f.post(
+        "/api/layout",
+        Some(&cookie),
+        &format!(r#"{{"text":"v1-from-a","version":{}}}"#, version_a["version"]),
+    );
+    assert!(status_a.contains("409"), "a's stale write should be rejected: {resp_a}");
+    let v: serde_json::Value = serde_json::from_str(&resp_a).unwrap();
+    assert_eq!(v["text"], "v1-from-b", "conflict must report what's really on disk");
+
+    // B's write must be the one that landed — A's content must never appear.
+    let (_, _, body) = f.get("/api/layout", Some(&cookie));
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["text"], "v1-from-b");
 }
 
 #[test]

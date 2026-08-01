@@ -9,7 +9,10 @@ import { formatName, makeId, retargetPane } from '../shared/names'
 import { formatBrowserName, isBrowserName } from '../shared/browserName'
 import { formatEditorName, isEditorName } from '../shared/editorName'
 import { splitLeaf, setRatio, reconcile, leaves, moveLeaf, type Node } from './layout'
-import { emptyLayout, parseLayout, serializeLayout, orderTabs, moveTab, type LayoutFile, type TabLayout } from '../shared/layoutFile'
+import {
+  emptyLayout, parseLayout, serializeLayout, orderTabs, moveTab, mergeLayout,
+  type LayoutFile, type TabLayout, type LoadLayoutResult, type SaveLayoutResult,
+} from '../shared/layoutFile'
 import {
   parseWorkspaceFile, serializeWorkspaceFile, assembleSave, planLoad,
   type WorkspaceDoc, type SaveWorkspace, type LoadPlan,
@@ -32,8 +35,12 @@ declare global {
       suspendSession: (name: string) => void
       resumeSession: (name: string) => void
       dumpBacklog: (name: string) => void
-      loadLayout: () => Promise<string | null>
-      saveLayout: (text: string) => Promise<void>
+      // CAS (spec 2026-08-01 §6): `saveLayout` must be given the version
+      // `loadLayout`/the previous `saveLayout` returned, so a concurrent
+      // writer (the browser, or another desktop instance) is detected rather
+      // than silently overwritten. See the persist effect below.
+      loadLayout: () => Promise<LoadLayoutResult>
+      saveLayout: (text: string, version: string | null) => Promise<SaveLayoutResult>
       saveWorkspaceFile: (json: string, suggestedName: string) => Promise<boolean>
       openWorkspaceFile: () => Promise<string | null>
       homeDir: string
@@ -196,6 +203,12 @@ function App(): JSX.Element {
   const [zoom, setZoom] = useState<Record<string, string>>({})
   const layoutRef = useRef(layout)
   layoutRef.current = layout
+  // CAS state (spec 2026-08-01 §6) — see the persist effect below for how
+  // these are used together. Refs because updating them must never itself
+  // trigger a render (that's what `layout` state is for).
+  const baseRef = useRef<LayoutFile>(emptyLayout()) // the tree this chain believes is on disk
+  const versionRef = useRef<string | null>(null) // the token that proves it
+  const saveChainRef = useRef<Promise<void>>(Promise.resolve()) // serializes overlapping debounced saves
   // App-wide terminal font size lives in the layout sidecar (single source of
   // truth → auto-persists via the debounced save, no separate state to sync).
   const fontSize = clampFont(layout.fontSize ?? DEFAULT_FONT_SIZE)
@@ -297,8 +310,14 @@ function App(): JSX.Element {
       const ev = toEvent(d); if (ev) dispatchEvent(ev)
       if (ev?.kind === 'Sessions') setSawSessions(true)
     })
-    void window.amber.loadLayout().then((text) => {
-      if (text) setLayout(parseLayout(text))
+    void window.amber.loadLayout().then(({ text, version }) => {
+      const l = text ? parseLayout(text) : emptyLayout()
+      if (text) setLayout(l)
+      // CAS anchor: `baseRef` is the tree this save-chain believes is on disk
+      // right now; `versionRef` is the token that proves it. Both are updated
+      // together, only ever from a successful load or save — see persist().
+      baseRef.current = l
+      versionRef.current = version
       setLoaded(true)
     })
   }, [bridgeReady])
@@ -309,12 +328,66 @@ function App(): JSX.Element {
     prevConnected.current = connected
   }, [connected])
 
-  // Debounced persist whenever the layout changes — only after the sidecar loaded.
+  // CAS persist (spec 2026-08-01 §6). `local` is a snapshot of the tree at
+  // the moment the write starts; the round trip to disk is async, so by the
+  // time it resolves either side (or both) may have moved on:
+  //   - the DISK may have moved (another writer landed a change) -> `conflict`.
+  //   - the LOCAL tree may have moved (the user kept editing mid-flight).
+  // A conflict is handled by re-reading the fresh disk tree and re-running
+  // the merge against it — "re-applying the mutation" means recomputing
+  // against `base`/`local`/`remote` (a real 3-way merge), never just
+  // re-sending the stale `local` object verbatim. The retry's result is then
+  // folded back into React state with a SECOND merge if needed, using
+  // `setLayout`'s functional form so a local edit made during the two awaits
+  // is never silently discarded (only writing `cur === local` — i.e.
+  // "nothing changed" — lets the disk's merged tree replace state outright).
+  // A second conflict surfaces to the user (the `notice` banner) instead of
+  // silently dropping either writer's change.
+  const persistLayout = useCallback(async (): Promise<void> => {
+    try {
+      const local = layoutRef.current
+      const text = serializeLayout(local)
+      const result = await window.amber.saveLayout(text, versionRef.current)
+      if ('ok' in result) {
+        versionRef.current = result.version
+        baseRef.current = local
+        return
+      }
+      if ('conflict' in result) {
+        const remote = result.text ? parseLayout(result.text) : emptyLayout()
+        const merged = mergeLayout(baseRef.current, local, remote)
+        const retry = await window.amber.saveLayout(serializeLayout(merged), result.version)
+        if ('ok' in retry) {
+          versionRef.current = retry.version
+          baseRef.current = merged
+          setLayout((cur) => (cur === local ? merged : mergeLayout(local, cur, merged)))
+          return
+        }
+        setNotice('Layout changes could not be saved — another device is editing at the same time. Reload to see the latest layout.')
+        return
+      }
+      // 'error' (disk failure): leave state as-is; the next edit's debounce retries naturally.
+    } catch (e) {
+      console.error('layout save failed', e)
+    }
+  }, [])
+
+  // Debounced persist whenever the layout changes — only after the sidecar
+  // loaded. Divider drags call `onSetRatio` (-> `setLayout`) on every
+  // mousemove, so this effect re-fires and restarts the timer continuously
+  // during a drag; a write only actually happens ~300 ms after the drag
+  // settles, matching "no write mid-drag" without any drag-specific code.
+  // Saves are chained (not fired independently) so an overlapping debounce
+  // can never read `versionRef`/`baseRef` while a previous save is still
+  // resolving them.
   useEffect(() => {
     if (!bridgeReady || !loaded) return
-    const id = setTimeout(() => void window.amber.saveLayout(serializeLayout(layoutRef.current)), 300)
+    const id = setTimeout(() => {
+      const prev = saveChainRef.current
+      saveChainRef.current = prev.then(persistLayout, persistLayout)
+    }, 300)
     return () => clearTimeout(id)
-  }, [layout, bridgeReady, loaded])
+  }, [layout, bridgeReady, loaded, persistLayout])
 
   const workspaces = mergeEditors(mergeBrowsers(groupSessions(state), layout.browsers ?? {}), layout.editors ?? {})
   const ws = workspaces.find((w) => w.ws === activeWs) ?? workspaces[0]
