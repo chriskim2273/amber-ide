@@ -1,7 +1,9 @@
 # amber-ide as a web app — serve the real renderer
 
 **Date:** 2026-08-01
-**Status:** designed, not implemented.
+**Status:** spike PASSED 2026-08-01 (commits `8d7d3b2`, `f157487`) — the real
+renderer rendered a live pty and round-tripped a keystroke in a browser with
+`Pane.tsx` unmodified. §4 was corrected by that spike. Full build in progress.
 **Supersedes:** `2026-08-01-live-mosaic-tiles-design.md`. That spec bolted live
 terminal previews onto the hand-written mobile UI. If the browser runs the real
 renderer, a "tile" *is* a pane — live, focusable, draggable — and the mosaic
@@ -126,18 +128,49 @@ A stubbed method must **reject visibly** (throw, or resolve to an error the UI
 already handles), never silently no-op — a silent stub is how a feature looks
 present and eats data.
 
-## 4. Input reaches any pane
+## 4. Multiple live panes: one WebSocket per pane
 
-The shipped whitelist gates input on one `open` session per client. The
-renderer opens every visible pane at once, so `Client.open: Option<String>`
-becomes a set, and input is routed by the session named in the frame rather
-than by a single current session.
+**Corrected after the §8.1 spike.** An earlier draft said input would route "by
+the session named in the frame". That is false: a browser-facing binary frame
+carries **no session id**. Routing is entirely positional — a frame belongs to
+whichever session that connection has `open`. The daemon's own wire tags data
+with a session (`Frame::Data { session, bytes }`); the browser protocol dropped
+it because a phone only ever had one session open.
 
-This is a real widening: previously a browser could only type into the one
-session it had zoomed. Now it can type into any session it has opened. That is
-the point — but it means the *only* thing standing between the token and every
-pty is the token. Already true (§7.1 of the mosaic spec priced it), now
-broader in surface.
+So multi-pane needs one of:
+
+- **(a) One WebSocket per pane. Chosen.** Each pane's `MessageChannel` is fed by
+  its own `/ws` connection with exactly one `open`. Zero protocol change, zero
+  risk to the existing mobile UI, and input routing is unambiguous by
+  construction — the connection *is* the addressing. `Client.open` stays
+  `Option<String>` and §4's proposed widening is simply not needed. The hub's
+  `detach_if_unwanted` already counts subscriptions across clients, so two
+  connections onto one session behave correctly today.
+  Cost: N connections and ~2 server threads per pane. Bounded by the visible
+  pane count (order 10), on a loopback server. Acceptable.
+- **(b) Tag browser binary frames with a session id.** Cleaner on the wire and
+  what the daemon itself does, but it is a breaking change to the browser
+  protocol that the shipped `assets/app.js` also consumes, and it buys nothing
+  at this scale. This is the upgrade path if thread count ever bites.
+
+Because each connection carries exactly one session, **input is still gated on
+that connection's single `open`** — the existing server-side guarantee is
+untouched, not widened. A pane can only ever receive input for itself.
+
+Unchanged and non-negotiable: **`Resize` remains unreachable.** The renderer
+DOES call resize paths in Electron; the shim must drop them. A pty's winsize is
+shared, and a browser-driven resize would reflow the user's desktop panes. This
+is the one place the shim must deliberately diverge from the preload's
+behaviour, and it needs its own test.
+
+### 4.1 Known bug the spike surfaced
+
+`amber web` re-`Attach`es to the daemon on its own reconnect, independently of
+any browser event, and that path's backlog arrives **untagged** — the browser
+cannot tell it is a replay, so history duplicates. Observed live: an extra
+unearned prompt line after a daemon-only restart. This predates the pivot and
+affects the shipped mobile UI too. Fix it before building further on the
+transport.
 
 Unchanged and non-negotiable: **`Resize` remains unreachable.** The renderer
 DOES call resize paths in Electron; the shim must drop them. A pty's winsize is
