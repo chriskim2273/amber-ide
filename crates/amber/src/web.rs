@@ -1059,7 +1059,13 @@ fn handle_conn(mut stream: TcpStream, hub: &Arc<Hub>, auth: &Arc<Auth>) -> anyho
             if !auth.valid_cookie(&req) {
                 return Ok(respond(&mut stream, "401 Unauthorized", "", &[], b"")?);
             }
-            let home = std::env::var("HOME").unwrap_or_default();
+            // A boot-managed `amber web` can start with a minimal env (the
+            // 2026-07-29 display-env lesson — this repo has been bitten by
+            // exactly this class of gap before). An empty `home` would become
+            // `cwd: ""` client-side, silently failing `map_browser_msg`'s
+            // `Path::new(cwd).is_dir()` gate on every `+ Pane` with no visible
+            // error — never serve it empty.
+            let home = std::env::var("HOME").ok().filter(|h| !h.is_empty()).unwrap_or_else(|| "/".into());
             let body = serde_json::json!({ "home": home }).to_string();
             Ok(respond(&mut stream, "200 OK", CT_JSON, &[], body.as_bytes())?)
         }

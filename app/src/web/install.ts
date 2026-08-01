@@ -18,16 +18,19 @@ function connectSocket(): SocketLike {
   return ws as unknown as SocketLike
 }
 
-// `softwareGl` (spec §3 "Env" row) is a browser-local fact the server cannot
-// know — probed here with a native feature check rather than served in the
-// bootstrap JSON like `homeDir` (which the server DOES uniquely know).
+// `softwareGl` (spec §3 "Env" row) tells `Pane.tsx` whether to skip xterm's
+// WebGL addon. Forced `true` (DOM renderer) rather than probed for real GPU
+// support: `Pane.tsx` creates ONE WebGL context per open pane, and browsers
+// cap concurrent live contexts (~16 in Chrome, oldest silently evicted past
+// the cap) — a busy workspace would repeatedly hit Pane's context-loss/
+// DOM-fallback path, and this pivot has never live-verified WebGL contention
+// across many simultaneously open panes (the spike ran headless/CDP with
+// `softwareGl` hardcoded `true` too, for the same untested-path reason). The
+// DOM renderer is correctness-neutral — the spike's own finding — so it's
+// the safe default. Flip this to a real `canvas.getContext('webgl')` probe
+// once a live-GUI pass has exercised that contention deliberately.
 function probeSoftwareGl(): boolean {
-  try {
-    const c = document.createElement('canvas')
-    return !(c.getContext('webgl2') ?? c.getContext('webgl'))
-  } catch {
-    return true
-  }
+  return true
 }
 
 /** Install `window.amber`. Must run with `home` already known — `main.tsx`

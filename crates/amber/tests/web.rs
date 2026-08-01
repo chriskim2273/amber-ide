@@ -150,6 +150,13 @@ fn unauthenticated_data_routes_and_ws_are_refused() {
     assert!(status.contains("401"), "expected 401, got {status}");
     let (status, _, _) = f.get("/api/sessions", Some("amber_web=forged"));
     assert!(status.contains("401"), "forged cookie accepted: {status}");
+    // /api/bootstrap (homeDir for the real-renderer web build) is gated the
+    // same way as /api/sessions — the token now reaches a much larger API
+    // (spec §5), and this is the one new route this pass added.
+    let (status, _, _) = f.get("/api/bootstrap", None);
+    assert!(status.contains("401"), "bootstrap leaked without a cookie: {status}");
+    let (status, _, _) = f.get("/api/bootstrap", Some("amber_web=forged"));
+    assert!(status.contains("401"), "bootstrap accepted a forged cookie: {status}");
     // The WebSocket upgrade is gated the same way (no cookie -> no 101).
     let (status, _, _) = f.request(&format!(
         "GET /ws HTTP/1.1\r\nHost: {}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
@@ -171,6 +178,25 @@ fn static_assets_are_public_so_the_page_can_exchange_its_token() {
     }
     let (status, _, _) = f.get("/nope", None);
     assert!(status.contains("404"), "{status}");
+}
+
+#[test]
+fn bootstrap_carries_a_non_empty_home_behind_the_cookie() {
+    let f = fixture();
+    let cookie = f.login();
+    let (status, _, body) = f.get("/api/bootstrap", Some(&cookie));
+    assert!(status.contains("200"), "{status}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let home = v["home"].as_str().unwrap_or("");
+    // A boot-managed `amber web` can start with a minimal/empty env (the
+    // 2026-07-29 display-env lesson: this repo has been bitten by exactly
+    // this class of gap before). `main.tsx`'s `homeDir` fallback is `?? '/'`,
+    // which does NOT rescue an empty string (only null/undefined) — so an
+    // empty `home` here would silently become `cwd: ""` and every `+ Pane`
+    // would 404 out of `map_browser_msg`'s `Path::new(cwd).is_dir()` gate
+    // with no visible error (the "wrong shape looks like a dead button"
+    // failure this whole task exists to avoid).
+    assert!(!home.is_empty(), "bootstrap must never serve an empty home: {body}");
 }
 
 #[test]

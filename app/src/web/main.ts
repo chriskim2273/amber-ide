@@ -31,7 +31,12 @@ async function fetchBootstrap(): Promise<{ home: string }> {
   try {
     const r = await fetch('/api/bootstrap', { credentials: 'same-origin' })
     if (!r.ok) return { home: '/' }
-    return (await r.json()) as { home: string }
+    const body = (await r.json()) as { home?: string }
+    // `main.tsx`'s own `?? '/'` fallback does not rescue an empty string
+    // (only null/undefined) — defend here too, the same way preload's
+    // `homeArg || '/'` already does, so a server that ever slipped and served
+    // `""` still can't turn every `+ Pane` into a silent no-op.
+    return { home: body.home || '/' }
   } catch {
     return { home: '/' }
   }
