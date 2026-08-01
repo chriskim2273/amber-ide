@@ -1137,14 +1137,14 @@ fn handle_conn(mut stream: TcpStream, hub: &Arc<Hub>, auth: &Arc<Auth>) -> anyho
             ws_session(stream, hub)
         }
         // SPIKE ONLY (2026-08-01 webapp-pivot spike, proving-order item 1 in
-        // the spec): serves `app/out/web/` straight off disk, read per-request,
-        // relative to the daemon's CWD. This is NOT the real bundle-serving
-        // design (spec §2.3) — that's `build.rs` generating a static
-        // `include_bytes!` table so the binary stays self-contained/offline;
-        // that's proving-order item 4, not built here. Same-origin as
+        // the spec): serves the built bundle off disk, read per-request, from
+        // `<state-root>/web/` (installed) or `app/out/web/` (dev). This is NOT
+        // the real bundle-serving design (spec §2.3) — that's `build.rs`
+        // generating a static `include_bytes!` table so the binary stays
+        // self-contained/offline; that's proving-order item 4. Same-origin as
         // everything else in this file on purpose: a cross-origin page would
         // fail both the WS `Origin` check and the `SameSite=Strict` cookie.
-        ("GET", "/app") | ("GET", "/app/") => match spike_web_asset("index.html") {
+        ("GET", "/app") | ("GET", "/app/") => match web_asset(&hub.root, "index.html") {
             Some((body, ctype)) => Ok(respond(&mut stream, "200 OK", ctype, &[], &body)?),
             None => Ok(respond(
                 &mut stream,
@@ -1154,7 +1154,7 @@ fn handle_conn(mut stream: TcpStream, hub: &Arc<Hub>, auth: &Arc<Auth>) -> anyho
                 b"web bundle not built - run `npm run build:web` in app/",
             )?),
         },
-        ("GET", p) if p.starts_with("/assets/") => match spike_web_asset(p) {
+        ("GET", p) if p.starts_with("/assets/") => match web_asset(&hub.root, p) {
             Some((body, ctype)) => Ok(respond(&mut stream, "200 OK", ctype, &[], &body)?),
             None => Ok(respond(&mut stream, "404 Not Found", "", &[], b"")?),
         },
@@ -1166,14 +1166,30 @@ fn handle_conn(mut stream: TcpStream, hub: &Arc<Hub>, auth: &Arc<Auth>) -> anyho
     }
 }
 
-/// SPIKE ONLY — see the call site. Reads a file out of `app/out/web/` relative
-/// to CWD; `rel` is a request path (`/assets/x.js` or `index.html`), so a
-/// leading `/` is stripped and any `..` component is refused.
-fn spike_web_asset(rel: &str) -> Option<(Vec<u8>, &'static str)> {
+/// Serve one file of the built web bundle. `rel` is a request path
+/// (`/assets/x.js` or `index.html`), so a leading `/` is stripped and any `..`
+/// component is refused.
+///
+/// Two locations, in order:
+///   1. `<state-root>/web/` — the INSTALLED bundle. This is the one that works
+///      under systemd, where the service's CWD is `/` and a relative path
+///      resolves to nothing.
+///   2. `app/out/web/` relative to CWD — the dev path, so `npm run build:web`
+///      plus `cargo run` still works from a checkout.
+///
+/// Still interim with respect to spec §2.3, which wants `build.rs` to generate
+/// a static `include_bytes!` table so the binary stays self-contained and
+/// offline. That is proving-order item 4. Until then a packaged binary must
+/// have the bundle installed alongside it.
+fn web_asset(root: &Path, rel: &str) -> Option<(Vec<u8>, &'static str)> {
     if rel.contains("..") {
         return None;
     }
-    let path = Path::new("app/out/web").join(rel.trim_start_matches('/'));
+    let rel = rel.trim_start_matches('/');
+    let path = {
+        let installed = root.join("web").join(rel);
+        if installed.is_file() { installed } else { Path::new("app/out/web").join(rel) }
+    };
     let ctype = if rel.ends_with(".js") {
         CT_JS
     } else if rel.ends_with(".css") {
