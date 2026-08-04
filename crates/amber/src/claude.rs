@@ -69,6 +69,23 @@ fn now() -> u64 {
 
 /// Record the session id from a SessionStart hook's stdin JSON. Fires on every
 /// hook invocation — ids rotate on resume/clear/compaction, last write wins.
+///
+/// `amber run` spawns claude with `AMBER_SESSION` set and no `env_clear()`, so
+/// every descendant of that claude process inherits it too — including a
+/// nested `claude` invocation (the pane's own Bash tool, or anything else
+/// launched from inside it) in a totally unrelated project. The GLOBAL
+/// SessionStart hook (`ensure_global_claude_hook`) fires for that nested
+/// claude as well, with the SAME `AMBER_SESSION`, so an unguarded "last write
+/// wins" lets an unrelated conversation silently clobber this pane's real
+/// resume id. Once a pane is an established agent session — `kind.is_agent()`
+/// (claude/grok created as such) or `resume_as_claude` (a hand-started claude
+/// already detected) — a hook report whose cwd doesn't match is refused: the
+/// pane's OWN claude always fires SessionStart from the exact directory
+/// `amber run` launched it in, so this has no legitimate false positive in
+/// steady state. (One accepted false-positive window: a shell that goes
+/// straight from claude-quit back to a hand-started claude elsewhere, faster
+/// than `CLAUDE_ABSENT_THRESHOLD` downgrades `resume_as_claude` — see
+/// `record_session_may_reject_a_fast_legitimate_recovery` below.)
 pub fn record_session(store: &StateStore, session_name: &str, hook_stdin: &str) -> anyhow::Result<()> {
     let v: serde_json::Value = serde_json::from_str(hook_stdin)?;
     let session_id = v
@@ -81,6 +98,18 @@ pub fn record_session(store: &StateStore, session_name: &str, hook_stdin: &str) 
         .and_then(|s| s.as_str())
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+
+    if let Ok(Some(meta)) = store.read_session(session_name) {
+        if (meta.kind.is_agent() || meta.resume_as_claude) && cwd != meta.cwd {
+            anyhow::bail!(
+                "hook cwd {} does not match session {session_name}'s cwd {} — refusing to record \
+                 (likely a nested/unrelated claude sharing an inherited AMBER_SESSION)",
+                cwd.display(),
+                meta.cwd.display()
+            );
+        }
+    }
+
     store.write_claude(
         session_name,
         &ClaudeMeta {
@@ -304,7 +333,7 @@ fn trust_cwd_in(config: &Path, cwd: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use amber_core::state::StateStore;
+    use amber_core::state::{SessionKind, SessionMeta, StateStore};
     use std::path::Path;
     use tempfile::tempdir;
 
@@ -353,6 +382,144 @@ mod tests {
         record_session(&store, "w", r#"{"session_id":"first","cwd":"/a"}"#).unwrap();
         record_session(&store, "w", r#"{"session_id":"second","cwd":"/a"}"#).unwrap();
         assert_eq!(store.read_claude("w").unwrap().unwrap().session_id, "second");
+    }
+
+    #[test]
+    fn record_session_refuses_a_hook_fired_outside_an_established_sessions_cwd() {
+        // `amber run` spawns claude with `AMBER_SESSION` in its environment and
+        // no `env_clear()`, so every descendant of that claude process inherits
+        // it too — including a nested `claude` invocation (e.g. via the pane's
+        // own Bash tool) in a totally unrelated project. The GLOBAL SessionStart
+        // hook fires for that nested claude as well, and `run_hook` trusts
+        // `AMBER_SESSION` blindly — so without this guard, the nested session's
+        // id silently clobbers this pane's real resume id (reproduces amber
+        // session 17, 2026-08-03: its recorded id turned out to belong to an
+        // unrelated `agentic-employee` conversation).
+        let dir = tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        store
+            .write_session(&SessionMeta {
+                name: "work".to_string(),
+                cwd: PathBuf::from("/home/u/amber-ide"),
+                kind: SessionKind::Shell,
+                updated: 0,
+                resume_as_claude: true,
+                run_state: None,
+                slot: 1,
+            })
+            .unwrap();
+        record_session(&store, "work", r#"{"session_id":"real-id","cwd":"/home/u/amber-ide"}"#)
+            .unwrap();
+
+        let result = record_session(
+            &store,
+            "work",
+            r#"{"session_id":"intruder-id","cwd":"/home/u/other-project"}"#,
+        );
+        assert!(result.is_err(), "a hook fired outside the session's cwd must be refused");
+
+        let meta = store.read_claude("work").unwrap().unwrap();
+        assert_eq!(meta.session_id, "real-id", "the real resume id must survive");
+    }
+
+    #[test]
+    fn record_session_accepts_a_matching_cwd_on_an_established_session() {
+        // The pane's OWN claude firing SessionStart again (resume/compaction)
+        // must keep working — it always reports the same cwd it was launched
+        // with.
+        let dir = tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        store
+            .write_session(&SessionMeta {
+                name: "work".to_string(),
+                cwd: PathBuf::from("/home/u/amber-ide"),
+                kind: SessionKind::Shell,
+                updated: 0,
+                resume_as_claude: true,
+                run_state: None,
+                slot: 1,
+            })
+            .unwrap();
+        record_session(&store, "work", r#"{"session_id":"first","cwd":"/home/u/amber-ide"}"#)
+            .unwrap();
+        record_session(&store, "work", r#"{"session_id":"rotated","cwd":"/home/u/amber-ide"}"#)
+            .unwrap();
+        assert_eq!(store.read_claude("work").unwrap().unwrap().session_id, "rotated");
+    }
+
+    #[test]
+    fn record_session_untracked_session_is_unguarded() {
+        // No `SessionMeta` on disk (e.g. a hand-started claude in a plain shell
+        // pane, before the periodic snapshot has even created one) — nothing to
+        // compare against, so the write must go through as before.
+        let dir = tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        record_session(&store, "untracked", r#"{"session_id":"x","cwd":"/anywhere"}"#).unwrap();
+        assert_eq!(store.read_claude("untracked").unwrap().unwrap().session_id, "x");
+    }
+
+    #[test]
+    fn record_session_guards_a_kind_claude_pane_even_before_resume_as_claude_flips() {
+        // `supervisor.rs` sets `AMBER_SESSION` on the grok launch path too (grok's
+        // id lives in this same file), and a pane created directly as
+        // `kind: Claude`/`Grok` never has `resume_as_claude` set at all —
+        // `persist_live_cwd` only touches `Shell`-kind sessions. Gating solely on
+        // `resume_as_claude` would leave both unguarded from the moment they're
+        // created.
+        let dir = tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        store
+            .write_session(&SessionMeta {
+                name: "agent".to_string(),
+                cwd: PathBuf::from("/home/u/amber-ide"),
+                kind: SessionKind::Grok,
+                updated: 0,
+                resume_as_claude: false,
+                run_state: None,
+                slot: 1,
+            })
+            .unwrap();
+        record_session(&store, "agent", r#"{"session_id":"real-id","cwd":"/home/u/amber-ide"}"#)
+            .unwrap();
+
+        let result =
+            record_session(&store, "agent", r#"{"session_id":"intruder","cwd":"/elsewhere"}"#);
+        assert!(result.is_err(), "an agent-kind pane must be guarded from creation, not just detection");
+        assert_eq!(store.read_claude("agent").unwrap().unwrap().session_id, "real-id");
+    }
+
+    #[test]
+    fn record_session_may_reject_a_fast_legitimate_recovery() {
+        // Accepted tradeoff, documented rather than fixed: if a shell drops to a
+        // bare shell (claude quit/crashed) and the user `cd`s + hand-starts
+        // claude again in a NEW directory faster than
+        // `CLAUDE_ABSENT_THRESHOLD` downgrades `resume_as_claude` back to
+        // false (~20 s at the default snapshot cadence), the hook's report of
+        // the new — genuinely correct — cwd still doesn't match the
+        // still-stale `meta.cwd`, and this guard refuses it exactly like it
+        // would refuse an intruder. `run_hook` swallows the error to stderr,
+        // so this surfaces one restart later as the same "conversation
+        // couldn't be found" symptom this fix targets. Rare (requires a
+        // sub-20s reaction) and one-directional (only ever loses a fresh
+        // relocation, never resurrects an intruder), so left as a known gap
+        // rather than adding cross-referencing against `claude_absent`
+        // streak state that only `SessionManager` has.
+        let dir = tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        store
+            .write_session(&SessionMeta {
+                name: "work".to_string(),
+                cwd: PathBuf::from("/home/u/old-project"),
+                kind: SessionKind::Shell,
+                updated: 0,
+                resume_as_claude: true, // downgrade hasn't happened yet
+                run_state: None,
+                slot: 1,
+            })
+            .unwrap();
+        let result =
+            record_session(&store, "work", r#"{"session_id":"new-real-id","cwd":"/home/u/new-project"}"#);
+        assert!(result.is_err(), "documents the accepted false-positive window");
     }
 
     #[test]
