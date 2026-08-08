@@ -4,3 +4,4 @@ Cargo.lock.orig
 /dist
 .serena/
 .playwright-mcp/
+.worktrees/
