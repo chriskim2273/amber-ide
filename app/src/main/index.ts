@@ -480,7 +480,18 @@ async function main(): Promise<void> {
   let controlPort: Electron.MessagePortMain | null = null
   let relaunchAttempt = 0
   let quitting = false
-  app.on('before-quit', () => { quitting = true })
+  // Tear the client utilityProcess down on quit. Spec §7: window close closes
+  // the utilityProcess and leaves the daemon running. Without this kill, the
+  // child outlives the window; combined with the historical darwin skip in
+  // window-all-closed, the red traffic-light left a headless Electron process
+  // in the Dock that required Force Quit.
+  app.on('before-quit', () => {
+    quitting = true
+    try { controlPort?.close() } catch { /* already closed */ }
+    controlPort = null
+    try { child?.kill() } catch { /* already dead */ }
+    child = null
+  })
 
   // Browser panes host <webview> web contents. Route popups (window.open /
   // target=_blank) to the system browser and refuse in-app popup windows, and
@@ -683,4 +694,9 @@ if (!app.requestSingleInstanceLock()) {
     app.quit()
   })
 }
-app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit() })
+// Single-window app: red traffic-light / window close must quit the process on
+// every platform, including macOS. The common Electron pattern of keeping the
+// app alive with zero windows on darwin left amber-ide headless in the Dock
+// (no activate handler recreates a window) until Force Quit. Spec §6/§7: window
+// close never stops the daemon, but it DOES exit the GUI.
+app.on('window-all-closed', () => { app.quit() })
