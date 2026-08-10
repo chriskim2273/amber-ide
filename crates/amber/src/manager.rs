@@ -293,9 +293,9 @@ impl SessionManager {
                 cmd.env("AMBER_STATE_DIR", self.root.to_string_lossy().to_string());
                 Ok(cmd)
             }
-            // Both agents run the SAME `amber run <name>` supervisor; it reads
-            // the persisted kind to decide which binary to launch and how.
-            SessionKind::Claude | SessionKind::Grok => {
+            // All agents run the SAME `amber run <name>` supervisor; it reads
+            // the kind from argv to decide which binary to launch and how.
+            SessionKind::Claude | SessionKind::Grok | SessionKind::Codex => {
                 let exe = resolve_current_exe()?;
                 let mut cmd = CommandBuilder::new(exe);
                 // The kind is passed EXPLICITLY, not looked up from the store:

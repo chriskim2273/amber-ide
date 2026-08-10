@@ -166,6 +166,7 @@ fn parse_kind(kind: &str) -> anyhow::Result<SessionKind> {
         "shell" => Ok(SessionKind::Shell),
         "claude" => Ok(SessionKind::Claude),
         "grok" => Ok(SessionKind::Grok),
+        "codex" => Ok(SessionKind::Codex),
         other => anyhow::bail!("unknown session kind: {other}"),
     }
 }
@@ -560,6 +561,8 @@ mod tests {
         // repaints its history over a live full-screen UI.
         assert!(suppress_backlog(true, Some(SessionKind::Grok)));
         assert!(!suppress_backlog(false, Some(SessionKind::Grok)));
+        assert!(suppress_backlog(true, Some(SessionKind::Codex)));
+        assert!(!suppress_backlog(false, Some(SessionKind::Codex)));
         assert!(!suppress_backlog(true, Some(SessionKind::Shell)));
         assert!(!suppress_backlog(false, Some(SessionKind::Claude)));
         assert!(!suppress_backlog(false, Some(SessionKind::Shell)));

@@ -885,6 +885,22 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   clippy clean, app 449 tests + typecheck + `build:web` green. **Live-verified**
   full report: `.reports/web-resize.md`.
 
+- [x] Codex session kind (2026-08-10) — a third supervised agent: `kind:"codex"`
+  is a pane whose pty runs `amber run <name> --kind codex`. Spec:
+  `docs/superpowers/specs/2026-08-10-codex-session-kind-design.md`. Claude-shaped
+  (not Grok-shaped): Codex cannot assign a session id on create, so amber
+  installs a global SessionStart hook in `$CODEX_HOME/hooks.json` (default
+  `~/.codex/hooks.json`) that runs `amber hook` and records into the SAME
+  `claude/<name>.json` store. Fresh: `codex --dangerously-bypass-approvals-and-sandbox
+  --dangerously-bypass-hook-trust`; resume: `codex resume <id> …`. Never
+  `resume --last`. Kind-gated sites use `SessionKind::is_agent()` /
+  `isAgentKind()` (codex included). Run-state vocabulary stays `claude*`.
+  Doctor records optional `codex_path`. App picker/dots/web create kinds extended.
+  Scope cuts: no hand-started-codex detection, no filesystem session scan, no
+  permission UI. Gates: Rust unit + clippy clean, app tests + typecheck green.
+  **A running daemon must be restarted to accept `kind:"codex"`.** Live create →
+  hook-record → kill/resume round-trip still manual when `codex` is on PATH.
+
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**
   `std::io::Read` (dedicated thread); `take_writer()` is one-shot;

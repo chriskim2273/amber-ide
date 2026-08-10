@@ -201,6 +201,16 @@ describe('paneDot grok', () => {
   })
 })
 
+describe('paneDot codex', () => {
+  it('maps run_state to dot + label', () => {
+    expect(paneDot('codex', undefined)).toEqual({ cls: 'codex', label: 'codex' })
+    expect(paneDot('codex', 'claude')).toEqual({ cls: 'codex', label: 'codex' })
+    expect(paneDot('codex', 'claude-retrying')).toEqual({ cls: 'codex-retrying', label: 'codex (retrying)' })
+    expect(paneDot('codex', 'shell-fallback')).toEqual({ cls: 'shell-fallback', label: 'shell (codex exited)' })
+    expect(paneDot('codex', 'suspended')).toEqual({ cls: 'suspended', label: 'suspended (RAM freed)' })
+  })
+})
+
 describe('tabDot', () => {
   it('no claude pane → shell', () => {
     expect(tabDot([pane('shell'), pane('shell')]).cls).toBe('shell')
@@ -223,6 +233,10 @@ describe('tabDot', () => {
   })
   it('a grok pane still counts toward the tab dot in a mixed tab', () => {
     expect(tabDot([pane('claude', 'shell-fallback'), pane('grok', 'claude')]).cls).toBe('claude')
+  })
+  it('an all-codex tab reads codex', () => {
+    expect(tabDot([pane('shell'), pane('codex', 'claude')])).toEqual({ cls: 'codex', label: 'codex' })
+    expect(tabDot([pane('codex', 'claude-retrying')]).cls).toBe('codex-retrying')
   })
 })
 

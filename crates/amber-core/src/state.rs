@@ -3,8 +3,8 @@
 //! Layout under a root dir:
 //! ```text
 //! config.toml
-//! sessions/<name>.json     { name, cwd, kind: "shell"|"claude"|"grok", updated }
-//! claude/<name>.json       { session_id, cwd, updated }   (grok ids live here too)
+//! sessions/<name>.json     { name, cwd, kind: "shell"|"claude"|"grok"|"codex", updated }
+//! claude/<name>.json       { session_id, cwd, updated }   (grok/codex ids live here too)
 //! scrollback/<name>.bin     raw bytes
 //! ```
 //! All writes are atomic: write to a `.tmp` file in the same directory as the
@@ -23,6 +23,7 @@ pub enum SessionKind {
     Shell,
     Claude,
     Grok,
+    Codex,
 }
 
 impl SessionKind {
@@ -30,10 +31,13 @@ impl SessionKind {
     /// `amber run <name>` instead of a bare shell. These share every behaviour
     /// that is about "an agent TUI on the alt screen", not about claude
     /// specifically: backlog suppression for raw clients, run-state reporting,
-    /// suspend/resume. Adding a third agent means adding one arm here, not
+    /// suspend/resume. Adding another agent means adding one arm here, not
     /// hunting `== SessionKind::Claude` across the daemon.
     pub fn is_agent(self) -> bool {
-        matches!(self, SessionKind::Claude | SessionKind::Grok)
+        matches!(
+            self,
+            SessionKind::Claude | SessionKind::Grok | SessionKind::Codex
+        )
     }
 
     /// The wire spelling (what `SessionInfo.kind` carries and the app matches on).
@@ -42,6 +46,7 @@ impl SessionKind {
             SessionKind::Shell => "shell",
             SessionKind::Claude => "claude",
             SessionKind::Grok => "grok",
+            SessionKind::Codex => "codex",
         }
     }
 }
@@ -91,6 +96,9 @@ pub struct Config {
     /// written before grok support still loads.
     #[serde(default)]
     pub grok_path: Option<PathBuf>,
+    /// Resolved `codex` binary (OpenAI Codex CLI). Defaulted for older configs.
+    #[serde(default)]
+    pub codex_path: Option<PathBuf>,
     pub snapshot_interval_secs: u64,
     pub scrollback_bytes: usize,
 }
@@ -100,6 +108,7 @@ impl Default for Config {
         Config {
             claude_path: None,
             grok_path: None,
+            codex_path: None,
             snapshot_interval_secs: 10,
             scrollback_bytes: 2 * 1024 * 1024,
         }
@@ -575,6 +584,7 @@ mod tests {
     fn agent_kinds_are_the_supervised_ones() {
         assert!(SessionKind::Claude.is_agent());
         assert!(SessionKind::Grok.is_agent());
+        assert!(SessionKind::Codex.is_agent());
         assert!(!SessionKind::Shell.is_agent());
     }
 
@@ -583,6 +593,29 @@ mod tests {
         // The wire/JSON spelling is what `parse_kind` and the app both use.
         let json = serde_json::to_string(&SessionKind::Grok).unwrap();
         assert_eq!(json, "\"grok\"");
+    }
+
+    #[test]
+    fn codex_kind_serializes_lowercase() {
+        let json = serde_json::to_string(&SessionKind::Codex).unwrap();
+        assert_eq!(json, "\"codex\"");
+    }
+
+    #[test]
+    fn config_written_before_codex_support_still_loads() {
+        let dir = tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        fs::write(
+            dir.path().join("config.toml"),
+            b"claude_path = \"/usr/bin/claude\"\ngrok_path = \"/usr/bin/grok\"\nsnapshot_interval_secs = 10\nscrollback_bytes = 2048\n",
+        )
+        .unwrap();
+
+        let cfg = store.load_config().unwrap();
+
+        assert_eq!(cfg.claude_path, Some(PathBuf::from("/usr/bin/claude")));
+        assert_eq!(cfg.grok_path, Some(PathBuf::from("/usr/bin/grok")));
+        assert_eq!(cfg.codex_path, None);
     }
 
     #[test]
@@ -603,6 +636,7 @@ mod tests {
         let cfg = Config {
             claude_path: Some(PathBuf::from("/usr/local/bin/claude")),
             grok_path: Some(PathBuf::from("/usr/local/bin/grok")),
+            codex_path: Some(PathBuf::from("/usr/local/bin/codex")),
             snapshot_interval_secs: 42,
             scrollback_bytes: 4096,
         };

@@ -106,12 +106,12 @@ export function reduce(state: AppState, ev: DaemonEvent): AppState {
 export interface KindDot { cls: string; label: string }
 
 // A supervised coding-agent pane — one whose daemon session runs `amber run`
-// and reports a run_state. The daemon's `SessionKind::is_agent`, mirrored: both
+// and reports a run_state. The daemon's `SessionKind::is_agent`, mirrored: all
 // agents share every run_state behaviour (dots, freeze/suspend, tab label), and
-// the run_state vocabulary stays spelled `claude*` for both because it names
-// the supervision phase, not the binary.
+// the run_state vocabulary stays spelled `claude*` for all of them because it
+// names the supervision phase, not the binary.
 export function isAgentKind(kind: string): boolean {
-  return kind === 'claude' || kind === 'grok'
+  return kind === 'claude' || kind === 'grok' || kind === 'codex'
 }
 
 // A pane's kind-dot appearance + tooltip, from its kind and agent run_state.
@@ -133,11 +133,12 @@ export function paneDot(kind: string, runState: string | undefined): KindDot {
 // The tab bar's dot, aggregated over a tab's panes: no agent → shell; any
 // retrying agent → retrying (most attention-worthy); every agent fallen back
 // to a shell → shell-fallback (gray); otherwise → the agent. A tab whose agents
-// are all grok reads "grok"; a mixed tab is labelled with the older name.
+// are all the same kind uses that kind; a mixed tab is labelled "claude".
 export function tabDot(panes: PaneModel[]): KindDot {
   const agents = panes.filter((p) => isAgentKind(p.kind))
   if (agents.length === 0) return { cls: 'shell', label: 'shell' }
-  const k = agents.every((p) => p.kind === 'grok') ? 'grok' : 'claude'
+  const kinds = new Set(agents.map((p) => p.kind))
+  const k = kinds.size === 1 ? agents[0]!.kind : 'claude'
   if (agents.some((p) => p.runState === 'claude-retrying')) return { cls: `${k}-retrying`, label: `${k} (retrying)` }
   if (agents.every((p) => p.runState === 'shell-fallback')) return { cls: 'shell-fallback', label: `shell (${k} exited)` }
   return { cls: k, label: k }

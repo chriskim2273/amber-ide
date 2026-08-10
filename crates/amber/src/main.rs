@@ -112,14 +112,14 @@ enum Command {
     /// agent session's child process; not meant to be run directly by users).
     Run {
         name: String,
-        /// Which agent to supervise: `claude` (default) or `grok`. Passed by
-        /// the daemon rather than read from the store, which the spawn races.
+        /// Which agent to supervise: `claude` (default), `grok`, or `codex`.
+        /// Passed by the daemon rather than read from the store, which the
+        /// spawn races.
         #[arg(long, default_value = "claude")]
         kind: String,
     },
-    /// `SessionStart` hook target invoked by claude itself; records the
-    /// rotating session id from stdin (`AMBER_SESSION`/`AMBER_STATE_DIR`
-    /// env, spec §6.2).
+    /// `SessionStart` hook target invoked by claude/codex; records the
+    /// session id from stdin (`AMBER_SESSION`/`AMBER_STATE_DIR` env, spec §6.2).
     Hook,
     /// Diagnostics + lifecycle helpers.
     Ctl {
@@ -130,9 +130,9 @@ enum Command {
 
 #[derive(Subcommand)]
 enum CtlAction {
-    /// Resolve the agent binaries (claude, grok) via your login shell and
-    /// record them in config (the distribution-safe path — never the daemon's
-    /// own PATH; spec §8).
+    /// Resolve the agent binaries (claude, grok, codex) via your login shell
+    /// and record them in config (the distribution-safe path — never the
+    /// daemon's own PATH; spec §8).
     Doctor {
         #[arg(long)]
         root: Option<PathBuf>,
@@ -244,8 +244,8 @@ fn run_doctor(root: Option<PathBuf>) -> anyhow::Result<()> {
     std::fs::create_dir_all(&root)?;
     let store = StateStore::new(&root);
 
-    // grok is optional: a machine with only claude installed is a working
-    // amber, so a missing grok is reported but never fails the doctor.
+    // grok/codex are optional: a machine with only claude installed is a working
+    // amber, so a missing optional agent is reported but never fails the doctor.
     if let Some(path) = amber::grok::resolve_grok() {
         let mut cfg = store.load_config()?;
         cfg.grok_path = Some(path.clone());
@@ -253,6 +253,14 @@ fn run_doctor(root: Option<PathBuf>) -> anyhow::Result<()> {
         println!("grok:   {} (recorded in config)", path.display());
     } else {
         println!("grok:   not found via your login shell (grok panes will fall back to a shell)");
+    }
+    if let Some(path) = amber::codex::resolve_codex() {
+        let mut cfg = store.load_config()?;
+        cfg.codex_path = Some(path.clone());
+        store.save_config(&cfg)?;
+        println!("codex:  {} (recorded in config)", path.display());
+    } else {
+        println!("codex:  not found via your login shell (codex panes will fall back to a shell)");
     }
 
     match claude::resolve_claude() {
@@ -540,11 +548,13 @@ fn run_daemon(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Result<
             .with_socket(socket_path.clone())
             .with_watchers(Arc::clone(&watchers)),
     );
-    // Global claude SessionStart hook: lets a hand-started claude in a shell
-    // record its resume id too (best-effort; the per-session hook covers
-    // amber-launched claude).
+    // Global SessionStart hooks: claude (also covers hand-started claude in a
+    // shell); codex (no per-session settings file — the global hook is the only
+    // id-capture path for amber-launched codex panes).
     if let Ok(exe) = amber::manager::resolve_current_exe() {
-        claude::ensure_global_claude_hook(&format!("{} hook", exe.display()));
+        let hook = format!("{} hook", exe.display());
+        claude::ensure_global_claude_hook(&hook);
+        amber::codex::ensure_global_codex_hook(&hook);
     }
     manager.restore()?;
 

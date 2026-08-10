@@ -219,6 +219,8 @@ body {
 .tab .kind-dot.claude { background: var(--warn); }
 /* grok: its own hue so a glance tells the two agents apart. */
 .tab .kind-dot.grok { background: var(--grok, #8ab4f8); }
+/* codex: green/teal, distinct from claude amber and grok blue. */
+.tab .kind-dot.codex { background: var(--codex, #3dd68c); }
 .tab .kind-dot.shell { background: var(--accent-2); }
 .tab .kind-dot.browser { background: var(--ok, #3fb950); }
 /* editor pane — app-local like a browser pane, distinct hue */
@@ -226,6 +228,7 @@ body {
 /* claude crashed and is retrying — pulsing amber draws the eye */
 .tab .kind-dot.claude-retrying { background: var(--warn); animation: pulse 1.2s ease-in-out infinite; }
 .tab .kind-dot.grok-retrying { background: var(--grok, #8ab4f8); animation: pulse 1.2s ease-in-out infinite; }
+.tab .kind-dot.codex-retrying { background: var(--codex, #3dd68c); animation: pulse 1.2s ease-in-out infinite; }
 /* claude gave up / user quit — pane is a plain shell now (gray) */
 .tab .kind-dot.shell-fallback { background: var(--text-faint); }
 /* parked by a freeze grace — claude killed to free RAM, resumable (cyan) */
@@ -325,6 +328,7 @@ body {
 }
 .pane-header .kind-dot.claude { background: var(--warn); }
 .pane-header .kind-dot.grok { background: var(--grok, #8ab4f8); }
+.pane-header .kind-dot.codex { background: var(--codex, #3dd68c); }
 .pane-header .kind-dot.shell { background: var(--accent-2); }
 /* app-local web viewer (green) */
 .pane-header .kind-dot.browser { background: var(--ok, #3fb950); }
@@ -355,6 +359,7 @@ body {
 /* claude crashed and is retrying — pulsing amber draws the eye */
 .pane-header .kind-dot.claude-retrying { background: var(--warn); animation: pulse 1.2s ease-in-out infinite; }
 .pane-header .kind-dot.grok-retrying { background: var(--grok, #8ab4f8); animation: pulse 1.2s ease-in-out infinite; }
+.pane-header .kind-dot.codex-retrying { background: var(--codex, #3dd68c); animation: pulse 1.2s ease-in-out infinite; }
 /* claude gave up / user quit — pane is a plain shell now (gray) */
 .pane-header .kind-dot.shell-fallback { background: var(--text-faint); }
 /* parked by a freeze grace — claude killed to free RAM, resumable (cyan) */

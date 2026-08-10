@@ -126,7 +126,7 @@ pub fn resolve_claude_with(shell: &str, login: bool, extra_env: &[(String, Strin
     resolve_bin_with(shell, login, "claude", extra_env)
 }
 
-/// Resolve an agent binary by name through a shell. Shared by claude and grok:
+/// Resolve an agent binary by name through a shell. Shared by claude/grok/codex:
 /// both must be found on the USER's PATH, not the daemon's (spec §8).
 pub fn resolve_bin_with(
     shell: &str,
@@ -187,8 +187,8 @@ pub fn ensure_global_claude_hook(hook_command: &str) {
 /// (typically a dev build in a removed git worktree). Deliberately narrow: the
 /// command must be exactly two whitespace-separated words, the second `hook`,
 /// and the first must end in `amber`, so a user's unrelated SessionStart hook
-/// can never match.
-fn is_dangling_amber_hook(command: &str) -> bool {
+/// can never match. Shared with the codex global-hook installer.
+pub(crate) fn is_dangling_amber_hook(command: &str) -> bool {
     let mut parts = command.split_whitespace();
     let (Some(path), Some("hook"), None) = (parts.next(), parts.next(), parts.next()) else {
         return false;

@@ -9,12 +9,15 @@ import { CLAUDE_SESSION_ID } from '../shared/ids'
 
 export interface PaneMeta { kind: string; title: string; cwd: string; runState?: string | undefined; rssKb?: number | undefined; growing?: boolean | undefined; claudeId?: string | undefined }
 
-/** Which agent binary a pane's recorded conversation id belongs to. Only a
- *  `grok` pane is grok's; a shell pane with a recorded id got it from a
+/** Which agent binary a pane's recorded conversation id belongs to. Explicit
+ *  agent kinds map to themselves; a shell pane with a recorded id got it from a
  *  hand-started claude (the global SessionStart hook), so it stays claude. */
-export function agentOf(kind: string): 'claude' | 'grok' {
-  return kind === 'grok' ? 'grok' : 'claude'
+export function agentOf(kind: string): 'claude' | 'grok' | 'codex' {
+  if (kind === 'grok' || kind === 'codex') return kind
+  return 'claude'
 }
+
+export type PaneKind = 'shell' | 'claude' | 'grok' | 'codex' | 'browser' | 'editor'
 
 // Compact memory label from resident KiB: "0" hidden by the caller; MB up to
 // ~1 GB, then GB with one decimal. Display-only.
@@ -149,7 +152,7 @@ export function SplitView(props: {
   fontSize: number
   onPaneTitle: (session: string, title: string) => void
   onSetRatio: (path: Array<'a' | 'b'>, ratio: number) => void
-  onSplit: (paneId: string, dir: 'h' | 'v', kind?: 'shell' | 'claude' | 'grok' | 'browser' | 'editor') => void
+  onSplit: (paneId: string, dir: 'h' | 'v', kind?: PaneKind) => void
   onMove: (sourceId: string, targetId: string, zone: Zone) => void
   // Cross-group move: the pane was dropped on a tab header (`{ tab }`) or a
   // workspace pill (`{ ws }`). Grouping is name-encoded, so App turns this into a
@@ -279,7 +282,9 @@ export function SplitView(props: {
       // recorded id lives in one store for both, so the KIND picks the binary.
       const cmd = kind === 'grok'
         ? `grok --permission-mode bypassPermissions${flag}`
-        : `claude --dangerously-skip-permissions${flag}`
+        : kind === 'codex'
+          ? (id ? `codex resume ${id} --dangerously-bypass-approvals-and-sandbox` : 'codex resume --last --dangerously-bypass-approvals-and-sandbox')
+          : `claude --dangerously-skip-permissions${flag}`
       api.insert(`\x15${cmd}\n`)
     }
     setReloadPane(null)
@@ -697,7 +702,11 @@ export function SplitView(props: {
                       Resume last <span className="reload-id">{meta.claudeId!.slice(0, 8)}…</span>
                     </button>
                     <button className="btn" onClick={() => reloadClaude(paneId, null, meta.kind)}
-                      title={meta.kind === 'grok' ? "resumes the most recent conversation in this folder" : "opens claude's own session list"}>
+                      title={
+                        meta.kind === 'grok' ? "resumes the most recent conversation in this folder"
+                          : meta.kind === 'codex' ? "opens codex's session picker (resume --last)"
+                            : "opens claude's own session list"
+                      }>
                       Pick session…
                     </button>
                     <button className="btn btn-ghost" onClick={() => setReloadPane(null)}>Cancel</button>
@@ -745,7 +754,7 @@ export function SplitView(props: {
           return (
             <div className="ctx-menu" role="menu" aria-label={dir === 'h' ? 'split right as' : 'split down as'}
               style={{ left: x, top: y }} onMouseDown={(e) => e.stopPropagation()}>
-              {(['shell', 'claude', 'grok', 'browser', 'editor'] as const).map((k) => (
+              {(['shell', 'claude', 'grok', 'codex', 'browser', 'editor'] as const).map((k) => (
                 <button key={k} className="ctx-item" role="menuitem"
                   onClick={run(() => props.onSplit(paneId, dir, k))}>{k}</button>
               ))}

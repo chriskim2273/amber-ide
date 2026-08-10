@@ -195,7 +195,7 @@ function main() {
     });
 
     var add = pill('+ pane', false, function () {
-      var kind = window.prompt('kind: shell, claude or grok', 'shell');
+      var kind = window.prompt('kind: shell, claude, grok or codex', 'shell');
       if (!kind) return;
       var s = sessionByName(firstPaneOf(ws, cur)) || sessions[0];
       newPane(kind.trim(), (s && s.cwd) || '/');
@@ -294,7 +294,7 @@ function main() {
     menu.textContent = '⋯';
     menu.addEventListener('click', function (e) {
       e.stopPropagation();          // don't open the terminal
-      var agent = s.kind === 'claude' || s.kind === 'grok';
+      var agent = s.kind === 'claude' || s.kind === 'grok' || s.kind === 'codex';
       var choices = ['close'];
       if (agent) choices.push(s.run_state === 'suspended' ? 'unfreeze' : 'freeze');
       choices.push('move to tab…');
@@ -517,12 +517,12 @@ function main() {
   // a tap feels answered; it never touches `layout`.
   var pending = {};   // paneName -> expiry ms
 
-  var CREATE_KINDS = { shell: 1, claude: 1, grok: 1 };
+  var CREATE_KINDS = { shell: 1, claude: 1, grok: 1, codex: 1 };
 
   function newPane(kind, cwd) {
     // Mirrors the server's CREATE_KINDS check (web.rs) so a bad kind banners
     // instead of silently no-opping.
-    if (!CREATE_KINDS[kind]) { banner('kind must be shell, claude or grok', 'warn'); return; }
+    if (!CREATE_KINDS[kind]) { banner('kind must be shell, claude, grok or codex', 'warn'); return; }
     var name = paneName(curWs, curTab, freeOrd(curWs, curTab));
     pending[name] = Date.now() + 3000;
     control({ t: 'create', name: name, cwd: cwd, kind: kind });
@@ -539,9 +539,9 @@ function main() {
     control({ t: 'move', from: name, to: paneName(ws, tab, freeOrd(ws, tab), p.id) });
   }
 
-  // suspend/resume are refused server-side for anything that isn't kind
-  // claude/grok; gated client-side too (see the `agent` check in `tile()`'s
-  // menu) so the control is never even offered on a shell pane.
+  // suspend/resume are refused server-side for anything that isn't an agent
+  // kind; gated client-side too (see the `agent` check in `tile()`'s menu) so
+  // the control is never even offered on a shell pane.
   function setFrozen(name, frozen) {
     control({ t: frozen ? 'suspend' : 'resume', name: name });
   }

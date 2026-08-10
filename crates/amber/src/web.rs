@@ -278,9 +278,9 @@ const RESIZE_MAX_COLS: u16 = 1000;
 const RESIZE_MIN_ROWS: u16 = 4;
 const RESIZE_MAX_ROWS: u16 = 300;
 
-/// Valid `Create` kinds. A pty runs a shell or `amber run <name> [--kind grok]`
+/// Valid `Create` kinds. A pty runs a shell or `amber run <name> [--kind …]`
 /// and nothing else — `Create` carries no argv, so this is the entire surface.
-const CREATE_KINDS: [&str; 3] = ["shell", "claude", "grok"];
+const CREATE_KINDS: [&str; 4] = ["shell", "claude", "grok", "codex"];
 
 /// The ONLY mapping from a browser message to daemon control messages
 /// (spec §5, widened by the pane-parity pass). `open` is this connection's
@@ -299,7 +299,9 @@ pub fn map_browser_msg(
 ) -> Vec<ControlMsg> {
     let live = |n: &str| sessions.iter().any(|s| s.name == n);
     let is_agent = |n: &str| {
-        sessions.iter().any(|s| s.name == n && (s.kind == "claude" || s.kind == "grok"))
+        sessions.iter().any(|s| {
+            s.name == n && (s.kind == "claude" || s.kind == "grok" || s.kind == "codex")
+        })
     };
     // Exhaustive match: adding a browser message forces a decision here, so a
     // forbidden control can never become reachable by accident.

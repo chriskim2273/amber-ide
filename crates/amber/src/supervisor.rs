@@ -13,7 +13,7 @@ use std::time::Duration;
 use amber_core::proto::{self, ControlMsg, Frame};
 use amber_core::state::{SessionKind, StateStore};
 
-use crate::{claude, grok};
+use crate::{claude, codex, grok};
 
 /// Upper bound on a single fire-and-forget run-state report write. Reporting
 /// must NEVER stall supervision, so both the connect and the write are
@@ -59,15 +59,18 @@ pub enum SuperviseOutcome {
     Exhausted,
 }
 
-/// Which coding agent a supervised session runs. Both share this module's
+/// Which coding agent a supervised session runs. All share this module's
 /// retry/suspend/fallback machinery; only the argv differs — see
-/// [`claude::claude_argv`] and [`grok::grok_argv`].
+/// [`claude::claude_argv`], [`grok::grok_argv`], and [`codex::codex_argv`].
 pub enum Agent {
     /// claude, whose rotating session id is recorded by its `SessionStart` hook
     /// into the generated per-session settings file at this path.
     Claude { settings: PathBuf },
     /// grok, whose session id amber assigns itself (`--session-id`).
     Grok,
+    /// codex, whose session id is recorded by a global SessionStart hook
+    /// (`amber hook`) — Claude-shaped, not assign-on-create.
+    Codex,
 }
 
 impl Agent {
@@ -75,6 +78,7 @@ impl Agent {
         match self {
             Agent::Claude { .. } => "claude",
             Agent::Grok => "grok",
+            Agent::Codex => "codex",
         }
     }
 }
@@ -130,6 +134,10 @@ pub fn supervise_agent(
                 session_id.as_deref(),
                 escalation,
             )?),
+            Agent::Codex => codex::codex_argv(&select_codex_start(
+                session_id.as_deref(),
+                escalation,
+            )),
         };
 
         // Entering (or re-entering) the running phase.
@@ -206,6 +214,17 @@ fn select_start(session_id: Option<&str>, escalation: u32) -> claude::ClaudeStar
     match (session_id, escalation) {
         (Some(id), 0) => claude::ClaudeStart::Resume(id.to_string()),
         _ => claude::ClaudeStart::Fresh,
+    }
+}
+
+/// Pick how to start `codex` for one attempt. Claude-shaped: a non-empty
+/// recorded id on the first un-escalated attempt is resumed; every other case
+/// starts Fresh. Never `resume --last` (that hijacks the most recent session in
+/// the cwd). The SessionStart hook records the id after a Fresh launch.
+fn select_codex_start(session_id: Option<&str>, escalation: u32) -> codex::CodexStart {
+    match (session_id, escalation) {
+        (Some(id), 0) if codex::is_session_id(id) => codex::CodexStart::Resume(id.to_string()),
+        _ => codex::CodexStart::Fresh,
     }
 }
 
@@ -364,22 +383,39 @@ pub fn run_session(root: &Path, name: &str, socket: &Path, kind: &str) -> anyhow
     // Which agent this pane runs, from the DAEMON's own argv — deliberately not
     // the store: `SessionManager::create` spawns the pty before persisting the
     // metadata, so reading it here is a race that silently launches claude for
-    // a grok pane (observed). Anything unrecognised, including a hand-started
-    // supervisor, keeps the historical claude behaviour. A `Shell` session
-    // reaching here is a hand-started claude restored via `resume_as_claude`.
-    let is_grok = kind == SessionKind::Grok.as_str();
+    // a grok/codex pane (observed for grok). Anything unrecognised, including a
+    // hand-started supervisor, keeps the historical claude behaviour. A `Shell`
+    // session reaching here is a hand-started claude restored via
+    // `resume_as_claude`.
+    let agent_kind = match kind {
+        k if k == SessionKind::Grok.as_str() => "grok",
+        k if k == SessionKind::Codex.as_str() => "codex",
+        _ => "claude",
+    };
 
-    // The cached path is only trusted while it still EXISTS. Both agents ship
+    // The cached path is only trusted while it still EXISTS. Agents ship
     // self-updaters that can relocate their binary; without this check a stale
     // cache makes every launch fail with ENOENT, and the pane drops to a shell
     // permanently until someone runs `amber ctl doctor` by hand.
-    let cached = if is_grok { cfg.grok_path.clone() } else { cfg.claude_path.clone() };
+    let cached = match agent_kind {
+        "grok" => cfg.grok_path.clone(),
+        "codex" => cfg.codex_path.clone(),
+        _ => cfg.claude_path.clone(),
+    };
     let agent_path = match cached.filter(|p| p.exists()) {
         Some(p) => Some(p),
         None => {
-            let resolved = if is_grok { grok::resolve_grok() } else { claude::resolve_claude() };
+            let resolved = match agent_kind {
+                "grok" => grok::resolve_grok(),
+                "codex" => codex::resolve_codex(),
+                _ => claude::resolve_claude(),
+            };
             if let Some(p) = resolved.clone() {
-                if is_grok { cfg.grok_path = Some(p) } else { cfg.claude_path = Some(p) }
+                match agent_kind {
+                    "grok" => cfg.grok_path = Some(p),
+                    "codex" => cfg.codex_path = Some(p),
+                    _ => cfg.claude_path = Some(p),
+                }
                 store.save_config(&cfg)?;
             }
             resolved
@@ -392,19 +428,30 @@ pub fn run_session(root: &Path, name: &str, socket: &Path, kind: &str) -> anyhow
     };
 
     if let Some(agent_path) = agent_path {
-        let agent = if is_grok {
-            // Grok records nothing on our behalf and has no folder-trust
-            // dialog to pre-accept: `--session-id` is the whole mechanism.
-            Agent::Grok
-        } else {
-            // A detached claude blocks forever on the interactive folder-trust
-            // prompt for an untrusted cwd (never starting the session /
-            // recording the resume id). Pre-accept trust for this cwd.
-            claude::ensure_cwd_trusted(&cwd);
-            let current_exe = crate::manager::resolve_current_exe()?;
-            let hook_command = format!("{} hook", current_exe.display());
-            Agent::Claude {
-                settings: claude::write_settings(root, name, &hook_command)?,
+        let agent = match agent_kind {
+            "grok" => {
+                // Grok records nothing on our behalf and has no folder-trust
+                // dialog to pre-accept: `--session-id` is the whole mechanism.
+                Agent::Grok
+            }
+            "codex" => {
+                // Global SessionStart hook + AMBER_SESSION records the id;
+                // ensure it is installed even if doctor was never run.
+                if let Ok(exe) = crate::manager::resolve_current_exe() {
+                    codex::ensure_global_codex_hook(&format!("{} hook", exe.display()));
+                }
+                Agent::Codex
+            }
+            _ => {
+                // A detached claude blocks forever on the interactive folder-trust
+                // prompt for an untrusted cwd (never starting the session /
+                // recording the resume id). Pre-accept trust for this cwd.
+                claude::ensure_cwd_trusted(&cwd);
+                let current_exe = crate::manager::resolve_current_exe()?;
+                let hook_command = format!("{} hook", current_exe.display());
+                Agent::Claude {
+                    settings: claude::write_settings(root, name, &hook_command)?,
+                }
             }
         };
 
@@ -432,8 +479,7 @@ pub fn run_session(root: &Path, name: &str, socket: &Path, kind: &str) -> anyhow
             }
         }
     } else {
-        let missing = if is_grok { "grok" } else { "claude" };
-        eprintln!("amber: {missing} not found on PATH; falling back to shell");
+        eprintln!("amber: {agent_kind} not found on PATH; falling back to shell");
     }
 
     // The pane is now a plain shell (user quit, exhausted retries, or claude
@@ -487,6 +533,24 @@ mod tests {
         // of escalation.
         assert_eq!(select_start(None, 0), claude::ClaudeStart::Fresh);
         assert_eq!(select_start(None, 2), claude::ClaudeStart::Fresh);
+    }
+
+    #[test]
+    fn codex_resumes_a_recorded_id_first() {
+        assert_eq!(
+            select_codex_start(Some("7f9f9a2e-1b3c-4c7a-9b0e-example-id"), 0),
+            codex::CodexStart::Resume("7f9f9a2e-1b3c-4c7a-9b0e-example-id".into())
+        );
+    }
+
+    #[test]
+    fn codex_fresh_when_no_id_or_after_resume_fails() {
+        assert_eq!(select_codex_start(None, 0), codex::CodexStart::Fresh);
+        assert_eq!(select_codex_start(Some(""), 0), codex::CodexStart::Fresh);
+        assert_eq!(
+            select_codex_start(Some("7f9f9a2e-1b3c-4c7a-9b0e-example-id"), 1),
+            codex::CodexStart::Fresh
+        );
     }
 
     #[test]
