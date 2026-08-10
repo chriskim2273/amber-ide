@@ -47,20 +47,130 @@ pub fn resolve_codex() -> Option<PathBuf> {
     crate::claude::resolve_bin_with(&shell, true, "codex", &[])
 }
 
-/// Path of the Codex hooks file amber merges into.
-///
-/// Honours `CODEX_HOME` when set (must be a directory — matches codex's own
-/// `find_codex_home`); otherwise `~/.codex/hooks.json`.
-pub fn hooks_path() -> Option<PathBuf> {
+/// Codex home directory: `$CODEX_HOME` when set to an existing directory,
+/// otherwise `~/.codex` (matches codex's own `find_codex_home`).
+pub fn codex_home() -> Option<PathBuf> {
     if let Ok(home) = std::env::var("CODEX_HOME") {
         let p = PathBuf::from(home);
         if p.is_dir() {
-            return Some(p.join("hooks.json"));
+            return Some(p);
         }
     }
     std::env::var("HOME")
         .ok()
-        .map(|h| PathBuf::from(h).join(".codex").join("hooks.json"))
+        .map(|h| PathBuf::from(h).join(".codex"))
+}
+
+/// Path of the Codex hooks file amber merges into.
+pub fn hooks_path() -> Option<PathBuf> {
+    codex_home().map(|h| h.join("hooks.json"))
+}
+
+/// Pre-accept Codex's interactive directory-trust dialog for `cwd`.
+///
+/// A codex session runs detached in the daemon's pty; an untrusted cwd blocks
+/// forever on "Do you trust the contents of this directory?" and SessionStart
+/// never fires — so the resume id is never recorded. Setting
+/// `[projects."<cwd>"] trust_level = "trusted"` in `$CODEX_HOME/config.toml` is
+/// what accepting the dialog does. Best-effort: any failure leaves codex to
+/// prompt as usual.
+pub fn ensure_cwd_trusted(cwd: &Path) {
+    if let Some(home) = codex_home() {
+        trust_cwd_in(&home.join("config.toml"), cwd);
+    }
+}
+
+/// Testable core of [`ensure_cwd_trusted`].
+pub fn trust_cwd_in(config: &Path, cwd: &Path) {
+    let abs = match cwd.canonicalize() {
+        Ok(p) => p,
+        Err(_) => cwd.to_path_buf(),
+    };
+    let key = abs.to_string_lossy();
+    // TOML basic-string key: escape \ and ".
+    let escaped = key.replace('\\', "\\\\").replace('"', "\\\"");
+    let header = format!("[projects.\"{escaped}\"]");
+
+    let original = std::fs::read_to_string(config).unwrap_or_default();
+    if let Some(updated) = merge_project_trust(&original, &header) {
+        if let Some(parent) = config.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let tmp = config.with_extension("toml.amber-tmp");
+        if std::fs::write(&tmp, updated.as_bytes()).is_ok() {
+            let _ = std::fs::rename(&tmp, config);
+        }
+    }
+}
+
+/// Insert or update a `[projects."<cwd>"] trust_level = "trusted"` table.
+/// Returns `None` when the file already grants trust (no rewrite).
+fn merge_project_trust(original: &str, header: &str) -> Option<String> {
+    // Find an existing table for this cwd. Section headers are line-based.
+    let lines: Vec<&str> = original.lines().collect();
+    let mut start: Option<usize> = None;
+    let mut end: usize = lines.len();
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim();
+        if t == header {
+            start = Some(i);
+            continue;
+        }
+        if start.is_some() && t.starts_with('[') {
+            end = i;
+            break;
+        }
+    }
+
+    if let Some(s) = start {
+        let body = &lines[s + 1..end];
+        let already = body.iter().any(|l| {
+            let t = l.trim();
+            t == "trust_level = \"trusted\"" || t == "trust_level='trusted'"
+        });
+        if already {
+            return None;
+        }
+        // Rewrite the table body to set trust_level, keep other keys.
+        let mut out: Vec<String> = lines[..s].iter().map(|l| (*l).to_string()).collect();
+        out.push(header.to_string());
+        let mut wrote_trust = false;
+        for l in body {
+            let t = l.trim();
+            if t.starts_with("trust_level") {
+                if !wrote_trust {
+                    out.push("trust_level = \"trusted\"".to_string());
+                    wrote_trust = true;
+                }
+            } else {
+                out.push((*l).to_string());
+            }
+        }
+        if !wrote_trust {
+            out.push("trust_level = \"trusted\"".to_string());
+        }
+        out.extend(lines[end..].iter().map(|l| (*l).to_string()));
+        let mut s = out.join("\n");
+        if original.ends_with('\n') || !s.ends_with('\n') {
+            if !s.ends_with('\n') {
+                s.push('\n');
+            }
+        }
+        return Some(s);
+    }
+
+    // Append a new table.
+    let mut s = original.to_string();
+    if !s.is_empty() && !s.ends_with('\n') {
+        s.push('\n');
+    }
+    if !s.is_empty() {
+        s.push('\n');
+    }
+    s.push_str(header);
+    s.push('\n');
+    s.push_str("trust_level = \"trusted\"\n");
+    Some(s)
 }
 
 /// Ensure a global Codex `SessionStart` hook running `hook_command` exists in
@@ -322,5 +432,64 @@ mod tests {
         add_global_hook_in(&config, "/opt/amber hook");
 
         assert_eq!(fs::read_to_string(&config).unwrap(), original);
+    }
+
+    #[test]
+    fn trust_appends_project_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        fs::write(&config, "model = \"gpt-5\"\n").unwrap();
+        let cwd = dir.path().join("proj");
+        fs::create_dir(&cwd).unwrap();
+
+        trust_cwd_in(&config, &cwd);
+
+        let text = fs::read_to_string(&config).unwrap();
+        let abs = cwd.canonicalize().unwrap();
+        assert!(text.contains("model = \"gpt-5\""));
+        assert!(text.contains(&format!("[projects.\"{}\"]", abs.display())));
+        assert!(text.contains("trust_level = \"trusted\""));
+    }
+
+    #[test]
+    fn trust_is_idempotent_when_already_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let cwd = dir.path().join("proj");
+        fs::create_dir(&cwd).unwrap();
+        let abs = cwd.canonicalize().unwrap();
+        let original = format!(
+            "model = \"x\"\n\n[projects.\"{}\"]\ntrust_level = \"trusted\"\nother = 1\n",
+            abs.display()
+        );
+        fs::write(&config, &original).unwrap();
+
+        trust_cwd_in(&config, &cwd);
+
+        assert_eq!(fs::read_to_string(&config).unwrap(), original);
+    }
+
+    #[test]
+    fn trust_upgrades_existing_project_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let cwd = dir.path().join("proj");
+        fs::create_dir(&cwd).unwrap();
+        let abs = cwd.canonicalize().unwrap();
+        fs::write(
+            &config,
+            format!(
+                "[projects.\"{}\"]\ntrust_level = \"untrusted\"\nnote = \"keep\"\n",
+                abs.display()
+            ),
+        )
+        .unwrap();
+
+        trust_cwd_in(&config, &cwd);
+
+        let text = fs::read_to_string(&config).unwrap();
+        assert!(text.contains("trust_level = \"trusted\""));
+        assert!(!text.contains("untrusted"));
+        assert!(text.contains("note = \"keep\""));
     }
 }

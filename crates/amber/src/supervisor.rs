@@ -435,8 +435,10 @@ pub fn run_session(root: &Path, name: &str, socket: &Path, kind: &str) -> anyhow
                 Agent::Grok
             }
             "codex" => {
-                // Global SessionStart hook + AMBER_SESSION records the id;
-                // ensure it is installed even if doctor was never run.
+                // Untrusted cwd blocks forever on the directory-trust dialog
+                // (SessionStart never fires). Pre-accept like claude's folder
+                // trust. Global SessionStart hook + AMBER_SESSION records the id.
+                codex::ensure_cwd_trusted(&cwd);
                 if let Ok(exe) = crate::manager::resolve_current_exe() {
                     codex::ensure_global_codex_hook(&format!("{} hook", exe.display()));
                 }

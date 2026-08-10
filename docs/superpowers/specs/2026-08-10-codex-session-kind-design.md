@@ -1,7 +1,12 @@
 # Codex as a session kind — design
 
-**Status:** implemented (2026-08-10). Unit + typecheck gates green. Live create →
-resume round-trip still needs a box with `codex` installed and a restarted daemon.
+**Status:** implemented (2026-08-10). Unit + typecheck gates green. Live on
+codex-cli 0.147.0: doctor records `codex_path`, create spawns
+`codex --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust`,
+global SessionStart hook installs, and directory trust is pre-accepted via
+`[projects."<cwd>"] trust_level = "trusted"` (without that, codex blocks forever
+on the trust dialog and SessionStart never fires). Hook-driven id write after a
+real user turn still needs manual confirmation in the GUI.
 
 ## Goal
 
