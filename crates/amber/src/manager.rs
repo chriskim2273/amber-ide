@@ -13,7 +13,7 @@ use amber_core::state::{Config, SessionKind, SessionMeta, StateStore};
 use portable_pty::CommandBuilder;
 
 use crate::cgroup::{CgroupManager, CgroupRole};
-use crate::pty::PtySession;
+use crate::pty::{PtySession, SuspendOrigin};
 use crate::watchers::Watchers;
 
 const DEFAULT_ROWS: u16 = 24;
@@ -160,6 +160,12 @@ pub struct SessionManager {
     /// the `write()`/`resize()` path, so keystrokes still never wait on a
     /// snapshot.
     maintenance: Mutex<()>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResumeCause {
+    Manual,
+    Focus,
 }
 
 /// Consecutive absent periodic snapshots before `resume_as_claude` downgrades
@@ -489,6 +495,7 @@ impl SessionManager {
         slot: u32,
         session: Option<&Arc<PtySession>>,
     ) -> anyhow::Result<()> {
+        let _transition = session.map(|session| session.lock_suspend_transition());
         let mut empty = self.cgroups.kill_session(slot).unwrap_or(false);
         if !empty {
             if let Some(session) = session.filter(|session| session.is_alive()) {
@@ -697,6 +704,15 @@ impl SessionManager {
                     );
                 }
             }
+            let restore_name = meta.name.clone();
+            meta = match self.normalize_restored_meta(meta) {
+                Ok(meta) => meta,
+                Err(error) => {
+                    eprintln!("amber daemon: restore skipped session {restore_name}: {error}");
+                    lost.push(restore_name);
+                    continue;
+                }
+            };
             if let Err(error) = self.cgroups.prepare_session(meta.slot) {
                 eprintln!("amber daemon: restore skipped session {}: {error}", meta.name);
                 lost.push(meta.name.clone());
@@ -730,6 +746,17 @@ impl SessionManager {
         Ok(())
     }
 
+    fn normalize_restored_meta(&self, mut meta: SessionMeta) -> anyhow::Result<SessionMeta> {
+        if meta.resume_as_claude {
+            if meta.kind == SessionKind::Shell {
+                meta.kind = SessionKind::Claude;
+            }
+            meta.resume_as_claude = false;
+            self.store.write_session(&meta)?;
+        }
+        Ok(meta)
+    }
+
     /// Called on a clean SIGTERM/SIGINT exit, right after the final snapshot
     /// — arms the next boot's clean/unclean detection in [`Self::restore`].
     pub fn mark_clean_shutdown(&self) -> anyhow::Result<()> {
@@ -750,11 +777,7 @@ impl SessionManager {
             }
         }
         let scrollback = self.store.read_scrollback(&meta.name)?;
-        // A shell that was running a hand-started claude comes back as a
-        // supervised, resumable claude (which falls back to a shell when
-        // claude exits — so the pane never regresses).
-        let kind = if meta.resume_as_claude { SessionKind::Claude } else { meta.kind };
-        let sess = self.spawn(kind, &meta.name, &meta.cwd, meta.slot)?;
+        let sess = self.spawn(meta.kind, &meta.name, &meta.cwd, meta.slot)?;
         if let Some(bytes) = scrollback {
             sess.preload(&bytes);
         }
@@ -762,7 +785,7 @@ impl SessionManager {
         // agent-neutral "running" state); its freshly-spawned supervisor
         // re-reports on any later transition. Any persisted run_state is
         // deliberately discarded here.
-        if kind.is_agent() {
+        if meta.kind.is_agent() {
             sess.set_run_state(Some("claude".to_string()));
         }
         Ok(sess)
@@ -795,8 +818,7 @@ impl SessionManager {
     /// Record an agent session's supervision phase (from `ReportRunState`).
     /// Errors — surfaced to the client as an `Error` reply — if the session is
     /// unknown, is not an agent session, or `state` is not one of the four
-    /// allowed values. A restored hand-started claude (`resume_as_claude`) runs
-    /// the supervisor too, so it counts as an agent here.
+    /// allowed values.
     ///
     /// The phase strings stay spelled `claude*` for every agent: they name the
     /// supervision phase, not the binary, and grok's supervisor reports the
@@ -811,12 +833,13 @@ impl SessionManager {
         let sess = self
             .session(name)
             .ok_or_else(|| anyhow::anyhow!("no such session: {name}"))?;
+        let _transition = sess.lock_suspend_transition();
         let is_agent = self
             .store
             .read_session(name)
             .ok()
             .flatten()
-            .map(|m| m.kind.is_agent() || m.resume_as_claude)
+            .map(|m| m.kind.is_agent())
             .unwrap_or(false);
         if !is_agent {
             anyhow::bail!("run_state applies only to agent sessions: {name}");
@@ -825,33 +848,13 @@ impl SessionManager {
         Ok(())
     }
 
-    /// Signal an agent session's supervisor (`amber run`) to suspend (SIGUSR1 —
-    /// kill the agent, free its RAM, idle) or resume (SIGUSR2 — relaunch it
-    /// with `--resume`). Slice 3 freeze-to-free-RAM. Errors if the session is
-    /// unknown, not an agent session, or has no child pid. The supervisor
-    /// reports the resulting phase back via `ReportRunState`, so this does not
-    /// itself set run_state.
-    pub fn signal_suspend(&self, name: &str, resume: bool) -> anyhow::Result<()> {
-        let sess = self
-            .session(name)
-            .ok_or_else(|| anyhow::anyhow!("no such session: {name}"))?;
-        let is_agent = self
-            .store
-            .read_session(name)
-            .ok()
-            .flatten()
-            .map(|m| m.kind.is_agent() || m.resume_as_claude)
-            .unwrap_or(false);
-        if !is_agent {
-            anyhow::bail!("suspend applies only to agent sessions: {name}");
-        }
-        let pid = sess
+    fn signal_supervisor(name: &str, session: &PtySession, signal: i32) -> anyhow::Result<()> {
+        let pid = session
             .pid()
             .ok_or_else(|| anyhow::anyhow!("session {name} has no child pid"))?;
-        let sig = if resume { nix::libc::SIGUSR2 } else { nix::libc::SIGUSR1 };
         // SAFETY: kill(2) with our own child's pid and a fixed valid signal;
         // failure is reported via errno, never UB.
-        let rc = unsafe { nix::libc::kill(pid as nix::libc::pid_t, sig) };
+        let rc = unsafe { nix::libc::kill(pid as nix::libc::pid_t, signal) };
         if rc != 0 {
             anyhow::bail!(
                 "failed to signal session {name}: {}",
@@ -859,6 +862,123 @@ impl SessionManager {
             );
         }
         Ok(())
+    }
+
+    pub fn suspend(&self, name: &str, origin: SuspendOrigin) -> anyhow::Result<()> {
+        if origin == SuspendOrigin::None {
+            anyhow::bail!("invalid suspend origin for session {name}");
+        }
+        let session = self
+            .session(name)
+            .ok_or_else(|| anyhow::anyhow!("no such session: {name}"))?;
+        let _transition = session.lock_suspend_transition();
+        let meta = self
+            .store
+            .read_session(name)?
+            .ok_or_else(|| anyhow::anyhow!("session {name} vanished from the store"))?;
+        if !meta.kind.is_agent() {
+            anyhow::bail!("suspend applies only to agent sessions: {name}");
+        }
+
+        let state = session.run_state();
+        if matches!(state.as_deref(), Some("claude-retrying" | "shell-fallback")) {
+            anyhow::bail!("cannot suspend session {name} while it is {}", state.unwrap());
+        }
+        if !matches!(state.as_deref(), Some("claude" | "suspended")) {
+            anyhow::bail!("cannot suspend session {name} without a running agent");
+        }
+
+        let current = session.suspend_origin();
+        if current == SuspendOrigin::Manual && origin == SuspendOrigin::Manual {
+            if state.as_deref() == Some("suspended") {
+                return Ok(());
+            }
+            return Self::signal_supervisor(name, &session, nix::libc::SIGUSR1);
+        }
+        if current != SuspendOrigin::None
+            && !(current == SuspendOrigin::Memory && origin == SuspendOrigin::Manual)
+        {
+            anyhow::bail!("session {name} is already suspended by {current:?}");
+        }
+        if current == SuspendOrigin::None && state.as_deref() != Some("claude") {
+            anyhow::bail!("cannot newly suspend session {name} while it is suspended");
+        }
+
+        let previous = session
+            .claim_suspend(origin)
+            .map_err(|existing| anyhow::anyhow!("session {name} is already suspended by {existing:?}"))?;
+        let previous_started = session.memory_suspend_started_ms();
+        match origin {
+            SuspendOrigin::Memory => {
+                session.set_memory_suspend_started_ms(crate::pty::monotonic_ms().max(1));
+            }
+            SuspendOrigin::Manual => session.set_memory_suspend_started_ms(0),
+            SuspendOrigin::None => unreachable!(),
+        }
+
+        if previous == SuspendOrigin::Memory && state.as_deref() == Some("suspended") {
+            return Ok(());
+        }
+        if let Err(error) = Self::signal_supervisor(name, &session, nix::libc::SIGUSR1) {
+            session.restore_suspend_origin(origin, previous);
+            session.set_memory_suspend_started_ms(previous_started);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn resume_locked(
+        &self,
+        name: &str,
+        session: &PtySession,
+        cause: ResumeCause,
+    ) -> anyhow::Result<bool> {
+        let origin = session.suspend_origin();
+        let eligible = match cause {
+            ResumeCause::Manual => origin != SuspendOrigin::None,
+            ResumeCause::Focus => origin == SuspendOrigin::Memory,
+        };
+        if !eligible {
+            return Ok(false);
+        }
+        let is_agent = self
+            .store
+            .read_session(name)?
+            .map(|meta| meta.kind.is_agent())
+            .unwrap_or(false);
+        if !is_agent {
+            anyhow::bail!("resume applies only to agent sessions: {name}");
+        }
+        Self::signal_supervisor(name, session, nix::libc::SIGUSR2)?;
+        session.clear_suspend_origin();
+        session.set_memory_suspend_started_ms(0);
+        Ok(true)
+    }
+
+    fn resume_for_focus_locked(
+        &self,
+        name: &str,
+        session: &PtySession,
+    ) -> anyhow::Result<bool> {
+        self.resume_locked(name, session, ResumeCause::Focus)
+    }
+
+    pub fn resume(&self, name: &str, cause: ResumeCause) -> anyhow::Result<bool> {
+        let session = self
+            .session(name)
+            .ok_or_else(|| anyhow::anyhow!("no such session: {name}"))?;
+        let _transition = session.lock_suspend_transition();
+        session.mark_user_activity();
+        self.resume_locked(name, &session, cause)
+    }
+
+    pub fn focus_session(&self, name: &str) -> anyhow::Result<bool> {
+        let session = self
+            .session(name)
+            .ok_or_else(|| anyhow::anyhow!("no such session: {name}"))?;
+        let _transition = session.lock_suspend_transition();
+        session.mark_user_activity();
+        self.resume_for_focus_locked(name, &session)
     }
 
     pub fn names(&self) -> Vec<String> {
@@ -882,7 +1002,12 @@ impl SessionManager {
                     kind: meta.kind.as_str().to_string(),
                     alive: sess.is_alive(),
                     updated: meta.updated,
-                    run_state: sess.run_state(),
+                    run_state: match (sess.run_state(), sess.suspend_origin()) {
+                        (Some(state), SuspendOrigin::Memory) if state == "suspended" => {
+                            Some("memory-suspended".to_string())
+                        }
+                        (state, _) => state,
+                    },
                     claude_id: self.store.read_claude(&meta.name).ok().flatten().map(|c| c.session_id),
                     cols: sess.size().map(|(_, c)| c).unwrap_or(0),
                     rows: sess.size().map(|(r, _)| r).unwrap_or(0),
@@ -895,10 +1020,16 @@ impl SessionManager {
     }
 
     pub fn write(&self, name: &str, bytes: &[u8]) -> anyhow::Result<()> {
-        let sess = self
+        let session = self
             .session(name)
             .ok_or_else(|| anyhow::anyhow!("no such session: {name}"))?;
-        sess.write(bytes)
+        let _transition = session.lock_suspend_transition();
+        session.mark_user_activity();
+        self.resume_for_focus_locked(name, &session)?;
+        if session.suspend_origin() == SuspendOrigin::Manual {
+            anyhow::bail!("session is manually suspended: {name}");
+        }
+        session.write(bytes)
     }
 
     pub fn resize(&self, name: &str, rows: u16, cols: u16) -> anyhow::Result<()> {
@@ -1061,6 +1192,7 @@ impl SessionManager {
         if let Some(meta) = meta {
             self.stop_session(meta.slot, sess.as_ref())?;
         } else if let Some(sess) = &sess {
+            let _transition = sess.lock_suspend_transition();
             sess.kill()?;
         }
         self.store.remove_session(name)?;
@@ -1073,8 +1205,10 @@ impl SessionManager {
 mod tests {
     use super::*;
     use crate::cgroup::CgroupManager;
+    use crate::pty::SuspendOrigin;
+    use portable_pty::CommandBuilder;
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::Barrier;
+    use std::sync::{mpsc, Barrier};
     use tempfile::tempdir;
 
     fn with_fake_cgroups(state: &Path, cgroup_root: &Path) -> SessionManager {
@@ -1084,6 +1218,44 @@ mod tests {
             CgroupManager::test_root(cgroup_root),
         )
         .unwrap()
+    }
+
+    fn wait_for_output(session: &PtySession, needle: &[u8]) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !session.scrollback().windows(needle.len()).any(|bytes| bytes == needle) {
+            assert!(std::time::Instant::now() < deadline, "missing output {needle:?}");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    fn fake_agent(mgr: &SessionManager, name: &str) -> Arc<PtySession> {
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.arg("-c");
+        cmd.arg(
+            "trap 'printf RESUME_SIGNAL\\n' USR2; \
+             trap 'printf SUSPEND_SIGNAL\\n' USR1; \
+             printf READY\\n; \
+             while :; do \
+               if IFS= read -r line; then printf 'INPUT:%s\\n' \"$line\"; \
+               else sleep 0.05; fi; \
+             done",
+        );
+        let session = Arc::new(PtySession::spawn(cmd, 24, 80, 4096).unwrap());
+        wait_for_output(&session, b"READY");
+        mgr.store
+            .write_session(&SessionMeta {
+                name: name.to_string(),
+                cwd: PathBuf::from("/tmp"),
+                kind: SessionKind::Claude,
+                updated: 1,
+                resume_as_claude: false,
+                run_state: None,
+                slot: 1,
+            })
+            .unwrap();
+        session.set_run_state(Some("claude".into()));
+        mgr.sessions.lock().unwrap().insert(name.to_string(), Arc::clone(&session));
+        session
     }
 
     /// The display allowlist: takes only the wanted keys, unquotes a systemd
@@ -1518,6 +1690,211 @@ mod tests {
         mgr.restore().unwrap();
         assert_eq!(mgr.store.read_session("restored").unwrap().unwrap().slot, slot);
         assert!(cgroups.path().join(format!("session-{slot}")).is_dir());
+    }
+
+    #[test]
+    fn restore_normalizes_a_hand_started_claude_to_persisted_agent_truth() {
+        let dir = tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        let name = "restored-agent";
+        store
+            .write_session(&SessionMeta {
+                name: name.to_string(),
+                cwd: dir.path().to_path_buf(),
+                kind: SessionKind::Shell,
+                updated: 1,
+                resume_as_claude: true,
+                run_state: None,
+                slot: 1,
+            })
+            .unwrap();
+
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        mgr.restore().unwrap();
+
+        let restored = mgr.store.read_session(name).unwrap().unwrap();
+        assert_eq!(restored.kind, SessionKind::Claude);
+        assert!(!restored.resume_as_claude);
+        assert_eq!(mgr.session_infos().unwrap()[0].kind, "claude");
+    }
+
+    #[test]
+    fn restore_does_not_spawn_when_kind_normalization_cannot_be_persisted() {
+        let dir = tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        store
+            .write_session(&SessionMeta {
+                name: "blocked-normalize".to_string(),
+                cwd: dir.path().to_path_buf(),
+                kind: SessionKind::Shell,
+                updated: 1,
+                resume_as_claude: true,
+                run_state: None,
+                slot: 1,
+            })
+            .unwrap();
+        let sessions_dir = dir.path().join("sessions");
+        std::fs::set_permissions(&sessions_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        mgr.restore().unwrap();
+        std::fs::set_permissions(&sessions_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(mgr.names().is_empty());
+        let meta = store.read_session("blocked-normalize").unwrap().unwrap();
+        assert_eq!(meta.kind, SessionKind::Shell);
+        assert!(meta.resume_as_claude);
+    }
+
+    #[test]
+    fn live_resume_flag_does_not_change_a_shells_runtime_kind() {
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        let from = "live-shell";
+        let to = "renamed-shell";
+        mgr.create(from, dir.path(), SessionKind::Shell).unwrap();
+        let mut meta = mgr.store.read_session(from).unwrap().unwrap();
+        meta.resume_as_claude = true;
+        mgr.store.write_session(&meta).unwrap();
+        let before = mgr.session(from).unwrap();
+
+        assert_eq!(mgr.session_infos().unwrap()[0].kind, "shell");
+        assert!(mgr.set_run_state(from, "claude").is_err());
+        assert!(mgr.suspend(from, SuspendOrigin::Manual).is_err());
+        let info = mgr.rename(from, to).unwrap();
+        let after = mgr.session(to).unwrap();
+        assert_eq!(info.kind, "shell");
+        assert_eq!(before.pid(), after.pid());
+        assert!(Arc::ptr_eq(&before, &after));
+    }
+
+    #[test]
+    fn shell_fallback_and_retrying_sessions_refuse_suspend() {
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        let session = fake_agent(&mgr, "agent");
+
+        for state in ["claude-retrying", "shell-fallback"] {
+            session.set_run_state(Some(state.into()));
+            let error = mgr.suspend("agent", SuspendOrigin::Manual).unwrap_err();
+            assert!(error.to_string().contains(state));
+            assert_eq!(session.suspend_origin(), SuspendOrigin::None);
+        }
+    }
+
+    #[test]
+    fn memory_suspend_tracks_pending_until_manual_override_and_resume() {
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        let session = fake_agent(&mgr, "agent");
+
+        mgr.suspend("agent", SuspendOrigin::Memory).unwrap();
+        wait_for_output(&session, b"SUSPEND_SIGNAL");
+        assert_eq!(session.suspend_origin(), SuspendOrigin::Memory);
+        assert_ne!(session.memory_suspend_started_ms(), 0);
+
+        session.set_run_state(Some("suspended".into()));
+        mgr.suspend("agent", SuspendOrigin::Manual).unwrap();
+        assert_eq!(session.suspend_origin(), SuspendOrigin::Manual);
+        assert_eq!(session.memory_suspend_started_ms(), 0);
+
+        assert!(mgr.resume("agent", ResumeCause::Manual).unwrap());
+        wait_for_output(&session, b"RESUME_SIGNAL");
+        assert_eq!(session.suspend_origin(), SuspendOrigin::None);
+    }
+
+    #[test]
+    fn focus_resumes_memory_origin_but_not_manual_origin() {
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        let session = fake_agent(&mgr, "agent");
+        session.set_run_state(Some("suspended".into()));
+        session.claim_suspend(SuspendOrigin::Memory).unwrap();
+
+        assert!(mgr.focus_session("agent").unwrap());
+        wait_for_output(&session, b"RESUME_SIGNAL");
+        assert_eq!(session.suspend_origin(), SuspendOrigin::None);
+
+        session.claim_suspend(SuspendOrigin::Manual).unwrap();
+        assert!(!mgr.focus_session("agent").unwrap());
+        assert_eq!(session.suspend_origin(), SuspendOrigin::Manual);
+    }
+
+    #[test]
+    fn input_resumes_memory_but_is_rejected_while_manual() {
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        let session = fake_agent(&mgr, "agent");
+        session.set_run_state(Some("suspended".into()));
+        session.claim_suspend(SuspendOrigin::Memory).unwrap();
+
+        mgr.write("agent", b"memory-input\n").unwrap();
+        wait_for_output(&session, b"RESUME_SIGNAL");
+        wait_for_output(&session, b"INPUT:memory-input");
+
+        session.claim_suspend(SuspendOrigin::Manual).unwrap();
+        let error = mgr.write("agent", b"forbidden-input\n").unwrap_err();
+        assert!(error.to_string().contains("manually suspended"));
+        assert!(!session
+            .scrollback()
+            .windows(b"forbidden-input".len())
+            .any(|bytes| bytes == b"forbidden-input"));
+    }
+
+    #[test]
+    fn failed_signal_restores_the_previous_origin_and_pending_clock() {
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        let session = fake_agent(&mgr, "agent");
+        session.claim_suspend(SuspendOrigin::Memory).unwrap();
+        session.set_memory_suspend_started_ms(77);
+        session.kill().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while session.is_alive() {
+            assert!(std::time::Instant::now() < deadline, "fake supervisor stayed alive");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        assert!(mgr.resume("agent", ResumeCause::Manual).is_err());
+        assert_eq!(session.suspend_origin(), SuspendOrigin::Memory);
+        assert_eq!(session.memory_suspend_started_ms(), 77);
+
+        session.set_run_state(Some("claude".into()));
+        assert!(mgr.suspend("agent", SuspendOrigin::Manual).is_err());
+        assert_eq!(session.suspend_origin(), SuspendOrigin::Memory);
+        assert_eq!(session.memory_suspend_started_ms(), 77);
+    }
+
+    #[test]
+    fn focus_waits_for_an_in_progress_suspend_transition() {
+        let dir = tempdir().unwrap();
+        let mgr = Arc::new(SessionManager::new(dir.path()).unwrap());
+        let session = fake_agent(&mgr, "agent");
+        session.set_run_state(Some("suspended".into()));
+        session.claim_suspend(SuspendOrigin::Memory).unwrap();
+        let guard = session.lock_suspend_transition();
+        let (tx, rx) = mpsc::channel();
+        let worker = Arc::clone(&mgr);
+        std::thread::spawn(move || tx.send(worker.focus_session("agent")).unwrap());
+
+        assert!(rx.recv_timeout(std::time::Duration::from_millis(100)).is_err());
+        drop(guard);
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap().unwrap()
+        );
+    }
+
+    #[test]
+    fn session_infos_distinguishes_memory_from_manual_suspension() {
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        let session = fake_agent(&mgr, "agent");
+        session.set_run_state(Some("suspended".into()));
+        session.claim_suspend(SuspendOrigin::Memory).unwrap();
+        assert_eq!(mgr.session_infos().unwrap()[0].run_state.as_deref(), Some("memory-suspended"));
+
+        session.claim_suspend(SuspendOrigin::Manual).unwrap();
+        assert_eq!(mgr.session_infos().unwrap()[0].run_state.as_deref(), Some("suspended"));
     }
 
     #[test]

@@ -3,9 +3,9 @@
 //! capped scrollback [`Ring`] and to any live subscribers.
 
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 
 use amber_core::ring::Ring;
@@ -47,10 +47,18 @@ pub type ActivityHook = Box<dyn Fn() + Send + Sync>;
 
 /// Monotonic milliseconds since an arbitrary process-wide start. Cheap
 /// (`Instant::now`), never goes backwards — the activity rate-limit clock.
-fn monotonic_ms() -> u64 {
+pub(crate) fn monotonic_ms() -> u64 {
     use std::time::Instant;
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SuspendOrigin {
+    None = 0,
+    Manual = 1,
+    Memory = 2,
 }
 
 /// Rounds of [`STALL_POLL`] a full subscriber is tolerated for WHILE other
@@ -86,9 +94,14 @@ pub struct PtySession {
     /// via `procinfo::cwd_of` so `cd` inside a shell survives restart).
     pid: Option<u32>,
     /// Claude supervision phase reported by this session's `amber run`
-    /// supervisor (`ReportRunState`). App-facing metadata only — it never
-    /// affects supervision. Mutex-guarded so `PtySession` stays `Send + Sync`.
+    /// supervisor (`ReportRunState`). The manager uses it to reject unsafe
+    /// suspend requests; it does not drive the supervisor loop itself.
+    /// Mutex-guarded so `PtySession` stays `Send + Sync`.
     run_state: Mutex<Option<String>>,
+    suspend_origin: AtomicU8,
+    last_user_ms: AtomicU64,
+    memory_suspend_started_ms: AtomicU64,
+    suspend_transition: Mutex<()>,
     /// Optional output-activity notifier + its rate-limit clock, shared with
     /// the batcher thread. The batcher does a cheap atomic check on every
     /// frame and only locks/fires the hook once per `ACTIVITY_MIN_INTERVAL_MS`
@@ -337,6 +350,10 @@ impl PtySession {
             exit,
             pid,
             run_state: Mutex::new(None),
+            suspend_origin: AtomicU8::new(SuspendOrigin::None as u8),
+            last_user_ms: AtomicU64::new(monotonic_ms().max(1)),
+            memory_suspend_started_ms: AtomicU64::new(0),
+            suspend_transition: Mutex::new(()),
             activity,
         })
     }
@@ -356,6 +373,82 @@ impl PtySession {
     /// `Some("claude")` on restore).
     pub fn set_run_state(&self, state: Option<String>) {
         *self.run_state.lock().unwrap() = state;
+    }
+
+    pub fn suspend_origin(&self) -> SuspendOrigin {
+        match self.suspend_origin.load(Ordering::SeqCst) {
+            1 => SuspendOrigin::Manual,
+            2 => SuspendOrigin::Memory,
+            _ => SuspendOrigin::None,
+        }
+    }
+
+    pub fn claim_suspend(
+        &self,
+        origin: SuspendOrigin,
+    ) -> Result<SuspendOrigin, SuspendOrigin> {
+        loop {
+            let previous = self.suspend_origin();
+            let allowed = match origin {
+                SuspendOrigin::Memory => previous == SuspendOrigin::None,
+                SuspendOrigin::Manual => previous != SuspendOrigin::Manual,
+                SuspendOrigin::None => false,
+            };
+            if !allowed {
+                return Err(previous);
+            }
+            if self
+                .suspend_origin
+                .compare_exchange(
+                    previous as u8,
+                    origin as u8,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .is_ok()
+            {
+                return Ok(previous);
+            }
+        }
+    }
+
+    pub fn restore_suspend_origin(&self, expected: SuspendOrigin, previous: SuspendOrigin) {
+        let _ = self.suspend_origin.compare_exchange(
+            expected as u8,
+            previous as u8,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+    }
+
+    pub fn clear_suspend_origin(&self) -> SuspendOrigin {
+        match self.suspend_origin.swap(SuspendOrigin::None as u8, Ordering::SeqCst) {
+            1 => SuspendOrigin::Manual,
+            2 => SuspendOrigin::Memory,
+            _ => SuspendOrigin::None,
+        }
+    }
+
+    pub fn mark_user_activity(&self) {
+        self.last_user_ms.store(monotonic_ms().max(1), Ordering::Relaxed);
+    }
+
+    pub fn last_used_ms(&self) -> u64 {
+        self.last_user_ms
+            .load(Ordering::Relaxed)
+            .max(self.activity.last_ms.load(Ordering::Relaxed))
+    }
+
+    pub fn memory_suspend_started_ms(&self) -> u64 {
+        self.memory_suspend_started_ms.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn set_memory_suspend_started_ms(&self, value: u64) {
+        self.memory_suspend_started_ms.store(value, Ordering::SeqCst);
+    }
+
+    pub(crate) fn lock_suspend_transition(&self) -> MutexGuard<'_, ()> {
+        self.suspend_transition.lock().unwrap()
     }
 
     /// The child's OS process id (None if the platform didn't report one).
@@ -509,29 +602,32 @@ impl PtySession {
     /// ESRCH (already gone/reaped) is expected, not an error. The direct-child
     /// kill still runs last, as the fallback for a missing pid.
     pub fn kill(&self) -> anyhow::Result<()> {
-        #[cfg(unix)]
         if let Some(pid) = self.pid {
-            use nix::sys::signal::{kill, killpg, Signal};
-            use nix::unistd::Pid;
-            // Snapshot the parentage BEFORE anything dies — killing the child
-            // first would reparent its tree to init and erase the links.
-            let strays = crate::procinfo::descendants_of(&crate::procinfo::process_table(), pid);
-            match killpg(Pid::from_raw(pid as i32), Signal::SIGKILL) {
-                Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
-                Err(e) => eprintln!("amber: killpg({pid}) failed: {e}"),
-            }
-            // Anything the group signal missed: a job the interactive shell put
-            // in its own process group. Already-dead pids give ESRCH, which is
-            // the expected result for most of these.
-            // ponytail: bare-pid kill, so a stray whose pid is recycled between
-            // the snapshot and here takes the signal instead. Microseconds wide
-            // on a desktop; use pidfd (Linux) / kqueue if that ever matters.
-            for stray in strays {
-                let _ = kill(Pid::from_raw(stray as i32), Signal::SIGKILL);
-            }
+            kill_process_tree(pid);
         }
         self.killer.lock().unwrap().kill()?;
         Ok(())
+    }
+}
+
+/// Kill a pty child and everything parented beneath it. Shared by whole-session
+/// teardown and the supervisor's uncontained suspend fallback.
+pub(crate) fn kill_process_tree(pid: u32) {
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::{kill, killpg, Signal};
+        use nix::unistd::Pid;
+
+        let strays = crate::procinfo::descendants_of(&crate::procinfo::process_table(), pid);
+        match killpg(Pid::from_raw(pid as i32), Signal::SIGKILL) {
+            Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+            Err(e) => eprintln!("amber: killpg({pid}) failed: {e}"),
+        }
+        // ponytail: bare-pid kill, so a stray whose pid is recycled between
+        // snapshot and signal can be hit. Use pidfd/kqueue if this is observed.
+        for stray in strays {
+            let _ = kill(Pid::from_raw(stray as i32), Signal::SIGKILL);
+        }
     }
 }
 
@@ -574,6 +670,38 @@ mod tests {
         let sess = PtySession::spawn(cmd, 24, 80, 4096).unwrap();
         sess.write(b"ping-pong\n").unwrap();
         wait_for(&sess, b"ping-pong");
+    }
+
+    #[test]
+    fn manual_origin_overrides_memory_but_memory_never_overrides_manual() {
+        let cmd = CommandBuilder::new("cat");
+        let sess = PtySession::spawn(cmd, 24, 80, 4096).unwrap();
+
+        assert_eq!(sess.claim_suspend(SuspendOrigin::Memory), Ok(SuspendOrigin::None));
+        assert_eq!(sess.claim_suspend(SuspendOrigin::Manual), Ok(SuspendOrigin::Memory));
+        assert_eq!(
+            sess.claim_suspend(SuspendOrigin::Memory),
+            Err(SuspendOrigin::Manual)
+        );
+        assert_eq!(sess.suspend_origin(), SuspendOrigin::Manual);
+    }
+
+    #[test]
+    fn new_session_starts_recently_used() {
+        let cmd = CommandBuilder::new("/bin/sh");
+        let sess = PtySession::spawn(cmd, 24, 80, 4096).unwrap();
+        assert_ne!(sess.last_used_ms(), 0);
+    }
+
+    #[test]
+    fn output_activity_updates_last_output_clock() {
+        let cmd = CommandBuilder::new("/bin/cat");
+        let sess = PtySession::spawn(cmd, 24, 80, 4096).unwrap();
+        let before = sess.last_used_ms();
+        std::thread::sleep(Duration::from_millis(2));
+        sess.write(b"activity\n").unwrap();
+        wait_for(&sess, b"activity");
+        assert!(sess.last_used_ms() > before);
     }
 
     #[test]

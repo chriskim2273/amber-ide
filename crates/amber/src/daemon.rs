@@ -9,8 +9,8 @@ use std::thread;
 use amber_core::proto::{self, ControlMsg, Decoded, Decoder, Frame};
 use amber_core::state::SessionKind;
 
-use crate::manager::SessionManager;
-use crate::pty::PtySession;
+use crate::manager::{ResumeCause, SessionManager};
+use crate::pty::{PtySession, SuspendOrigin};
 
 /// Upper bound on a single daemon->client write (`SO_SNDTIMEO`), set once per
 /// accepted connection so it covers EVERY write on that socket: control
@@ -416,7 +416,7 @@ fn handle_control(
         // watchers. On success, no reply (fire-and-forget, like ReportRunState);
         // only a failure gets a small Error frame.
         ControlMsg::Suspend { name } => {
-            if let Err(e) = manager.signal_suspend(&name, false) {
+            if let Err(e) = manager.suspend(&name, SuspendOrigin::Manual) {
                 let _ = write_frame(
                     writer,
                     &Frame::Control(ControlMsg::Error { msg: e.to_string() }),
@@ -424,7 +424,7 @@ fn handle_control(
             }
         }
         ControlMsg::Resume { name } => {
-            if let Err(e) = manager.signal_suspend(&name, true) {
+            if let Err(e) = manager.resume(&name, ResumeCause::Manual) {
                 let _ = write_frame(
                     writer,
                     &Frame::Control(ControlMsg::Error { msg: e.to_string() }),

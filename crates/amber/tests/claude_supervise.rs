@@ -99,7 +99,7 @@ fn resume_after_first_run() {
     let phases = Mutex::new(Vec::<String>::new());
     let report = |s: &str| phases.lock().unwrap().push(s.to_string());
     let outcome =
-        supervise_agent(&Agent::Claude { settings: settings.clone() }, &claude_path, root, "work", cwd, 3, report, &SuspendControl::new()).unwrap();
+        supervise_agent(&Agent::Claude { settings: settings.clone() }, &claude_path, root, "work", cwd, 3, report, &SuspendControl::new(), None).unwrap();
     assert!(matches!(outcome, SuperviseOutcome::CleanExit));
     // A clean first run reports exactly one "claude" (start), no retry.
     assert_eq!(phases.lock().unwrap().clone(), vec!["claude".to_string()]);
@@ -125,7 +125,7 @@ fn resume_after_first_run() {
     // Second run: claude/<name>.json now present -> --resume sid-9.
     let report = |_s: &str| {};
     let outcome =
-        supervise_agent(&Agent::Claude { settings: settings.clone() }, &claude_path, root, "work", cwd, 3, report, &SuspendControl::new()).unwrap();
+        supervise_agent(&Agent::Claude { settings: settings.clone() }, &claude_path, root, "work", cwd, 3, report, &SuspendControl::new(), None).unwrap();
     assert!(matches!(outcome, SuperviseOutcome::CleanExit));
 
     let lines = log_lines(root);
@@ -146,7 +146,7 @@ fn crash_exhausts_to_outcome() {
     let phases = Mutex::new(Vec::<String>::new());
     let report = |s: &str| phases.lock().unwrap().push(s.to_string());
     let outcome =
-        supervise_agent(&Agent::Claude { settings: settings.clone() }, &claude_path, root, "work", cwd, 3, report, &SuspendControl::new()).unwrap();
+        supervise_agent(&Agent::Claude { settings: settings.clone() }, &claude_path, root, "work", cwd, 3, report, &SuspendControl::new(), None).unwrap();
     assert!(matches!(outcome, SuperviseOutcome::Exhausted));
 
     let lines = log_lines(root);
@@ -211,7 +211,7 @@ fn suspend_then_resume_parks_and_relaunches_claude() {
     );
     let handle = std::thread::spawn(move || {
         let report = |s: &str| ph2.lock().unwrap().push(s.to_string());
-        supervise_agent(&Agent::Claude { settings: set2.clone() }, &cp2, &root2, "work", &root2, 3, report, &ctl2).unwrap()
+        supervise_agent(&Agent::Claude { settings: set2.clone() }, &cp2, &root2, "work", &root2, 3, report, &ctl2, None).unwrap()
     });
 
     // Run #1 is up.
@@ -236,6 +236,145 @@ fn suspend_then_resume_parks_and_relaunches_claude() {
         "unfreeze must resume the recorded conversation, got: {}",
         lines[1]
     );
+}
+
+#[test]
+fn suspend_reclaims_a_stubborn_descendant_before_reporting_suspended() {
+    let _exec_guard = exec_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let claude_path = bin.join("claude");
+    fs::write(
+        &claude_path,
+        r#"#!/bin/sh
+echo "$@" >> "$AMBER_STATE_DIR/claude_argv.log"
+count=$(wc -l < "$AMBER_STATE_DIR/claude_argv.log")
+if [ "$count" -eq 1 ]; then
+  python3 -c 'import os,signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); open(os.environ["AMBER_STATE_DIR"]+"/stubborn.pid","w").write(str(os.getpid())); payload=bytearray(1024*1024); time.sleep(60)' &
+  wait
+fi
+"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&claude_path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    StateStore::new(&root)
+        .write_claude(
+            "work",
+            &ClaudeMeta {
+                session_id: "conv-42".to_string(),
+                cwd: root.clone(),
+                updated: 1,
+            },
+        )
+        .unwrap();
+    let settings = root.join("settings.json");
+    let ctl = SuspendControl::new();
+    let phases = Arc::new(Mutex::new(Vec::<String>::new()));
+    let thread = {
+        let root = root.clone();
+        let claude_path = claude_path.clone();
+        let settings = settings.clone();
+        let ctl = ctl.clone();
+        let phases = Arc::clone(&phases);
+        std::thread::spawn(move || {
+            supervise_agent(
+                &Agent::Claude { settings },
+                &claude_path,
+                &root,
+                "work",
+                &root,
+                3,
+                |state| phases.lock().unwrap().push(state.to_string()),
+                &ctl,
+                None,
+            )
+            .unwrap()
+        })
+    };
+
+    let pid_path = root.join("stubborn.pid");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !pid_path.exists() {
+        assert!(Instant::now() < deadline, "stubborn descendant never started");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let stubborn_pid: i32 = fs::read_to_string(&pid_path).unwrap().parse().unwrap();
+    ctl.suspend.store(true, Ordering::SeqCst);
+    wait_until(
+        &phases,
+        |states| states.iter().any(|state| state == "suspended"),
+        Duration::from_secs(5),
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let reclaimed = loop {
+        let alive = unsafe { libc::kill(stubborn_pid, 0) } == 0;
+        if !alive || Instant::now() >= deadline {
+            break !alive;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    if !reclaimed {
+        unsafe { libc::kill(stubborn_pid, libc::SIGKILL) };
+    }
+    assert!(reclaimed, "suspend reported success while a descendant survived");
+    assert!(!thread.is_finished(), "the supervisor exited while parked");
+
+    ctl.resume.store(true, Ordering::SeqCst);
+    assert!(matches!(thread.join().unwrap(), SuperviseOutcome::CleanExit));
+    assert!(log_lines(&root)[1].contains("--resume conv-42"));
+}
+
+#[test]
+fn shell_fallback_ignores_late_supervisor_signals() {
+    let _exec_guard = exec_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let claude_path = write_fake_claude(root, 0);
+    let fallback = root.join("fallback-shell");
+    fs::write(
+        &fallback,
+        "#!/bin/sh\n: > \"$AMBER_STATE_DIR/fallback-ready\"\nwhile :; do sleep 1; done\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&fallback, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let store = StateStore::new(root);
+    let mut config = store.load_config().unwrap();
+    config.claude_path = Some(claude_path);
+    store.save_config(&config).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .args(["run", "work", "--kind", "claude"])
+        .env("AMBER_STATE_DIR", root)
+        .env("SHELL", &fallback)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let ready = root.join("fallback-ready");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !ready.exists() {
+        assert!(Instant::now() < deadline, "supervisor never entered shell fallback");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    for signal in [libc::SIGUSR1, libc::SIGUSR2] {
+        assert_eq!(unsafe { libc::kill(child.id() as i32, signal) }, 0);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(child.try_wait().unwrap().is_none(), "fallback died from signal {signal}");
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
 }
 
 #[test]

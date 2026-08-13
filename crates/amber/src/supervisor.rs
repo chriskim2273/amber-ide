@@ -26,6 +26,7 @@ const REPORT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const WAIT_POLL: Duration = Duration::from_millis(150);
 /// How often a parked (suspended) supervisor polls for the resume request.
 const IDLE_POLL: Duration = Duration::from_millis(250);
+const WORKLOAD_KILL_LOG_INTERVAL: u32 = 20;
 
 /// How many consecutive launches may try to `--resume` grok's recorded
 /// conversation before the ladder gives up and starts a new one. See
@@ -95,8 +96,9 @@ impl Agent {
 /// must never block supervision (the socket-backed reporter used in production
 /// time-bounds its I/O and swallows errors); tests pass a recording closure to
 /// assert the exact transition sequence.
-// Eight params (the seven original + the suspend control). Grouping them into a
-// config struct would add ceremony without clarity here; the call sites are few.
+// Nine params (the original seven + suspend control + stable cgroup slot).
+// Grouping them into a config struct would add ceremony without clarity here;
+// the call sites are few.
 #[allow(clippy::too_many_arguments)]
 pub fn supervise_agent(
     agent: &Agent,
@@ -107,6 +109,7 @@ pub fn supervise_agent(
     max_attempts: u32,
     report: impl Fn(&str),
     ctl: &SuspendControl,
+    slot: Option<u32>,
 ) -> anyhow::Result<SuperviseOutcome> {
     let store = StateStore::new(root);
     let mut attempts = 0u32;
@@ -156,8 +159,8 @@ pub fn supervise_agent(
         // transient ETXTBSY while the binary is replaced) counts against the
         // retry budget rather than aborting supervision ("a session never
         // silently dies", spec §6.2).
-        let outcome: std::io::Result<std::process::ExitStatus> = match Command::new(agent_path)
-            .args(&argv)
+        let mut command = agent_command(agent_path, &argv, slot)?;
+        let outcome: std::io::Result<std::process::ExitStatus> = match command
             .current_dir(cwd)
             .env("AMBER_SESSION", name)
             .env("AMBER_STATE_DIR", root)
@@ -177,8 +180,7 @@ pub fn supervise_agent(
                     // until a resume, then relaunch via the resume ladder. NOT
                     // counted as a crash — escalation/prev_id reset so the
                     // recorded id is Resumed on relaunch.
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    reclaim_workload(&mut child, slot)?;
                     report("suspended");
                     while !ctl.resume.swap(false, Ordering::SeqCst) {
                         std::thread::sleep(IDLE_POLL);
@@ -210,6 +212,84 @@ pub fn supervise_agent(
             }
         }
     }
+}
+
+fn agent_command(
+    agent_path: &Path,
+    argv: &[String],
+    slot: Option<u32>,
+) -> anyhow::Result<Command> {
+    #[cfg(target_os = "linux")]
+    if let Some(slot) = slot {
+        let mut command = Command::new(crate::manager::resolve_current_exe()?);
+        command
+            .arg("__cgroup-exec")
+            .arg("--slot")
+            .arg(slot.to_string())
+            .arg("--role")
+            .arg("workload")
+            .arg("--")
+            .arg(agent_path)
+            .args(argv);
+        return Ok(command);
+    }
+    let mut command = Command::new(agent_path);
+    command.args(argv);
+    Ok(command)
+}
+
+fn reclaim_workload(child: &mut std::process::Child, slot: Option<u32>) -> anyhow::Result<()> {
+    let pid = child.id();
+    let mut cleaned_by_cgroup = false;
+    if let Some(slot) = slot {
+        let mut attempts = 0u32;
+        loop {
+            match crate::cgroup::kill_workload_from_current(slot) {
+                Ok(Some(true)) => {
+                    cleaned_by_cgroup = true;
+                    break;
+                }
+                Ok(Some(false)) => {
+                    attempts = attempts.saturating_add(1);
+                    if attempts == 1 || attempts.is_multiple_of(WORKLOAD_KILL_LOG_INTERVAL) {
+                        eprintln!(
+                            "amber: session slot {slot} workload still populated; retrying cleanup"
+                        );
+                    }
+                    std::thread::sleep(IDLE_POLL);
+                }
+                Ok(None) => break,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::Interrupted
+                            | std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    attempts = attempts.saturating_add(1);
+                    if attempts == 1 || attempts.is_multiple_of(WORKLOAD_KILL_LOG_INTERVAL) {
+                        eprintln!(
+                            "amber: session slot {slot} workload cleanup failed; retrying: {error}"
+                        );
+                    }
+                    std::thread::sleep(IDLE_POLL);
+                }
+                Err(error) => {
+                    crate::pty::kill_process_tree(pid);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error.into());
+                }
+            }
+        }
+    }
+    if !cleaned_by_cgroup {
+        crate::pty::kill_process_tree(pid);
+        let _ = child.kill();
+    }
+    child.wait()?;
+    Ok(())
 }
 
 /// Pick how to start `claude` for one attempt (spec §6.2 resume ladder). A
@@ -383,18 +463,23 @@ fn try_report_run_state(socket: &Path, name: &str, state: &str) -> anyhow::Resul
 /// interactive shell (replacing this process) if claude is unresolvable or
 /// exhausts its retries. Runs inside the pty, so the child inherits the tty.
 /// `socket` is the daemon socket the supervisor reports its phase to.
-pub fn run_session(root: &Path, name: &str, socket: &Path, kind: &str) -> anyhow::Result<()> {
+pub fn run_session(
+    root: &Path,
+    name: &str,
+    socket: &Path,
+    kind: &str,
+    slot: Option<u32>,
+) -> anyhow::Result<()> {
     let store = StateStore::new(root);
     let mut cfg = store.load_config()?;
 
     let meta = store.read_session(name)?;
+    let slot = slot.or_else(|| meta.as_ref().and_then(|meta| (meta.slot > 0).then_some(meta.slot)));
     // Which agent this pane runs, from the DAEMON's own argv — deliberately not
     // the store: `SessionManager::create` spawns the pty before persisting the
     // metadata, so reading it here is a race that silently launches claude for
     // a grok/codex pane (observed for grok). Anything unrecognised, including a
-    // hand-started supervisor, keeps the historical claude behaviour. A `Shell`
-    // session reaching here is a hand-started claude restored via
-    // `resume_as_claude`.
+    // hand-started supervisor, keeps the historical claude behaviour.
     let agent_kind = match kind {
         k if k == SessionKind::Grok.as_str() => "grok",
         k if k == SessionKind::Codex.as_str() => "codex",
@@ -479,7 +564,7 @@ pub fn run_session(root: &Path, name: &str, socket: &Path, kind: &str) -> anyhow
         let _ = signal_hook::flag::register(signal_hook::consts::SIGUSR2, Arc::clone(&ctl.resume));
 
         let report = |state: &str| report_run_state(socket, name, state);
-        match supervise_agent(&agent, &agent_path, root, name, &cwd, 3, report, &ctl)? {
+        match supervise_agent(&agent, &agent_path, root, name, &cwd, 3, report, &ctl, slot)? {
             SuperviseOutcome::CleanExit => {}
             SuperviseOutcome::Exhausted => {
                 eprintln!(
@@ -493,9 +578,22 @@ pub fn run_session(root: &Path, name: &str, socket: &Path, kind: &str) -> anyhow
     }
 
     // The pane is now a plain shell (user quit, exhausted retries, or claude
-    // unresolvable). Surface that to clients before exec'ing the shell.
+    // unresolvable). Ignore supervisor-only signals before reporting the
+    // transition; ignored dispositions survive exec and close the report race.
+    ignore_suspend_signals()?;
     report_run_state(socket, name, "shell-fallback");
     shell_fallback(&cwd)
+}
+
+fn ignore_suspend_signals() -> anyhow::Result<()> {
+    use nix::sys::signal::{signal, SigHandler, Signal};
+
+    // SAFETY: fixed valid signals and SIG_IGN, immediately before shell exec.
+    unsafe {
+        signal(Signal::SIGUSR1, SigHandler::SigIgn)?;
+        signal(Signal::SIGUSR2, SigHandler::SigIgn)?;
+    }
+    Ok(())
 }
 
 /// `exec $SHELL -l` in `cwd`, replacing this process so the pane never dies.
@@ -513,6 +611,27 @@ fn shell_fallback(cwd: &Path) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use std::process::ExitStatus;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn slotted_agent_launches_through_the_workload_wrapper() {
+        let command = agent_command(Path::new("/usr/bin/claude"), &["--resume".into()], Some(7))
+            .unwrap();
+        let args: Vec<_> = command.get_args().map(|arg| arg.to_string_lossy()).collect();
+        assert_eq!(
+            args,
+            [
+                "__cgroup-exec",
+                "--slot",
+                "7",
+                "--role",
+                "workload",
+                "--",
+                "/usr/bin/claude",
+                "--resume",
+            ]
+        );
+    }
 
     #[test]
     fn select_start_resumes_recorded_id_first() {

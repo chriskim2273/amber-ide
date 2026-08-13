@@ -554,8 +554,8 @@ fn supervisor_socket() -> PathBuf {
         .unwrap_or_else(|| default_socket(&root))
 }
 
-fn run_supervisor(name: &str, kind: &str, _slot: Option<u32>) -> anyhow::Result<()> {
-    supervisor::run_session(&supervisor_root(), name, &supervisor_socket(), kind)
+fn run_supervisor(name: &str, kind: &str, slot: Option<u32>) -> anyhow::Result<()> {
+    supervisor::run_session(&supervisor_root(), name, &supervisor_socket(), kind, slot)
 }
 
 /// `SessionStart` hook: read the hook JSON from stdin and record the

@@ -61,6 +61,13 @@ fn flip_kind_to_claude(state_root: &Path, name: &str) {
     store.write_session(&meta).unwrap();
 }
 
+fn mark_resume_as_claude(state_root: &Path, name: &str) {
+    let store = amber_core::state::StateStore::new(state_root);
+    let mut meta = store.read_session(name).unwrap().unwrap();
+    meta.resume_as_claude = true;
+    store.write_session(&meta).unwrap();
+}
+
 /// Accumulate Data-frame bytes from `stream` until `pred(acc)` matches, or
 /// panic after `timeout`. Returns everything accumulated.
 fn read_data_until<F: Fn(&[u8]) -> bool>(
@@ -831,6 +838,36 @@ fn raw_attach_to_shell_session_replays_backlog() {
         &mut stream,
         &mut decoder,
         |acc| acc.windows(16).any(|w| w == b"SHELL_HISTORY_OK"),
+        Duration::from_secs(10),
+    );
+}
+
+#[test]
+fn raw_attach_to_live_resume_flagged_shell_still_replays_backlog() {
+    let (socket_path, manager, dir) = start_daemon_with_manager();
+    manager
+        .create("flagged-shell", "/tmp", amber_core::state::SessionKind::Shell)
+        .unwrap();
+    mark_resume_as_claude(&dir.path().join("state"), "flagged-shell");
+    manager
+        .session("flagged-shell")
+        .unwrap()
+        .preload(b"FLAGGED_SHELL_HISTORY");
+
+    let mut stream = connect_with_retry(&socket_path);
+    let mut decoder = Decoder::new();
+    send(
+        &mut stream,
+        &Frame::Control(ControlMsg::Attach {
+            name: "flagged-shell".into(),
+            raw_client: true,
+            preview: false,
+        }),
+    );
+    read_data_until(
+        &mut stream,
+        &mut decoder,
+        |acc| acc.windows(21).any(|w| w == b"FLAGGED_SHELL_HISTORY"),
         Duration::from_secs(10),
     );
 }

@@ -16,7 +16,7 @@ use amber::daemon::{prepare_socket, Daemon};
 use amber::manager::SessionManager;
 use amber::watchers::Watchers;
 use amber_core::proto::{self, ControlMsg, Decoder, Frame};
-use amber_core::state::SessionKind;
+use amber_core::state::{SessionKind, StateStore};
 
 fn send(stream: &UnixStream, msg: ControlMsg) {
     let mut w = stream;
@@ -122,4 +122,35 @@ fn report_run_state_stores_broadcasts_and_validates() {
         ControlMsg::Error { msg } => assert!(msg.contains("agent"), "unexpected error: {msg}"),
         other => panic!("expected Error, got {other:?}"),
     }
+}
+
+#[test]
+fn live_resume_flagged_shell_still_rejects_run_state_reports() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("amberd.sock");
+    let manager = Arc::new(SessionManager::new(dir.path()).unwrap());
+    manager.create("flagged-shell", dir.path(), SessionKind::Shell).unwrap();
+    let store = StateStore::new(dir.path());
+    let mut meta = store.read_session("flagged-shell").unwrap().unwrap();
+    meta.resume_as_claude = true;
+    store.write_session(&meta).unwrap();
+
+    let listener = prepare_socket(&sock).unwrap();
+    let daemon = Daemon::new(Arc::clone(&manager), Arc::new(Watchers::new()));
+    std::thread::spawn(move || {
+        let _ = daemon.serve(listener);
+    });
+
+    let reporter = UnixStream::connect(&sock).unwrap();
+    let mut replies = reporter.try_clone().unwrap();
+    send(
+        &reporter,
+        ControlMsg::ReportRunState {
+            name: "flagged-shell".into(),
+            state: "claude".into(),
+        },
+    );
+    let error = read_control_until(&mut replies, |msg| matches!(msg, ControlMsg::Error { .. }));
+    assert!(matches!(error, ControlMsg::Error { msg } if msg.contains("agent")));
+    assert_eq!(manager.session_infos().unwrap()[0].kind, "shell");
 }

@@ -349,6 +349,47 @@ fn placement_target(current: &Path, slot: u32, role: CgroupRole) -> Option<PathB
     })
 }
 
+/// Kill the workload sibling of the current Amber supervisor. `None` means
+/// this process is not inside the expected delegated session hierarchy.
+pub fn kill_workload_from_current(slot: u32) -> io::Result<Option<bool>> {
+    #[cfg(target_os = "linux")]
+    {
+        let cgroup = fs::read_to_string("/proc/self/cgroup")?;
+        let unified = match parse_unified_path(&cgroup) {
+            Ok(path) => path,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
+        let mount = match parse_cgroup2_mount(&mountinfo, &unified) {
+            Ok(mount) => mount,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let current = resolve_cgroup_path(&mount, &unified)?;
+        let Some(workload) = workload_from_current(&current, slot) else {
+            return Ok(None);
+        };
+        kill_tree(&workload).map(Some)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = slot;
+        Ok(None)
+    }
+}
+
+fn workload_from_current(current: &Path, slot: u32) -> Option<PathBuf> {
+    if current.file_name()?.to_str()? != "supervisor" {
+        return None;
+    }
+    let session = current.parent()?;
+    if session.file_name()?.to_str()? != format!("session-{slot}") {
+        return None;
+    }
+    Some(session.join("workload"))
+}
+
 fn parse_unified_path(body: &str) -> io::Result<PathBuf> {
     for line in body.lines() {
         let mut fields = line.splitn(3, ':');
@@ -625,6 +666,18 @@ mod tests {
             CgroupRole::Workload,
         )
         .is_none());
+    }
+
+    #[test]
+    fn workload_kill_target_requires_the_matching_supervisor_slot() {
+        let service = Path::new("/run/cgroup/amber.service");
+        assert_eq!(
+            workload_from_current(&service.join("session-7/supervisor"), 7),
+            Some(service.join("session-7/workload"))
+        );
+        assert!(workload_from_current(&service.join("session-7/supervisor"), 8).is_none());
+        assert!(workload_from_current(&service.join("session-7/workload"), 7).is_none());
+        assert!(workload_from_current(&service.join("_daemon"), 7).is_none());
     }
 
     #[test]

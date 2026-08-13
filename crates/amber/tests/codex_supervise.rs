@@ -52,6 +52,7 @@ fn crash_resumes_the_id_recorded_by_codex_session_start() {
         3,
         report,
         &SuspendControl::new(),
+        None,
     )
     .unwrap();
 
@@ -105,6 +106,7 @@ fn active_pre_recorded_session_is_resumed_again_after_crash() {
         3,
         |_| {},
         &SuspendControl::new(),
+        None,
     )
     .unwrap();
 
