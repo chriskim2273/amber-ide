@@ -1,7 +1,6 @@
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::os::fd::RawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -13,7 +12,6 @@ use std::os::unix::fs::OpenOptionsExt;
 const DAEMON_MEMORY_LOW_BYTES: u64 = 128 * 1024 * 1024;
 const KILL_TIMEOUT: Duration = Duration::from_secs(2);
 const KILL_POLL_INTERVAL: Duration = Duration::from_millis(10);
-pub(crate) const EXEC_STATUS_FD_ENV: &str = "AMBER_CGROUP_EXEC_STATUS_FD";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CgroupRole {
@@ -313,55 +311,29 @@ pub fn exec_current_into(
     if let Err(error) = place_current(slot, role) {
         eprintln!("amber: cgroup placement failed; continuing uncontained: {error}");
     }
-    let status_fd = std::env::var(EXEC_STATUS_FD_ENV)
-        .ok()
-        .and_then(|value| value.parse::<RawFd>().ok());
-    if let Some(fd) = status_fd {
-        if let Err(error) = set_close_on_exec(fd) {
-            write_exec_error(fd, &error);
-            return Err(error);
-        }
-    }
-    let error = Command::new(program)
-        .args(args)
-        .env_remove(EXEC_STATUS_FD_ENV)
-        .exec();
-    if let Some(fd) = status_fd {
-        write_exec_error(fd, &error);
-    }
-    Err(error)
+    Err(Command::new(program).args(args).exec())
 }
 
-fn set_close_on_exec(fd: RawFd) -> io::Result<()> {
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    if flags == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-fn write_exec_error(fd: RawFd, error: &io::Error) {
-    let bytes = error.raw_os_error().unwrap_or(libc::EIO).to_ne_bytes();
-    let mut written = 0;
-    while written < bytes.len() {
-        let count = unsafe {
-            libc::write(
-                fd,
-                bytes[written..].as_ptr().cast(),
-                bytes.len() - written,
-            )
-        };
-        if count > 0 {
-            written += count as usize;
-        } else if count < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-            continue;
-        } else {
-            break;
-        }
-    }
+/// Open the workload placement control while the parent may safely allocate
+/// and inspect `/proc`. The returned descriptor is written from `pre_exec`,
+/// after fork and immediately before the real agent exec.
+#[cfg(target_os = "linux")]
+pub(crate) fn open_workload_procs_from_current(slot: u32) -> io::Result<Option<File>> {
+    let unified = match parse_unified_path(&fs::read_to_string("/proc/self/cgroup")?) {
+        Ok(path) => path,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mount = match parse_cgroup2_mount(&fs::read_to_string("/proc/self/mountinfo")?, &unified) {
+        Ok(mount) => mount,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let current = resolve_cgroup_path(&mount, &unified)?;
+    let Some(workload) = workload_from_current(&current, slot) else {
+        return Ok(None);
+    };
+    OpenOptions::new().write(true).open(workload.join("cgroup.procs")).map(Some)
 }
 
 #[cfg(target_os = "linux")]

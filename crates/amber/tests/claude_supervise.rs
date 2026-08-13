@@ -426,6 +426,29 @@ fn successful_slotted_inner_exec_reports_a_running_agent() {
     assert_eq!(states, ["claude", "shell-fallback"]);
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn ambient_exec_status_env_cannot_hijack_a_generic_cgroup_launcher() {
+    let output = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .args([
+            "__cgroup-exec",
+            "--slot",
+            "7",
+            "--role",
+            "workload",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf ambient-safe",
+        ])
+        .env("AMBER_CGROUP_EXEC_STATUS_FD", "1")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"ambient-safe");
+}
+
 #[test]
 fn suspend_then_resume_parks_and_relaunches_claude() {
     let _exec_guard = exec_guard();
