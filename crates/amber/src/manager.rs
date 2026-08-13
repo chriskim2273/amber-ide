@@ -1159,6 +1159,13 @@ impl SessionManager {
         }
         if state == "suspended" {
             sess.mark_initial_suspend_ready();
+            // A second suspend can race a failed reclaim after the daemon has
+            // already rolled back its origin. If that later request succeeds,
+            // keep the parked workload recoverable. Manual is conservative:
+            // focus must never wake work the user may have explicitly parked.
+            if sess.suspend_origin() == SuspendOrigin::None {
+                let _ = sess.claim_suspend(SuspendOrigin::Manual);
+            }
             if sess.take_pending_resume() {
                 if let Err(error) = Self::signal_supervisor(name, &sess, nix::libc::SIGUSR2) {
                     sess.restore_pending_resume();
@@ -2958,6 +2965,22 @@ mod tests {
             assert_eq!(session.suspend_origin(), SuspendOrigin::Manual);
             assert_eq!(session.run_state().as_deref(), Some("claude"));
         }
+    }
+
+    #[test]
+    fn suspended_after_failed_reclaim_recovers_as_manual() {
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        let session = fake_agent(&mgr, "agent");
+        assert!(mgr.set_run_state_report("agent", "suspend-failed", 1).unwrap());
+        assert_eq!(session.suspend_origin(), SuspendOrigin::None);
+
+        assert!(mgr.set_run_state_report("agent", "suspended", 2).unwrap());
+
+        assert_eq!(session.suspend_origin(), SuspendOrigin::Manual);
+        assert_eq!(session.run_state().as_deref(), Some("suspended"));
+        assert!(!mgr.focus_session("agent").unwrap());
+        assert!(mgr.resume("agent", ResumeCause::Manual).unwrap());
     }
 
     #[test]
