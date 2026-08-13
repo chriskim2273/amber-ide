@@ -84,6 +84,10 @@ pub enum ControlMsg {
         preview: bool,
     },
     Detach { name: String },
+    /// Client -> daemon: mark a live terminal session as recently used. This
+    /// hint refreshes automatic-parking protection and resumes only a
+    /// memory-parked session; it never overrides a manual suspend.
+    Focus { name: String },
     Resize { name: String, cols: u16, rows: u16 },
     Kill { name: String },
     Rename { from: String, to: String },
@@ -148,6 +152,18 @@ pub enum ControlMsg {
         rss_kb: u64,
         #[serde(default)]
         growing: bool,
+    },
+    /// Daemon -> watchers: aggregate memory pressure. Numeric/boolean fields
+    /// are additive for older clients; `level` stays required so a malformed
+    /// sender cannot silently invent a pressure state.
+    MemoryPressure {
+        level: String,
+        #[serde(default)]
+        current_kb: u64,
+        #[serde(default)]
+        budget_kb: u64,
+        #[serde(default)]
+        blocked: bool,
     },
     SessionList { names: Vec<String> },
     Created { name: String },
@@ -438,6 +454,41 @@ mod tests {
         assert_eq!(roundtrip(&req), req);
         let ack = Frame::Control(ControlMsg::SnapshotOk);
         assert_eq!(roundtrip(&ack), ack);
+    }
+
+    #[test]
+    fn focus_control_roundtrips() {
+        let frame = Frame::Control(ControlMsg::Focus {
+            name: "amber-1-1-0-x".into(),
+        });
+        assert_eq!(roundtrip(&frame), frame);
+    }
+
+    #[test]
+    fn memory_pressure_roundtrips_with_additive_fields() {
+        let frame = Frame::Control(ControlMsg::MemoryPressure {
+            level: "critical".into(),
+            current_kb: 7_000_000,
+            budget_kb: 8_000_000,
+            blocked: true,
+        });
+        assert_eq!(roundtrip(&frame), frame);
+    }
+
+    #[test]
+    fn memory_pressure_defaults_only_additive_fields() {
+        let msg: ControlMsg =
+            serde_json::from_str(r#"{"MemoryPressure":{"level":"warning"}}"#).unwrap();
+        assert_eq!(
+            msg,
+            ControlMsg::MemoryPressure {
+                level: "warning".into(),
+                current_kb: 0,
+                budget_kb: 0,
+                blocked: false,
+            }
+        );
+        assert!(serde_json::from_str::<ControlMsg>(r#"{"MemoryPressure":{}}"#).is_err());
     }
 
     #[test]

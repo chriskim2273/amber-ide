@@ -303,16 +303,19 @@ mod tests {
         watchers.register(&healthy);
         assert_eq!(watchers.watcher_count(), 2);
 
-        let msg = ControlMsg::SessionsChanged { added: vec![], removed: vec!["x".into()] };
-        {
-            let watchers = Arc::clone(&watchers);
-            let msg = msg.clone();
-            std::thread::spawn(move || {
-                watchers.broadcast(&msg);
-            });
+        // Repeated pressure refreshes ride this same bounded queue. The healthy
+        // watcher receives every one while the non-reader fills its grace and
+        // is evicted; no pressure-specific queue is needed.
+        for current_kb in 0..=(WATCHER_QUEUE_DEPTH as u64) {
+            let msg = ControlMsg::MemoryPressure {
+                level: "critical".into(),
+                current_kb,
+                budget_kb: 100,
+                blocked: false,
+            };
+            watchers.broadcast(&msg);
+            assert_eq!(read_one(&mut healthy_peer), Some(Frame::Control(msg)));
         }
-        // Healthy watcher keeps its subscription and receives the event.
-        assert_eq!(read_one(&mut healthy_peer), Some(Frame::Control(msg)));
         // The wedged one is evicted after a bounded grace (generous bound,
         // far above the eviction deadline, so CI load can't flake it).
         wait_until(Duration::from_secs(15), || watchers.watcher_count() == 1)

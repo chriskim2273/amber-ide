@@ -13,6 +13,7 @@ use amber_core::state::{Config, SessionKind, SessionMeta, StateStore};
 use portable_pty::CommandBuilder;
 
 use crate::cgroup::{CgroupManager, CgroupRole};
+use crate::memory_guardian::{Candidate, RECENT_USE_MS};
 use crate::pty::{PtySession, SuspendOrigin};
 use crate::watchers::Watchers;
 
@@ -834,6 +835,137 @@ impl SessionManager {
             .iter()
             .filter_map(|(name, sess)| sess.pid().map(|p| (name.clone(), p)))
             .collect()
+    }
+
+    /// Snapshot the live/session-store facts the pure memory policy needs.
+    /// Session handles are cloned first so state and cgroup reads never hold
+    /// the live-table lock.
+    pub fn memory_candidates(&self, per_session_kb: &HashMap<String, u64>) -> Vec<Candidate> {
+        let sessions: Vec<(String, Arc<PtySession>)> = self
+            .sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, session)| (name.clone(), Arc::clone(session)))
+            .collect();
+        sessions
+            .into_iter()
+            .filter_map(|(name, session)| {
+                let meta = match self.store.read_session(&name) {
+                    Ok(Some(meta)) => meta,
+                    Ok(None) => return None,
+                    Err(error) => {
+                        eprintln!("amber daemon: memory candidate {name} metadata failed: {error}");
+                        return None;
+                    }
+                };
+                let has_resume_id = match self.store.read_claude(&name) {
+                    Ok(recorded) => {
+                        recorded.is_some_and(|recorded| !recorded.session_id.is_empty())
+                    }
+                    Err(error) => {
+                        eprintln!("amber daemon: memory candidate {name} resume id failed: {error}");
+                        false
+                    }
+                };
+                Some(Candidate {
+                    memory_kb: per_session_kb.get(&name).copied().unwrap_or(0),
+                    last_used_ms: session.last_used_ms(),
+                    is_agent: meta.kind.is_agent(),
+                    running: session.is_alive()
+                        && session.run_state().as_deref() == Some("claude"),
+                    has_resume_id,
+                    suspended: session.suspend_origin() != SuspendOrigin::None,
+                    name,
+                })
+            })
+            .collect()
+    }
+
+    pub fn suspend_for_memory(&self, name: &str, now_ms: u64) -> anyhow::Result<()> {
+        let session = self
+            .session(name)
+            .ok_or_else(|| anyhow::anyhow!("no such session: {name}"))?;
+        let _transition = session.lock_suspend_transition();
+        self.ensure_current_session(name, &session)?;
+        let meta = self
+            .store
+            .read_session(name)?
+            .ok_or_else(|| anyhow::anyhow!("session {name} vanished from the store"))?;
+        if !meta.kind.is_agent() {
+            anyhow::bail!("automatic memory suspend applies only to agent sessions: {name}");
+        }
+        if session.run_state().as_deref() != Some("claude") {
+            anyhow::bail!("session {name} no longer has a running agent");
+        }
+        let has_resume_id = self
+            .store
+            .read_claude(name)?
+            .is_some_and(|recorded| !recorded.session_id.is_empty());
+        if !has_resume_id {
+            anyhow::bail!("session {name} has no recorded resume id");
+        }
+        if session.suspend_origin() != SuspendOrigin::None {
+            anyhow::bail!("session {name} is already suspended");
+        }
+        if now_ms.saturating_sub(session.last_used_ms()) < RECENT_USE_MS {
+            anyhow::bail!("session {name} received recent activity");
+        }
+
+        session
+            .claim_suspend(SuspendOrigin::Memory)
+            .map_err(|origin| anyhow::anyhow!("session {name} is already suspended by {origin:?}"))?;
+        let previous_started = session.memory_suspend_started_ms();
+        session.set_memory_suspend_started_ms(now_ms.max(1));
+        if let Err(error) = Self::signal_supervisor(name, &session, nix::libc::SIGUSR1) {
+            session.restore_suspend_origin(SuspendOrigin::Memory, SuspendOrigin::None);
+            session.set_memory_suspend_started_ms(previous_started);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn memory_suspend_pending_since(&self) -> Option<u64> {
+        let sessions: Vec<Arc<PtySession>> =
+            self.sessions.lock().unwrap().values().cloned().collect();
+        sessions
+            .into_iter()
+            .filter(|session| {
+                session.suspend_origin() == SuspendOrigin::Memory
+                    && session.run_state().as_deref() != Some("suspended")
+            })
+            .map(|session| session.memory_suspend_started_ms())
+            .filter(|started| *started != 0)
+            .min()
+    }
+
+    pub fn cgroup_memory_sample(
+        &self,
+    ) -> anyhow::Result<Option<(u64, HashMap<String, u64>)>> {
+        if !self.cgroups.is_enabled() {
+            return Ok(None);
+        }
+        let sessions: Vec<(String, Arc<PtySession>)> = self
+            .sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, session)| (name.clone(), Arc::clone(session)))
+            .collect();
+        let Some(current_kb) = self.cgroups.aggregate_current_kb()? else {
+            return Ok(None);
+        };
+        let mut per_session = HashMap::new();
+        for (name, session) in sessions {
+            if !session.is_alive() {
+                continue;
+            }
+            let Some(meta) = self.store.read_session(&name)? else { continue };
+            if let Some(current_kb) = self.cgroups.session_current_kb(meta.slot)? {
+                per_session.insert(name, current_kb);
+            }
+        }
+        Ok(Some((current_kb, per_session)))
     }
 
     /// The persisted kind of a session, from the state store (None if the
@@ -1838,6 +1970,59 @@ mod tests {
         assert!(mgr.resume("agent", ResumeCause::Manual).unwrap());
         wait_for_output(&session, b"RESUME_SIGNAL");
         assert_eq!(session.suspend_origin(), SuspendOrigin::None);
+    }
+
+    #[test]
+    fn memory_candidates_join_live_state_persisted_identity_and_charge() {
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        let session = fake_agent(&mgr, "agent");
+        mgr.store
+            .write_claude(
+                "agent",
+                &amber_core::state::ClaudeMeta {
+                    session_id: "resume-id".into(),
+                    cwd: dir.path().to_path_buf(),
+                    updated: 1,
+                },
+            )
+            .unwrap();
+
+        let candidates = mgr.memory_candidates(&HashMap::from([("agent".to_string(), 321)]));
+        assert_eq!(candidates.len(), 1);
+        let candidate = &candidates[0];
+        assert_eq!((candidate.name.as_str(), candidate.memory_kb), ("agent", 321));
+        assert!(candidate.is_agent && candidate.running && candidate.has_resume_id);
+        assert!(!candidate.suspended);
+        assert_eq!(candidate.last_used_ms, session.last_used_ms());
+
+        session.claim_suspend(SuspendOrigin::Manual).unwrap();
+        assert!(mgr.memory_candidates(&HashMap::new())[0].suspended);
+    }
+
+    #[test]
+    fn memory_pending_reports_the_earliest_unconfirmed_memory_suspend() {
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        let first = fake_agent(&mgr, "first");
+        let second = fake_agent(&mgr, "second");
+        first.claim_suspend(SuspendOrigin::Memory).unwrap();
+        first.set_memory_suspend_started_ms(20);
+        second.claim_suspend(SuspendOrigin::Memory).unwrap();
+        second.set_memory_suspend_started_ms(10);
+        assert_eq!(mgr.memory_suspend_pending_since(), Some(10));
+
+        second.set_run_state(Some("suspended".into()));
+        assert_eq!(mgr.memory_suspend_pending_since(), Some(20));
+        first.claim_suspend(SuspendOrigin::Manual).unwrap();
+        assert_eq!(mgr.memory_suspend_pending_since(), None);
+    }
+
+    #[test]
+    fn cgroup_memory_sample_is_absent_when_containment_is_disabled() {
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        assert_eq!(mgr.cgroup_memory_sample().unwrap(), None);
     }
 
     #[test]
