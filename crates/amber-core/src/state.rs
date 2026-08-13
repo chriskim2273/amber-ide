@@ -280,7 +280,6 @@ impl StateStore {
     }
 
     pub fn list_sessions(&self) -> anyhow::Result<Vec<SessionMeta>> {
-        self.recover_pending_rename()?;
         let dir = self.sessions_dir();
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
@@ -309,11 +308,14 @@ impl StateStore {
 
     /// Resolve a rename interrupted before its two metadata names can be
     /// mistaken for independent sessions. The journal is durable before any
-    /// destination artifact is published.
-    fn recover_pending_rename(&self) -> anyhow::Result<()> {
+    /// destination artifact is published. Callers must serialize this with
+    /// rename; the manager does so with its outer maintenance lock. Returns
+    /// `false` when the authoritative metadata is safe to restore but orphan
+    /// cleanup remains retryable under the durable journal.
+    pub fn recover_pending_rename(&self) -> anyhow::Result<bool> {
         let journal_path = self.rename_journal_path();
         let Some(journal) = Self::read_json::<RenameJournal>(&journal_path)? else {
-            return Ok(());
+            return Ok(true);
         };
         if journal.from == journal.to
             || journal.source.name != journal.from
@@ -343,33 +345,58 @@ impl StateStore {
             // Destination metadata is published only after every matching
             // artifact is durable, so it wins deterministically.
             (_, true) => {
-                Self::remove_durable(&self.session_path(&journal.from))?;
-                self.cleanup_rename_artifacts(&journal.from);
+                let from_path = self.session_path(&journal.from);
+                if let Err(error) = Self::remove_durable(&from_path) {
+                    // remove_file may have succeeded before its directory
+                    // fsync failed. In that case one authoritative metadata
+                    // record is already visible and the journal makes the
+                    // durability warning safely retryable.
+                    if self.read_session(&journal.from)?.is_some() {
+                        return Err(error);
+                    }
+                    eprintln!(
+                        "amber state: recovered rename but could not sync {}: {error}",
+                        from_path.display()
+                    );
+                }
+                if self.cleanup_rename_artifacts(&journal.from).is_err() {
+                    return Ok(false);
+                }
             }
             // Destination metadata was never published: retain the complete
             // source and discard any unreferenced destination copies.
-            (true, false) => self.cleanup_rename_artifacts(&journal.to),
+            (true, false) => {
+                if self.cleanup_rename_artifacts(&journal.to).is_err() {
+                    return Ok(false);
+                }
+            }
             (false, false) => anyhow::bail!("pending rename has no session metadata"),
         }
-        if let Err(error) = Self::remove_durable(&journal_path) {
-            eprintln!("amber state: recovered rename but could not remove journal: {error}");
+        match Self::remove_durable(&journal_path) {
+            Ok(()) => Ok(true),
+            Err(error) => {
+                eprintln!("amber state: recovered rename but could not remove journal: {error}");
+                Ok(false)
+            }
         }
-        Ok(())
     }
 
-    fn cleanup_rename_artifacts(&self, name: &str) {
+    fn cleanup_rename_artifacts(&self, name: &str) -> anyhow::Result<()> {
+        let mut first_error = None;
         for path in [
             self.claude_path(name),
             self.claude_settings_path(name),
             self.scrollback_path(name),
         ] {
             if let Err(error) = Self::remove_durable(&path) {
-                eprintln!(
-                    "amber state: recovered rename but could not remove {}: {error}",
-                    path.display()
-                );
+                let error = anyhow::anyhow!("could not remove {}: {error}", path.display());
+                eprintln!("amber state: recovered rename but {error}");
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
             }
         }
+        first_error.map_or(Ok(()), Err)
     }
 
     pub fn remove_session(&self, name: &str) -> anyhow::Result<()> {
@@ -407,8 +434,8 @@ impl StateStore {
     /// enumerates, so a crash at any point leaves either the old fully
     /// restorable session or the new one — never metadata without its matching
     /// resume record. A crash between publishing `to` and removing `from`
-    /// leaves both files, but [`Self::list_sessions`] consumes the journal and
-    /// exposes only `to`, so one conversation is never resumed twice.
+    /// leaves both files, but startup recovery consumes the journal before
+    /// listing sessions, so one conversation is never resumed twice.
     pub fn rename_session(&self, from: &str, to: &str) -> anyhow::Result<()> {
         self.rename_session_with_checkpoint(from, to, |_| Ok(()))
     }
@@ -516,19 +543,23 @@ impl StateStore {
 
         // POST-COMMIT garbage collection. Failure here must not report the
         // rename as failed: the manager would attempt an in-memory rollback
-        // even though `to` is now authoritative. Leftover source artifacts are
-        // harmless/unreferenced and a later remove/rename can clean them.
+        // even though `to` is now authoritative. The durable journal retains
+        // ownership of leftover source artifacts until recovery removes them.
+        let mut cleanup_failed = false;
         for (offset, (old, _)) in copies.iter().enumerate() {
             if let Err(error) = Self::remove_durable(old) {
                 eprintln!(
                     "amber state: renamed session but could not remove {}: {error}",
                     old.display()
                 );
+                cleanup_failed = true;
             }
             checkpoint(6 + offset)?;
         }
-        if let Err(error) = Self::remove_durable(&journal_path) {
-            eprintln!("amber state: renamed session but could not remove journal: {error}");
+        if !cleanup_failed {
+            if let Err(error) = Self::remove_durable(&journal_path) {
+                eprintln!("amber state: renamed session but could not remove journal: {error}");
+            }
         }
         checkpoint(9)?;
         Ok(())
@@ -585,6 +616,7 @@ impl StateStore {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::{Arc, Barrier};
     use tempfile::tempdir;
 
     fn sample_session(name: &str) -> SessionMeta {
@@ -1064,6 +1096,138 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_list_does_not_consume_an_in_flight_rename_journal() {
+        let dir = tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        store.write_session(&sample_session("from")).unwrap();
+        let ready = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+
+        std::thread::scope(|scope| {
+            let root = dir.path().to_path_buf();
+            let worker_ready = Arc::clone(&ready);
+            let worker_release = Arc::clone(&release);
+            let worker = scope.spawn(move || {
+                StateStore::new(root).rename_session_with_checkpoint("from", "to", |step| {
+                    if step == 0 {
+                        worker_ready.wait();
+                        worker_release.wait();
+                    }
+                    Ok(())
+                })
+            });
+
+            ready.wait();
+            let names = store
+                .list_sessions()
+                .unwrap()
+                .into_iter()
+                .map(|meta| meta.name)
+                .collect::<Vec<_>>();
+            let journal_survived = store.rename_journal_path().exists();
+            release.wait();
+            worker.join().unwrap().unwrap();
+
+            assert_eq!(names, vec!["from"]);
+            assert!(journal_survived, "ordinary read consumed the live rename journal");
+        });
+    }
+
+    #[test]
+    fn committed_rename_survives_a_journal_unlink_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        let from = "amber-1-1-0-unlink";
+        let to = "amber-1-2-0-unlink";
+        store.write_session(&sample_session(from)).unwrap();
+        let original_mode = fs::metadata(dir.path()).unwrap().permissions().mode();
+
+        store
+            .rename_session_with_checkpoint(from, to, |step| {
+                if step == 8 {
+                    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555))?;
+                } else if step == 9 {
+                    fs::set_permissions(dir.path(), fs::Permissions::from_mode(original_mode))?;
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(store.rename_journal_path().exists());
+        assert_eq!(
+            store.list_sessions().unwrap().into_iter().map(|m| m.name).collect::<Vec<_>>(),
+            vec![to]
+        );
+        assert!(store.recover_pending_rename().unwrap());
+        store.rename_session(to, from).unwrap();
+        assert!(store.read_session(from).unwrap().is_some());
+    }
+
+    #[test]
+    fn failed_losing_artifact_cleanup_keeps_journal_until_safe_retry() {
+        const FROM: &str = "amber-1-1-0-cleanup";
+        const TO: &str = "amber-1-2-0-cleanup";
+
+        for artifact in 0..3 {
+            let dir = tempdir().unwrap();
+            let store = StateStore::new(dir.path());
+            let mut meta = sample_session(FROM);
+            meta.kind = SessionKind::Claude;
+            store.write_session(&meta).unwrap();
+            store
+                .write_claude(
+                    FROM,
+                    &ClaudeMeta {
+                        session_id: "conversation-survives".into(),
+                        cwd: PathBuf::from("/tmp/proj"),
+                        updated: 1,
+                    },
+                )
+                .unwrap();
+            fs::create_dir_all(store.claude_dir()).unwrap();
+            fs::write(store.claude_settings_path(FROM), b"{}").unwrap();
+            store.write_scrollback(FROM, b"history").unwrap();
+            let losing = [
+                store.claude_path(FROM),
+                store.claude_settings_path(FROM),
+                store.scrollback_path(FROM),
+            ][artifact]
+                .clone();
+
+            store
+                .rename_session_with_checkpoint(FROM, TO, |step| {
+                    if step == 5 {
+                        fs::remove_file(&losing)?;
+                        fs::create_dir(&losing)?;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+
+            assert!(store.rename_journal_path().exists(), "artifact {artifact} lost ownership");
+            assert_eq!(
+                store.list_sessions().unwrap().into_iter().map(|m| m.name).collect::<Vec<_>>(),
+                vec![TO]
+            );
+            assert!(!store.recover_pending_rename().unwrap());
+            assert!(store.rename_journal_path().exists());
+
+            fs::remove_dir(&losing).unwrap();
+            assert!(store.recover_pending_rename().unwrap());
+            assert!(!store.rename_journal_path().exists());
+            store.rename_session(TO, FROM).unwrap();
+            assert_eq!(
+                store.read_claude(FROM).unwrap().map(|meta| meta.session_id),
+                Some("conversation-survives".into())
+            );
+            assert_eq!(store.read_scrollback(FROM).unwrap(), Some(b"history".to_vec()));
+            assert!(store.claude_settings_path(FROM).exists());
+        }
+    }
+
+    #[test]
     fn every_rename_crash_point_restores_exactly_one_name_with_its_resume_record() {
         const FROM: &str = "amber-1-1-0-crash";
         const TO: &str = "amber-1-2-0-crash";
@@ -1104,6 +1268,7 @@ mod tests {
             });
             assert!(result.is_err(), "checkpoint {stop_after} did not interrupt");
 
+            store.recover_pending_rename().unwrap();
             let restored = store.list_sessions().unwrap();
             assert_eq!(
                 restored.len(),

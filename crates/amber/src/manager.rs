@@ -445,6 +445,7 @@ impl SessionManager {
         // works across daemon restarts / reboots regardless of launch context.
         let cwd = Self::resolve_cwd(&cwd.into());
         let _maint = self.maintenance.lock().unwrap();
+        self.finish_pending_rename()?;
         if self.sessions.lock().unwrap().contains_key(name) {
             anyhow::bail!("session {name} already exists");
         }
@@ -496,6 +497,16 @@ impl SessionManager {
     /// only when the session leaves the table (kill/reap).
     fn used_slots(metas: &[SessionMeta]) -> BTreeSet<u32> {
         metas.iter().filter(|meta| meta.slot >= 1).map(|meta| meta.slot).collect()
+    }
+
+    /// Retry rename garbage collection before any metadata mutation. Restore
+    /// may proceed once recovery has selected one authoritative metadata name,
+    /// but mutation must wait until the journal releases both names.
+    fn finish_pending_rename(&self) -> anyhow::Result<()> {
+        if !self.store.recover_pending_rename()? {
+            anyhow::bail!("pending session rename cleanup is incomplete");
+        }
+        Ok(())
     }
 
     fn stop_session(
@@ -551,6 +562,7 @@ impl SessionManager {
     ) -> anyhow::Result<()> {
         let cleanup_error = self.stop_session(old_meta.slot, None).err();
         if store_moved {
+            self.finish_pending_rename()?;
             self.store.rename_session(to, from)?;
         }
         self.cgroups.prepare_session(old_meta.slot)?;
@@ -703,6 +715,11 @@ impl SessionManager {
     /// deterministic; a failure to persist a repair is logged, never fatal.
     pub fn restore(&self) -> anyhow::Result<()> {
         let _maint = self.maintenance.lock().unwrap();
+        if !self.store.recover_pending_rename()? {
+            eprintln!(
+                "amber daemon: restored authoritative rename while orphan cleanup remains pending"
+            );
+        }
         // Written on a clean SIGTERM/SIGINT exit (main.rs), consumed here.
         // Still present at startup means this boot follows an unclean death
         // (SIGKILL, oomd, power loss) rather than a normal restart/reinstall.
@@ -1233,6 +1250,7 @@ impl SessionManager {
     /// respawned on the next daemon start. Returns the reaped names.
     pub fn reap(&self) -> anyhow::Result<Vec<String>> {
         let _maint = self.maintenance.lock().unwrap();
+        self.finish_pending_rename()?;
         let dead: Vec<(String, Arc<PtySession>)> = self
             .sessions
             .lock()
@@ -1283,6 +1301,7 @@ impl SessionManager {
     pub fn rename(&self, from: &str, to: &str) -> anyhow::Result<SessionInfo> {
         Self::validate_name(to)?;
         let _maint = self.maintenance.lock().unwrap();
+        self.finish_pending_rename()?;
         if self.sessions.lock().unwrap().contains_key(to)
             || self.store.read_session(to)?.is_some()
         {
@@ -1378,6 +1397,7 @@ impl SessionManager {
         // recreate the artifacts this is deleting (lock order: maintenance
         // before sessions, matching `snapshot_inner`).
         let _maint = self.maintenance.lock().unwrap();
+        self.finish_pending_rename()?;
         let sess = self.sessions.lock().unwrap().get(name).cloned();
         let meta = self.store.read_session(name)?;
         let _transition = sess.as_ref().map(|session| session.lock_suspend_transition());
@@ -1450,6 +1470,20 @@ mod tests {
         session.set_run_state(Some("claude".into()));
         mgr.sessions.lock().unwrap().insert(name.to_string(), Arc::clone(&session));
         session
+    }
+
+    fn write_rename_journal(root: &Path, from: &str, to: &str, mut source: SessionMeta) {
+        source.name = from.to_string();
+        std::fs::write(
+            root.join("rename.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "from": from,
+                "to": to,
+                "source": source,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
     }
 
     /// The display allowlist: takes only the wanted keys, unquotes a systemd
@@ -1884,6 +1918,44 @@ mod tests {
         mgr.restore().unwrap();
         assert_eq!(mgr.store.read_session("restored").unwrap().unwrap().slot, slot);
         assert!(cgroups.path().join(format!("session-{slot}")).is_dir());
+    }
+
+    #[test]
+    fn restore_starts_the_authoritative_name_while_rename_cleanup_is_pending() {
+        let dir = tempdir().unwrap();
+        let cgroups = tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        let from = "amber-1-1-0-pending";
+        let to = "amber-1-2-0-pending";
+        let source = SessionMeta {
+            name: from.to_string(),
+            cwd: PathBuf::from("/tmp"),
+            kind: SessionKind::Shell,
+            updated: 1,
+            resume_as_claude: false,
+            run_state: None,
+            slot: 1,
+        };
+        store.write_session(&source).unwrap();
+        store
+            .write_session(&SessionMeta { name: to.to_string(), ..source.clone() })
+            .unwrap();
+        write_rename_journal(dir.path(), from, to, source);
+        let obstruction = dir.path().join(format!("claude/{from}.json"));
+        std::fs::create_dir_all(&obstruction).unwrap();
+
+        let mgr = with_fake_cgroups(dir.path(), cgroups.path());
+        let restored = mgr.restore();
+
+        assert!(restored.is_ok(), "retryable cleanup prevented startup: {restored:?}");
+        assert_eq!(mgr.names(), vec![to.to_string()]);
+        assert!(store.read_session(from).unwrap().is_none());
+        assert!(store.read_session(to).unwrap().is_some());
+        assert!(dir.path().join("rename.json").exists());
+
+        std::fs::remove_dir(obstruction).unwrap();
+        mgr.remove(to).unwrap();
+        assert!(!dir.path().join("rename.json").exists());
     }
 
     #[test]
@@ -2494,6 +2566,73 @@ mod tests {
         );
         assert!(mgr.store.read_session(to).unwrap().is_none());
         assert!(cgroups.path().join(format!("session-{slot}")).is_dir());
+    }
+
+    #[test]
+    fn agent_rollback_recovers_committed_journal_before_reverse_rename() {
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        let from = "amber-1-1-0-stale";
+        let to = "amber-1-2-0-stale";
+        let session = fake_agent(&mgr, from);
+        mgr.store
+            .write_claude(
+                from,
+                &amber_core::state::ClaudeMeta {
+                    session_id: "conv-stale".into(),
+                    cwd: dir.path().to_path_buf(),
+                    updated: 1,
+                },
+            )
+            .unwrap();
+        let old_meta = mgr.store.read_session(from).unwrap().unwrap();
+        let size = session.size();
+        mgr.stop_session_locked(old_meta.slot, Some(&session)).unwrap();
+        mgr.store.rename_session(from, to).unwrap();
+        // Recreate the exact durable state left when a committed rename could
+        // not unlink its journal before the replacement supervisor failed.
+        write_rename_journal(dir.path(), from, to, old_meta.clone());
+
+        let first_ok = mgr
+            .rollback_agent_rename(from, to, &old_meta, size, true)
+            .is_ok();
+        if !first_ok {
+            std::fs::remove_file(dir.path().join("rename.json")).unwrap();
+            mgr.rollback_agent_rename(from, to, &old_meta, size, true).unwrap();
+        }
+
+        assert!(first_ok, "stale committed journal blocked reverse rollback");
+        assert!(mgr.session(from).is_some());
+        assert!(mgr.session(to).is_none());
+        assert_eq!(
+            mgr.store.read_claude(from).unwrap().unwrap().session_id,
+            "conv-stale"
+        );
+    }
+
+    #[test]
+    fn create_waits_for_pending_rename_cleanup_before_reusing_losing_name() {
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        let from = "amber-1-1-0-orphan";
+        let to = "amber-1-2-0-orphan";
+        mgr.create(to, "/tmp", SessionKind::Shell).unwrap();
+        let to_meta = mgr.store.read_session(to).unwrap().unwrap();
+        write_rename_journal(dir.path(), from, to, to_meta);
+        let orphan = dir.path().join(format!("claude/{from}.json"));
+        std::fs::create_dir_all(&orphan).unwrap();
+
+        let first_ok = mgr.create(from, "/tmp", SessionKind::Shell).is_ok();
+        std::fs::remove_dir(&orphan).unwrap();
+        if first_ok {
+            mgr.remove(from).unwrap();
+        }
+        assert!(!first_ok, "name was reused while its old artifact was still owned");
+        assert!(dir.path().join("rename.json").exists());
+
+        mgr.create(from, "/tmp", SessionKind::Shell).unwrap();
+        assert_eq!(mgr.store.read_claude(from).unwrap(), None);
+        assert!(!dir.path().join("rename.json").exists());
     }
 
     #[test]
