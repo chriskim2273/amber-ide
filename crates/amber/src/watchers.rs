@@ -72,7 +72,11 @@ struct Entry {
 
 enum QueuedFrame {
     Frame(Arc<Vec<u8>>),
-    Initial(Receiver<Arc<Vec<u8>>>),
+    Initial {
+        frame: Receiver<Arc<Vec<u8>>>,
+        #[cfg(test)]
+        entered: Option<std::sync::mpsc::SyncSender<()>>,
+    },
 }
 
 pub struct Watchers {
@@ -118,10 +122,20 @@ impl Watchers {
     ) {
         let writer_key = Arc::as_ptr(writer) as usize;
         let (snapshot_tx, snapshot_rx) = sync_channel(1);
+        #[cfg(test)]
+        let (entered_tx, entered_rx) = sync_channel(0);
         let forwarder = {
             let mut entries = self.entries.lock().unwrap();
             if let Some(index) = entries.iter().position(|entry| entry.writer_key == writer_key) {
-                if entries[index].tx.try_send(QueuedFrame::Initial(snapshot_rx)).is_err() {
+                if entries[index]
+                    .tx
+                    .try_send(QueuedFrame::Initial {
+                        frame: snapshot_rx,
+                        #[cfg(test)]
+                        entered: None,
+                    })
+                    .is_err()
+                {
                     entries.remove(index);
                     return;
                 }
@@ -130,7 +144,12 @@ impl Watchers {
             } else {
                 let id = self.next_id.fetch_add(1, Ordering::Relaxed);
                 let (tx, rx) = sync_channel(WATCHER_QUEUE_DEPTH);
-                tx.send(QueuedFrame::Initial(snapshot_rx)).unwrap();
+                tx.send(QueuedFrame::Initial {
+                    frame: snapshot_rx,
+                    #[cfg(test)]
+                    entered: Some(entered_tx),
+                })
+                .unwrap();
                 entries.push(Entry {
                     id,
                     writer_key,
@@ -143,6 +162,8 @@ impl Watchers {
         };
         if let Some((id, rx, weak, entries)) = forwarder {
             thread::spawn(move || forward(id, rx, weak, entries));
+            #[cfg(test)]
+            entered_rx.recv().unwrap();
         }
         let initial = Arc::new(proto::encode(&Frame::Control(ControlMsg::Sessions {
             sessions: snapshot(),
@@ -237,10 +258,20 @@ fn forward(
         };
         let frame = match frame {
             QueuedFrame::Frame(frame) => frame,
-            QueuedFrame::Initial(initial) => match initial.recv() {
-                Ok(frame) => frame,
-                Err(_) => break true,
-            },
+            QueuedFrame::Initial {
+                frame: initial,
+                #[cfg(test)]
+                entered,
+            } => {
+                #[cfg(test)]
+                if let Some(entered) = entered {
+                    let _ = entered.send(());
+                }
+                match initial.recv() {
+                    Ok(frame) => frame,
+                    Err(_) => break true,
+                }
+            }
         };
         if write_frame(&weak, &frame).is_err() {
             break false;

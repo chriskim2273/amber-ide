@@ -1887,9 +1887,15 @@ mod tests {
         // delete the file after the first snapshot; if the second snapshot skips
         // the write, it stays deleted.
         let dir = tempdir().unwrap();
-        let mgr = SessionManager::new(dir.path()).unwrap();
+        let shell = dir.path().join("quiet-shell");
+        std::fs::write(&shell, "#!/bin/sh\nprintf READY\\n\nsleep 60\n").unwrap();
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mgr = SessionManager::new(dir.path())
+            .unwrap()
+            .with_test_shell(shell.into_os_string());
         mgr.create("idle", "/tmp", SessionKind::Shell).unwrap();
         let sess = mgr.session("idle").unwrap();
+        wait_for_output(&sess, b"READY");
         // Wait for the shell's startup output (prompt, rc-file noise) to STOP,
         // rather than sleeping a fixed span: under a loaded parallel test run a
         // slow shell can emit its prompt after any constant we would pick, and
