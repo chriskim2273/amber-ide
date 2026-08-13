@@ -128,3 +128,27 @@ fn codex_skill_invalid_utf8_conflict_exits_cleanly() {
         "amber: ~/.agents/skills/claude-handoff exists but is not Amber-owned; leaving it unchanged"
     );
 }
+
+#[test]
+fn codex_skill_marker_bearing_invalid_utf8_conflicts_cleanly() {
+    let home = tempfile::tempdir().unwrap();
+    let file = home.path().join(".agents/skills/claude-handoff/SKILL.md");
+    let bytes = b"<!-- amber-owned-skill -->\n\xff";
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, bytes).unwrap();
+
+    for action in ["install-codex-skill", "purge-codex-skill"] {
+        let conflict = Command::new(env!("CARGO_BIN_EXE_amber"))
+            .args(["ctl", action])
+            .env("HOME", home.path())
+            .output()
+            .unwrap();
+
+        assert!(conflict.status.success());
+        assert_eq!(std::fs::read(&file).unwrap(), bytes);
+        assert_eq!(
+            String::from_utf8_lossy(&conflict.stderr).trim(),
+            "amber: ~/.agents/skills/claude-handoff exists but is not Amber-owned; leaving it unchanged"
+        );
+    }
+}

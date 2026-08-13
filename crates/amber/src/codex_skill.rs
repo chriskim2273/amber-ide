@@ -39,9 +39,11 @@ fn is_owned_file(path: &Path) -> anyhow::Result<bool> {
     if meta.file_type().is_symlink() || !meta.is_file() {
         return Ok(false);
     }
-    Ok(fs::read(path)?
-        .split(|byte| *byte == b'\n')
-        .any(|line| line.strip_suffix(b"\r").unwrap_or(line) == OWNERSHIP_MARKER.as_bytes()))
+    let bytes = fs::read(path)?;
+    let Ok(contents) = std::str::from_utf8(&bytes) else {
+        return Ok(false);
+    };
+    Ok(contents.lines().any(|line| line == OWNERSHIP_MARKER))
 }
 
 pub fn install(home: &Path) -> anyhow::Result<InstallOutcome> {
@@ -185,6 +187,19 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let file = skill_file(home.path());
         let bytes = b"user-owned\xff\n";
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, bytes).unwrap();
+
+        assert_eq!(install(home.path()).unwrap(), InstallOutcome::Conflict);
+        assert_eq!(remove(home.path()).unwrap(), RemoveOutcome::Conflict);
+        assert_eq!(fs::read(file).unwrap(), bytes);
+    }
+
+    #[test]
+    fn marker_bearing_invalid_utf8_skill_is_an_unchanged_conflict() {
+        let home = tempfile::tempdir().unwrap();
+        let file = skill_file(home.path());
+        let bytes = b"<!-- amber-owned-skill -->\n\xff";
         fs::create_dir_all(file.parent().unwrap()).unwrap();
         fs::write(&file, bytes).unwrap();
 
