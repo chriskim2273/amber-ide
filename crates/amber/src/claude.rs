@@ -67,6 +67,10 @@ fn now() -> u64 {
         .unwrap_or(0)
 }
 
+fn refreshed_updated(previous: Option<u64>, current: u64) -> u64 {
+    previous.map_or(current, |updated| current.max(updated.saturating_add(1)))
+}
+
 /// Record the session id from a SessionStart hook's stdin JSON. Fires on every
 /// hook invocation — ids rotate on resume/clear/compaction, last write wins.
 ///
@@ -110,12 +114,14 @@ pub fn record_session(store: &StateStore, session_name: &str, hook_stdin: &str) 
         }
     }
 
+    let previous = store.read_claude(session_name)?;
+    let updated = refreshed_updated(previous.as_ref().map(|meta| meta.updated), now());
     store.write_claude(
         session_name,
         &ClaudeMeta {
             session_id,
             cwd,
-            updated: now(),
+            updated,
         },
     )
 }
@@ -440,6 +446,11 @@ mod tests {
         record_session(&store, "w", r#"{"session_id":"first","cwd":"/a"}"#).unwrap();
         record_session(&store, "w", r#"{"session_id":"second","cwd":"/a"}"#).unwrap();
         assert_eq!(store.read_claude("w").unwrap().unwrap().session_id, "second");
+    }
+
+    #[test]
+    fn record_session_refreshes_same_id_within_the_same_second() {
+        assert_eq!(refreshed_updated(Some(1_700_000_000), 1_700_000_000), 1_700_000_001);
     }
 
     #[test]
