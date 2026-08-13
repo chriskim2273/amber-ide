@@ -435,9 +435,25 @@ and persistence without cgroup access.
 ## Rollback
 
 Setting `[memory] enabled = false` and restarting disables automatic parking.
-Removing the unit's memory directives and restarting disables Linux soft
-containment. No state migration is introduced; session metadata, scrollback,
-and conversation records remain readable by the previous binary.
+To disable Linux containment too, restore the previous unit file that omitted
+the memory directives, or override the installed unit with explicit neutral
+values:
+
+```ini
+[Service]
+Delegate=no
+MemoryAccounting=no
+MemoryHigh=infinity
+MemoryMax=infinity
+OOMPolicy=stop
+```
+
+After `systemctl --user daemon-reload`, restart the service. An empty
+`Delegate=` is not the rollback syntax: systemd treats it as delegation enabled
+with the controller list reset. `MemoryHigh=infinity` disables throttling and
+`MemoryMax=infinity` removes any administrator hard cap. No state migration is
+introduced; session metadata, scrollback, and conversation records remain
+readable by the previous binary.
 
 ## Authoritative references
 

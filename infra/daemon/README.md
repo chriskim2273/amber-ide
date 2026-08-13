@@ -52,7 +52,11 @@ Use `amber ls` to match the stable numeric slot printed for each session to its
 
 ```sh
 cg="$(systemctl --user show amber.service -p ControlGroup --value)"
-root="/sys/fs/cgroup${cg}"
+case "$cg" in /*) ;; *) echo "amber.service has no absolute ControlGroup" >&2; exit 1;; esac
+cgroup2_mount="$(awk '$0 ~ / - cgroup2 / { print $5; exit }' /proc/self/mountinfo)"
+test -n "$cgroup2_mount"
+root="${cgroup2_mount%/}${cg}"
+test -d "$root"
 find "$root" -maxdepth 3 \
   \( -name cgroup.procs -o -name cgroup.events -o -name memory.current \
      -o -name memory.high -o -name memory.events \) -print
@@ -76,10 +80,26 @@ amber ls
 ```
 
 `[memory] enabled = false` disables automatic parking after restart without a
-state migration. To remove Linux soft containment too, snapshot again, remove
-the unit memory directives in an administrator override, run
-`systemctl --user daemon-reload`, and restart the service. A `MemoryMax=`
-override is a destructive OOM boundary and is never installed by default.
+state migration. To remove Linux soft containment too, snapshot again and
+restore the pre-containment `amber.service` file, which omitted `Delegate=`,
+`MemoryAccounting=`, `MemoryHigh=`, and `OOMPolicy=`. If replacing the unit is
+not practical, create `~/.config/systemd/user/amber.service.d/90-memory-rollback.conf`
+with explicit neutral values:
+
+```ini
+[Service]
+Delegate=no
+MemoryAccounting=no
+MemoryHigh=infinity
+MemoryMax=infinity
+OOMPolicy=stop
+```
+
+Then run `systemctl --user daemon-reload` and restart `amber.service`. Do not
+use an empty `Delegate=` assignment: systemd defines that as delegation enabled
+with the controller list reset, not delegation disabled. `MemoryHigh=infinity`
+means no throttling and `MemoryMax=infinity` removes any administrator hard cap.
+Amber never installs a default `MemoryMax`.
 
 ## Reboot torture test (Slice 3 exit test)
 

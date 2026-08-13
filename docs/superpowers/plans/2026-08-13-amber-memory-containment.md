@@ -1634,4 +1634,4 @@ git commit -m "docs: document memory containment rollout"
 - [x] App-local panes never send daemon Focus.
 - [x] Old config and state files load without migration.
 - [ ] Nondelegated Linux and macOS retain usable session behavior.
-- [x] Automated gates, Linux pressure proof, soak, and real-Mac verification are recorded.
+- [ ] Automated gates, Linux pressure proof, soak, and real-Mac verification are recorded.
