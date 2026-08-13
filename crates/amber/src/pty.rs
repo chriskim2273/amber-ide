@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
+use std::time::Duration;
 
 use amber_core::ring::Ring;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
@@ -451,6 +452,23 @@ impl PtySession {
         self.suspend_transition.lock().unwrap()
     }
 
+    #[cfg(test)]
+    pub(crate) fn lock_killer_for_test(
+        &self,
+    ) -> MutexGuard<'_, Box<dyn ChildKiller + Send + Sync>> {
+        self.killer.lock().unwrap()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lock_exit_for_test(&self) -> MutexGuard<'_, Option<i32>> {
+        self.exit.lock().unwrap()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn suspend_transition_locked_for_test(&self) -> bool {
+        self.suspend_transition.try_lock().is_err()
+    }
+
     /// The child's OS process id (None if the platform didn't report one).
     pub fn pid(&self) -> Option<u32> {
         self.pid
@@ -578,6 +596,23 @@ impl PtySession {
 
     pub fn is_alive(&self) -> bool {
         self.exit_code().is_none()
+    }
+
+    pub(crate) fn wait_for_exit(&self, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match self.exit.try_lock() {
+                Ok(exit) if exit.is_some() => return true,
+                Ok(_) | Err(std::sync::TryLockError::WouldBlock) => {}
+                Err(std::sync::TryLockError::Poisoned(error)) => {
+                    return error.into_inner().is_some();
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// Terminate the child AND everything it started.

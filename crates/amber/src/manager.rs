@@ -6,7 +6,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use amber_core::proto::{ControlMsg, SessionInfo};
 use amber_core::state::{Config, SessionKind, SessionMeta, StateStore};
@@ -18,6 +18,7 @@ use crate::watchers::Watchers;
 
 const DEFAULT_ROWS: u16 = 24;
 const DEFAULT_COLS: u16 = 80;
+const CHILD_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// `current_exe()` returns a `<path> (deleted)`-suffixed string, forever, once
 /// this process's own backing binary inode is unlinked (e.g. an in-place
@@ -496,9 +497,17 @@ impl SessionManager {
         session: Option<&Arc<PtySession>>,
     ) -> anyhow::Result<()> {
         let _transition = session.map(|session| session.lock_suspend_transition());
+        self.stop_session_locked(slot, session)
+    }
+
+    fn stop_session_locked(
+        &self,
+        slot: u32,
+        session: Option<&Arc<PtySession>>,
+    ) -> anyhow::Result<()> {
         let mut empty = self.cgroups.kill_session(slot).unwrap_or(false);
-        if !empty {
-            if let Some(session) = session.filter(|session| session.is_alive()) {
+        if let Some(session) = session {
+            if session.is_alive() {
                 if let Err(error) = session.kill() {
                     let gone = error.chain().any(|cause| {
                         cause
@@ -511,6 +520,11 @@ impl SessionManager {
                     }
                 }
             }
+            if !session.wait_for_exit(CHILD_EXIT_TIMEOUT) {
+                anyhow::bail!("session child {slot} did not exit after termination");
+            }
+        }
+        if !empty {
             empty = self.cgroups.kill_session(slot).unwrap_or(false);
         }
         if self.cgroups.is_enabled() && !empty {
@@ -795,6 +809,20 @@ impl SessionManager {
         self.sessions.lock().unwrap().get(name).cloned()
     }
 
+    fn ensure_current_session(
+        &self,
+        name: &str,
+        session: &Arc<PtySession>,
+    ) -> anyhow::Result<()> {
+        let current = self.sessions.lock().unwrap().get(name).cloned();
+        if !current.as_ref().is_some_and(|live| Arc::ptr_eq(live, session))
+            || !session.is_alive()
+        {
+            anyhow::bail!("no such session: {name}");
+        }
+        Ok(())
+    }
+
     /// (name, child pid) for every live session with a pid — the memory monitor
     /// sums each pid's process-tree RSS. Snapshotted under the lock, which is
     /// then released: the caller does its `/proc` reads WITHOUT holding the
@@ -872,6 +900,7 @@ impl SessionManager {
             .session(name)
             .ok_or_else(|| anyhow::anyhow!("no such session: {name}"))?;
         let _transition = session.lock_suspend_transition();
+        self.ensure_current_session(name, &session)?;
         let meta = self
             .store
             .read_session(name)?
@@ -968,6 +997,7 @@ impl SessionManager {
             .session(name)
             .ok_or_else(|| anyhow::anyhow!("no such session: {name}"))?;
         let _transition = session.lock_suspend_transition();
+        self.ensure_current_session(name, &session)?;
         session.mark_user_activity();
         self.resume_locked(name, &session, cause)
     }
@@ -977,6 +1007,7 @@ impl SessionManager {
             .session(name)
             .ok_or_else(|| anyhow::anyhow!("no such session: {name}"))?;
         let _transition = session.lock_suspend_transition();
+        self.ensure_current_session(name, &session)?;
         session.mark_user_activity();
         self.resume_for_focus_locked(name, &session)
     }
@@ -1024,6 +1055,7 @@ impl SessionManager {
             .session(name)
             .ok_or_else(|| anyhow::anyhow!("no such session: {name}"))?;
         let _transition = session.lock_suspend_transition();
+        self.ensure_current_session(name, &session)?;
         session.mark_user_activity();
         self.resume_for_focus_locked(name, &session)?;
         if session.suspend_origin() == SuspendOrigin::Manual {
@@ -1055,11 +1087,12 @@ impl SessionManager {
         let mut reaped = Vec::new();
         for (name, session) in dead {
             let result = (|| -> anyhow::Result<()> {
+                let _transition = session.lock_suspend_transition();
                 let meta = self
                     .store
                     .read_session(&name)?
                     .ok_or_else(|| anyhow::anyhow!("dead session {name} has no metadata"))?;
-                self.stop_session(meta.slot, Some(&session))?;
+                self.stop_session_locked(meta.slot, Some(&session))?;
                 self.store.remove_session(&name)?;
                 self.sessions.lock().unwrap().remove(&name);
                 Ok(())
@@ -1110,9 +1143,10 @@ impl SessionManager {
             .read_session(from)?
             .ok_or_else(|| anyhow::anyhow!("session {from} vanished from the store"))?;
         let size = sess.size();
+        let _transition = old_meta.kind.is_agent().then(|| sess.lock_suspend_transition());
 
         if old_meta.kind.is_agent() {
-            self.stop_session(old_meta.slot, Some(&sess))?;
+            self.stop_session_locked(old_meta.slot, Some(&sess))?;
         }
         if let Err(error) = self.store.rename_session(from, to) {
             if old_meta.kind.is_agent() {
@@ -1156,7 +1190,7 @@ impl SessionManager {
                     watchers.broadcast(&ControlMsg::Activity { name: name.clone() });
                 }));
             }
-            sess
+            Arc::clone(&sess)
         };
         {
             let mut sessions = self.sessions.lock().unwrap();
@@ -1189,11 +1223,14 @@ impl SessionManager {
         let _maint = self.maintenance.lock().unwrap();
         let sess = self.sessions.lock().unwrap().get(name).cloned();
         let meta = self.store.read_session(name)?;
+        let _transition = sess.as_ref().map(|session| session.lock_suspend_transition());
         if let Some(meta) = meta {
-            self.stop_session(meta.slot, sess.as_ref())?;
+            self.stop_session_locked(meta.slot, sess.as_ref())?;
         } else if let Some(sess) = &sess {
-            let _transition = sess.lock_suspend_transition();
             sess.kill()?;
+            if !sess.wait_for_exit(CHILD_EXIT_TIMEOUT) {
+                anyhow::bail!("session child {name} did not exit after termination");
+            }
         }
         self.store.remove_session(name)?;
         self.sessions.lock().unwrap().remove(name);
@@ -1882,6 +1919,51 @@ mod tests {
         assert!(
             rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap().unwrap()
         );
+    }
+
+    #[test]
+    fn queued_focus_rechecks_identity_after_remove_finishes_teardown() {
+        let dir = tempdir().unwrap();
+        let mgr = Arc::new(SessionManager::new(dir.path()).unwrap());
+        let session = fake_agent(&mgr, "agent");
+        session.set_run_state(Some("suspended".into()));
+        session.claim_suspend(SuspendOrigin::Memory).unwrap();
+
+        // Hold the child-killer lock so remove owns the transition lock but
+        // cannot finish. Focus then deterministically queues behind teardown.
+        let killer = session.lock_killer_for_test();
+        let (remove_tx, remove_rx) = mpsc::channel();
+        let remover = Arc::clone(&mgr);
+        std::thread::spawn(move || remove_tx.send(remover.remove("agent")).unwrap());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !session.suspend_transition_locked_for_test() {
+            assert!(std::time::Instant::now() < deadline, "remove never entered teardown");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let exit_record = session.lock_exit_for_test();
+
+        let (focus_tx, focus_rx) = mpsc::channel();
+        let focuser = Arc::clone(&mgr);
+        std::thread::spawn(move || focus_tx.send(focuser.focus_session("agent")).unwrap());
+        assert!(focus_rx.recv_timeout(std::time::Duration::from_millis(100)).is_err());
+
+        drop(killer);
+        let premature_remove = remove_rx.recv_timeout(std::time::Duration::from_secs(1)).ok();
+        let returned_early = premature_remove.is_some();
+        drop(exit_record);
+        match premature_remove {
+            Some(result) => result.unwrap(),
+            None => remove_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap().unwrap(),
+        }
+        let error = focus_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap_err();
+
+        assert!(!returned_early, "remove returned before child exit was confirmed");
+        assert!(error.to_string().contains("no such session"), "unexpected focus result: {error}");
+        assert!(mgr.session("agent").is_none());
+        assert!(!session.is_alive(), "remove returned before the child exit was confirmed");
     }
 
     #[test]

@@ -3,11 +3,13 @@
 //! that records the rotating session id (spec §6.2, §8).
 
 use amber::supervisor::{supervise_agent, Agent, SuperviseOutcome, SuspendControl};
+use amber_core::proto::{self, ControlMsg, Decoder, Frame, SessionInfo};
 use amber_core::state::{ClaudeMeta, StateStore};
 use std::fs;
-use std::io::Write;
-use std::path::Path;
-use std::process::{Command, Stdio};
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -83,6 +85,160 @@ fn log_lines(root: &Path) -> Vec<String> {
         Ok(s) => s.lines().map(|l| l.to_string()).collect(),
         Err(_) => Vec::new(),
     }
+}
+
+enum TestDaemon {
+    Direct(Child),
+    #[cfg(target_os = "linux")]
+    Systemd(String),
+}
+
+impl Drop for TestDaemon {
+    fn drop(&mut self) {
+        match self {
+            TestDaemon::Direct(child) => {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            #[cfg(target_os = "linux")]
+            TestDaemon::Systemd(unit) => {
+                let _ = Command::new("systemctl")
+                    .args(["--user", "stop", unit])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        }
+    }
+}
+
+struct RunningDaemon {
+    _handle: TestDaemon,
+    delegated_root: Option<PathBuf>,
+}
+
+fn wait_for_socket(socket: &Path, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if UnixStream::connect(socket).is_ok() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn try_start_delegated_daemon(root: &Path, socket: &Path) -> Option<RunningDaemon> {
+    let unit = format!("amber-task4-cgroup-{}.service", std::process::id());
+    let output = Command::new("systemd-run")
+        .args(["--user", "--unit", &unit, "--property=Delegate=yes", "--collect", "--quiet"])
+        .args(["/usr/bin/env", "-u", "HOME", "-u", "CODEX_HOME"])
+        .arg(env!("CARGO_BIN_EXE_amber"))
+        .args(["daemon", "--root"])
+        .arg(root)
+        .arg("--socket")
+        .arg(socket)
+        .output()
+        .ok()?;
+    if !output.status.success() || !wait_for_socket(socket, Duration::from_secs(5)) {
+        let _ = Command::new("systemctl")
+            .args(["--user", "stop", &unit])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        return None;
+    }
+    let control_group = Command::new("systemctl")
+        .args(["--user", "show", &unit, "--property=ControlGroup", "--value"])
+        .output()
+        .ok()
+        .filter(|result| result.status.success())
+        .and_then(|result| String::from_utf8(result.stdout).ok())
+        .map(|path| PathBuf::from("/sys/fs/cgroup").join(path.trim().trim_start_matches('/')))
+        .filter(|path| path.join("_daemon").is_dir());
+    Some(RunningDaemon {
+        _handle: TestDaemon::Systemd(unit),
+        delegated_root: control_group,
+    })
+}
+
+fn start_test_daemon(root: &Path, socket: &Path) -> RunningDaemon {
+    #[cfg(target_os = "linux")]
+    if let Some(daemon) = try_start_delegated_daemon(root, socket) {
+        return daemon;
+    }
+
+    let child = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .args(["daemon", "--root"])
+        .arg(root)
+        .arg("--socket")
+        .arg(socket)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .env_remove("HOME")
+        .env_remove("CODEX_HOME")
+        .spawn()
+        .unwrap();
+    assert!(wait_for_socket(socket, Duration::from_secs(5)), "test daemon did not start");
+    RunningDaemon { _handle: TestDaemon::Direct(child), delegated_root: None }
+}
+
+fn send_control(socket: &Path, message: ControlMsg) {
+    let mut stream = UnixStream::connect(socket).unwrap();
+    stream.write_all(&proto::encode(&Frame::Control(message))).unwrap();
+    stream.flush().unwrap();
+}
+
+fn detailed_sessions(socket: &Path) -> Vec<SessionInfo> {
+    let mut stream = UnixStream::connect(socket).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream
+        .write_all(&proto::encode(&Frame::Control(ControlMsg::ListSessionsDetailed)))
+        .unwrap();
+    let mut decoder = Decoder::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        while let Some(frame) = decoder.next_frame().unwrap() {
+            if let Frame::Control(ControlMsg::Sessions { sessions }) = frame {
+                return sessions;
+            }
+        }
+        let read = stream.read(&mut buf).unwrap();
+        assert_ne!(read, 0, "daemon closed before detailed session reply");
+        decoder.feed(&buf[..read]);
+    }
+}
+
+fn wait_for_session(
+    socket: &Path,
+    name: &str,
+    predicate: impl Fn(&SessionInfo) -> bool,
+) -> SessionInfo {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(info) = detailed_sessions(socket)
+            .into_iter()
+            .find(|info| info.name == name && predicate(info))
+        {
+            return info;
+        }
+        assert!(Instant::now() < deadline, "session {name} never reached expected state");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn workload_populated(path: &Path) -> Option<bool> {
+    fs::read_to_string(path.join("cgroup.events"))
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            let mut fields = line.split_whitespace();
+            (fields.next() == Some("populated")).then(|| fields.next() == Some("1"))
+        })
 }
 
 #[test]
@@ -239,7 +395,7 @@ fn suspend_then_resume_parks_and_relaunches_claude() {
 }
 
 #[test]
-fn suspend_reclaims_a_stubborn_descendant_before_reporting_suspended() {
+fn duplicate_suspend_while_parked_does_not_repark_after_resume() {
     let _exec_guard = exec_guard();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_path_buf();
@@ -248,14 +404,7 @@ fn suspend_reclaims_a_stubborn_descendant_before_reporting_suspended() {
     let claude_path = bin.join("claude");
     fs::write(
         &claude_path,
-        r#"#!/bin/sh
-echo "$@" >> "$AMBER_STATE_DIR/claude_argv.log"
-count=$(wc -l < "$AMBER_STATE_DIR/claude_argv.log")
-if [ "$count" -eq 1 ]; then
-  python3 -c 'import os,signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); open(os.environ["AMBER_STATE_DIR"]+"/stubborn.pid","w").write(str(os.getpid())); payload=bytearray(1024*1024); time.sleep(60)' &
-  wait
-fi
-"#,
+        "#!/bin/sh\necho \"$@\" >> \"$AMBER_STATE_DIR/claude_argv.log\"\nsleep 1\nexit 0\n",
     )
     .unwrap();
     #[cfg(unix)]
@@ -267,7 +416,7 @@ fi
         .write_claude(
             "work",
             &ClaudeMeta {
-                session_id: "conv-42".to_string(),
+                session_id: "sid-double-suspend".to_string(),
                 cwd: root.clone(),
                 updated: 1,
             },
@@ -276,7 +425,7 @@ fi
     let settings = root.join("settings.json");
     let ctl = SuspendControl::new();
     let phases = Arc::new(Mutex::new(Vec::<String>::new()));
-    let thread = {
+    let handle = {
         let root = root.clone();
         let claude_path = claude_path.clone();
         let settings = settings.clone();
@@ -298,6 +447,100 @@ fi
         })
     };
 
+    wait_until(&phases, |states| states == ["claude"], Duration::from_secs(3));
+    ctl.suspend.store(true, Ordering::SeqCst);
+    wait_until(
+        &phases,
+        |states| states.iter().any(|state| state == "suspended"),
+        Duration::from_secs(3),
+    );
+    // A second SIGUSR1 can arrive after cleanup consumed the first request but
+    // before Resume. It belongs to the already-parked transition, not the next
+    // agent launch.
+    ctl.suspend.store(true, Ordering::SeqCst);
+    ctl.resume.store(true, Ordering::SeqCst);
+    wait_until(
+        &phases,
+        |states| states.iter().filter(|state| state.as_str() == "claude").count() >= 2,
+        Duration::from_secs(3),
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    let reparks = phases.lock().unwrap().iter().filter(|state| *state == "suspended").count();
+    if reparks > 1 {
+        ctl.resume.store(true, Ordering::SeqCst);
+    }
+    let outcome = handle.join().unwrap();
+
+    assert!(matches!(outcome, SuperviseOutcome::CleanExit));
+    assert_eq!(reparks, 1, "a duplicate suspend request leaked into the resumed launch");
+    assert_eq!(log_lines(&root).len(), 2);
+}
+
+#[test]
+fn suspend_reclaims_a_stubborn_descendant_before_reporting_suspended() {
+    let _exec_guard = exec_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let socket = root.join("amberd.sock");
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let claude_path = bin.join("claude");
+    fs::write(
+        &claude_path,
+        r#"#!/bin/sh
+echo "$@" >> "$AMBER_STATE_DIR/claude_argv.log"
+count=$(wc -l < "$AMBER_STATE_DIR/claude_argv.log")
+if [ "$count" -eq 1 ]; then
+  python3 -c 'import os,signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); open(os.environ["AMBER_STATE_DIR"]+"/stubborn.pid","w").write(str(os.getpid())); payload=bytearray(1024*1024); time.sleep(60)' &
+  wait
+else
+  sleep 2
+fi
+"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&claude_path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    StateStore::new(&root)
+        .write_claude(
+            "work",
+            &ClaudeMeta {
+                session_id: "conv-42".to_string(),
+                cwd: root.clone(),
+                updated: 1,
+            },
+        )
+        .unwrap();
+    let store = StateStore::new(&root);
+    let mut config = store.load_config().unwrap();
+    config.claude_path = Some(claude_path);
+    store.save_config(&config).unwrap();
+    let daemon = start_test_daemon(&root, &socket);
+    let create = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .args(["create", "work", "--cwd"])
+        .arg(&root)
+        .args(["--kind", "claude", "--socket"])
+        .arg(&socket)
+        .output()
+        .unwrap();
+    assert!(
+        create.status.success(),
+        "create failed: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+    wait_for_session(&socket, "work", |info| info.run_state.as_deref() == Some("claude"));
+    eprintln!(
+        "amber task4 test: {}",
+        if daemon.delegated_root.is_some() {
+            "exercising delegated workload cgroup"
+        } else {
+            "delegated cgroup unavailable; exercising process-tree fallback"
+        }
+    );
+
     let pid_path = root.join("stubborn.pid");
     let deadline = Instant::now() + Duration::from_secs(5);
     while !pid_path.exists() {
@@ -305,12 +548,33 @@ fi
         std::thread::sleep(Duration::from_millis(20));
     }
     let stubborn_pid: i32 = fs::read_to_string(&pid_path).unwrap().parse().unwrap();
-    ctl.suspend.store(true, Ordering::SeqCst);
-    wait_until(
-        &phases,
-        |states| states.iter().any(|state| state == "suspended"),
-        Duration::from_secs(5),
-    );
+
+    #[cfg(target_os = "linux")]
+    let delegated_workload = daemon.delegated_root.as_ref().map(|root| {
+        let slot = store.read_session("work").unwrap().unwrap().slot;
+        let workload = root.join(format!("session-{slot}/workload"));
+        assert!(workload.is_dir(), "delegated workload leaf was not created");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while workload_populated(&workload) != Some(true) {
+            assert!(Instant::now() < deadline, "agent never entered delegated workload");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        workload
+    });
+
+    send_control(&socket, ControlMsg::Suspend { name: "work".into() });
+    let suspended =
+        wait_for_session(&socket, "work", |info| info.run_state.as_deref() == Some("suspended"));
+    assert!(suspended.alive, "the supervisor exited instead of parking");
+
+    #[cfg(target_os = "linux")]
+    if let Some(workload) = &delegated_workload {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while workload_populated(workload) != Some(false) {
+            assert!(Instant::now() < deadline, "delegated workload stayed recursively populated");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 
     let deadline = Instant::now() + Duration::from_secs(5);
     let reclaimed = loop {
@@ -324,11 +588,23 @@ fi
         unsafe { libc::kill(stubborn_pid, libc::SIGKILL) };
     }
     assert!(reclaimed, "suspend reported success while a descendant survived");
-    assert!(!thread.is_finished(), "the supervisor exited while parked");
 
-    ctl.resume.store(true, Ordering::SeqCst);
-    assert!(matches!(thread.join().unwrap(), SuperviseOutcome::CleanExit));
+    send_control(&socket, ControlMsg::Resume { name: "work".into() });
+    wait_for_session(&socket, "work", |info| info.run_state.as_deref() == Some("claude"));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while log_lines(&root).len() < 2 {
+        assert!(Instant::now() < deadline, "agent did not relaunch after resume");
+        std::thread::sleep(Duration::from_millis(20));
+    }
     assert!(log_lines(&root)[1].contains("--resume conv-42"));
+
+    send_control(&socket, ControlMsg::Kill { name: "work".into() });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while detailed_sessions(&socket).iter().any(|info| info.name == "work") {
+        assert!(Instant::now() < deadline, "test session was not removed");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop(daemon);
 }
 
 #[test]

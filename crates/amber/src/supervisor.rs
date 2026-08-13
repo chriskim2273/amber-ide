@@ -181,10 +181,17 @@ pub fn supervise_agent(
                     // counted as a crash — escalation/prev_id reset so the
                     // recorded id is Resumed on relaunch.
                     reclaim_workload(&mut child, slot)?;
+                    // SIGUSR1 is a coalescing flag. A duplicate manual request
+                    // (or a Memory→Manual upgrade) can arrive after the first
+                    // request was consumed but while cleanup is still running.
+                    // It belongs to this parked transition, not the next child.
+                    ctl.suspend.store(false, Ordering::SeqCst);
                     report("suspended");
                     while !ctl.resume.swap(false, Ordering::SeqCst) {
+                        ctl.suspend.store(false, Ordering::SeqCst);
                         std::thread::sleep(IDLE_POLL);
                     }
+                    ctl.suspend.store(false, Ordering::SeqCst);
                     escalation = 0;
                     prev_recording = None;
                     continue 'sup;
@@ -239,12 +246,20 @@ fn agent_command(
 }
 
 fn reclaim_workload(child: &mut std::process::Child, slot: Option<u32>) -> anyhow::Result<()> {
+    reclaim_workload_with(child, slot, crate::cgroup::kill_workload_from_current)
+}
+
+fn reclaim_workload_with(
+    child: &mut std::process::Child,
+    slot: Option<u32>,
+    mut kill_workload: impl FnMut(u32) -> std::io::Result<Option<bool>>,
+) -> anyhow::Result<()> {
     let pid = child.id();
     let mut cleaned_by_cgroup = false;
     if let Some(slot) = slot {
         let mut attempts = 0u32;
         loop {
-            match crate::cgroup::kill_workload_from_current(slot) {
+            match kill_workload(slot) {
                 Ok(Some(true)) => {
                     cleaned_by_cgroup = true;
                     break;
@@ -284,10 +299,11 @@ fn reclaim_workload(child: &mut std::process::Child, slot: Option<u32>) -> anyho
             }
         }
     }
-    if !cleaned_by_cgroup {
-        crate::pty::kill_process_tree(pid);
-        let _ = child.kill();
+    if cleaned_by_cgroup && child.try_wait()?.is_some() {
+        return Ok(());
     }
+    crate::pty::kill_process_tree(pid);
+    let _ = child.kill();
     child.wait()?;
     Ok(())
 }
@@ -630,6 +646,21 @@ mod tests {
                 "/usr/bin/claude",
                 "--resume",
             ]
+        );
+    }
+
+    #[test]
+    fn empty_workload_still_reclaims_a_child_that_missed_placement() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "sleep 60"])
+            .spawn()
+            .unwrap();
+
+        reclaim_workload_with(&mut child, Some(7), |_| Ok(Some(true))).unwrap();
+
+        assert!(
+            child.try_wait().unwrap().is_some(),
+            "an empty workload cgroup must not make the supervisor wait on a live misplaced child"
         );
     }
 

@@ -3,9 +3,9 @@
 //! change to watchers, and rejects reports for a non-claude session.
 //!
 //! Fake-stub style (mirrors `watch.rs`): the report is sent manually over a
-//! client connection — the real supervisor child is bogus in-test — and no reap
-//! thread runs, so a session with a dead stub child stays in the table (session
-//! lookups key off table presence, not liveness).
+//! client connection. The agent fixture keeps a real shell PTY alive and
+//! rewrites only its persisted kind to Claude, so manager trust checks see the
+//! same live-kind shape as a production supervisor without launching one.
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -45,14 +45,18 @@ fn report_run_state_stores_broadcasts_and_validates() {
     let dir = tempfile::tempdir().unwrap();
     let sock = dir.path().join("amberd.sock");
     let manager = Arc::new(SessionManager::new(dir.path()).unwrap());
-    // Create the sessions directly on the manager (a claude one and a shell
-    // one) so the test doesn't depend on the bogus spawned supervisor child.
+    // Keep both PTY children alive; a direct agent create from a Rust test would
+    // launch the test-harness binary as `amber run`, which exits immediately.
     manager
-        .create("amber-1-1-0-c", dir.path(), SessionKind::Claude)
+        .create("amber-1-1-0-c", dir.path(), SessionKind::Shell)
         .unwrap();
     manager
         .create("amber-1-1-1-s", dir.path(), SessionKind::Shell)
         .unwrap();
+    let store = StateStore::new(dir.path());
+    let mut agent_meta = store.read_session("amber-1-1-0-c").unwrap().unwrap();
+    agent_meta.kind = SessionKind::Claude;
+    store.write_session(&agent_meta).unwrap();
 
     let watchers = Arc::new(Watchers::new());
     let listener = prepare_socket(&sock).unwrap();
