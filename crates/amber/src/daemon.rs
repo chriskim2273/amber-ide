@@ -472,12 +472,20 @@ fn handle_control(
         }
         ControlMsg::Kill { name } => {
             let existed = manager.session(&name).is_some();
-            let _ = manager.remove(&name);
-            if existed {
-                watchers.broadcast(&ControlMsg::SessionsChanged {
-                    added: vec![],
-                    removed: vec![name],
-                });
+            match manager.remove(&name) {
+                Ok(()) if existed => {
+                    watchers.broadcast(&ControlMsg::SessionsChanged {
+                        added: vec![],
+                        removed: vec![name],
+                    });
+                }
+                Ok(()) => {}
+                Err(error) => {
+                    let _ = write_frame(
+                        writer,
+                        &Frame::Control(ControlMsg::Error { msg: error.to_string() }),
+                    );
+                }
             }
         }
         ControlMsg::WatchSessions => {

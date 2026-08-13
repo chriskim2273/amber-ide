@@ -273,13 +273,15 @@ impl StateStore {
     }
 
     pub fn remove_session(&self, name: &str) -> anyhow::Result<()> {
-        Self::remove_if_exists(&self.session_path(name))?;
         Self::remove_if_exists(&self.claude_path(name))?;
         // The generated per-session claude settings file. Missed originally, so
         // every killed claude pane left one behind forever — `rename_session`
         // moves it, and only removal was blind to it.
         Self::remove_if_exists(&self.claude_settings_path(name))?;
         Self::remove_if_exists(&self.scrollback_path(name))?;
+        // Authoritative metadata is the retry record (including the cgroup
+        // slot), so remove it only after every optional artifact is gone.
+        Self::remove_if_exists(&self.session_path(name))?;
         Ok(())
     }
 
@@ -295,8 +297,10 @@ impl StateStore {
     /// `SessionMeta.name`. Used by a cross-tab pane move: the tab is encoded in
     /// the session name, so moving a pane IS a rename.
     ///
-    /// Crash-safe by ordering: the optional artifacts move first, then
-    /// `sessions/<to>.json` is written, and `sessions/<from>.json` is removed
+    /// Destination artifacts are preflighted and any completed artifact moves
+    /// are rolled back on error. Crash-safe ordering then moves the optional
+    /// artifacts first, writes `sessions/<to>.json`, and removes
+    /// `sessions/<from>.json`
     /// LAST. `sessions/*.json` is what `list_sessions` (and therefore restore)
     /// enumerates, so a crash at any point leaves either the old fully
     /// restorable session or the new one — never half of each. (A crash between
@@ -306,20 +310,48 @@ impl StateStore {
         let mut meta = self
             .read_session(from)?
             .ok_or_else(|| anyhow::anyhow!("no such session: {from}"))?;
-        for (old, new) in [
+        let moves = [
             (self.claude_path(from), self.claude_path(to)),
             (self.claude_settings_path(from), self.claude_settings_path(to)),
             (self.scrollback_path(from), self.scrollback_path(to)),
-        ] {
-            match fs::rename(&old, &new) {
-                Ok(()) => {}
+        ];
+        if let Some((_, path)) = moves.iter().find(|(_, path)| path.exists()) {
+            anyhow::bail!("target session artifact already exists: {}", path.display());
+        }
+        let mut moved = Vec::new();
+        for (old, new) in &moves {
+            match fs::rename(old, new) {
+                Ok(()) => moved.push((old, new)),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
+                Err(error) => {
+                    for (old, new) in moved.into_iter().rev() {
+                        if let Err(rollback) = fs::rename(new, old) {
+                            anyhow::bail!("{error}; rename rollback failed: {rollback}");
+                        }
+                    }
+                    return Err(error.into());
+                }
             }
         }
         meta.name = to.to_string();
-        self.write_session(&meta)?;
-        Self::remove_if_exists(&self.session_path(from))
+        if let Err(error) = self.write_session(&meta) {
+            for (old, new) in moved.into_iter().rev() {
+                if let Err(rollback) = fs::rename(new, old) {
+                    anyhow::bail!("{error}; rename rollback failed: {rollback}");
+                }
+            }
+            return Err(error);
+        }
+        if let Err(error) = Self::remove_if_exists(&self.session_path(from)) {
+            let _ = Self::remove_if_exists(&self.session_path(to));
+            for (old, new) in moved.into_iter().rev() {
+                if let Err(rollback) = fs::rename(new, old) {
+                    anyhow::bail!("{error}; rename rollback failed: {rollback}");
+                }
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn write_scrollback(&self, name: &str, bytes: &[u8]) -> anyhow::Result<()> {
@@ -767,6 +799,36 @@ mod tests {
         assert_eq!(store.read_scrollback("alpha").unwrap(), None);
         // The settings file too — otherwise every killed claude pane leaks one.
         assert!(!settings.exists());
+    }
+
+    #[test]
+    fn remove_session_keeps_authoritative_metadata_until_artifacts_are_deleted() {
+        let dir = tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        store.write_session(&sample_session("retryable")).unwrap();
+        store
+            .write_claude(
+                "retryable",
+                &ClaudeMeta {
+                    session_id: "sess-retry".to_string(),
+                    cwd: PathBuf::from("/tmp"),
+                    updated: 1,
+                },
+            )
+            .unwrap();
+        let blocked = store.scrollback_path("retryable");
+        std::fs::create_dir_all(&blocked).unwrap();
+
+        assert!(store.remove_session("retryable").is_err());
+        assert_eq!(
+            store.read_session("retryable").unwrap().unwrap().slot,
+            1,
+            "failed cleanup must retain the authoritative retry record"
+        );
+
+        std::fs::remove_dir(&blocked).unwrap();
+        store.remove_session("retryable").unwrap();
+        assert_eq!(store.read_session("retryable").unwrap(), None);
     }
 
     #[test]

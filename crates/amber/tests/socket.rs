@@ -576,6 +576,71 @@ fn kill_via_cli_removes_the_session() {
 }
 
 #[test]
+fn failed_kill_returns_error_and_does_not_broadcast_removal() {
+    let (socket_path, manager, dir) = start_daemon_with_manager();
+    manager
+        .create("blocked-kill", "/tmp", amber_core::state::SessionKind::Shell)
+        .unwrap();
+    // `remove_file` on this artifact must fail, leaving authoritative metadata
+    // and the live-table entry retryable.
+    std::fs::create_dir_all(dir.path().join("state/scrollback/blocked-kill.bin")).unwrap();
+
+    let mut watcher = connect_with_retry(&socket_path);
+    let mut watcher_decoder = Decoder::new();
+    send(&mut watcher, &Frame::Control(ControlMsg::WatchSessions));
+    read_frame_until(
+        &mut watcher,
+        &mut watcher_decoder,
+        |frame| matches!(frame, Frame::Control(ControlMsg::Sessions { .. })),
+        Duration::from_secs(5),
+    );
+
+    let mut control = connect_with_retry(&socket_path);
+    let mut control_decoder = Decoder::new();
+    send(
+        &mut control,
+        &Frame::Control(ControlMsg::Kill { name: "blocked-kill".into() }),
+    );
+    let error = read_frame_until(
+        &mut control,
+        &mut control_decoder,
+        |frame| matches!(frame, Frame::Control(ControlMsg::Error { .. })),
+        Duration::from_secs(5),
+    );
+    assert!(matches!(error, Frame::Control(ControlMsg::Error { .. })));
+
+    send(
+        &mut watcher,
+        &Frame::Control(ControlMsg::ListSessions),
+    );
+    loop {
+        let frame = read_frame_until(
+            &mut watcher,
+            &mut watcher_decoder,
+            |frame| {
+                matches!(
+                    frame,
+                    Frame::Control(
+                        ControlMsg::SessionsChanged { .. } | ControlMsg::SessionList { .. }
+                    )
+                )
+            },
+            Duration::from_secs(5),
+        );
+        match frame {
+            Frame::Control(ControlMsg::SessionsChanged { removed, .. }) => {
+                assert!(!removed.contains(&"blocked-kill".to_string()));
+            }
+            Frame::Control(ControlMsg::SessionList { names }) => {
+                assert!(names.contains(&"blocked-kill".to_string()));
+                break;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
 fn rename_via_cli_moves_the_session() {
     // `amber rename <from> <to>` over the real socket must succeed and be
     // independently visible; a rename of a nonexistent session must still

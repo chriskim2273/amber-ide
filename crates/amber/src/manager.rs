@@ -513,6 +513,30 @@ impl SessionManager {
         Ok(())
     }
 
+    fn rollback_agent_rename(
+        &self,
+        from: &str,
+        to: &str,
+        old_meta: &SessionMeta,
+        size: Option<(u16, u16)>,
+        store_moved: bool,
+    ) -> anyhow::Result<()> {
+        let cleanup_error = self.stop_session(old_meta.slot, None).err();
+        if store_moved {
+            self.store.rename_session(to, from)?;
+        }
+        self.cgroups.prepare_session(old_meta.slot)?;
+        let restored = self.restore_one(old_meta)?;
+        if let Some((rows, cols)) = size {
+            let _ = restored.resize(rows, cols);
+        }
+        self.sessions.lock().unwrap().insert(from.to_string(), restored);
+        if let Some(error) = cleanup_error {
+            eprintln!("amber daemon: rename rollback initial cleanup failed: {error}");
+        }
+        Ok(())
+    }
+
     /// Flush every live session's scrollback + metadata to the state store.
     /// Periodic snapshot (daemon healthy): re-detects hand-started claude with
     /// downgrade hysteresis.
@@ -717,6 +741,14 @@ impl SessionManager {
     /// child is spawned so a read failure cannot leak a freshly-spawned
     /// process.
     fn restore_one(&self, meta: &SessionMeta) -> anyhow::Result<Arc<PtySession>> {
+        #[cfg(test)]
+        {
+            let fail = self.root.join(".fail-restore");
+            if fail.exists() {
+                std::fs::remove_file(fail)?;
+                anyhow::bail!("injected restore failure");
+            }
+        }
         let scrollback = self.store.read_scrollback(&meta.name)?;
         // A shell that was running a hand-started claude comes back as a
         // supervised, resumable claude (which falls back to a shell when
@@ -891,14 +923,22 @@ impl SessionManager {
             .collect();
         let mut reaped = Vec::new();
         for (name, session) in dead {
-            let meta = self
-                .store
-                .read_session(&name)?
-                .ok_or_else(|| anyhow::anyhow!("dead session {name} has no metadata"))?;
-            self.stop_session(meta.slot, Some(&session))?;
-            self.store.remove_session(&name)?;
-            self.sessions.lock().unwrap().remove(&name);
-            reaped.push(name);
+            let result = (|| -> anyhow::Result<()> {
+                let meta = self
+                    .store
+                    .read_session(&name)?
+                    .ok_or_else(|| anyhow::anyhow!("dead session {name} has no metadata"))?;
+                self.stop_session(meta.slot, Some(&session))?;
+                self.store.remove_session(&name)?;
+                self.sessions.lock().unwrap().remove(&name);
+                Ok(())
+            })();
+            match result {
+                Ok(()) => reaped.push(name),
+                Err(error) => {
+                    eprintln!("amber daemon: could not reap session {name}: {error}");
+                }
+            }
         }
         Ok(reaped)
     }
@@ -945,27 +985,33 @@ impl SessionManager {
         }
         if let Err(error) = self.store.rename_session(from, to) {
             if old_meta.kind.is_agent() {
-                let restored = self
-                    .cgroups
-                    .prepare_session(old_meta.slot)
-                    .and_then(|_| {
-                        self.restore_one(&old_meta)
-                            .map_err(|error| std::io::Error::other(error.to_string()))
-                    });
-                if let Ok(restored) = restored {
-                    self.sessions.lock().unwrap().insert(from.to_string(), restored);
+                if let Err(rollback) =
+                    self.rollback_agent_rename(from, to, &old_meta, size, false)
+                {
+                    anyhow::bail!("{error}; rename rollback failed: {rollback}");
                 }
             }
             return Err(error);
         }
 
-        let meta = self
-            .store
-            .read_session(to)?
-            .ok_or_else(|| anyhow::anyhow!("renamed session {to} vanished from the store"))?;
+        let meta = SessionMeta { name: to.to_string(), ..old_meta.clone() };
         let sess = if meta.kind.is_agent() {
-            self.cgroups.prepare_session(meta.slot)?;
-            let fresh = self.restore_one(&meta)?;
+            let fresh = match self
+                .cgroups
+                .prepare_session(meta.slot)
+                .map_err(anyhow::Error::from)
+                .and_then(|_| self.restore_one(&meta))
+            {
+                Ok(fresh) => fresh,
+                Err(error) => {
+                    if let Err(rollback) =
+                        self.rollback_agent_rename(from, to, &old_meta, size, true)
+                    {
+                        anyhow::bail!("{error}; rename rollback failed: {rollback}");
+                    }
+                    return Err(error);
+                }
+            };
             if let Some((rows, cols)) = size {
                 let _ = fresh.resize(rows, cols);
             }
@@ -1357,6 +1403,42 @@ mod tests {
     }
 
     #[test]
+    fn reap_returns_successes_while_failed_cleanup_stays_retryable() {
+        let dir = tempdir().unwrap();
+        let cgroups = tempdir().unwrap();
+        let mgr = with_fake_cgroups(dir.path(), cgroups.path());
+        for name in ["blocked", "clean"] {
+            mgr.create(name, "/tmp", SessionKind::Shell).unwrap();
+            mgr.write(name, b"exit\n").unwrap();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while ["blocked", "clean"]
+            .iter()
+            .any(|name| mgr.session(name).unwrap().is_alive())
+        {
+            assert!(std::time::Instant::now() < deadline, "shells never exited");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let blocked_slot = mgr.store.read_session("blocked").unwrap().unwrap().slot;
+        let clean_slot = mgr.store.read_session("clean").unwrap().unwrap().slot;
+        let obstruction = cgroups
+            .path()
+            .join(format!("session-{blocked_slot}/workload/obstruction"));
+        std::fs::create_dir(&obstruction).unwrap();
+
+        let reaped = mgr.reap().unwrap();
+        assert_eq!(reaped, vec!["clean".to_string()]);
+        assert_eq!(mgr.names(), vec!["blocked".to_string()]);
+        assert!(mgr.store.read_session("blocked").unwrap().is_some());
+        assert!(cgroups.path().join(format!("session-{blocked_slot}")).exists());
+        assert!(!cgroups.path().join(format!("session-{clean_slot}")).exists());
+
+        std::fs::remove_dir(obstruction).unwrap();
+        assert_eq!(mgr.reap().unwrap(), vec!["blocked".to_string()]);
+        assert!(mgr.names().is_empty());
+    }
+
+    #[test]
     fn create_allocates_slot_before_spawn_and_rolls_back_cgroup_on_persist_failure() {
         // If the state store is unwritable, create must error, track nothing,
         // and kill the just-spawned child rather than leaking it.
@@ -1576,6 +1658,110 @@ mod tests {
             std::fs::canonicalize(dir.path()).unwrap_or_else(|_| dir.path().to_path_buf()),
             "cwd preserved"
         );
+    }
+
+    #[test]
+    fn agent_rename_rolls_back_a_partial_store_move() {
+        let dir = tempdir().unwrap();
+        let cgroups = tempdir().unwrap();
+        let mgr = with_fake_cgroups(dir.path(), cgroups.path());
+        let from = "amber-1-1-0-partial";
+        let to = "amber-1-2-0-partial";
+        mgr.create(from, dir.path(), SessionKind::Claude).unwrap();
+        let slot = mgr.store.read_session(from).unwrap().unwrap().slot;
+        mgr.store
+            .write_claude(
+                from,
+                &amber_core::state::ClaudeMeta {
+                    session_id: "conv-partial".to_string(),
+                    cwd: dir.path().to_path_buf(),
+                    updated: 1,
+                },
+            )
+            .unwrap();
+        let old_settings = dir.path().join(format!("claude/{from}.settings.json"));
+        std::fs::write(&old_settings, b"{}").unwrap();
+        // A conflicting target artifact must abort before mutating any source
+        // artifact; the stopped agent must still be restored under `from`.
+        std::fs::create_dir(dir.path().join(format!("claude/{to}.settings.json"))).unwrap();
+
+        assert!(mgr.rename(from, to).is_err());
+        assert!(mgr.session(from).is_some());
+        assert!(mgr.session(to).is_none());
+        assert_eq!(mgr.store.read_session(from).unwrap().unwrap().slot, slot);
+        assert_eq!(
+            mgr.store.read_claude(from).unwrap().unwrap().session_id,
+            "conv-partial"
+        );
+        assert!(old_settings.is_file());
+        assert!(mgr.store.read_session(to).unwrap().is_none());
+        assert!(cgroups.path().join(format!("session-{slot}")).is_dir());
+    }
+
+    #[test]
+    fn agent_rename_rolls_back_after_prepare_failure() {
+        let dir = tempdir().unwrap();
+        let cgroups = tempdir().unwrap();
+        let mgr = with_fake_cgroups(dir.path(), cgroups.path());
+        let from = "amber-1-1-0-prepare";
+        let to = "amber-1-2-0-prepare";
+        mgr.create(from, dir.path(), SessionKind::Claude).unwrap();
+        let slot = mgr.store.read_session(from).unwrap().unwrap().slot;
+        mgr.store
+            .write_claude(
+                from,
+                &amber_core::state::ClaudeMeta {
+                    session_id: "conv-prepare".to_string(),
+                    cwd: dir.path().to_path_buf(),
+                    updated: 1,
+                },
+            )
+            .unwrap();
+        std::fs::write(cgroups.path().join(format!(".fail-prepare-{slot}")), b"").unwrap();
+
+        assert!(mgr.rename(from, to).is_err());
+        assert!(mgr.session(from).is_some());
+        assert!(mgr.session(to).is_none());
+        assert_eq!(mgr.store.read_session(from).unwrap().unwrap().slot, slot);
+        assert_eq!(
+            mgr.store.read_claude(from).unwrap().unwrap().session_id,
+            "conv-prepare"
+        );
+        assert!(mgr.store.read_session(to).unwrap().is_none());
+        assert!(cgroups.path().join(format!("session-{slot}")).is_dir());
+    }
+
+    #[test]
+    fn agent_rename_rolls_back_after_restore_failure() {
+        let dir = tempdir().unwrap();
+        let cgroups = tempdir().unwrap();
+        let mgr = with_fake_cgroups(dir.path(), cgroups.path());
+        let from = "amber-1-1-0-restore";
+        let to = "amber-1-2-0-restore";
+        mgr.create(from, dir.path(), SessionKind::Claude).unwrap();
+        let slot = mgr.store.read_session(from).unwrap().unwrap().slot;
+        mgr.store
+            .write_claude(
+                from,
+                &amber_core::state::ClaudeMeta {
+                    session_id: "conv-restore".to_string(),
+                    cwd: dir.path().to_path_buf(),
+                    updated: 1,
+                },
+            )
+            .unwrap();
+        std::fs::write(dir.path().join(".fail-restore"), b"").unwrap();
+
+        assert!(mgr.rename(from, to).is_err());
+        assert!(mgr.session(from).is_some());
+        assert!(mgr.session(to).is_none());
+        assert_eq!(mgr.store.read_session(from).unwrap().unwrap().slot, slot);
+        assert_eq!(
+            mgr.store.read_claude(from).unwrap().unwrap().session_id,
+            "conv-restore"
+        );
+        assert!(mgr.store.read_session(to).unwrap().is_none());
+        assert!(cgroups.path().join(format!("session-{slot}")).is_dir());
     }
 
     #[test]

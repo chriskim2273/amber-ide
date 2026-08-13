@@ -150,6 +150,14 @@ impl CgroupManager {
             return Ok(());
         };
         if self.mount_point.is_none() {
+            #[cfg(test)]
+            {
+                let fail = root.join(format!(".fail-prepare-{slot}"));
+                if fail.exists() {
+                    fs::remove_file(fail)?;
+                    return Err(io::Error::other("injected cgroup prepare failure"));
+                }
+            }
             let paths = SessionPaths::new(root, slot)?;
             self.remove_session(slot)?;
             for path in [&paths.parent, &paths.supervisor, &paths.workload] {
