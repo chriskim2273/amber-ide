@@ -450,7 +450,30 @@ mod tests {
 
     #[test]
     fn record_session_refreshes_same_id_within_the_same_second() {
-        assert_eq!(refreshed_updated(Some(1_700_000_000), 1_700_000_000), 1_700_000_001);
+        let dir = tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        let previous_updated = now().saturating_add(3_600);
+        store
+            .write_claude(
+                "w",
+                &ClaudeMeta {
+                    session_id: "same-id".into(),
+                    cwd: "/a".into(),
+                    updated: previous_updated,
+                },
+            )
+            .unwrap();
+
+        record_session(&store, "w", r#"{"session_id":"same-id","cwd":"/a"}"#).unwrap();
+
+        assert_eq!(
+            store.read_claude("w").unwrap().unwrap(),
+            ClaudeMeta {
+                session_id: "same-id".into(),
+                cwd: "/a".into(),
+                updated: previous_updated + 1,
+            }
+        );
     }
 
     #[test]
