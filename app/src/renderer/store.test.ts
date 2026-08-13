@@ -31,9 +31,10 @@ describe('paneDot browser', () => {
 
 describe('terminal focus hint', () => {
   it('only allows an active terminal interaction to hint focus', () => {
-    expect(shouldHintTerminalFocus(true, true)).toBe(true)
-    expect(shouldHintTerminalFocus(false, true)).toBe(false)
-    expect(shouldHintTerminalFocus(true, false)).toBe(false)
+    expect(shouldHintTerminalFocus(true, true, true)).toBe(true)
+    expect(shouldHintTerminalFocus(true, true, false)).toBe(false)
+    expect(shouldHintTerminalFocus(false, true, true)).toBe(false)
+    expect(shouldHintTerminalFocus(true, false, true)).toBe(false)
   })
 })
 

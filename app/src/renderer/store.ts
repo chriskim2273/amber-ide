@@ -130,8 +130,8 @@ export function isAgentKind(kind: string): boolean {
 
 // Daemon Focus is a recent-use hint, so only a real interaction in the active
 // terminal earns one. Callers separately identify an xterm target.
-export function shouldHintTerminalFocus(active: boolean, terminalTarget: boolean): boolean {
-  return active && terminalTarget
+export function shouldHintTerminalFocus(active: boolean, terminalTarget: boolean, userArmed: boolean): boolean {
+  return active && terminalTarget && userArmed
 }
 
 // A pane's kind-dot appearance + tooltip, from its kind and agent run_state.

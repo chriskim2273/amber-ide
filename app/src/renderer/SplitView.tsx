@@ -234,7 +234,14 @@ export function SplitView(props: {
   // the hint (including clicking an already-focused xterm); suppress its paired
   // focus event. Programmatic keep-alive focus is suppressed separately.
   const pointerFocusRef = useRef<Set<string>>(new Set())
+  const userFocusRef = useRef<Set<string>>(new Set())
+  const keyboardFocusRef = useRef(false)
   const suppressedFocusRef = useRef<Set<string>>(new Set())
+
+  const armFocusHint = (id: string): void => {
+    userFocusRef.current.add(id)
+    requestAnimationFrame(() => userFocusRef.current.delete(id))
+  }
 
   const isTerminalTarget = (id: string, target: EventTarget | null): boolean => {
     const terminal = bodyEls.current.get(id)?.querySelector('.xterm')
@@ -243,11 +250,12 @@ export function SplitView(props: {
 
   // Never programmatically focus a frozen pane's terminal — it's input-locked
   // (belt-and-suspenders alongside the overlay swallowing pointer events).
-  const focusPane = (id: string, hint = true): void => {
+  const focusPane = (id: string, userInitiated = true): void => {
     if (frozenRef.current.has(id)) return
     const input = bodyEls.current.get(id)?.querySelector('textarea')
     if (!input) return
-    if (!hint) {
+    if (userInitiated) armFocusHint(id)
+    else {
       suppressedFocusRef.current.add(id)
       requestAnimationFrame(() => suppressedFocusRef.current.delete(id))
     }
@@ -405,6 +413,12 @@ export function SplitView(props: {
       // window listener. Only the visible tab may act on a chord — otherwise a
       // close/zoom would fire against a hidden tab's stale focusedRef too.
       if (!activeRef.current) return
+      // A trusted Tab may move focus from chrome into xterm. Arm one active
+      // focus event; mount-time term.focus() has no preceding user key.
+      if (e.key === 'Tab' && e.isTrusted) {
+        keyboardFocusRef.current = true
+        requestAnimationFrame(() => { keyboardFocusRef.current = false })
+      }
       const c = appChord(e)
       if (!c) return
       // Type the skip-permissions flag into the focused pane's pty (no Enter).
@@ -619,13 +633,16 @@ export function SplitView(props: {
               display: hidden ? 'none' : undefined, zIndex: isZoomedPane ? 2 : undefined }}
             onFocusCapture={(e) => {
               setFocused(paneId)
-              if (!shouldHintTerminalFocus(props.active, isTerminalTarget(paneId, e.target))) return
-              if (suppressedFocusRef.current.delete(paneId) || pointerFocusRef.current.delete(paneId)) return
+              const pairedPointer = pointerFocusRef.current.delete(paneId)
+              const userArmed = userFocusRef.current.delete(paneId) || keyboardFocusRef.current
+              keyboardFocusRef.current = false
+              if (!shouldHintTerminalFocus(props.active, isTerminalTarget(paneId, e.target), userArmed)) return
+              if (suppressedFocusRef.current.delete(paneId) || pairedPointer) return
               props.onPaneFocus(paneId)
             }}
             onPointerDownCapture={(e) => {
               setFocused(paneId)
-              if (!shouldHintTerminalFocus(props.active, isTerminalTarget(paneId, e.target))) return
+              if (!shouldHintTerminalFocus(props.active, isTerminalTarget(paneId, e.target), true)) return
               pointerFocusRef.current.add(paneId)
               props.onPaneFocus(paneId)
               requestAnimationFrame(() => pointerFocusRef.current.delete(paneId))
