@@ -171,6 +171,20 @@ describe('reduce Memory', () => {
   })
 })
 
+describe('reduce MemoryPressure', () => {
+  it('stores aggregate pressure and no-ops identical refreshes', () => {
+    const first = reduce(initialState(), {
+      kind: 'MemoryPressure', level: 'critical', currentKb: 7_000_000,
+      budgetKb: 8_000_000, blocked: false,
+    })
+    expect(first.pressure).toEqual({ level: 'critical', currentKb: 7_000_000, budgetKb: 8_000_000, blocked: false })
+    expect(reduce(first, {
+      kind: 'MemoryPressure', level: 'critical', currentKb: 7_000_000,
+      budgetKb: 8_000_000, blocked: false,
+    })).toBe(first)
+  })
+})
+
 describe('paneDot', () => {
   it('shell kind is always the shell dot', () => {
     expect(paneDot('shell', undefined)).toEqual({ cls: 'shell', label: 'shell' })
@@ -182,6 +196,15 @@ describe('paneDot', () => {
     expect(paneDot('claude', 'claude-retrying')).toEqual({ cls: 'claude-retrying', label: 'claude (retrying)' })
     expect(paneDot('claude', 'shell-fallback')).toEqual({ cls: 'shell-fallback', label: 'shell (claude exited)' })
     expect(paneDot('claude', 'suspended')).toEqual({ cls: 'suspended', label: 'suspended (RAM freed)' })
+  })
+
+  it('renders memory-suspended as a distinct resumable agent state', () => {
+    expect(paneDot('claude', 'memory-suspended')).toEqual({
+      cls: 'memory-suspended',
+      label: 'claude (parked for memory)',
+    })
+    expect(paneDot('grok', 'memory-suspended').cls).toBe('memory-suspended')
+    expect(paneDot('codex', 'memory-suspended').cls).toBe('memory-suspended')
   })
 })
 
@@ -226,6 +249,25 @@ describe('tabDot', () => {
   })
   it('a mix of fallen-back and running claude → claude', () => {
     expect(tabDot([pane('claude', 'shell-fallback'), pane('claude', 'claude')]).cls).toBe('claude')
+  })
+  it('a retrying agent still wins over a memory-parked agent', () => {
+    expect(tabDot([pane('claude', 'memory-suspended'), pane('claude', 'claude-retrying')]).cls).toBe('claude-retrying')
+  })
+  it('a running agent keeps the normal dot beside a memory-parked agent', () => {
+    expect(tabDot([pane('claude', 'memory-suspended'), pane('claude', 'claude')]).cls).toBe('claude')
+  })
+  it('all memory-parked agents use the memory-suspended dot', () => {
+    expect(tabDot([pane('claude', 'memory-suspended'), pane('claude', 'memory-suspended')])).toEqual({
+      cls: 'memory-suspended', label: 'claude (parked for memory)',
+    })
+  })
+  it('a memory-parked agent remains parked beside a shell fallback', () => {
+    expect(tabDot([pane('claude', 'memory-suspended'), pane('claude', 'shell-fallback')])).toEqual({
+      cls: 'memory-suspended', label: 'claude (parked for memory)',
+    })
+  })
+  it('a shell fallback alone keeps the fallback dot', () => {
+    expect(tabDot([pane('claude', 'shell-fallback')])).toEqual({ cls: 'shell-fallback', label: 'shell (claude exited)' })
   })
   it('an all-grok tab reads grok', () => {
     expect(tabDot([pane('shell'), pane('grok', 'claude')])).toEqual({ cls: 'grok', label: 'grok' })

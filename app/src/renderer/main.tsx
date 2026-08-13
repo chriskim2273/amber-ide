@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useReducer, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
-import { SplitView, type PaneMeta } from './SplitView'
+import { SplitView, fmtMem, type PaneMeta } from './SplitView'
 import type { EditorApi } from './Editor'
 import { initialState, reduce, groupSessions, mergeBrowsers, mergeEditors, tabDot, hasActivity, isAgentKind, type DaemonEvent } from './store'
+import type { ControlMsg } from '../shared/proto'
 import { sessionRows } from './sessionRows'
 import { deriveTab, shortCwd } from './tabView'
 import { formatName, makeId, retargetPane } from '../shared/names'
@@ -71,11 +72,15 @@ declare global {
 function toEvent(d: unknown): DaemonEvent | null {
   const f = (d as { frame?: { type: string; msg?: Record<string, unknown> } }).frame
   if (f?.type !== 'control' || !f.msg) return null
-  const m = f.msg as { kind: string; [k: string]: unknown }
+  const m = f.msg as ControlMsg
   if (m.kind === 'Sessions') return { kind: 'Sessions', sessions: m['sessions'] as never }
   if (m.kind === 'SessionsChanged') return { kind: 'SessionsChanged', added: m['added'] as never, removed: m['removed'] as never }
   if (m.kind === 'Activity') return { kind: 'Activity', name: m['name'] as string }
   if (m.kind === 'MemoryStat') return { kind: 'Memory', name: m['name'] as string, rssKb: (m['rss_kb'] as number) ?? 0, growing: (m['growing'] as boolean) ?? false }
+  if (m.kind === 'MemoryPressure') return {
+    kind: 'MemoryPressure', level: m.level, currentKb: m.current_kb,
+    budgetKb: m.budget_kb, blocked: m.blocked,
+  }
   if (m.kind === 'Exit') return { kind: 'Exit', name: m['name'] as string, code: m['code'] as number }
   if (m.kind === 'Error') return { kind: 'Error', msg: m['msg'] as string }
   return null
@@ -224,6 +229,11 @@ function App(): JSX.Element {
   const onPaneTitle = useCallback((session: string, title: string): void => {
     const t = title.slice(0, 120)
     setTitles((prev) => (prev[session] === t ? prev : { ...prev, [session]: t }))
+  }, [])
+
+  const onPaneFocus = useCallback((name: string): void => {
+    if (isBrowserName(name) || isEditorName(name)) return
+    window.amber.focusSession(name)
   }, [])
 
   // Prune titles whose session the daemon removed (state.sessions is the
@@ -965,6 +975,18 @@ function App(): JSX.Element {
           <button className="banner-close" aria-label="dismiss error" title="dismiss" onClick={() => dispatch({ kind: 'ClearError' })}>✕</button>
         </div>
       )}
+      {state.pressure && state.pressure.level !== 'normal' && (() => {
+        const { level, currentKb, budgetKb, blocked } = state.pressure
+        const message = level === 'warning'
+          ? `Amber memory usage is high: ${fmtMem(currentKb)} of ${fmtMem(budgetKb)}. Idle agent panes may be parked.`
+          : blocked
+            ? 'Amber memory is critical, but no idle resumable agent pane can be parked. Close or freeze active work.'
+            : 'Amber is protecting system memory by parking idle agent panes.'
+        return <div className={`banner memory-banner ${level}`} role={level === 'warning' ? 'status' : 'alert'}>
+          <span className="dot" />
+          <span className="banner-msg">{message}</span>
+        </div>
+      })()}
       {notice && (
         <div className="banner notice-banner" role="status" aria-live="polite">
           <span className="dot" />
@@ -1107,7 +1129,7 @@ function App(): JSX.Element {
                     {layerTree
                       ? <SplitView tree={layerTree} active={isActive} deadCodes={d.deadCodes} meta={d.paneMeta}
                           epoch={reconnectEpoch} portEpoch={childEpoch}
-                          fontSize={fontSize} onPaneTitle={onPaneTitle}
+                          fontSize={fontSize} onPaneTitle={onPaneTitle} onPaneFocus={onPaneFocus}
                           zoomedPane={isActive ? zoomedPane : null}
                           frozen={frozen}
                           onFreeze={freezePane}

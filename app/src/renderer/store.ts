@@ -18,6 +18,12 @@ export interface AppState {
   // KiB + a sustained-growth flag. Keyed by session name; pruned with the live
   // set. Display-only — never affects lifecycle.
   mem: Record<string, { rssKb: number; growing: boolean }>
+  pressure: null | {
+    level: 'normal' | 'warning' | 'critical'
+    currentKb: number
+    budgetKb: number
+    blocked: boolean
+  }
 }
 export type DaemonEvent =
   | { kind: 'Sessions'; sessions: SessionInfo[] }
@@ -28,6 +34,7 @@ export type DaemonEvent =
   | { kind: 'Activity'; name: string }
   // Daemon: periodic per-session memory reading (child-tree RSS KiB + growth).
   | { kind: 'Memory'; name: string; rssKb: number; growing: boolean }
+  | { kind: 'MemoryPressure'; level: 'normal' | 'warning' | 'critical'; currentKb: number; budgetKb: number; blocked: boolean }
   // UI-originated: the visible tab's panes have been seen (active tab/ws change,
   // or activity for the already-visible tab) — mark their activity as seen.
   | { kind: 'MarkSeen'; names: string[] }
@@ -38,7 +45,7 @@ export interface TabModel { tab: number; panes: PaneModel[] }
 export interface WorkspaceModel { ws: number; tabs: TabModel[] }
 
 export function initialState(): AppState {
-  return { sessions: [], dead: {}, error: null, lastActivity: {}, lastSeen: {}, seq: 0, mem: {} }
+  return { sessions: [], dead: {}, error: null, lastActivity: {}, lastSeen: {}, seq: 0, mem: {}, pressure: null }
 }
 
 // Keep only the keys present in `live` (prunes per-session state for removed
@@ -88,6 +95,13 @@ export function reduce(state: AppState, ev: DaemonEvent): AppState {
       if (prev && prev.rssKb === ev.rssKb && prev.growing === ev.growing) return state
       return { ...state, mem: { ...state.mem, [ev.name]: { rssKb: ev.rssKb, growing: ev.growing } } }
     }
+    case 'MemoryPressure': {
+      const pressure = { level: ev.level, currentKb: ev.currentKb, budgetKb: ev.budgetKb, blocked: ev.blocked }
+      const prev = state.pressure
+      if (prev && prev.level === pressure.level && prev.currentKb === pressure.currentKb
+        && prev.budgetKb === pressure.budgetKb && prev.blocked === pressure.blocked) return state
+      return { ...state, pressure }
+    }
     case 'MarkSeen': {
       let changed = false
       const lastSeen = { ...state.lastSeen }
@@ -124,6 +138,7 @@ export function paneDot(kind: string, runState: string | undefined): KindDot {
   switch (runState) {
     case 'claude-retrying': return { cls: `${kind}-retrying`, label: `${kind} (retrying)` }
     case 'shell-fallback': return { cls: 'shell-fallback', label: `shell (${kind} exited)` }
+    case 'memory-suspended': return { cls: 'memory-suspended', label: `${kind} (parked for memory)` }
     // Slice 3: parked by a freeze grace — the agent killed to free RAM, resumable.
     case 'suspended': return { cls: 'suspended', label: 'suspended (RAM freed)' }
     default: return { cls: kind, label: kind }
@@ -141,6 +156,10 @@ export function tabDot(panes: PaneModel[]): KindDot {
   const k = kinds.size === 1 ? agents[0]!.kind : 'claude'
   if (agents.some((p) => p.runState === 'claude-retrying')) return { cls: `${k}-retrying`, label: `${k} (retrying)` }
   if (agents.every((p) => p.runState === 'shell-fallback')) return { cls: 'shell-fallback', label: `shell (${k} exited)` }
+  if (agents.some((p) => p.runState === 'memory-suspended')
+    && agents.every((p) => (p.runState === 'memory-suspended' || p.runState === 'shell-fallback'))) {
+    return { cls: 'memory-suspended', label: `${k} (parked for memory)` }
+  }
   return { cls: k, label: k }
 }
 

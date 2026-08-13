@@ -151,6 +151,7 @@ export function SplitView(props: {
   portEpoch: number
   fontSize: number
   onPaneTitle: (session: string, title: string) => void
+  onPaneFocus: (session: string) => void
   onSetRatio: (path: Array<'a' | 'b'>, ratio: number) => void
   onSplit: (paneId: string, dir: 'h' | 'v', kind?: PaneKind) => void
   onMove: (sourceId: string, targetId: string, zone: Zone) => void
@@ -601,8 +602,8 @@ export function SplitView(props: {
             style={{ left: box.x, top: box.y, width: box.w, height: box.h,
               opacity: drag?.source === paneId ? 0.4 : 1,
               display: hidden ? 'none' : undefined, zIndex: isZoomedPane ? 2 : undefined }}
-            onFocusCapture={() => setFocused(paneId)}
-            onMouseDownCapture={() => setFocused(paneId)}>
+            onFocusCapture={() => { setFocused(paneId); props.onPaneFocus(paneId) }}
+            onPointerDownCapture={() => { setFocused(paneId); props.onPaneFocus(paneId) }}>
             <div className="pane-header"
               onDoubleClick={(e) => { if (!(e.target as HTMLElement).closest('button')) props.onToggleZoom(paneId) }}
               onContextMenu={(e) => {
@@ -705,6 +706,11 @@ export function SplitView(props: {
                   <div className="frozen-note-text">{frozenEntry.note?.trim() || 'frozen'}</div>
                   <button className="frozen-unfreeze" aria-label="unfreeze pane"
                     onClick={() => props.onUnfreeze(paneId)}>⏵ unfreeze</button>
+                </div>}
+              {meta?.runState === 'memory-suspended' && !isFrozen && dead === undefined &&
+                <div className="memory-parked-overlay" role="status">
+                  <span>Parked to protect system memory</span>
+                  <button type="button" onClick={() => props.onPaneFocus(paneId)}>Resume</button>
                 </div>}
             </div>
           </div>
