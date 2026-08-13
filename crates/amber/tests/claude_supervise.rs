@@ -192,6 +192,69 @@ fn send_control(socket: &Path, message: ControlMsg) {
     stream.flush().unwrap();
 }
 
+#[cfg(target_os = "linux")]
+fn record_run_states_until_fallback(socket: &Path) -> std::thread::JoinHandle<Vec<String>> {
+    let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+    std::thread::spawn(move || {
+        let mut states = Vec::new();
+        loop {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut decoder = Decoder::new();
+            let mut buf = [0u8; 4096];
+            let (name, state, seq) = loop {
+                if let Some(Frame::Control(ControlMsg::ReportRunState {
+                    name,
+                    state,
+                    seq,
+                })) = decoder.next_frame().unwrap()
+                {
+                    break (name, state, seq);
+                }
+                let read = stream.read(&mut buf).unwrap();
+                assert!(read > 0, "reporter closed before sending a run-state frame");
+                decoder.feed(&buf[..read]);
+            };
+            stream
+                .write_all(&proto::encode(&Frame::Control(ControlMsg::RunStateAck {
+                    name,
+                    seq,
+                })))
+                .unwrap();
+            let terminal = state == "shell-fallback";
+            states.push(state);
+            if terminal {
+                return states;
+            }
+        }
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn run_slotted_agent(root: &Path, agent_path: &Path) -> (std::process::Output, Vec<String>) {
+    let store = StateStore::new(root);
+    let mut config = store.load_config().unwrap();
+    config.claude_path = Some(agent_path.to_path_buf());
+    store.save_config(&config).unwrap();
+
+    let fallback = root.join("fallback-shell");
+    fs::write(&fallback, "#!/bin/sh\nexit 0\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&fallback, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let socket = root.join("report.sock");
+    let recorder = record_run_states_until_fallback(&socket);
+    let output = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .args(["run", "work", "--kind", "claude", "--slot", "7"])
+        .current_dir(root)
+        .env("AMBER_STATE_DIR", root)
+        .env("AMBER_SOCK", &socket)
+        .env("HOME", root)
+        .env("SHELL", &fallback)
+        .output()
+        .unwrap();
+    (output, recorder.join().unwrap())
+}
+
 fn detailed_sessions(socket: &Path) -> Vec<SessionInfo> {
     let mut stream = UnixStream::connect(socket).unwrap();
     stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -322,6 +385,45 @@ fn crash_exhausts_to_outcome() {
             "claude".to_string(),
         ]
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn slotted_inner_exec_failure_never_reports_a_running_agent() {
+    let _exec_guard = exec_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let unexecutable = dir.path().join("agent-is-a-directory");
+    fs::create_dir(&unexecutable).unwrap();
+
+    let (output, states) = run_slotted_agent(dir.path(), &unexecutable);
+
+    assert!(
+        output.status.success(),
+        "fallback shell failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        states,
+        ["claude-retrying", "claude-retrying", "shell-fallback"],
+        "the wrapper starting is not proof that the real agent reached exec"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn successful_slotted_inner_exec_reports_a_running_agent() {
+    let _exec_guard = exec_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let agent = write_fake_claude(dir.path(), 0);
+
+    let (output, states) = run_slotted_agent(dir.path(), &agent);
+
+    assert!(
+        output.status.success(),
+        "fallback shell failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(states, ["claude", "shell-fallback"]);
 }
 
 #[test]

@@ -5,7 +5,7 @@
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
@@ -157,18 +157,16 @@ pub fn supervise_agent(
         // retry budget rather than aborting supervision ("a session never
         // silently dies", spec §6.2).
         let mut command = agent_command(agent_path, &argv, slot)?;
-        let outcome: std::io::Result<std::process::ExitStatus> = match command
+        command
             .current_dir(cwd)
             .env("AMBER_SESSION", name)
-            .env("AMBER_STATE_DIR", root)
-            .spawn()
-        {
+            .env("AMBER_STATE_DIR", root);
+        let outcome = match spawn_agent(&mut command, slot) {
             Err(e) => Err(e),
             Ok(mut child) => {
-                // Process truth starts only after spawn succeeds. Reporting
-                // before `spawn()` made ENOENT/ETXTBSY look like a running
-                // agent and could make the guardian signal the supervisor at
-                // exactly the wrong phase.
+                // The exec-status handshake proves that the cgroup wrapper
+                // reached the real agent's exec. Wrapper spawn alone is not
+                // process truth and must not produce a running report.
                 report("claude");
                 'wait: loop {
                     // Prefer a real exit over a coincident suspend: if claude has
@@ -249,6 +247,66 @@ fn agent_command(
     Ok(command)
 }
 
+fn spawn_agent(command: &mut Command, slot: Option<u32>) -> std::io::Result<Child> {
+    #[cfg(target_os = "linux")]
+    if slot.is_some() {
+        return spawn_agent_via_wrapper(command);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = slot;
+    command.spawn()
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_agent_via_wrapper(command: &mut Command) -> std::io::Result<Child> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+
+    let (mut status_reader, status_writer) = UnixStream::pair()?;
+    let status_fd = status_writer.as_raw_fd();
+    command.env(crate::cgroup::EXEC_STATUS_FD_ENV, status_fd.to_string());
+    // SAFETY: the child hook calls only async-signal-safe fcntl on a captured
+    // descriptor. All allocation and environment work happens before spawn.
+    unsafe {
+        command.pre_exec(move || {
+            let flags = libc::fcntl(status_fd, libc::F_GETFD);
+            if flags == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::fcntl(status_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let spawned = command.spawn();
+    drop(status_writer);
+    let mut child = spawned?;
+    let mut status = Vec::new();
+    if let Err(error) = status_reader.read_to_end(&mut status) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    match status.as_slice() {
+        [] => Ok(child),
+        bytes if bytes.len() == std::mem::size_of::<i32>() => {
+            let raw = i32::from_ne_bytes(bytes.try_into().unwrap());
+            let _ = child.wait();
+            Err(std::io::Error::from_raw_os_error(raw))
+        }
+        _ => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid cgroup exec status",
+            ))
+        }
+    }
+}
+
 fn reclaim_workload(child: &mut std::process::Child, slot: Option<u32>) -> anyhow::Result<()> {
     reclaim_workload_with(child, slot, crate::cgroup::kill_workload_from_current)
 }
@@ -317,12 +375,20 @@ fn reclaim_workload_with(
             }
         }
     }
-    if cleaned_by_cgroup && child.try_wait()?.is_some() {
-        return Ok(());
+    if cleaned_by_cgroup {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("amber: workload cleanup status check failed; continuing: {error}");
+            }
+        }
     }
     crate::pty::kill_process_tree(pid);
     let _ = child.kill();
-    child.wait()?;
+    if let Err(error) = child.wait() {
+        eprintln!("amber: workload cleanup wait failed; keeping the supervisor parked: {error}");
+    }
     Ok(())
 }
 
@@ -802,6 +868,30 @@ mod tests {
             child.try_wait().unwrap().is_some(),
             "an empty workload cgroup must not make the supervisor wait on a live misplaced child"
         );
+    }
+
+    fn reap_outside_child(child: &std::process::Child) {
+        let pid = child.id() as i32;
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+    }
+
+    #[test]
+    fn reclaim_try_wait_error_keeps_the_supervisor_recoverable() {
+        let mut child = Command::new("/bin/true").spawn().unwrap();
+        reap_outside_child(&child);
+
+        reclaim_workload_with(&mut child, Some(7), |_| Ok(Some(true)))
+            .expect("try_wait cleanup failure must not escape the parked supervisor path");
+    }
+
+    #[test]
+    fn reclaim_wait_error_keeps_the_supervisor_recoverable() {
+        let mut child = Command::new("/bin/true").spawn().unwrap();
+        reap_outside_child(&child);
+
+        reclaim_workload_with(&mut child, None, |_| Ok(None))
+            .expect("wait cleanup failure must not escape the parked supervisor path");
     }
 
     #[test]
