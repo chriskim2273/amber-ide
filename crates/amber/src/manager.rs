@@ -596,6 +596,7 @@ impl SessionManager {
 
     fn snapshot_inner(&self, is_final: bool) -> anyhow::Result<()> {
         let _maint = self.maintenance.lock().unwrap();
+        self.finish_pending_rename()?;
         // Take a CHEAP COPY of the session handles and release the lock at once.
         //
         // This loop writes up to `scrollback_bytes` per session to disk and reads
@@ -715,7 +716,8 @@ impl SessionManager {
     /// deterministic; a failure to persist a repair is logged, never fatal.
     pub fn restore(&self) -> anyhow::Result<()> {
         let _maint = self.maintenance.lock().unwrap();
-        if !self.store.recover_pending_rename()? {
+        let recovery_complete = self.store.recover_pending_rename()?;
+        if !recovery_complete {
             eprintln!(
                 "amber daemon: restored authoritative rename while orphan cleanup remains pending"
             );
@@ -735,15 +737,22 @@ impl SessionManager {
             if meta.slot < 1 || !used.insert(meta.slot) {
                 meta.slot = alloc_slot(&used);
                 used.insert(meta.slot);
-                if let Err(e) = self.store.write_session(&meta) {
+                if recovery_complete {
+                    if let Err(e) = self.store.write_session(&meta) {
+                        eprintln!(
+                            "amber daemon: could not persist repaired slot for {}: {e}",
+                            meta.name
+                        );
+                    }
+                } else {
                     eprintln!(
-                        "amber daemon: could not persist repaired slot for {}: {e}",
+                        "amber daemon: deferred repaired slot for {} until rename cleanup completes",
                         meta.name
                     );
                 }
             }
             let restore_name = meta.name.clone();
-            meta = match self.normalize_restored_meta(meta) {
+            meta = match self.normalize_restored_meta(meta, recovery_complete) {
                 Ok(meta) => meta,
                 Err(error) => {
                     eprintln!("amber daemon: restore skipped session {restore_name}: {error}");
@@ -784,13 +793,19 @@ impl SessionManager {
         Ok(())
     }
 
-    fn normalize_restored_meta(&self, mut meta: SessionMeta) -> anyhow::Result<SessionMeta> {
+    fn normalize_restored_meta(
+        &self,
+        mut meta: SessionMeta,
+        persist: bool,
+    ) -> anyhow::Result<SessionMeta> {
         if meta.resume_as_claude {
             if meta.kind == SessionKind::Shell {
                 meta.kind = SessionKind::Claude;
             }
             meta.resume_as_claude = false;
-            self.store.write_session(&meta)?;
+            if persist {
+                self.store.write_session(&meta)?;
+            }
         }
         Ok(meta)
     }
@@ -1694,6 +1709,40 @@ mod tests {
     }
 
     #[test]
+    fn periodic_snapshot_does_not_mutate_metadata_while_rename_cleanup_is_pending() {
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        let from = "amber-1-1-0-snapshot";
+        let to = "amber-1-2-0-snapshot";
+        mgr.create(to, "/tmp", SessionKind::Shell).unwrap();
+        let sess = mgr.session(to).unwrap();
+        let expected = mgr.store.read_session(to).unwrap().unwrap();
+        mgr.store
+            .write_session(&SessionMeta { name: from.to_string(), ..expected.clone() })
+            .unwrap();
+        write_rename_journal(dir.path(), from, to, expected.clone());
+        let obstruction = dir.path().join(format!("claude/{from}.json"));
+        std::fs::create_dir_all(&obstruction).unwrap();
+
+        let target = std::fs::canonicalize(dir.path()).unwrap();
+        sess.write(format!("cd '{}'\n", target.display()).as_bytes()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while sess.live_cwd() != Some(target.clone()) {
+            assert!(std::time::Instant::now() < deadline, "shell never cd'd");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        assert!(mgr.snapshot().is_err(), "snapshot ignored pending rename cleanup");
+        assert_eq!(mgr.store.read_session(to).unwrap(), Some(expected));
+        assert!(dir.path().join("rename.json").exists());
+
+        std::fs::remove_dir(obstruction).unwrap();
+        mgr.snapshot().unwrap();
+        assert_eq!(mgr.store.read_session(to).unwrap().unwrap().cwd, target);
+        assert!(!dir.path().join("rename.json").exists());
+    }
+
+    #[test]
     fn snapshot_skips_a_session_whose_scrollback_did_not_change() {
         // The snapshot ran every 10 s and unconditionally cloned + rewrote every
         // ring. Measured live: 18 sessions all at their 2 MiB cap = 36 MiB of
@@ -1956,6 +2005,90 @@ mod tests {
         std::fs::remove_dir(obstruction).unwrap();
         mgr.remove(to).unwrap();
         assert!(!dir.path().join("rename.json").exists());
+    }
+
+    #[test]
+    fn second_restore_recovers_after_pending_cleanup_deferred_slot_repair() {
+        let dir = tempdir().unwrap();
+        let cgroups = tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        let from = "amber-1-1-0-slot";
+        let to = "amber-1-2-0-slot";
+        let source = SessionMeta {
+            name: from.to_string(),
+            cwd: PathBuf::from("/tmp"),
+            kind: SessionKind::Shell,
+            updated: 1,
+            resume_as_claude: false,
+            run_state: None,
+            slot: 0,
+        };
+        store.write_session(&source).unwrap();
+        store
+            .write_session(&SessionMeta { name: to.to_string(), ..source.clone() })
+            .unwrap();
+        write_rename_journal(dir.path(), from, to, source);
+        let obstruction = dir.path().join(format!("claude/{from}.json"));
+        std::fs::create_dir_all(&obstruction).unwrap();
+
+        let first = with_fake_cgroups(dir.path(), cgroups.path());
+        first.restore().unwrap();
+        assert_eq!(first.names(), vec![to.to_string()]);
+        assert_eq!(store.read_session(to).unwrap().unwrap().slot, 0);
+        let first_session = first.session(to).unwrap();
+        first.stop_session(1, Some(&first_session)).unwrap();
+
+        std::fs::remove_dir(obstruction).unwrap();
+        let second = with_fake_cgroups(dir.path(), cgroups.path());
+        second.restore().unwrap();
+        assert_eq!(second.names(), vec![to.to_string()]);
+        assert_eq!(store.read_session(to).unwrap().unwrap().slot, 1);
+        assert!(!dir.path().join("rename.json").exists());
+        second.remove(to).unwrap();
+    }
+
+    #[test]
+    fn second_restore_recovers_after_pending_cleanup_deferred_resume_normalization() {
+        let dir = tempdir().unwrap();
+        let cgroups = tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        let from = "amber-1-1-0-resume";
+        let to = "amber-1-2-0-resume";
+        let source = SessionMeta {
+            name: from.to_string(),
+            cwd: dir.path().to_path_buf(),
+            kind: SessionKind::Shell,
+            updated: 1,
+            resume_as_claude: true,
+            run_state: None,
+            slot: 1,
+        };
+        store.write_session(&source).unwrap();
+        store
+            .write_session(&SessionMeta { name: to.to_string(), ..source.clone() })
+            .unwrap();
+        write_rename_journal(dir.path(), from, to, source);
+        let obstruction = dir.path().join(format!("claude/{from}.json"));
+        std::fs::create_dir_all(&obstruction).unwrap();
+
+        let first = with_fake_cgroups(dir.path(), cgroups.path());
+        first.restore().unwrap();
+        assert_eq!(first.names(), vec![to.to_string()]);
+        let unchanged = store.read_session(to).unwrap().unwrap();
+        assert_eq!(unchanged.kind, SessionKind::Shell);
+        assert!(unchanged.resume_as_claude);
+        let first_session = first.session(to).unwrap();
+        first.stop_session(1, Some(&first_session)).unwrap();
+
+        std::fs::remove_dir(obstruction).unwrap();
+        let second = with_fake_cgroups(dir.path(), cgroups.path());
+        second.restore().unwrap();
+        assert_eq!(second.names(), vec![to.to_string()]);
+        let normalized = store.read_session(to).unwrap().unwrap();
+        assert_eq!(normalized.kind, SessionKind::Claude);
+        assert!(!normalized.resume_as_claude);
+        assert!(!dir.path().join("rename.json").exists());
+        second.remove(to).unwrap();
     }
 
     #[test]
