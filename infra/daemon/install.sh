@@ -29,6 +29,7 @@ build_and_install_bin() {
     mkdir -p "$BIN_DIR"
     install -m 0755 "$REPO_ROOT/target/release/amber" "$AMBER_BIN"
     log "installed $AMBER_BIN"
+    "$AMBER_BIN" ctl install-codex-skill
     case ":$PATH:" in
         *":$BIN_DIR:"*) ;;
         *) log "WARNING: $BIN_DIR is not on your PATH — add it to your shell profile" ;;
@@ -168,6 +169,7 @@ do_uninstall() {
 
     if [ "$purge_binary" = true ]; then
         if [ -f "$AMBER_BIN" ]; then
+            "$AMBER_BIN" ctl purge-codex-skill
             rm -f "$AMBER_BIN"
             log "removed $AMBER_BIN"
         else

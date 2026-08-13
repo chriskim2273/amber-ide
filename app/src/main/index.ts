@@ -128,6 +128,7 @@ async function installDaemon(): Promise<void> {
     const stable = join(home, '.local', 'bin', 'amber')
     await mkdir(dirname(stable), { recursive: true })
     await installBinary(amberBinary(), stable)
+    await spawnOk(stable, ['ctl', 'install-codex-skill'])
 
     if (process.platform === 'linux') {
       const unitDir = join(home, '.config', 'systemd', 'user')

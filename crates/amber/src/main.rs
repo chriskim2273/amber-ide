@@ -181,6 +181,10 @@ enum CtlAction {
         #[arg(long)]
         web: bool,
     },
+    #[command(hide = true)]
+    InstallCodexSkill,
+    #[command(hide = true)]
+    PurgeCodexSkill,
 }
 
 /// `$XDG_STATE_HOME/amber-ide`, falling back to `$HOME/.local/state/amber-ide`.
@@ -238,6 +242,8 @@ fn main() -> anyhow::Result<()> {
             CtlAction::Uninstall { dry_run, purge_binary, purge_state, web } => {
                 run_uninstall(dry_run, purge_binary, purge_state, web)
             }
+            CtlAction::InstallCodexSkill => run_install_codex_skill(),
+            CtlAction::PurgeCodexSkill => run_purge_codex_skill(),
         },
     }
 }
@@ -282,6 +288,42 @@ fn run_doctor(root: Option<PathBuf>) -> anyhow::Result<()> {
             std::process::exit(1);
         }
     }
+}
+
+fn codex_skill_home() -> anyhow::Result<PathBuf> {
+    std::env::var("HOME")
+        .ok()
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("amber ctl: HOME must be set and non-empty"))
+}
+
+fn codex_skill_conflict_warning() {
+    eprintln!(
+        "amber: ~/.agents/skills/claude-handoff exists but is not Amber-owned; leaving it unchanged"
+    );
+}
+
+fn run_install_codex_skill() -> anyhow::Result<()> {
+    let home = codex_skill_home()?;
+    let file = amber::codex_skill::skill_file(&home);
+    match amber::codex_skill::install(&home)? {
+        amber::codex_skill::InstallOutcome::Installed => println!("installed {}", file.display()),
+        amber::codex_skill::InstallOutcome::Updated => println!("updated {}", file.display()),
+        amber::codex_skill::InstallOutcome::Conflict => codex_skill_conflict_warning(),
+    }
+    Ok(())
+}
+
+fn run_purge_codex_skill() -> anyhow::Result<()> {
+    let home = codex_skill_home()?;
+    let file = amber::codex_skill::skill_file(&home);
+    match amber::codex_skill::remove(&home)? {
+        amber::codex_skill::RemoveOutcome::Removed => println!("removed {}", file.display()),
+        amber::codex_skill::RemoveOutcome::Missing => {}
+        amber::codex_skill::RemoveOutcome::Conflict => codex_skill_conflict_warning(),
+    }
+    Ok(())
 }
 
 /// Print (and consume) `last-crash-report.json` if the last boot found the

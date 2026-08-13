@@ -76,3 +76,27 @@ fn install_script_passes_bash_syntax_check() {
     let status = Command::new("bash").args(["-n", script]).status().unwrap();
     assert!(status.success(), "bash -n rejected {script}");
 }
+
+#[test]
+fn codex_skill_maintenance_commands_respect_ownership() {
+    let home = tempfile::tempdir().unwrap();
+    let amber = env!("CARGO_BIN_EXE_amber");
+    let install = Command::new(amber)
+        .args(["ctl", "install-codex-skill"])
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(install.status.success(), "{}", String::from_utf8_lossy(&install.stderr));
+    let file = home.path().join(".agents/skills/claude-handoff/SKILL.md");
+    assert!(std::fs::read_to_string(&file).unwrap().contains("<!-- amber-owned-skill -->"));
+
+    std::fs::write(&file, "user-owned\n").unwrap();
+    let conflict = Command::new(amber)
+        .args(["ctl", "purge-codex-skill"])
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(conflict.status.success());
+    assert_eq!(std::fs::read_to_string(file).unwrap(), "user-owned\n");
+    assert!(String::from_utf8_lossy(&conflict.stderr).contains("not Amber-owned"));
+}

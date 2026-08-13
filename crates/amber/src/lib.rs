@@ -4,6 +4,7 @@
 pub mod attach;
 pub mod claude;
 pub mod codex;
+pub mod codex_skill;
 pub mod daemon;
 pub mod grok;
 pub mod layout_cas;
