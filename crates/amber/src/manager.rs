@@ -332,6 +332,7 @@ impl SessionManager {
         name: &str,
         cwd: &Path,
         slot: u32,
+        start_suspended: bool,
     ) -> anyhow::Result<CommandBuilder> {
         let (program, args, role): (OsString, Vec<OsString>, CgroupRole) = match kind {
             SessionKind::Shell => {
@@ -384,6 +385,9 @@ impl SessionManager {
         };
         cmd.cwd(cwd);
         cmd.env("AMBER_STATE_DIR", self.root.to_string_lossy().to_string());
+        if start_suspended {
+            cmd.env("AMBER_START_SUSPENDED", "1");
+        }
         match kind {
             SessionKind::Shell => {
                 // A hand-started agent inherits the session identity for hooks.
@@ -404,9 +408,10 @@ impl SessionManager {
         name: &str,
         cwd: &Path,
         slot: u32,
+        start_suspended: bool,
     ) -> anyhow::Result<Arc<PtySession>> {
         let cwd = Self::resolve_cwd(cwd);
-        let mut cmd = self.command_for(kind, name, &cwd, slot)?;
+        let mut cmd = self.command_for(kind, name, &cwd, slot, start_suspended)?;
         // The daemon may run under systemd, which has no TERM — without a
         // color-capable terminal, claude (and any colored program) renders
         // monochrome. Force one on the pty regardless of the daemon's own env.
@@ -468,7 +473,7 @@ impl SessionManager {
         }
         let slot = alloc_slot(&Self::used_slots(&stored));
         self.cgroups.prepare_session(slot)?;
-        let sess = match self.spawn(kind, name, &cwd, slot) {
+        let sess = match self.spawn(kind, name, &cwd, slot, false) {
             Ok(sess) => sess,
             Err(error) => {
                 if let Err(cleanup) = self.stop_session(slot, None) {
@@ -603,6 +608,7 @@ impl SessionManager {
         to: &str,
         old_meta: &SessionMeta,
         size: Option<(u16, u16)>,
+        suspension: Option<(SuspendOrigin, u64)>,
         store_moved: bool,
     ) -> anyhow::Result<()> {
         let cleanup_error = self.stop_session(old_meta.slot, None).err();
@@ -611,7 +617,7 @@ impl SessionManager {
             self.store.rename_session(to, from)?;
         }
         self.cgroups.prepare_session(old_meta.slot)?;
-        let restored = self.restore_one(old_meta)?;
+        let restored = self.restore_one_with_suspension(old_meta, suspension)?;
         if let Some((rows, cols)) = size {
             let _ = restored.resize(rows, cols);
         }
@@ -876,6 +882,14 @@ impl SessionManager {
     /// child is spawned so a read failure cannot leak a freshly-spawned
     /// process.
     fn restore_one(&self, meta: &SessionMeta) -> anyhow::Result<Arc<PtySession>> {
+        self.restore_one_with_suspension(meta, None)
+    }
+
+    fn restore_one_with_suspension(
+        &self,
+        meta: &SessionMeta,
+        suspension: Option<(SuspendOrigin, u64)>,
+    ) -> anyhow::Result<Arc<PtySession>> {
         #[cfg(test)]
         {
             let fail = self.root.join(".fail-restore");
@@ -885,9 +899,22 @@ impl SessionManager {
             }
         }
         let scrollback = self.store.read_scrollback(&meta.name)?;
-        let sess = self.spawn(meta.kind, &meta.name, &meta.cwd, meta.slot)?;
+        let sess = self.spawn(
+            meta.kind,
+            &meta.name,
+            &meta.cwd,
+            meta.slot,
+            suspension.is_some(),
+        )?;
         if let Some(bytes) = scrollback {
             sess.preload(&bytes);
+        }
+        if let Some((origin, started)) = suspension {
+            debug_assert_ne!(origin, SuspendOrigin::None);
+            sess.claim_suspend(origin).expect("fresh session cannot already be suspended");
+            sess.set_memory_suspend_started_ms(started);
+            sess.set_run_state(Some("suspended".to_string()));
+            sess.await_initial_suspend_ready();
         }
         // Do not infer "claude" merely because the supervisor process spawned:
         // the agent child may still fail to launch. The supervisor reports the
@@ -1119,6 +1146,17 @@ impl SessionManager {
         if seq > 0 {
             sess.set_run_state_seq(seq);
         }
+        if state == "suspended" {
+            sess.mark_initial_suspend_ready();
+            if sess.take_pending_resume() {
+                if let Err(error) = Self::signal_supervisor(name, &sess, nix::libc::SIGUSR2) {
+                    sess.restore_pending_resume();
+                    return Err(error);
+                }
+                sess.clear_suspend_origin();
+                sess.set_memory_suspend_started_ms(0);
+            }
+        }
         Ok(true)
     }
 
@@ -1221,6 +1259,10 @@ impl SessionManager {
             .unwrap_or(false);
         if !is_agent {
             anyhow::bail!("resume applies only to agent sessions: {name}");
+        }
+        if !session.initial_suspend_ready() {
+            session.queue_pending_resume();
+            return Ok(true);
         }
         Self::signal_supervisor(name, session, nix::libc::SIGUSR2)?;
         session.clear_suspend_origin();
@@ -1398,6 +1440,9 @@ impl SessionManager {
             .ok_or_else(|| anyhow::anyhow!("session {from} vanished from the store"))?;
         let size = sess.size();
         let _transition = old_meta.kind.is_agent().then(|| sess.lock_suspend_transition());
+        let suspension = (sess.suspend_origin() != SuspendOrigin::None).then(|| {
+            (sess.suspend_origin(), sess.memory_suspend_started_ms())
+        });
 
         if old_meta.kind.is_agent() {
             self.stop_session_locked(old_meta.slot, Some(&sess))?;
@@ -1405,7 +1450,7 @@ impl SessionManager {
         if let Err(error) = self.store.rename_session(from, to) {
             if old_meta.kind.is_agent() {
                 if let Err(rollback) =
-                    self.rollback_agent_rename(from, to, &old_meta, size, false)
+                    self.rollback_agent_rename(from, to, &old_meta, size, suspension, false)
                 {
                     anyhow::bail!("{error}; rename rollback failed: {rollback}");
                 }
@@ -1419,12 +1464,12 @@ impl SessionManager {
                 .cgroups
                 .prepare_session(meta.slot)
                 .map_err(anyhow::Error::from)
-                .and_then(|_| self.restore_one(&meta))
+                .and_then(|_| self.restore_one_with_suspension(&meta, suspension))
             {
                 Ok(fresh) => fresh,
                 Err(error) => {
                     if let Err(rollback) =
-                        self.rollback_agent_rename(from, to, &old_meta, size, true)
+                        self.rollback_agent_rename(from, to, &old_meta, size, suspension, true)
                     {
                         anyhow::bail!("{error}; rename rollback failed: {rollback}");
                     }
@@ -2756,6 +2801,64 @@ mod tests {
     }
 
     #[test]
+    fn agent_rename_keeps_manual_suspension_parked() {
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        let from = "amber-1-1-0-manual";
+        let to = "amber-1-2-0-manual";
+        let before = fake_agent(&mgr, from);
+        before.set_run_state(Some("suspended".into()));
+        before.claim_suspend(SuspendOrigin::Manual).unwrap();
+
+        mgr.rename(from, to).unwrap();
+
+        let after = mgr.session(to).unwrap();
+        assert_eq!(after.suspend_origin(), SuspendOrigin::Manual);
+        assert_eq!(after.memory_suspend_started_ms(), 0);
+        assert!(!mgr.focus_session(to).unwrap(), "focus must not resume a manual park");
+    }
+
+    #[test]
+    fn agent_rename_keeps_memory_suspension_resumable_on_focus() {
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        let from = "amber-1-1-0-memory";
+        let to = "amber-1-2-0-memory";
+        let before = fake_agent(&mgr, from);
+        before.set_run_state(Some("suspended".into()));
+        before.claim_suspend(SuspendOrigin::Memory).unwrap();
+        before.set_memory_suspend_started_ms(77);
+
+        mgr.rename(from, to).unwrap();
+
+        let after = mgr.session(to).unwrap();
+        assert_eq!(after.suspend_origin(), SuspendOrigin::Memory);
+        assert_eq!(after.memory_suspend_started_ms(), 77);
+        assert!(mgr.focus_session(to).unwrap(), "memory suspension must resume on focus");
+        assert_eq!(after.suspend_origin(), SuspendOrigin::Memory, "focus waits for the new supervisor");
+        assert!(after.pending_resume_for_test());
+    }
+
+    #[test]
+    fn initial_parked_resume_waits_for_the_supervisor_ready_report() {
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        let session = fake_agent(&mgr, "agent");
+        session.set_run_state(Some("suspended".into()));
+        session.claim_suspend(SuspendOrigin::Memory).unwrap();
+        session.await_initial_suspend_ready();
+
+        assert!(mgr.focus_session("agent").unwrap());
+        assert_eq!(session.suspend_origin(), SuspendOrigin::Memory);
+        assert!(session.pending_resume_for_test());
+
+        mgr.set_run_state("agent", "suspended").unwrap();
+        wait_for_output(&session, b"RESUME_SIGNAL");
+        assert_eq!(session.suspend_origin(), SuspendOrigin::None);
+        assert!(!session.pending_resume_for_test());
+    }
+
+    #[test]
     fn agent_rename_rolls_back_a_partial_store_move() {
         let dir = tempdir().unwrap();
         let cgroups = tempdir().unwrap();
@@ -2860,6 +2963,28 @@ mod tests {
     }
 
     #[test]
+    fn agent_rename_rollback_restores_the_original_suspension() {
+        for (origin, started) in [(SuspendOrigin::Manual, 0), (SuspendOrigin::Memory, 91)] {
+            let dir = tempdir().unwrap();
+            let mgr = SessionManager::new(dir.path()).unwrap();
+            let from = "amber-1-1-0-rollback";
+            let to = "amber-1-2-0-rollback";
+            let before = fake_agent(&mgr, from);
+            before.set_run_state(Some("suspended".into()));
+            before.claim_suspend(origin).unwrap();
+            before.set_memory_suspend_started_ms(started);
+            std::fs::write(dir.path().join(".fail-restore"), b"").unwrap();
+
+            assert!(mgr.rename(from, to).is_err(), "{origin:?}");
+
+            let restored = mgr.session(from).unwrap();
+            assert_eq!(restored.suspend_origin(), origin);
+            assert_eq!(restored.memory_suspend_started_ms(), started);
+            assert!(mgr.session(to).is_none());
+        }
+    }
+
+    #[test]
     fn agent_rollback_recovers_committed_journal_before_reverse_rename() {
         let dir = tempdir().unwrap();
         let mgr = SessionManager::new(dir.path()).unwrap();
@@ -2885,11 +3010,11 @@ mod tests {
         write_rename_journal(dir.path(), from, to, old_meta.clone());
 
         let first_ok = mgr
-            .rollback_agent_rename(from, to, &old_meta, size, true)
+            .rollback_agent_rename(from, to, &old_meta, size, None, true)
             .is_ok();
         if !first_ok {
             std::fs::remove_file(dir.path().join("rename.json")).unwrap();
-            mgr.rollback_agent_rename(from, to, &old_meta, size, true).unwrap();
+            mgr.rollback_agent_rename(from, to, &old_meta, size, None, true).unwrap();
         }
 
         assert!(first_ok, "stale committed journal blocked reverse rollback");

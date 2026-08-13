@@ -3,7 +3,7 @@
 //! capped scrollback [`Ring`] and to any live subscribers.
 
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
@@ -105,6 +105,11 @@ pub struct PtySession {
     suspend_origin: AtomicU8,
     last_user_ms: AtomicU64,
     memory_suspend_started_ms: AtomicU64,
+    /// A renamed, initially parked supervisor has not reported that its signal
+    /// handlers are installed yet. Resume requests wait here rather than
+    /// risking SIGUSR2's default action during exec startup.
+    initial_suspend_ready: AtomicBool,
+    pending_resume: AtomicBool,
     suspend_transition: Arc<Mutex<()>>,
     /// Optional output-activity notifier + its rate-limit clock, shared with
     /// the batcher thread. The batcher does a cheap atomic check on every
@@ -375,6 +380,8 @@ impl PtySession {
             suspend_origin: AtomicU8::new(SuspendOrigin::None as u8),
             last_user_ms: AtomicU64::new(monotonic_ms().max(1)),
             memory_suspend_started_ms: AtomicU64::new(0),
+            initial_suspend_ready: AtomicBool::new(true),
+            pending_resume: AtomicBool::new(false),
             suspend_transition,
             activity,
         })
@@ -475,6 +482,35 @@ impl PtySession {
 
     pub(crate) fn set_memory_suspend_started_ms(&self, value: u64) {
         self.memory_suspend_started_ms.store(value, Ordering::SeqCst);
+    }
+
+    pub(crate) fn await_initial_suspend_ready(&self) {
+        self.initial_suspend_ready.store(false, Ordering::SeqCst);
+    }
+
+    pub(crate) fn initial_suspend_ready(&self) -> bool {
+        self.initial_suspend_ready.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn mark_initial_suspend_ready(&self) {
+        self.initial_suspend_ready.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn queue_pending_resume(&self) {
+        self.pending_resume.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn take_pending_resume(&self) -> bool {
+        self.pending_resume.swap(false, Ordering::SeqCst)
+    }
+
+    pub(crate) fn restore_pending_resume(&self) {
+        self.pending_resume.store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_resume_for_test(&self) -> bool {
+        self.pending_resume.load(Ordering::SeqCst)
     }
 
     pub(crate) fn lock_suspend_transition(&self) -> MutexGuard<'_, ()> {
