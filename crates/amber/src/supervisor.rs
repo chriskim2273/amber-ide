@@ -201,10 +201,13 @@ pub fn supervise_agent(
                             // A delegated workload cleanup that cannot prove
                             // its cgroup is empty must stay running; reporting
                             // it as suspended would make the daemon believe a
-                            // possibly reparented descendant is contained.
+                            // possibly reparented descendant is contained. Tell
+                            // the daemon to roll back its claimed suspend origin
+                            // before accepting another suspend/resume gesture.
                             eprintln!(
                                 "amber: unable to safely suspend session {name}; keeping agent running: {error}"
                             );
+                            report("suspend-failed");
                             continue 'wait;
                         }
                         // SIGUSR1 is a coalescing flag. A duplicate manual request
