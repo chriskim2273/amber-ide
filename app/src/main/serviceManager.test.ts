@@ -1,5 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { restartDaemonCommand,
+  AMBER_SYSTEMD_UNIT,
+  linuxInstallServiceArgv,
   renderDaemonPlist,
   launchAgentPlistPath,
   launchctlBootstrapArgv,
@@ -107,6 +109,22 @@ describe('constants', () => {
   it('match the infra unit/label names', () => {
     expect(LAUNCHD_LABEL).toBe('com.amber-ide.daemon')
     expect(SYSTEMD_SERVICE).toBe('amber.service')
+  })
+
+  it('delegates memory with a soft aggregate boundary and no hard max', () => {
+    expect(AMBER_SYSTEMD_UNIT).toContain('Delegate=memory')
+    expect(AMBER_SYSTEMD_UNIT).toContain('MemoryAccounting=yes')
+    expect(AMBER_SYSTEMD_UNIT).toContain('MemoryHigh=50%')
+    expect(AMBER_SYSTEMD_UNIT).toContain('OOMPolicy=continue')
+    expect(AMBER_SYSTEMD_UNIT).not.toContain('MemoryMax=')
+  })
+
+  it('linux upgrade reloads, enables, then explicitly restarts', () => {
+    expect(linuxInstallServiceArgv()).toEqual([
+      { cmd: 'systemctl', args: ['--user', 'daemon-reload'] },
+      { cmd: 'systemctl', args: ['--user', 'enable', 'amber.service'] },
+      { cmd: 'systemctl', args: ['--user', 'restart', 'amber.service'] },
+    ])
   })
 })
 

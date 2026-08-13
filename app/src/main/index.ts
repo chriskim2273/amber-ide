@@ -21,6 +21,8 @@ import {
   stopDaemonFallbackCommand,
   bootUnitPath,
   restartDaemonCommand,
+  AMBER_SYSTEMD_UNIT,
+  linuxInstallServiceArgv,
 } from './serviceManager'
 import { backoffDelay, nextAttempt } from './clientSupervisor'
 import {
@@ -93,23 +95,6 @@ function layoutPath(): string {
   return root + '/ui-layout.json'
 }
 
-// systemd user unit, mirroring infra/daemon/amber.service. ExecStart uses the
-// STABLE ~/.local/bin/amber path (%h), never the ephemeral bundle mount.
-const AMBER_SYSTEMD_UNIT = `[Unit]
-Description=amber session daemon (persistent terminal workspace)
-
-[Service]
-Type=simple
-ExecStart=%h/.local/bin/amber daemon
-Restart=on-failure
-RestartSec=1
-KillSignal=SIGTERM
-TimeoutStopSec=10
-
-[Install]
-WantedBy=default.target
-`
-
 function spawnOk(cmd: string, args: string[]): Promise<void> {
   return new Promise((resolve, reject) => {
     const p = spawn(cmd, args, { stdio: 'ignore' })
@@ -137,11 +122,13 @@ async function installDaemon(): Promise<void> {
       const unitDir = join(home, '.config', 'systemd', 'user')
       await mkdir(unitDir, { recursive: true })
       await writeFile(join(unitDir, 'amber.service'), AMBER_SYSTEMD_UNIT)
-      await spawnOk('systemctl', ['--user', 'daemon-reload'])
       // enable-linger lets the user daemon run at boot before login (reboot
       // survival). Best-effort: don't fail the whole install if it's denied.
       await spawnOk('loginctl', ['enable-linger', process.env['USER'] ?? '']).catch(() => {})
-      await spawnOk('systemctl', ['--user', 'enable', '--now', 'amber.service'])
+      await spawnOk(stable, ['ctl', 'snapshot-now']).catch(() => {})
+      for (const command of linuxInstallServiceArgv()) {
+        await spawnOk(command.cmd, command.args)
+      }
       return
     }
     // macOS packaged: write the launchd agent plist to ~/Library/LaunchAgents

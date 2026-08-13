@@ -43,8 +43,10 @@ install_linux() {
     # enable-linger so the daemon starts at boot, before login, and survives logout.
     loginctl enable-linger "$USER" 2>/dev/null || \
         log "note: could not enable-linger (needs a logind session); boot-start may require it"
+    "$BIN_DIR/amber" ctl snapshot-now >/dev/null 2>&1 || true
     systemctl --user daemon-reload
-    systemctl --user enable --now amber.service
+    systemctl --user enable amber.service
+    systemctl --user restart amber.service
     log "systemd user unit enabled and started"
     log "status: systemctl --user status amber.service"
 }

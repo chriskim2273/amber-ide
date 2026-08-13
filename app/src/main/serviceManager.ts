@@ -8,6 +8,27 @@ import { join } from 'node:path'
 export const LAUNCHD_LABEL = 'com.amber-ide.daemon'
 export const SYSTEMD_SERVICE = 'amber.service'
 
+// systemd user unit, mirroring infra/daemon/amber.service. ExecStart uses the
+// stable ~/.local/bin/amber path (%h), never the ephemeral bundle mount.
+export const AMBER_SYSTEMD_UNIT = `[Unit]
+Description=amber session daemon (persistent terminal workspace)
+
+[Service]
+Type=simple
+Delegate=memory
+MemoryAccounting=yes
+MemoryHigh=50%
+OOMPolicy=continue
+ExecStart=%h/.local/bin/amber daemon
+Restart=on-failure
+RestartSec=1
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target
+`
+
 // launchd agent, mirroring infra/daemon/com.amber-ide.daemon.plist.in. A
 // packaged app has no repo to read the template from, so it is inlined here (the
 // same reason the systemd unit is inlined in index.ts). __AMBER_BIN__ is the
@@ -48,6 +69,14 @@ export function launchAgentPlistPath(home: string): string {
 export interface Argv {
   cmd: string
   args: string[]
+}
+
+export function linuxInstallServiceArgv(): Argv[] {
+  return [
+    { cmd: 'systemctl', args: ['--user', 'daemon-reload'] },
+    { cmd: 'systemctl', args: ['--user', 'enable', SYSTEMD_SERVICE] },
+    { cmd: 'systemctl', args: ['--user', 'restart', SYSTEMD_SERVICE] },
+  ]
 }
 
 // macOS install: bootstrap into the GUI domain (modern), fall back to load -w

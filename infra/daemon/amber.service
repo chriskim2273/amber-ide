@@ -6,6 +6,10 @@ Documentation=https://github.com/chriskim2273/amber-ide
 
 [Service]
 Type=simple
+Delegate=memory
+MemoryAccounting=yes
+MemoryHigh=50%
+OOMPolicy=continue
 ExecStart=%h/.local/bin/amber daemon
 Restart=on-failure
 RestartSec=1
