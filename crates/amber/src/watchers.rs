@@ -230,23 +230,42 @@ fn forward(
     weak: Weak<Mutex<UnixStream>>,
     entries: Arc<Mutex<Vec<Entry>>>,
 ) {
-    while let Ok(frame) = rx.recv() {
+    let queue_closed = loop {
+        let frame = match rx.recv() {
+            Ok(frame) => frame,
+            Err(_) => break true,
+        };
         let frame = match frame {
             QueuedFrame::Frame(frame) => frame,
             QueuedFrame::Initial(initial) => match initial.recv() {
                 Ok(frame) => frame,
-                Err(_) => break,
+                Err(_) => break true,
             },
         };
         if write_frame(&weak, &frame).is_err() {
-            break;
+            break false;
         }
+    };
+    // An evicted queue drops its last sender. Its forwarder may first drain
+    // already-queued frames, but must then close the still-live connection:
+    // the client missed the frame that triggered eviction and needs a full
+    // resync on reconnect.
+    if queue_closed {
+        shutdown_writer(&weak);
     }
     // Remove by the entry's never-reused id on every exit path, including a
     // vanished writer. This happens before `weak` is dropped, so its Arc
     // allocation cannot be reused while a raw-address registry key survives.
     // (Writer guard is released above — registry and writer locks never nest.)
     entries.lock().unwrap().retain(|e| e.id != id);
+}
+
+fn shutdown_writer(weak: &Weak<Mutex<UnixStream>>) {
+    let Some(writer) = weak.upgrade() else {
+        return;
+    };
+    let s = writer.lock().unwrap();
+    let _ = s.shutdown(Shutdown::Both);
 }
 
 fn write_frame(weak: &Weak<Mutex<UnixStream>>, frame: &[u8]) -> std::io::Result<()> {
@@ -475,6 +494,100 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         Ok(())
+    }
+
+    fn assert_eof(stream: &mut UnixStream) {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut buf = [0u8; 4096];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) => return,
+                Ok(_) => {}
+                Err(error) => panic!("watcher stayed connected after eviction: {error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn queue_full_behind_initial_snapshot_evicts_and_closes_the_client() {
+        // A full queue while the initial barrier is held drops a delta. The
+        // client must be disconnected, not left subscribed without that delta.
+        let watchers = Arc::new(Watchers::new());
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let writer = Arc::new(Mutex::new(server));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        let registering = {
+            let watchers = Arc::clone(&watchers);
+            let writer = Arc::clone(&writer);
+            thread::spawn(move || {
+                watchers.register_sessions(&writer, || {
+                    started_tx.send(()).unwrap();
+                    finish_rx.recv().unwrap();
+                    vec![]
+                });
+            })
+        };
+
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        for index in 0..=WATCHER_QUEUE_DEPTH {
+            watchers.broadcast(&ControlMsg::SessionsChanged {
+                added: vec![],
+                removed: vec![index.to_string()],
+            });
+        }
+        assert_eq!(watchers.watcher_count(), 0, "full queue must evict watcher");
+
+        finish_tx.send(()).unwrap();
+        registering.join().unwrap();
+        assert_eof(&mut client);
+        assert_eq!(watchers.watcher_count(), 0);
+        drop(writer);
+    }
+
+    #[test]
+    fn repeat_initial_snapshot_with_full_queue_evicts_and_closes_the_client() {
+        // Repeating WatchSessions is an Initial queue write too. If it cannot
+        // fit behind the held snapshot, the client must reconnect for a full
+        // resync rather than remain connected with no watcher entry.
+        let watchers = Arc::new(Watchers::new());
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let writer = Arc::new(Mutex::new(server));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        let registering = {
+            let watchers = Arc::clone(&watchers);
+            let writer = Arc::clone(&writer);
+            thread::spawn(move || {
+                watchers.register_sessions(&writer, || {
+                    started_tx.send(()).unwrap();
+                    finish_rx.recv().unwrap();
+                    vec![]
+                });
+            })
+        };
+
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        for index in 0..WATCHER_QUEUE_DEPTH {
+            watchers.broadcast(&ControlMsg::SessionsChanged {
+                added: vec![],
+                removed: vec![index.to_string()],
+            });
+        }
+        watchers.register_sessions(&writer, || panic!("full repeat must not build a snapshot"));
+        assert_eq!(
+            watchers.watcher_count(),
+            0,
+            "full repeat must evict watcher"
+        );
+
+        finish_tx.send(()).unwrap();
+        registering.join().unwrap();
+        assert_eof(&mut client);
+        assert_eq!(watchers.watcher_count(), 0);
+        drop(writer);
     }
 
     #[test]
