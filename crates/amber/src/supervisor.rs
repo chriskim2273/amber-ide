@@ -282,7 +282,7 @@ fn reclaim_workload_with(
     child: &mut std::process::Child,
     slot: Option<u32>,
     mut kill_workload: impl FnMut(u32) -> std::io::Result<Option<bool>>,
-    mut kill_process_tree: impl FnMut(u32),
+    kill_process_tree: impl FnMut(u32),
 ) -> anyhow::Result<()> {
     let pid = child.id();
     if let Some(slot) = slot {
@@ -323,20 +323,7 @@ fn reclaim_workload_with(
                         "amber: session slot {slot} cgroup cleanup is unavailable; \
                          reclaiming the process tree and keeping the supervisor parked: {error}"
                     );
-                    kill_process_tree(pid);
-                    let _ = child.kill();
-                    if let Err(wait_error) = child.wait() {
-                        eprintln!(
-                            "amber: workload fallback wait failed after cgroup error: {wait_error}"
-                        );
-                    }
-                    // The workload is gone (or best-effort killed), but the
-                    // `amber run` supervisor must stay alive in its parked
-                    // loop. Returning this cgroup error used to exit the pty
-                    // child, after which daemon reap deleted session metadata
-                    // and the resume record — turning a containment failure
-                    // into conversation loss.
-                    return Ok(());
+                    break;
                 }
             }
         }
@@ -908,6 +895,28 @@ mod tests {
             |_| kill_called = true,
         )
             .expect("ECHILD must keep the supervisor in its parked path");
+
+        assert!(!kill_called, "ECHILD must not signal a possibly recycled pid");
+    }
+
+    #[test]
+    fn nonretryable_cgroup_failure_never_signals_an_unowned_child() {
+        let mut child = Command::new("/bin/true").spawn().unwrap();
+        reap_outside_child(&child);
+        let mut kill_called = false;
+
+        reclaim_workload_with(
+            &mut child,
+            Some(7),
+            |_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected cgroup cleanup failure",
+                ))
+            },
+            |_| kill_called = true,
+        )
+        .expect("an unowned child must keep the supervisor in its parked path");
 
         assert!(!kill_called, "ECHILD must not signal a possibly recycled pid");
     }
