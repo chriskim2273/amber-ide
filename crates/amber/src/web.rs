@@ -225,6 +225,7 @@ pub fn origin_ok(origin: Option<&str>, host: Option<&str>, fwd_host: Option<&str
 pub enum BrowserMsg {
     Open { name: String },
     Close { name: String },
+    Focus { name: String },
     Create { name: String, cwd: String, kind: String },
     Kill { name: String },
     Move { from: String, to: String },
@@ -247,6 +248,7 @@ pub fn parse_browser_msg(text: &str) -> Option<BrowserMsg> {
     match v.get("t")?.as_str()? {
         "open" => Some(BrowserMsg::Open { name: f("name")? }),
         "close" => Some(BrowserMsg::Close { name: f("name")? }),
+        "focus" => Some(BrowserMsg::Focus { name: f("name")? }),
         "create" => Some(BrowserMsg::Create { name: f("name")?, cwd: f("cwd")?, kind: f("kind")? }),
         "kill" => Some(BrowserMsg::Kill { name: f("name")? }),
         "move" => Some(BrowserMsg::Move { from: f("from")?, to: f("to")? }),
@@ -324,6 +326,12 @@ pub fn map_browser_msg(
                 return Vec::new();
             }
             vec![ControlMsg::Detach { name: name.clone() }]
+        }
+        BrowserMsg::Focus { name } => {
+            if !live(name) {
+                return Vec::new();
+            }
+            vec![ControlMsg::Focus { name: name.clone() }]
         }
         BrowserMsg::Create { name, cwd, kind } => {
             // Grammar first: a name outside it belongs to no workspace, and
@@ -745,7 +753,8 @@ impl Hub {
         inner.clients[pos].open = match &msg {
             BrowserMsg::Open { name } => Some(name.clone()),
             BrowserMsg::Close { .. } => None,
-            BrowserMsg::Create { .. }
+            BrowserMsg::Focus { .. }
+            | BrowserMsg::Create { .. }
             | BrowserMsg::Kill { .. }
             | BrowserMsg::Move { .. }
             | BrowserMsg::Suspend { .. }
@@ -875,6 +884,24 @@ impl Hub {
                 let out = Out::Text(Arc::new(
                     serde_json::json!({ "t": "memory", "name": name, "rss_kb": rss_kb, "growing": growing })
                         .to_string(),
+                ));
+                Self::queue(&mut inner, |_| true, out);
+            }
+            Frame::Control(ControlMsg::MemoryPressure {
+                level,
+                current_kb,
+                budget_kb,
+                blocked,
+            }) => {
+                let out = Out::Text(Arc::new(
+                    serde_json::json!({
+                        "t": "memoryPressure",
+                        "level": level,
+                        "current_kb": current_kb,
+                        "budget_kb": budget_kb,
+                        "blocked": blocked,
+                    })
+                    .to_string(),
                 ));
                 Self::queue(&mut inner, |_| true, out);
             }
@@ -1422,6 +1449,10 @@ mod tests {
             Some(BrowserMsg::Close { name: "s".into() })
         );
         assert_eq!(
+            parse_browser_msg(r#"{"t":"focus","name":"s"}"#),
+            Some(BrowserMsg::Focus { name: "s".into() })
+        );
+        assert_eq!(
             parse_browser_msg(r#"{"t":"create","name":"s","cwd":"/tmp","kind":"shell"}"#),
             Some(BrowserMsg::Create { name: "s".into(), cwd: "/tmp".into(), kind: "shell".into() })
         );
@@ -1517,6 +1548,19 @@ mod tests {
         let live = [s("s", "shell")];
         assert!(map_browser_msg(&BrowserMsg::Open { name: "ghost".into() }, None, &live).is_empty());
         assert!(map_browser_msg(&BrowserMsg::Close { name: "ghost".into() }, None, &live)
+            .is_empty());
+        assert!(map_browser_msg(&BrowserMsg::Focus { name: "ghost".into() }, None, &live)
+            .is_empty());
+    }
+
+    #[test]
+    fn browser_focus_reaches_only_live_sessions() {
+        let live = [s("live", "shell")];
+        assert_eq!(
+            map_browser_msg(&BrowserMsg::Focus { name: "live".into() }, None, &live),
+            vec![ControlMsg::Focus { name: "live".into() }]
+        );
+        assert!(map_browser_msg(&BrowserMsg::Focus { name: "missing".into() }, None, &live)
             .is_empty());
     }
 
@@ -1737,6 +1781,7 @@ mod tests {
             r#"{"t":"open","name":"ghost"}"#,
             r#"{"t":"close","name":"s"}"#,
             r#"{"t":"close","name":"ghost"}"#,
+            r#"{"t":"focus","name":"s"}"#,
             r#"{"t":"resize","name":"s","cols":80,"rows":24}"#,
             r#"{"t":"kill","name":"s"}"#,
             r#"{"t":"create","name":"s","cwd":"/tmp","kind":"shell"}"#,
@@ -1761,6 +1806,7 @@ mod tests {
                                 out,
                                 ControlMsg::Attach { .. }
                                     | ControlMsg::Detach { .. }
+                                    | ControlMsg::Focus { .. }
                                     | ControlMsg::Create { .. }
                                     | ControlMsg::Kill { .. }
                                     | ControlMsg::Rename { .. }
@@ -1784,6 +1830,39 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn memory_pressure_is_broadcast_to_every_browser_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = Hub::new(dir.path().join("daemon.sock"), dir.path().to_path_buf());
+        let (_a, rx_a) = hub.add_client();
+        let (_b, rx_b) = hub.add_client();
+        for rx in [&rx_a, &rx_b] {
+            let _ = recv_out(rx);
+            let _ = recv_out(rx);
+        }
+
+        hub.on_frame(Frame::Control(ControlMsg::MemoryPressure {
+            level: "critical".into(),
+            current_kb: 7_000_000,
+            budget_kb: 8_000_000,
+            blocked: false,
+        }));
+
+        for rx in [&rx_a, &rx_b] {
+            let Out::Text(text) = recv_out(rx) else { panic!("expected pressure text") };
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+                serde_json::json!({
+                    "t": "memoryPressure",
+                    "level": "critical",
+                    "current_kb": 7_000_000,
+                    "budget_kb": 8_000_000,
+                    "blocked": false,
+                })
+            );
         }
     }
 

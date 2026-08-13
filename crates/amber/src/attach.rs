@@ -468,6 +468,7 @@ pub fn run_client(
     prefix: Option<u8>,
     ui: &StatusUi,
 ) -> anyhow::Result<ClientEnd> {
+    send_control(stream, ControlMsg::Focus { name: name.to_string() })?;
     send_control(stream, ControlMsg::Attach { name: name.to_string(), raw_client: true, preview: false })?;
 
     // Whether the bar can be shown at a given height: it needs the physical
@@ -833,6 +834,25 @@ mod tests {
         assert_eq!(
             frame,
             Frame::Control(ControlMsg::Attach { name: "s".into(), raw_client: true, preview: false })
+        );
+        drop(h.server);
+        let _ = h.done.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+
+    #[test]
+    fn client_sends_focus_before_raw_attach() {
+        let mut h = start_client();
+        assert_eq!(
+            h.server_read_until(|_| true),
+            Frame::Control(ControlMsg::Focus { name: "s".into() })
+        );
+        assert_eq!(
+            h.server_read_until(|_| true),
+            Frame::Control(ControlMsg::Attach {
+                name: "s".into(),
+                raw_client: true,
+                preview: false,
+            })
         );
         drop(h.server);
         let _ = h.done.recv_timeout(Duration::from_secs(5)).unwrap();

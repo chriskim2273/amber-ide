@@ -10,6 +10,19 @@ function roundtrip(f: Frame): Frame {
 }
 
 describe('proto', () => {
+  function decodeControlJson(json: string): Frame {
+    const jsonBytes = new TextEncoder().encode(json)
+    const wire = new Uint8Array(5 + jsonBytes.length)
+    new DataView(wire.buffer).setUint32(0, 1 + jsonBytes.length, false)
+    wire[4] = 0
+    wire.set(jsonBytes, 5)
+    const d = new Decoder()
+    d.feed(wire)
+    const frame = d.next()
+    if (!frame) throw new Error('no frame')
+    return frame
+  }
+
   it('roundtrips a control frame', () => {
     const f: Frame = { type: 'control', msg: { kind: 'WatchSessions' } }
     expect(roundtrip(f)).toEqual(f)
@@ -52,6 +65,32 @@ describe('proto', () => {
     const bodyLen = new DataView(wire.buffer).getUint32(0, false)
     const json = new TextDecoder().decode(wire.slice(5, 4 + bodyLen))
     expect(json).toBe('{"Activity":{"name":"amber-1-1-0-a"}}')
+  })
+
+  it('roundtrips Focus in the exact Rust serde shape', () => {
+    const f: Frame = { type: 'control', msg: { kind: 'Focus', name: 's' } }
+    expect(roundtrip(f)).toEqual(f)
+    const wire = encode(f)
+    const bodyLen = new DataView(wire.buffer).getUint32(0, false)
+    expect(new TextDecoder().decode(wire.slice(5, 4 + bodyLen)))
+      .toBe('{"Focus":{"name":"s"}}')
+  })
+
+  it('decodes MemoryPressure with additive numeric and boolean defaults', () => {
+    expect(decodeControlJson('{"MemoryPressure":{"level":"warning"}}')).toEqual({
+      type: 'control',
+      msg: { kind: 'MemoryPressure', level: 'warning', current_kb: 0, budget_kb: 0, blocked: false },
+    })
+    const full: Frame = {
+      type: 'control',
+      msg: { kind: 'MemoryPressure', level: 'critical', current_kb: 7_000_000, budget_kb: 8_000_000, blocked: true },
+    }
+    expect(roundtrip(full)).toEqual(full)
+  })
+
+  it('rejects an unknown MemoryPressure level', () => {
+    expect(() => decodeControlJson('{"MemoryPressure":{"level":"severe"}}'))
+      .toThrow(/pressure level/)
   })
 
   it('encodes DumpBacklog externally-tagged to match serde', () => {

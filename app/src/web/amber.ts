@@ -75,6 +75,7 @@ export type ServerMsg =
   | { t: 'backlogReply'; name: string }
   | { t: 'activity'; name: string }
   | { t: 'memory'; name: string; rss_kb: number; growing: boolean }
+  | { t: 'memoryPressure'; level: 'normal' | 'warning' | 'critical'; current_kb: number; budget_kb: number; blocked: boolean }
 
 /** Parse one JSON text frame from `amber web`. `null` for anything this
  * shim has no use for (malformed JSON, an unknown `t`). */
@@ -105,6 +106,17 @@ export function parseServerMsg(text: string): ServerMsg | null {
         rss_kb: (raw['rss_kb'] as number) ?? 0,
         growing: (raw['growing'] as boolean) ?? false,
       }
+    case 'memoryPressure': {
+      const level = raw['level']
+      if (level !== 'normal' && level !== 'warning' && level !== 'critical') return null
+      return {
+        t: 'memoryPressure',
+        level,
+        current_kb: (raw['current_kb'] as number) ?? 0,
+        budget_kb: (raw['budget_kb'] as number) ?? 0,
+        blocked: (raw['blocked'] as boolean) ?? false,
+      }
+    }
     default:
       return null
   }
@@ -117,7 +129,7 @@ export function parseServerMsg(text: string): ServerMsg | null {
  * passthrough), and the backlog messages need the binary payload that
  * arrives in a separate frame — see `ControlLink`. */
 export function toDaemonEvent(
-  m: Extract<ServerMsg, { t: 'sessions' | 'error' | 'activity' | 'memory' }>,
+  m: Extract<ServerMsg, { t: 'sessions' | 'error' | 'activity' | 'memory' | 'memoryPressure' }>,
 ): unknown {
   switch (m.t) {
     case 'sessions':
@@ -131,6 +143,19 @@ export function toDaemonEvent(
         frame: {
           type: 'control',
           msg: { kind: 'MemoryStat', name: m.name, rss_kb: m.rss_kb, growing: m.growing },
+        },
+      }
+    case 'memoryPressure':
+      return {
+        frame: {
+          type: 'control',
+          msg: {
+            kind: 'MemoryPressure',
+            level: m.level,
+            current_kb: m.current_kb,
+            budget_kb: m.budget_kb,
+            blocked: m.blocked,
+          },
         },
       }
   }
@@ -402,6 +427,7 @@ export function createAmber(deps: AmberDeps): Window['amber'] {
     renameSession: (from, to): void => control.send({ t: 'move', from, to }),
     suspendSession: (name): void => control.send({ t: 'suspend', name }),
     resumeSession: (name): void => control.send({ t: 'resume', name }),
+    focusSession: (name): void => control.send({ t: 'focus', name }),
     dumpBacklog: (name): void => control.send({ t: 'dumpBacklog', name }),
 
     // --- native browser API, not a stub (spec §3 "Clipboard" row) ----------

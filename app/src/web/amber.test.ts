@@ -40,6 +40,8 @@ describe('parseServerMsg', () => {
     expect(parseServerMsg('{"t":"activity","name":"s"}')).toEqual({ t: 'activity', name: 's' })
     expect(parseServerMsg('{"t":"memory","name":"s","rss_kb":12,"growing":true}'))
       .toEqual({ t: 'memory', name: 's', rss_kb: 12, growing: true })
+    expect(parseServerMsg('{"t":"memoryPressure","level":"critical","current_kb":7000000,"budget_kb":8000000,"blocked":false}'))
+      .toEqual({ t: 'memoryPressure', level: 'critical', current_kb: 7000000, budget_kb: 8000000, blocked: false })
   })
 
   it('returns null for an unknown t or malformed JSON', () => {
@@ -59,6 +61,8 @@ describe('toDaemonEvent', () => {
       .toEqual({ frame: { type: 'control', msg: { kind: 'Activity', name: 's' } } })
     expect(toDaemonEvent({ t: 'memory', name: 's', rss_kb: 5, growing: false }))
       .toEqual({ frame: { type: 'control', msg: { kind: 'MemoryStat', name: 's', rss_kb: 5, growing: false } } })
+    expect(toDaemonEvent({ t: 'memoryPressure', level: 'warning', current_kb: 7, budget_kb: 10, blocked: true }))
+      .toEqual({ frame: { type: 'control', msg: { kind: 'MemoryPressure', level: 'warning', current_kb: 7, budget_kb: 10, blocked: true } } })
   })
 })
 
@@ -236,7 +240,7 @@ describe('ControlLink', () => {
     ])
   })
 
-  it('dispatches sessions/error/activity/memory as onDaemonEvent frames', () => {
+  it('dispatches sessions/error/activity/memory/pressure as onDaemonEvent frames', () => {
     const events: unknown[] = []
     const socket = new FakeSocket()
     new ControlLink(() => socket, (ev) => events.push(ev))
@@ -247,12 +251,14 @@ describe('ControlLink', () => {
     socket.emit(JSON.stringify({ t: 'error', msg: 'oops' }))
     socket.emit(JSON.stringify({ t: 'activity', name: 's' }))
     socket.emit(JSON.stringify({ t: 'memory', name: 's', rss_kb: 9, growing: true }))
+    socket.emit(JSON.stringify({ t: 'memoryPressure', level: 'critical', current_kb: 7, budget_kb: 8, blocked: false }))
 
     expect(events).toEqual([
       { frame: { type: 'control', msg: { kind: 'Sessions', sessions: [{ name: 's' }] } } },
       { frame: { type: 'control', msg: { kind: 'Error', msg: 'oops' } } },
       { frame: { type: 'control', msg: { kind: 'Activity', name: 's' } } },
       { frame: { type: 'control', msg: { kind: 'MemoryStat', name: 's', rss_kb: 9, growing: true } } },
+      { frame: { type: 'control', msg: { kind: 'MemoryPressure', level: 'critical', current_kb: 7, budget_kb: 8, blocked: false } } },
     ])
   })
 
@@ -325,6 +331,15 @@ describe('createAmber', () => {
     sockets[2]!.open()
     expect(sockets[1]!.sent).toEqual([JSON.stringify({ t: 'open', name: 'a' })])
     expect(sockets[2]!.sent).toEqual([JSON.stringify({ t: 'open', name: 'b' })])
+  })
+
+  it('focusSession emits the explicit focus shape exactly once', () => {
+    const socket = new FakeSocket()
+    const amber = createAmber(deps({ connectSocket: () => socket }))
+    socket.open()
+    socket.sent.length = 0
+    amber.focusSession('live')
+    expect(socket.sent).toEqual([JSON.stringify({ t: 'focus', name: 'live' })])
   })
 
   it('createSession/killSession/renameSession/suspendSession/resumeSession/dumpBacklog send the whitelist shapes', () => {

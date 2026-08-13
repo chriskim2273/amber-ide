@@ -431,6 +431,14 @@ fn handle_control(
                 );
             }
         }
+        ControlMsg::Focus { name } => {
+            if let Err(e) = manager.focus_session(&name) {
+                let _ = write_frame(
+                    writer,
+                    &Frame::Control(ControlMsg::Error { msg: e.to_string() }),
+                );
+            }
+        }
         ControlMsg::DumpBacklog { name } => {
             let Some(sess) = manager.session(&name) else {
                 let _ = write_frame(

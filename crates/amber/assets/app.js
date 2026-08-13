@@ -479,6 +479,7 @@ function main() {
     titleEl.textContent = name;
     viewList.hidden = true;
     viewTerm.hidden = false;
+    send({ t: 'focus', name: name });
     send({ t: 'open', name: name });
     syncGeom();
     term.focus();

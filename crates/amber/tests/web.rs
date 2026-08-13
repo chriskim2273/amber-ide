@@ -18,6 +18,7 @@ struct Fixture {
     sock: std::path::PathBuf,
     addr: std::net::SocketAddr,
     token: String,
+    manager: Arc<SessionManager>,
 }
 
 /// Boot a private daemon + an `amber web` bound to an ephemeral port.
@@ -44,7 +45,7 @@ fn fixture() -> Fixture {
             let _ = web::serve(tcp, sock, root, token);
         });
     }
-    Fixture { dir, sock, addr, token }
+    Fixture { dir, sock, addr, token, manager }
 }
 
 impl Fixture {
@@ -326,6 +327,30 @@ fn websocket_open_and_input_reach_the_pty_and_output_comes_back() {
     let text = String::from_utf8_lossy(&seen).into_owned();
     assert!(got_sessions_json, "no sessions push on the websocket");
     assert!(text.contains("amber-web-marker"), "pty output never returned: {text:?}");
+}
+
+#[test]
+fn websocket_focus_refreshes_a_live_session() {
+    let f = fixture();
+    let name = f.create_session();
+    let cookie = f.login();
+    assert!(wait_until(Duration::from_secs(10), || {
+        f.get("/api/sessions", Some(&cookie)).2.contains(&name)
+    }));
+    let session = f.manager.session(&name).unwrap();
+    let before = session.last_used_ms();
+    std::thread::sleep(Duration::from_millis(2));
+
+    let mut ws = ws_connect(&f, &cookie);
+    ws.send(tungstenite::Message::Text(
+        format!(r#"{{"t":"focus","name":"{name}"}}"#).into(),
+    ))
+    .unwrap();
+
+    assert!(
+        wait_until(Duration::from_secs(5), || session.last_used_ms() > before),
+        "browser focus never refreshed the live session"
+    );
 }
 
 #[test]
@@ -680,4 +705,3 @@ fn create_and_kill_from_the_browser_reach_the_daemon() {
         "browser Kill never reached the daemon"
     );
 }
-

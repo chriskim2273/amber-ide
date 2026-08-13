@@ -39,6 +39,7 @@ export type ControlMsg =
   | { kind: 'Create'; name: string; cwd: string; sessionKind: string }
   | { kind: 'Attach'; name: string }
   | { kind: 'Detach'; name: string }
+  | { kind: 'Focus'; name: string }
   | { kind: 'DumpBacklog'; name: string }
   | { kind: 'Backlog'; name: string; data: Uint8Array }
   | { kind: 'Kill'; name: string }
@@ -51,6 +52,7 @@ export type ControlMsg =
   | { kind: 'SessionsChanged'; added: SessionInfo[]; removed: string[] }
   | { kind: 'Activity'; name: string }
   | { kind: 'MemoryStat'; name: string; rss_kb: number; growing: boolean }
+  | { kind: 'MemoryPressure'; level: 'normal' | 'warning' | 'critical'; current_kb: number; budget_kb: number; blocked: boolean }
   | { kind: 'Created'; name: string }
   | { kind: 'Exit'; name: string; code: number }
   | { kind: 'Error'; msg: string }
@@ -91,6 +93,8 @@ function msgToJson(m: ControlMsg): unknown {
       return { Attach: { name: m.name } }
     case 'Detach':
       return { Detach: { name: m.name } }
+    case 'Focus':
+      return { Focus: { name: m.name } }
     case 'DumpBacklog':
       return { DumpBacklog: { name: m.name } }
     case 'Backlog':
@@ -114,6 +118,8 @@ function msgToJson(m: ControlMsg): unknown {
       return { SessionsChanged: { added: m.added, removed: m.removed } }
     case 'Activity':
       return { Activity: { name: m.name } }
+    case 'MemoryPressure':
+      return { MemoryPressure: { level: m.level, current_kb: m.current_kb, budget_kb: m.budget_kb, blocked: m.blocked } }
     case 'Created':
       return { Created: { name: m.name } }
     case 'Exit':
@@ -137,6 +143,7 @@ function jsonToMsg(v: unknown): ControlMsg {
       case 'Create': return { kind: 'Create', name: body['name'] as string, cwd: body['cwd'] as string, sessionKind: body['kind'] as string }
       case 'Attach': return { kind: 'Attach', name: body['name'] as string }
       case 'Detach': return { kind: 'Detach', name: body['name'] as string }
+      case 'Focus': return { kind: 'Focus', name: body['name'] as string }
       case 'DumpBacklog': return { kind: 'DumpBacklog', name: body['name'] as string }
       // serde encodes Vec<u8> as a JSON numeric array; rebuild the Uint8Array.
       case 'Backlog': return { kind: 'Backlog', name: body['name'] as string, data: Uint8Array.from(body['data'] as number[]) }
@@ -148,6 +155,19 @@ function jsonToMsg(v: unknown): ControlMsg {
       case 'SessionsChanged': return { kind: 'SessionsChanged', added: body['added'] as SessionInfo[], removed: body['removed'] as string[] }
       case 'Activity': return { kind: 'Activity', name: body['name'] as string }
       case 'MemoryStat': return { kind: 'MemoryStat', name: body['name'] as string, rss_kb: (body['rss_kb'] as number) ?? 0, growing: (body['growing'] as boolean) ?? false }
+      case 'MemoryPressure': {
+        const level = body['level']
+        if (level !== 'normal' && level !== 'warning' && level !== 'critical') {
+          throw new Error(`invalid pressure level: ${String(level)}`)
+        }
+        return {
+          kind: 'MemoryPressure',
+          level,
+          current_kb: (body['current_kb'] as number) ?? 0,
+          budget_kb: (body['budget_kb'] as number) ?? 0,
+          blocked: (body['blocked'] as boolean) ?? false,
+        }
+      }
       case 'Created': return { kind: 'Created', name: body['name'] as string }
       case 'Exit': return { kind: 'Exit', name: body['name'] as string, code: body['code'] as number }
       case 'Error': return { kind: 'Error', msg: body['msg'] as string }

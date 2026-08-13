@@ -3,6 +3,7 @@
 
 use amber::daemon::Daemon;
 use amber::manager::SessionManager;
+use amber::pty::SuspendOrigin;
 use amber::watchers::Watchers;
 use amber_core::proto::{self, ControlMsg, Decoder, Frame};
 use std::io::{Read, Write};
@@ -119,6 +120,29 @@ fn connect_with_retry(path: &Path) -> UnixStream {
 
 fn send(stream: &mut UnixStream, frame: &Frame) {
     stream.write_all(&proto::encode(frame)).unwrap();
+}
+
+fn prepare_trapped_agent(manager: &SessionManager, state_root: &Path, name: &str) {
+    manager
+        .create(name, "/tmp", amber_core::state::SessionKind::Shell)
+        .unwrap();
+    manager.write(name, b"stty -echo\n").unwrap();
+    thread::sleep(Duration::from_millis(50));
+    manager
+        .write(name, b"trap '' USR1 USR2; echo TRAPS_READY\n")
+        .unwrap();
+    let session = manager.session(name).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !session
+        .scrollback()
+        .windows(b"TRAPS_READY".len())
+        .any(|w| w == b"TRAPS_READY")
+    {
+        assert!(Instant::now() < deadline, "shell never installed signal traps");
+        thread::sleep(Duration::from_millis(10));
+    }
+    flip_kind_to_claude(state_root, name);
+    session.set_run_state(Some("claude".into()));
 }
 
 /// Pull frames from `stream` (via `decoder`) until `pred` matches one, or
@@ -918,6 +942,91 @@ fn stale_session_write_and_resize_do_not_kill_the_connection() {
         reply,
         Frame::Control(ControlMsg::SessionList { names: vec![] }),
         "connection died after a stale-session write/resize"
+    );
+}
+
+#[test]
+fn focus_refreshes_use_and_resumes_only_memory_suspension() {
+    let (socket_path, manager, dir) = start_daemon_with_manager();
+    prepare_trapped_agent(&manager, &dir.path().join("state"), "agent");
+    let session = manager.session("agent").unwrap();
+    session.claim_suspend(SuspendOrigin::Memory).unwrap();
+    let before = session.last_used_ms();
+    thread::sleep(Duration::from_millis(2));
+
+    let mut stream = connect_with_retry(&socket_path);
+    send(&mut stream, &Frame::Control(ControlMsg::Focus { name: "agent".into() }));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while session.suspend_origin() != SuspendOrigin::None {
+        assert!(Instant::now() < deadline, "focus never resumed memory suspension");
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(session.last_used_ms() > before);
+    assert_eq!(manager.session_infos().unwrap()[0].run_state.as_deref(), Some("claude"));
+}
+
+#[test]
+fn focus_never_resumes_manual_suspension() {
+    let (socket_path, manager, dir) = start_daemon_with_manager();
+    prepare_trapped_agent(&manager, &dir.path().join("state"), "agent");
+    let session = manager.session("agent").unwrap();
+    session.set_run_state(Some("suspended".into()));
+    session.claim_suspend(SuspendOrigin::Manual).unwrap();
+
+    let mut stream = connect_with_retry(&socket_path);
+    send(&mut stream, &Frame::Control(ControlMsg::Focus { name: "agent".into() }));
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(session.suspend_origin(), SuspendOrigin::Manual);
+    assert_eq!(manager.session_infos().unwrap()[0].run_state.as_deref(), Some("suspended"));
+}
+
+#[test]
+fn input_uses_the_same_focus_boundary_before_write() {
+    let (socket_path, manager, dir) = start_daemon_with_manager();
+    prepare_trapped_agent(&manager, &dir.path().join("state"), "agent");
+    let session = manager.session("agent").unwrap();
+    session.claim_suspend(SuspendOrigin::Memory).unwrap();
+
+    let mut stream = connect_with_retry(&socket_path);
+    send(
+        &mut stream,
+        &Frame::Data { session: "agent".into(), bytes: b"echo INPUT_AFTER_FOCUS\n".to_vec() },
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !session
+        .scrollback()
+        .windows(b"INPUT_AFTER_FOCUS".len())
+        .any(|w| w == b"INPUT_AFTER_FOCUS")
+    {
+        assert!(Instant::now() < deadline, "input never reached resumed session");
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(session.suspend_origin(), SuspendOrigin::None);
+}
+
+#[test]
+fn focus_of_unknown_session_returns_an_error_without_closing_connection() {
+    let (socket_path, _dir) = start_daemon();
+    let mut stream = connect_with_retry(&socket_path);
+    let mut decoder = Decoder::new();
+    send(&mut stream, &Frame::Control(ControlMsg::Focus { name: "ghost".into() }));
+    let error = read_frame_until(
+        &mut stream,
+        &mut decoder,
+        |f| matches!(f, Frame::Control(ControlMsg::Error { .. })),
+        Duration::from_secs(5),
+    );
+    assert!(matches!(error, Frame::Control(ControlMsg::Error { msg }) if msg.contains("no such session")));
+
+    send(&mut stream, &Frame::Control(ControlMsg::ListSessions));
+    assert_eq!(
+        read_frame_until(
+            &mut stream,
+            &mut decoder,
+            |f| matches!(f, Frame::Control(ControlMsg::SessionList { .. })),
+            Duration::from_secs(5),
+        ),
+        Frame::Control(ControlMsg::SessionList { names: vec![] })
     );
 }
 

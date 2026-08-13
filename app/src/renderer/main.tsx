@@ -34,6 +34,7 @@ declare global {
       renameSession: (from: string, to: string) => void
       suspendSession: (name: string) => void
       resumeSession: (name: string) => void
+      focusSession: (name: string) => void
       dumpBacklog: (name: string) => void
       // CAS (spec 2026-08-01 §6): `saveLayout` must be given the version
       // `loadLayout`/the previous `saveLayout` returned, so a concurrent
