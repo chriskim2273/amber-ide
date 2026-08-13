@@ -44,10 +44,10 @@ daemon (`amber`) that owns everything.
 - **Reboot survival:** the daemon snapshots session metadata + capped scrollback
   to disk on a timer *and* on `SIGTERM` (the pre-reboot final snapshot), then
   restores every session on start — deterministically, no `send-keys` replay.
-- **Claude Code sessions are supervised and resumed precisely.** A Claude pane
-  runs `amber run <name>`, which resumes the exact conversation id
-  (`claude --resume <id>`), rotating the id as it changes and falling back to a
-  shell so a pane never silently dies.
+- **Coding-agent sessions are supervised and resumed precisely.** Claude Code,
+  OpenAI Codex, and Grok panes run through `amber run <name>`, which resumes the
+  exact recorded conversation id and falls back to a shell so a pane never
+  silently dies.
 
 No tmux, no double terminal emulation. Raw pty bytes stream over a unix socket
 straight to a single xterm.js emulator.
@@ -79,11 +79,22 @@ straight to a single xterm.js emulator.
   auto-backoff.
 - Tab + workspace rename, tab close, drag-to-reorder tabs.
 
-**Claude Code**
-- A Claude pane is supervised by `amber run` — it resumes the **exact**
-  conversation id across restarts, rotates the id as it changes, and falls back
-  to a shell so a pane never silently dies.
-- Run-state dots: claude / retrying / shell-fallback.
+**Coding agents**
+- Claude Code, OpenAI Codex, and Grok are supported supervised pane kinds. Their
+  exact recorded conversations resume after agent crashes, unfreeze, daemon
+  restart, and machine reboot.
+- Codex remains its native terminal UI. Amber resolves the user-installed
+  `codex` executable through the login shell; it does not bundle Codex or own
+  authentication.
+- In Codex, run `$claude-handoff <CLAUDE_SESSION_ID>` (or choose the skill from
+  `/skills`) to import a read-only, provider-neutral handoff from a saved Claude
+  Code task. Codex verifies the live worktree and continues in its own session;
+  this does not convert or resume the Claude session natively.
+- Supervised panes run unattended. Codex receives
+  `--dangerously-bypass-approvals-and-sandbox` and
+  `--dangerously-bypass-hook-trust`; use Amber only in directories where that
+  trust level is acceptable.
+- Run-state dots: agent / retrying / shell-fallback.
 
 **Browser pane**
 - A web-viewer pane kind (Electron `<webview>` + URL bar); its URL persists and
@@ -95,6 +106,7 @@ straight to a single xterm.js emulator.
 
 **CLI (`amber`)** — works standalone from any terminal
 - `ls`, `create`, `attach` (newest or by name), `kill`, `rename`.
+- `handoff <CLAUDE_SESSION_ID>` prints a read-only Claude-to-Codex task handoff.
 - `attach` extras: `Ctrl-b d` tmux-style detach (remappable, `--no-prefix` to
   disable), OSC terminal title, a bottom status bar, and refusal to nest inside
   an existing amber pane.
@@ -198,6 +210,12 @@ Debian/Ubuntu; Xcode Command Line Tools on macOS) for native build steps.
 > **Odd-kernel note:** on some Linux kernels the dev GUI needs
 > `AMBER_NO_SANDBOX=1 AMBER_SOFTWARE_GL=1` to render (documented in `CLAUDE.md`).
 
+**4. Agent CLIs (optional)** — install the provider binaries you plan to use.
+Amber discovers `claude`, `codex`, and `grok` through your login shell. A
+missing provider only makes that pane fall back to a shell. `amber handoff`
+requires Claude Code because Claude itself summarizes the saved session without
+exposing its private transcript format.
+
 ### Build
 
 Clone, then build each half:
@@ -241,11 +259,12 @@ amber ctl status            # daemon health
 
 ## Status
 
-Early — `v0.0.1`, single-developer project. The daemon spine, Claude
-supervision, reboot restore, and the full Electron IDE surface (tabs,
-workspaces, splits, drag-to-rearrange, browser panes, workspace save/load) all
-work and have been verified on a live GUI. See the build-status checklist at the
-bottom of [`CLAUDE.md`](CLAUDE.md) for the detailed per-slice state.
+Early — `v0.0.1`, single-developer project. The daemon spine, Claude Code,
+Codex, and Grok supervision, reboot restore, and the full Electron IDE surface
+(tabs, workspaces, splits, drag-to-rearrange, browser panes, workspace
+save/load) work through automated coverage; live GUI verification remains
+feature-specific. See the build-status checklist at the bottom of
+[`CLAUDE.md`](CLAUDE.md) for the detailed per-slice state.
 
 ## License
 

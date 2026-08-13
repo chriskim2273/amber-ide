@@ -898,8 +898,16 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   Doctor records optional `codex_path`. App picker/dots/web create kinds extended.
   Scope cuts: no hand-started-codex detection, no filesystem session scan, no
   permission UI. Gates: Rust unit + clippy clean, app tests + typecheck green.
-  **A running daemon must be restarted to accept `kind:"codex"`.** Live create →
-  hook-record → kill/resume round-trip still manual when `codex` is on PATH.
+  **A running daemon must be restarted to accept `kind:"codex"`.** Fake-Codex
+  integration covers fresh launch → real `amber hook` ID capture → crash →
+  exact-ID resume, including both bypass flags and the never-`--last` invariant.
+  Renderer tests cover exact string IDs, shell quoting, control-byte rejection,
+  and the interactive picker. `$claude-handoff <id>` is installed as a
+  user-level Codex skill; fake-Claude tests cover its safe, non-persistent
+  handoff command and installer ownership guards. Full Rust/app gates are green.
+  A real installed-Codex create/kill/resume smoke remains manual because
+  isolated Amber state does not isolate Codex authentication and conversation
+  storage.
 
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**
