@@ -98,6 +98,57 @@ fn watcher_sees_create_and_kill_deltas() {
 }
 
 #[test]
+fn watcher_snapshot_arrives_before_later_deltas() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("amberd.sock");
+    let manager = Arc::new(SessionManager::new(dir.path()).unwrap());
+    let watchers = Arc::new(Watchers::new());
+    let listener = prepare_socket(&sock).unwrap();
+    let daemon = Daemon::new(Arc::clone(&manager), Arc::clone(&watchers));
+    std::thread::spawn(move || {
+        let _ = daemon.serve(listener);
+    });
+
+    let watcher = UnixStream::connect(&sock).unwrap();
+    let mut reader = watcher.try_clone().unwrap();
+    send(&watcher, ControlMsg::WatchSessions);
+    send(
+        &UnixStream::connect(&sock).unwrap(),
+        ControlMsg::Create {
+            name: "amber-1-1-0-after-watch".into(),
+            cwd: dir.path().to_string_lossy().into_owned(),
+            kind: "shell".into(),
+        },
+    );
+
+    let mut decoder = Decoder::new();
+    reader.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut buf = [0u8; 8192];
+    let first = loop {
+        if let Some(frame) = decoder.next_frame().unwrap() {
+            break frame;
+        }
+        let n = reader.read(&mut buf).expect("timed out waiting for initial snapshot");
+        assert!(n > 0, "watcher closed before its initial snapshot");
+        decoder.feed(&buf[..n]);
+    };
+    assert!(matches!(first, Frame::Control(ControlMsg::Sessions { .. })));
+    let delta = loop {
+        if let Some(Frame::Control(msg)) = decoder.next_frame().unwrap() {
+            break msg;
+        }
+        let n = reader.read(&mut buf).expect("timed out waiting for create delta");
+        assert!(n > 0, "watcher closed before create delta");
+        decoder.feed(&buf[..n]);
+    };
+    assert!(matches!(
+        delta,
+        ControlMsg::SessionsChanged { added, .. }
+            if added.iter().any(|info| info.name == "amber-1-1-0-after-watch")
+    ));
+}
+
+#[test]
 fn memory_pressure_reaches_only_versioned_opt_in_watchers() {
     let dir = tempfile::tempdir().unwrap();
     let sock = dir.path().join("amberd.sock");

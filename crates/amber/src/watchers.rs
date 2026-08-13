@@ -67,7 +67,12 @@ struct Entry {
     writer_key: usize,
     session_events: bool,
     pressure_version: u16,
-    tx: SyncSender<Arc<Vec<u8>>>,
+    tx: SyncSender<QueuedFrame>,
+}
+
+enum QueuedFrame {
+    Frame(Arc<Vec<u8>>),
+    Initial(Receiver<Arc<Vec<u8>>>),
 }
 
 pub struct Watchers {
@@ -102,6 +107,52 @@ impl Watchers {
         self.register_capability(writer, false, Some(version));
     }
 
+    /// Register a session watcher before building its full snapshot. Its
+    /// forwarder waits for that snapshot, so every delta queued meanwhile is
+    /// delivered after it without holding the registry lock across manager or
+    /// disk work.
+    pub fn register_sessions(
+        &self,
+        writer: &Arc<Mutex<UnixStream>>,
+        snapshot: impl FnOnce() -> Vec<amber_core::proto::SessionInfo>,
+    ) {
+        let writer_key = Arc::as_ptr(writer) as usize;
+        let (snapshot_tx, snapshot_rx) = sync_channel(1);
+        let forwarder = {
+            let mut entries = self.entries.lock().unwrap();
+            if let Some(index) = entries.iter().position(|entry| entry.writer_key == writer_key) {
+                if entries[index].session_events {
+                    return;
+                }
+                if entries[index].tx.try_send(QueuedFrame::Initial(snapshot_rx)).is_err() {
+                    entries.remove(index);
+                    return;
+                }
+                entries[index].session_events = true;
+                None
+            } else {
+                let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+                let (tx, rx) = sync_channel(WATCHER_QUEUE_DEPTH);
+                tx.send(QueuedFrame::Initial(snapshot_rx)).unwrap();
+                entries.push(Entry {
+                    id,
+                    writer_key,
+                    session_events: true,
+                    pressure_version: 0,
+                    tx,
+                });
+                Some((id, rx, Arc::downgrade(writer), Arc::clone(&self.entries)))
+            }
+        };
+        if let Some((id, rx, weak, entries)) = forwarder {
+            thread::spawn(move || forward(id, rx, weak, entries));
+        }
+        let initial = Arc::new(proto::encode(&Frame::Control(ControlMsg::Sessions {
+            sessions: snapshot(),
+        })));
+        let _ = snapshot_tx.send(initial);
+    }
+
     fn register_capability(
         &self,
         writer: &Arc<Mutex<UnixStream>>,
@@ -124,7 +175,7 @@ impl Watchers {
             writer_key,
             session_events,
             pressure_version: pressure_version.unwrap_or(0),
-            tx,
+            tx: tx.clone(),
         });
         drop(entries);
         let weak = Arc::downgrade(writer);
@@ -153,7 +204,7 @@ impl Watchers {
             if !include(e) {
                 return true;
             }
-            match e.tx.try_send(Arc::clone(&frame)) {
+            match e.tx.try_send(QueuedFrame::Frame(Arc::clone(&frame))) {
                 Ok(()) => true,
                 // Full: WATCHER_QUEUE_DEPTH undelivered low-rate events is
                 // the bounded grace — the watcher is wedged. Dropping the
@@ -178,32 +229,19 @@ impl Watchers {
 /// the watcher is evicted (queue dropped by `broadcast`).
 fn forward(
     id: u64,
-    rx: Receiver<Arc<Vec<u8>>>,
+    rx: Receiver<QueuedFrame>,
     weak: Weak<Mutex<UnixStream>>,
     entries: Arc<Mutex<Vec<Entry>>>,
 ) {
     while let Ok(frame) = rx.recv() {
-        // Connection dropped its writer: nothing to write to, just exit.
-        let Some(writer) = weak.upgrade() else { break };
-        let mut s = writer.lock().unwrap();
-        // Bounded hold of the shared mutex: the write can take at most
-        // WRITE_TIMEOUT. The tighter timeout is scoped to this write and the
-        // socket's PREVIOUS value restored afterwards — restored, not cleared,
-        // because the connection carries a `daemon::CLIENT_WRITE_TIMEOUT` and
-        // clearing it here would leave every later control-reply/Output write
-        // on this socket unbounded again. Saving the actual value also keeps
-        // this module independent of daemon.rs (unit-test pairs have none).
-        let prev = s.write_timeout().ok().flatten();
-        let res = s
-            .set_write_timeout(Some(WRITE_TIMEOUT))
-            .and_then(|()| crate::daemon::write_bounded(&mut s, &frame, WRITE_TIMEOUT));
-        let _ = s.set_write_timeout(prev);
-        if res.is_err() {
-            // Wedged (timeout) or dead. A timed-out write may have left a
-            // partial frame on the stream — it is no longer frame-aligned —
-            // so sever it entirely; later writes fail fast instead of
-            // blocking, and the client reconnects.
-            let _ = s.shutdown(Shutdown::Both);
+        let frame = match frame {
+            QueuedFrame::Frame(frame) => frame,
+            QueuedFrame::Initial(initial) => match initial.recv() {
+                Ok(frame) => frame,
+                Err(_) => break,
+            },
+        };
+        if write_frame(&weak, &frame).is_err() {
             break;
         }
     }
@@ -214,16 +252,46 @@ fn forward(
     entries.lock().unwrap().retain(|e| e.id != id);
 }
 
+fn write_frame(weak: &Weak<Mutex<UnixStream>>, frame: &[u8]) -> std::io::Result<()> {
+    // Connection dropped its writer: nothing to write to, just exit.
+    let Some(writer) = weak.upgrade() else {
+        return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer dropped"));
+    };
+    let mut s = writer.lock().unwrap();
+    // Bounded hold of the shared mutex: the write can take at most
+    // WRITE_TIMEOUT. The tighter timeout is scoped to this write and the
+    // socket's PREVIOUS value restored afterwards — restored, not cleared,
+    // because the connection carries a `daemon::CLIENT_WRITE_TIMEOUT` and
+    // clearing it here would leave every later control-reply/Output write
+    // on this socket unbounded again. Saving the actual value also keeps
+    // this module independent of daemon.rs (unit-test pairs have none).
+    let prev = s.write_timeout().ok().flatten();
+    let res = s
+        .set_write_timeout(Some(WRITE_TIMEOUT))
+        .and_then(|()| crate::daemon::write_bounded(&mut s, frame, WRITE_TIMEOUT));
+    let _ = s.set_write_timeout(prev);
+    if res.is_err() {
+        // Wedged (timeout) or dead. A timed-out write may have left a partial
+        // frame on the stream, so it can no longer carry a reply safely.
+        let _ = s.shutdown(Shutdown::Both);
+    }
+    res
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use amber_core::proto::Decoder;
+    use amber_core::proto::{Decoder, SessionInfo};
     use std::io::{Read, Write};
     use std::time::Duration;
 
     fn read_one(stream: &mut UnixStream) -> Option<Frame> {
-        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let mut dec = Decoder::new();
+        read_next(stream, &mut dec)
+    }
+
+    fn read_next(stream: &mut UnixStream, dec: &mut Decoder) -> Option<Frame> {
+        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let mut buf = [0u8; 4096];
         loop {
             if let Some(f) = dec.next_frame().unwrap() {
@@ -235,6 +303,90 @@ mod tests {
                 Err(_) => return None,
             }
         }
+    }
+
+    #[test]
+    fn initial_snapshot_precedes_delta_queued_while_it_is_built() {
+        // Hold the snapshot builder after registration. A concurrent delta
+        // must queue behind the initial full set, not overtake it on the
+        // forwarder and make the client overwrite a newer state as stale.
+        let watchers = Arc::new(Watchers::new());
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let writer = Arc::new(Mutex::new(server));
+        let (snapshot_started_tx, snapshot_started_rx) = std::sync::mpsc::channel();
+        let (finish_snapshot_tx, finish_snapshot_rx) = std::sync::mpsc::channel();
+        let registering = {
+            let watchers = Arc::clone(&watchers);
+            let writer = Arc::clone(&writer);
+            thread::spawn(move || {
+                watchers.register_sessions(&writer, || {
+                    snapshot_started_tx.send(()).unwrap();
+                    finish_snapshot_rx.recv().unwrap();
+                    vec![SessionInfo {
+                        name: "before".into(),
+                        cwd: "/tmp".into(),
+                        kind: "shell".into(),
+                        alive: true,
+                        updated: 0,
+                        run_state: None,
+                        claude_id: None,
+                        cols: 80,
+                        rows: 24,
+                        slot: 0,
+                    }]
+                });
+            })
+        };
+
+        snapshot_started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let delta = ControlMsg::SessionsChanged {
+            added: vec![],
+            removed: vec!["before".into()],
+        };
+        watchers.broadcast(&delta);
+        finish_snapshot_tx.send(()).unwrap();
+        registering.join().unwrap();
+
+        let mut decoder = Decoder::new();
+        assert!(matches!(
+            read_next(&mut client, &mut decoder),
+            Some(Frame::Control(ControlMsg::Sessions { sessions }))
+                if sessions.iter().any(|info| info.name == "before")
+        ));
+        assert_eq!(read_next(&mut client, &mut decoder), Some(Frame::Control(delta)));
+    }
+
+    #[test]
+    fn pressure_watcher_snapshot_precedes_delta_queued_while_it_is_built() {
+        let watchers = Arc::new(Watchers::new());
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let writer = Arc::new(Mutex::new(server));
+        watchers.register_pressure(&writer, 1);
+        let (snapshot_started_tx, snapshot_started_rx) = std::sync::mpsc::channel();
+        let (finish_snapshot_tx, finish_snapshot_rx) = std::sync::mpsc::channel();
+        let registering = {
+            let watchers = Arc::clone(&watchers);
+            let writer = Arc::clone(&writer);
+            thread::spawn(move || {
+                watchers.register_sessions(&writer, || {
+                    snapshot_started_tx.send(()).unwrap();
+                    finish_snapshot_rx.recv().unwrap();
+                    vec![]
+                });
+            })
+        };
+        snapshot_started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let delta = ControlMsg::SessionsChanged { added: vec![], removed: vec!["after".into()] };
+        watchers.broadcast(&delta);
+        finish_snapshot_tx.send(()).unwrap();
+        registering.join().unwrap();
+
+        let mut decoder = Decoder::new();
+        assert!(matches!(
+            read_next(&mut client, &mut decoder),
+            Some(Frame::Control(ControlMsg::Sessions { sessions })) if sessions.is_empty()
+        ));
+        assert_eq!(read_next(&mut client, &mut decoder), Some(Frame::Control(delta)));
     }
 
     #[test]

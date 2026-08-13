@@ -504,9 +504,7 @@ fn handle_control(
             }
         }
         ControlMsg::WatchSessions => {
-            watchers.register(writer);
-            let sessions = manager.session_infos().unwrap_or_default();
-            let _ = write_frame(writer, &Frame::Control(ControlMsg::Sessions { sessions }));
+            watchers.register_sessions(writer, || manager.session_infos().unwrap_or_default());
         }
         ControlMsg::WatchMemoryPressure { version } => {
             watchers.register_pressure(writer, version);
