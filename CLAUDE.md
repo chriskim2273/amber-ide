@@ -909,24 +909,29 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   isolated Amber state does not isolate Codex authentication and conversation
   storage.
 
-- [ ] Memory containment + guardian (2026-08-13) — implementation is complete,
-  but release verification remains open. Linux uses delegated cgroup-v2 slot
-  leaves to isolate the daemon, supervisors, workloads, and descendants;
+- [x] Memory containment + guardian (2026-08-13) — Linux implementation,
+  review, soak, and production rollout are complete. Linux uses delegated
+  cgroup-v2 slot leaves to isolate the daemon, supervisors, workloads, and
+  descendants;
   `MemoryHigh=50%` and per-session `memory.high` are soft boundaries with no
   default `MemoryMax`. The daemon snapshots before parking only old recorded
   agent sessions, preserves manual suspension, and resumes memory-origin panes
   on real terminal focus/input. macOS keeps RSS-based guardian parking without
-  cgroup throttling. Automated evidence: Rust 438 tests passed twice; app 478
-  passed with one intentional skip; equivalent warnings-as-errors clippy,
+  cgroup throttling. Automated evidence: Rust 486 tests passed twice; app 481
+  passed with one intentional skip; warnings-as-errors clippy,
   typecheck, bundle, systemd-unit, and lockfile gates passed. Rustfmt 1.9 still
   reports repository-wide pre-existing formatting differences, so the full
   automatic gate is not green. Private Linux proof under a 512 MiB transient
   service confirmed slot placement, reclaim without OOM, exact-id resume,
   manual-focus protection, rename/kill/restart persistence, and usable
   nondelegated fallback. A 1,820-second pressure soak completed 180/180 live
-  service and CLI samples with stable tasks and zero OOM events. **Still open:**
-  real-Mac verification, live desktop/mobile/banner checks, formatting cleanup,
-  and production rollout; production `amber.service` was not restarted.
+  service and CLI samples with stable tasks and zero OOM events. Production Linux
+  rollout restored all six sessions, placed daemon/supervisor/workload processes
+  in their delegated leaves, launched the new AppImage, and reduced Amber from a
+  10.7 GiB pre-upgrade peak to about 1.4 GiB with zero cgroup OOM events. This
+  host keeps a calibrated persistent 8 GiB `MemoryHigh` drop-in. **Still open:**
+  real-Mac verification, live mobile/banner gestures, and repository-wide
+  formatting cleanup.
 
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**
