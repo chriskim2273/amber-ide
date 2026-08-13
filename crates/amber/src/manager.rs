@@ -3,6 +3,7 @@
 //! tmux-resurrect (restore) and tmux-continuum (snapshot).
 
 use std::collections::{BTreeSet, HashMap};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -11,6 +12,7 @@ use amber_core::proto::{ControlMsg, SessionInfo};
 use amber_core::state::{Config, SessionKind, SessionMeta, StateStore};
 use portable_pty::CommandBuilder;
 
+use crate::cgroup::{CgroupManager, CgroupRole};
 use crate::pty::PtySession;
 use crate::watchers::Watchers;
 
@@ -146,6 +148,9 @@ pub struct SessionManager {
     /// cloned AND 36 MiB written every 10 s, almost all of it identical bytes.
     /// Pruned alongside `claude_absent` so a removed session leaves nothing.
     persisted_scrollback: Mutex<HashMap<String, u64>>,
+    cgroups: CgroupManager,
+    #[cfg(test)]
+    test_shell: Option<OsString>,
     /// Serialises snapshot against the operations that MOVE a session's stored
     /// artifacts (remove/rename). The snapshot deliberately writes to disk with
     /// `sessions` released — holding it there is what froze typing — so without
@@ -194,10 +199,18 @@ impl SessionManager {
     /// Open a manager rooted at `root`, loading config (defaults if absent).
     pub fn new(root: impl Into<PathBuf>) -> anyhow::Result<Self> {
         let root = root.into();
-        let store = StateStore::new(root.clone());
-        let cfg = store.load_config()?;
+        let cfg = StateStore::new(&root).load_config()?;
+        Self::new_with_cgroups(root, cfg, CgroupManager::disabled())
+    }
+
+    pub fn new_with_cgroups(
+        root: impl Into<PathBuf>,
+        cfg: Config,
+        cgroups: CgroupManager,
+    ) -> anyhow::Result<Self> {
+        let root = root.into();
         Ok(SessionManager {
-            store,
+            store: StateStore::new(&root),
             cfg,
             root,
             sessions: Mutex::new(HashMap::new()),
@@ -205,6 +218,9 @@ impl SessionManager {
             watchers: None,
             claude_absent: Mutex::new(HashMap::new()),
             persisted_scrollback: Mutex::new(HashMap::new()),
+            cgroups,
+            #[cfg(test)]
+            test_shell: None,
             maintenance: Mutex::new(()),
         })
     }
@@ -222,6 +238,12 @@ impl SessionManager {
     /// callers/tests that don't care keep using `new`.
     pub fn with_socket(mut self, socket: impl Into<PathBuf>) -> Self {
         self.socket = Some(socket.into());
+        self
+    }
+
+    #[cfg(test)]
+    fn with_test_shell(mut self, shell: impl Into<OsString>) -> Self {
+        self.test_shell = Some(shell.into());
         self
     }
 
@@ -280,46 +302,87 @@ impl SessionManager {
     /// directly; `Claude` spawns this same binary as `amber run <name>`,
     /// which supervises the real `claude --resume/--continue` process (and
     /// falls back to a shell) inside the pty (spec §6.2).
-    fn command_for(&self, kind: SessionKind, name: &str, cwd: &Path) -> anyhow::Result<CommandBuilder> {
-        match kind {
+    fn command_for(
+        &self,
+        kind: SessionKind,
+        name: &str,
+        cwd: &Path,
+        slot: u32,
+    ) -> anyhow::Result<CommandBuilder> {
+        let (program, args, role): (OsString, Vec<OsString>, CgroupRole) = match kind {
             SessionKind::Shell => {
-                let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-                let mut cmd = CommandBuilder::new(shell);
-                cmd.cwd(cwd);
-                // A claude the user starts by hand in this shell inherits these,
-                // so the global SessionStart hook can record its resume id
-                // against this session name.
-                cmd.env("AMBER_SESSION", name);
-                cmd.env("AMBER_STATE_DIR", self.root.to_string_lossy().to_string());
-                Ok(cmd)
+                #[cfg(test)]
+                let shell = self.test_shell.clone().unwrap_or_else(|| {
+                    std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into())
+                });
+                #[cfg(not(test))]
+                let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into());
+                (shell, Vec::new(), CgroupRole::Workload)
             }
             // All agents run the SAME `amber run <name>` supervisor; it reads
             // the kind from argv to decide which binary to launch and how.
             SessionKind::Claude | SessionKind::Grok | SessionKind::Codex => {
                 let exe = resolve_current_exe()?;
-                let mut cmd = CommandBuilder::new(exe);
                 // The kind is passed EXPLICITLY, not looked up from the store:
                 // `create` spawns the pty before it persists the metadata (the
                 // slot is allocated under the sessions lock, which the spawn
                 // must stay outside of), so a supervisor that read the store
                 // would race it and fall back to the wrong agent.
-                cmd.args(["run", name, "--kind", kind.as_str()]);
-                cmd.cwd(cwd);
-                cmd.env("AMBER_STATE_DIR", self.root.to_string_lossy().to_string());
-                // Tell the supervisor where to report its phase back. If unset
-                // (hand-started manager / tests), the supervisor falls back to
-                // the default socket derived from AMBER_STATE_DIR.
+                let args = vec![
+                    "run".into(),
+                    name.into(),
+                    "--kind".into(),
+                    kind.as_str().into(),
+                    "--slot".into(),
+                    slot.to_string().into(),
+                ];
+                (exe.into_os_string(), args, CgroupRole::Supervisor)
+            }
+        };
+        let mut cmd = if self.cgroups.is_enabled() {
+            let mut wrapped = CommandBuilder::new(resolve_current_exe()?);
+            wrapped.arg("__cgroup-exec");
+            wrapped.arg("--slot");
+            wrapped.arg(slot.to_string());
+            wrapped.arg("--role");
+            wrapped.arg(match role {
+                CgroupRole::Supervisor => "supervisor",
+                CgroupRole::Workload => "workload",
+            });
+            wrapped.arg("--");
+            wrapped.arg(&program);
+            wrapped.args(&args);
+            wrapped
+        } else {
+            let mut direct = CommandBuilder::new(program);
+            direct.args(args);
+            direct
+        };
+        cmd.cwd(cwd);
+        cmd.env("AMBER_STATE_DIR", self.root.to_string_lossy().to_string());
+        match kind {
+            SessionKind::Shell => {
+                // A hand-started agent inherits the session identity for hooks.
+                cmd.env("AMBER_SESSION", name);
+            }
+            SessionKind::Claude | SessionKind::Grok | SessionKind::Codex => {
                 if let Some(sock) = &self.socket {
                     cmd.env("AMBER_SOCK", sock.to_string_lossy().to_string());
                 }
-                Ok(cmd)
             }
         }
+        Ok(cmd)
     }
 
-    fn spawn(&self, kind: SessionKind, name: &str, cwd: &Path) -> anyhow::Result<Arc<PtySession>> {
+    fn spawn(
+        &self,
+        kind: SessionKind,
+        name: &str,
+        cwd: &Path,
+        slot: u32,
+    ) -> anyhow::Result<Arc<PtySession>> {
         let cwd = Self::resolve_cwd(cwd);
-        let mut cmd = self.command_for(kind, name, &cwd)?;
+        let mut cmd = self.command_for(kind, name, &cwd, slot)?;
         // The daemon may run under systemd, which has no TERM — without a
         // color-capable terminal, claude (and any colored program) renders
         // monochrome. Force one on the pty regardless of the daemon's own env.
@@ -367,24 +430,26 @@ impl SessionManager {
         // Store an absolute, stable cwd (not a relative `.`) so claude resume
         // works across daemon restarts / reboots regardless of launch context.
         let cwd = Self::resolve_cwd(&cwd.into());
-        let sess = self.spawn(kind, name, &cwd)?;
-        // Allocate + persist + insert under ONE lock hold, so two concurrent
-        // creates can't be handed the same slot.
-        let mut sessions = self.sessions.lock().unwrap();
-        // Under the lock, because the name is chosen by the CALLER off an
-        // earlier listing (bare `amber` picks the lowest free `s<n>`), so two
-        // concurrent creates can land on the same one. Inserting would drop the
-        // live session's Arc out of the table and orphan its child — silent
-        // data loss. Refuse instead, and kill the child spawned for the loser.
-        if sessions.contains_key(name) {
-            let _ = sess.kill();
+        let _maint = self.maintenance.lock().unwrap();
+        if self.sessions.lock().unwrap().contains_key(name) {
             anyhow::bail!("session {name} already exists");
         }
-        let slot = match Self::used_slots(&self.store, &sessions) {
-            Ok(used) => alloc_slot(&used),
-            Err(e) => {
-                let _ = sess.kill();
-                return Err(e);
+        let stored = self.store.list_sessions()?;
+        if stored.iter().any(|meta| meta.name == name) {
+            anyhow::bail!("session {name} already exists");
+        }
+        if self.sessions.lock().unwrap().contains_key(name) {
+            anyhow::bail!("session {name} already exists");
+        }
+        let slot = alloc_slot(&Self::used_slots(&stored));
+        self.cgroups.prepare_session(slot)?;
+        let sess = match self.spawn(kind, name, &cwd, slot) {
+            Ok(sess) => sess,
+            Err(error) => {
+                if let Err(cleanup) = self.stop_session(slot, None) {
+                    eprintln!("amber daemon: failed-create cleanup for slot {slot}: {cleanup}");
+                }
+                return Err(error);
             }
         };
         let meta = SessionMeta {
@@ -396,12 +461,16 @@ impl SessionManager {
             run_state: None,
             slot,
         };
-        if let Err(e) = self.store.write_session(&meta) {
-            // Don't leak the freshly-spawned child if persisting fails.
-            let _ = sess.kill();
-            return Err(e);
+        if let Err(error) = self.store.write_session(&meta) {
+            if let Err(cleanup) = self.stop_session(slot, Some(&sess)) {
+                eprintln!("amber daemon: failed-create cleanup for slot {slot}: {cleanup}");
+            }
+            return Err(error);
         }
-        sessions.insert(name.to_string(), Arc::clone(&sess));
+        self.sessions
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), Arc::clone(&sess));
         Ok(sess)
     }
 
@@ -411,16 +480,37 @@ impl SessionManager {
     /// number; handing that number to a new session would make `attach <n>`
     /// ambiguous, which is the exact bug slots exist to remove. A slot frees
     /// only when the session leaves the table (kill/reap).
-    fn used_slots(
-        store: &StateStore,
-        sessions: &HashMap<String, Arc<PtySession>>,
-    ) -> anyhow::Result<BTreeSet<u32>> {
-        Ok(store
-            .list_sessions()?
-            .into_iter()
-            .filter(|m| m.slot >= 1 && sessions.contains_key(&m.name))
-            .map(|m| m.slot)
-            .collect())
+    fn used_slots(metas: &[SessionMeta]) -> BTreeSet<u32> {
+        metas.iter().filter(|meta| meta.slot >= 1).map(|meta| meta.slot).collect()
+    }
+
+    fn stop_session(
+        &self,
+        slot: u32,
+        session: Option<&Arc<PtySession>>,
+    ) -> anyhow::Result<()> {
+        let mut empty = self.cgroups.kill_session(slot).unwrap_or(false);
+        if !empty {
+            if let Some(session) = session.filter(|session| session.is_alive()) {
+                if let Err(error) = session.kill() {
+                    let gone = error.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<std::io::Error>()
+                            .and_then(std::io::Error::raw_os_error)
+                            == Some(libc::ESRCH)
+                    });
+                    if !gone {
+                        return Err(error);
+                    }
+                }
+            }
+            empty = self.cgroups.kill_session(slot).unwrap_or(false);
+        }
+        if self.cgroups.is_enabled() && !empty {
+            anyhow::bail!("session cgroup {slot} remained populated");
+        }
+        self.cgroups.remove_session(slot)?;
+        Ok(())
     }
 
     /// Flush every live session's scrollback + metadata to the state store.
@@ -560,6 +650,7 @@ impl SessionManager {
     /// reassigned lowest-free. Restore order is by name, so the repair is
     /// deterministic; a failure to persist a repair is logged, never fatal.
     pub fn restore(&self) -> anyhow::Result<()> {
+        let _maint = self.maintenance.lock().unwrap();
         // Written on a clean SIGTERM/SIGINT exit (main.rs), consumed here.
         // Still present at startup means this boot follows an unclean death
         // (SIGKILL, oomd, power loss) rather than a normal restart/reinstall.
@@ -569,7 +660,6 @@ impl SessionManager {
 
         let mut metas = self.store.list_sessions()?;
         metas.sort_by(|a, b| a.name.cmp(&b.name));
-        let mut sessions = self.sessions.lock().unwrap();
         let mut used: BTreeSet<u32> = BTreeSet::new();
         let mut lost = Vec::new();
         for mut meta in metas {
@@ -583,12 +673,23 @@ impl SessionManager {
                     );
                 }
             }
+            if let Err(error) = self.cgroups.prepare_session(meta.slot) {
+                eprintln!("amber daemon: restore skipped session {}: {error}", meta.name);
+                lost.push(meta.name.clone());
+                continue;
+            }
             match self.restore_one(&meta) {
                 Ok(sess) => {
-                    sessions.insert(meta.name.clone(), sess);
+                    self.sessions.lock().unwrap().insert(meta.name.clone(), sess);
                 }
                 Err(e) => {
                     eprintln!("amber daemon: restore skipped session {}: {e}", meta.name);
+                    if let Err(cleanup) = self.stop_session(meta.slot, None) {
+                        eprintln!(
+                            "amber daemon: restore cleanup failed for {}: {cleanup}",
+                            meta.name
+                        );
+                    }
                     lost.push(meta.name.clone());
                 }
             }
@@ -621,7 +722,7 @@ impl SessionManager {
         // supervised, resumable claude (which falls back to a shell when
         // claude exits — so the pane never regresses).
         let kind = if meta.resume_as_claude { SessionKind::Claude } else { meta.kind };
-        let sess = self.spawn(kind, &meta.name, &meta.cwd)?;
+        let sess = self.spawn(kind, &meta.name, &meta.cwd, meta.slot)?;
         if let Some(bytes) = scrollback {
             sess.preload(&bytes);
         }
@@ -779,17 +880,27 @@ impl SessionManager {
     /// ends", spec §6.1), deleting their persisted artifacts so they are not
     /// respawned on the next daemon start. Returns the reaped names.
     pub fn reap(&self) -> anyhow::Result<Vec<String>> {
-        let mut sessions = self.sessions.lock().unwrap();
-        let dead: Vec<String> = sessions
+        let _maint = self.maintenance.lock().unwrap();
+        let dead: Vec<(String, Arc<PtySession>)> = self
+            .sessions
+            .lock()
+            .unwrap()
             .iter()
-            .filter(|(_, s)| !s.is_alive())
-            .map(|(n, _)| n.clone())
+            .filter(|(_, session)| !session.is_alive())
+            .map(|(name, session)| (name.clone(), Arc::clone(session)))
             .collect();
-        for name in &dead {
-            sessions.remove(name);
-            self.store.remove_session(name)?;
+        let mut reaped = Vec::new();
+        for (name, session) in dead {
+            let meta = self
+                .store
+                .read_session(&name)?
+                .ok_or_else(|| anyhow::anyhow!("dead session {name} has no metadata"))?;
+            self.stop_session(meta.slot, Some(&session))?;
+            self.store.remove_session(&name)?;
+            self.sessions.lock().unwrap().remove(&name);
+            reaped.push(name);
         }
-        Ok(dead)
+        Ok(reaped)
     }
 
     /// Rename a session — the daemon-side half of a cross-tab pane move (the
@@ -808,26 +919,44 @@ impl SessionManager {
     /// `claude/<to>.json` makes it `--resume` the SAME conversation; claude is a
     /// full-screen TUI, so the redraw is the only visible cost.
     ///
-    /// The whole operation is done under the `sessions` lock so a concurrent
-    /// snapshot can never observe (or persist) a half-rename.
     pub fn rename(&self, from: &str, to: &str) -> anyhow::Result<SessionInfo> {
         Self::validate_name(to)?;
-        // `maintenance` OUTERMOST, then sessions, then claude_absent — the same
-        // order `snapshot_inner` takes them. It keeps a concurrent snapshot from
-        // writing artifacts under `from` after they have been moved to `to`.
         let _maint = self.maintenance.lock().unwrap();
-        let mut sessions = self.sessions.lock().unwrap();
-        if sessions.contains_key(to) || self.store.read_session(to)?.is_some() {
+        if self.sessions.lock().unwrap().contains_key(to)
+            || self.store.read_session(to)?.is_some()
+        {
             anyhow::bail!("session already exists: {to}");
         }
-        let sess = sessions
-            .remove(from)
+        let sess = self
+            .sessions
+            .lock()
+            .unwrap()
+            .get(from)
+            .cloned()
             .ok_or_else(|| anyhow::anyhow!("no such session: {from}"))?;
-        self.claude_absent.lock().unwrap().remove(from);
+        let old_meta = self
+            .store
+            .read_session(from)?
+            .ok_or_else(|| anyhow::anyhow!("session {from} vanished from the store"))?;
+        let size = sess.size();
 
-        if let Err(e) = self.store.rename_session(from, to) {
-            sessions.insert(from.to_string(), sess); // leave the session as it was
-            return Err(e);
+        if old_meta.kind.is_agent() {
+            self.stop_session(old_meta.slot, Some(&sess))?;
+        }
+        if let Err(error) = self.store.rename_session(from, to) {
+            if old_meta.kind.is_agent() {
+                let restored = self
+                    .cgroups
+                    .prepare_session(old_meta.slot)
+                    .and_then(|_| {
+                        self.restore_one(&old_meta)
+                            .map_err(|error| std::io::Error::other(error.to_string()))
+                    });
+                if let Ok(restored) = restored {
+                    self.sessions.lock().unwrap().insert(from.to_string(), restored);
+                }
+            }
+            return Err(error);
         }
 
         let meta = self
@@ -835,17 +964,7 @@ impl SessionManager {
             .read_session(to)?
             .ok_or_else(|| anyhow::anyhow!("renamed session {to} vanished from the store"))?;
         let sess = if meta.kind.is_agent() {
-            // An agent pane is respawned so its supervisor re-binds to the new
-            // name (and resumes the same conversation). Deliberately keyed on
-            // the persisted kind, NOT on `kind || resume_as_claude`: a shell
-            // that merely HAS a hand-started claude inside it must not have its
-            // user's shell killed.
-            let size = sess.size();
-            let _ = sess.kill();
-            // If this spawn fails (pty/fork exhaustion — rare) the store is
-            // already consistent under `to`, so nothing is lost and the session
-            // comes back on the next daemon start; until then the client sees an
-            // Error and a stale `from` pane. Not worth an un-rename dance.
+            self.cgroups.prepare_session(meta.slot)?;
             let fresh = self.restore_one(&meta)?;
             if let Some((rows, cols)) = size {
                 let _ = fresh.resize(rows, cols);
@@ -862,7 +981,12 @@ impl SessionManager {
             }
             sess
         };
-        sessions.insert(to.to_string(), Arc::clone(&sess));
+        {
+            let mut sessions = self.sessions.lock().unwrap();
+            sessions.remove(from);
+            sessions.insert(to.to_string(), Arc::clone(&sess));
+        }
+        self.claude_absent.lock().unwrap().remove(from);
 
         Ok(SessionInfo {
             name: meta.name,
@@ -886,16 +1010,15 @@ impl SessionManager {
         // recreate the artifacts this is deleting (lock order: maintenance
         // before sessions, matching `snapshot_inner`).
         let _maint = self.maintenance.lock().unwrap();
-        // Bind the removed session to a local FIRST: on edition 2021 the
-        // `lock()` temporary in `if let Some(x) = lock().remove(..)` lives to
-        // the end of the if-let body, and `kill()` enumerates the process table
-        // (a full /proc walk). Holding `sessions` across that would stall
-        // session_infos(), the watcher broadcast and the snapshot timer.
-        let sess = self.sessions.lock().unwrap().remove(name);
-        if let Some(sess) = sess {
-            let _ = sess.kill();
+        let sess = self.sessions.lock().unwrap().get(name).cloned();
+        let meta = self.store.read_session(name)?;
+        if let Some(meta) = meta {
+            self.stop_session(meta.slot, sess.as_ref())?;
+        } else if let Some(sess) = &sess {
+            sess.kill()?;
         }
         self.store.remove_session(name)?;
+        self.sessions.lock().unwrap().remove(name);
         Ok(())
     }
 }
@@ -903,8 +1026,19 @@ impl SessionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cgroup::CgroupManager;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::Barrier;
     use tempfile::tempdir;
+
+    fn with_fake_cgroups(state: &Path, cgroup_root: &Path) -> SessionManager {
+        SessionManager::new_with_cgroups(
+            state,
+            Config::default(),
+            CgroupManager::test_root(cgroup_root),
+        )
+        .unwrap()
+    }
 
     /// The display allowlist: takes only the wanted keys, unquotes a systemd
     /// quoted value, and drops an empty one (a blank `DISPLAY=` fails
@@ -1190,13 +1324,21 @@ mod tests {
     }
 
     #[test]
-    fn reap_removes_dead_sessions_and_their_persisted_state() {
+    fn reap_and_remove_clear_session_cgroups() {
         // "Child exits -> session ends" (spec §6.1): a dead session must
         // leave the live table and the state store, while live ones stay.
         let dir = tempdir().unwrap();
-        let mgr = SessionManager::new(dir.path()).unwrap();
+        let cgroups = tempdir().unwrap();
+        let mgr = with_fake_cgroups(dir.path(), cgroups.path());
+        mgr.create("removed", "/tmp", SessionKind::Shell).unwrap();
+        let removed_slot = mgr.store.read_session("removed").unwrap().unwrap().slot;
+        assert!(cgroups.path().join(format!("session-{removed_slot}")).exists());
+        mgr.remove("removed").unwrap();
+        assert!(!cgroups.path().join(format!("session-{removed_slot}")).exists());
+
         mgr.create("dies", "/tmp", SessionKind::Shell).unwrap();
         mgr.create("lives", "/tmp", SessionKind::Shell).unwrap();
+        let dead_slot = mgr.store.read_session("dies").unwrap().unwrap().slot;
 
         mgr.write("dies", b"exit\n").unwrap();
         let sess = mgr.session("dies").unwrap();
@@ -1211,21 +1353,89 @@ mod tests {
         assert_eq!(mgr.names(), vec!["lives".to_string()]);
         assert!(!dir.path().join("sessions/dies.json").exists());
         assert!(dir.path().join("sessions/lives.json").exists());
+        assert!(!cgroups.path().join(format!("session-{dead_slot}")).exists());
     }
 
     #[test]
-    fn create_fails_cleanly_when_metadata_cannot_be_persisted() {
+    fn create_allocates_slot_before_spawn_and_rolls_back_cgroup_on_persist_failure() {
         // If the state store is unwritable, create must error, track nothing,
         // and kill the just-spawned child rather than leaking it.
         use std::os::unix::fs::PermissionsExt;
         let dir = tempdir().unwrap();
-        let mgr = SessionManager::new(dir.path()).unwrap();
+        let cgroups = tempdir().unwrap();
+        let mgr = with_fake_cgroups(dir.path(), cgroups.path());
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
         let result = mgr.create("orphan", "/tmp", SessionKind::Shell);
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(result.is_err(), "create must fail when the store is unwritable");
         assert!(mgr.names().is_empty(), "failed create must not be tracked");
         assert!(!dir.path().join("sessions/orphan.json").exists());
+        assert!(!cgroups.path().join("session-1").exists());
+    }
+
+    #[test]
+    fn missing_shell_is_reaped_without_a_cgroup_leak() {
+        let dir = tempdir().unwrap();
+        let cgroups = tempdir().unwrap();
+        let mgr = with_fake_cgroups(dir.path(), cgroups.path())
+            .with_test_shell(dir.path().join("missing-shell"));
+        let created = mgr.create("missing", "/tmp", SessionKind::Shell);
+
+        if let Ok(session) = created {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while session.is_alive() {
+                assert!(std::time::Instant::now() < deadline, "missing shell stayed alive");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            mgr.reap().unwrap();
+        }
+        assert!(mgr.names().is_empty());
+        assert!(!dir.path().join("sessions/missing.json").exists());
+        assert!(!cgroups.path().join("session-1").exists());
+    }
+
+    #[test]
+    fn concurrent_creates_get_unique_slots_without_persisted_reservations() {
+        let dir = tempdir().unwrap();
+        let cgroups = tempdir().unwrap();
+        let mgr = Arc::new(with_fake_cgroups(dir.path(), cgroups.path()));
+        let barrier = Arc::new(Barrier::new(3));
+        let mut threads = Vec::new();
+        for name in ["one", "two"] {
+            let mgr = Arc::clone(&mgr);
+            let barrier = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                mgr.create(name, "/tmp", SessionKind::Shell).unwrap();
+            }));
+        }
+        barrier.wait();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        let slots: BTreeSet<u32> = mgr.session_infos().unwrap().into_iter().map(|i| i.slot).collect();
+        assert_eq!(slots.len(), 2);
+        assert!(!slots.contains(&0));
+        assert_eq!(StateStore::new(dir.path()).list_sessions().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn restore_reuses_the_persisted_slot() {
+        let dir = tempdir().unwrap();
+        let cgroups = tempdir().unwrap();
+        let slot = {
+            let mgr = with_fake_cgroups(dir.path(), cgroups.path());
+            mgr.create("restored", "/tmp", SessionKind::Shell).unwrap();
+            let slot = mgr.store.read_session("restored").unwrap().unwrap().slot;
+            mgr.snapshot().unwrap();
+            slot
+        };
+
+        let mgr = with_fake_cgroups(dir.path(), cgroups.path());
+        mgr.restore().unwrap();
+        assert_eq!(mgr.store.read_session("restored").unwrap().unwrap().slot, slot);
+        assert!(cgroups.path().join(format!("session-{slot}")).is_dir());
     }
 
     #[test]
@@ -1300,13 +1510,15 @@ mod tests {
     }
 
     #[test]
-    fn rename_rekeys_a_shell_session_and_keeps_its_child() {
+    fn shell_rename_keeps_pid_and_cgroup_slot() {
         // Spec §3.2: a shell moves tab in place — same pty, same child, same
         // scrollback; only the key and the store files change.
         let dir = tempdir().unwrap();
-        let mgr = SessionManager::new(dir.path()).unwrap();
+        let cgroups = tempdir().unwrap();
+        let mgr = with_fake_cgroups(dir.path(), cgroups.path());
         mgr.create("amber-1-1-0-a", "/tmp", SessionKind::Shell).unwrap();
         let before = mgr.session("amber-1-1-0-a").unwrap();
+        let slot = mgr.store.read_session("amber-1-1-0-a").unwrap().unwrap().slot;
 
         let info = mgr.rename("amber-1-1-0-a", "amber-1-2-0-a").unwrap();
 
@@ -1315,19 +1527,23 @@ mod tests {
         let after = mgr.session("amber-1-2-0-a").unwrap();
         assert!(Arc::ptr_eq(&before, &after), "shell must keep its live pty");
         assert_eq!(before.pid(), after.pid(), "shell must keep its child");
+        assert_eq!(info.slot, slot);
+        assert!(cgroups.path().join(format!("session-{slot}")).is_dir());
         assert!(after.is_alive());
         assert!(dir.path().join("sessions/amber-1-2-0-a.json").exists());
         assert!(!dir.path().join("sessions/amber-1-1-0-a.json").exists());
     }
 
     #[test]
-    fn rename_respawns_a_claude_session_under_the_new_name() {
+    fn agent_rename_respawns_but_keeps_cgroup_slot() {
         // Spec §3.2: a claude supervisor is env-bound to its name, so a rename
         // respawns it under the new name (same conversation resumes via the
         // migrated claude/<to>.json) — a NEW child, preserving cwd.
         let dir = tempdir().unwrap();
-        let mgr = SessionManager::new(dir.path()).unwrap();
+        let cgroups = tempdir().unwrap();
+        let mgr = with_fake_cgroups(dir.path(), cgroups.path());
         mgr.create("amber-1-1-0-c", dir.path(), SessionKind::Claude).unwrap();
+        let slot = mgr.store.read_session("amber-1-1-0-c").unwrap().unwrap().slot;
         mgr.store
             .write_claude(
                 "amber-1-1-0-c",
@@ -1348,6 +1564,8 @@ mod tests {
         let after = mgr.session("amber-1-2-0-c").unwrap();
         assert!(!Arc::ptr_eq(&before, &after), "claude must be respawned");
         assert_ne!(before.pid(), after.pid(), "claude must get a fresh child");
+        assert_eq!(info.slot, slot);
+        assert!(cgroups.path().join(format!("session-{slot}")).is_dir());
         assert_eq!(
             mgr.store.read_claude("amber-1-2-0-c").unwrap().unwrap().session_id,
             "conv-42",

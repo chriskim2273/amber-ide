@@ -1,6 +1,7 @@
 //! `amber` CLI: busybox-style subcommands over the daemon's unix socket
 //! (spec §2).
 
+use std::ffi::OsString;
 use std::io::{IsTerminal, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -15,7 +16,7 @@ use amber::manager::SessionManager;
 use amber::supervisor;
 use amber_core::proto::{self, ControlMsg, Decoder, Frame};
 use amber_core::state::StateStore;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
@@ -117,6 +118,17 @@ enum Command {
         /// spawn races.
         #[arg(long, default_value = "claude")]
         kind: String,
+        #[arg(long, hide = true, value_parser = parse_slot)]
+        slot: Option<u32>,
+    },
+    #[command(name = "__cgroup-exec", hide = true)]
+    CgroupExec {
+        #[arg(long, value_parser = parse_slot)]
+        slot: u32,
+        #[arg(long)]
+        role: CgroupRoleArg,
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<OsString>,
     },
     /// `SessionStart` hook target invoked by claude/codex; records the
     /// session id from stdin (`AMBER_SESSION`/`AMBER_STATE_DIR` env, spec §6.2).
@@ -131,6 +143,29 @@ enum Command {
         #[command(subcommand)]
         action: CtlAction,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum CgroupRoleArg {
+    Supervisor,
+    Workload,
+}
+
+impl From<CgroupRoleArg> for amber::cgroup::CgroupRole {
+    fn from(role: CgroupRoleArg) -> Self {
+        match role {
+            CgroupRoleArg::Supervisor => Self::Supervisor,
+            CgroupRoleArg::Workload => Self::Workload,
+        }
+    }
+}
+
+fn parse_slot(value: &str) -> Result<u32, String> {
+    value
+        .parse::<u32>()
+        .ok()
+        .filter(|slot| *slot > 0)
+        .ok_or_else(|| "slot must be at least 1".to_string())
 }
 
 #[derive(Subcommand)]
@@ -231,7 +266,10 @@ fn main() -> anyhow::Result<()> {
         Command::Web { port, new_token, print_url, root, socket } => {
             run_web(root, socket, port, new_token, print_url)
         }
-        Command::Run { name, kind } => run_supervisor(&name, &kind),
+        Command::Run { name, kind, slot } => run_supervisor(&name, &kind, slot),
+        Command::CgroupExec { slot, role, command } => {
+            Ok(amber::cgroup::exec_current_into(slot, role.into(), command)?)
+        }
         Command::Hook => run_hook(),
         Command::Handoff { session_id } => run_handoff(&session_id),
         Command::Ctl { action } => match action {
@@ -516,7 +554,7 @@ fn supervisor_socket() -> PathBuf {
         .unwrap_or_else(|| default_socket(&root))
 }
 
-fn run_supervisor(name: &str, kind: &str) -> anyhow::Result<()> {
+fn run_supervisor(name: &str, kind: &str, _slot: Option<u32>) -> anyhow::Result<()> {
     supervisor::run_session(&supervisor_root(), name, &supervisor_socket(), kind)
 }
 
@@ -600,8 +638,19 @@ fn run_daemon(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Result<
     // Created before the manager so restored sessions get their output-activity
     // hook wired (a restored pane that produces output must light its tab dot).
     let watchers = std::sync::Arc::new(amber::watchers::Watchers::new());
+    let config = StateStore::new(&root).load_config()?;
+    let mut cgroups = amber::cgroup::CgroupManager::activate();
+    let cgroup_limit_kb = match cgroups.lowest_finite_limit_kb() {
+        Ok(limit) => limit,
+        Err(error) => {
+            eprintln!("amber daemon: could not read cgroup memory limits: {error}");
+            None
+        }
+    };
+    let budget_kb = config.memory.budget_kb(amber::procinfo::total_memory_kb(), cgroup_limit_kb);
+    cgroups.set_session_high_kb(config.memory.session_high_kb(budget_kb));
     let manager = Arc::new(
-        SessionManager::new(&root)?
+        SessionManager::new_with_cgroups(&root, config, cgroups)?
             .with_socket(socket_path.clone())
             .with_watchers(Arc::clone(&watchers)),
     );
@@ -1032,6 +1081,81 @@ fn create_session(socket: &Path, name: &str, cwd: &Path, kind: &str) -> anyhow::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_hidden_cgroup_launcher_without_rewriting_agent_flags() {
+        let cli = Cli::try_parse_from([
+            "amber",
+            "__cgroup-exec",
+            "--slot",
+            "7",
+            "--role",
+            "workload",
+            "--",
+            "/bin/sh",
+            "-l",
+        ])
+        .unwrap();
+        let Some(Command::CgroupExec { slot, role, command }) = cli.command else {
+            panic!("expected hidden cgroup launcher");
+        };
+        assert_eq!(slot, 7);
+        assert_eq!(role, CgroupRoleArg::Workload);
+        assert_eq!(command, [std::ffi::OsString::from("/bin/sh"), std::ffi::OsString::from("-l")]);
+    }
+
+    #[test]
+    fn hidden_cgroup_launcher_rejects_zero_unknown_role_and_empty_command() {
+        assert!(Cli::try_parse_from([
+            "amber",
+            "__cgroup-exec",
+            "--slot",
+            "0",
+            "--role",
+            "workload",
+            "--",
+            "/bin/sh",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "amber",
+            "__cgroup-exec",
+            "--slot",
+            "7",
+            "--role",
+            "other",
+            "--",
+            "/bin/sh",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "amber",
+            "__cgroup-exec",
+            "--slot",
+            "7",
+            "--role",
+            "supervisor",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn internal_run_accepts_explicit_slot_and_legacy_invocation() {
+        let cli = Cli::try_parse_from([
+            "amber", "run", "name", "--kind", "claude", "--slot", "7",
+        ])
+        .unwrap();
+        let Some(Command::Run { name, kind, slot }) = cli.command else {
+            panic!("expected internal run command");
+        };
+        assert_eq!((name.as_str(), kind.as_str(), slot), ("name", "claude", Some(7)));
+
+        let legacy = Cli::try_parse_from(["amber", "run", "name"]).unwrap();
+        let Some(Command::Run { slot, .. }) = legacy.command else {
+            panic!("expected legacy internal run command");
+        };
+        assert_eq!(slot, None);
+    }
 
     fn info(kind: &str, alive: bool, run_state: Option<&str>) -> proto::SessionInfo {
         proto::SessionInfo {

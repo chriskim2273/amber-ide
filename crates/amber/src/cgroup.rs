@@ -1,6 +1,9 @@
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
+use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
@@ -60,6 +63,17 @@ impl CgroupManager {
             root: None,
             mount_point: None,
             session_high_bytes: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_root(root: impl Into<PathBuf>) -> Self {
+        let root = root.into();
+        fs::create_dir_all(&root).expect("create fake cgroup root");
+        Self {
+            root: Some(root),
+            mount_point: None,
+            session_high_bytes: Some(0),
         }
     }
 
@@ -128,13 +142,25 @@ impl CgroupManager {
     }
 
     pub fn is_enabled(&self) -> bool {
-        self.root.is_some()
+        self.root.is_some() && self.mount_point.is_some()
     }
 
     pub fn prepare_session(&self, slot: u32) -> io::Result<()> {
         let Some(root) = &self.root else {
             return Ok(());
         };
+        if self.mount_point.is_none() {
+            let paths = SessionPaths::new(root, slot)?;
+            self.remove_session(slot)?;
+            for path in [&paths.parent, &paths.supervisor, &paths.workload] {
+                fs::create_dir(path)?;
+                fs::write(path.join("cgroup.procs"), "")?;
+                fs::write(path.join("cgroup.events"), "populated 0\n")?;
+            }
+            fs::write(paths.parent.join("cgroup.subtree_control"), "+memory")?;
+            fs::write(paths.parent.join("memory.high"), "0")?;
+            return Ok(());
+        }
         let high = self.session_high_bytes.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -206,15 +232,21 @@ impl CgroupManager {
 
     pub fn kill_workload(&self, slot: u32) -> io::Result<bool> {
         let Some(root) = &self.root else {
-            return Ok(true);
+            return Ok(false);
         };
+        if self.mount_point.is_none() {
+            return Ok(false);
+        }
         kill_tree(&SessionPaths::new(root, slot)?.workload)
     }
 
     pub fn kill_session(&self, slot: u32) -> io::Result<bool> {
         let Some(root) = &self.root else {
-            return Ok(true);
+            return Ok(false);
         };
+        if self.mount_point.is_none() {
+            return Ok(false);
+        }
         kill_tree(&SessionPaths::new(root, slot)?.parent)
     }
 
@@ -223,6 +255,18 @@ impl CgroupManager {
             return Ok(());
         };
         let paths = SessionPaths::new(root, slot)?;
+        if self.mount_point.is_none() {
+            for path in [&paths.workload, &paths.supervisor, &paths.parent] {
+                if path.exists() {
+                    for entry in fs::read_dir(path)? {
+                        let entry = entry?;
+                        if entry.file_type()?.is_file() {
+                            fs::remove_file(entry.path())?;
+                        }
+                    }
+                }
+            }
+        }
         for path in [&paths.workload, &paths.supervisor, &paths.parent] {
             match fs::remove_dir(path) {
                 Ok(()) => {}
@@ -243,6 +287,58 @@ impl CgroupManager {
             Err(error) => Err(error),
         }
     }
+}
+
+/// Move this short-lived launcher into a numeric session leaf, then replace it
+/// with the requested process. A placement failure must not lose the pane.
+pub fn exec_current_into(
+    slot: u32,
+    role: CgroupRole,
+    command: Vec<OsString>,
+) -> io::Result<()> {
+    let Some((program, args)) = command.split_first() else {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "missing command"));
+    };
+    #[cfg(target_os = "linux")]
+    if let Err(error) = place_current(slot, role) {
+        eprintln!("amber: cgroup placement failed; continuing uncontained: {error}");
+    }
+    Err(Command::new(program).args(args).exec())
+}
+
+#[cfg(target_os = "linux")]
+fn place_current(slot: u32, role: CgroupRole) -> io::Result<()> {
+    let unified = parse_unified_path(&fs::read_to_string("/proc/self/cgroup")?)?;
+    let mount = parse_cgroup2_mount(&fs::read_to_string("/proc/self/mountinfo")?, &unified)?;
+    let current = resolve_cgroup_path(&mount, &unified)?;
+    let Some(target) = placement_target(&current, slot, role) else {
+        return Ok(());
+    };
+    if !target.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("missing target cgroup {}", target.display()),
+        ));
+    }
+    write_control(&target.join("cgroup.procs"), "0")
+}
+
+fn placement_target(current: &Path, slot: u32, role: CgroupRole) -> Option<PathBuf> {
+    let service_root = match current.file_name()?.to_str()? {
+        "_daemon" => current.parent()?,
+        "supervisor" | "workload" => {
+            let session = current.parent()?;
+            let number = session.file_name()?.to_str()?.strip_prefix("session-")?;
+            number.parse::<u32>().ok().filter(|slot| *slot > 0)?;
+            session.parent()?
+        }
+        _ => return None,
+    };
+    let paths = SessionPaths::new(service_root, slot).ok()?;
+    Some(match role {
+        CgroupRole::Supervisor => paths.supervisor,
+        CgroupRole::Workload => paths.workload,
+    })
 }
 
 fn parse_unified_path(body: &str) -> io::Result<PathBuf> {
@@ -499,6 +595,46 @@ mod tests {
     }
 
     #[test]
+    fn launcher_derives_only_supported_service_roots_and_numeric_targets() {
+        let service = Path::new("/run/cgroup/user.slice/amber.service");
+        assert_eq!(
+            placement_target(&service.join("_daemon"), 7, CgroupRole::Workload).unwrap(),
+            service.join("session-7/workload")
+        );
+        assert_eq!(
+            placement_target(
+                &service.join("session-4/supervisor"),
+                7,
+                CgroupRole::Supervisor,
+            )
+            .unwrap(),
+            service.join("session-7/supervisor")
+        );
+        assert!(placement_target(service, 7, CgroupRole::Workload).is_none());
+        assert!(placement_target(
+            &service.join("other/supervisor"),
+            7,
+            CgroupRole::Workload,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn fake_root_accounts_for_session_directories_without_claiming_kernel_support() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = CgroupManager::test_root(temp.path());
+        assert!(!manager.is_enabled());
+
+        manager.prepare_session(3).unwrap();
+        assert!(temp.path().join("session-3/supervisor").is_dir());
+        assert!(temp.path().join("session-3/workload").is_dir());
+        assert!(!manager.kill_session(3).unwrap());
+
+        manager.remove_session(3).unwrap();
+        assert!(!temp.path().join("session-3").exists());
+    }
+
+    #[test]
     fn resolves_cgroup2_mount_without_assuming_sys_fs_cgroup() {
         let mountinfo = "31 22 0:27 / /run/cgroup rw,nosuid,nodev,noexec - cgroup2 cgroup rw\n";
         let unified = Path::new("/user.slice/amber.service");
@@ -600,8 +736,8 @@ mod tests {
         assert!(!disabled.is_enabled());
         assert_eq!(disabled.aggregate_current_kb().unwrap(), None);
         assert_eq!(disabled.session_current_kb(1).unwrap(), None);
-        assert!(disabled.kill_workload(1).unwrap());
-        assert!(disabled.kill_session(1).unwrap());
+        assert!(!disabled.kill_workload(1).unwrap());
+        assert!(!disabled.kill_session(1).unwrap());
         disabled.remove_session(1).unwrap();
         disabled.prepare_session(1).unwrap();
 
