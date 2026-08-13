@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { initialState, reduce, groupSessions, mergeBrowsers, paneDot, tabDot, hasActivity, type PaneModel, type WorkspaceModel } from './store'
+import { initialState, reduce, groupSessions, mergeBrowsers, paneDot, tabDot, hasActivity, shouldHintTerminalFocus, type PaneModel, type WorkspaceModel } from './store'
 import type { SessionInfo } from '../shared/proto'
 
 describe('mergeBrowsers', () => {
@@ -26,6 +26,14 @@ describe('mergeBrowsers', () => {
 describe('paneDot browser', () => {
   it('is a browser dot', () => {
     expect(paneDot('browser', undefined)).toEqual({ cls: 'browser', label: 'browser' })
+  })
+})
+
+describe('terminal focus hint', () => {
+  it('only allows an active terminal interaction to hint focus', () => {
+    expect(shouldHintTerminalFocus(true, true)).toBe(true)
+    expect(shouldHintTerminalFocus(false, true)).toBe(false)
+    expect(shouldHintTerminalFocus(true, false)).toBe(false)
   })
 })
 

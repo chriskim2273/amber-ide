@@ -128,6 +128,12 @@ export function isAgentKind(kind: string): boolean {
   return kind === 'claude' || kind === 'grok' || kind === 'codex'
 }
 
+// Daemon Focus is a recent-use hint, so only a real interaction in the active
+// terminal earns one. Callers separately identify an xterm target.
+export function shouldHintTerminalFocus(active: boolean, terminalTarget: boolean): boolean {
+  return active && terminalTarget
+}
+
 // A pane's kind-dot appearance + tooltip, from its kind and agent run_state.
 // Shared by the pane header and the tab bar so they downgrade identically:
 // amber = claude, pulsing amber = claude-retrying, gray = shell-fallback.

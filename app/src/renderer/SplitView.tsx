@@ -4,7 +4,7 @@ import { Browser } from './Browser'
 import { Editor, type EditorApi } from './Editor'
 import { paneRects, handles, nextPaneInDirection, focusCandidates, ratioAt, leaves, type Node, type Rect, type Zone, type FocusDir } from './layout'
 import { appChord, chordLabel } from './keys'
-import { paneDot } from './store'
+import { paneDot, shouldHintTerminalFocus } from './store'
 import { reloadAgentCommand } from './reloadAgent'
 
 export interface PaneMeta { kind: string; title: string; cwd: string; runState?: string | undefined; rssKb?: number | undefined; growing?: boolean | undefined; claudeId?: string | undefined }
@@ -230,13 +230,28 @@ export function SplitView(props: {
   // calls .focus() on the target's xterm textarea; the resulting focusin bubbles
   // to onFocusCapture and updates `focused`.
   const bodyEls = useRef<Map<string, HTMLElement>>(new Map())
+  // A click usually causes both pointerdown and focus. The pointer path carries
+  // the hint (including clicking an already-focused xterm); suppress its paired
+  // focus event. Programmatic keep-alive focus is suppressed separately.
+  const pointerFocusRef = useRef<Set<string>>(new Set())
+  const suppressedFocusRef = useRef<Set<string>>(new Set())
+
+  const isTerminalTarget = (id: string, target: EventTarget | null): boolean => {
+    const terminal = bodyEls.current.get(id)?.querySelector('.xterm')
+    return target instanceof Node && terminal?.contains(target) === true
+  }
 
   // Never programmatically focus a frozen pane's terminal — it's input-locked
   // (belt-and-suspenders alongside the overlay swallowing pointer events).
-  const focusPane = (id: string): void => {
+  const focusPane = (id: string, hint = true): void => {
     if (frozenRef.current.has(id)) return
-    const el = bodyEls.current.get(id)
-    el?.querySelector('textarea')?.focus()
+    const input = bodyEls.current.get(id)?.querySelector('textarea')
+    if (!input) return
+    if (!hint) {
+      suppressedFocusRef.current.add(id)
+      requestAnimationFrame(() => suppressedFocusRef.current.delete(id))
+    }
+    input.focus()
   }
 
   // Keep-alive activation: when this tab goes hidden -> visible (parent flips
@@ -251,7 +266,7 @@ export function SplitView(props: {
     if (!rising) return
     setActivateSeq((s) => s + 1)
     const target = focusedRef.current ?? leaves(props.tree)[0] ?? null
-    if (target) focusPane(target)
+    if (target) focusPane(target, false)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [props.active])
 
@@ -602,8 +617,19 @@ export function SplitView(props: {
             style={{ left: box.x, top: box.y, width: box.w, height: box.h,
               opacity: drag?.source === paneId ? 0.4 : 1,
               display: hidden ? 'none' : undefined, zIndex: isZoomedPane ? 2 : undefined }}
-            onFocusCapture={() => { setFocused(paneId); props.onPaneFocus(paneId) }}
-            onPointerDownCapture={() => { setFocused(paneId); props.onPaneFocus(paneId) }}>
+            onFocusCapture={(e) => {
+              setFocused(paneId)
+              if (!shouldHintTerminalFocus(props.active, isTerminalTarget(paneId, e.target))) return
+              if (suppressedFocusRef.current.delete(paneId) || pointerFocusRef.current.delete(paneId)) return
+              props.onPaneFocus(paneId)
+            }}
+            onPointerDownCapture={(e) => {
+              setFocused(paneId)
+              if (!shouldHintTerminalFocus(props.active, isTerminalTarget(paneId, e.target))) return
+              pointerFocusRef.current.add(paneId)
+              props.onPaneFocus(paneId)
+              requestAnimationFrame(() => pointerFocusRef.current.delete(paneId))
+            }}>
             <div className="pane-header"
               onDoubleClick={(e) => { if (!(e.target as HTMLElement).closest('button')) props.onToggleZoom(paneId) }}
               onContextMenu={(e) => {
