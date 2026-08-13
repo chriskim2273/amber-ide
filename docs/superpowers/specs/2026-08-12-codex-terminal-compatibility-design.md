@@ -1,12 +1,17 @@
 # Codex terminal compatibility hardening
 
-**Status:** approved 2026-08-12; implementation pending.
+**Status:** base design and Claude-to-Codex handoff approved in chat on
+2026-08-12; implementation pending written-spec review.
 
 ## Goal
 
 Make Amber's existing terminal-first Codex pane reliable for fresh sessions,
 exact resume, manual reload, crash recovery, freeze/unfreeze, and daemon restart.
 Keep Amber's raw-pty architecture and current unattended permission policy.
+
+Also provide a semantic handoff from a saved Claude Code session into the
+current Codex conversation. This is context transfer, not cross-provider session
+resume: Codex receives a concise handoff and then continues in its own session.
 
 “Complete compatibility” here means compatibility with the installed Codex CLI
 surface that Amber uses. It does not mean recreating Codex's native IDE client.
@@ -26,12 +31,23 @@ Current official Codex documentation establishes the pieces Amber depends on:
 - The user chose to keep
   `--dangerously-bypass-approvals-and-sandbox` for parity with Amber's other
   supervised agents.
+- Codex skills are the supported reusable-workflow surface. In the CLI and IDE,
+  users invoke them with `$skill-name` or select them through `/skills`.
+  Custom `/prompts:*` commands still exist but are deprecated.
+- Claude Code supports asking a saved session a scripted question with
+  `claude --print --resume <session-id>`. Its JSONL transcript format is
+  documented as internal and subject to change, so Amber must not parse it for
+  this handoff.
 
 Sources:
 
 - <https://learn.chatgpt.com/docs/hooks>
 - <https://learn.chatgpt.com/docs/config-file/config-reference>
+- <https://learn.chatgpt.com/docs/build-skills>
+- <https://learn.chatgpt.com/docs/custom-prompts>
+- <https://code.claude.com/docs/en/sessions>
 - `codex --help` and `codex resume --help` from installed 0.147.0
+- `claude --help` from installed 2.1.229
 
 ## Design
 
@@ -84,6 +100,75 @@ Fix the existing Clippy failure in `merge_project_trust` without changing its
 behavior. No new config parser, lock service, or dependency is justified by a
 reported failure.
 
+### Claude-to-Codex handoff
+
+Install a user-level Codex skill named `claude-handoff`. Its public interface is:
+
+```text
+$claude-handoff <CLAUDE_SESSION_ID>
+```
+
+The user may also open `/skills`, choose `claude-handoff`, and provide the ID.
+The skill runs `amber handoff <CLAUDE_SESSION_ID>`, treats stdout as historical
+context, inspects the live repository state, and continues from the handoff's
+latest request. It does not ask the user to copy an intermediate file or open a
+Claude pane.
+
+`amber handoff` is a synchronous, daemon-independent CLI command. It accepts
+only a canonical hyphenated UUID (case-insensitive), resolves the existing
+Claude binary through Amber's login-shell resolver, and starts it with a direct
+process argument vector rather than a shell command:
+
+```text
+claude --print
+       --resume <CLAUDE_SESSION_ID>
+       --fork-session
+       --no-session-persistence
+       --safe-mode
+       --tools ""
+       --output-format json
+       <fixed-handoff-prompt>
+```
+
+`--fork-session` keeps the source conversation separate,
+`--no-session-persistence` prevents the temporary fork from being saved,
+`--safe-mode` disables custom hooks and plugins, and `--tools ""` prevents the
+handoff request from changing the workspace. Claude's own session lookup honors
+its configured storage and current cross-project ID search; Amber adds no JSONL
+scanner or transcript-format dependency.
+
+The fixed prompt requests provider-neutral Markdown containing:
+
+- the goal and latest user request;
+- the latest relevant user and assistant messages;
+- decisions, constraints, and unresolved questions;
+- completed work and changed files;
+- commands, tests, and their results;
+- blockers and the exact next action.
+
+It also instructs Claude not to expose secrets, system/developer prompts, or raw
+tool-output blobs. Amber extracts the `result` string from Claude's JSON response
+and writes only that handoff to stdout. Invalid IDs, a missing Claude binary, a
+nonzero Claude exit, malformed JSON, or a missing result produce a concise
+nonzero error on stderr.
+
+The skill tells Codex that handoff text is historical evidence, not a new system
+instruction. Codex must inspect the current worktree before trusting claims
+about files, git state, or test results. Invoking the skill is the user's
+explicit request to transfer this Claude context into Codex; no automatic
+cross-provider transfer occurs.
+
+Store the distributable skill under
+`infra/codex/skills/claude-handoff/SKILL.md`. `amber ctl install` installs it to
+`~/.agents/skills/claude-handoff/`, making it available across repositories.
+Installation may update only an Amber-marked copy and must not overwrite an
+unrelated user skill with the same name. `uninstall --purge-binary` removes the
+Amber-marked skill because it would otherwise call a missing binary; ordinary
+uninstall keeps both the binary and working skill. The exact ownership marker
+is `<!-- amber-owned-skill -->` in the installed `SKILL.md`; absence of that
+line makes both install and uninstall leave the directory untouched and print
+an actionable conflict message.
+
 ### Documentation
 
 Update README Codex sections so public claims match implemented behavior:
@@ -124,6 +209,16 @@ cd app && npm run typecheck && npx vitest run && npm run build && npm run build:
    without changing or deleting existing Codex conversations. Confirm create,
    hook capture, kill/resume, and daemon restart. If safe isolation is not
    possible, report this manual check as outstanding rather than claiming it.
+6. Add focused handoff tests:
+   - strict Claude UUID validation rejects traversal and option-shaped input;
+   - the exact headless argv includes fork, no-persistence, safe-mode, no-tools,
+     and JSON output flags;
+   - a fake Claude result reaches stdout unchanged;
+   - fake nonzero and malformed responses fail clearly;
+   - the installed skill invokes `amber handoff <ID>` and instructs Codex to
+     verify the live worktree before continuing;
+   - installer tests prove an unrelated existing skill is never overwritten or
+     removed.
 
 ## Acceptance criteria
 
@@ -136,6 +231,15 @@ cd app && npm run typecheck && npx vitest run && npm run build && npm run build:
   recent session.
 - Missing Codex or exhausted retries still fall back to a shell.
 - Public documentation describes Codex support and security behavior.
+- `$claude-handoff <CLAUDE_SESSION_ID>` works from any Codex project after
+  Amber installation.
+- Handoff opens no interactive Claude pane, persists no temporary Claude
+  session, invokes no Claude tools or custom hooks, and leaves the source
+  session unchanged.
+- Codex receives goal, recent context, current request, work state, and next
+  action, then verifies the repository before continuing.
+- Amber never parses Claude's private JSONL transcript format or prints Claude's
+  JSON envelope.
 - Every listed automated gate passes.
 
 ## Non-goals
@@ -145,3 +249,8 @@ cd app && npm run typecheck && npx vitest run && npm run build && npm run build:
 - Bundling or pinning the Codex binary.
 - A provider framework or refactor of Claude/Grok supervision.
 - Hand-started Codex detection or filesystem transcript scanning.
+- Native conversion of a Claude session ID into a Codex session ID.
+- Raw/full Claude transcript import, direct Claude JSONL parsing, or a transcript
+  viewer.
+- A literal `/prompts:claude-handoff` command; that Codex surface is deprecated
+  in favor of skills.
