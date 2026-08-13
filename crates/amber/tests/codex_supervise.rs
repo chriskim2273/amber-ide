@@ -1,15 +1,15 @@
 use amber::supervisor::{supervise_agent, Agent, SuperviseOutcome, SuspendControl};
-use amber_core::state::StateStore;
+use amber_core::state::{ClaudeMeta, StateStore};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-fn write_fake_codex(dir: &Path) -> PathBuf {
+fn write_fake_codex(dir: &Path, session_id: &str) -> PathBuf {
     let bin = dir.join("bin");
     fs::create_dir_all(&bin).unwrap();
     let path = bin.join("codex");
     let payload = serde_json::json!({
-        "session_id": "codex-named-session",
+        "session_id": session_id,
         "cwd": dir,
         "hook_event_name": "SessionStart"
     })
@@ -39,7 +39,7 @@ exit 0
 fn crash_resumes_the_id_recorded_by_codex_session_start() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    let codex = write_fake_codex(root);
+    let codex = write_fake_codex(root, "codex-named-session");
     let phases = Mutex::new(Vec::<String>::new());
     let report = |phase: &str| phases.lock().unwrap().push(phase.to_string());
 
@@ -70,7 +70,7 @@ fn crash_resumes_the_id_recorded_by_codex_session_start() {
         lines,
         vec![
             "--dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust",
-            "resume codex-named-session --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust",
+            "resume --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust -- codex-named-session",
         ]
     );
     assert!(!lines.iter().any(|line| line.contains("--last")));
@@ -78,4 +78,47 @@ fn crash_resumes_the_id_recorded_by_codex_session_start() {
     let recorded = StateStore::new(root).read_claude("work").unwrap().unwrap();
     assert_eq!(recorded.session_id, "codex-named-session");
     assert_eq!(recorded.cwd, root);
+}
+
+#[test]
+fn active_pre_recorded_session_is_resumed_again_after_crash() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let codex = write_fake_codex(root, "--last");
+    StateStore::new(root)
+        .write_claude(
+            "work",
+            &ClaudeMeta {
+                session_id: "--last".into(),
+                cwd: root.into(),
+                updated: 0,
+            },
+        )
+        .unwrap();
+
+    let outcome = supervise_agent(
+        &Agent::Codex,
+        &codex,
+        root,
+        "work",
+        root,
+        3,
+        |_| {},
+        &SuspendControl::new(),
+    )
+    .unwrap();
+
+    assert_eq!(outcome, SuperviseOutcome::CleanExit);
+    let lines: Vec<_> = fs::read_to_string(root.join("codex_argv.log"))
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "resume --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust -- --last",
+            "resume --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust -- --last",
+        ]
+    );
 }

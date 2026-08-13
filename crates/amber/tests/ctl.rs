@@ -4,6 +4,9 @@
 
 use std::process::Command;
 
+const SKILL_WARNING: &str =
+    "amber: ~/.agents/skills/claude-handoff exists but is not Amber-owned; leaving it unchanged";
+
 #[test]
 fn ctl_install_dry_run_resolves_the_install_script() {
     let out = Command::new(env!("CARGO_BIN_EXE_amber"))
@@ -148,7 +151,53 @@ fn codex_skill_marker_bearing_invalid_utf8_conflicts_cleanly() {
         assert_eq!(std::fs::read(&file).unwrap(), bytes);
         assert_eq!(
             String::from_utf8_lossy(&conflict.stderr).trim(),
-            "amber: ~/.agents/skills/claude-handoff exists but is not Amber-owned; leaving it unchanged"
+            SKILL_WARNING
         );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_skill_ancestor_symlink_conflicts_exit_cleanly() {
+    use std::os::unix::fs::symlink;
+
+    for action in ["install-codex-skill", "purge-codex-skill"] {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let outside = root.path().join("user-owned");
+        std::fs::create_dir(&outside).unwrap();
+        let sentinel = outside.join("sentinel");
+        std::fs::write(&sentinel, "unchanged\n").unwrap();
+        symlink(&outside, home.join(".agents")).unwrap();
+
+        let out = Command::new(env!("CARGO_BIN_EXE_amber"))
+            .args(["ctl", action])
+            .env("HOME", &home)
+            .output()
+            .unwrap();
+
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8_lossy(&out.stderr).trim(), SKILL_WARNING);
+        assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "unchanged\n");
+    }
+}
+
+#[test]
+fn codex_skill_ancestor_file_conflicts_exit_cleanly() {
+    for action in ["install-codex-skill", "purge-codex-skill"] {
+        let home = tempfile::tempdir().unwrap();
+        let agents = home.path().join(".agents");
+        std::fs::write(&agents, "user-owned ancestor\n").unwrap();
+
+        let out = Command::new(env!("CARGO_BIN_EXE_amber"))
+            .args(["ctl", action])
+            .env("HOME", home.path())
+            .output()
+            .unwrap();
+
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8_lossy(&out.stderr).trim(), SKILL_WARNING);
+        assert_eq!(std::fs::read_to_string(agents).unwrap(), "user-owned ancestor\n");
     }
 }

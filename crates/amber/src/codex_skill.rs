@@ -46,16 +46,45 @@ fn is_owned_file(path: &Path) -> anyhow::Result<bool> {
     Ok(contents.lines().any(|line| line == OWNERSHIP_MARKER))
 }
 
+enum SkillDir {
+    Ready(PathBuf),
+    Missing,
+    Conflict,
+}
+
+fn skill_dir(home: &Path, create: bool) -> anyhow::Result<SkillDir> {
+    let mut path = home.to_path_buf();
+    for component in [".agents", "skills", "claude-handoff"] {
+        path.push(component);
+        match metadata(&path)? {
+            Some(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+                return Ok(SkillDir::Conflict)
+            }
+            Some(_) => {}
+            None if create => match fs::create_dir(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                    let Some(meta) = metadata(&path)? else {
+                        return Ok(SkillDir::Conflict);
+                    };
+                    if meta.file_type().is_symlink() || !meta.is_dir() {
+                        return Ok(SkillDir::Conflict);
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            },
+            None => return Ok(SkillDir::Missing),
+        }
+    }
+    Ok(SkillDir::Ready(path))
+}
+
 pub fn install(home: &Path) -> anyhow::Result<InstallOutcome> {
     let file = skill_file(home);
-    let dir = file.parent().expect("skill path has a parent");
-    match metadata(dir)? {
-        None => {}
-        Some(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
-            return Ok(InstallOutcome::Conflict);
-        }
-        Some(_) => {}
-    }
+    let dir = match skill_dir(home, true)? {
+        SkillDir::Ready(dir) => dir,
+        SkillDir::Missing | SkillDir::Conflict => return Ok(InstallOutcome::Conflict),
+    };
     let existed = match metadata(&file)? {
         None => false,
         Some(meta)
@@ -65,7 +94,6 @@ pub fn install(home: &Path) -> anyhow::Result<InstallOutcome> {
         }
         Some(_) => true,
     };
-    fs::create_dir_all(dir)?;
     let temporary = dir.join(".SKILL.md.amber-tmp");
     if metadata(&temporary)?.is_some() {
         return Ok(InstallOutcome::Conflict);
@@ -93,13 +121,11 @@ pub fn install(home: &Path) -> anyhow::Result<InstallOutcome> {
 
 pub fn remove(home: &Path) -> anyhow::Result<RemoveOutcome> {
     let file = skill_file(home);
-    let dir = file.parent().expect("skill path has a parent");
-    let Some(meta) = metadata(dir)? else {
-        return Ok(RemoveOutcome::Missing);
+    let dir = match skill_dir(home, false)? {
+        SkillDir::Ready(dir) => dir,
+        SkillDir::Missing => return Ok(RemoveOutcome::Missing),
+        SkillDir::Conflict => return Ok(RemoveOutcome::Conflict),
     };
-    if meta.file_type().is_symlink() || !meta.is_dir() {
-        return Ok(RemoveOutcome::Conflict);
-    }
     match metadata(&file)? {
         None => return Ok(RemoveOutcome::Missing),
         Some(meta)
@@ -206,5 +232,60 @@ mod tests {
         assert_eq!(install(home.path()).unwrap(), InstallOutcome::Conflict);
         assert_eq!(remove(home.path()).unwrap(), RemoveOutcome::Conflict);
         assert_eq!(fs::read(file).unwrap(), bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ancestor_symlinks_are_unchanged_conflicts() {
+        use std::os::unix::fs::symlink;
+
+        for (index, relative) in [
+            ".agents",
+            ".agents/skills",
+            ".agents/skills/claude-handoff",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let root = tempfile::tempdir().unwrap();
+            let home = root.path().join("home");
+            let conflict = home.join(relative);
+            fs::create_dir_all(conflict.parent().unwrap()).unwrap();
+            let outside = root.path().join(format!("outside-{index}"));
+            fs::create_dir(&outside).unwrap();
+            let sentinel = outside.join("sentinel");
+            fs::write(&sentinel, "user-owned\n").unwrap();
+            symlink(&outside, &conflict).unwrap();
+
+            assert_eq!(install(&home).unwrap(), InstallOutcome::Conflict);
+            assert_eq!(remove(&home).unwrap(), RemoveOutcome::Conflict);
+            assert_eq!(fs::read_to_string(&sentinel).unwrap(), "user-owned\n");
+            assert!(fs::symlink_metadata(conflict)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+        }
+    }
+
+    #[test]
+    fn ancestor_files_are_unchanged_conflicts() {
+        for relative in [
+            ".agents",
+            ".agents/skills",
+            ".agents/skills/claude-handoff",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let home = root.path().join("home");
+            let conflict = home.join(relative);
+            fs::create_dir_all(conflict.parent().unwrap()).unwrap();
+            fs::write(&conflict, "user-owned ancestor\n").unwrap();
+
+            assert_eq!(install(&home).unwrap(), InstallOutcome::Conflict);
+            assert_eq!(remove(&home).unwrap(), RemoveOutcome::Conflict);
+            assert_eq!(
+                fs::read_to_string(conflict).unwrap(),
+                "user-owned ancestor\n"
+            );
+        }
     }
 }

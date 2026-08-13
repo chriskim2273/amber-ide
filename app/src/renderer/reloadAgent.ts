@@ -16,8 +16,9 @@ export function reloadAgentCommand(agent: AgentName, id: string | null): string 
   }
 
   if (agent === 'codex') {
-    const resume = id === null ? 'resume' : `resume ${shellQuote(id)}`
-    return `codex ${resume} ${CODEX_FLAGS}`
+    return id === null
+      ? `codex resume ${CODEX_FLAGS}`
+      : `codex resume ${CODEX_FLAGS} -- ${shellQuote(id)}`
   }
 
   const resume = id === null ? ' --resume' : ` --resume ${id}`

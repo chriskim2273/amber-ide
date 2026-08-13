@@ -7,9 +7,14 @@ const UUID = '91b9f942-914d-4ea0-8c29-cef2c8b3b984'
 describe('reloadAgentCommand', () => {
   it('resumes the exact Codex string id with both required flags', () => {
     expect(reloadAgentCommand('codex', 'named session; still one argument'))
-      .toBe(`codex resume 'named session; still one argument' ${CODEX_FLAGS}`)
+      .toBe(`codex resume ${CODEX_FLAGS} -- 'named session; still one argument'`)
     expect(reloadAgentCommand('codex', "abc'def"))
-      .toBe(`codex resume 'abc'\\''def' ${CODEX_FLAGS}`)
+      .toBe(`codex resume ${CODEX_FLAGS} -- 'abc'\\''def'`)
+  })
+
+  it('treats an option-shaped Codex id as the literal recorded id', () => {
+    expect(reloadAgentCommand('codex', '--last'))
+      .toBe(`codex resume ${CODEX_FLAGS} -- '--last'`)
   })
 
   it('opens the Codex picker without selecting the latest session', () => {

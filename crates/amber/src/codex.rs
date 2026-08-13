@@ -25,11 +25,15 @@ pub enum CodexStart {
 /// hook cannot hang a detached pane waiting for interactive trust.
 pub fn codex_argv(start: &CodexStart) -> Vec<String> {
     let mut argv = match start {
-        CodexStart::Resume(id) => vec!["resume".to_string(), id.clone()],
+        CodexStart::Resume(_) => vec!["resume".to_string()],
         CodexStart::Fresh => Vec::new(),
     };
     argv.push("--dangerously-bypass-approvals-and-sandbox".to_string());
     argv.push("--dangerously-bypass-hook-trust".to_string());
+    if let CodexStart::Resume(id) = start {
+        argv.push("--".to_string());
+        argv.push(id.clone());
+    }
     argv
 }
 
@@ -304,11 +308,31 @@ mod tests {
     fn argv_resumes_a_recorded_id() {
         let id = "7f9f9a2e-1b3c-4c7a-9b0e-example-id";
         let argv = codex_argv(&CodexStart::Resume(id.into()));
-        assert_eq!(argv[0], "resume");
-        assert_eq!(argv[1], id);
+        assert_eq!(
+            argv,
+            [
+                "resume",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--dangerously-bypass-hook-trust",
+                "--",
+                id,
+            ]
+        );
         assert!(!argv.iter().any(|a| a == "--last"));
-        assert!(argv.iter().any(|a| a == "--dangerously-bypass-approvals-and-sandbox"));
-        assert!(argv.iter().any(|a| a == "--dangerously-bypass-hook-trust"));
+    }
+
+    #[test]
+    fn argv_treats_option_shaped_id_as_literal() {
+        assert_eq!(
+            codex_argv(&CodexStart::Resume("--last".into())),
+            [
+                "resume",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--dangerously-bypass-hook-trust",
+                "--",
+                "--last",
+            ]
+        );
     }
 
     #[test]

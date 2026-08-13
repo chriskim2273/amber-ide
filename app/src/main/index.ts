@@ -41,6 +41,7 @@ import { claudeNames } from './claudeNames'
 import { loadLayoutFile, saveLayoutFile } from './layoutIO'
 import { compatSignature, shouldUseCompat, compatWorthyReason, COMPAT_SWITCHES, DETECT_WINDOW_MS } from './renderCompat'
 import { installBinary } from './installBinary'
+import { spawnOkWithStderr } from './spawnOk'
 import clientPath from '../client/index?modulePath'
 
 // A client child that stays up this long counts as a genuine run; a shorter
@@ -128,7 +129,9 @@ async function installDaemon(): Promise<void> {
     const stable = join(home, '.local', 'bin', 'amber')
     await mkdir(dirname(stable), { recursive: true })
     await installBinary(amberBinary(), stable)
-    await spawnOk(stable, ['ctl', 'install-codex-skill'])
+    await spawnOkWithStderr(stable, ['ctl', 'install-codex-skill'], (stderr) => {
+      process.stderr.write(stderr)
+    })
 
     if (process.platform === 'linux') {
       const unitDir = join(home, '.config', 'systemd', 'user')

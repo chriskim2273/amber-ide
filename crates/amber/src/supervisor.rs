@@ -110,34 +110,42 @@ pub fn supervise_agent(
 ) -> anyhow::Result<SuperviseOutcome> {
     let store = StateStore::new(root);
     let mut attempts = 0u32;
-    // Escalation within a run of the SAME recorded id: Resume (escalation 0) ->
-    // Fresh (every later attempt). Reset whenever the recorded id changes (e.g.
-    // the hook records a new id after a fresh start), so a crash then resumes
-    // the new id rather than continuing to escalate. See `select_start`.
+    // Escalation within one unchanged recording: Resume (escalation 0) -> Fresh
+    // (every later attempt). Codex also resets when SessionStart refreshes the
+    // recording's timestamp with the same id; Claude/Grok retain their id-only
+    // ladder.
     let mut escalation = 0u32;
-    let mut prev_id: Option<String> = None;
+    let mut prev_recording = None;
     'sup: loop {
-        let session_id = store.read_claude(name)?.map(|m| m.session_id);
-        if session_id != prev_id {
+        let recording = store.read_claude(name)?;
+        let recording_key = recording.as_ref().map(|meta| {
+            (
+                meta.session_id.clone(),
+                if matches!(agent, Agent::Codex) {
+                    meta.updated
+                } else {
+                    0
+                },
+            )
+        });
+        if recording_key != prev_recording {
             escalation = 0;
-            prev_id = session_id.clone();
+            prev_recording = recording_key;
         }
+        let session_id = recording.as_ref().map(|m| m.session_id.as_str());
         let argv = match agent {
             Agent::Claude { settings } => {
-                let start = select_start(session_id.as_deref(), escalation);
+                let start = select_start(session_id, escalation);
                 claude::claude_argv(&start, settings)
             }
             Agent::Grok => grok::grok_argv(&select_grok_start(
                 &store,
                 name,
                 cwd,
-                session_id.as_deref(),
+                session_id,
                 escalation,
             )?),
-            Agent::Codex => codex::codex_argv(&select_codex_start(
-                session_id.as_deref(),
-                escalation,
-            )),
+            Agent::Codex => codex::codex_argv(&select_codex_start(session_id, escalation)),
         };
 
         // Entering (or re-entering) the running phase.
@@ -176,7 +184,7 @@ pub fn supervise_agent(
                         std::thread::sleep(IDLE_POLL);
                     }
                     escalation = 0;
-                    prev_id = None;
+                    prev_recording = None;
                     continue 'sup;
                 }
                 std::thread::sleep(WAIT_POLL);
