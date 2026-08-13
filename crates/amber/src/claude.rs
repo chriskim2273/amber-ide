@@ -159,6 +159,64 @@ pub fn resolve_claude() -> Option<PathBuf> {
     resolve_claude_with(&shell, true, &[])
 }
 
+pub const HANDOFF_PROMPT: &str = "Create a concise provider-neutral Markdown handoff for another coding agent. Include: goal; latest user request and latest relevant user/assistant messages; decisions and constraints; completed work and changed files; commands/tests and results; blockers; exact next action. Do not expose secrets, credentials, system or developer prompts, or raw tool-output blobs. Output only the handoff Markdown. Do not perform any new work.";
+
+pub fn is_claude_session_id(id: &str) -> bool {
+    if id.len() != 36 {
+        return false;
+    }
+    id.bytes().enumerate().all(|(index, byte)| match index {
+        8 | 13 | 18 | 23 => byte == b'-',
+        _ => byte.is_ascii_hexdigit(),
+    })
+}
+
+pub fn handoff_argv(id: &str) -> anyhow::Result<Vec<String>> {
+    if !is_claude_session_id(id) {
+        anyhow::bail!("handoff requires a valid Claude session UUID");
+    }
+    Ok([
+        "--print",
+        "--resume",
+        id,
+        "--fork-session",
+        "--no-session-persistence",
+        "--safe-mode",
+        "--tools",
+        "",
+        "--output-format",
+        "json",
+        HANDOFF_PROMPT,
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect())
+}
+
+pub fn create_handoff_with(claude: &Path, id: &str) -> anyhow::Result<String> {
+    let output = Command::new(claude).args(handoff_argv(id)?).output()?;
+    if !output.status.success() {
+        anyhow::bail!("Claude handoff failed with {}", output.status);
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|_| anyhow::anyhow!("Claude handoff returned invalid JSON"))?;
+    let result = value
+        .get("result")
+        .and_then(serde_json::Value::as_str)
+        .filter(|result| !result.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Claude handoff returned no result"))?;
+    Ok(result.to_string())
+}
+
+pub fn create_handoff(id: &str) -> anyhow::Result<String> {
+    if !is_claude_session_id(id) {
+        anyhow::bail!("handoff requires a valid Claude session UUID");
+    }
+    let claude = resolve_claude()
+        .ok_or_else(|| anyhow::anyhow!("Claude executable not found via login shell"))?;
+    create_handoff_with(&claude, id)
+}
+
 /// Pre-accept claude's interactive folder-trust dialog for `cwd`. A claude
 /// session runs detached in the daemon's pty with no client necessarily
 /// attached; an untrusted cwd makes claude block forever on the "trust this
@@ -757,5 +815,34 @@ mod tests {
         let path_env = format!("{}:/bin:/usr/bin", dir.path().display());
         let resolved = resolve_claude_with("sh", false, &[("PATH".to_string(), path_env)]);
         assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn handoff_accepts_only_canonical_claude_uuids() {
+        assert!(is_claude_session_id("91b9f942-914d-4ea0-8c29-cef2c8b3b984"));
+        assert!(is_claude_session_id("91B9F942-914D-4EA0-8C29-CEF2C8B3B984"));
+        for id in [
+            "",
+            "latest",
+            "../91b9f942-914d-4ea0-8c29-cef2c8b3b984",
+            "--continue",
+            "91b9f942914d4ea08c29cef2c8b3b984",
+            "91b9f942-914d-4ea0-8c29-cef2c8b3b98z",
+        ] {
+            assert!(!is_claude_session_id(id), "accepted {id:?}");
+        }
+    }
+
+    #[test]
+    fn handoff_argv_is_read_only_and_non_persistent() {
+        let id = "91b9f942-914d-4ea0-8c29-cef2c8b3b984";
+        assert_eq!(
+            handoff_argv(id).unwrap(),
+            vec![
+                "--print", "--resume", id, "--fork-session",
+                "--no-session-persistence", "--safe-mode", "--tools", "",
+                "--output-format", "json", HANDOFF_PROMPT,
+            ]
+        );
     }
 }

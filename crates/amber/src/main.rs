@@ -121,6 +121,11 @@ enum Command {
     /// `SessionStart` hook target invoked by claude/codex; records the
     /// session id from stdin (`AMBER_SESSION`/`AMBER_STATE_DIR` env, spec §6.2).
     Hook,
+    /// Print a read-only Claude-session handoff for the current Codex session.
+    Handoff {
+        /// Claude Code session UUID.
+        session_id: String,
+    },
     /// Diagnostics + lifecycle helpers.
     Ctl {
         #[command(subcommand)]
@@ -224,6 +229,7 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Run { name, kind } => run_supervisor(&name, &kind),
         Command::Hook => run_hook(),
+        Command::Handoff { session_id } => run_handoff(&session_id),
         Command::Ctl { action } => match action {
             CtlAction::Doctor { root } => run_doctor(root),
             CtlAction::Status { socket } => run_status(&resolve_socket(socket)),
@@ -493,6 +499,15 @@ fn run_hook() -> anyhow::Result<()> {
     let store = StateStore::new(root);
     if let Err(e) = claude::record_session(&store, &name, &input) {
         eprintln!("amber hook: failed to record session: {e}");
+    }
+    Ok(())
+}
+
+fn run_handoff(session_id: &str) -> anyhow::Result<()> {
+    let handoff = claude::create_handoff(session_id)?;
+    print!("{handoff}");
+    if !handoff.ends_with('\n') {
+        println!();
     }
     Ok(())
 }
