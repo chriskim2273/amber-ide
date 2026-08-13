@@ -182,7 +182,6 @@ fn forward(
     weak: Weak<Mutex<UnixStream>>,
     entries: Arc<Mutex<Vec<Entry>>>,
 ) {
-    let mut evicted = false;
     while let Ok(frame) = rx.recv() {
         // Connection dropped its writer: nothing to write to, just exit.
         let Some(writer) = weak.upgrade() else { break };
@@ -205,16 +204,14 @@ fn forward(
             // so sever it entirely; later writes fail fast instead of
             // blocking, and the client reconnects.
             let _ = s.shutdown(Shutdown::Both);
-            evicted = true;
             break;
         }
     }
-    if evicted {
-        // `broadcast` prunes Disconnected entries lazily; remove eagerly so
-        // eviction is observable without another event. (Writer guard is
-        // released above — registry and writer locks are never nested.)
-        entries.lock().unwrap().retain(|e| e.id != id);
-    }
+    // Remove by the entry's never-reused id on every exit path, including a
+    // vanished writer. This happens before `weak` is dropped, so its Arc
+    // allocation cannot be reused while a raw-address registry key survives.
+    // (Writer guard is released above — registry and writer locks never nest.)
+    entries.lock().unwrap().retain(|e| e.id != id);
 }
 
 #[cfg(test)]
@@ -399,5 +396,50 @@ mod tests {
         done_rx
             .recv_timeout(Duration::from_secs(10))
             .expect("shared writer mutex held beyond the bounded write timeout");
+    }
+
+    #[test]
+    fn vanished_watcher_is_removed_before_reconnect_merges_capabilities() {
+        let watchers = Watchers::new();
+        let (_old_peer, old_server) = UnixStream::pair().unwrap();
+        let old = Arc::new(Mutex::new(old_server));
+        watchers.register(&old);
+        drop(old);
+
+        // Wake the forwarder so it observes the vanished writer. Its stale
+        // entry must be gone before a reconnect can be mistaken for it after
+        // allocator address reuse.
+        watchers.broadcast(&ControlMsg::SessionsChanged {
+            added: vec![],
+            removed: vec![],
+        });
+        wait_until(Duration::from_secs(5), || watchers.watcher_count() == 0)
+            .expect("vanished watcher left a stale registry entry");
+
+        let (mut peer, server) = UnixStream::pair().unwrap();
+        let reconnect = Arc::new(Mutex::new(server));
+        watchers.register(&reconnect);
+        watchers.register_pressure(&reconnect, 1);
+        assert_eq!(
+            watchers.watcher_count(),
+            1,
+            "one live writer gets one merged entry"
+        );
+
+        let sessions = ControlMsg::SessionsChanged {
+            added: vec![],
+            removed: vec!["reconnected".into()],
+        };
+        watchers.broadcast(&sessions);
+        assert_eq!(read_one(&mut peer), Some(Frame::Control(sessions)));
+
+        let pressure = ControlMsg::MemoryPressure {
+            level: "warning".into(),
+            current_kb: 80,
+            budget_kb: 100,
+            blocked: false,
+        };
+        watchers.broadcast_pressure(&pressure);
+        assert_eq!(read_one(&mut peer), Some(Frame::Control(pressure)));
     }
 }

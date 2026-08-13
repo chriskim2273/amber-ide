@@ -88,6 +88,13 @@ pub struct ClaudeMeta {
     pub updated: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct RenameJournal {
+    from: String,
+    to: String,
+    source: SessionMeta,
+}
+
 /// Daemon-wide configuration, persisted as `config.toml`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
@@ -188,6 +195,10 @@ impl StateStore {
         self.scrollback_dir().join(format!("{name}.bin"))
     }
 
+    fn rename_journal_path(&self) -> PathBuf {
+        self.root.join("rename.json")
+    }
+
     fn config_path(&self) -> PathBuf {
         self.root.join("config.toml")
     }
@@ -269,6 +280,7 @@ impl StateStore {
     }
 
     pub fn list_sessions(&self) -> anyhow::Result<Vec<SessionMeta>> {
+        self.recover_pending_rename()?;
         let dir = self.sessions_dir();
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
@@ -293,6 +305,71 @@ impl StateStore {
             }
         }
         Ok(sessions)
+    }
+
+    /// Resolve a rename interrupted before its two metadata names can be
+    /// mistaken for independent sessions. The journal is durable before any
+    /// destination artifact is published.
+    fn recover_pending_rename(&self) -> anyhow::Result<()> {
+        let journal_path = self.rename_journal_path();
+        let Some(journal) = Self::read_json::<RenameJournal>(&journal_path)? else {
+            return Ok(());
+        };
+        if journal.from == journal.to
+            || journal.source.name != journal.from
+            || [&journal.from, &journal.to].into_iter().any(|name| {
+                name.is_empty()
+                    || name.len() > 200
+                    || name == "."
+                    || name == ".."
+                    || name.contains('/')
+                    || name.contains('\0')
+            })
+        {
+            anyhow::bail!("invalid pending rename journal");
+        }
+
+        let from = self.read_session(&journal.from)?;
+        let to = self.read_session(&journal.to)?;
+        let mut expected_to = journal.source.clone();
+        expected_to.name = journal.to.clone();
+        if from.as_ref().is_some_and(|meta| meta != &journal.source)
+            || to.as_ref().is_some_and(|meta| meta != &expected_to)
+        {
+            anyhow::bail!("pending rename metadata does not match its journal");
+        }
+
+        match (from.is_some(), to.is_some()) {
+            // Destination metadata is published only after every matching
+            // artifact is durable, so it wins deterministically.
+            (_, true) => {
+                Self::remove_durable(&self.session_path(&journal.from))?;
+                self.cleanup_rename_artifacts(&journal.from);
+            }
+            // Destination metadata was never published: retain the complete
+            // source and discard any unreferenced destination copies.
+            (true, false) => self.cleanup_rename_artifacts(&journal.to),
+            (false, false) => anyhow::bail!("pending rename has no session metadata"),
+        }
+        if let Err(error) = Self::remove_durable(&journal_path) {
+            eprintln!("amber state: recovered rename but could not remove journal: {error}");
+        }
+        Ok(())
+    }
+
+    fn cleanup_rename_artifacts(&self, name: &str) {
+        for path in [
+            self.claude_path(name),
+            self.claude_settings_path(name),
+            self.scrollback_path(name),
+        ] {
+            if let Err(error) = Self::remove_durable(&path) {
+                eprintln!(
+                    "amber state: recovered rename but could not remove {}: {error}",
+                    path.display()
+                );
+            }
+        }
     }
 
     pub fn remove_session(&self, name: &str) -> anyhow::Result<()> {
@@ -321,15 +398,17 @@ impl StateStore {
     /// the session name, so moving a pane IS a rename.
     ///
     /// Destination artifacts are preflighted and any completed artifact copies
-    /// are rolled back on a pre-commit error. Crash-safe ordering copies the
-    /// optional artifacts while retaining their sources, writes
-    /// `sessions/<to>.json`, then removes `sessions/<from>.json`. The old
-    /// artifacts are garbage-collected only after that metadata commit.
+    /// are rolled back on a pre-commit error. A durable intent journal links
+    /// the names across a crash; crash-safe ordering then copies the optional
+    /// artifacts while retaining their sources, writes `sessions/<to>.json`,
+    /// and removes `sessions/<from>.json`. The old artifacts are
+    /// garbage-collected only after that metadata commit.
     /// `sessions/*.json` is what `list_sessions` (and therefore restore)
     /// enumerates, so a crash at any point leaves either the old fully
     /// restorable session or the new one — never metadata without its matching
-    /// resume record. (A crash between publishing `to` and removing `from`
-    /// leaves both names listed; duplication is the safe direction.)
+    /// resume record. A crash between publishing `to` and removing `from`
+    /// leaves both files, but [`Self::list_sessions`] consumes the journal and
+    /// exposes only `to`, so one conversation is never resumed twice.
     pub fn rename_session(&self, from: &str, to: &str) -> anyhow::Result<()> {
         self.rename_session_with_checkpoint(from, to, |_| Ok(()))
     }
@@ -348,7 +427,11 @@ impl StateStore {
             (self.claude_settings_path(from), self.claude_settings_path(to)),
             (self.scrollback_path(from), self.scrollback_path(to)),
         ];
+        let journal_path = self.rename_journal_path();
         let to_meta = self.session_path(to);
+        if journal_path.exists() {
+            anyhow::bail!("another session rename is pending recovery");
+        }
         if to_meta.exists() {
             anyhow::bail!("target session artifact already exists: {}", to_meta.display());
         }
@@ -356,10 +439,25 @@ impl StateStore {
             anyhow::bail!("target session artifact already exists: {}", path.display());
         }
 
+        let journal = RenameJournal {
+            from: from.to_string(),
+            to: to.to_string(),
+            source: meta.clone(),
+        };
+        if let Err(error) = Self::write_json(&journal_path, &journal) {
+            let created = journal_path
+                .exists()
+                .then(|| journal_path.clone())
+                .into_iter()
+                .collect::<Vec<_>>();
+            return self.rename_precommit_error(error, &created);
+        }
+        checkpoint(0)?;
+
         // PRE-COMMIT: copy every optional artifact while leaving the source
         // completely intact. A process crash here restores `from`; destination
         // copies are unreferenced because no destination metadata exists yet.
-        let mut created = Vec::new();
+        let mut created = vec![journal_path.clone()];
         for (index, (old, new)) in copies.iter().enumerate() {
             let bytes = match fs::read(old) {
                 Ok(bytes) => bytes,
@@ -377,7 +475,7 @@ impl StateStore {
                 return self.rename_precommit_error(error, &rollback);
             }
             created.push(new.clone());
-            checkpoint(index)?;
+            checkpoint(index + 1)?;
         }
 
         // COMMIT PREPARATION: publish `to` only after all of its artifacts are
@@ -391,7 +489,7 @@ impl StateStore {
             }
             return self.rename_precommit_error(error, &rollback);
         }
-        checkpoint(3)?;
+        checkpoint(4)?;
 
         // COMMIT POINT: remove and durably record disappearance of the source
         // metadata. If this normal operation fails, destination publication is
@@ -414,7 +512,7 @@ impl StateStore {
                 );
             }
         }
-        checkpoint(4)?;
+        checkpoint(5)?;
 
         // POST-COMMIT garbage collection. Failure here must not report the
         // rename as failed: the manager would attempt an in-memory rollback
@@ -422,10 +520,17 @@ impl StateStore {
         // harmless/unreferenced and a later remove/rename can clean them.
         for (offset, (old, _)) in copies.iter().enumerate() {
             if let Err(error) = Self::remove_durable(old) {
-                eprintln!("amber state: renamed session but could not remove {}: {error}", old.display());
+                eprintln!(
+                    "amber state: renamed session but could not remove {}: {error}",
+                    old.display()
+                );
             }
-            checkpoint(5 + offset)?;
+            checkpoint(6 + offset)?;
         }
+        if let Err(error) = Self::remove_durable(&journal_path) {
+            eprintln!("amber state: renamed session but could not remove journal: {error}");
+        }
+        checkpoint(9)?;
         Ok(())
     }
 
@@ -959,15 +1064,16 @@ mod tests {
     }
 
     #[test]
-    fn every_rename_crash_point_restores_a_name_with_its_resume_record() {
+    fn every_rename_crash_point_restores_exactly_one_name_with_its_resume_record() {
         const FROM: &str = "amber-1-1-0-crash";
         const TO: &str = "amber-1-2-0-crash";
 
-        // Three destination artifact copies, destination metadata commit,
-        // source metadata removal, then three source-artifact cleanups.
+        // Rename intent, three destination artifact copies, destination
+        // metadata commit, source metadata removal, three source-artifact
+        // cleanups, then intent cleanup.
         // Interrupt immediately after each mutation, as a process crash would:
         // no in-process rollback gets a chance to run.
-        for stop_after in 0..8 {
+        for stop_after in 0..10 {
             let dir = tempdir().unwrap();
             let store = StateStore::new(dir.path());
             let mut meta = sample_session(FROM);
@@ -999,16 +1105,19 @@ mod tests {
             assert!(result.is_err(), "checkpoint {stop_after} did not interrupt");
 
             let restored = store.list_sessions().unwrap();
-            assert!(!restored.is_empty(), "checkpoint {stop_after} lost all metadata");
-            for session in restored {
-                assert!(session.name == FROM || session.name == TO);
-                assert_eq!(
-                    store.read_claude(&session.name).unwrap().map(|m| m.session_id),
-                    Some("conversation-survives".to_string()),
-                    "checkpoint {stop_after}: {} metadata has no matching resume record",
-                    session.name
-                );
-            }
+            assert_eq!(
+                restored.len(),
+                1,
+                "checkpoint {stop_after} must restore exactly one session"
+            );
+            let session = &restored[0];
+            assert!(session.name == FROM || session.name == TO);
+            assert_eq!(
+                store.read_claude(&session.name).unwrap().map(|m| m.session_id),
+                Some("conversation-survives".to_string()),
+                "checkpoint {stop_after}: {} metadata has no matching resume record",
+                session.name
+            );
         }
     }
 
