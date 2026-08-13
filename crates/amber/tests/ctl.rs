@@ -86,9 +86,15 @@ fn codex_skill_maintenance_commands_respect_ownership() {
         .env("HOME", home.path())
         .output()
         .unwrap();
-    assert!(install.status.success(), "{}", String::from_utf8_lossy(&install.stderr));
+    assert!(
+        install.status.success(),
+        "{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
     let file = home.path().join(".agents/skills/claude-handoff/SKILL.md");
-    assert!(std::fs::read_to_string(&file).unwrap().contains("<!-- amber-owned-skill -->"));
+    assert!(std::fs::read_to_string(&file)
+        .unwrap()
+        .contains("<!-- amber-owned-skill -->"));
 
     std::fs::write(&file, "user-owned\n").unwrap();
     let conflict = Command::new(amber)
@@ -99,4 +105,26 @@ fn codex_skill_maintenance_commands_respect_ownership() {
     assert!(conflict.status.success());
     assert_eq!(std::fs::read_to_string(file).unwrap(), "user-owned\n");
     assert!(String::from_utf8_lossy(&conflict.stderr).contains("not Amber-owned"));
+}
+
+#[test]
+fn codex_skill_invalid_utf8_conflict_exits_cleanly() {
+    let home = tempfile::tempdir().unwrap();
+    let file = home.path().join(".agents/skills/claude-handoff/SKILL.md");
+    let bytes = b"user-owned\xff\n";
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, bytes).unwrap();
+
+    let conflict = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .args(["ctl", "install-codex-skill"])
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+
+    assert!(conflict.status.success());
+    assert_eq!(std::fs::read(file).unwrap(), bytes);
+    assert_eq!(
+        String::from_utf8_lossy(&conflict.stderr).trim(),
+        "amber: ~/.agents/skills/claude-handoff exists but is not Amber-owned; leaving it unchanged"
+    );
 }

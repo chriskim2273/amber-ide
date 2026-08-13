@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 pub const OWNERSHIP_MARKER: &str = "<!-- amber-owned-skill -->";
@@ -39,9 +39,9 @@ fn is_owned_file(path: &Path) -> anyhow::Result<bool> {
     if meta.file_type().is_symlink() || !meta.is_file() {
         return Ok(false);
     }
-    Ok(fs::read_to_string(path)?
-        .lines()
-        .any(|line| line == OWNERSHIP_MARKER))
+    Ok(fs::read(path)?
+        .split(|byte| *byte == b'\n')
+        .any(|line| line.strip_suffix(b"\r").unwrap_or(line) == OWNERSHIP_MARKER.as_bytes()))
 }
 
 pub fn install(home: &Path) -> anyhow::Result<InstallOutcome> {
@@ -65,7 +65,22 @@ pub fn install(home: &Path) -> anyhow::Result<InstallOutcome> {
     };
     fs::create_dir_all(dir)?;
     let temporary = dir.join(".SKILL.md.amber-tmp");
-    fs::write(&temporary, SKILL)?;
+    if metadata(&temporary)?.is_some() {
+        return Ok(InstallOutcome::Conflict);
+    }
+    let mut temporary_file = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            return Ok(InstallOutcome::Conflict)
+        }
+        Err(error) => return Err(error.into()),
+    };
+    temporary_file.write_all(SKILL.as_bytes())?;
+    drop(temporary_file);
     fs::rename(temporary, file)?;
     Ok(if existed {
         InstallOutcome::Updated
@@ -125,5 +140,56 @@ mod tests {
         assert_eq!(install(home.path()).unwrap(), InstallOutcome::Conflict);
         assert_eq!(remove(home.path()).unwrap(), RemoveOutcome::Conflict);
         assert_eq!(fs::read_to_string(file).unwrap(), "user-owned\n");
+    }
+
+    #[test]
+    fn existing_temporary_file_is_preserved() {
+        let home = tempfile::tempdir().unwrap();
+        let file = skill_file(home.path());
+        let temporary = file.parent().unwrap().join(".SKILL.md.amber-tmp");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&temporary, "user-owned temporary\n").unwrap();
+
+        assert_eq!(install(home.path()).unwrap(), InstallOutcome::Conflict);
+        assert_eq!(
+            fs::read_to_string(temporary).unwrap(),
+            "user-owned temporary\n"
+        );
+        assert!(!file.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_temporary_symlink_is_preserved() {
+        use std::os::unix::fs::symlink;
+
+        let home = tempfile::tempdir().unwrap();
+        let file = skill_file(home.path());
+        let temporary = file.parent().unwrap().join(".SKILL.md.amber-tmp");
+        let outside = home.path().join("user-owned");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&outside, "user-owned target\n").unwrap();
+        symlink(&outside, &temporary).unwrap();
+
+        assert_eq!(install(home.path()).unwrap(), InstallOutcome::Conflict);
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "user-owned target\n");
+        assert!(fs::symlink_metadata(temporary)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn invalid_utf8_skill_is_an_unchanged_conflict() {
+        let home = tempfile::tempdir().unwrap();
+        let file = skill_file(home.path());
+        let bytes = b"user-owned\xff\n";
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, bytes).unwrap();
+
+        assert_eq!(install(home.path()).unwrap(), InstallOutcome::Conflict);
+        assert_eq!(remove(home.path()).unwrap(), RemoveOutcome::Conflict);
+        assert_eq!(fs::read(file).unwrap(), bytes);
     }
 }
