@@ -9,6 +9,7 @@ pub mod daemon;
 pub mod grok;
 pub mod layout_cas;
 pub mod manager;
+pub mod memory_guardian;
 pub mod mosaic;
 pub mod procinfo;
 pub mod pty;

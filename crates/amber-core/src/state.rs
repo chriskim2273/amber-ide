@@ -101,6 +101,43 @@ pub struct Config {
     pub codex_path: Option<PathBuf>,
     pub snapshot_interval_secs: u64,
     pub scrollback_bytes: usize,
+    #[serde(default)]
+    pub memory: MemoryConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MemoryConfig {
+    pub enabled: bool,
+    pub budget_mb: Option<u64>,
+    pub session_high_mb: u64,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            budget_mb: None,
+            session_high_mb: 4096,
+        }
+    }
+}
+
+impl MemoryConfig {
+    pub fn budget_kb(&self, physical_kb: Option<u64>, cgroup_limit_kb: Option<u64>) -> Option<u64> {
+        let requested = self
+            .budget_mb
+            .map(|mb| mb.saturating_mul(1024))
+            .or_else(|| physical_kb.map(|kb| kb / 2))
+            .or(cgroup_limit_kb)?
+            .max(512 * 1024);
+        Some(cgroup_limit_kb.map_or(requested, |limit| requested.min(limit)))
+    }
+
+    pub fn session_high_kb(&self, budget_kb: Option<u64>) -> u64 {
+        let requested = self.session_high_mb.saturating_mul(1024).max(256 * 1024);
+        budget_kb.map_or(requested, |budget| requested.min(budget))
+    }
 }
 
 impl Default for Config {
@@ -111,6 +148,7 @@ impl Default for Config {
             codex_path: None,
             snapshot_interval_secs: 10,
             scrollback_bytes: 2 * 1024 * 1024,
+            memory: MemoryConfig::default(),
         }
     }
 }
@@ -619,6 +657,60 @@ mod tests {
     }
 
     #[test]
+    fn config_written_before_memory_guardian_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "claude_path = \"/usr/bin/claude\"\nsnapshot_interval_secs = 10\nscrollback_bytes = 2097152\n",
+        )
+        .unwrap();
+
+        let cfg = store.load_config().unwrap();
+        assert_eq!(cfg.memory, MemoryConfig::default());
+    }
+
+    #[test]
+    fn memory_config_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        let mut cfg = Config::default();
+        cfg.memory.enabled = false;
+        cfg.memory.budget_mb = Some(6144);
+        cfg.memory.session_high_mb = 2048;
+
+        store.save_config(&cfg).unwrap();
+        assert_eq!(store.load_config().unwrap(), cfg);
+    }
+
+    #[test]
+    fn partial_memory_section_uses_defaults() {
+        let cfg: Config = toml::from_str(
+            "snapshot_interval_secs = 10\nscrollback_bytes = 2048\n[memory]\nenabled = false\n",
+        )
+        .unwrap();
+        assert!(!cfg.memory.enabled);
+        assert_eq!(cfg.memory.budget_mb, None);
+        assert_eq!(cfg.memory.session_high_mb, 4096);
+    }
+
+    #[test]
+    fn memory_budget_uses_available_sources_and_clamps_session_high() {
+        let cfg = MemoryConfig::default();
+        assert_eq!(
+            cfg.budget_kb(Some(32 * 1024 * 1024), None),
+            Some(16 * 1024 * 1024)
+        );
+        assert_eq!(
+            cfg.budget_kb(None, Some(8 * 1024 * 1024)),
+            Some(8 * 1024 * 1024)
+        );
+        assert_eq!(cfg.budget_kb(None, None), None);
+        assert_eq!(cfg.session_high_kb(Some(512 * 1024)), 512 * 1024);
+    }
+
+    #[test]
     fn config_corrupt_is_err() {
         let dir = tempdir().unwrap();
         let store = StateStore::new(dir.path());
@@ -639,6 +731,7 @@ mod tests {
             codex_path: Some(PathBuf::from("/usr/local/bin/codex")),
             snapshot_interval_secs: 42,
             scrollback_bytes: 4096,
+            memory: MemoryConfig::default(),
         };
 
         store.save_config(&cfg).unwrap();

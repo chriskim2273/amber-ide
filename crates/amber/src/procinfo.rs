@@ -134,7 +134,23 @@ pub fn is_growing(samples: &[u64], min_growth_kb: u64, noise_kb: u64) -> bool {
     true
 }
 
+fn parse_memtotal_kb(meminfo: &str) -> Option<u64> {
+    let fields = meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemTotal:"))?;
+    let mut fields = fields.split_whitespace();
+    let kb = fields.next()?.parse().ok()?;
+    (fields.next() == Some("kB")).then_some(kb)
+}
+
 // ---- Linux: /proc ----
+
+#[cfg(target_os = "linux")]
+pub fn total_memory_kb() -> Option<u64> {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|meminfo| parse_memtotal_kb(&meminfo))
+}
 
 #[cfg(target_os = "linux")]
 pub fn process_table() -> Vec<ProcEntry> {
@@ -221,6 +237,22 @@ pub fn argv0_basename(pid: u32) -> Option<String> {
 }
 
 // ---- macOS: libc proc_* ----
+
+#[cfg(target_os = "macos")]
+pub fn total_memory_kb() -> Option<u64> {
+    let mut bytes = 0u64;
+    let mut len = std::mem::size_of_val(&bytes);
+    let result = unsafe {
+        nix::libc::sysctlbyname(
+            b"hw.memsize\0".as_ptr() as *const nix::libc::c_char,
+            &mut bytes as *mut u64 as *mut nix::libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (result == 0).then_some(bytes / 1024)
+}
 
 /// Read a NUL-terminated C char array into a String (lossy).
 #[cfg(target_os = "macos")]
@@ -366,6 +398,11 @@ pub fn argv0_basename(pid: u32) -> Option<String> {
 // ---- Other OS: degrade (preserves today's silent no-op) ----
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn total_memory_kb() -> Option<u64> {
+    None
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn process_table() -> Vec<ProcEntry> {
     Vec::new()
 }
@@ -396,6 +433,20 @@ mod tests {
     /// Like `e` but with an RSS (KiB) — for subtree_rss_kb tests.
     fn er(pid: u32, ppid: u32, rss_kb: u64) -> ProcEntry {
         ProcEntry { pid, ppid, comm: String::new(), rss_kb }
+    }
+
+    #[test]
+    fn parses_linux_memtotal_in_kibibytes() {
+        assert_eq!(
+            parse_memtotal_kb("MemTotal:       32620768 kB\nMemFree: 1 kB\n"),
+            Some(32_620_768)
+        );
+    }
+
+    #[test]
+    fn rejects_missing_or_malformed_memtotal() {
+        assert_eq!(parse_memtotal_kb("MemFree: 42 kB\n"), None);
+        assert_eq!(parse_memtotal_kb("MemTotal: nope kB\n"), None);
     }
 
     #[test]
