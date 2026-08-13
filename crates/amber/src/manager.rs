@@ -5,7 +5,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use amber_core::proto::{ControlMsg, SessionInfo};
@@ -128,6 +128,10 @@ pub struct SessionManager {
     cfg: Config,
     root: PathBuf,
     sessions: Mutex<HashMap<String, Arc<PtySession>>>,
+    /// Effective metadata that could not yet be persisted because a retained
+    /// rename journal still validates the pre-repair bytes. The weak identity
+    /// prevents a later session reusing the same name from inheriting it.
+    deferred_meta: Mutex<HashMap<String, LiveMetaOverride>>,
     /// The daemon socket path, passed to each claude session's `amber run`
     /// supervisor (via `AMBER_SOCK`) so it can report its supervision phase
     /// back (`ReportRunState`). `None` in tests / hand-started managers — the
@@ -162,6 +166,11 @@ pub struct SessionManager {
     /// the `write()`/`resize()` path, so keystrokes still never wait on a
     /// snapshot.
     maintenance: Mutex<()>,
+}
+
+struct LiveMetaOverride {
+    session: Weak<PtySession>,
+    meta: SessionMeta,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -228,6 +237,7 @@ impl SessionManager {
             cfg,
             root,
             sessions: Mutex::new(HashMap::new()),
+            deferred_meta: Mutex::new(HashMap::new()),
             socket: None,
             watchers: None,
             claude_absent: Mutex::new(HashMap::new()),
@@ -506,7 +516,42 @@ impl SessionManager {
         if !self.store.recover_pending_rename()? {
             anyhow::bail!("pending session rename cleanup is incomplete");
         }
+        let pending = {
+            let sessions = self.sessions.lock().unwrap();
+            let mut deferred = self.deferred_meta.lock().unwrap();
+            deferred.retain(|name, entry| {
+                sessions
+                    .get(name)
+                    .is_some_and(|session| Weak::ptr_eq(&entry.session, &Arc::downgrade(session)))
+            });
+            deferred.values().map(|entry| entry.meta.clone()).collect::<Vec<_>>()
+        };
+        for meta in &pending {
+            self.store.write_session(meta)?;
+        }
+        self.deferred_meta.lock().unwrap().clear();
         Ok(())
+    }
+
+    fn deferred_meta_for(&self, name: &str, session: &Arc<PtySession>) -> Option<SessionMeta> {
+        let mut deferred = self.deferred_meta.lock().unwrap();
+        let entry = deferred.get(name)?;
+        if Weak::ptr_eq(&entry.session, &Arc::downgrade(session)) {
+            return Some(entry.meta.clone());
+        }
+        deferred.remove(name);
+        None
+    }
+
+    fn effective_meta_for(
+        &self,
+        name: &str,
+        session: &Arc<PtySession>,
+    ) -> anyhow::Result<Option<SessionMeta>> {
+        if let Some(meta) = self.deferred_meta_for(name, session) {
+            return Ok(Some(meta));
+        }
+        self.store.read_session(name)
     }
 
     fn stop_session(
@@ -767,7 +812,17 @@ impl SessionManager {
             }
             match self.restore_one(&meta) {
                 Ok(sess) => {
-                    self.sessions.lock().unwrap().insert(meta.name.clone(), sess);
+                    let mut sessions = self.sessions.lock().unwrap();
+                    if !recovery_complete {
+                        self.deferred_meta.lock().unwrap().insert(
+                            meta.name.clone(),
+                            LiveMetaOverride {
+                                session: Arc::downgrade(&sess),
+                                meta: meta.clone(),
+                            },
+                        );
+                    }
+                    sessions.insert(meta.name.clone(), sess);
                 }
                 Err(e) => {
                     eprintln!("amber daemon: restore skipped session {}: {e}", meta.name);
@@ -886,7 +941,7 @@ impl SessionManager {
         sessions
             .into_iter()
             .filter_map(|(name, session)| {
-                let meta = match self.store.read_session(&name) {
+                let meta = match self.effective_meta_for(&name, &session) {
                     Ok(Some(meta)) => meta,
                     Ok(None) => return None,
                     Err(error) => {
@@ -924,8 +979,7 @@ impl SessionManager {
         let _transition = session.lock_suspend_transition();
         self.ensure_current_session(name, &session)?;
         let meta = self
-            .store
-            .read_session(name)?
+            .effective_meta_for(name, &session)?
             .ok_or_else(|| anyhow::anyhow!("session {name} vanished from the store"))?;
         if !meta.kind.is_agent() {
             anyhow::bail!("automatic memory suspend applies only to agent sessions: {name}");
@@ -993,7 +1047,7 @@ impl SessionManager {
             if !session.is_alive() {
                 continue;
             }
-            let Some(meta) = self.store.read_session(&name)? else { continue };
+            let Some(meta) = self.effective_meta_for(&name, &session)? else { continue };
             if let Some(current_kb) = self.cgroups.session_current_kb(meta.slot)? {
                 per_session.insert(name, current_kb);
             }
@@ -1005,11 +1059,15 @@ impl SessionManager {
         self.cgroups.is_enabled()
     }
 
-    /// The persisted kind of a session, from the state store (None if the
-    /// metadata is missing/unreadable). Consulted on Attach to apply the
-    /// spec-§5 reconnect semantics for raw clients.
+    /// The effective live kind of a session. During pending rename cleanup it
+    /// may intentionally be newer than the journal-owned persisted metadata.
+    /// Consulted on Attach to apply the spec-§5 reconnect semantics.
     pub fn session_kind(&self, name: &str) -> Option<SessionKind> {
-        self.store.read_session(name).ok().flatten().map(|m| m.kind)
+        let session = self.session(name);
+        match session {
+            Some(session) => self.effective_meta_for(name, &session).ok().flatten().map(|m| m.kind),
+            None => self.store.read_session(name).ok().flatten().map(|m| m.kind),
+        }
     }
 
     /// Record an agent session's supervision phase (from `ReportRunState`).
@@ -1045,8 +1103,7 @@ impl SessionManager {
             .ok_or_else(|| anyhow::anyhow!("no such session: {name}"))?;
         let _transition = sess.lock_suspend_transition();
         let is_agent = self
-            .store
-            .read_session(name)
+            .effective_meta_for(name, &sess)
             .ok()
             .flatten()
             .map(|m| m.kind.is_agent())
@@ -1091,8 +1148,7 @@ impl SessionManager {
         let _transition = session.lock_suspend_transition();
         self.ensure_current_session(name, &session)?;
         let meta = self
-            .store
-            .read_session(name)?
+            .effective_meta_for(name, &session)?
             .ok_or_else(|| anyhow::anyhow!("session {name} vanished from the store"))?;
         if !meta.kind.is_agent() {
             anyhow::bail!("suspend applies only to agent sessions: {name}");
@@ -1148,7 +1204,7 @@ impl SessionManager {
     fn resume_locked(
         &self,
         name: &str,
-        session: &PtySession,
+        session: &Arc<PtySession>,
         cause: ResumeCause,
     ) -> anyhow::Result<bool> {
         let origin = session.suspend_origin();
@@ -1160,8 +1216,7 @@ impl SessionManager {
             return Ok(false);
         }
         let is_agent = self
-            .store
-            .read_session(name)?
+            .effective_meta_for(name, session)?
             .map(|meta| meta.kind.is_agent())
             .unwrap_or(false);
         if !is_agent {
@@ -1176,7 +1231,7 @@ impl SessionManager {
     fn resume_for_focus_locked(
         &self,
         name: &str,
-        session: &PtySession,
+        session: &Arc<PtySession>,
     ) -> anyhow::Result<bool> {
         self.resume_locked(name, session, ResumeCause::Focus)
     }
@@ -1210,13 +1265,23 @@ impl SessionManager {
     /// One [`SessionInfo`] per live session, joining the live table (existence
     /// + liveness) with the persisted metadata (cwd/kind). Sorted by name.
     pub fn session_infos(&self) -> anyhow::Result<Vec<SessionInfo>> {
-        let sessions = self.sessions.lock().unwrap();
+        let sessions: HashMap<String, Arc<PtySession>> = self
+            .sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, session)| (name.clone(), Arc::clone(session)))
+            .collect();
         let mut infos: Vec<SessionInfo> = self
             .store
             .list_sessions()?
             .into_iter()
-            .filter_map(|meta| {
-                sessions.get(&meta.name).map(|sess| SessionInfo {
+            .filter_map(|persisted| {
+                let sess = sessions.get(&persisted.name)?;
+                let meta = self
+                    .deferred_meta_for(&persisted.name, sess)
+                    .unwrap_or(persisted);
+                Some(SessionInfo {
                     name: meta.name.clone(),
                     cwd: meta.cwd.to_string_lossy().into_owned(),
                     kind: meta.kind.as_str().to_string(),
@@ -1279,8 +1344,7 @@ impl SessionManager {
             let result = (|| -> anyhow::Result<()> {
                 let _transition = session.lock_suspend_transition();
                 let meta = self
-                    .store
-                    .read_session(&name)?
+                    .effective_meta_for(&name, &session)?
                     .ok_or_else(|| anyhow::anyhow!("dead session {name} has no metadata"))?;
                 self.stop_session_locked(meta.slot, Some(&session))?;
                 self.store.remove_session(&name)?;
@@ -1330,8 +1394,7 @@ impl SessionManager {
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("no such session: {from}"))?;
         let old_meta = self
-            .store
-            .read_session(from)?
+            .effective_meta_for(from, &sess)?
             .ok_or_else(|| anyhow::anyhow!("session {from} vanished from the store"))?;
         let size = sess.size();
         let _transition = old_meta.kind.is_agent().then(|| sess.lock_suspend_transition());
@@ -1414,7 +1477,10 @@ impl SessionManager {
         let _maint = self.maintenance.lock().unwrap();
         self.finish_pending_rename()?;
         let sess = self.sessions.lock().unwrap().get(name).cloned();
-        let meta = self.store.read_session(name)?;
+        let meta = match &sess {
+            Some(session) => self.effective_meta_for(name, session)?,
+            None => self.store.read_session(name)?,
+        };
         let _transition = sess.as_ref().map(|session| session.lock_suspend_transition());
         if let Some(meta) = meta {
             self.stop_session_locked(meta.slot, sess.as_ref())?;
@@ -2048,6 +2114,60 @@ mod tests {
     }
 
     #[test]
+    fn pending_repaired_slot_remains_live_authority_for_sampling_and_remove() {
+        let dir = tempdir().unwrap();
+        let cgroups = tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        let other = "amber-1-1-0-other";
+        let from = "amber-1-1-1-from";
+        let to = "amber-1-2-0-moved";
+        let source = SessionMeta {
+            name: from.to_string(),
+            cwd: PathBuf::from("/tmp"),
+            kind: SessionKind::Shell,
+            updated: 1,
+            resume_as_claude: false,
+            run_state: None,
+            slot: 1,
+        };
+        store
+            .write_session(&SessionMeta { name: other.to_string(), ..source.clone() })
+            .unwrap();
+        store.write_session(&source).unwrap();
+        store
+            .write_session(&SessionMeta { name: to.to_string(), ..source.clone() })
+            .unwrap();
+        write_rename_journal(dir.path(), from, to, source);
+        let obstruction = dir.path().join(format!("claude/{from}.json"));
+        std::fs::create_dir_all(&obstruction).unwrap();
+
+        let mgr = with_fake_cgroups(dir.path(), cgroups.path());
+        mgr.restore().unwrap();
+        let slots = mgr
+            .session_infos()
+            .unwrap()
+            .into_iter()
+            .map(|info| (info.name, info.slot))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(slots.get(other), Some(&1));
+        assert_eq!(slots.get(to), Some(&2));
+        let moved = mgr.session(to).unwrap();
+        assert_eq!(mgr.effective_meta_for(to, &moved).unwrap().unwrap().slot, 2);
+
+        std::fs::remove_dir(obstruction).unwrap();
+        mgr.finish_pending_rename().unwrap();
+        assert_eq!(store.read_session(to).unwrap().unwrap().slot, 2);
+        assert!(mgr.deferred_meta.lock().unwrap().is_empty());
+        mgr.remove(to).unwrap();
+
+        assert!(mgr.session(other).is_some());
+        assert!(cgroups.path().join("session-1").exists());
+        assert!(!cgroups.path().join("session-2").exists());
+        assert_eq!(store.read_session(to).unwrap(), None);
+        mgr.remove(other).unwrap();
+    }
+
+    #[test]
     fn second_restore_recovers_after_pending_cleanup_deferred_resume_normalization() {
         let dir = tempdir().unwrap();
         let cgroups = tempdir().unwrap();
@@ -2077,10 +2197,24 @@ mod tests {
         let unchanged = store.read_session(to).unwrap().unwrap();
         assert_eq!(unchanged.kind, SessionKind::Shell);
         assert!(unchanged.resume_as_claude);
+        assert_eq!(first.session_infos().unwrap()[0].kind, "claude");
+        assert_eq!(first.session_kind(to), Some(SessionKind::Claude));
+        assert!(first.set_run_state(to, "claude").is_ok());
+        assert!(first
+            .memory_candidates(&HashMap::from([(to.to_string(), 1)]))
+            .into_iter()
+            .next()
+            .unwrap()
+            .is_agent);
+        std::fs::remove_dir(obstruction).unwrap();
+        first.finish_pending_rename().unwrap();
+        let flushed = store.read_session(to).unwrap().unwrap();
+        assert_eq!(flushed.kind, SessionKind::Claude);
+        assert!(!flushed.resume_as_claude);
+        assert!(first.deferred_meta.lock().unwrap().is_empty());
         let first_session = first.session(to).unwrap();
         first.stop_session(1, Some(&first_session)).unwrap();
 
-        std::fs::remove_dir(obstruction).unwrap();
         let second = with_fake_cgroups(dir.path(), cgroups.path());
         second.restore().unwrap();
         assert_eq!(second.names(), vec![to.to_string()]);
@@ -2089,6 +2223,30 @@ mod tests {
         assert!(!normalized.resume_as_claude);
         assert!(!dir.path().join("rename.json").exists());
         second.remove(to).unwrap();
+    }
+
+    #[test]
+    fn deferred_metadata_does_not_follow_a_reused_name() {
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        let name = "reused";
+        let old = fake_agent(&mgr, name);
+        let mut repaired = mgr.store.read_session(name).unwrap().unwrap();
+        repaired.slot = 9;
+        repaired.kind = SessionKind::Grok;
+        mgr.deferred_meta.lock().unwrap().insert(
+            name.to_string(),
+            LiveMetaOverride { session: Arc::downgrade(&old), meta: repaired },
+        );
+
+        let replacement = fake_agent(&mgr, name);
+        let effective = mgr.effective_meta_for(name, &replacement).unwrap().unwrap();
+
+        assert_eq!(effective.slot, 1);
+        assert_eq!(effective.kind, SessionKind::Claude);
+        assert!(!mgr.deferred_meta.lock().unwrap().contains_key(name));
+        old.kill().unwrap();
+        replacement.kill().unwrap();
     }
 
     #[test]
