@@ -1122,7 +1122,10 @@ impl SessionManager {
     ) -> anyhow::Result<bool> {
         // "suspended" (Slice 3): the agent parked by a freeze grace — child
         // killed to free RAM, pty held idle, resumable.
-        if !matches!(state, "claude" | "claude-retrying" | "shell-fallback" | "suspended") {
+        if !matches!(
+            state,
+            "claude" | "claude-retrying" | "shell-fallback" | "suspended" | "suspend-failed"
+        ) {
             anyhow::bail!("invalid run_state: {state}");
         }
         let sess = self
@@ -1142,7 +1145,15 @@ impl SessionManager {
         if (seq == 0 && current > 0) || (seq > 0 && seq <= current) {
             return Ok(false);
         }
-        sess.set_run_state(Some(state.to_string()));
+        // A renamed parked session inherits its suspension before the replacement
+        // supervisor has confirmed it parked its child. A terminal fallback at
+        // that point means there is nothing left to resume, so release the
+        // inherited gate instead of leaving input blocked forever. `suspend-failed`
+        // is the same reconciliation for a live cgroup reclaim failure.
+        let release_suspension = state == "suspend-failed"
+            || (state == "shell-fallback" && !sess.initial_suspend_ready());
+        let projected_state = if state == "suspend-failed" { "claude" } else { state };
+        sess.set_run_state(Some(projected_state.to_string()));
         if seq > 0 {
             sess.set_run_state_seq(seq);
         }
@@ -1156,6 +1167,11 @@ impl SessionManager {
                 sess.clear_suspend_origin();
                 sess.set_memory_suspend_started_ms(0);
             }
+        } else if release_suspension {
+            sess.mark_initial_suspend_ready();
+            let _ = sess.take_pending_resume();
+            sess.clear_suspend_origin();
+            sess.set_memory_suspend_started_ms(0);
         }
         Ok(true)
     }
@@ -1260,7 +1276,7 @@ impl SessionManager {
         if !is_agent {
             anyhow::bail!("resume applies only to agent sessions: {name}");
         }
-        if !session.initial_suspend_ready() {
+        if !session.initial_suspend_ready() || session.run_state().as_deref() != Some("suspended") {
             session.queue_pending_resume();
             return Ok(true);
         }
@@ -2362,6 +2378,7 @@ mod tests {
 
         assert_eq!(mgr.session_infos().unwrap()[0].kind, "shell");
         assert!(mgr.set_run_state(from, "claude").is_err());
+        assert!(mgr.set_run_state(from, "suspend-failed").is_err());
         assert!(mgr.suspend(from, SuspendOrigin::Manual).is_err());
         let info = mgr.rename(from, to).unwrap();
         let after = mgr.session(to).unwrap();
@@ -2856,6 +2873,91 @@ mod tests {
         wait_for_output(&session, b"RESUME_SIGNAL");
         assert_eq!(session.suspend_origin(), SuspendOrigin::None);
         assert!(!session.pending_resume_for_test());
+    }
+
+    #[test]
+    fn focus_waits_for_the_supervisor_to_confirm_suspension() {
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        let session = fake_agent(&mgr, "agent");
+        session.claim_suspend(SuspendOrigin::Memory).unwrap();
+
+        assert!(mgr.focus_session("agent").unwrap());
+        assert_eq!(session.suspend_origin(), SuspendOrigin::Memory);
+        assert!(session.pending_resume_for_test());
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            !session
+                .scrollback()
+                .windows(b"RESUME_SIGNAL".len())
+                .any(|bytes| bytes == b"RESUME_SIGNAL"),
+            "the supervisor has not yet parked the agent"
+        );
+
+        assert!(mgr.set_run_state_report("agent", "suspended", 1).unwrap());
+        wait_for_output(&session, b"RESUME_SIGNAL");
+        assert_eq!(session.suspend_origin(), SuspendOrigin::None);
+        assert!(!session.pending_resume_for_test());
+    }
+
+    #[test]
+    fn terminal_reports_release_an_inherited_initial_suspension() {
+        for (report, expected_state) in [
+            ("shell-fallback", "shell-fallback"),
+            ("suspend-failed", "claude"),
+        ] {
+            for (origin, queue_resume) in [
+                (SuspendOrigin::Manual, false),
+                (SuspendOrigin::Manual, true),
+                (SuspendOrigin::Memory, false),
+                (SuspendOrigin::Memory, true),
+            ] {
+                let dir = tempdir().unwrap();
+                let mgr = SessionManager::new(dir.path()).unwrap();
+                let name = format!("{report}-{origin:?}-{queue_resume}");
+                let session = fake_agent(&mgr, &name);
+                session.set_run_state(Some("suspended".into()));
+                session.claim_suspend(origin).unwrap();
+                session.set_memory_suspend_started_ms(77);
+                session.await_initial_suspend_ready();
+                if queue_resume {
+                    assert!(mgr.resume(&name, ResumeCause::Manual).unwrap());
+                    assert!(session.pending_resume_for_test());
+                }
+
+                assert!(mgr.set_run_state_report(&name, report, 1).unwrap());
+                assert!(session.initial_suspend_ready());
+                assert!(!session.pending_resume_for_test());
+                assert_eq!(session.suspend_origin(), SuspendOrigin::None);
+                assert_eq!(session.memory_suspend_started_ms(), 0);
+                assert_eq!(session.run_state().as_deref(), Some(expected_state));
+                assert!(!mgr.resume(&name, ResumeCause::Manual).unwrap());
+                mgr.write(&name, b"after-terminal-report\n").unwrap();
+                wait_for_output(&session, b"INPUT:after-terminal-report");
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_or_stale_reports_do_not_release_manual_suspension() {
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        let session = fake_agent(&mgr, "agent");
+        assert!(mgr.set_run_state_report("agent", "claude", 7).unwrap());
+        session.set_run_state(Some("suspended".into()));
+        session.claim_suspend(SuspendOrigin::Manual).unwrap();
+
+        assert!(mgr.set_run_state_report("agent", "claude", 8).unwrap());
+        assert_eq!(session.suspend_origin(), SuspendOrigin::Manual);
+        assert_eq!(session.memory_suspend_started_ms(), 0);
+        let error = mgr.write("agent", b"still-parked\n").unwrap_err();
+        assert!(error.to_string().contains("manually suspended"));
+
+        for report in ["shell-fallback", "suspend-failed"] {
+            assert!(!mgr.set_run_state_report("agent", report, 8).unwrap());
+            assert_eq!(session.suspend_origin(), SuspendOrigin::Manual);
+            assert_eq!(session.run_state().as_deref(), Some("claude"));
+        }
     }
 
     #[test]
