@@ -203,6 +203,12 @@ fn alloc_slot(used: &BTreeSet<u32>) -> u32 {
     (1..).find(|n| !used.contains(n)).expect("session slots exhausted")
 }
 
+fn require_cgroup_aggregate(current_kb: Option<u64>) -> anyhow::Result<u64> {
+    current_kb.ok_or_else(|| {
+        anyhow::anyhow!("cgroup containment is enabled but aggregate memory.current is unavailable")
+    })
+}
+
 impl SessionManager {
     /// Open a manager rooted at `root`, loading config (defaults if absent).
     pub fn new(root: impl Into<PathBuf>) -> anyhow::Result<Self> {
@@ -952,9 +958,7 @@ impl SessionManager {
             .iter()
             .map(|(name, session)| (name.clone(), Arc::clone(session)))
             .collect();
-        let Some(current_kb) = self.cgroups.aggregate_current_kb()? else {
-            return Ok(None);
-        };
+        let current_kb = require_cgroup_aggregate(self.cgroups.aggregate_current_kb()?)?;
         let mut per_session = HashMap::new();
         for (name, session) in sessions {
             if !session.is_alive() {
@@ -966,6 +970,10 @@ impl SessionManager {
             }
         }
         Ok(Some((current_kb, per_session)))
+    }
+
+    pub(crate) fn cgroup_memory_enabled(&self) -> bool {
+        self.cgroups.is_enabled()
     }
 
     /// The persisted kind of a session, from the state store (None if the
@@ -2023,6 +2031,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let mgr = SessionManager::new(dir.path()).unwrap();
         assert_eq!(mgr.cgroup_memory_sample().unwrap(), None);
+    }
+
+    #[test]
+    fn enabled_cgroup_requires_an_aggregate_memory_sample() {
+        let error = require_cgroup_aggregate(None).unwrap_err();
+        assert!(error.to_string().contains("aggregate memory.current"));
+        assert_eq!(require_cgroup_aggregate(Some(321)).unwrap(), 321);
     }
 
     #[test]

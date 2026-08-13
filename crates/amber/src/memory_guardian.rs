@@ -134,6 +134,36 @@ fn should_broadcast(
         || last_broadcast_ms.is_none_or(|last| now_ms.saturating_sub(last) >= PRESSURE_REFRESH_MS)
 }
 
+fn record_rss_stat(
+    histories: &mut HashMap<String, VecDeque<u64>>,
+    name: String,
+    rss_kb: u64,
+) -> ControlMsg {
+    let history = histories.entry(name.clone()).or_default();
+    history.push_back(rss_kb);
+    while history.len() > WINDOW {
+        history.pop_front();
+    }
+    let series: Vec<u64> = history.iter().copied().collect();
+    ControlMsg::MemoryStat {
+        name,
+        rss_kb,
+        growing: crate::procinfo::is_growing(&series, MIN_GROWTH_KB, NOISE_KB),
+    }
+}
+
+fn select_pressure_sample(
+    cgroup_enabled: bool,
+    cgroup_sample: Option<(u64, HashMap<String, u64>)>,
+    rss_sample: Option<(u64, HashMap<String, u64>)>,
+) -> Option<(u64, HashMap<String, u64>)> {
+    if cgroup_enabled {
+        cgroup_sample
+    } else {
+        rss_sample
+    }
+}
+
 /// Start the daemon's single memory monitor/guardian thread. Cgroup charge is
 /// sampled every second when available; the process table is read once every
 /// three ticks for the existing per-session RSS telemetry and as the fallback
@@ -151,6 +181,7 @@ pub fn start(
         ),
     }
     thread::spawn(move || {
+        let cgroup_enabled = manager.cgroup_memory_enabled();
         let mut level = PressureLevel::Normal;
         let mut blocked = false;
         let mut last_pressure_broadcast_ms: Option<u64> = None;
@@ -179,17 +210,8 @@ pub fn start(
                     for (name, pid) in pids {
                         let rss_kb = crate::procinfo::subtree_rss_kb(&table, pid);
                         per_session.insert(name.clone(), rss_kb);
-                        let history = samples.entry(name.clone()).or_default();
-                        history.push_back(rss_kb);
-                        while history.len() > WINDOW {
-                            history.pop_front();
-                        }
-                        let series: Vec<u64> = history.iter().copied().collect();
-                        watchers.broadcast(&ControlMsg::MemoryStat {
-                            name,
-                            rss_kb,
-                            growing: crate::procinfo::is_growing(&series, MIN_GROWTH_KB, NOISE_KB),
-                        });
+                        let event = record_rss_stat(&mut samples, name, rss_kb);
+                        watchers.broadcast(&event);
                     }
                     let total = per_session
                         .values()
@@ -202,7 +224,9 @@ pub fn start(
             };
 
             let Some(budget) = budget_kb else { continue };
-            let Some((current_kb, per_session_kb)) = cgroup_sample.or(rss_sample) else {
+            let Some((current_kb, per_session_kb)) =
+                select_pressure_sample(cgroup_enabled, cgroup_sample, rss_sample)
+            else {
                 continue;
             };
             let now_ms = crate::pty::monotonic_ms();
@@ -340,6 +364,31 @@ mod tests {
         assert_eq!(
             pressure_level(PressureLevel::Critical, 900, 1000),
             PressureLevel::Critical
+        );
+    }
+
+    #[test]
+    fn active_cgroup_failure_keeps_rss_for_telemetry_only_while_disabled_uses_rss_pressure() {
+        let mut histories = HashMap::new();
+        let telemetry = record_rss_stat(&mut histories, "agent".to_string(), 900);
+        let rss_sample = (900, HashMap::from([("agent".to_string(), 900)]));
+
+        assert_eq!(
+            telemetry,
+            ControlMsg::MemoryStat {
+                name: "agent".to_string(),
+                rss_kb: 900,
+                growing: false,
+            }
+        );
+
+        assert_eq!(
+            select_pressure_sample(true, None, Some(rss_sample.clone())),
+            None
+        );
+        assert_eq!(
+            select_pressure_sample(false, None, Some(rss_sample.clone())),
+            Some(rss_sample)
         );
     }
 
