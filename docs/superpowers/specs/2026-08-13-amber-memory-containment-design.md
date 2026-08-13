@@ -1,7 +1,9 @@
 # Amber Memory Containment and Safe Session Parking — Design
 
 **Date:** 2026-08-13
-**Status:** Implementation plan ready
+**Status:** Implemented; private Linux pressure verification complete;
+repository formatting gate, production rollout, and real-Mac verification
+pending
 **Supersedes:** The deferred Slice 2 and Slice 3 designs in
 `2026-07-17-memory-monitor-throttle-design.md`. The shipped Slice 1 memory
 monitor remains compatible.
@@ -203,6 +205,27 @@ pub struct MemoryConfig {
 }
 ```
 
+An operator who wants an explicit 12 GiB aggregate calibration with the
+default 4 GiB per-session soft boundary can use:
+
+```toml
+[memory]
+enabled = true
+budget_mb = 12288
+session_high_mb = 4096
+```
+
+`budget_mb` calibrates Amber's warning, critical, and parking thresholds; it is
+not a hard allocation limit. Linux still clamps it to the lowest finite cgroup
+boundary. The installed systemd unit's default `MemoryHigh=50%` is the aggregate
+soft reclaim boundary. Administrators may add `MemoryMax=` in a systemd drop-in,
+but that is a destructive OOM boundary: crossing it can kill workload processes
+and, if no reclaimable child remains, the daemon. Amber intentionally ships no
+default `MemoryMax`.
+
+On macOS, the same guardian policy uses process-tree RSS and can park recorded
+idle agent sessions, but there is no cgroup placement or soft throttling.
+
 `budget_mb` is a calibration override. Before ancestor limits, runtime clamping
 keeps aggregate budget at least 512 MiB and per-session soft boundary at least
 256 MiB. A lower ancestor boundary still wins because descendants cannot escape
@@ -364,6 +387,50 @@ that allocates memory and forks a stubborn child must prove:
 
 Real-Mac verification covers RSS-based pressure, safe parking, focus resume,
 and persistence without cgroup access.
+
+### Verification log
+
+- 2026-08-13 automated gates on Linux 7.0.0 x86_64, systemd 255, Rust
+  1.96.1: Rust tests passed twice (438 each); app tests passed (478 with one
+  intentional skip); equivalent warnings-as-errors clippy, TypeScript
+  typecheck, production bundle, systemd unit verification, and lockfile check
+  passed. The literal clippy command is misrouted by the repository command
+  hook; `RUSTFLAGS='-D warnings' cargo clippy --workspace --all-targets` passed.
+  `cargo fmt --all -- --check` did not pass: rustfmt 1.9 reports repository-wide
+  formatting differences in pre-existing Rust files, while this documentation
+  task changed no Rust source. The automated release gate is therefore not
+  fully green.
+- 2026-08-13 private Linux proof used a transient `amber-memory-test.service`
+  with an isolated `/tmp/amber-memory-test.*` state root, 512 MiB
+  `MemoryHigh`, `Delegate=memory`, `OOMPolicy=continue`, and no `MemoryMax`.
+  The service root stayed empty; the daemon, supervisors, workloads, shell, and
+  stubborn descendants appeared in the expected slot leaves. Every session
+  parent read `memory.high=536870912`. Reclaim raised the service `high` event
+  counter while `oom` and `oom_kill` stayed zero. List, create, attach, input,
+  kill, snapshot, and watcher traffic remained responsive.
+- Guardian proof: the oldest idle recorded agent parked before the focused
+  agent, its workload leaf became unpopulated, and service charge fell from
+  about 444 MiB to 228 MiB. The blocked-critical watcher event was observed
+  when no candidate was yet eligible. Raw attach resumed the exact
+  `sid-mem-idle`; a manual suspension remained `suspended` after Focus. Shell
+  rename preserved PID and slot; agent rename changed supervisor PID while
+  preserving slot and recorded id. Kill removed the supervisor, stubborn
+  descendant, and slot cgroups. Private daemon restart restored name, cwd,
+  scrollback, slots, and the exact recorded conversation id. A direct
+  nondelegated daemon logged one containment warning and still supported
+  create, attach/input, list, and kill.
+- Pressure soak ran 1,820 seconds with 180 samples at ten-second intervals.
+  All 180 samples reported active/running and all 180 two-second `amber ls`
+  probes succeeded. After reclaim, charge stayed about 429–431 MiB, peak was
+  570,601,472 bytes, task count stayed 13, `high=3308`, and `oom=oom_kill=0`.
+  The private unit was then stopped, its validated state root removed, and the
+  unit reported inactive/dead with PID 0.
+- Production rollout is intentionally deferred: installing this worktree build
+  would restart live user sessions. The production daemon remained PID 2314
+  throughout the proof. Real-Mac verification is pending because this host is
+  Linux; no macOS result is claimed. Desktop/mobile resume and renderer-banner
+  behavior remain automated-test evidence rather than live GUI/phone evidence
+  in this pass.
 
 ## Rollback
 

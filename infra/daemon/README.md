@@ -36,6 +36,51 @@ Builds `--release`, installs the binary to `~/.local/bin/amber` (override with
 Snapshot cadence is `config.snapshot_interval_secs` (default 10s) plus a final
 snapshot on `SIGTERM`. State lives under `$XDG_STATE_HOME/amber-ide/`.
 
+## Memory containment checks (Linux)
+
+The installed unit uses delegated cgroup v2 memory accounting with an aggregate
+soft boundary. It has no default hard OOM limit:
+
+```sh
+systemctl --user show amber.service \
+  -p ActiveState -p SubState -p Delegate -p MemoryHigh -p MemoryMax \
+  -p OOMPolicy -p ControlGroup
+```
+
+Use `amber ls` to match the stable numeric slot printed for each session to its
+`session-<slot>` cgroup. Resolve the service path rather than assuming it:
+
+```sh
+cg="$(systemctl --user show amber.service -p ControlGroup --value)"
+root="/sys/fs/cgroup${cg}"
+find "$root" -maxdepth 3 \
+  \( -name cgroup.procs -o -name cgroup.events -o -name memory.current \
+     -o -name memory.high -o -name memory.events \) -print
+```
+
+The daemon PID belongs only in `_daemon/cgroup.procs`. Agent supervisors belong
+in `session-<slot>/supervisor/cgroup.procs`; agent workloads, shells, and all
+their descendants belong in `session-<slot>/workload/cgroup.procs`. The session
+parent's `memory.high` is the configured per-session boundary clamped to the
+aggregate service boundary. `memory.events` reports reclaim pressure (`high`)
+and must not gain `oom` or `oom_kill` events during normal soft throttling.
+
+Session metadata, stable slots, agent resume ids, and scrollback remain in the
+state root. Before an upgrade or rollback, flush it and confirm the daemon is
+reachable:
+
+```sh
+amber ctl snapshot-now
+amber ctl status
+amber ls
+```
+
+`[memory] enabled = false` disables automatic parking after restart without a
+state migration. To remove Linux soft containment too, snapshot again, remove
+the unit memory directives in an administrator override, run
+`systemctl --user daemon-reload`, and restart the service. A `MemoryMax=`
+override is a destructive OOM boundary and is never installed by default.
+
 ## Reboot torture test (Slice 3 exit test)
 
 Requires a real reboot; run it by hand.
@@ -55,9 +100,7 @@ Requires a real reboot; run it by hand.
    hold a real conversation in each so `claude/<name>.json` records distinct
    session ids.
 4. Wait ≥ `snapshot_interval_secs` (default 10s) for an autosnapshot, or force
-   one: `amber ctl snapshot-now` *(Slice: ctl subcommand pending — until then a
-   clean `systemctl --user stop amber.service` triggers the SIGTERM final
-   snapshot)*.
+   one: `amber ctl snapshot-now`.
 5. **Reboot.** Log in.
 6. `amber ls` → all four sessions present. `amber attach t-a` → original cwd +
    scrollback restored. `amber attach t-c` and `t-d` → **each claude session

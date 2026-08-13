@@ -1,7 +1,8 @@
 # Memory Monitor + Soft Throttle — Design
 
 **Date:** 2026-07-17
-**Status:** Slice 1 approved (monitor); Slice 2 designed (throttle, deferred)
+**Status:** Slice 1 shipped; deferred Slices 2–3 superseded by
+`2026-08-13-amber-memory-containment-design.md`
 
 ## Problem
 
@@ -95,7 +96,12 @@ next normal restart, and nothing about process placement changes.
 - Degradation: non-Linux → monitor no-ops (no `/proc`); the app simply shows no
   MB. No hard dependency on cgroups.
 
-## Slice 2 — Soft throttle (designed, deferred; needs restart + unit change)
+## Slice 2 — Soft throttle (historical design; superseded)
+
+This deferred design was not implemented as written. The 2026-08-13 memory
+containment design replaces it with stable slot cgroups, delegated service
+containment, an isolated daemon leaf, and a calibrated aggregate budget. The
+notes below are retained as design history.
 
 Linux cgroup v2 `memory.high`. Requires the daemon to restructure its cgroup:
 
@@ -121,7 +127,12 @@ Linux cgroup v2 `memory.high`. Requires the daemon to restructure its cgroup:
 
 Deploying Slice 2 restarts the daemon (sessions restore with scrollback).
 
-## Slice 3 — Freeze → claude suspend/resume (designed, deferred)
+## Slice 3 — Freeze → claude suspend/resume (historical design; superseded)
+
+This deferred design was not implemented as written. The 2026-08-13 memory
+containment design replaces its renderer grace timer with daemon-owned pressure
+policy, snapshot-before-park, typed suspend origins, and focus-driven resume.
+The notes below are retained as design history.
 
 A different lever than throttling: **actually free a parked claude pane's RAM**
 by killing its child and resuming it on unfreeze. This is *manual, per-session
