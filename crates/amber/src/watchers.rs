@@ -121,9 +121,6 @@ impl Watchers {
         let forwarder = {
             let mut entries = self.entries.lock().unwrap();
             if let Some(index) = entries.iter().position(|entry| entry.writer_key == writer_key) {
-                if entries[index].session_events {
-                    return;
-                }
                 if entries[index].tx.try_send(QueuedFrame::Initial(snapshot_rx)).is_err() {
                     entries.remove(index);
                     return;
@@ -362,6 +359,39 @@ mod tests {
         let (mut client, server) = UnixStream::pair().unwrap();
         let writer = Arc::new(Mutex::new(server));
         watchers.register_pressure(&writer, 1);
+        let (snapshot_started_tx, snapshot_started_rx) = std::sync::mpsc::channel();
+        let (finish_snapshot_tx, finish_snapshot_rx) = std::sync::mpsc::channel();
+        let registering = {
+            let watchers = Arc::clone(&watchers);
+            let writer = Arc::clone(&writer);
+            thread::spawn(move || {
+                watchers.register_sessions(&writer, || {
+                    snapshot_started_tx.send(()).unwrap();
+                    finish_snapshot_rx.recv().unwrap();
+                    vec![]
+                });
+            })
+        };
+        snapshot_started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let delta = ControlMsg::SessionsChanged { added: vec![], removed: vec!["after".into()] };
+        watchers.broadcast(&delta);
+        finish_snapshot_tx.send(()).unwrap();
+        registering.join().unwrap();
+
+        let mut decoder = Decoder::new();
+        assert!(matches!(
+            read_next(&mut client, &mut decoder),
+            Some(Frame::Control(ControlMsg::Sessions { sessions })) if sessions.is_empty()
+        ));
+        assert_eq!(read_next(&mut client, &mut decoder), Some(Frame::Control(delta)));
+    }
+
+    #[test]
+    fn repeat_session_watch_snapshot_precedes_later_delta() {
+        let watchers = Arc::new(Watchers::new());
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let writer = Arc::new(Mutex::new(server));
+        watchers.register(&writer);
         let (snapshot_started_tx, snapshot_started_rx) = std::sync::mpsc::channel();
         let (finish_snapshot_tx, finish_snapshot_rx) = std::sync::mpsc::channel();
         let registering = {
