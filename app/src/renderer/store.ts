@@ -35,6 +35,7 @@ export type DaemonEvent =
   // Daemon: periodic per-session memory reading (child-tree RSS KiB + growth).
   | { kind: 'Memory'; name: string; rssKb: number; growing: boolean }
   | { kind: 'MemoryPressure'; level: 'normal' | 'warning' | 'critical'; currentKb: number; budgetKb: number; blocked: boolean }
+  | { kind: 'ClearMemoryPressure' }
   // UI-originated: the visible tab's panes have been seen (active tab/ws change,
   // or activity for the already-visible tab) — mark their activity as seen.
   | { kind: 'MarkSeen'; names: string[] }
@@ -102,6 +103,8 @@ export function reduce(state: AppState, ev: DaemonEvent): AppState {
         && prev.budgetKb === pressure.budgetKb && prev.blocked === pressure.blocked) return state
       return { ...state, pressure }
     }
+    case 'ClearMemoryPressure':
+      return state.pressure === null ? state : { ...state, pressure: null }
     case 'MarkSeen': {
       let changed = false
       const lastSeen = { ...state.lastSeen }

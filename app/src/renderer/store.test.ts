@@ -200,6 +200,16 @@ describe('reduce MemoryPressure', () => {
       budgetKb: 8_000_000, blocked: false,
     })).toBe(first)
   })
+
+  it('clears stale pressure on disconnect and no-ops when already clear', () => {
+    const critical = reduce(initialState(), {
+      kind: 'MemoryPressure', level: 'critical', currentKb: 7_000_000,
+      budgetKb: 8_000_000, blocked: false,
+    })
+    const cleared = reduce(critical, { kind: 'ClearMemoryPressure' })
+    expect(cleared.pressure).toBeNull()
+    expect(reduce(cleared, { kind: 'ClearMemoryPressure' })).toBe(cleared)
+  })
 })
 
 describe('paneDot', () => {

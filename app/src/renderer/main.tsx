@@ -314,7 +314,12 @@ function App(): JSX.Element {
       }
       const st = (d as { status?: string }).status
       if (st === 'connected') setConnected(true)
-      else if (st === 'disconnected') setConnected(false)
+      else if (st === 'disconnected') {
+        // A reconnect to an older daemon may never send MemoryPressure, so a
+        // prior connection's warning must not survive the socket boundary.
+        dispatch({ kind: 'ClearMemoryPressure' })
+        setConnected(false)
+      }
       // The client utilityProcess was relaunched: its old pane ports are dead,
       // so ask every Pane to re-acquire from the new child.
       if ((d as { childRestart?: boolean }).childRestart) setChildEpoch((e) => e + 1)
