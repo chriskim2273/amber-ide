@@ -5,7 +5,7 @@ import { Editor, type EditorApi } from './Editor'
 import { paneRects, handles, nextPaneInDirection, focusCandidates, ratioAt, leaves, type Node, type Rect, type Zone, type FocusDir } from './layout'
 import { appChord, chordLabel } from './keys'
 import { paneDot } from './store'
-import { CLAUDE_SESSION_ID } from '../shared/ids'
+import { reloadAgentCommand } from './reloadAgent'
 
 export interface PaneMeta { kind: string; title: string; cwd: string; runState?: string | undefined; rssKb?: number | undefined; growing?: boolean | undefined; claudeId?: string | undefined }
 
@@ -264,29 +264,13 @@ export function SplitView(props: {
     onFreeze(id, note)
   }
 
-  // Reload the pane's agent in its shell: Ctrl-U (\x15) clears any stray input
-  // line, then `<agent> --resume` + Enter. `id` resumes that exact
-  // conversation; null omits it (claude opens its own session picker; grok
-  // takes the most recent conversation in the cwd).
-  // SECURITY: the id is interpolated into a command line run in the pane's
-  // SHELL, so it must be shape-validated first — a value with shell
-  // metacharacters (`; rm -rf ~`) would otherwise execute. Both agents' session
-  // ids are UUIDs; anything else is rejected (the command is not sent). It comes
-  // from the store today, but this is the trust boundary, so validate at use.
+  // Reload the pane's agent in its shell: Ctrl-U clears stray input, then the
+  // provider-specific resume command runs. Construction is isolated at the
+  // shell trust boundary and rejects unsafe recorded ids.
   const reloadClaude = (paneId: string, id: string | null, kind: string): void => {
-    if (id !== null && !CLAUDE_SESSION_ID.test(id)) { setReloadPane(null); return }
-    const api = searchApis.current.get(paneId)
-    if (api) {
-      const flag = id ? ` --resume ${id}` : ' --resume'
-      // A grok id must never be handed to claude (and vice versa) — the
-      // recorded id lives in one store for both, so the KIND picks the binary.
-      const cmd = kind === 'grok'
-        ? `grok --permission-mode bypassPermissions${flag}`
-        : kind === 'codex'
-          ? (id ? `codex resume ${id} --dangerously-bypass-approvals-and-sandbox` : 'codex resume --last --dangerously-bypass-approvals-and-sandbox')
-          : `claude --dangerously-skip-permissions${flag}`
-      api.insert(`\x15${cmd}\n`)
-    }
+    const cmd = reloadAgentCommand(agentOf(kind), id)
+    if (cmd === null) { setReloadPane(null); return }
+    searchApis.current.get(paneId)?.insert(`\x15${cmd}\n`)
     setReloadPane(null)
   }
 
@@ -689,22 +673,19 @@ export function SplitView(props: {
                 <FreezeNoteInput
                   onCommit={(note) => { freeze(paneId, note); setNotePane(null) }}
                   onCancel={() => setNotePane(null)} />}
-              {/* Reload-claude confirmation. Runs `claude --resume` in the shell,
-                  so it's gated behind this prompt. "Resume last" targets the exact
-                  recorded conversation; "Pick session…" opens claude's own history
-                  picker. Clears the input line first (Ctrl-U). */}
+              {/* Provider-specific resume confirmation. */}
               {reloadPane === paneId && meta?.claudeId && !isFrozen &&
                 <div className="reload-claude-prompt" role="dialog" aria-label={`reload ${agentOf(meta.kind)}`}>
                   <div className="reload-claude-title">Reload {agentOf(meta.kind)} in this pane?</div>
-                  <div className="reload-claude-sub">Clears the current line, then runs <code>{agentOf(meta.kind)} --resume</code>.</div>
+                  <div className="reload-claude-sub">Clears the current line, then runs <code>{meta.kind === 'codex' ? 'codex resume' : `${agentOf(meta.kind)} --resume`}</code>.</div>
                   <div className="reload-claude-actions">
                     <button className="btn btn-accent" onClick={() => reloadClaude(paneId, meta.claudeId ?? null, meta.kind)}>
-                      Resume last <span className="reload-id">{meta.claudeId!.slice(0, 8)}…</span>
+                      Resume saved <span className="reload-id">{meta.claudeId!.slice(0, 8)}…</span>
                     </button>
                     <button className="btn" onClick={() => reloadClaude(paneId, null, meta.kind)}
                       title={
                         meta.kind === 'grok' ? "resumes the most recent conversation in this folder"
-                          : meta.kind === 'codex' ? "opens codex's session picker (resume --last)"
+                          : meta.kind === 'codex' ? "opens codex's session picker"
                             : "opens claude's own session list"
                       }>
                       Pick session…
