@@ -151,10 +151,8 @@ fn merge_project_trust(original: &str, header: &str) -> Option<String> {
         }
         out.extend(lines[end..].iter().map(|l| (*l).to_string()));
         let mut s = out.join("\n");
-        if original.ends_with('\n') || !s.ends_with('\n') {
-            if !s.ends_with('\n') {
-                s.push('\n');
-            }
+        if !s.ends_with('\n') {
+            s.push('\n');
         }
         return Some(s);
     }
