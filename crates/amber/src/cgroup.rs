@@ -19,6 +19,7 @@ pub enum CgroupRole {
 #[derive(Clone, Debug)]
 pub struct CgroupManager {
     root: Option<PathBuf>,
+    mount_point: Option<PathBuf>,
     session_high_bytes: Option<u64>,
 }
 
@@ -57,6 +58,7 @@ impl CgroupManager {
     pub fn disabled() -> Self {
         Self {
             root: None,
+            mount_point: None,
             session_high_bytes: None,
         }
     }
@@ -81,7 +83,7 @@ impl CgroupManager {
     #[cfg(target_os = "linux")]
     fn activate_linux() -> io::Result<Self> {
         let unified = parse_unified_path(&fs::read_to_string("/proc/self/cgroup")?)?;
-        let mount = parse_cgroup2_mount(&fs::read_to_string("/proc/self/mountinfo")?)?;
+        let mount = parse_cgroup2_mount(&fs::read_to_string("/proc/self/mountinfo")?, &unified)?;
         let root = resolve_cgroup_path(&mount, &unified)?;
         let controllers = fs::read_to_string(root.join("cgroup.controllers"))?;
         if !controllers.split_whitespace().any(|name| name == "memory") {
@@ -116,6 +118,7 @@ impl CgroupManager {
         }
         Ok(Self {
             root: Some(root),
+            mount_point: Some(mount.mount_point),
             session_high_bytes: None,
         })
     }
@@ -170,12 +173,24 @@ impl CgroupManager {
         let Some(root) = &self.root else {
             return Ok(None);
         };
+        let mount_point = self.mount_point.as_deref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "missing cgroup2 mount boundary")
+        })?;
+        if !root.starts_with(mount_point) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cgroup root is outside its mount point",
+            ));
+        }
         let mut lowest: Option<u64> = None;
         for ancestor in root.ancestors() {
             for control in ["memory.high", "memory.max"] {
                 if let Some(bytes) = read_finite_control(&ancestor.join(control))? {
                     lowest = Some(lowest.map_or(bytes, |current| current.min(bytes)));
                 }
+            }
+            if ancestor == mount_point {
+                break;
             }
         }
         Ok(lowest.map(|bytes| bytes / 1024))
@@ -245,7 +260,8 @@ fn parse_unified_path(body: &str) -> io::Result<PathBuf> {
     ))
 }
 
-fn parse_cgroup2_mount(body: &str) -> io::Result<CgroupMount> {
+fn parse_cgroup2_mount(body: &str, unified: &Path) -> io::Result<CgroupMount> {
+    validate_absolute(unified)?;
     for line in body.lines() {
         let Some((before, after)) = line.split_once(" - ") else {
             continue;
@@ -261,6 +277,9 @@ fn parse_cgroup2_mount(body: &str) -> io::Result<CgroupMount> {
         let mount_point = PathBuf::from(decode_proc_path(fields[4]));
         validate_absolute(&root)?;
         validate_absolute(&mount_point)?;
+        if !unified.starts_with(&root) {
+            continue;
+        }
         return Ok(CgroupMount { root, mount_point });
     }
     Err(io::Error::new(
@@ -374,8 +393,8 @@ fn kill_tree(target: &Path) -> io::Result<bool> {
     };
     let deadline = Instant::now() + KILL_TIMEOUT;
     loop {
-        if fallback {
-            kill_all_pids(target)?;
+        if fallback && !kill_all_pids(target, deadline)? {
+            return Ok(false);
         }
         if !read_populated(target)? {
             return Ok(true);
@@ -411,15 +430,21 @@ fn read_populated(path: &Path) -> io::Result<bool> {
         })
 }
 
-fn kill_all_pids(root: &Path) -> io::Result<()> {
+fn kill_all_pids(root: &Path, deadline: Instant) -> io::Result<bool> {
     let mut pending = vec![root.to_path_buf()];
     while let Some(path) = pending.pop() {
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
         match fs::read_to_string(path.join("cgroup.procs")) {
             Ok(body) => {
                 for pid in body
                     .lines()
                     .filter_map(|line| line.trim().parse::<i32>().ok())
                 {
+                    if Instant::now() >= deadline {
+                        return Ok(false);
+                    }
                     let result = unsafe { libc::kill(pid, libc::SIGKILL) };
                     if result != 0 {
                         let error = io::Error::last_os_error();
@@ -433,13 +458,16 @@ fn kill_all_pids(root: &Path) -> io::Result<()> {
             Err(error) => return Err(error),
         }
         for entry in fs::read_dir(&path)? {
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
             let entry = entry?;
             if entry.file_type()?.is_dir() {
                 pending.push(entry.path());
             }
         }
     }
-    Ok(())
+    Ok(Instant::now() < deadline)
 }
 
 #[cfg(test)]
@@ -473,19 +501,35 @@ mod tests {
     #[test]
     fn resolves_cgroup2_mount_without_assuming_sys_fs_cgroup() {
         let mountinfo = "31 22 0:27 / /run/cgroup rw,nosuid,nodev,noexec - cgroup2 cgroup rw\n";
-        let mount = parse_cgroup2_mount(mountinfo).unwrap();
+        let unified = Path::new("/user.slice/amber.service");
+        let mount = parse_cgroup2_mount(mountinfo, unified).unwrap();
         assert_eq!(
-            resolve_cgroup_path(&mount, Path::new("/user.slice/amber.service")).unwrap(),
+            resolve_cgroup_path(&mount, unified).unwrap(),
             PathBuf::from("/run/cgroup/user.slice/amber.service"),
+        );
+    }
+
+    #[test]
+    fn selects_the_cgroup2_mount_whose_root_contains_the_unified_path() {
+        let mountinfo = concat!(
+            "31 22 0:27 /other /wrong rw - cgroup2 cgroup rw\n",
+            "32 22 0:28 /user.slice /right rw - cgroup2 cgroup rw\n",
+        );
+        let unified = Path::new("/user.slice/amber.service");
+        let mount = parse_cgroup2_mount(mountinfo, unified).unwrap();
+        assert_eq!(
+            resolve_cgroup_path(&mount, unified).unwrap(),
+            PathBuf::from("/right/amber.service"),
         );
     }
 
     #[test]
     fn resolves_mount_root_prefix_and_proc_escapes() {
         let mountinfo = "31 22 0:27 /user.slice /run/cgroup\\040v2 rw - cgroup2 cgroup rw\n";
-        let mount = parse_cgroup2_mount(mountinfo).unwrap();
+        let unified = Path::new("/user.slice/amber.service");
+        let mount = parse_cgroup2_mount(mountinfo, unified).unwrap();
         assert_eq!(
-            resolve_cgroup_path(&mount, Path::new("/user.slice/amber.service")).unwrap(),
+            resolve_cgroup_path(&mount, unified).unwrap(),
             PathBuf::from("/run/cgroup v2/amber.service"),
         );
         assert!(resolve_cgroup_path(&mount, Path::new("/other/amber.service")).is_err());
@@ -515,9 +559,39 @@ mod tests {
 
         let manager = CgroupManager {
             root: Some(service),
+            mount_point: Some(temp.path().to_path_buf()),
             session_high_bytes: None,
         };
         assert_eq!(manager.lowest_finite_limit_kb().unwrap(), Some(4096));
+    }
+
+    #[test]
+    fn finite_limit_scan_stops_at_the_cgroup2_mount_point() {
+        let temp = tempfile::tempdir().unwrap();
+        let mount = temp.path().join("mount");
+        let service = mount.join("parent/service");
+        std::fs::create_dir_all(&service).unwrap();
+        std::fs::write(temp.path().join("memory.max"), "1048576\n").unwrap();
+        std::fs::write(mount.join("memory.max"), "8388608\n").unwrap();
+        std::fs::write(mount.join("memory.high"), "max\n").unwrap();
+        std::fs::write(mount.join("parent/memory.high"), "4194304\n").unwrap();
+        std::fs::write(mount.join("parent/memory.max"), "max\n").unwrap();
+        std::fs::write(service.join("memory.high"), "6291456\n").unwrap();
+        std::fs::write(service.join("memory.max"), "max\n").unwrap();
+
+        let manager = CgroupManager {
+            root: Some(service),
+            mount_point: Some(mount),
+            session_high_bytes: None,
+        };
+        assert_eq!(manager.lowest_finite_limit_kb().unwrap(), Some(4096));
+    }
+
+    #[test]
+    fn fallback_pid_traversal_honors_an_expired_deadline() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("cgroup.procs"), "2147483647\n").unwrap();
+        assert!(!kill_all_pids(temp.path(), Instant::now()).unwrap());
     }
 
     #[test]
@@ -534,6 +608,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let enabled = CgroupManager {
             root: Some(temp.path().to_path_buf()),
+            mount_point: Some(temp.path().to_path_buf()),
             session_high_bytes: None,
         };
         assert!(enabled.prepare_session(1).is_err());
