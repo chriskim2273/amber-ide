@@ -271,7 +271,7 @@ pub fn start(
                 now_ms,
                 &decision,
             ) {
-                watchers.broadcast(&ControlMsg::MemoryPressure {
+                watchers.broadcast_pressure(&ControlMsg::MemoryPressure {
                     level: match decision.level {
                         PressureLevel::Normal => "normal",
                         PressureLevel::Warning => "warning",
@@ -608,11 +608,19 @@ mod tests {
         let manager = Arc::new(crate::manager::SessionManager::new(dir.path()).unwrap());
         let name = "race-agent";
         manager
-            .create(name, dir.path(), SessionKind::Claude)
+            // Keep a real shell pty alive, then rewrite only the persisted
+            // trust-boundary kind. Spawning an agent kind from a unit test
+            // launches the test binary as `amber run` and can exit before the
+            // race is exercised.
+            .create(name, dir.path(), SessionKind::Shell)
             .unwrap();
         let session = manager.session(name).unwrap();
         session.set_run_state(Some("claude".into()));
-        StateStore::new(dir.path())
+        let store = StateStore::new(dir.path());
+        let mut meta = store.read_session(name).unwrap().unwrap();
+        meta.kind = SessionKind::Claude;
+        store.write_session(&meta).unwrap();
+        store
             .write_claude(
                 name,
                 &ClaudeMeta {

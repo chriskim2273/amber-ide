@@ -78,6 +78,7 @@ fn report_run_state_stores_broadcasts_and_validates() {
         ControlMsg::ReportRunState {
             name: "amber-1-1-0-c".into(),
             state: "claude-retrying".into(),
+            seq: 0,
         },
     );
 
@@ -119,6 +120,7 @@ fn report_run_state_stores_broadcasts_and_validates() {
         ControlMsg::ReportRunState {
             name: "amber-1-1-1-s".into(),
             state: "claude".into(),
+            seq: 0,
         },
     );
     let err = read_control_until(&mut b, |m| matches!(m, ControlMsg::Error { .. }));
@@ -152,9 +154,56 @@ fn live_resume_flagged_shell_still_rejects_run_state_reports() {
         ControlMsg::ReportRunState {
             name: "flagged-shell".into(),
             state: "claude".into(),
+            seq: 0,
         },
     );
     let error = read_control_until(&mut replies, |msg| matches!(msg, ControlMsg::Error { .. }));
     assert!(matches!(error, ControlMsg::Error { msg } if msg.contains("agent")));
     assert_eq!(manager.session_infos().unwrap()[0].kind, "shell");
+}
+
+#[test]
+fn stale_reordered_report_cannot_overwrite_terminal_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("amberd.sock");
+    let manager = Arc::new(SessionManager::new(dir.path()).unwrap());
+    manager.create("agent", dir.path(), SessionKind::Shell).unwrap();
+    let store = StateStore::new(dir.path());
+    let mut meta = store.read_session("agent").unwrap().unwrap();
+    meta.kind = SessionKind::Claude;
+    store.write_session(&meta).unwrap();
+
+    let listener = prepare_socket(&sock).unwrap();
+    let daemon = Daemon::new(Arc::clone(&manager), Arc::new(Watchers::new()));
+    std::thread::spawn(move || {
+        let _ = daemon.serve(listener);
+    });
+
+    let reporter = UnixStream::connect(&sock).unwrap();
+    let mut replies = reporter.try_clone().unwrap();
+    send(
+        &reporter,
+        ControlMsg::ReportRunState {
+            name: "agent".into(),
+            state: "shell-fallback".into(),
+            seq: 2,
+        },
+    );
+    assert_eq!(
+        read_control_until(&mut replies, |m| matches!(m, ControlMsg::RunStateAck { seq: 2, .. })),
+        ControlMsg::RunStateAck { name: "agent".into(), seq: 2 }
+    );
+
+    // Delayed delivery from an earlier connection arrives after the terminal
+    // report. It is acknowledged (so a retry loop can stop) but not applied.
+    send(
+        &reporter,
+        ControlMsg::ReportRunState {
+            name: "agent".into(),
+            state: "claude".into(),
+            seq: 1,
+        },
+    );
+    read_control_until(&mut replies, |m| matches!(m, ControlMsg::RunStateAck { seq: 1, .. }));
+    assert_eq!(manager.session_infos().unwrap()[0].run_state.as_deref(), Some("shell-fallback"));
 }

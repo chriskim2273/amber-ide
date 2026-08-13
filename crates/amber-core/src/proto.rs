@@ -94,10 +94,18 @@ pub enum ControlMsg {
     /// Client -> daemon: a `claude` session's `amber run` supervisor reports
     /// its current supervision phase (`state`: one of `"claude"`,
     /// `"claude-retrying"`, `"shell-fallback"`). The daemon stores it on the
-    /// session and broadcasts the change to watchers. Fire-and-forget: the
-    /// supervisor never waits for a reply (the daemon replies `Error` only for
-    /// an unknown session, a non-claude session, or an invalid state string).
-    ReportRunState { name: String, state: String },
+    /// session and broadcasts the change to watchers. Versioned reports are
+    /// acknowledged with `RunStateAck` and retried in order; legacy sequence
+    /// zero remains accepted during mixed-version upgrades.
+    ReportRunState {
+        name: String,
+        state: String,
+        /// Monotonic per-supervisor sequence. Zero denotes a legacy
+        /// fire-and-forget reporter; nonzero reports are acknowledged and
+        /// stale/duplicate sequences cannot overwrite newer truth.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        seq: u64,
+    },
     /// Client -> daemon: park a claude session's child to free its RAM (Slice 3,
     /// freeze grace). The daemon signals the session's `amber run` supervisor
     /// (SIGUSR1) to kill claude and idle; the session record + pty + attachments
@@ -129,6 +137,13 @@ pub enum ControlMsg {
     Backlog { name: String, data: Vec<u8> },
     /// Client -> daemon: opt this connection in to pushed session-change events.
     WatchSessions,
+    /// Client -> daemon: explicitly opt this connection in to memory-pressure
+    /// controls. Kept separate from `WatchSessions` because older Electron and
+    /// amber-web clients used strict control decoders; sending a newly-added
+    /// pressure variant to those clients would make them reconnect forever.
+    /// `version` lets a future pressure payload evolve without guessing client
+    /// support. Version 1 is the current `MemoryPressure` shape.
+    WatchMemoryPressure { version: u16 },
     /// Client -> daemon: request the full session set with metadata.
     ListSessionsDetailed,
     /// Daemon -> client: the full session set (reply to ListSessionsDetailed
@@ -165,6 +180,9 @@ pub enum ControlMsg {
         #[serde(default)]
         blocked: bool,
     },
+    /// Daemon -> supervisor: an ordered run-state report was accepted (or was
+    /// already superseded by a report with a higher sequence).
+    RunStateAck { name: String, seq: u64 },
     SessionList { names: Vec<String> },
     Created { name: String },
     Killed { name: String },
@@ -204,6 +222,58 @@ pub enum Decoded {
 const TAG_CONTROL: u8 = 0;
 const TAG_DATA: u8 = 1;
 const TAG_BACKLOG: u8 = 2;
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+// Keep this exhaustive with `ControlMsg`: an omitted known variant would make
+// a malformed instance look like a safely-skippable future message.
+fn known_control_variant(name: &str) -> bool {
+    matches!(
+        name,
+        "Hello"
+            | "ListSessions"
+            | "Create"
+            | "Attach"
+            | "Detach"
+            | "Focus"
+            | "Resize"
+            | "Kill"
+            | "Rename"
+            | "ReportRunState"
+            | "Suspend"
+            | "Resume"
+            | "Snapshot"
+            | "SnapshotOk"
+            | "DumpBacklog"
+            | "Backlog"
+            | "WatchSessions"
+            | "WatchMemoryPressure"
+            | "ListSessionsDetailed"
+            | "Sessions"
+            | "SessionsChanged"
+            | "Activity"
+            | "MemoryStat"
+            | "MemoryPressure"
+            | "RunStateAck"
+            | "SessionList"
+            | "Created"
+            | "Killed"
+            | "Exit"
+            | "Error"
+    )
+}
+
+fn control_variant_name(value: &serde_json::Value) -> Option<&str> {
+    match value {
+        serde_json::Value::String(name) => Some(name),
+        serde_json::Value::Object(object) if object.len() == 1 => {
+            object.keys().next().map(String::as_str)
+        }
+        _ => None,
+    }
+}
 
 /// Maximum accepted frame body length. Generously above the largest
 /// legitimate frame (a full 2 MiB scrollback backlog in one `Data` frame);
@@ -296,13 +366,24 @@ impl Decoder {
             .split_first()
             .ok_or_else(|| anyhow::anyhow!("empty frame body"))?;
         let decoded = match tag {
-            TAG_CONTROL => match serde_json::from_slice(rest) {
-                Ok(msg) => Decoded::Frame(Frame::Control(msg)),
-                // Well-framed but undecodable (e.g. a newer peer's unknown
-                // control variant). The frame is already drained; signal a
-                // skippable frame rather than tearing down the connection.
-                Err(e) => Decoded::UndecodableControl(anyhow::Error::new(e)),
-            },
+            TAG_CONTROL => {
+                // Parse syntax separately from the enum so forward-compatible
+                // callers can distinguish a genuinely unknown future variant
+                // from a KNOWN variant with malformed fields. Only the former
+                // is safe to skip; accepting the latter would silently weaken
+                // validation (notably MemoryPressure.level).
+                let value: serde_json::Value = serde_json::from_slice(rest)?;
+                match serde_json::from_value::<ControlMsg>(value.clone()) {
+                    Ok(msg) => Decoded::Frame(Frame::Control(msg)),
+                    Err(error)
+                        if control_variant_name(&value)
+                            .is_some_and(|name| !known_control_variant(name)) =>
+                    {
+                        Decoded::UndecodableControl(anyhow::Error::new(error))
+                    }
+                    Err(error) => return Err(anyhow::Error::new(error)),
+                }
+            }
             TAG_DATA | TAG_BACKLOG => {
                 if rest.len() < 2 {
                     anyhow::bail!("truncated data frame header");
@@ -411,6 +492,18 @@ mod tests {
         bytes.push(TAG_CONTROL);
         d.feed(&bytes);
         assert!(d.next_decoded().is_err());
+    }
+
+    #[test]
+    fn next_decoded_skips_unknown_but_rejects_malformed_known_control() {
+        let mut d = Decoder::new();
+        d.feed(&encode_raw_control(
+            br#"{"MemoryPressure":{"current_kb":42}}"#,
+        ));
+        assert!(
+            d.next_decoded().is_err(),
+            "a known control with invalid fields must not be mistaken for a future variant"
+        );
     }
 
     #[test]
@@ -608,12 +701,14 @@ mod tests {
         let f = Frame::Control(ControlMsg::ReportRunState {
             name: "amber-1-1-0-a".into(),
             state: "claude-retrying".into(),
+            seq: 7,
         });
         assert_eq!(roundtrip(&f), f);
         // Lock the externally-tagged JSON shape the supervisor emits.
         let json = serde_json::to_string(&ControlMsg::ReportRunState {
             name: "s".into(),
             state: "shell-fallback".into(),
+            seq: 0,
         })
         .unwrap();
         assert_eq!(json, r#"{"ReportRunState":{"name":"s","state":"shell-fallback"}}"#);

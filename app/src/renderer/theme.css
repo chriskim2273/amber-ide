@@ -603,6 +603,10 @@ body {
   background: var(--bg);
   font-family: var(--font-ui);
 }
+.memory-parked-overlay:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: -3px;
+}
 .frozen-note-text,
 .memory-parked-overlay span {
   max-width: 90%;

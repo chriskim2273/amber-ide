@@ -64,6 +64,9 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
 struct Entry {
     id: u64,
+    writer_key: usize,
+    session_events: bool,
+    pressure_version: u16,
     tx: SyncSender<Arc<Vec<u8>>>,
 }
 
@@ -90,9 +93,40 @@ impl Watchers {
     /// dedicated forwarder thread. Holds only a `Weak` to the writer, so a
     /// vanished connection is pruned automatically.
     pub fn register(&self, writer: &Arc<Mutex<UnixStream>>) {
+        self.register_capability(writer, true, None);
+    }
+
+    /// Opt a connection in to versioned memory-pressure controls without
+    /// changing what legacy `WatchSessions` means.
+    pub fn register_pressure(&self, writer: &Arc<Mutex<UnixStream>>, version: u16) {
+        self.register_capability(writer, false, Some(version));
+    }
+
+    fn register_capability(
+        &self,
+        writer: &Arc<Mutex<UnixStream>>,
+        session_events: bool,
+        pressure_version: Option<u16>,
+    ) {
+        let writer_key = Arc::as_ptr(writer) as usize;
+        let mut entries = self.entries.lock().unwrap();
+        if let Some(entry) = entries.iter_mut().find(|entry| entry.writer_key == writer_key) {
+            entry.session_events |= session_events;
+            if let Some(version) = pressure_version {
+                entry.pressure_version = entry.pressure_version.max(version);
+            }
+            return;
+        }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = sync_channel(WATCHER_QUEUE_DEPTH);
-        self.entries.lock().unwrap().push(Entry { id, tx });
+        entries.push(Entry {
+            id,
+            writer_key,
+            session_events,
+            pressure_version: pressure_version.unwrap_or(0),
+            tx,
+        });
+        drop(entries);
         let weak = Arc::downgrade(writer);
         let entries = Arc::clone(&self.entries);
         thread::spawn(move || forward(id, rx, weak, entries));
@@ -102,8 +136,23 @@ impl Watchers {
     /// blocks: only `try_send`s into bounded queues (no socket I/O). A
     /// watcher whose queue is full or whose forwarder is gone is evicted.
     pub fn broadcast(&self, msg: &ControlMsg) {
+        self.broadcast_where(msg, |entry| entry.session_events);
+    }
+
+    /// Queue a pressure control only for clients that explicitly advertised a
+    /// compatible pressure-watch version. Legacy session watchers receive no
+    /// unknown variant and therefore stay connected.
+    pub fn broadcast_pressure(&self, msg: &ControlMsg) {
+        debug_assert!(matches!(msg, ControlMsg::MemoryPressure { .. }));
+        self.broadcast_where(msg, |entry| entry.pressure_version >= 1);
+    }
+
+    fn broadcast_where(&self, msg: &ControlMsg, include: impl Fn(&Entry) -> bool) {
         let frame = Arc::new(proto::encode(&Frame::Control(msg.clone())));
         self.entries.lock().unwrap().retain(|e| {
+            if !include(e) {
+                return true;
+            }
             match e.tx.try_send(Arc::clone(&frame)) {
                 Ok(()) => true,
                 // Full: WATCHER_QUEUE_DEPTH undelivered low-rate events is
@@ -299,13 +348,14 @@ mod tests {
         saturate(&wedged_server);
         let wedged = Arc::new(Mutex::new(wedged_server));
         let healthy = Arc::new(Mutex::new(healthy_server));
-        watchers.register(&wedged);
-        watchers.register(&healthy);
+        watchers.register_pressure(&wedged, 1);
+        watchers.register_pressure(&healthy, 1);
         assert_eq!(watchers.watcher_count(), 2);
 
         // Repeated pressure refreshes ride this same bounded queue. The healthy
         // watcher receives every one while the non-reader fills its grace and
-        // is evicted; no pressure-specific queue is needed.
+        // is evicted; pressure uses the same bounded per-connection queue once
+        // the connection explicitly opts in.
         for current_kb in 0..=(WATCHER_QUEUE_DEPTH as u64) {
             let msg = ControlMsg::MemoryPressure {
                 level: "critical".into(),
@@ -313,7 +363,7 @@ mod tests {
                 budget_kb: 100,
                 blocked: false,
             };
-            watchers.broadcast(&msg);
+            watchers.broadcast_pressure(&msg);
             assert_eq!(read_one(&mut healthy_peer), Some(Frame::Control(msg)));
         }
         // The wedged one is evicted after a bounded grace (generous bound,

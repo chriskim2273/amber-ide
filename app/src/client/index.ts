@@ -20,6 +20,7 @@ conn.on('frame', (f: Frame) => {
 conn.on('open', () => {
   controlPort?.postMessage({ status: 'connected' })
   conn.send({ type: 'control', msg: { kind: 'WatchSessions' } })
+  conn.send({ type: 'control', msg: { kind: 'WatchMemoryPressure', version: 1 } })
   conn.send({ type: 'control', msg: { kind: 'ListSessionsDetailed' } })
   router.reattachAll()
 })

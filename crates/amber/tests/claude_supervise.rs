@@ -543,11 +543,18 @@ fi
 
     let pid_path = root.join("stubborn.pid");
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !pid_path.exists() {
-        assert!(Instant::now() < deadline, "stubborn descendant never started");
+    let stubborn_pid: i32 = loop {
+        if let Ok(text) = fs::read_to_string(&pid_path) {
+            if let Ok(pid) = text.trim().parse() {
+                break pid;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "stubborn descendant never published its pid"
+        );
         std::thread::sleep(Duration::from_millis(20));
-    }
-    let stubborn_pid: i32 = fs::read_to_string(&pid_path).unwrap().parse().unwrap();
+    };
 
     #[cfg(target_os = "linux")]
     let delegated_workload = daemon.delegated_root.as_ref().map(|root| {
@@ -629,9 +636,40 @@ fn shell_fallback_ignores_late_supervisor_signals() {
     config.claude_path = Some(claude_path);
     store.save_config(&config).unwrap();
 
+    // `amber run` now flushes ordered run-state reports before exec'ing the
+    // shell. This focused signal test has no real daemon/session manager, so a
+    // tiny protocol-faithful peer acknowledges the expected running + terminal
+    // reports instead of accidentally testing an absent socket.
+    let report_socket = root.join("report.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&report_socket).unwrap();
+    let ack_server = std::thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut decoder = Decoder::new();
+            let mut buf = [0u8; 4096];
+            let (name, seq) = loop {
+                if let Some(Frame::Control(ControlMsg::ReportRunState { name, seq, .. })) =
+                    decoder.next_frame().unwrap()
+                {
+                    break (name, seq);
+                }
+                let n = stream.read(&mut buf).unwrap();
+                assert!(n > 0, "reporter closed before sending a run-state frame");
+                decoder.feed(&buf[..n]);
+            };
+            stream
+                .write_all(&proto::encode(&Frame::Control(ControlMsg::RunStateAck {
+                    name,
+                    seq,
+                })))
+                .unwrap();
+        }
+    });
+
     let mut child = Command::new(env!("CARGO_BIN_EXE_amber"))
         .args(["run", "work", "--kind", "claude"])
         .env("AMBER_STATE_DIR", root)
+        .env("AMBER_SOCK", &report_socket)
         .env("SHELL", &fallback)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -643,6 +681,7 @@ fn shell_fallback_ignores_late_supervisor_signals() {
         assert!(Instant::now() < deadline, "supervisor never entered shell fallback");
         std::thread::sleep(Duration::from_millis(20));
     }
+    ack_server.join().unwrap();
 
     for signal in [libc::SIGUSR1, libc::SIGUSR2] {
         assert_eq!(unsafe { libc::kill(child.id() as i32, signal) }, 0);

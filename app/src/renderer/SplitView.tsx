@@ -4,7 +4,7 @@ import { Browser } from './Browser'
 import { Editor, type EditorApi } from './Editor'
 import { paneRects, handles, nextPaneInDirection, focusCandidates, ratioAt, leaves, type Node, type Rect, type Zone, type FocusDir } from './layout'
 import { appChord, chordLabel } from './keys'
-import { paneDot, shouldHintTerminalFocus } from './store'
+import { paneDot, shouldHintTerminalFocus, shouldResumeMemoryParked } from './store'
 import { reloadAgentCommand } from './reloadAgent'
 
 export interface PaneMeta { kind: string; title: string; cwd: string; runState?: string | undefined; rssKb?: number | undefined; growing?: boolean | undefined; claudeId?: string | undefined }
@@ -234,6 +234,7 @@ export function SplitView(props: {
   // the hint (including clicking an already-focused xterm); suppress its paired
   // focus event. Programmatic keep-alive focus is suppressed separately.
   const pointerFocusRef = useRef<Set<string>>(new Set())
+  const memoryPointerFocusRef = useRef<Set<string>>(new Set())
   const userFocusRef = useRef<Set<string>>(new Set())
   const keyboardFocusRef = useRef(false)
   const suppressedFocusRef = useRef<Set<string>>(new Set())
@@ -247,6 +248,9 @@ export function SplitView(props: {
     const terminal = bodyEls.current.get(id)?.querySelector('.xterm')
     return target instanceof Node && terminal?.contains(target) === true
   }
+
+  const isMemoryParkedTarget = (target: EventTarget | null): boolean =>
+    target instanceof HTMLElement && target.classList.contains('memory-parked-overlay')
 
   // Never programmatically focus a frozen pane's terminal — it's input-locked
   // (belt-and-suspenders alongside the overlay swallowing pointer events).
@@ -634,18 +638,37 @@ export function SplitView(props: {
             onFocusCapture={(e) => {
               setFocused(paneId)
               const pairedPointer = pointerFocusRef.current.delete(paneId)
-              const userArmed = userFocusRef.current.delete(paneId) || keyboardFocusRef.current
+              const pairedMemoryPointer = memoryPointerFocusRef.current.delete(paneId)
+              const keyboardArmed = keyboardFocusRef.current
+              const userArmed = userFocusRef.current.delete(paneId) || keyboardArmed
               keyboardFocusRef.current = false
-              if (!shouldHintTerminalFocus(props.active, isTerminalTarget(paneId, e.target), userArmed)) return
-              if (suppressedFocusRef.current.delete(paneId) || pairedPointer) return
-              props.onPaneFocus(paneId)
+              if (shouldHintTerminalFocus(props.active, isTerminalTarget(paneId, e.target), userArmed)
+                && !suppressedFocusRef.current.delete(paneId) && !pairedPointer) {
+                props.onPaneFocus(paneId)
+              }
+              if (shouldResumeMemoryParked(
+                props.active,
+                isMemoryParkedTarget(e.target),
+                keyboardArmed,
+                pairedMemoryPointer,
+              )) props.onPaneFocus(paneId)
             }}
             onPointerDownCapture={(e) => {
               setFocused(paneId)
-              if (!shouldHintTerminalFocus(props.active, isTerminalTarget(paneId, e.target), true)) return
-              pointerFocusRef.current.add(paneId)
-              props.onPaneFocus(paneId)
-              requestAnimationFrame(() => pointerFocusRef.current.delete(paneId))
+              if (shouldHintTerminalFocus(props.active, isTerminalTarget(paneId, e.target), true)) {
+                pointerFocusRef.current.add(paneId)
+                props.onPaneFocus(paneId)
+                requestAnimationFrame(() => pointerFocusRef.current.delete(paneId))
+              }
+              if (shouldResumeMemoryParked(
+                props.active,
+                isMemoryParkedTarget(e.target),
+                e.isTrusted,
+              )) {
+                memoryPointerFocusRef.current.add(paneId)
+                props.onPaneFocus(paneId)
+                requestAnimationFrame(() => memoryPointerFocusRef.current.delete(paneId))
+              }
             }}>
             <div className="pane-header"
               onDoubleClick={(e) => { if (!(e.target as HTMLElement).closest('button')) props.onToggleZoom(paneId) }}
@@ -751,7 +774,8 @@ export function SplitView(props: {
                     onClick={() => props.onUnfreeze(paneId)}>⏵ unfreeze</button>
                 </div>}
               {meta?.runState === 'memory-suspended' && !isFrozen && dead === undefined &&
-                <div className="memory-parked-overlay" role="status">
+                <div className="memory-parked-overlay" role="status" tabIndex={0}
+                  aria-label="Pane parked to protect system memory; focus to resume">
                   <span>Parked to protect system memory</span>
                   <button type="button" onClick={() => props.onPaneFocus(paneId)}>Resume</button>
                 </div>}

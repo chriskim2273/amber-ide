@@ -2,23 +2,23 @@
 //! with resume/continue argv selection, falling back to an interactive shell
 //! so a pane never silently dies.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
-use amber_core::proto::{self, ControlMsg, Frame};
+use amber_core::proto::{self, ControlMsg, Decoded, Decoder, Frame};
 use amber_core::state::{SessionKind, StateStore};
 
 use crate::{claude, codex, grok};
 
-/// Upper bound on a single fire-and-forget run-state report write. Reporting
-/// must NEVER stall supervision, so both the connect and the write are
-/// best-effort and time-bounded; a failure is logged and ignored.
+/// Upper bound on one run-state report attempt. The ordered reporter retries a
+/// timed-out attempt without blocking the child-monitoring loop.
 const REPORT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+const REPORT_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 /// How often the interruptible run-wait polls for claude's exit or a suspend
 /// request (Slice 3). Replaces a blocking wait so a SIGUSR1 can park claude
@@ -151,9 +151,6 @@ pub fn supervise_agent(
             Agent::Codex => codex::codex_argv(&select_codex_start(session_id, escalation)),
         };
 
-        // Entering (or re-entering) the running phase.
-        report("claude");
-
         // Spawn (not `.status()`) so the run is interruptible: a SIGUSR1-set
         // suspend request parks claude mid-run. A launch failure (e.g. a
         // transient ETXTBSY while the binary is replaced) counts against the
@@ -167,37 +164,44 @@ pub fn supervise_agent(
             .spawn()
         {
             Err(e) => Err(e),
-            Ok(mut child) => 'wait: loop {
-                // Prefer a real exit over a coincident suspend: if claude has
-                // already exited (e.g. a user quit), handle that normally.
-                match child.try_wait() {
-                    Ok(Some(status)) => break 'wait Ok(status),
-                    Ok(None) => {}
-                    Err(e) => break 'wait Err(e),
-                }
-                if ctl.suspend.swap(false, Ordering::SeqCst) {
-                    // Park: kill claude (frees its RAM), idle holding the pty
-                    // until a resume, then relaunch via the resume ladder. NOT
-                    // counted as a crash — escalation/prev_id reset so the
-                    // recorded id is Resumed on relaunch.
-                    reclaim_workload(&mut child, slot)?;
-                    // SIGUSR1 is a coalescing flag. A duplicate manual request
-                    // (or a Memory→Manual upgrade) can arrive after the first
-                    // request was consumed but while cleanup is still running.
-                    // It belongs to this parked transition, not the next child.
-                    ctl.suspend.store(false, Ordering::SeqCst);
-                    report("suspended");
-                    while !ctl.resume.swap(false, Ordering::SeqCst) {
-                        ctl.suspend.store(false, Ordering::SeqCst);
-                        std::thread::sleep(IDLE_POLL);
+            Ok(mut child) => {
+                // Process truth starts only after spawn succeeds. Reporting
+                // before `spawn()` made ENOENT/ETXTBSY look like a running
+                // agent and could make the guardian signal the supervisor at
+                // exactly the wrong phase.
+                report("claude");
+                'wait: loop {
+                    // Prefer a real exit over a coincident suspend: if claude has
+                    // already exited (e.g. a user quit), handle that normally.
+                    match child.try_wait() {
+                        Ok(Some(status)) => break 'wait Ok(status),
+                        Ok(None) => {}
+                        Err(e) => break 'wait Err(e),
                     }
-                    ctl.suspend.store(false, Ordering::SeqCst);
-                    escalation = 0;
-                    prev_recording = None;
-                    continue 'sup;
+                    if ctl.suspend.swap(false, Ordering::SeqCst) {
+                        // Park: kill claude (frees its RAM), idle holding the pty
+                        // until a resume, then relaunch via the resume ladder. NOT
+                        // counted as a crash — escalation/prev_id reset so the
+                        // recorded id is Resumed on relaunch.
+                        reclaim_workload(&mut child, slot)?;
+                        // SIGUSR1 is a coalescing flag. A duplicate manual request
+                        // (or a Memory→Manual upgrade) can arrive after the first
+                        // request was consumed but while cleanup is still running.
+                        // It belongs to this parked transition, not the next child.
+                        ctl.suspend.store(false, Ordering::SeqCst);
+                        report("suspended");
+                        while !ctl.resume.swap(false, Ordering::SeqCst) {
+                            ctl.suspend.store(false, Ordering::SeqCst);
+                            std::thread::sleep(IDLE_POLL);
+                        }
+                        ctl.suspend.store(false, Ordering::SeqCst);
+                        escalation = 0;
+                        prev_recording = None;
+                        continue 'sup;
+                    }
+                    std::thread::sleep(WAIT_POLL);
                 }
-                std::thread::sleep(WAIT_POLL);
-            },
+            }
         };
 
         let class = classify_run(&outcome);
@@ -291,10 +295,24 @@ fn reclaim_workload_with(
                     std::thread::sleep(IDLE_POLL);
                 }
                 Err(error) => {
+                    eprintln!(
+                        "amber: session slot {slot} cgroup cleanup is unavailable; \
+                         reclaiming the process tree and keeping the supervisor parked: {error}"
+                    );
                     crate::pty::kill_process_tree(pid);
                     let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(error.into());
+                    if let Err(wait_error) = child.wait() {
+                        eprintln!(
+                            "amber: workload fallback wait failed after cgroup error: {wait_error}"
+                        );
+                    }
+                    // The workload is gone (or best-effort killed), but the
+                    // `amber run` supervisor must stay alive in its parked
+                    // loop. Returning this cgroup error used to exit the pty
+                    // child, after which daemon reap deleted session metadata
+                    // and the resume record — turning a containment failure
+                    // into conversation loss.
+                    return Ok(());
                 }
             }
         }
@@ -452,27 +470,113 @@ fn backoff_delay(attempts: u32) -> Duration {
     Duration::from_millis(backoff_ms)
 }
 
-/// Best-effort, time-bounded report of `name`'s supervision phase to the
-/// daemon at `socket`. Fire-and-forget: a connect/write failure is logged and
-/// swallowed — reporting must never affect supervision or block the pty. The
-/// connection is opened, the frame written, then dropped; the daemon reads the
-/// frame off the half-closed socket.
-fn report_run_state(socket: &Path, name: &str, state: &str) {
-    if let Err(e) = try_report_run_state(socket, name, state) {
-        eprintln!("amber run: failed to report run_state {state} for {name}: {e}");
+struct QueuedRunState {
+    state: String,
+    done: Option<mpsc::SyncSender<()>>,
+}
+
+/// One ordered report queue per `amber run`. The worker retries each sequence
+/// until the daemon acknowledges it, then advances; later states therefore
+/// cannot overtake an earlier report on independent best-effort connections.
+struct RunStateReporter {
+    tx: mpsc::Sender<QueuedRunState>,
+}
+
+impl RunStateReporter {
+    fn new(socket: &Path, name: &str) -> Self {
+        let socket = socket.to_path_buf();
+        let name = name.to_string();
+        let (tx, rx) = mpsc::channel::<QueuedRunState>();
+        std::thread::spawn(move || {
+            let mut seq = 1u64;
+            while let Ok(report) = rx.recv() {
+                if let Err(error) = report_until_acked(&socket, &name, &report.state, seq) {
+                    eprintln!(
+                        "amber run: run_state reporter stopped for {name} at {}: {error}",
+                        report.state
+                    );
+                    break;
+                }
+                if let Some(done) = report.done {
+                    let _ = done.send(());
+                }
+                seq = seq.saturating_add(1);
+            }
+        });
+        Self { tx }
+    }
+
+    fn report(&self, state: &str) {
+        if self
+            .tx
+            .send(QueuedRunState { state: state.to_string(), done: None })
+            .is_err()
+        {
+            eprintln!("amber run: run_state reporter is unavailable");
+        }
+    }
+
+    fn report_and_wait(&self, state: &str) -> anyhow::Result<()> {
+        let (done_tx, done_rx) = mpsc::sync_channel(0);
+        self.tx
+            .send(QueuedRunState { state: state.to_string(), done: Some(done_tx) })
+            .map_err(|_| anyhow::anyhow!("run_state reporter stopped"))?;
+        done_rx.recv().map_err(|_| anyhow::anyhow!("run_state reporter stopped"))
     }
 }
 
-fn try_report_run_state(socket: &Path, name: &str, state: &str) -> anyhow::Result<()> {
+fn report_until_acked(socket: &Path, name: &str, state: &str, seq: u64) -> anyhow::Result<()> {
+    loop {
+        match try_report_run_state(socket, name, state, seq) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                eprintln!(
+                    "amber run: run_state {state} seq {seq} for {name} not acknowledged: {error}; retrying"
+                );
+                std::thread::sleep(REPORT_RETRY_DELAY);
+            }
+        }
+    }
+}
+
+fn try_report_run_state(
+    socket: &Path,
+    name: &str,
+    state: &str,
+    seq: u64,
+) -> anyhow::Result<()> {
     let mut stream = UnixStream::connect(socket)?;
     stream.set_write_timeout(Some(REPORT_WRITE_TIMEOUT))?;
+    stream.set_read_timeout(Some(REPORT_WRITE_TIMEOUT))?;
     let frame = proto::encode(&Frame::Control(ControlMsg::ReportRunState {
         name: name.to_string(),
         state: state.to_string(),
+        seq,
     }));
     stream.write_all(&frame)?;
     stream.flush()?;
-    Ok(())
+
+    let mut decoder = Decoder::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        while let Some(decoded) = decoder.next_decoded()? {
+            match decoded {
+                Decoded::Frame(Frame::Control(ControlMsg::RunStateAck {
+                    name: ack_name,
+                    seq: ack_seq,
+                })) if ack_name == name && ack_seq == seq => return Ok(()),
+                Decoded::Frame(Frame::Control(ControlMsg::Error { msg })) => {
+                    anyhow::bail!("daemon rejected run_state: {msg}")
+                }
+                Decoded::Frame(_) | Decoded::UndecodableControl(_) => {}
+            }
+        }
+        let n = stream.read(&mut buf)?;
+        if n == 0 {
+            anyhow::bail!("daemon closed before run_state acknowledgement");
+        }
+        decoder.feed(&buf[..n]);
+    }
 }
 
 /// Resolve claude, supervise it for `name`, and fall through to an
@@ -487,6 +591,7 @@ pub fn run_session(
     slot: Option<u32>,
 ) -> anyhow::Result<()> {
     let store = StateStore::new(root);
+    let reporter = RunStateReporter::new(socket, name);
     let mut cfg = store.load_config()?;
 
     let meta = store.read_session(name)?;
@@ -573,18 +678,36 @@ pub fn run_session(
         // §6.2 — "a session never silently dies").
         // Suspend/resume signalling (Slice 3). SIGUSR1 parks claude, SIGUSR2
         // resumes it. `amber run` is a dedicated per-pane process, so these
-        // signals are ours. Registration is best-effort: a failure just means
-        // freeze-to-free-RAM won't work for this pane (supervision is unaffected).
+        // signals are ours. BOTH handlers are a prerequisite for supervised
+        // mode: with a default disposition, a later suspend/resume signal can
+        // terminate `amber run` and make daemon reap delete the session.
         let ctl = SuspendControl::new();
-        let _ = signal_hook::flag::register(signal_hook::consts::SIGUSR1, Arc::clone(&ctl.suspend));
-        let _ = signal_hook::flag::register(signal_hook::consts::SIGUSR2, Arc::clone(&ctl.resume));
-
-        let report = |state: &str| report_run_state(socket, name, state);
-        match supervise_agent(&agent, &agent_path, root, name, &cwd, 3, report, &ctl, slot)? {
-            SuperviseOutcome::CleanExit => {}
-            SuperviseOutcome::Exhausted => {
+        match install_suspend_handlers(&ctl) {
+            Ok(()) => {
+                let report = |state: &str| reporter.report(state);
+                match supervise_agent(
+                    &agent,
+                    &agent_path,
+                    root,
+                    name,
+                    &cwd,
+                    3,
+                    report,
+                    &ctl,
+                    slot,
+                )? {
+                    SuperviseOutcome::CleanExit => {}
+                    SuperviseOutcome::Exhausted => {
+                        eprintln!(
+                            "amber: {} exhausted retries for session {name}; falling back to shell",
+                            agent.label()
+                        );
+                    }
+                }
+            }
+            Err(error) => {
                 eprintln!(
-                    "amber: {} exhausted retries for session {name}; falling back to shell",
+                    "amber: cannot safely supervise {} for session {name}: {error}; falling back to shell",
                     agent.label()
                 );
             }
@@ -597,8 +720,25 @@ pub fn run_session(
     // unresolvable). Ignore supervisor-only signals before reporting the
     // transition; ignored dispositions survive exec and close the report race.
     ignore_suspend_signals()?;
-    report_run_state(socket, name, "shell-fallback");
+    // This thread is about to disappear in `exec`; wait until the terminal
+    // state (and every queued predecessor) is acknowledged first.
+    reporter.report_and_wait("shell-fallback")?;
     shell_fallback(&cwd)
+}
+
+fn install_suspend_handlers(ctl: &SuspendControl) -> anyhow::Result<()> {
+    install_suspend_handlers_with(ctl, |signal, flag| {
+        signal_hook::flag::register(signal, flag).map(|_| ())
+    })
+}
+
+fn install_suspend_handlers_with(
+    ctl: &SuspendControl,
+    mut register: impl FnMut(i32, Arc<AtomicBool>) -> std::io::Result<()>,
+) -> anyhow::Result<()> {
+    register(signal_hook::consts::SIGUSR1, Arc::clone(&ctl.suspend))?;
+    register(signal_hook::consts::SIGUSR2, Arc::clone(&ctl.resume))?;
+    Ok(())
 }
 
 fn ignore_suspend_signals() -> anyhow::Result<()> {
@@ -661,6 +801,108 @@ mod tests {
         assert!(
             child.try_wait().unwrap().is_some(),
             "an empty workload cgroup must not make the supervisor wait on a live misplaced child"
+        );
+    }
+
+    #[test]
+    fn nonretryable_cgroup_cleanup_failure_keeps_supervisor_recoverable() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "sleep 60"])
+            .spawn()
+            .unwrap();
+
+        reclaim_workload_with(&mut child, Some(7), |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected cgroup cleanup failure",
+            ))
+        })
+        .expect("fallback process-tree cleanup must keep the supervisor in its parked loop");
+
+        assert!(
+            child.try_wait().unwrap().is_some(),
+            "failed cgroup cleanup must still reclaim the workload child"
+        );
+    }
+
+    #[test]
+    fn both_suspend_signal_handlers_are_required_before_agent_launch() {
+        let ctl = SuspendControl::new();
+        let mut calls = 0;
+        let error = install_suspend_handlers_with(&ctl, |_, _| {
+            calls += 1;
+            if calls == 2 {
+                Err(std::io::Error::other("injected registration failure"))
+            } else {
+                Ok(())
+            }
+        })
+        .expect_err("a missing resume handler must reject supervised mode");
+
+        assert!(error.to_string().contains("registration failure"));
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn spawn_failure_never_reports_a_running_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("settings.json");
+        let states = std::sync::Mutex::new(Vec::new());
+        let outcome = supervise_agent(
+            &Agent::Claude { settings },
+            &dir.path().join("missing-agent"),
+            dir.path(),
+            "agent",
+            dir.path(),
+            2,
+            |state| states.lock().unwrap().push(state.to_string()),
+            &SuspendControl::new(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, SuperviseOutcome::Exhausted);
+        assert_eq!(states.into_inner().unwrap(), vec!["claude-retrying"]);
+    }
+
+    #[test]
+    fn dropped_run_state_ack_retries_the_same_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("report.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut decoder = amber_core::proto::Decoder::new();
+                let mut buf = [0u8; 4096];
+                let report = loop {
+                    if let Some(Frame::Control(report)) = decoder.next_frame().unwrap() {
+                        break report;
+                    }
+                    let n = std::io::Read::read(&mut stream, &mut buf).unwrap();
+                    decoder.feed(&buf[..n]);
+                };
+                let ControlMsg::ReportRunState { name, state, seq } = report else {
+                    panic!("unexpected report frame")
+                };
+                seen.push((name.clone(), state, seq));
+                if attempt == 1 {
+                    let ack = proto::encode(&Frame::Control(ControlMsg::RunStateAck { name, seq }));
+                    stream.write_all(&ack).unwrap();
+                }
+            }
+            seen
+        });
+
+        report_until_acked(&socket, "agent", "shell-fallback", 9).unwrap();
+        let seen = server.join().unwrap();
+        assert_eq!(
+            seen,
+            vec![
+                ("agent".to_string(), "shell-fallback".to_string(), 9),
+                ("agent".to_string(), "shell-fallback".to_string(), 9),
+            ]
         );
     }
 

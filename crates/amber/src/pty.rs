@@ -16,7 +16,7 @@ use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, Pt
 /// subscriber stays flat at `depth * BATCH_MAX_BYTES` = 2 MiB (spec §9, e.g.
 /// `cat` of a huge file) — the same budget as the pre-batching
 /// 256-chunks-of-8-KiB queue.
-const SUBSCRIBER_QUEUE_DEPTH: usize = 8;
+pub(crate) const SUBSCRIBER_QUEUE_DEPTH: usize = 8;
 
 /// Output batching window (spec §9): pty reads landing within this span are
 /// coalesced into one frame before fan-out — matches the app's render
@@ -99,10 +99,13 @@ pub struct PtySession {
     /// suspend requests; it does not drive the supervisor loop itself.
     /// Mutex-guarded so `PtySession` stays `Send + Sync`.
     run_state: Mutex<Option<String>>,
+    /// Highest acknowledged versioned `ReportRunState` sequence for this
+    /// supervisor. Zero is the legacy, unversioned mode.
+    run_state_seq: AtomicU64,
     suspend_origin: AtomicU8,
     last_user_ms: AtomicU64,
     memory_suspend_started_ms: AtomicU64,
-    suspend_transition: Mutex<()>,
+    suspend_transition: Arc<Mutex<()>>,
     /// Optional output-activity notifier + its rate-limit clock, shared with
     /// the batcher thread. The batcher does a cheap atomic check on every
     /// frame and only locks/fires the hook once per `ACTIVITY_MIN_INTERVAL_MS`
@@ -110,10 +113,12 @@ pub struct PtySession {
     activity: Arc<ActivityState>,
 }
 
-/// Rate-limit clock + optional notifier for output activity. `last_ms` starts
-/// at 0 so the very first frame fires immediately.
+/// Output truth plus a separate rate-limit clock for UI notifications. Output
+/// activity itself must never be rate-limited: the memory guardian relies on
+/// the exact last-output time for its final suspend check.
 struct ActivityState {
-    last_ms: AtomicU64,
+    last_output_ms: AtomicU64,
+    last_hook_ms: AtomicU64,
     hook: Mutex<Option<ActivityHook>>,
 }
 
@@ -205,9 +210,11 @@ impl PtySession {
         let subs: Arc<Mutex<Subscribers>> = Arc::new(Mutex::new(Vec::new()));
         let reader_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let activity = Arc::new(ActivityState {
-            last_ms: AtomicU64::new(0),
+            last_output_ms: AtomicU64::new(0),
+            last_hook_ms: AtomicU64::new(0),
             hook: Mutex::new(None),
         });
+        let suspend_transition = Arc::new(Mutex::new(()));
 
         // Output path, two threads (spec §9 batching):
         //
@@ -224,12 +231,25 @@ impl PtySession {
 
         // Raw reader thread: blocking pty reads -> channel. Dropping the
         // sender on EOF/read-error is the batcher's end-of-stream signal.
+        let reader_activity = Arc::clone(&activity);
+        let reader_suspend_transition = Arc::clone(&suspend_transition);
         thread::spawn(move || {
             let mut buf = [0u8; 8192];
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
+                        // Publish output truth at the earliest userspace
+                        // boundary, before the bounded batch channel or a
+                        // saturated subscriber can block this byte stream.
+                        // The guardian takes the same guard around its final
+                        // eligibility check + suspend claim, so either this
+                        // activity wins first or suspension already committed.
+                        let output_ms = monotonic_ms().max(1);
+                        {
+                            let _transition = reader_suspend_transition.lock().unwrap();
+                            reader_activity.last_output_ms.store(output_ms, Ordering::SeqCst);
+                        }
                         if chunk_tx.send(buf[..n].to_vec()).is_err() {
                             break; // batcher gone (unreachable in practice)
                         }
@@ -297,7 +317,7 @@ impl PtySession {
                     // the hook (a non-blocking watcher broadcast) fires at most
                     // ~2/sec, so the fan-out thread is never blocked here.
                     let now = monotonic_ms();
-                    let last = activity.last_ms.load(Ordering::Relaxed);
+                    let last = activity.last_hook_ms.load(Ordering::Relaxed);
                     // `last == 0` is the "never fired" sentinel: the first output
                     // frame *after the hook is installed* notifies immediately
                     // (monotonic_ms starts near 0, so a plain `now - last >=
@@ -308,7 +328,7 @@ impl PtySession {
                     // 500 ms window (harmless). Store `now.max(1)` so a real fire
                     // never re-arms the sentinel.
                     if last == 0 || now.saturating_sub(last) >= ACTIVITY_MIN_INTERVAL_MS {
-                        activity.last_ms.store(now.max(1), Ordering::Relaxed);
+                        activity.last_hook_ms.store(now.max(1), Ordering::Relaxed);
                         if let Some(hook) = activity.hook.lock().unwrap().as_ref() {
                             hook();
                         }
@@ -351,10 +371,11 @@ impl PtySession {
             exit,
             pid,
             run_state: Mutex::new(None),
+            run_state_seq: AtomicU64::new(0),
             suspend_origin: AtomicU8::new(SuspendOrigin::None as u8),
             last_user_ms: AtomicU64::new(monotonic_ms().max(1)),
             memory_suspend_started_ms: AtomicU64::new(0),
-            suspend_transition: Mutex::new(()),
+            suspend_transition,
             activity,
         })
     }
@@ -374,6 +395,14 @@ impl PtySession {
     /// `Some("claude")` on restore).
     pub fn set_run_state(&self, state: Option<String>) {
         *self.run_state.lock().unwrap() = state;
+    }
+
+    pub(crate) fn run_state_seq(&self) -> u64 {
+        self.run_state_seq.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn set_run_state_seq(&self, seq: u64) {
+        self.run_state_seq.store(seq, Ordering::SeqCst);
     }
 
     pub fn suspend_origin(&self) -> SuspendOrigin {
@@ -437,7 +466,7 @@ impl PtySession {
     pub fn last_used_ms(&self) -> u64 {
         self.last_user_ms
             .load(Ordering::Relaxed)
-            .max(self.activity.last_ms.load(Ordering::Relaxed))
+            .max(self.activity.last_output_ms.load(Ordering::SeqCst))
     }
 
     pub fn memory_suspend_started_ms(&self) -> u64 {

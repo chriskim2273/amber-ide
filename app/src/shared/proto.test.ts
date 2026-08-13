@@ -93,6 +93,22 @@ describe('proto', () => {
       .toThrow(/pressure level/)
   })
 
+  it('skips a well-framed unknown control and decodes the following frame', () => {
+    const unknownJson = new TextEncoder().encode('{"FutureControl":{"version":2}}')
+    const unknown = new Uint8Array(5 + unknownJson.length)
+    new DataView(unknown.buffer).setUint32(0, 1 + unknownJson.length, false)
+    unknown[4] = 0
+    unknown.set(unknownJson, 5)
+    const known = encode({ type: 'control', msg: { kind: 'Activity', name: 'still-connected' } })
+    const wire = new Uint8Array(unknown.length + known.length)
+    wire.set(unknown)
+    wire.set(known, unknown.length)
+
+    const d = new Decoder()
+    d.feed(wire)
+    expect(d.next()).toEqual({ type: 'control', msg: { kind: 'Activity', name: 'still-connected' } })
+  })
+
   it('encodes DumpBacklog externally-tagged to match serde', () => {
     const f: Frame = { type: 'control', msg: { kind: 'DumpBacklog', name: 's' } }
     const wire = encode(f)

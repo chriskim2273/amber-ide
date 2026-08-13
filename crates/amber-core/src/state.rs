@@ -12,6 +12,7 @@
 //! at restore (see [`StateStore::list_sessions`], [`StateStore::read_session`]).
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -208,8 +209,30 @@ impl StateStore {
             .to_string_lossy();
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp_path = parent.join(format!("{file_name}.{}.{seq}.tmp", std::process::id()));
-        fs::write(&tmp_path, bytes)?;
+        let mut tmp = fs::File::create(&tmp_path)?;
+        tmp.write_all(bytes)?;
+        tmp.sync_all()?;
+        drop(tmp);
         fs::rename(&tmp_path, path)?;
+        Self::sync_dir(parent)?;
+        Ok(())
+    }
+
+    fn sync_dir(path: &Path) -> anyhow::Result<()> {
+        fs::File::open(path)?.sync_all()?;
+        Ok(())
+    }
+
+    fn remove_durable(path: &Path) -> anyhow::Result<()> {
+        match fs::remove_file(path) {
+            Ok(()) => {
+                if let Some(parent) = path.parent() {
+                    Self::sync_dir(parent)?;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         Ok(())
     }
 
@@ -297,61 +320,126 @@ impl StateStore {
     /// `SessionMeta.name`. Used by a cross-tab pane move: the tab is encoded in
     /// the session name, so moving a pane IS a rename.
     ///
-    /// Destination artifacts are preflighted and any completed artifact moves
-    /// are rolled back on error. Crash-safe ordering then moves the optional
-    /// artifacts first, writes `sessions/<to>.json`, and removes
-    /// `sessions/<from>.json`
-    /// LAST. `sessions/*.json` is what `list_sessions` (and therefore restore)
+    /// Destination artifacts are preflighted and any completed artifact copies
+    /// are rolled back on a pre-commit error. Crash-safe ordering copies the
+    /// optional artifacts while retaining their sources, writes
+    /// `sessions/<to>.json`, then removes `sessions/<from>.json`. The old
+    /// artifacts are garbage-collected only after that metadata commit.
+    /// `sessions/*.json` is what `list_sessions` (and therefore restore)
     /// enumerates, so a crash at any point leaves either the old fully
-    /// restorable session or the new one — never half of each. (A crash between
-    /// the last two steps leaves both names listed; the duplicate is the safe
-    /// direction — nothing is lost.)
+    /// restorable session or the new one — never metadata without its matching
+    /// resume record. (A crash between publishing `to` and removing `from`
+    /// leaves both names listed; duplication is the safe direction.)
     pub fn rename_session(&self, from: &str, to: &str) -> anyhow::Result<()> {
+        self.rename_session_with_checkpoint(from, to, |_| Ok(()))
+    }
+
+    fn rename_session_with_checkpoint(
+        &self,
+        from: &str,
+        to: &str,
+        mut checkpoint: impl FnMut(usize) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
         let mut meta = self
             .read_session(from)?
             .ok_or_else(|| anyhow::anyhow!("no such session: {from}"))?;
-        let moves = [
+        let copies = [
             (self.claude_path(from), self.claude_path(to)),
             (self.claude_settings_path(from), self.claude_settings_path(to)),
             (self.scrollback_path(from), self.scrollback_path(to)),
         ];
-        if let Some((_, path)) = moves.iter().find(|(_, path)| path.exists()) {
+        let to_meta = self.session_path(to);
+        if to_meta.exists() {
+            anyhow::bail!("target session artifact already exists: {}", to_meta.display());
+        }
+        if let Some((_, path)) = copies.iter().find(|(_, path)| path.exists()) {
             anyhow::bail!("target session artifact already exists: {}", path.display());
         }
-        let mut moved = Vec::new();
-        for (old, new) in &moves {
-            match fs::rename(old, new) {
-                Ok(()) => moved.push((old, new)),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    for (old, new) in moved.into_iter().rev() {
-                        if let Err(rollback) = fs::rename(new, old) {
-                            anyhow::bail!("{error}; rename rollback failed: {rollback}");
-                        }
-                    }
-                    return Err(error.into());
+
+        // PRE-COMMIT: copy every optional artifact while leaving the source
+        // completely intact. A process crash here restores `from`; destination
+        // copies are unreferenced because no destination metadata exists yet.
+        let mut created = Vec::new();
+        for (index, (old, new)) in copies.iter().enumerate() {
+            let bytes = match fs::read(old) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return self.rename_precommit_error(error.into(), &created),
+            };
+            if let Err(error) = Self::atomic_write(new, &bytes) {
+                let mut rollback = created.clone();
+                // `atomic_write` may have completed its rename and then failed
+                // the directory fsync. Include that visible destination in the
+                // rollback instead of stranding an orphan that blocks retries.
+                if new.exists() {
+                    rollback.push(new.clone());
                 }
+                return self.rename_precommit_error(error, &rollback);
             }
+            created.push(new.clone());
+            checkpoint(index)?;
         }
+
+        // COMMIT PREPARATION: publish `to` only after all of its artifacts are
+        // durable. Until `from` metadata is removed, both listed names are
+        // fully restorable and point at matching resume records.
         meta.name = to.to_string();
         if let Err(error) = self.write_session(&meta) {
-            for (old, new) in moved.into_iter().rev() {
-                if let Err(rollback) = fs::rename(new, old) {
-                    anyhow::bail!("{error}; rename rollback failed: {rollback}");
-                }
+            let mut rollback = created.clone();
+            if to_meta.exists() {
+                rollback.push(to_meta.clone());
             }
-            return Err(error);
+            return self.rename_precommit_error(error, &rollback);
         }
-        if let Err(error) = Self::remove_if_exists(&self.session_path(from)) {
-            let _ = Self::remove_if_exists(&self.session_path(to));
-            for (old, new) in moved.into_iter().rev() {
-                if let Err(rollback) = fs::rename(new, old) {
-                    anyhow::bail!("{error}; rename rollback failed: {rollback}");
-                }
+        checkpoint(3)?;
+
+        // COMMIT POINT: remove and durably record disappearance of the source
+        // metadata. If this normal operation fails, destination publication is
+        // rolled back while the source is still authoritative.
+        let from_meta = self.session_path(from);
+        if let Err(error) = Self::remove_if_exists(&from_meta) {
+            let mut rollback = created.clone();
+            rollback.push(to_meta);
+            return self.rename_precommit_error(error, &rollback);
+        }
+        // Once remove_file succeeds the transaction is committed in the live
+        // filesystem. A directory-fsync error makes crash durability uncertain
+        // but must NOT trigger pre-commit rollback: deleting destination then
+        // could leave no metadata at all. Keep the new authoritative record and
+        // surface the durability warning in logs.
+        if let Some(parent) = from_meta.parent() {
+            if let Err(error) = Self::sync_dir(parent) {
+                eprintln!(
+                    "amber state: renamed session but could not sync metadata directory: {error}"
+                );
             }
-            return Err(error);
+        }
+        checkpoint(4)?;
+
+        // POST-COMMIT garbage collection. Failure here must not report the
+        // rename as failed: the manager would attempt an in-memory rollback
+        // even though `to` is now authoritative. Leftover source artifacts are
+        // harmless/unreferenced and a later remove/rename can clean them.
+        for (offset, (old, _)) in copies.iter().enumerate() {
+            if let Err(error) = Self::remove_durable(old) {
+                eprintln!("amber state: renamed session but could not remove {}: {error}", old.display());
+            }
+            checkpoint(5 + offset)?;
         }
         Ok(())
+    }
+
+    fn rename_precommit_error<T>(
+        &self,
+        error: anyhow::Error,
+        destination_paths: &[PathBuf],
+    ) -> anyhow::Result<T> {
+        for path in destination_paths.iter().rev() {
+            if let Err(rollback) = Self::remove_durable(path) {
+                anyhow::bail!("{error}; rename rollback failed: {rollback}");
+            }
+        }
+        Err(error)
     }
 
     pub fn write_scrollback(&self, name: &str, bytes: &[u8]) -> anyhow::Result<()> {
@@ -868,6 +956,74 @@ mod tests {
         assert_eq!(store.read_scrollback("amber-1-1-0-a").unwrap(), None);
         assert!(dir.path().join("claude/amber-1-2-0-a.settings.json").exists());
         assert!(!settings.exists());
+    }
+
+    #[test]
+    fn every_rename_crash_point_restores_a_name_with_its_resume_record() {
+        const FROM: &str = "amber-1-1-0-crash";
+        const TO: &str = "amber-1-2-0-crash";
+
+        // Three destination artifact copies, destination metadata commit,
+        // source metadata removal, then three source-artifact cleanups.
+        // Interrupt immediately after each mutation, as a process crash would:
+        // no in-process rollback gets a chance to run.
+        for stop_after in 0..8 {
+            let dir = tempdir().unwrap();
+            let store = StateStore::new(dir.path());
+            let mut meta = sample_session(FROM);
+            meta.kind = SessionKind::Claude;
+            store.write_session(&meta).unwrap();
+            store
+                .write_claude(
+                    FROM,
+                    &ClaudeMeta {
+                        session_id: "conversation-survives".to_string(),
+                        cwd: PathBuf::from("/tmp/proj"),
+                        updated: 1,
+                    },
+                )
+                .unwrap();
+            fs::create_dir_all(store.claude_dir()).unwrap();
+            fs::write(store.claude_settings_path(FROM), b"{}").unwrap();
+            store.write_scrollback(FROM, b"history").unwrap();
+
+            let mut step = 0;
+            let result = store.rename_session_with_checkpoint(FROM, TO, |_| {
+                let should_stop = step == stop_after;
+                step += 1;
+                if should_stop {
+                    anyhow::bail!("injected crash")
+                }
+                Ok(())
+            });
+            assert!(result.is_err(), "checkpoint {stop_after} did not interrupt");
+
+            let restored = store.list_sessions().unwrap();
+            assert!(!restored.is_empty(), "checkpoint {stop_after} lost all metadata");
+            for session in restored {
+                assert!(session.name == FROM || session.name == TO);
+                assert_eq!(
+                    store.read_claude(&session.name).unwrap().map(|m| m.session_id),
+                    Some("conversation-survives".to_string()),
+                    "checkpoint {stop_after}: {} metadata has no matching resume record",
+                    session.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rename_session_never_clobbers_orphaned_destination_metadata() {
+        let dir = tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        store.write_session(&sample_session("from")).unwrap();
+        let mut occupied = sample_session("to");
+        occupied.updated = 99;
+        store.write_session(&occupied).unwrap();
+
+        assert!(store.rename_session("from", "to").is_err());
+        assert_eq!(store.read_session("from").unwrap().unwrap().name, "from");
+        assert_eq!(store.read_session("to").unwrap().unwrap().updated, 99);
     }
 
     #[test]

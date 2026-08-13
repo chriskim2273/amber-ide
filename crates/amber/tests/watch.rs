@@ -16,6 +16,17 @@ fn send(stream: &UnixStream, msg: ControlMsg) {
     w.flush().unwrap();
 }
 
+fn send_raw_control(stream: &UnixStream, json: &str) {
+    let mut body = vec![0];
+    body.extend_from_slice(json.as_bytes());
+    let mut wire = Vec::with_capacity(4 + body.len());
+    wire.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    wire.extend_from_slice(&body);
+    let mut w = stream;
+    w.write_all(&wire).unwrap();
+    w.flush().unwrap();
+}
+
 fn read_control_until<F: Fn(&ControlMsg) -> bool>(stream: &mut UnixStream, pred: F) -> ControlMsg {
     stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let mut dec = Decoder::new();
@@ -84,4 +95,65 @@ fn watcher_sees_create_and_kill_deltas() {
         }
         other => panic!("expected removal, got {other:?}"),
     }
+}
+
+#[test]
+fn memory_pressure_reaches_only_versioned_opt_in_watchers() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("amberd.sock");
+    let manager = Arc::new(SessionManager::new(dir.path()).unwrap());
+    let watchers = Arc::new(Watchers::new());
+    let listener = prepare_socket(&sock).unwrap();
+    let daemon = Daemon::new(Arc::clone(&manager), Arc::clone(&watchers));
+    std::thread::spawn(move || {
+        let _ = daemon.serve(listener);
+    });
+
+    // This connection models an older strict client: it knows WatchSessions
+    // but has never advertised support for the newer pressure control.
+    let old = UnixStream::connect(&sock).unwrap();
+    let mut old_read = old.try_clone().unwrap();
+    send(&old, ControlMsg::WatchSessions);
+    read_control_until(&mut old_read, |m| matches!(m, ControlMsg::Sessions { .. }));
+
+    // Send the new capability in raw serde shape so this test is RED before
+    // the protocol enum learns the variant.
+    let current = UnixStream::connect(&sock).unwrap();
+    let mut current_read = current.try_clone().unwrap();
+    send(&current, ControlMsg::WatchSessions);
+    read_control_until(&mut current_read, |m| matches!(m, ControlMsg::Sessions { .. }));
+    send_raw_control(&current, r#"{"WatchMemoryPressure":{"version":1}}"#);
+    // A reply to the following request proves the daemon processed the
+    // capability first (one ordered unix stream) before pressure is emitted.
+    send(&current, ControlMsg::ListSessionsDetailed);
+    read_control_until(&mut current_read, |m| matches!(m, ControlMsg::Sessions { .. }));
+
+    let pressure = ControlMsg::MemoryPressure {
+        level: "critical".into(),
+        current_kb: 9_000,
+        budget_kb: 8_000,
+        blocked: false,
+    };
+    watchers.broadcast_pressure(&pressure);
+    assert_eq!(
+        read_control_until(&mut current_read, |m| matches!(m, ControlMsg::MemoryPressure { .. })),
+        pressure
+    );
+
+    // If pressure leaked to the old connection, it is the next frame and this
+    // exact assertion fails. Otherwise the old client remains connected and
+    // receives its ordinary Sessions response.
+    send(&old, ControlMsg::ListSessionsDetailed);
+    old_read.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut decoder = Decoder::new();
+    let mut buf = [0u8; 8192];
+    let first = loop {
+        if let Some(frame) = decoder.next_frame().unwrap() {
+            break frame;
+        }
+        let n = old_read.read(&mut buf).expect("old watcher disconnected");
+        assert!(n > 0, "old watcher disconnected");
+        decoder.feed(&buf[..n]);
+    };
+    assert!(matches!(first, Frame::Control(ControlMsg::Sessions { .. })), "unexpected old-client frame: {first:?}");
 }

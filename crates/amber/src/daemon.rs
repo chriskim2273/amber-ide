@@ -384,23 +384,30 @@ fn handle_control(
                 }
             });
         }
-        ControlMsg::ReportRunState { name, state } => {
+        ControlMsg::ReportRunState { name, state, seq } => {
             // A claude session's supervisor reporting its phase. Store it and
             // fan the updated SessionInfo out to watchers via the existing
-            // non-blocking broadcast (bounded queue + forwarder). On success we
-            // send NO reply — the supervisor is fire-and-forget; only an
-            // invalid report (unknown/non-claude session, bad state) gets an
-            // Error, and that is a small frame, never a big blocking write.
-            match manager.set_run_state(&name, &state) {
-                Ok(()) => {
-                    if let Ok(infos) = manager.session_infos() {
-                        if let Some(info) = infos.into_iter().find(|i| i.name == name) {
-                            watchers.broadcast(&ControlMsg::SessionsChanged {
-                                added: vec![info],
-                                removed: vec![],
-                            });
+            // non-blocking broadcast (bounded queue + forwarder). Every valid
+            // sequence gets an ack, including stale/duplicate retries; an
+            // invalid report gets Error instead.
+            match manager.set_run_state_report(&name, &state, seq) {
+                Ok(applied) => {
+                    if applied {
+                        if let Ok(infos) = manager.session_infos() {
+                            if let Some(info) = infos.into_iter().find(|i| i.name == name) {
+                                watchers.broadcast(&ControlMsg::SessionsChanged {
+                                    added: vec![info],
+                                    removed: vec![],
+                                });
+                            }
                         }
                     }
+                    // Ack duplicates/stale reports too: retry is idempotent and
+                    // must stop once this sequence is known not to be newer.
+                    let _ = write_frame(
+                        writer,
+                        &Frame::Control(ControlMsg::RunStateAck { name, seq }),
+                    );
                 }
                 Err(e) => {
                     let _ = write_frame(
@@ -500,6 +507,9 @@ fn handle_control(
             watchers.register(writer);
             let sessions = manager.session_infos().unwrap_or_default();
             let _ = write_frame(writer, &Frame::Control(ControlMsg::Sessions { sessions }));
+        }
+        ControlMsg::WatchMemoryPressure { version } => {
+            watchers.register_pressure(writer, version);
         }
         ControlMsg::ListSessionsDetailed => {
             let sessions = manager.session_infos().unwrap_or_default();

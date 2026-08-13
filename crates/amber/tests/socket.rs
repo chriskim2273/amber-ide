@@ -129,7 +129,10 @@ fn prepare_trapped_agent(manager: &SessionManager, state_root: &Path, name: &str
     manager.write(name, b"stty -echo\n").unwrap();
     thread::sleep(Duration::from_millis(50));
     manager
-        .write(name, b"trap '' USR1 USR2; echo TRAPS_READY\n")
+        .write(
+            name,
+            b"trap 'echo SOCKET_SUSPEND_SIGNAL' USR1; trap 'echo SOCKET_RESUME_SIGNAL' USR2; echo TRAPS_READY\n",
+        )
         .unwrap();
     let session = manager.session(name).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -142,7 +145,11 @@ fn prepare_trapped_agent(manager: &SessionManager, state_root: &Path, name: &str
         thread::sleep(Duration::from_millis(10));
     }
     flip_kind_to_claude(state_root, name);
-    session.set_run_state(Some("claude".into()));
+    // These socket fixtures model a supervisor that has already parked. The
+    // fake shell cannot report phase changes back to the daemon, so tests must
+    // assert the observable resume signal rather than a pre-seeded "claude"
+    // value that would make Focus look successful without proving anything.
+    session.set_run_state(Some("suspended".into()));
 }
 
 /// Pull frames from `stream` (via `decoder`) until `pred` matches one, or
@@ -962,7 +969,15 @@ fn focus_refreshes_use_and_resumes_only_memory_suspension() {
         thread::sleep(Duration::from_millis(10));
     }
     assert!(session.last_used_ms() > before);
-    assert_eq!(manager.session_infos().unwrap()[0].run_state.as_deref(), Some("claude"));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !session
+        .scrollback()
+        .windows(b"SOCKET_RESUME_SIGNAL".len())
+        .any(|w| w == b"SOCKET_RESUME_SIGNAL")
+    {
+        assert!(Instant::now() < deadline, "focus cleared origin without signalling resume");
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]

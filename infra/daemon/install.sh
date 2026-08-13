@@ -70,7 +70,10 @@ install_web_linux() {
     mkdir -p "$unit_dir"
     install -m 0644 "$REPO_ROOT/infra/daemon/amber-web.service" "$unit_dir/amber-web.service"
     systemctl --user daemon-reload
-    systemctl --user enable --now amber-web.service
+    systemctl --user enable amber-web.service
+    # `enable --now` does not restart an already-running unit, so an upgrade
+    # could leave the old strict protocol decoder resident indefinitely.
+    systemctl --user restart amber-web.service
     log "amber web enabled on 127.0.0.1:7717"
     log "phone URL: $AMBER_BIN web --print-url   (expose it: tailscale serve --bg 7717)"
 }

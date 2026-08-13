@@ -81,7 +81,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use amber_core::proto::{self, ControlMsg, Decoder, Frame, SessionInfo};
+use amber_core::proto::{self, ControlMsg, Decoded, Decoder, Frame, SessionInfo};
 
 use crate::layout_cas;
 use crate::mosaic;
@@ -920,8 +920,11 @@ impl Hub {
             };
             decoder.feed(&buf[..n]);
             loop {
-                match decoder.next_frame() {
-                    Ok(Some(frame)) => self.on_frame(frame),
+                match decoder.next_decoded() {
+                    Ok(Some(Decoded::Frame(frame))) => self.on_frame(frame),
+                    Ok(Some(Decoded::UndecodableControl(error))) => {
+                        eprintln!("amber web: skipping unknown daemon control: {error}");
+                    }
                     Ok(None) => break,
                     Err(e) => {
                         eprintln!("amber web: daemon frame decode failed: {e}");
@@ -948,6 +951,10 @@ fn run_daemon_link(hub: Arc<Hub>) {
                     let mut inner = hub.inner.lock().unwrap();
                     inner.daemon = Some(stream);
                     Hub::write_daemon(&mut inner, &Frame::Control(ControlMsg::WatchSessions));
+                    Hub::write_daemon(
+                        &mut inner,
+                        &Frame::Control(ControlMsg::WatchMemoryPressure { version: 1 }),
+                    );
                     let mut reattach: Vec<String> =
                         inner.clients.iter().filter_map(|c| c.open.clone()).collect();
                     reattach.sort();
@@ -1864,6 +1871,33 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn daemon_link_skips_unknown_control_and_keeps_decoding() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = Arc::new(Hub::new(
+            dir.path().join("daemon.sock"),
+            dir.path().to_path_buf(),
+        ));
+        let (mut peer, web_end) = UnixStream::pair().unwrap();
+        let reader_hub = Arc::clone(&hub);
+        let reader = std::thread::spawn(move || reader_hub.read_loop(web_end));
+
+        let json = br#"{"FutureDaemonEvent":{"version":2}}"#;
+        let mut unknown_body = vec![0u8];
+        unknown_body.extend_from_slice(json);
+        let mut unknown = (unknown_body.len() as u32).to_be_bytes().to_vec();
+        unknown.extend_from_slice(&unknown_body);
+        peer.write_all(&unknown).unwrap();
+        peer.write_all(&proto::encode(&Frame::Control(ControlMsg::Sessions {
+            sessions: vec![s("still-connected", "shell")],
+        })))
+        .unwrap();
+        drop(peer);
+        reader.join().unwrap();
+
+        assert_eq!(hub.inner.lock().unwrap().sessions[0].name, "still-connected");
     }
 
     /// Reads whole `Frame`s off a raw fake-daemon connection, keeping the

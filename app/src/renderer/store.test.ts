@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { initialState, reduce, groupSessions, mergeBrowsers, paneDot, tabDot, hasActivity, shouldHintTerminalFocus, type PaneModel, type WorkspaceModel } from './store'
+import { initialState, reduce, groupSessions, mergeBrowsers, paneDot, tabDot, hasActivity, shouldHintTerminalFocus, shouldResumeMemoryParked, type PaneModel, type WorkspaceModel } from './store'
 import type { SessionInfo } from '../shared/proto'
 
 describe('mergeBrowsers', () => {
@@ -35,6 +35,14 @@ describe('terminal focus hint', () => {
     expect(shouldHintTerminalFocus(true, true, false)).toBe(false)
     expect(shouldHintTerminalFocus(false, true, true)).toBe(false)
     expect(shouldHintTerminalFocus(true, false, true)).toBe(false)
+  })
+
+  it('resumes a parked pane only for direct trusted focus in the active tab', () => {
+    expect(shouldResumeMemoryParked(true, true, true)).toBe(true)
+    expect(shouldResumeMemoryParked(true, true, false)).toBe(false) // unarmed programmatic mount focus
+    expect(shouldResumeMemoryParked(true, false, true)).toBe(false) // child button focus
+    expect(shouldResumeMemoryParked(false, true, true)).toBe(false) // hidden keep-alive tab
+    expect(shouldResumeMemoryParked(true, true, true, true)).toBe(false) // paired pointer focus already sent
   })
 })
 

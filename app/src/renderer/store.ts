@@ -134,6 +134,19 @@ export function shouldHintTerminalFocus(active: boolean, terminalTarget: boolean
   return active && terminalTarget && userArmed
 }
 
+// A memory-parked overlay may resume on real keyboard/pointer focus, but never
+// because React/xterm restored focus during mount or keep-alive activation.
+// `directTarget` excludes focus bubbling from the explicit Resume button,
+// whose click remains its own single Focus request.
+export function shouldResumeMemoryParked(
+  active: boolean,
+  directTarget: boolean,
+  userArmed: boolean,
+  alreadySent = false,
+): boolean {
+  return active && directTarget && userArmed && !alreadySent
+}
+
 // A pane's kind-dot appearance + tooltip, from its kind and agent run_state.
 // Shared by the pane header and the tab bar so they downgrade identically:
 // amber = claude, pulsing amber = claude-retrying, gray = shell-fallback.

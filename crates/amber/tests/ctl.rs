@@ -81,6 +81,22 @@ fn install_script_passes_bash_syntax_check() {
 }
 
 #[test]
+fn linux_web_upgrade_restarts_an_already_running_service() {
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../infra/daemon/install.sh");
+    let text = std::fs::read_to_string(script).unwrap();
+    let start = text.find("install_web_linux() {").unwrap();
+    let end = text[start..].find("install_web_macos() {").unwrap() + start;
+    let body = &text[start..end];
+
+    assert!(body.contains("systemctl --user enable amber-web.service"));
+    assert!(body.contains("systemctl --user restart amber-web.service"));
+    assert!(
+        !body.contains("enable --now amber-web.service"),
+        "enable --now leaves an old running amber-web binary resident during upgrade"
+    );
+}
+
+#[test]
 fn codex_skill_maintenance_commands_respect_ownership() {
     let home = tempfile::tempdir().unwrap();
     let amber = env!("CARGO_BIN_EXE_amber");

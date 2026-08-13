@@ -33,6 +33,7 @@ export type ControlMsg =
   | { kind: 'Hello' }
   | { kind: 'ListSessions' }
   | { kind: 'WatchSessions' }
+  | { kind: 'WatchMemoryPressure'; version: number }
   | { kind: 'ListSessionsDetailed' }
   | { kind: 'Snapshot' }
   | { kind: 'SnapshotOk' }
@@ -83,6 +84,8 @@ function msgToJson(m: ControlMsg): unknown {
     case 'Snapshot':
     case 'SnapshotOk':
       return m.kind // unit variant -> bare string
+    case 'WatchMemoryPressure':
+      return { WatchMemoryPressure: { version: m.version } }
     case 'Create':
       return { Create: { name: m.name, cwd: m.cwd, kind: m.sessionKind } }
     case 'Attach':
@@ -129,18 +132,19 @@ function msgToJson(m: ControlMsg): unknown {
   }
 }
 
-function jsonToMsg(v: unknown): ControlMsg {
+function jsonToMsg(v: unknown): ControlMsg | null {
   if (typeof v === 'string') {
     if (v === 'Hello' || v === 'ListSessions' || v === 'WatchSessions' ||
         v === 'ListSessionsDetailed' || v === 'Snapshot' || v === 'SnapshotOk') {
       return { kind: v }
     }
-    throw new Error(`unknown unit control: ${v}`)
+    return null
   }
   if (v && typeof v === 'object') {
     const [key, body] = Object.entries(v as Record<string, unknown>)[0] as [string, Record<string, unknown>]
     switch (key) {
       case 'Create': return { kind: 'Create', name: body['name'] as string, cwd: body['cwd'] as string, sessionKind: body['kind'] as string }
+      case 'WatchMemoryPressure': return { kind: 'WatchMemoryPressure', version: body['version'] as number }
       case 'Attach': return { kind: 'Attach', name: body['name'] as string }
       case 'Detach': return { kind: 'Detach', name: body['name'] as string }
       case 'Focus': return { kind: 'Focus', name: body['name'] as string }
@@ -171,7 +175,7 @@ function jsonToMsg(v: unknown): ControlMsg {
       case 'Created': return { kind: 'Created', name: body['name'] as string }
       case 'Exit': return { kind: 'Exit', name: body['name'] as string, code: body['code'] as number }
       case 'Error': return { kind: 'Error', msg: body['msg'] as string }
-      default: throw new Error(`unknown control: ${key}`)
+      default: return null
     }
   }
   throw new Error('malformed control value')
@@ -258,6 +262,13 @@ export class Decoder {
   }
 
   next(): Frame | null {
+    for (;;) {
+      const next = this.nextOne()
+      if (next !== SKIP_CONTROL) return next
+    }
+  }
+
+  private nextOne(): Frame | typeof SKIP_CONTROL | null {
     if (this.buffered() < 4) return null
     const view = new DataView(this.buf.buffer, this.buf.byteOffset, this.buf.length)
     const len = view.getUint32(this.read, false)
@@ -273,7 +284,8 @@ export class Decoder {
     const tag = this.buf[body]
     if (tag === TAG_CONTROL) {
       const json = new TextDecoder().decode(this.buf.subarray(body + 1, end))
-      return { type: 'control', msg: jsonToMsg(JSON.parse(json)) }
+      const msg = jsonToMsg(JSON.parse(json))
+      return msg === null ? SKIP_CONTROL : { type: 'control', msg }
     }
     if (tag === TAG_DATA || tag === TAG_BACKLOG) {
       // Bounds-check the name header against THIS frame, mirroring the Rust
@@ -294,3 +306,5 @@ export class Decoder {
     throw new Error(`unknown frame tag ${tag}`)
   }
 }
+
+const SKIP_CONTROL = Symbol('skip-control')

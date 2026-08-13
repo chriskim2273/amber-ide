@@ -802,13 +802,10 @@ impl SessionManager {
         if let Some(bytes) = scrollback {
             sess.preload(&bytes);
         }
-        // A restored agent session starts back in the `claude` phase (the
-        // agent-neutral "running" state); its freshly-spawned supervisor
-        // re-reports on any later transition. Any persisted run_state is
-        // deliberately discarded here.
-        if meta.kind.is_agent() {
-            sess.set_run_state(Some("claude".to_string()));
-        }
+        // Do not infer "claude" merely because the supervisor process spawned:
+        // the agent child may still fail to launch. The supervisor reports the
+        // running phase only after its agent spawn succeeds. Persisted state is
+        // deliberately discarded, leaving None until that authoritative report.
         Ok(sess)
     }
 
@@ -993,6 +990,19 @@ impl SessionManager {
     /// same four. Minting `grok-*` variants would mean new vocabulary here, in
     /// the app's kind-dot, and in the tab label for no behaviour gain.
     pub fn set_run_state(&self, name: &str, state: &str) -> anyhow::Result<()> {
+        self.set_run_state_report(name, state, 0).map(|_| ())
+    }
+
+    /// Apply an ordered supervisor report. A stale or duplicate sequence is
+    /// successfully acknowledged but does not overwrite newer state. Legacy
+    /// sequence-zero reporters remain supported until a versioned report has
+    /// established authority for this live supervisor.
+    pub fn set_run_state_report(
+        &self,
+        name: &str,
+        state: &str,
+        seq: u64,
+    ) -> anyhow::Result<bool> {
         // "suspended" (Slice 3): the agent parked by a freeze grace — child
         // killed to free RAM, pty held idle, resumable.
         if !matches!(state, "claude" | "claude-retrying" | "shell-fallback" | "suspended") {
@@ -1012,8 +1022,15 @@ impl SessionManager {
         if !is_agent {
             anyhow::bail!("run_state applies only to agent sessions: {name}");
         }
+        let current = sess.run_state_seq();
+        if (seq == 0 && current > 0) || (seq > 0 && seq <= current) {
+            return Ok(false);
+        }
         sess.set_run_state(Some(state.to_string()));
-        Ok(())
+        if seq > 0 {
+            sess.set_run_state_seq(seq);
+        }
+        Ok(true)
     }
 
     fn signal_supervisor(name: &str, session: &PtySession, signal: i32) -> anyhow::Result<()> {
@@ -2006,6 +2023,62 @@ mod tests {
 
         session.claim_suspend(SuspendOrigin::Manual).unwrap();
         assert!(mgr.memory_candidates(&HashMap::new())[0].suspended);
+    }
+
+    #[test]
+    fn output_waiting_on_a_saturated_subscriber_blocks_memory_suspend() {
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        let session = fake_agent(&mgr, "agent");
+        mgr.store
+            .write_claude(
+                "agent",
+                &amber_core::state::ClaudeMeta {
+                    session_id: "resume-id".into(),
+                    cwd: dir.path().to_path_buf(),
+                    updated: 1,
+                },
+            )
+            .unwrap();
+
+        // Never drain this receiver. Queue-capacity separately-flushed frames
+        // fill the bounded subscriber queue; the next reaches the ring and then
+        // blocks in fan-out. The final guardian check must still see that output.
+        let (_id, _backlog, saturated_rx) = session.subscribe();
+        for i in 0..crate::pty::SUBSCRIBER_QUEUE_DEPTH {
+            let before_written = session.scrollback_written();
+            session.write(format!("fill-{i}\n").as_bytes()).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while session.scrollback_written() == before_written {
+                assert!(std::time::Instant::now() < deadline, "fill frame {i} never flushed");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        session.write(b"blocked-fanout\n").unwrap();
+        wait_for_output(&session, b"INPUT:blocked-fanout");
+
+        // The batcher is now stuck delivering the preceding frame. A later
+        // pty read must still publish activity before it queues behind that
+        // batcher; otherwise a long-lived wedged subscriber can make genuinely
+        // fresh output look idle to the guardian.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let before_queued_output = session.last_used_ms();
+        session.write(b"queued-behind-fanout\n").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while session.last_used_ms() <= before_queued_output {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "raw pty output queued behind fan-out never published activity"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let error = mgr
+            .suspend_for_memory("agent", before_queued_output + RECENT_USE_MS)
+            .expect_err("output queued behind fan-out must defeat the final suspend claim");
+        assert!(error.to_string().contains("recent activity"));
+        assert_eq!(session.suspend_origin(), SuspendOrigin::None);
+        drop(saturated_rx);
     }
 
     #[test]
