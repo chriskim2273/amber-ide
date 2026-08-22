@@ -129,12 +129,15 @@ borrows: HashMap<String /*session*/, Borrow>
 struct Borrow { client: u64, prior: (u16, u16), set: (u16, u16) }
 ```
 
-- On a web-originated `Resize` for session `S` from client `C`, if there is no
-  existing borrow, record `prior` = the session's current `cols`/`rows` as the
-  Hub already knows them (`HubInner::sessions` carries them —
-  `SessionInfo.cols`/`.rows`). Record `set` = what we are about to apply.
-  A subsequent resize by the same client updates `set` only; `prior` never
-  moves.
+- **`prior` is captured in the `Open` handler, never in the `Resize`
+  handler.** This is load-bearing, not a style choice — see §2.2.1. At `Open`
+  the Hub records the session's current `cols`/`rows` from `HubInner::sessions`
+  (`SessionInfo.cols`/`.rows`, which the daemon fills from the live pty winsize
+  — `manager.rs:1524`ff reads `PtySession::size()`, `pty.rs:593`, so it tracks
+  every `Resize` rather than reporting spawn geometry). The record becomes a
+  *borrow* only when the first web-originated `Resize` for `S` from `C`
+  arrives, at which point `set` = what we are about to apply. Later resizes
+  from the same client move `set` only; `prior` never moves.
 - **Release** fires on: an explicit release from the client, the client's
   socket closing, or the client changing which session it has open (`Client`
   holds exactly one `open` session — `web.rs:557`).
@@ -143,6 +146,28 @@ struct Borrow { client: u64, prior: (u16, u16), set: (u16, u16) }
   newer writer and we leave it alone. Last writer wins; a restore never
   clobbers.
 - A borrow whose session disappears is dropped silently.
+
+### 2.2.1 Why `prior` cannot be captured on `Resize`
+
+`HubInner::sessions` refreshes on the **1 s** daemon poll (the 2026-07-19
+decision: poll rather than make the daemon broadcast on every `Resize`).
+`PaneLink` debounces resizes by **300 ms**. So inside one poll window a phone
+can emit two resizes, and if the borrow were created on the *second* one,
+`prior` would capture **the phone's own grid**. Restore would then be a no-op
+that silently leaves the desktop at ~46 columns — the exact failure "borrow and
+restore" exists to prevent, and it would present as a Playwright test that
+passes or fails on poll timing. This repo has been bitten by timing-dependent
+intermittents before (the backlog head-of-line fix: *never conclude "not
+reproducible" from one green run*).
+
+Capturing at `Open` removes the race by construction: a socket declares its one
+`open` session before any `Resize` can arrive on it, and `Client.open`
+(`web.rs:557`) is already the borrow key.
+
+Residual staleness is bounded and benign: `prior` can be up to one poll
+interval old, so a desktop resize in that last second is missed. The value is
+still a *desktop-sized* grid, never a phone-sized one, and the desktop's own
+`FitAddon` re-asserts on its next layout event.
 
 ### 2.3 Client side
 
@@ -333,10 +358,25 @@ All support `--json`. **The app parses only `--json`** — never human text.
 
 ### 9.3 `GET /api/status`
 
-A new authenticated endpoint on `amber web` itself (same token, same cookie
-boundary as `/api/sessions`). It reports: port, uptime, connected clients
+A new authenticated endpoint on `amber web` itself, behind the **same cookie
+boundary** as `/api/sessions`. It reports: port, uptime, connected clients
 (peer, the one session each has open, whether it holds a borrow per §2.2), and
-the tailscale mapping as last verified. `amber ctl web status` is its client.
+the tailscale mapping as last verified.
+
+`amber ctl web status` is its client, and it is a **two-step** client — there
+is no single authenticated GET. A CLI has no URL fragment and no cookie jar, so
+it must:
+
+1. read `<state>/web-token` directly (mode 0600, same uid — that *is* the
+   security model; the CLI is not a remote party),
+2. `POST /api/auth` with it and keep the `Set-Cookie`,
+3. `GET /api/status` with that cookie.
+
+**The CLI must not retry a failed `/api/auth`.** `Auth::throttled` buckets by
+peer IP, and behind `tailscale serve` every peer is 127.0.0.1 (recorded
+2026-07-19), so a status poll looping on a stale token — after a rotate, say —
+would burn the 8-failure budget and lock **the phone** out. One attempt, then
+report "token rejected — rotate or restart" and stop.
 
 Rationale for an endpoint rather than a status file: it reuses the existing
 auth surface and cannot go stale.
@@ -398,6 +438,13 @@ at the machine. Therefore:
 - `Hub` borrow/restore state machine: restore fires on release; restore is
   **suppressed** when the desktop re-fit after the borrow; borrow released on
   socket close and on `open` change; a vanished session drops its borrow.
+- **`prior` is never the borrower's own grid** (§2.2.1): drive two resizes from
+  one client inside a single poll window with the Hub's session list
+  deliberately stale, and assert the restore targets the pre-`Open` geometry.
+  This is the regression test for the intermittent, so it must fail if `prior`
+  capture is moved back into the `Resize` handler.
+- `amber ctl web status` performs the token → cookie exchange and does **not**
+  retry on a rejected token (the throttle-lockout guard, §9.3).
 - `{"t":"release"}` reaches no daemon control message except the constructed
   restore `Resize`; `Snapshot`/`ReportRunState` still unreachable.
 - `/api/status` requires the cookie; unauthenticated ⇒ 401.
