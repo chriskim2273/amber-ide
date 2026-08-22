@@ -287,7 +287,7 @@ const RESIZE_MAX_ROWS: u16 = 300;
 
 /// Valid `Create` kinds. A pty runs a shell or `amber run <name> [--kind …]`
 /// and nothing else — `Create` carries no argv, so this is the entire surface.
-const CREATE_KINDS: [&str; 4] = ["shell", "claude", "grok", "codex"];
+const CREATE_KINDS: [&str; 5] = ["shell", "claude", "grok", "codex", "opencode"];
 
 /// The ONLY mapping from a browser message to daemon control messages
 /// (spec §5, widened by the pane-parity pass). `open` is this connection's
@@ -307,7 +307,11 @@ pub fn map_browser_msg(
     let live = |n: &str| sessions.iter().any(|s| s.name == n);
     let is_agent = |n: &str| {
         sessions.iter().any(|s| {
-            s.name == n && (s.kind == "claude" || s.kind == "grok" || s.kind == "codex")
+            s.name == n
+                && (s.kind == "claude"
+                    || s.kind == "grok"
+                    || s.kind == "codex"
+                    || s.kind == "opencode")
         })
     };
     // Exhaustive match: adding a browser message forces a decision here, so a
@@ -1936,6 +1940,7 @@ mod tests {
         };
         assert_eq!(mk("amber-1-1-1-bb", "shell").len(), 1);
         assert_eq!(mk("amber-1-1-1-bb", "grok").len(), 1);
+        assert_eq!(mk("amber-1-1-1-bb", "opencode").len(), 1);
         // Outside the pane grammar: no pane could ever show it, and `s<n>`
         // would shadow the bare-`amber` CLI namespace.
         assert!(mk("s3", "shell").is_empty());
@@ -1999,9 +2004,13 @@ mod tests {
 
     #[test]
     fn suspend_and_resume_are_refused_for_non_agent_sessions() {
-        let live =
-            [s("amber-1-1-0-aa", "shell"), s("amber-1-1-1-bb", "claude"), s("amber-1-1-2-cc", "grok")];
-        for kind_name in ["amber-1-1-1-bb", "amber-1-1-2-cc"] {
+        let live = [
+            s("amber-1-1-0-aa", "shell"),
+            s("amber-1-1-1-bb", "claude"),
+            s("amber-1-1-2-cc", "grok"),
+            s("amber-1-1-3-dd", "opencode"),
+        ];
+        for kind_name in ["amber-1-1-1-bb", "amber-1-1-2-cc", "amber-1-1-3-dd"] {
             assert_eq!(
                 map_browser_msg(&BrowserMsg::Suspend { name: kind_name.into() }, None, &live).len(),
                 1,

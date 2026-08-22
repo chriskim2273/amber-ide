@@ -407,7 +407,10 @@ impl SessionManager {
             }
             // All agents run the SAME `amber run <name>` supervisor; it reads
             // the kind from argv to decide which binary to launch and how.
-            SessionKind::Claude | SessionKind::Grok | SessionKind::Codex => {
+            SessionKind::Claude
+            | SessionKind::Grok
+            | SessionKind::Codex
+            | SessionKind::OpenCode => {
                 let exe = resolve_current_exe()?;
                 // The kind is passed EXPLICITLY, not looked up from the store:
                 // `create` spawns the pty before it persists the metadata (the
@@ -454,7 +457,10 @@ impl SessionManager {
                 // A hand-started agent inherits the session identity for hooks.
                 cmd.env("AMBER_SESSION", name);
             }
-            SessionKind::Claude | SessionKind::Grok | SessionKind::Codex => {
+            SessionKind::Claude
+            | SessionKind::Grok
+            | SessionKind::Codex
+            | SessionKind::OpenCode => {
                 if let Some(sock) = &self.socket {
                     cmd.env("AMBER_SOCK", sock.to_string_lossy().to_string());
                 }

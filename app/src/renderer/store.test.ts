@@ -286,6 +286,7 @@ describe('paneDot', () => {
     })
     expect(paneDot('grok', 'memory-suspended').cls).toBe('memory-suspended')
     expect(paneDot('codex', 'memory-suspended').cls).toBe('memory-suspended')
+    expect(paneDot('opencode', 'memory-suspended').cls).toBe('memory-suspended')
   })
 
   it('renders resource-suspended with the generalized parked status', () => {
@@ -319,6 +320,16 @@ describe('paneDot codex', () => {
     expect(paneDot('codex', 'claude-retrying')).toEqual({ cls: 'codex-retrying', label: 'codex (retrying)' })
     expect(paneDot('codex', 'shell-fallback')).toEqual({ cls: 'shell-fallback', label: 'shell (codex exited)' })
     expect(paneDot('codex', 'suspended')).toEqual({ cls: 'suspended', label: 'suspended (RAM freed)' })
+  })
+})
+
+describe('paneDot opencode', () => {
+  it('maps run_state to dot + label', () => {
+    expect(paneDot('opencode', undefined)).toEqual({ cls: 'opencode', label: 'opencode' })
+    expect(paneDot('opencode', 'claude')).toEqual({ cls: 'opencode', label: 'opencode' })
+    expect(paneDot('opencode', 'claude-retrying')).toEqual({ cls: 'opencode-retrying', label: 'opencode (retrying)' })
+    expect(paneDot('opencode', 'shell-fallback')).toEqual({ cls: 'shell-fallback', label: 'shell (opencode exited)' })
+    expect(paneDot('opencode', 'suspended')).toEqual({ cls: 'suspended', label: 'suspended (RAM freed)' })
   })
 })
 
@@ -372,6 +383,10 @@ describe('tabDot', () => {
   it('an all-codex tab reads codex', () => {
     expect(tabDot([pane('shell'), pane('codex', 'claude')])).toEqual({ cls: 'codex', label: 'codex' })
     expect(tabDot([pane('codex', 'claude-retrying')]).cls).toBe('codex-retrying')
+  })
+  it('an all-opencode tab reads opencode', () => {
+    expect(tabDot([pane('shell'), pane('opencode', 'claude')])).toEqual({ cls: 'opencode', label: 'opencode' })
+    expect(tabDot([pane('opencode', 'claude-retrying')]).cls).toBe('opencode-retrying')
   })
 })
 

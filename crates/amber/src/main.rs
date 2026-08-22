@@ -76,6 +76,21 @@ enum Command {
     },
     /// Kill (destroy) a session.
     Kill {
+        /// Session to kill: a name, or the slot number `amber ls` prints.
+        name: String,
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+    /// Freeze an agent session (kill the child to free RAM; the pane stays).
+    Freeze {
+        /// Session to freeze: a name, or the slot number `amber ls` prints.
+        name: String,
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+    /// Unfreeze a previously frozen agent session (resume the same conversation).
+    Unfreeze {
+        /// Session to unfreeze: a name, or the slot number `amber ls` prints.
         name: String,
         #[arg(long)]
         socket: Option<PathBuf>,
@@ -113,9 +128,9 @@ enum Command {
     /// agent session's child process; not meant to be run directly by users).
     Run {
         name: String,
-        /// Which agent to supervise: `claude` (default), `grok`, or `codex`.
-        /// Passed by the daemon rather than read from the store, which the
-        /// spawn races.
+        /// Which agent to supervise: `claude` (default), `grok`, `codex`, or
+        /// `opencode`. Passed by the daemon rather than read from the store,
+        /// which the spawn races.
         #[arg(long, default_value = "claude")]
         kind: String,
         #[arg(long, hide = true, value_parser = parse_slot)]
@@ -130,7 +145,7 @@ enum Command {
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<OsString>,
     },
-    /// `SessionStart` hook target invoked by claude/codex; records the
+    /// `SessionStart` hook target invoked by claude/codex/opencode; records the
     /// session id from stdin (`AMBER_SESSION`/`AMBER_STATE_DIR` env, spec §6.2).
     Hook,
     /// Print a read-only Claude-session handoff for the current Codex session.
@@ -170,9 +185,9 @@ fn parse_slot(value: &str) -> Result<u32, String> {
 
 #[derive(Subcommand)]
 enum CtlAction {
-    /// Resolve the agent binaries (claude, grok, codex) via your login shell
-    /// and record them in config (the distribution-safe path — never the
-    /// daemon's own PATH; spec §8).
+    /// Resolve the agent binaries (claude, grok, codex, opencode) via your
+    /// login shell and record them in config (the distribution-safe path —
+    /// never the daemon's own PATH; spec §8).
     Doctor {
         #[arg(long)]
         root: Option<PathBuf>,
@@ -319,6 +334,8 @@ fn main() -> anyhow::Result<()> {
             run_create(&resolve_socket(socket), &name, &cwd, &kind)
         }
         Command::Kill { name, socket } => run_kill(&resolve_socket(socket), &name),
+        Command::Freeze { name, socket } => run_suspend(&resolve_socket(socket), &name, true),
+        Command::Unfreeze { name, socket } => run_suspend(&resolve_socket(socket), &name, false),
         Command::Rename { from, to, socket } => run_rename(&resolve_socket(socket), &from, &to),
         Command::Web { port, new_token, print_url, root, socket } => {
             run_web(root, socket, port, new_token, print_url)
@@ -355,8 +372,9 @@ fn run_doctor(root: Option<PathBuf>) -> anyhow::Result<()> {
     std::fs::create_dir_all(&root)?;
     let store = StateStore::new(&root);
 
-    // grok/codex are optional: a machine with only claude installed is a working
-    // amber, so a missing optional agent is reported but never fails the doctor.
+    // grok/codex/opencode are optional: a machine with only claude installed is
+    // a working amber, so a missing optional agent is reported but never fails
+    // the doctor.
     if let Some(path) = amber::grok::resolve_grok() {
         let mut cfg = store.load_config()?;
         cfg.grok_path = Some(path.clone());
@@ -372,6 +390,14 @@ fn run_doctor(root: Option<PathBuf>) -> anyhow::Result<()> {
         println!("codex:  {} (recorded in config)", path.display());
     } else {
         println!("codex:  not found via your login shell (codex panes will fall back to a shell)");
+    }
+    if let Some(path) = amber::opencode::resolve_opencode() {
+        let mut cfg = store.load_config()?;
+        cfg.opencode_path = Some(path.clone());
+        store.save_config(&cfg)?;
+        println!("opencode: {} (recorded in config)", path.display());
+    } else {
+        println!("opencode: not found via your login shell (opencode panes will fall back to a shell)");
     }
 
     match claude::resolve_claude() {
@@ -1154,6 +1180,7 @@ fn run_daemon(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Result<
         let hook = format!("{} hook", exe.display());
         claude::ensure_global_claude_hook(&hook);
         amber::codex::ensure_global_codex_hook(&hook);
+        amber::opencode::ensure_global_opencode_plugin();
     }
     manager.restore()?;
 
@@ -1435,15 +1462,42 @@ fn resolve_target(socket: &Path, name: Option<String>) -> anyhow::Result<(String
     }
 }
 
-/// `amber kill <name>`: ask the daemon to destroy a session. The daemon sends
-/// no reply to Kill (it only broadcasts to watchers), so we confirm removal
-/// with a follow-up ListSessions on the same connection — the daemon services
-/// frames in order, so the session is already gone by the time it replies.
-/// Killing a name that never existed is a success (idempotent).
-fn run_kill(socket: &Path, name: &str) -> anyhow::Result<()> {
+/// List every session the daemon currently holds (dead-but-unreaped included).
+fn list_detailed(socket: &Path) -> anyhow::Result<Vec<amber_core::proto::SessionInfo>> {
+    let mut stream = connect_daemon(socket)?;
+    stream.write_all(&proto::encode(&Frame::Control(ControlMsg::ListSessionsDetailed)))?;
+
+    let mut decoder = Decoder::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        if let Some(Frame::Control(ControlMsg::Sessions { sessions })) = decoder.next_frame()? {
+            return Ok(sessions);
+        }
+        let n = stream.read(&mut buf)?;
+        if n == 0 {
+            anyhow::bail!("daemon closed the connection before replying");
+        }
+        decoder.feed(&buf[..n]);
+    }
+}
+
+/// Resolve a CLI name-or-slot against the daemon's current listing. Missing
+/// names and missing slots are both errors (see `amber ls`).
+fn resolve_existing(socket: &Path, arg: &str) -> anyhow::Result<String> {
+    let sessions = list_detailed(socket)?;
+    attach::resolve_name_or_slot(arg, &sessions).map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// `amber kill <name|slot>`: ask the daemon to destroy a session. The daemon
+/// sends no reply to Kill (it only broadcasts to watchers), so we confirm
+/// removal with a follow-up ListSessions on the same connection — the daemon
+/// services frames in order, so the session is already gone by the time it
+/// replies. A name or slot the daemon does not currently list is an error.
+fn run_kill(socket: &Path, arg: &str) -> anyhow::Result<()> {
+    let name = resolve_existing(socket, arg)?;
     let mut stream = UnixStream::connect(socket)?;
     stream.write_all(&proto::encode(&Frame::Control(ControlMsg::Kill {
-        name: name.to_string(),
+        name: name.clone(),
     })))?;
     stream.write_all(&proto::encode(&Frame::Control(ControlMsg::ListSessions)))?;
 
@@ -1451,7 +1505,7 @@ fn run_kill(socket: &Path, name: &str) -> anyhow::Result<()> {
     let mut buf = [0u8; 8192];
     loop {
         if let Some(Frame::Control(ControlMsg::SessionList { names })) = decoder.next_frame()? {
-            if names.iter().any(|n| n == name) {
+            if names.iter().any(|n| n == &name) {
                 anyhow::bail!("kill failed: session {name} still present");
             }
             println!("killed {name}");
@@ -1459,6 +1513,54 @@ fn run_kill(socket: &Path, name: &str) -> anyhow::Result<()> {
         }
         let n = stream.read(&mut buf)?;
         if n == 0 {
+            anyhow::bail!("daemon closed the connection before replying");
+        }
+        decoder.feed(&buf[..n]);
+    }
+}
+
+/// `amber freeze` / `amber unfreeze`: send Suspend/Resume. Success is
+/// fire-and-forget (no ack); a failure comes back as `Error` before the
+/// follow-up listing. A missing name/slot is refused before we send anything.
+fn run_suspend(socket: &Path, arg: &str, freeze: bool) -> anyhow::Result<()> {
+    let name = resolve_existing(socket, arg)?;
+    let verb = if freeze { "freeze" } else { "unfreeze" };
+    let ok = if freeze { "froze" } else { "unfroze" };
+    let msg = if freeze {
+        ControlMsg::Suspend { name: name.clone() }
+    } else {
+        ControlMsg::Resume { name: name.clone() }
+    };
+    let mut stream = UnixStream::connect(socket)?;
+    stream.write_all(&proto::encode(&Frame::Control(msg)))?;
+    stream.write_all(&proto::encode(&Frame::Control(ControlMsg::ListSessionsDetailed)))?;
+
+    let mut decoder = Decoder::new();
+    let mut buf = [0u8; 8192];
+    let mut err = None;
+    loop {
+        match decoder.next_frame()? {
+            Some(Frame::Control(ControlMsg::Error { msg })) => {
+                err = Some(msg);
+            }
+            Some(Frame::Control(ControlMsg::Sessions { sessions })) => {
+                if let Some(msg) = err {
+                    anyhow::bail!("{verb} failed: {msg}");
+                }
+                if !sessions.iter().any(|s| s.name == name) {
+                    anyhow::bail!("no such session: {name}");
+                }
+                println!("{ok} {name}");
+                return Ok(());
+            }
+            Some(Frame::Control(_)) => {}
+            _ => {}
+        }
+        let n = stream.read(&mut buf)?;
+        if n == 0 {
+            if let Some(msg) = err {
+                anyhow::bail!("{verb} failed: {msg}");
+            }
             anyhow::bail!("daemon closed the connection before replying");
         }
         decoder.feed(&buf[..n]);

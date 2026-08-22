@@ -613,6 +613,108 @@ fn kill_via_cli_removes_the_session() {
     }
 }
 
+fn cli_stderr(socket: &Path, args: &[&str]) -> (bool, String) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_amber"));
+    cmd.args(args).arg("--socket").arg(socket);
+    let out = cmd.output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    (out.status.success(), format!("{stdout}{stderr}"))
+}
+
+#[test]
+fn kill_via_cli_errors_on_a_missing_name_or_slot() {
+    let (socket_path, _dir) = start_daemon();
+    let (ok, msg) = cli_stderr(&socket_path, &["kill", "ghost"]);
+    assert!(!ok, "missing name must fail: {msg}");
+    assert!(msg.contains("no such session: ghost"), "{msg}");
+
+    let (ok, msg) = cli_stderr(&socket_path, &["kill", "9"]);
+    assert!(!ok, "missing slot must fail: {msg}");
+    assert!(msg.contains("no session with slot 9 (see `amber ls`)"), "{msg}");
+}
+
+#[test]
+fn kill_via_cli_resolves_a_slot_number() {
+    let (socket_path, _dir) = start_daemon();
+    let mut stream = connect_with_retry(&socket_path);
+    let mut decoder = Decoder::new();
+    for name in ["keep-me", "drop-me"] {
+        send(
+            &mut stream,
+            &Frame::Control(ControlMsg::Create {
+                name: name.into(),
+                cwd: "/tmp".into(),
+                kind: "shell".into(),
+            }),
+        );
+        read_frame_until(
+            &mut stream,
+            &mut decoder,
+            |f| matches!(f, Frame::Control(ControlMsg::Created { .. })),
+            Duration::from_secs(5),
+        );
+    }
+
+    send(&mut stream, &Frame::Control(ControlMsg::ListSessionsDetailed));
+    let frame = read_frame_until(
+        &mut stream,
+        &mut decoder,
+        |f| matches!(f, Frame::Control(ControlMsg::Sessions { .. })),
+        Duration::from_secs(5),
+    );
+    let slot = match frame {
+        Frame::Control(ControlMsg::Sessions { sessions }) => {
+            sessions.iter().find(|s| s.name == "drop-me").unwrap().slot
+        }
+        _ => unreachable!(),
+    };
+    assert!(slot > 0, "created session must have a slot");
+
+    let (ok, msg) = cli_stderr(&socket_path, &["kill", &slot.to_string()]);
+    assert!(ok, "amber kill {slot} failed: {msg}");
+    assert!(msg.contains("killed drop-me"), "{msg}");
+
+    let (ok, msg) = cli_stderr(&socket_path, &["kill", "keep-me"]);
+    assert!(ok, "{msg}");
+}
+
+#[test]
+fn freeze_via_cli_errors_on_missing_and_non_agent() {
+    let (socket_path, _dir) = start_daemon();
+    let (ok, msg) = cli_stderr(&socket_path, &["freeze", "ghost"]);
+    assert!(!ok, "missing name must fail: {msg}");
+    assert!(msg.contains("no such session: ghost"), "{msg}");
+
+    let (ok, msg) = cli_stderr(&socket_path, &["freeze", "9"]);
+    assert!(!ok, "missing slot must fail: {msg}");
+    assert!(msg.contains("no session with slot 9 (see `amber ls`)"), "{msg}");
+
+    let mut stream = connect_with_retry(&socket_path);
+    let mut decoder = Decoder::new();
+    send(
+        &mut stream,
+        &Frame::Control(ControlMsg::Create {
+            name: "sh".into(),
+            cwd: "/tmp".into(),
+            kind: "shell".into(),
+        }),
+    );
+    read_frame_until(
+        &mut stream,
+        &mut decoder,
+        |f| matches!(f, Frame::Control(ControlMsg::Created { .. })),
+        Duration::from_secs(5),
+    );
+
+    let (ok, msg) = cli_stderr(&socket_path, &["freeze", "sh"]);
+    assert!(!ok, "freezing a shell must fail: {msg}");
+    assert!(
+        msg.contains("suspend applies only to agent sessions: sh"),
+        "{msg}"
+    );
+}
+
 #[test]
 fn failed_kill_returns_error_and_does_not_broadcast_removal() {
     let (socket_path, manager, dir) = start_daemon_with_manager();

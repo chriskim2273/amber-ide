@@ -143,6 +143,9 @@ html, body {
 .dot { width: 10px; height: 10px; border-radius: 50%; flex: none; background: var(--text-faint); }
 .dot.k-shell { background: var(--ok); }
 .dot.k-claude { background: var(--accent); }
+.dot.k-grok { background: #8ab4f8; }
+.dot.k-codex { background: #3dd68c; }
+.dot.k-opencode { background: #c084fc; }
 .dot.k-browser { background: #4d9fff; }
 .tag { font-size: 11px; color: var(--warn); flex: none; }
 .empty { color: var(--text-faint); font-size: 13px; padding: 24px 8px; text-align: center; }

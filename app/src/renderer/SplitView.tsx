@@ -24,12 +24,12 @@ export interface PaneMeta { kind: string; title: string; cwd: string; runState?:
 /** Which agent binary a pane's recorded conversation id belongs to. Explicit
  *  agent kinds map to themselves; a shell pane with a recorded id got it from a
  *  hand-started claude (the global SessionStart hook), so it stays claude. */
-export function agentOf(kind: string): 'claude' | 'grok' | 'codex' {
-  if (kind === 'grok' || kind === 'codex') return kind
+export function agentOf(kind: string): 'claude' | 'grok' | 'codex' | 'opencode' {
+  if (kind === 'grok' || kind === 'codex' || kind === 'opencode') return kind
   return 'claude'
 }
 
-export type PaneKind = 'shell' | 'claude' | 'grok' | 'codex' | 'browser' | 'editor'
+export type PaneKind = 'shell' | 'claude' | 'grok' | 'codex' | 'opencode' | 'browser' | 'editor'
 
 // Compact memory label from resident KiB: "0" hidden by the caller; MB up to
 // ~1 GB, then GB with one decimal. Display-only.
@@ -820,7 +820,11 @@ export function SplitView(props: {
               {reloadPane === paneId && meta?.claudeId && !isFrozen &&
                 <div className="reload-claude-prompt" role="dialog" aria-label={`reload ${agentOf(meta.kind)}`}>
                   <div className="reload-claude-title">Reload {agentOf(meta.kind)} in this pane?</div>
-                  <div className="reload-claude-sub">Clears the current line, then runs <code>{meta.kind === 'codex' ? 'codex resume' : `${agentOf(meta.kind)} --resume`}</code>.</div>
+                  <div className="reload-claude-sub">Clears the current line, then runs <code>{
+                    meta.kind === 'codex' ? 'codex resume'
+                      : meta.kind === 'opencode' ? 'opencode -s'
+                        : `${agentOf(meta.kind)} --resume`
+                  }</code>.</div>
                   <div className="reload-claude-actions">
                     <button className="btn btn-accent" onClick={() => reloadClaude(paneId, meta.claudeId ?? null, meta.kind)}>
                       Resume saved <span className="reload-id">{meta.claudeId!.slice(0, 8)}…</span>
@@ -829,7 +833,8 @@ export function SplitView(props: {
                       title={
                         meta.kind === 'grok' ? "resumes the most recent conversation in this folder"
                           : meta.kind === 'codex' ? "opens codex's session picker"
-                            : "opens claude's own session list"
+                            : meta.kind === 'opencode' ? "starts a fresh OpenCode session"
+                              : "opens claude's own session list"
                       }>
                       Pick session…
                     </button>
@@ -884,7 +889,7 @@ export function SplitView(props: {
           return (
             <div className="ctx-menu" role="menu" aria-label={dir === 'h' ? 'split right as' : 'split down as'}
               style={{ left: x, top: y }} onMouseDown={(e) => e.stopPropagation()}>
-              {(['shell', 'claude', 'grok', 'codex', 'browser', 'editor'] as const).map((k) => (
+              {(['shell', 'claude', 'grok', 'codex', 'opencode', 'browser', 'editor'] as const).map((k) => (
                 <button key={k} className="ctx-item" role="menuitem"
                   onClick={run(() => props.onSplit(paneId, dir, k))}>{k}</button>
               ))}

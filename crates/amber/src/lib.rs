@@ -13,6 +13,7 @@ pub mod layout_cas;
 pub mod manager;
 pub mod memory_guardian;
 pub mod mosaic;
+pub mod opencode;
 pub mod procinfo;
 pub mod pty;
 pub mod supervisor;

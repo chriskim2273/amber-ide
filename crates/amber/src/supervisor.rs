@@ -13,7 +13,7 @@ use std::time::Duration;
 use amber_core::proto::{self, ControlMsg, Decoded, Decoder, Frame};
 use amber_core::state::{SessionKind, StateStore};
 
-use crate::{claude, codex, grok};
+use crate::{claude, codex, grok, opencode};
 
 /// Upper bound on one run-state report attempt. The ordered reporter retries a
 /// timed-out attempt without blocking the child-monitoring loop.
@@ -67,7 +67,8 @@ pub enum SuperviseOutcome {
 
 /// Which coding agent a supervised session runs. All share this module's
 /// retry/suspend/fallback machinery; only the argv differs — see
-/// [`claude::claude_argv`], [`grok::grok_argv`], and [`codex::codex_argv`].
+/// [`claude::claude_argv`], [`grok::grok_argv`], [`codex::codex_argv`], and
+/// [`opencode::opencode_argv`].
 pub enum Agent {
     /// claude, whose rotating session id is recorded by its `SessionStart` hook
     /// into the generated per-session settings file at this path.
@@ -77,6 +78,9 @@ pub enum Agent {
     /// codex, whose session id is recorded by a global SessionStart hook
     /// (`amber hook`) — Claude-shaped, not assign-on-create.
     Codex,
+    /// opencode, whose session id is recorded by a global plugin (`amber hook`)
+    /// — Claude-shaped (`-s` continues; amber cannot assign an id on create).
+    OpenCode,
 }
 
 impl Agent {
@@ -85,6 +89,7 @@ impl Agent {
             Agent::Claude { .. } => "claude",
             Agent::Grok => "grok",
             Agent::Codex => "codex",
+            Agent::OpenCode => "opencode",
         }
     }
 }
@@ -165,6 +170,9 @@ pub fn supervise_agent(
                 escalation,
             )?),
             Agent::Codex => codex::codex_argv(&select_codex_start(session_id, escalation)),
+            Agent::OpenCode => {
+                opencode::opencode_argv(&select_opencode_start(session_id, escalation))
+            }
         };
 
         // Spawn (not `.status()`) so the run is interruptible: a SIGUSR1-set
@@ -177,6 +185,9 @@ pub fn supervise_agent(
             .current_dir(cwd)
             .env("AMBER_SESSION", name)
             .env("AMBER_STATE_DIR", root);
+        if let Ok(exe) = crate::manager::resolve_current_exe() {
+            command.env("AMBER_BIN", exe);
+        }
         let outcome = match spawn_agent(&mut command, slot) {
             Err(e) => Err(e),
             Ok(mut child) => {
@@ -402,6 +413,18 @@ fn select_codex_start(session_id: Option<&str>, escalation: u32) -> codex::Codex
     match (session_id, escalation) {
         (Some(id), 0) if codex::is_session_id(id) => codex::CodexStart::Resume(id.to_string()),
         _ => codex::CodexStart::Fresh,
+    }
+}
+
+/// Pick how to start `opencode` for one attempt. Claude-shaped: a `ses_`-shaped
+/// recorded id on the first un-escalated attempt is resumed with `-s`; every
+/// other case starts Fresh. Never `-c` / `--continue` (cwd hijack).
+fn select_opencode_start(session_id: Option<&str>, escalation: u32) -> opencode::OpenCodeStart {
+    match (session_id, escalation) {
+        (Some(id), 0) if opencode::is_session_id(id) => {
+            opencode::OpenCodeStart::Resume(id.to_string())
+        }
+        _ => opencode::OpenCodeStart::Fresh,
     }
 }
 
@@ -679,6 +702,7 @@ pub fn run_session(
     let agent_kind = match kind {
         k if k == SessionKind::Grok.as_str() => "grok",
         k if k == SessionKind::Codex.as_str() => "codex",
+        k if k == SessionKind::OpenCode.as_str() => "opencode",
         _ => "claude",
     };
 
@@ -689,6 +713,7 @@ pub fn run_session(
     let cached = match agent_kind {
         "grok" => cfg.grok_path.clone(),
         "codex" => cfg.codex_path.clone(),
+        "opencode" => cfg.opencode_path.clone(),
         _ => cfg.claude_path.clone(),
     };
     let agent_path = match cached.filter(|p| p.exists()) {
@@ -697,12 +722,14 @@ pub fn run_session(
             let resolved = match agent_kind {
                 "grok" => grok::resolve_grok(),
                 "codex" => codex::resolve_codex(),
+                "opencode" => opencode::resolve_opencode(),
                 _ => claude::resolve_claude(),
             };
             if let Some(p) = resolved.clone() {
                 match agent_kind {
                     "grok" => cfg.grok_path = Some(p),
                     "codex" => cfg.codex_path = Some(p),
+                    "opencode" => cfg.opencode_path = Some(p),
                     _ => cfg.claude_path = Some(p),
                 }
                 store.save_config(&cfg)?;
@@ -732,6 +759,12 @@ pub fn run_session(
                     codex::ensure_global_codex_hook(&format!("{} hook", exe.display()));
                 }
                 Agent::Codex
+            }
+            "opencode" => {
+                // OpenCode cannot assign an id on create (`-s` continues). The
+                // global plugin records `session.created` via `amber hook`.
+                opencode::ensure_global_opencode_plugin();
+                Agent::OpenCode
             }
             _ => {
                 // A detached claude blocks forever on the interactive folder-trust
@@ -1233,6 +1266,29 @@ mod tests {
         assert_eq!(
             select_codex_start(Some("7f9f9a2e-1b3c-4c7a-9b0e-example-id"), 1),
             codex::CodexStart::Fresh
+        );
+    }
+
+    #[test]
+    fn opencode_resumes_a_recorded_ses_id_first() {
+        let id = "ses_fd8f8accaffeTWUvgvTimbhECs";
+        assert_eq!(
+            select_opencode_start(Some(id), 0),
+            opencode::OpenCodeStart::Resume(id.into())
+        );
+    }
+
+    #[test]
+    fn opencode_fresh_when_no_id_or_after_resume_fails() {
+        assert_eq!(select_opencode_start(None, 0), opencode::OpenCodeStart::Fresh);
+        assert_eq!(select_opencode_start(Some(""), 0), opencode::OpenCodeStart::Fresh);
+        assert_eq!(
+            select_opencode_start(Some("latest"), 0),
+            opencode::OpenCodeStart::Fresh
+        );
+        assert_eq!(
+            select_opencode_start(Some("ses_fd8f8accaffeTWUvgvTimbhECs"), 1),
+            opencode::OpenCodeStart::Fresh
         );
     }
 

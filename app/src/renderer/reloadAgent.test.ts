@@ -43,4 +43,24 @@ describe('reloadAgentCommand', () => {
       .toBe('grok --permission-mode bypassPermissions --resume')
     expect(reloadAgentCommand('grok', 'named-session')).toBeNull()
   })
+
+  it('resumes OpenCode with -s and never --continue', () => {
+    const id = 'ses_fd8f8accaffeTWUvgvTimbhECs'
+    const command = reloadAgentCommand('opencode', id)
+    expect(command).toBe(`opencode --auto -s '${id}'`)
+    expect(command).not.toContain('--continue')
+    expect(command).not.toContain(' -c')
+  })
+
+  it('starts a fresh OpenCode session when no id is recorded', () => {
+    const command = reloadAgentCommand('opencode', null)
+    expect(command).toBe('opencode --auto')
+    expect(command).not.toContain('-s')
+    expect(command).not.toContain('--continue')
+  })
+
+  it.each(['', '   ', 'latest', 'ses_', 'ses_has-dash', 'line\nbreak'])
+  ('rejects an invalid OpenCode id %j', (id) => {
+    expect(reloadAgentCommand('opencode', id)).toBeNull()
+  })
 })
