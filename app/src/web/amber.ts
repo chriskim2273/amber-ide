@@ -38,6 +38,7 @@
 // forwards, it does not validate.
 
 import type { LoadLayoutResult, SaveLayoutResult, LayoutVersion } from '../shared/layoutFile'
+import type { WebStatus } from '../main/webService'
 
 export interface SocketLike {
   send(data: string | Uint8Array): void
@@ -465,5 +466,29 @@ export function createAmber(deps: AmberDeps): Window['amber'] {
     editorDraftClear: notImplemented('editorDraftClear'),
     editorInlineImages: notImplemented('editorInlineImages'),
     claudeNames: notImplemented('claudeNames'),
+
+    // --- remote access (spec 2026-08-22 §9) --------------------------------
+    // The browser IS the remote client; it has no service to manage and no
+    // business reading the host's token. These report their own absence
+    // rather than throwing, because `main.tsx` calls `webStatus` on mount and
+    // an uncaught throw there would take the whole toolbar down.
+    webStatus: (): Promise<WebStatus> =>
+      Promise.resolve({
+        unit: 'unknown',
+        port: 0,
+        url: '',
+        tailscale: 'not-installed',
+        host: '',
+        hasToken: false,
+        clients: [],
+        sessions: null,
+        uptimeSecs: null,
+        error: 'remote access is managed from the desktop app',
+      }),
+    webAction: (): Promise<{ ok: boolean; error?: string }> =>
+      Promise.resolve({ ok: false, error: 'not available in the browser' }),
+    webUrl: (): Promise<string> => Promise.resolve(''),
+    webLogTail: (): Promise<string> => Promise.resolve(''),
+    webOpenLocal: (): Promise<void> => Promise.resolve(),
   }
 }

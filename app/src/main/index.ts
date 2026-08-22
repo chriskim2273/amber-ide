@@ -44,6 +44,7 @@ import { loadLayoutFile, saveLayoutFile } from './layoutIO'
 import { compatSignature, shouldUseCompat, compatWorthyReason, COMPAT_SWITCHES, DETECT_WINDOW_MS } from './renderCompat'
 import { installBinary } from './installBinary'
 import { spawnOkWithStderr } from './spawnOk'
+import { webCtlArgv, parseWebStatus, redactUrl, type WebStatus } from './webService'
 import clientPath from '../client/index?modulePath'
 
 // A client child that stays up this long counts as a genuine run; a shorter
@@ -82,6 +83,42 @@ if (compat) {
   // The renderer reads this to pick xterm's DOM renderer over WebGL (WebGL on
   // SwiftShader is the input-lag source).
   process.env['AMBER_SOFTWARE_GL'] = '1'
+}
+
+/**
+ * Port `amber web` listens on.
+ *
+ * KNOWN LIMITATION (plan follow-up 2): this is one of three places the port
+ * lives — here, `infra/daemon/amber-web.service`, and `webctl::render_*`'s
+ * argument. `amber ctl web enable --port N` therefore produces a service this
+ * dialog cannot see: it would query 7717 and report `unit: inactive` while the
+ * service runs fine on N. The fix is to read the port out of the installed
+ * unit; the dialog offers no port editor yet, so this is deliberate for now.
+ */
+const WEB_PORT = 7717
+
+/** Run a command and collect its output. Never rejects — callers report. */
+function runCapture(
+  cmd: string,
+  args: string[],
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  return new Promise((resolveRun) => {
+    const p = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] })
+    let stdout = ''
+    let stderr = ''
+    p.stdout?.on('data', (d: Buffer) => {
+      stdout += d.toString()
+    })
+    p.stderr?.on('data', (d: Buffer) => {
+      stderr += d.toString()
+    })
+    p.on('close', (code) => resolveRun({ code: code ?? -1, stdout, stderr }))
+    p.on('error', (e) => resolveRun({ code: -1, stdout: '', stderr: String(e) }))
+  })
+}
+
+function runAmberCapture(args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
+  return runCapture(amberBinary(), args)
 }
 
 function amberBinary(): string {
@@ -590,6 +627,67 @@ async function main(): Promise<void> {
   })
   ipcMain.handle('clipboard-read', () => clipboard.readText())
 
+  // ---- remote access (spec 2026-08-22 §9) ------------------------------
+  //
+  // The app is a CONTROLLER, never the owner: `amber web` is boot-managed by
+  // its own unit so closing the IDE does not kill phone access. Every call
+  // here shells to `amber ctl web`, which owns the unit file, the tailscale
+  // mapping and the token.
+
+  ipcMain.handle('web:status', async (): Promise<WebStatus> => {
+    const { stdout } = await runAmberCapture(webCtlArgv('status', WEB_PORT))
+    return parseWebStatus(stdout)
+  })
+
+  ipcMain.handle('web:action', async (_e, action: unknown) => {
+    // Allowlist, not passthrough: this argument crosses the renderer boundary
+    // and is spliced into an argv.
+    const allowed = ['start', 'stop', 'restart', 'enable', 'disable', 'rotate-token']
+    if (typeof action !== 'string' || !allowed.includes(action)) {
+      return { ok: false, error: `unknown action ${String(action)}` }
+    }
+    const { code, stderr } = await runAmberCapture(webCtlArgv(action, WEB_PORT))
+    return code === 0 ? { ok: true } : { ok: false, error: stderr.trim() || `exit ${code}` }
+  })
+
+  // On-demand ONLY — called when the user presses Reveal / Copy / Show QR.
+  // Never on the status poll: the token is a full-authority credential and the
+  // dialog polls every 3 s while open.
+  ipcMain.handle('web:url', async (): Promise<string> => {
+    const { stdout } = await runAmberCapture(['ctl', 'web', 'url', '--port', String(WEB_PORT)])
+    return stdout.trim()
+  })
+
+  ipcMain.handle('web:logTail', async (): Promise<string> => {
+    if (process.platform === 'linux') {
+      const { stdout, stderr } = await runCapture('journalctl', [
+        '--user',
+        '-u',
+        'amber-web.service',
+        '-n',
+        '200',
+        '--no-pager',
+      ])
+      return stdout || stderr
+    }
+    // launchd has no journal — the agent writes StandardErrorPath here.
+    try {
+      return await readFile(join(homedir(), 'Library', 'Logs', 'amber-web.log'), 'utf8')
+    } catch (e) {
+      return `no log available: ${String(e)}`
+    }
+  })
+
+  ipcMain.handle('web:openLocal', async () => {
+    // Opens the user's own browser on the user's own machine, so the tokenised
+    // url is correct here — but only the REDACTED form is ever logged.
+    const { stdout } = await runAmberCapture(['ctl', 'web', 'url', '--port', String(WEB_PORT)])
+    const url = stdout.trim()
+    if (url.length === 0) return
+    console.log('[amber] opening', redactUrl(url))
+    await shell.openExternal(url)
+  })
+
   ipcMain.handle('pick-folder', async () => {
     const r = await dialog.showOpenDialog(win, { properties: ['openDirectory', 'createDirectory'] })
     return r.canceled || r.filePaths.length === 0 ? null : r.filePaths[0]
@@ -648,46 +746,4 @@ async function main(): Promise<void> {
   ipcMain.handle('claude-names', (_e, entries: unknown) =>
     claudeNames(
       Array.isArray(entries)
-        ? entries.flatMap((e) => {
-            const o = e as { id?: unknown; cwd?: unknown }
-            return typeof o?.id === 'string' ? [{ id: o.id, cwd: typeof o.cwd === 'string' ? o.cwd : '' }] : []
-          })
-        : [],
-    ))
-  ipcMain.handle('editor-read', (_e, path: string) => readEditorFile(String(path)))
-  ipcMain.handle('editor-save', (_e, path: string, text: string, expectedMtimeMs: number | null) =>
-    saveEditorFile(String(path), String(text), typeof expectedMtimeMs === 'number' ? expectedMtimeMs : null))
-  ipcMain.handle('editor-save-dialog', async (_e, suggestedName: string, text: string) => {
-    const r = await dialog.showSaveDialog(win, { defaultPath: suggestedName, filters: EDITOR_FILTERS })
-    if (r.canceled || !r.filePath) return null
-    return { path: r.filePath, ...(await saveEditorFile(r.filePath, String(text), null)) }
-  })
-  ipcMain.handle('editor-draft-write', (_e, paneId: string, text: string) =>
-    writeDraft(draftsDir(), String(paneId), String(text)))
-  ipcMain.handle('editor-draft-read', (_e, paneId: string) => readDraft(draftsDir(), String(paneId)))
-  ipcMain.handle('editor-draft-clear', (_e, paneId: string) => clearDraft(draftsDir(), String(paneId)))
-  // Markdown preview images: the sandboxed srcdoc frame inherits the renderer
-  // CSP (img-src 'self' data:), so local file: images never load — main inlines
-  // them as data: URIs. Remote srcs are deliberately left alone.
-  ipcMain.handle('editor-inline-images', (_e, mdDir: string, html: string) =>
-    inlineImages(String(mdDir), String(html)))
-}
-
-// Single-instance lock: a second launch (or a dev run whose predecessor didn't
-// fully exit) would open a second window + utilityProcess attaching the same
-// daemon sessions — duplicate subscriptions that read as "input sent twice".
-// Refuse to run a duplicate; the first instance keeps ownership.
-if (!app.requestSingleInstanceLock()) {
-  app.quit()
-} else {
-  app.whenReady().then(main).catch((e) => {
-    console.error(e)
-    app.quit()
-  })
-}
-// Single-window app: red traffic-light / window close must quit the process on
-// every platform, including macOS. The common Electron pattern of keeping the
-// app alive with zero windows on darwin left amber-ide headless in the Dock
-// (no activate handler recreates a window) until Force Quit. Spec §6/§7: window
-// close never stops the daemon, but it DOES exit the GUI.
-app.on('window-all-closed', () => { app.quit() })
+        ? entr

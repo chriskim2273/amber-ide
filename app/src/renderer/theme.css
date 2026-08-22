@@ -950,3 +950,100 @@ body {
 }
 .open-path-btn:hover { filter: brightness(1.12); }
 .open-path-btn:active { filter: brightness(0.95); }
+
+/* ---- remote access (spec 2026-08-22 §9.5) ------------------------------ */
+
+.web-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.web-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--fg-dim, #8b949e);
+}
+/* Green ONLY when a phone can actually reach it. */
+.web-pill-serving .web-dot { background: #3fb950; }
+/* Running, but local-only — reachable from this machine, not the tailnet. */
+.web-pill-local .web-dot { background: #d29922; }
+.web-pill-error .web-dot { background: #f85149; }
+
+.remote-dialog {
+  min-width: 520px;
+  max-width: 720px;
+  max-height: 80vh;
+  overflow-y: auto;
+}
+.remote-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 8px 0;
+}
+.remote-section {
+  margin-top: 14px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border, #30363d);
+}
+.remote-url {
+  display: block;
+  padding: 6px 8px;
+  border-radius: 4px;
+  background: var(--bg-inset, #0d1117);
+  font-size: 12px;
+  word-break: break-all;
+}
+.remote-warn {
+  margin: 6px 0;
+  padding: 6px 8px;
+  border-radius: 4px;
+  border: 1px solid #d29922;
+  color: #d29922;
+  font-size: 11.5px;
+}
+.remote-error {
+  margin: 6px 0;
+  color: #f85149;
+  font-size: 12px;
+}
+.remote-qr {
+  display: block;
+  margin: 8px 0;
+  image-rendering: pixelated;
+  background: #fff;
+  padding: 8px;
+  border-radius: 4px;
+}
+.remote-checks,
+.remote-clients {
+  list-style: none;
+  margin: 4px 0;
+  padding: 0;
+  font-size: 12px;
+}
+.remote-checks li,
+.remote-clients li {
+  display: flex;
+  gap: 10px;
+  padding: 3px 0;
+}
+.remote-checks li.ok .remote-check-mark { color: #3fb950; }
+.remote-checks li.bad .remote-check-mark { color: #f85149; }
+.remote-check-label { min-width: 76px; }
+.remote-check-hint,
+.remote-client-borrow {
+  color: var(--fg-dim, #8b949e);
+}
+.remote-client-id { min-width: 40px; }
+.remote-log {
+  max-height: 220px;
+  overflow: auto;
+  padding: 8px;
+  border-radius: 4px;
+  background: var(--bg-inset, #0d1117);
+  font-size: 11px;
+  white-space: pre-wrap;
+}

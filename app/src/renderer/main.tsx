@@ -6,6 +6,8 @@ import { initialState, reduce, groupSessions, mergeBrowsers, mergeEditors, tabDo
 import type { ControlMsg } from '../shared/proto'
 import { sessionRows } from './sessionRows'
 import { deriveTab, shortCwd } from './tabView'
+import { RemoteAccess } from './RemoteAccess'
+import type { WebStatus } from '../main/webService'
 import { formatName, makeId, retargetPane } from '../shared/names'
 import { formatBrowserName, isBrowserName } from '../shared/browserName'
 import { formatEditorName, isEditorName } from '../shared/editorName'
@@ -65,6 +67,13 @@ declare global {
       editorInlineImages: (mdDir: string, html: string) => Promise<{ html: string }>
       // Session-cleanup dialog: conversation labels for claude session ids.
       claudeNames: (entries: { id: string; cwd: string }[]) => Promise<Record<string, string>>
+      // Remote access (spec 2026-08-22 §9). `webUrl` returns the TOKENISED
+      // login url and is called on demand only — never on the status poll.
+      webStatus: () => Promise<WebStatus>
+      webAction: (action: string) => Promise<{ ok: boolean; error?: string }>
+      webUrl: () => Promise<string>
+      webLogTail: () => Promise<string>
+      webOpenLocal: () => Promise<void>
     }
   }
 }
@@ -142,6 +151,10 @@ function App(): JSX.Element {
   // verbatim so a session restores in the SAME folder — a relative '.' would
   // drift to the daemon's cwd ($HOME under systemd) on restart.
   const [cwd, setCwd] = useState<string>(() => window.amber?.homeDir ?? '/')
+  // Remote access (spec 2026-08-22 §9). The status payload carries NO token —
+  // the tokenised url is fetched on demand by the dialog.
+  const [webStatus, setWebStatus] = useState<WebStatus | null>(null)
+  const [remoteOpen, setRemoteOpen] = useState(false)
   const [connected, setConnected] = useState(true)
   const [showHelp, setShowHelp] = useState(false)
   // Workspace save/load UI. `saveScopeOpen` shows the one-vs-all scope dialog;
@@ -970,6 +983,45 @@ function App(): JSX.Element {
   // The daemon broadcasts removal for live AND dead-not-reaped sessions
   // (daemon.rs Kill broadcasts when the session still exists; the main.rs reap
   // timer broadcasts too), so dead panes ("close to remove") also flow cleanly.
+  // Remote-access status. Polls ONLY while the dialog is open (a background
+  // 3 s spawn of `amber ctl web status` forever would be pure waste); when it
+  // is closed a window focus is the refresh trigger.
+  useEffect(() => {
+    let cancelled = false
+    const poll = async (): Promise<void> => {
+      const s = await window.amber?.webStatus?.()
+      if (!cancelled && s) setWebStatus(s)
+    }
+    void poll()
+    if (!remoteOpen) {
+      const onFocus = (): void => {
+        void poll()
+      }
+      window.addEventListener('focus', onFocus)
+      return () => {
+        cancelled = true
+        window.removeEventListener('focus', onFocus)
+      }
+    }
+    const t = setInterval(() => {
+      void poll()
+    }, 3000)
+    return () => {
+      cancelled = true
+      clearInterval(t)
+    }
+  }, [remoteOpen])
+
+  // Pill colour: green only when it is actually reachable from a phone.
+  const webDot =
+    webStatus?.unit === 'active' && webStatus.tailscale === 'serving'
+      ? 'serving'
+      : webStatus?.unit === 'active'
+        ? 'local'
+        : webStatus?.error !== null && webStatus?.error !== undefined
+          ? 'error'
+          : 'off'
+
   return (
     <div className="app">
       {!connected && <div className="banner" role="status" aria-live="polite"><span className="dot" />daemon disconnected — reconnecting…</div>}
@@ -1055,6 +1107,17 @@ function App(): JSX.Element {
         </button>
         <div className="spacer" />
         <button className="btn btn-accent" onClick={startPane}>+ Pane</button>
+        <button
+          className={`btn web-pill web-pill-${webDot}`}
+          // NEVER the url here: a title attribute is read by screen readers,
+          // screenshots and hover — and the login url is a full-authority
+          // credential.
+          title="Remote access — run the browser/mobile server"
+          aria-label={`Remote access: ${webDot}`}
+          onClick={() => setRemoteOpen(true)}
+        >
+          <span className="web-dot" /> remote
+        </button>
         <button className="icon-btn help-btn" aria-label="keyboard shortcuts"
           title={`Keyboard shortcuts (${chordLabel('help')})`} onClick={() => setShowHelp(true)}>?</button>
       </div>
@@ -1387,6 +1450,9 @@ function App(): JSX.Element {
           </div>
         )
       })()}
+      {remoteOpen && (
+        <RemoteAccess status={webStatus} onClose={() => setRemoteOpen(false)} onRefresh={() => { void window.amber.webStatus().then(setWebStatus) }} />
+      )}
       {showHelp && (
         <div className="help-overlay" onClick={() => setShowHelp(false)}>
           <div className="help-card" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts"

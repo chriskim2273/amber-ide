@@ -19,5 +19,12 @@
     <true/>
     <key>ProcessType</key>
     <string>Background</string>
+    <!-- launchd has no journal, so the desktop app's "log" panel reads this
+         file (spec 2026-08-22 §12.2 records the Linux/macOS asymmetry:
+         `journalctl --user -u amber-web.service` has no macOS equivalent). -->
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/amber-web.log</string>
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/amber-web.log</string>
 </dict>
 </plist>

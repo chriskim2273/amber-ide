@@ -52,6 +52,14 @@ contextBridge.exposeInMainWorld('amber', {
   // menu, so the native copy role can't reach it).
   clipboardWrite: (text: string): void => ipcRenderer.send('clipboard-write', text),
   clipboardRead: (): Promise<string> => ipcRenderer.invoke('clipboard-read'),
+  // Remote access (spec 2026-08-22 §9). `webUrl` is on-demand ONLY: it returns
+  // the tokenised login url, which must never ride the 3-second status poll.
+  webStatus: (): Promise<unknown> => ipcRenderer.invoke('web:status'),
+  webAction: (action: string): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('web:action', action),
+  webUrl: (): Promise<string> => ipcRenderer.invoke('web:url'),
+  webLogTail: (): Promise<string> => ipcRenderer.invoke('web:logTail'),
+  webOpenLocal: (): Promise<void> => ipcRenderer.invoke('web:openLocal'),
   editorOpenDialog: (): Promise<
     { path: string; text: string; mtimeMs: number } | { path: string; error: string } | null
   > => ipcRenderer.invoke('editor-open-dialog'),

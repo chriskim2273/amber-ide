@@ -656,7 +656,7 @@ fn run_ctl_web(
     match action {
         WebAction::Url => {
             let token = amber::web::load_or_create_token(&root, false)?;
-            println!("{}", web_url(port, &token));
+            println!("{}", login_url(&amber::tailscale::detect(port), port, &token));
             Ok(())
         }
         WebAction::RotateToken => {
@@ -747,11 +747,7 @@ fn run_ctl_web(
             let token = amber::web::load_token(&root);
             let host = tail.host().to_string();
             // NO token in this URL — see rule 1 above.
-            let url = if host.is_empty() {
-                format!("http://127.0.0.1:{port}/app")
-            } else {
-                format!("https://{host}/app")
-            };
+            let url = public_url(&tail, port);
             let live = token.as_deref().and_then(|t| fetch_web_status(port, t));
             if json {
                 let mut out = serde_json::json!({
@@ -794,10 +790,24 @@ fn run_ctl_web(
     }
 }
 
-/// The login URL. Token in the FRAGMENT — never a query string, which the
-/// server receives and logs.
-fn web_url(port: u16, token: &str) -> String {
-    format!("http://127.0.0.1:{port}/app#t={token}")
+/// The address a client should use, WITHOUT the token.
+///
+/// The tailnet host is claimed ONLY when `tailscale serve` actually proxies
+/// THIS port. Live testing caught the alternative: with a tailnet present but
+/// mapped to a different port, we happily printed
+/// `https://<host>/app` — an address that reaches some other service, or
+/// nothing, and sends the user hunting for a server fault that does not exist.
+fn public_url(tail: &amber::tailscale::TailState, port: u16) -> String {
+    match tail {
+        amber::tailscale::TailState::Serving { host } => format!("https://{host}/app"),
+        _ => format!("http://127.0.0.1:{port}/app"),
+    }
+}
+
+/// The login URL: `public_url` plus the token in the FRAGMENT — never a query
+/// string, which the server receives and logs.
+fn login_url(tail: &amber::tailscale::TailState, port: u16, token: &str) -> String {
+    format!("{}#t={token}", public_url(tail, port))
 }
 
 /// Run one `webctl::Argv`, substituting the placeholders those pure builders

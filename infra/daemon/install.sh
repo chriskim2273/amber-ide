@@ -81,7 +81,12 @@ install_web_linux() {
 install_web_macos() {
     local plist="$HOME/Library/LaunchAgents/com.amber-ide.web.plist"
     mkdir -p "$HOME/Library/LaunchAgents"
-    sed "s#__AMBER_BIN__#$AMBER_BIN#g" \
+    # `__HOME__` is the StandardErrorPath the desktop app's log panel reads —
+    # launchd has no journal, so an unsubstituted placeholder would send the
+    # agent's output to a literal `__HOME__/...` path and the panel would find
+    # nothing.
+    mkdir -p "$HOME/Library/Logs"
+    sed -e "s#__AMBER_BIN__#$AMBER_BIN#g" -e "s#__HOME__#$HOME#g" \
         "$REPO_ROOT/infra/daemon/com.amber-ide.web.plist.in" > "$plist"
     chmod 0644 "$plist"
     launchctl unload "$plist" 2>/dev/null || true

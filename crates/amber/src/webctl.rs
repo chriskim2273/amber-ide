@@ -60,10 +60,19 @@ pub fn render_systemd_unit(bin: &Path, port: u16) -> String {
 /// `<string>7717</string>` could appear for an unrelated reason in a future
 /// template. Rewrite the argument that FOLLOWS `--port`, positionally.
 pub fn render_launchd_plist(bin: &Path, port: u16) -> String {
+    render_launchd_plist_with_home(bin, port, &std::env::var("HOME").unwrap_or_else(|_| "/".into()))
+}
+
+/// Split out so the substitution is testable without touching the process
+/// environment.
+pub fn render_launchd_plist_with_home(bin: &Path, port: u16, home: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut after_port_flag = false;
     for line in LAUNCHD_TEMPLATE.lines() {
-        let replaced = line.replace("__AMBER_BIN__", &bin.display().to_string());
+        let replaced = line
+            .replace("__AMBER_BIN__", &bin.display().to_string())
+            // The log path the app's log panel reads — launchd has no journal.
+            .replace("__HOME__", home);
         if after_port_flag && replaced.trim().starts_with("<string>") {
             let indent = &replaced[..replaced.len() - replaced.trim_start().len()];
             out.push(format!("{indent}<string>{port}</string>"));
@@ -180,6 +189,13 @@ mod tests {
         assert!(p.contains("<string>9001</string>"), "{p}");
         assert!(p.contains("<string>com.amber-ide.web</string>"), "{p}");
         assert!(!p.contains("__AMBER_BIN__"), "{p}");
+    }
+
+    #[test]
+    fn plist_log_path_is_absolute_under_the_home() {
+        let p = render_launchd_plist_with_home(Path::new("/x/amber"), 7717, "/Users/u");
+        assert!(p.contains("<string>/Users/u/Library/Logs/amber-web.log</string>"), "{p}");
+        assert!(!p.contains("__HOME__"), "{p}");
     }
 
     #[test]
