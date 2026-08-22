@@ -3,8 +3,8 @@
 //! Layout under a root dir:
 //! ```text
 //! config.toml
-//! sessions/<name>.json     { name, cwd, kind: "shell"|"claude"|"grok"|"codex", updated }
-//! claude/<name>.json       { session_id, cwd, updated }   (grok/codex ids live here too)
+//! sessions/<name>.json     { name, cwd, kind: "shell"|"claude"|"grok"|"codex"|"opencode", updated }
+//! claude/<name>.json       { session_id, cwd, updated }   (grok/codex/opencode ids live here too)
 //! scrollback/<name>.bin     raw bytes
 //! ```
 //! All writes are atomic: write to a `.tmp` file in the same directory as the
@@ -25,6 +25,7 @@ pub enum SessionKind {
     Claude,
     Grok,
     Codex,
+    OpenCode,
 }
 
 impl SessionKind {
@@ -37,7 +38,7 @@ impl SessionKind {
     pub fn is_agent(self) -> bool {
         matches!(
             self,
-            SessionKind::Claude | SessionKind::Grok | SessionKind::Codex
+            SessionKind::Claude | SessionKind::Grok | SessionKind::Codex | SessionKind::OpenCode
         )
     }
 
@@ -48,6 +49,7 @@ impl SessionKind {
             SessionKind::Claude => "claude",
             SessionKind::Grok => "grok",
             SessionKind::Codex => "codex",
+            SessionKind::OpenCode => "opencode",
         }
     }
 }
@@ -107,6 +109,9 @@ pub struct Config {
     /// Resolved `codex` binary (OpenAI Codex CLI). Defaulted for older configs.
     #[serde(default)]
     pub codex_path: Option<PathBuf>,
+    /// Resolved `opencode` binary. Defaulted for older configs.
+    #[serde(default)]
+    pub opencode_path: Option<PathBuf>,
     pub snapshot_interval_secs: u64,
     pub scrollback_bytes: usize,
     #[serde(default)]
@@ -154,6 +159,7 @@ impl Default for Config {
             claude_path: None,
             grok_path: None,
             codex_path: None,
+            opencode_path: None,
             snapshot_interval_secs: 10,
             scrollback_bytes: 2 * 1024 * 1024,
             memory: MemoryConfig::default(),
@@ -880,6 +886,7 @@ mod tests {
         assert!(SessionKind::Claude.is_agent());
         assert!(SessionKind::Grok.is_agent());
         assert!(SessionKind::Codex.is_agent());
+        assert!(SessionKind::OpenCode.is_agent());
         assert!(!SessionKind::Shell.is_agent());
     }
 
@@ -897,6 +904,12 @@ mod tests {
     }
 
     #[test]
+    fn opencode_kind_serializes_lowercase() {
+        let json = serde_json::to_string(&SessionKind::OpenCode).unwrap();
+        assert_eq!(json, "\"opencode\"");
+    }
+
+    #[test]
     fn config_written_before_codex_support_still_loads() {
         let dir = tempdir().unwrap();
         let store = StateStore::new(dir.path());
@@ -911,6 +924,24 @@ mod tests {
         assert_eq!(cfg.claude_path, Some(PathBuf::from("/usr/bin/claude")));
         assert_eq!(cfg.grok_path, Some(PathBuf::from("/usr/bin/grok")));
         assert_eq!(cfg.codex_path, None);
+        assert_eq!(cfg.opencode_path, None);
+    }
+
+    #[test]
+    fn config_written_before_opencode_support_still_loads() {
+        let dir = tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        fs::write(
+            dir.path().join("config.toml"),
+            b"claude_path = \"/usr/bin/claude\"\ngrok_path = \"/usr/bin/grok\"\ncodex_path = \"/usr/bin/codex\"\nsnapshot_interval_secs = 10\nscrollback_bytes = 2048\n",
+        )
+        .unwrap();
+
+        let cfg = store.load_config().unwrap();
+
+        assert_eq!(cfg.claude_path, Some(PathBuf::from("/usr/bin/claude")));
+        assert_eq!(cfg.codex_path, Some(PathBuf::from("/usr/bin/codex")));
+        assert_eq!(cfg.opencode_path, None);
     }
 
     #[test]
@@ -986,6 +1017,7 @@ mod tests {
             claude_path: Some(PathBuf::from("/usr/local/bin/claude")),
             grok_path: Some(PathBuf::from("/usr/local/bin/grok")),
             codex_path: Some(PathBuf::from("/usr/local/bin/codex")),
+            opencode_path: Some(PathBuf::from("/usr/local/bin/opencode")),
             snapshot_interval_secs: 42,
             scrollback_bytes: 4096,
             memory: MemoryConfig::default(),

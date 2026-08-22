@@ -909,6 +909,23 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   isolated Amber state does not isolate Codex authentication and conversation
   storage.
 
+- [x] OpenCode session kind + CLI kill/freeze (2026-08-22) — a fourth
+  supervised agent: `kind:"opencode"` is a pane whose pty runs
+  `amber run <name> --kind opencode`. Spec:
+  `docs/superpowers/specs/2026-08-22-opencode-session-kind-design.md`.
+  Claude-shaped (not Grok-shaped): OpenCode cannot assign a session id on
+  create (`-s` continues), so amber installs a global plugin at
+  `~/.config/opencode/plugins/amber-hook.js` that runs `amber hook` on
+  `session.created` and records into the SAME `claude/<name>.json` store.
+  Fresh: `opencode --auto`; resume: `opencode --auto -s <ses_…>`. Never
+  `-c` / `--continue`. Kind-gated sites use `SessionKind::is_agent()` /
+  `isAgentKind()` (opencode included). Run-state vocabulary stays `claude*`.
+  Doctor records optional `opencode_path`. App picker/dots/web create kinds
+  extended. Same pass: `amber kill <name|slot>` errors on a missing name or
+  slot (`no such session` / `no session with slot N (see amber ls)`);
+  `amber freeze` / `amber unfreeze` send Suspend/Resume. **A running daemon
+  must be restarted to accept `kind:"opencode"`.**
+
 - [x] Memory containment + guardian (2026-08-13) — Linux implementation,
   review, soak, and production rollout are complete. Linux uses delegated
   cgroup-v2 slot leaves to isolate the daemon, supervisors, workloads, and

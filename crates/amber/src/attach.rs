@@ -162,6 +162,24 @@ pub fn pick_by_slot(sessions: &[proto::SessionInfo], slot: u32) -> Option<&proto
     sessions.iter().find(|s| s.slot == slot)
 }
 
+/// Resolve a CLI target that may be a slot (`amber kill 2`) or a session name.
+/// A pure integer is always a slot — amber names are never bare digits — and
+/// both a missing slot and a missing name are errors (unlike `attach`, which
+/// leaves an unknown name for the daemon to reject).
+pub fn resolve_name_or_slot(arg: &str, sessions: &[proto::SessionInfo]) -> Result<String, String> {
+    if arg.parse::<u32>().is_ok() {
+        let slot = arg.parse::<u32>().unwrap();
+        match pick_by_slot(sessions, slot) {
+            Some(s) => Ok(s.name.clone()),
+            None => Err(format!("no session with slot {slot} (see `amber ls`)")),
+        }
+    } else if sessions.iter().any(|s| s.name == arg) {
+        Ok(arg.to_string())
+    } else {
+        Err(format!("no such session: {arg}"))
+    }
+}
+
 /// The name a bare `amber` gives the session it creates: the lowest free
 /// `s<n>`, tmux's auto-numbering. Numbers are reused once a session is gone, so
 /// a long-lived daemon does not drift into `s47`. The `s` prefix is what keeps
@@ -983,6 +1001,34 @@ mod tests {
         // 0 is "unassigned" on the wire (older daemon), never a match.
         assert!(pick_by_slot(&s, 0).is_none());
         assert!(pick_by_slot(&[], 1).is_none());
+    }
+
+    #[test]
+    fn resolve_name_or_slot_accepts_a_live_name_and_a_slot() {
+        let mut s = [info("amber-c", true, 1), info("work", true, 2)];
+        s[0].slot = 2;
+        s[1].slot = 1;
+        assert_eq!(resolve_name_or_slot("work", &s).unwrap(), "work");
+        assert_eq!(resolve_name_or_slot("2", &s).unwrap(), "amber-c");
+        assert_eq!(resolve_name_or_slot("1", &s).unwrap(), "work");
+    }
+
+    #[test]
+    fn resolve_name_or_slot_errors_on_a_missing_name_or_slot() {
+        let mut s = [info("work", true, 1)];
+        s[0].slot = 1;
+        assert_eq!(
+            resolve_name_or_slot("ghost", &s).unwrap_err(),
+            "no such session: ghost"
+        );
+        assert_eq!(
+            resolve_name_or_slot("9", &s).unwrap_err(),
+            "no session with slot 9 (see `amber ls`)"
+        );
+        assert_eq!(
+            resolve_name_or_slot("0", &s).unwrap_err(),
+            "no session with slot 0 (see `amber ls`)"
+        );
     }
 
     #[test]

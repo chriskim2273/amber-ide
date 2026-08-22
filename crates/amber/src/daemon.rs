@@ -167,6 +167,7 @@ fn parse_kind(kind: &str) -> anyhow::Result<SessionKind> {
         "claude" => Ok(SessionKind::Claude),
         "grok" => Ok(SessionKind::Grok),
         "codex" => Ok(SessionKind::Codex),
+        "opencode" => Ok(SessionKind::OpenCode),
         other => anyhow::bail!("unknown session kind: {other}"),
     }
 }
@@ -587,6 +588,8 @@ mod tests {
         assert!(!suppress_backlog(false, Some(SessionKind::Grok)));
         assert!(suppress_backlog(true, Some(SessionKind::Codex)));
         assert!(!suppress_backlog(false, Some(SessionKind::Codex)));
+        assert!(suppress_backlog(true, Some(SessionKind::OpenCode)));
+        assert!(!suppress_backlog(false, Some(SessionKind::OpenCode)));
         assert!(!suppress_backlog(true, Some(SessionKind::Shell)));
         assert!(!suppress_backlog(false, Some(SessionKind::Claude)));
         assert!(!suppress_backlog(false, Some(SessionKind::Shell)));

@@ -137,7 +137,7 @@ function App(): JSX.Element {
   // Tab id currently being dragged for reorder (HTML5 drag; ref, not state, so
   // the drag gesture never re-renders the terminals).
   const dragTab = useRef<number | null>(null)
-  const [kind, setKind] = useState<'shell' | 'claude' | 'grok' | 'codex' | 'browser' | 'editor'>('shell')
+  const [kind, setKind] = useState<'shell' | 'claude' | 'grok' | 'codex' | 'opencode' | 'browser' | 'editor'>('shell')
   // Absolute working directory for newly created panes (default $HOME). Sent
   // verbatim so a session restores in the SAME folder — a relative '.' would
   // drift to the daemon's cwd ($HOME under systemd) on restart.
@@ -1040,11 +1040,12 @@ function App(): JSX.Element {
           onClick={() => setSessionsOpen(true)}>🧹</button>
         <div className="divider" />
         <span className="label">new</span>
-        <select className="select" value={kind} onChange={(e) => setKind(e.target.value as 'shell' | 'claude' | 'grok' | 'codex' | 'browser' | 'editor')}>
+        <select className="select" value={kind} onChange={(e) => setKind(e.target.value as 'shell' | 'claude' | 'grok' | 'codex' | 'opencode' | 'browser' | 'editor')}>
           <option value="shell">shell</option>
           <option value="claude">claude</option>
           <option value="grok">grok</option>
           <option value="codex">codex</option>
+          <option value="opencode">opencode</option>
           <option value="browser">browser</option>
           <option value="editor">editor</option>
         </select>
