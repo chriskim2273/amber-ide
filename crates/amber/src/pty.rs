@@ -75,6 +75,18 @@ const STALL_ROUND_LIMIT: u32 = 150;
 /// specific dead subscriber after a snapshot-then-send.
 type Subscribers = Vec<(u64, SyncSender<Vec<u8>>)>;
 
+/// The result of [`PtySession::subscribe_from`]: the subscriber id, whether
+/// the backlog is the FULL scrollback (client must reset first) or only the
+/// delta past the caller's watermark, those bytes, the watermark to present
+/// on the next attach once they are consumed, and the live receiver.
+pub struct Subscription {
+    pub id: u64,
+    pub full: bool,
+    pub backlog: Vec<u8>,
+    pub end_offset: u64,
+    pub rx: Receiver<Vec<u8>>,
+}
+
 /// A live session: owns the pty master, the child's writer, the scrollback
 /// ring, and the subscriber list. Reader and waiter run on dedicated threads
 /// (portable-pty's reader is a blocking `std::io::Read`).
@@ -623,21 +635,54 @@ impl PtySession {
     /// subscriber id (for [`unsubscribe`](Self::unsubscribe)), the backlog,
     /// and the live receiver.
     pub fn subscribe(&self) -> (u64, Vec<u8>, Receiver<Vec<u8>>) {
+        let sub = self.subscribe_from(0, 0); // epoch 0 never matches: full replay
+        (sub.id, sub.backlog, sub.rx)
+    }
+
+    /// The scrollback ring's stream identity — see [`Ring::epoch`]. A client
+    /// watermark is only meaningful when its epoch matches.
+    pub fn scrollback_epoch(&self) -> u64 {
+        self.ring.lock().unwrap().epoch()
+    }
+
+    /// Like [`subscribe`](Self::subscribe), but a caller holding a valid
+    /// `(epoch, offset)` watermark gets only the bytes it has not seen.
+    ///
+    /// `full` says which kind of backlog came back: `true` = the whole
+    /// ring (the watermark was stale, evicted, or from a previous stream
+    /// lifetime — the client must reset its terminal first), `false` =
+    /// exactly the missing tail. Either way `end_offset` is the watermark to
+    /// present on the NEXT attach once every returned byte plus all live
+    /// output has been consumed, and the live receiver continues seamlessly
+    /// after the backlog with the same no-dup/no-loss guarantee as
+    /// [`subscribe`](Self::subscribe).
+    pub fn subscribe_from(&self, epoch: u64, offset: u64) -> Subscription {
         let ring = self.ring.lock().unwrap();
-        let backlog = ring.snapshot();
+        let current_epoch = ring.epoch();
+        let written = ring.written();
+        let (full, backlog) = if current_epoch == epoch && epoch != 0 {
+            match ring.since(offset) {
+                Some(delta) => (false, delta),
+                None => (true, ring.snapshot()),
+            }
+        } else {
+            (true, ring.snapshot())
+        };
         let (tx, rx) = sync_channel(SUBSCRIBER_QUEUE_DEPTH);
         let id = self.next_sub_id.fetch_add(1, Ordering::Relaxed);
         {
             let mut subs = self.subs.lock().unwrap();
             // If the pty already hit EOF the reader will never clear this
             // sender; drop it now so the subscriber sees a closed channel
-            // (backlog still delivered above).
+            // (backlog still delivered above). Same discipline as `subscribe`:
+            // taken under the ring lock so no batcher push can slip between
+            // the snapshot and the registration.
             if !self.reader_done.load(Ordering::SeqCst) {
                 subs.push((id, tx));
             }
         }
         drop(ring);
-        (id, backlog, rx)
+        Subscription { id, full, backlog, end_offset: written, rx }
     }
 
     /// Drop a subscriber's sender so its channel closes and it stops
@@ -841,6 +886,104 @@ mod tests {
             .scrollback()
             .windows(16)
             .any(|w| w == b"RESTORED-HISTORY"));
+    }
+
+    #[test]
+    fn subscribe_from_a_current_watermark_serves_only_the_missing_tail() {
+        let cmd = CommandBuilder::new("cat");
+        let sess = PtySession::spawn(cmd, 24, 80, 4096).unwrap();
+        sess.write(b"AAA").unwrap();
+        wait_for(&sess, b"AAA");
+        let epoch = sess.scrollback_epoch();
+        let offset = sess.scrollback_written();
+
+        sess.write(b"BBB").unwrap();
+        wait_for(&sess, b"BBB");
+
+        let sub = sess.subscribe_from(epoch, offset);
+        assert!(!sub.full, "a current watermark must yield a delta");
+        assert_eq!(sub.backlog, b"BBB", "delta must be exactly the unseen bytes");
+        assert_eq!(sub.end_offset, sess.scrollback_written());
+    }
+
+    #[test]
+    fn subscribe_from_a_caught_up_watermark_yields_an_empty_delta() {
+        let cmd = CommandBuilder::new("cat");
+        let sess = PtySession::spawn(cmd, 24, 80, 4096).unwrap();
+        sess.write(b"AAA").unwrap();
+        wait_for(&sess, b"AAA");
+        let sub = sess.subscribe_from(sess.scrollback_epoch(), sess.scrollback_written());
+        assert!(!sub.full);
+        assert!(sub.backlog.is_empty(), "nothing missed: empty delta, not a full replay");
+    }
+
+    #[test]
+    fn subscribe_from_a_stale_epoch_falls_back_to_a_full_replay() {
+        // The watermark of a PREVIOUS stream lifetime (previous spawn or
+        // previous daemon) must never address this one.
+        let cmd = CommandBuilder::new("cat");
+        let sess = PtySession::spawn(cmd, 24, 80, 4096).unwrap();
+        sess.write(b"AAA").unwrap();
+        wait_for(&sess, b"AAA");
+        let sub = sess.subscribe_from(sess.scrollback_epoch() + 999, sess.scrollback_written());
+        assert!(sub.full);
+        assert_eq!(sub.backlog, sess.scrollback());
+    }
+
+    #[test]
+    fn subscribe_from_zero_epoch_is_always_full() {
+        // `subscribe()` delegates with (0, 0); epochs are never 0, so this is
+        // the legacy full-replay path.
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.arg("-c");
+        cmd.arg("printf hi");
+        let sess = PtySession::spawn(cmd, 24, 80, 4096).unwrap();
+        wait_for(&sess, b"hi");
+        let sub = sess.subscribe_from(0, 0);
+        assert!(sub.full);
+        assert!(sub.backlog.windows(2).any(|w| w == b"hi"));
+    }
+
+    #[test]
+    fn delta_subscription_never_duplicates_or_loses_live_bytes() {
+        // The no-dup/no-loss invariant across a DELTA handoff: backlog + live
+        // bytes must be an exact suffix of the final stream.
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.arg("-c");
+        cmd.arg("printf FIRSTHALF; sleep 0.15; seq 1 5000");
+        let sess = Arc::new(PtySession::spawn(cmd, 24, 80, 8 * 1024 * 1024).unwrap());
+        wait_for(&sess, b"FIRSTHALF");
+        let epoch = sess.scrollback_epoch();
+
+        // Subscribe mid-stream from an offset INSIDE the first burst, so the
+        // delta straddles produced-before and produced-after bytes.
+        let cut = sess.scrollback_written() - 3;
+        let handle = {
+            let sess = Arc::clone(&sess);
+            std::thread::spawn(move || {
+                let sub = sess.subscribe_from(epoch, cut);
+                assert!(!sub.full, "recent watermark must stay servable");
+                let mut acc = sub.backlog;
+                while let Ok(chunk) = sub.rx.recv_timeout(Duration::from_secs(10)) {
+                    acc.extend_from_slice(&chunk);
+                }
+                acc
+            })
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while sess.is_alive() {
+            assert!(Instant::now() < deadline, "producer never finished");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let acc = handle.join().unwrap();
+        let full = sess.scrollback();
+        assert!(
+            full.ends_with(&acc),
+            "delta backlog+live is not a suffix of the final stream \
+             (duplicated or lost bytes at the subscribe_from boundary)"
+        );
     }
 
     #[test]

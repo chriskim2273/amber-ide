@@ -134,7 +134,7 @@ fn non_reading_client_is_dropped_and_never_freezes_the_daemon() {
     // Victim: attaches, then never reads a byte (a stuck renderer).
     let victim = UnixStream::connect(&sock).unwrap();
     shrink_rcvbuf(&victim);
-    send(&victim, ControlMsg::Attach { name: "amber-1-1-0-a".into(), raw_client: false, preview: false });
+    send(&victim, ControlMsg::Attach { name: "amber-1-1-0-a".into(), raw_client: false, preview: false, resume: None });
     // Let the subscription register before output starts, so the victim really
     // is the subscriber being backpressured (not a late attacher).
     std::thread::sleep(Duration::from_millis(300));
@@ -181,6 +181,6 @@ fn non_reading_client_is_dropped_and_never_freezes_the_daemon() {
     // (c) Dropping it released its subscription, so the session's pty — which
     // was backpressured with a single saturated subscriber — resumes.
     let mut fresh = UnixStream::connect(&sock).unwrap();
-    send(&fresh, ControlMsg::Attach { name: "amber-1-1-0-a".into(), raw_client: false, preview: false });
+    send(&fresh, ControlMsg::Attach { name: "amber-1-1-0-a".into(), raw_client: false, preview: false, resume: None });
     drain_until_marker(&mut fresh, "amber-1-1-0-a", b"RESUMED", Duration::from_secs(30));
 }

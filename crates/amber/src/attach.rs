@@ -469,7 +469,7 @@ pub fn run_client(
     ui: &StatusUi,
 ) -> anyhow::Result<ClientEnd> {
     send_control(stream, ControlMsg::Focus { name: name.to_string() })?;
-    send_control(stream, ControlMsg::Attach { name: name.to_string(), raw_client: true, preview: false })?;
+    send_control(stream, ControlMsg::Attach { name: name.to_string(), raw_client: true, preview: false, resume: None })?;
 
     // Whether the bar can be shown at a given height: it needs the physical
     // last row plus at least one row for the child.
@@ -833,7 +833,7 @@ mod tests {
             h.server_read_until(|f| matches!(f, Frame::Control(ControlMsg::Attach { .. })));
         assert_eq!(
             frame,
-            Frame::Control(ControlMsg::Attach { name: "s".into(), raw_client: true, preview: false })
+            Frame::Control(ControlMsg::Attach { name: "s".into(), raw_client: true, preview: false, resume: None })
         );
         drop(h.server);
         let _ = h.done.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -852,6 +852,7 @@ mod tests {
                 name: "s".into(),
                 raw_client: true,
                 preview: false,
+                resume: None,
             })
         );
         drop(h.server);
