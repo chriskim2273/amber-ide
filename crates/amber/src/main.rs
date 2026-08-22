@@ -187,6 +187,24 @@ enum CtlAction {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
+    /// Control the `amber web` browser/mobile server: service lifecycle, the
+    /// phone URL, tailscale mapping, and live status. `--json` is the contract
+    /// the desktop app consumes; the human output is for people only.
+    Web {
+        #[command(subcommand)]
+        action: WebAction,
+        // `global = true` so these may follow the leaf subcommand
+        // (`ctl web status --json`), which is how a human and the app both
+        // type it. Without it clap rejects the flag as unexpected.
+        /// Port the service listens on (must match the installed unit).
+        #[arg(long, default_value_t = 7717, global = true)]
+        port: u16,
+        /// Emit machine-readable JSON.
+        #[arg(long, global = true)]
+        json: bool,
+        #[arg(long, global = true)]
+        root: Option<PathBuf>,
+    },
     /// Build + install the amber binary and boot unit (systemd user unit on
     /// Linux, launchd agent on macOS) by running the repo's install script.
     Install {
@@ -247,6 +265,24 @@ fn resolve_socket(explicit: Option<PathBuf>) -> PathBuf {
     explicit.unwrap_or_else(|| default_socket(&default_root()))
 }
 
+#[derive(clap::Subcommand, Debug)]
+enum WebAction {
+    /// Report unit state, tailscale state, URL and connected clients.
+    Status,
+    Start,
+    Stop,
+    Restart,
+    /// Install + enable the boot unit (opt-in: it opens a local port), then
+    /// map it with `tailscale serve`.
+    Enable,
+    /// Stop + disable the boot unit. Leaves the tailscale mapping alone.
+    Disable,
+    /// Print the tokenised phone URL.
+    Url,
+    /// Regenerate the token, invalidating every existing link and cookie.
+    RotateToken,
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let Some(command) = cli.command else {
@@ -280,6 +316,7 @@ fn main() -> anyhow::Result<()> {
             CtlAction::Uninstall { dry_run, purge_binary, purge_state, web } => {
                 run_uninstall(dry_run, purge_binary, purge_state, web)
             }
+            CtlAction::Web { action, port, json, root } => run_ctl_web(action, port, json, root),
             CtlAction::InstallCodexSkill => run_install_codex_skill(),
             CtlAction::PurgeCodexSkill => run_purge_codex_skill(),
         },
@@ -590,6 +627,240 @@ fn run_handoff(session_id: &str) -> anyhow::Result<()> {
         println!();
     }
     Ok(())
+}
+
+/// `amber ctl web <action>` — the desktop app's controller surface (spec §9).
+///
+/// Two rules live here and are load-bearing:
+///
+/// 1. **The token appears only in `url`.** `status` is polled every few
+///    seconds by the Remote access dialog; a token in that payload would sit
+///    in renderer memory and every IPC trace continuously. `status` therefore
+///    reports `has_token` and a token-FREE url, and the tokenised one is
+///    fetched on demand.
+/// 2. **`/api/status` gets exactly ONE auth attempt.** `Auth::throttled`
+///    buckets by peer IP, and behind `tailscale serve` every peer is
+///    127.0.0.1, so a retry loop would burn the 8-failure budget and lock the
+///    PHONE out for 60 s.
+fn run_ctl_web(
+    action: WebAction,
+    port: u16,
+    json: bool,
+    root: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let root = root.unwrap_or_else(default_root);
+    std::fs::create_dir_all(&root)?;
+    let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".into()));
+    let unit = amber::webctl::unit_path(&home);
+
+    match action {
+        WebAction::Url => {
+            let token = amber::web::load_or_create_token(&root, false)?;
+            println!("{}", web_url(port, &token));
+            Ok(())
+        }
+        WebAction::RotateToken => {
+            amber::web::load_or_create_token(&root, true)?;
+            // Rotation only bites once the server re-reads the file, and live
+            // cookie sessions are held in the server's memory — so restarting
+            // it IS the invalidation.
+            let _ = run_web_argv(&amber::webctl::restart_argv(), &unit);
+            if json {
+                println!("{}", serde_json::json!({ "ok": true }));
+            } else {
+                println!("token rotated; every existing link and device is logged out");
+            }
+            Ok(())
+        }
+        WebAction::Enable => {
+            let bin = std::env::current_exe()?;
+            if let Some(parent) = unit.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let body = if cfg!(target_os = "macos") {
+                amber::webctl::render_launchd_plist(&bin, port)
+            } else {
+                amber::webctl::render_systemd_unit(&bin, port)
+            };
+            std::fs::write(&unit, body)?;
+            for a in amber::webctl::enable_argv() {
+                run_web_argv(&a, &unit)?;
+            }
+            // Best effort: the unit is up either way, and the tailscale state
+            // is reported by `status` with a named reason.
+            let tail_err = amber::tailscale::enable_serve(port).err();
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "ok": true,
+                        "unit": unit.display().to_string(),
+                        "tailscale_error": tail_err,
+                    })
+                );
+            } else {
+                println!("amber web enabled at boot ({})", unit.display());
+                if let Some(e) = tail_err {
+                    println!("tailscale serve failed: {e}");
+                }
+            }
+            Ok(())
+        }
+        WebAction::Disable => {
+            for a in amber::webctl::disable_argv() {
+                let _ = run_web_argv(&a, &unit);
+            }
+            if json {
+                println!("{}", serde_json::json!({ "ok": true }));
+            } else {
+                println!("amber web disabled");
+            }
+            Ok(())
+        }
+        WebAction::Start | WebAction::Stop | WebAction::Restart => {
+            let argv = match action {
+                WebAction::Start => amber::webctl::start_argv(),
+                WebAction::Stop => amber::webctl::stop_argv(),
+                _ => amber::webctl::restart_argv(),
+            };
+            let out = run_web_argv(&argv, &unit)?;
+            if json {
+                println!("{}", serde_json::json!({ "ok": out.status.success() }));
+            } else if !out.status.success() {
+                println!("{}", String::from_utf8_lossy(&out.stderr).trim());
+            }
+            if out.status.success() {
+                Ok(())
+            } else {
+                anyhow::bail!("{} failed", argv.cmd)
+            }
+        }
+        WebAction::Status => {
+            let unit_state = match run_web_argv(&amber::webctl::is_active_argv(), &unit) {
+                Ok(o) if o.status.success() => "active",
+                Ok(_) => "inactive",
+                Err(_) => "unknown",
+            };
+            let tail = amber::tailscale::detect(port);
+            // READ-ONLY: `load_or_create_token` would mint a credential as a
+            // side effect of a status query.
+            let token = amber::web::load_token(&root);
+            let host = tail.host().to_string();
+            // NO token in this URL — see rule 1 above.
+            let url = if host.is_empty() {
+                format!("http://127.0.0.1:{port}/app")
+            } else {
+                format!("https://{host}/app")
+            };
+            let live = token.as_deref().and_then(|t| fetch_web_status(port, t));
+            if json {
+                let mut out = serde_json::json!({
+                    "unit": unit_state,
+                    "port": port,
+                    "url": url,
+                    "has_token": token.is_some(),
+                    "tailscale": tail.label(),
+                    "host": host,
+                    "error": serde_json::Value::Null,
+                });
+                match live {
+                    Some(v) => {
+                        for key in ["clients", "sessions", "uptime_secs"] {
+                            out[key] = v.get(key).cloned().unwrap_or(serde_json::Value::Null);
+                        }
+                    }
+                    None => {
+                        out["error"] = serde_json::Value::String("server unreachable".into());
+                    }
+                }
+                println!("{out}");
+            } else {
+                println!("unit:      {unit_state}");
+                println!("port:      {port}");
+                println!("tailscale: {} {}", tail.label(), host);
+                println!("url:       {url}  (login url: `amber ctl web url`)");
+                match live {
+                    Some(v) => println!(
+                        "server:    up {}s, {} sessions, {} clients",
+                        v.get("uptime_secs").and_then(|x| x.as_u64()).unwrap_or(0),
+                        v.get("sessions").and_then(|x| x.as_u64()).unwrap_or(0),
+                        v.get("clients").and_then(|x| x.as_array()).map(|a| a.len()).unwrap_or(0),
+                    ),
+                    None => println!("server:    unreachable"),
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// The login URL. Token in the FRAGMENT — never a query string, which the
+/// server receives and logs.
+fn web_url(port: u16, token: &str) -> String {
+    format!("http://127.0.0.1:{port}/app#t={token}")
+}
+
+/// Run one `webctl::Argv`, substituting the placeholders those pure builders
+/// deliberately leave for the caller (`__UNIT__`, `__UID__`).
+fn run_web_argv(a: &amber::webctl::Argv, unit: &Path) -> anyhow::Result<std::process::Output> {
+    let uid = current_uid();
+    let args: Vec<String> = a
+        .args
+        .iter()
+        .map(|s| s.replace("__UNIT__", &unit.display().to_string()).replace("__UID__", &uid))
+        .collect();
+    Ok(std::process::Command::new(&a.cmd).args(&args).output()?)
+}
+
+/// Only the launchd argv needs a uid, and `id -u` is portable to exactly the
+/// platform that needs it. Shelling out here keeps the crate free of a libc
+/// dependency for one number.
+fn current_uid() -> String {
+    std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Token -> cookie -> `/api/status`, over plain TCP to 127.0.0.1.
+///
+/// ONE auth attempt, ever: see `run_ctl_web`'s rule 2. Every failure returns
+/// `None` (reported as "server unreachable"), never a retry.
+fn fetch_web_status(port: u16, token: &str) -> Option<serde_json::Value> {
+    use std::io::{Read, Write};
+    let deadline = Duration::from_secs(3);
+
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
+    s.set_read_timeout(Some(deadline)).ok()?;
+    s.set_write_timeout(Some(deadline)).ok()?;
+    let req = format!(
+        "POST /api/auth HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{token}",
+        token.len()
+    );
+    s.write_all(req.as_bytes()).ok()?;
+    let mut head = String::new();
+    s.read_to_string(&mut head).ok()?;
+    let cookie = head
+        .lines()
+        .find_map(|l| l.strip_prefix("Set-Cookie: "))
+        .and_then(|c| c.split(';').next())?
+        .to_string();
+
+    let mut s2 = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
+    s2.set_read_timeout(Some(deadline)).ok()?;
+    s2.set_write_timeout(Some(deadline)).ok()?;
+    let req2 = format!(
+        "GET /api/status HTTP/1.1\r\nHost: 127.0.0.1\r\nCookie: {cookie}\r\n\
+         Connection: close\r\n\r\n"
+    );
+    s2.write_all(req2.as_bytes()).ok()?;
+    let mut body = String::new();
+    s2.read_to_string(&mut body).ok()?;
+    let json = body.split("\r\n\r\n").nth(1)?;
+    serde_json::from_str(json).ok()
 }
 
 /// `amber web`: serve the mobile UI on 127.0.0.1 as a long-lived daemon
