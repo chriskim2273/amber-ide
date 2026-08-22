@@ -16,4 +16,6 @@ pub mod procinfo;
 pub mod pty;
 pub mod supervisor;
 pub mod web;
+pub mod tailscale;
+pub mod webctl;
 pub mod watchers;

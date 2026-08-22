@@ -465,6 +465,17 @@ pub fn load_or_create_token(root: &Path, regenerate: bool) -> anyhow::Result<Str
     Ok(token)
 }
 
+/// Read the token WITHOUT creating one.
+///
+/// `load_or_create_token` mints a credential as a side effect, which is wrong
+/// for a read-only query: `amber ctl web status` must be able to report "no
+/// token yet" rather than manufacture one.
+pub fn load_token(root: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(root.join(TOKEN_FILE)).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+}
+
 struct Auth {
     token: String,
     /// Live cookie session ids (in memory only — restarting `amber web`
@@ -586,6 +597,9 @@ pub struct Hub {
     root: PathBuf,
     inner: Mutex<HubInner>,
     next_id: AtomicU64,
+    /// When this server came up — the only thing `/api/status` reports that is
+    /// not derivable from `HubInner`.
+    started: Instant,
 }
 
 fn session_json(s: &SessionInfo) -> serde_json::Value {
@@ -619,7 +633,38 @@ impl Hub {
                 dump_pending: HashMap::new(),
             }),
             next_id: AtomicU64::new(0),
+            started: Instant::now(),
         })
+    }
+
+    /// JSON body for `GET /api/status`: the operator-facing snapshot behind
+    /// `amber ctl web status`.
+    ///
+    /// Deliberately holds NO secret. The token is a full-authority credential
+    /// and this payload is polled every few seconds by the desktop dialog,
+    /// piped through IPC, logged and pasted — everything a credential must not
+    /// travel in. The tokenised URL comes from `amber ctl web url`, on demand.
+    fn status_json(&self, port: u16) -> String {
+        let inner = self.inner.lock().unwrap();
+        let clients: Vec<serde_json::Value> = inner
+            .clients
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "id": c.id,
+                    "open": c.open,
+                    // Phase B (spec §2.2) fills this with the borrowed grid.
+                    "borrow": serde_json::Value::Null,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "port": port,
+            "uptime_secs": self.started.elapsed().as_secs(),
+            "sessions": inner.sessions.len(),
+            "clients": clients,
+        })
+        .to_string()
     }
 
     /// JSON body for `GET /api/sessions`: `{"sessions":[…],"layout":{…}}`.
@@ -1056,12 +1101,15 @@ pub fn serve(
         });
     }
     let auth = Arc::new(Auth::new(token));
+    // The honest port is the one actually bound — the tests bind port 0, and a
+    // caller-supplied argument would report a lie.
+    let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
     for conn in listener.incoming() {
         let Ok(stream) = conn else { continue };
         let hub = Arc::clone(&hub);
         let auth = Arc::clone(&auth);
         thread::spawn(move || {
-            if let Err(e) = handle_conn(stream, &hub, &auth) {
+            if let Err(e) = handle_conn(stream, &hub, &auth, port) {
                 eprintln!("amber web: connection error: {e}");
             }
         });
@@ -1097,7 +1145,12 @@ fn respond(
     stream.flush()
 }
 
-fn handle_conn(mut stream: TcpStream, hub: &Arc<Hub>, auth: &Arc<Auth>) -> anyhow::Result<()> {
+fn handle_conn(
+    mut stream: TcpStream,
+    hub: &Arc<Hub>,
+    auth: &Arc<Auth>,
+    port: u16,
+) -> anyhow::Result<()> {
     let peer = stream.peer_addr()?.ip();
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     let mut buf: Vec<u8> = Vec::new();
@@ -1138,6 +1191,15 @@ fn handle_conn(mut stream: TcpStream, hub: &Arc<Hub>, auth: &Arc<Auth>) -> anyho
                 return Ok(respond(&mut stream, "401 Unauthorized", "", &[], b"")?);
             }
             let body = hub.sessions_json();
+            Ok(respond(&mut stream, "200 OK", CT_JSON, &[], body.as_bytes())?)
+        }
+        // Operator status for `amber ctl web status` (spec §9.3). Same cookie
+        // boundary as `/api/sessions`; carries no secret of its own.
+        ("GET", "/api/status") => {
+            if !auth.valid_cookie(&req) {
+                return Ok(respond(&mut stream, "401 Unauthorized", "", &[], b"")?);
+            }
+            let body = hub.status_json(port);
             Ok(respond(&mut stream, "200 OK", CT_JSON, &[], body.as_bytes())?)
         }
         // Bootstrap for the real-renderer web build (spec 2026-08-01 §3 "Env"
@@ -1838,6 +1900,47 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn status_json_lists_open_sessions_per_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = Hub::new(dir.path().join("daemon.sock"), dir.path().to_path_buf());
+        let (id, _rx) = hub.add_client();
+        hub.inner.lock().unwrap().clients[0].open = Some("amber-1-1-0-ab".into());
+
+        let body = hub.status_json(7717);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        assert_eq!(v["port"], 7717);
+        assert_eq!(v["clients"][0]["id"], id);
+        assert_eq!(v["clients"][0]["open"], "amber-1-1-0-ab");
+        // Phase B (spec §2.2) fills this; the field exists now so the payload
+        // shape does not change under the app when it lands.
+        assert!(v["clients"][0]["borrow"].is_null());
+        assert!(v["uptime_secs"].is_number());
+        assert!(v["sessions"].is_number());
+    }
+
+    #[test]
+    fn status_json_never_carries_a_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = Hub::new(dir.path().join("daemon.sock"), dir.path().to_path_buf());
+        let body = hub.status_json(7717);
+        // The desktop dialog polls this every 3 s. A token here would sit in
+        // renderer memory and every IPC trace continuously.
+        assert!(!body.contains("t="), "{body}");
+        assert!(!body.contains("token"), "{body}");
+    }
+
+    #[test]
+    fn load_token_reads_but_never_creates() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(load_token(dir.path()), None);
+        // The read must not have minted one — that is the whole point.
+        assert!(!dir.path().join(TOKEN_FILE).exists());
+
+        let made = load_or_create_token(dir.path(), false).unwrap();
+        assert_eq!(load_token(dir.path()).as_deref(), Some(made.as_str()));
     }
 
     #[test]
