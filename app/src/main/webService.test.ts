@@ -60,3 +60,9 @@ describe('redactUrl', () => {
     expect(redactUrl('https://desk.ts.net/app')).toBe('https://desk.ts.net/app')
   })
 })
+
+describe('managed', () => {
+  it('defaults to managed on the desktop side', () => {
+    expect(parseWebStatus(JSON.stringify({ unit: 'active' })).managed).toBe(true)
+  })
+})

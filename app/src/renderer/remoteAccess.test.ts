@@ -1,8 +1,9 @@
 import { describe, it, expect } from 'vitest'
 import { diagnosticRows } from './RemoteAccess'
-import type { WebStatus } from '../main/webService'
+import type { WebStatus } from '../shared/webStatus'
 
 const base: WebStatus = {
+  managed: true,
   unit: 'active',
   port: 7717,
   url: 'https://d.ts.net/app',

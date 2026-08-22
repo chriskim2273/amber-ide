@@ -3,12 +3,8 @@
 // The app parses ONLY json: the CLI's human output is for humans and changes
 // freely, and a dialog that scrapes it would break silently.
 
-export type TailscaleState =
-  | 'not-installed'
-  | 'not-logged-in'
-  | 'not-running'
-  | 'serve-not-mapped'
-  | 'serving'
+export type { TailscaleState, WebClient, WebStatus } from '../shared/webStatus'
+import type { TailscaleState, WebStatus } from '../shared/webStatus'
 
 const TAIL_STATES: readonly TailscaleState[] = [
   'not-installed',
@@ -17,34 +13,6 @@ const TAIL_STATES: readonly TailscaleState[] = [
   'serve-not-mapped',
   'serving',
 ]
-
-export interface WebClient {
-  id: number
-  /** The one session this browser socket has open, if any. */
-  open: string | null
-  /** Borrowed pty grid — always null until spec §2.2 (Phase B) lands. */
-  borrow: unknown | null
-}
-
-export interface WebStatus {
-  unit: 'active' | 'inactive' | 'unknown'
-  port: number
-  /** Token-FREE. The tokenised URL comes from `webUrl()`, on demand. */
-  url: string
-  tailscale: TailscaleState
-  host: string
-  /**
-   * Whether a token file exists. The token itself is never carried here: this
-   * payload is polled every few seconds while the dialog is open, so a
-   * credential in it would sit in renderer memory and every IPC trace
-   * continuously.
-   */
-  hasToken: boolean
-  clients: WebClient[]
-  sessions: number | null
-  uptimeSecs: number | null
-  error: string | null
-}
 
 export function webCtlArgv(action: string, port: number): string[] {
   return ['ctl', 'web', action, '--json', '--port', String(port)]
@@ -56,6 +24,8 @@ export function webCtlArgv(action: string, port: number): string[] {
  */
 export function parseWebStatus(stdout: string): WebStatus {
   const base: WebStatus = {
+    // The desktop main process IS the manager — only the web shim says false.
+    managed: true,
     unit: 'unknown',
     port: 0,
     url: '',

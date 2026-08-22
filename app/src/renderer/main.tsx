@@ -7,7 +7,7 @@ import type { ControlMsg } from '../shared/proto'
 import { sessionRows } from './sessionRows'
 import { deriveTab, shortCwd } from './tabView'
 import { RemoteAccess } from './RemoteAccess'
-import type { WebStatus } from '../main/webService'
+import type { WebStatus } from '../shared/webStatus'
 import { formatName, makeId, retargetPane } from '../shared/names'
 import { formatBrowserName, isBrowserName } from '../shared/browserName'
 import { formatEditorName, isEditorName } from '../shared/editorName'
@@ -1012,6 +1012,11 @@ function App(): JSX.Element {
     }
   }, [remoteOpen])
 
+  // The browser build cannot manage the service that serves it, so the whole
+  // control is hidden there rather than shown broken. `null` (first paint,
+  // before the first poll answers) keeps it visible: hiding then showing would
+  // make the toolbar jump on every launch.
+  const webManaged = webStatus === null || webStatus.managed
   // Pill colour: green only when it is actually reachable from a phone.
   const webDot =
     webStatus?.unit === 'active' && webStatus.tailscale === 'serving'
@@ -1107,7 +1112,7 @@ function App(): JSX.Element {
         </button>
         <div className="spacer" />
         <button className="btn btn-accent" onClick={startPane}>+ Pane</button>
-        <button
+        {webManaged && <button
           className={`btn web-pill web-pill-${webDot}`}
           // NEVER the url here: a title attribute is read by screen readers,
           // screenshots and hover — and the login url is a full-authority
@@ -1117,7 +1122,7 @@ function App(): JSX.Element {
           onClick={() => setRemoteOpen(true)}
         >
           <span className="web-dot" /> remote
-        </button>
+        </button>}
         <button className="icon-btn help-btn" aria-label="keyboard shortcuts"
           title={`Keyboard shortcuts (${chordLabel('help')})`} onClick={() => setShowHelp(true)}>?</button>
       </div>

@@ -38,7 +38,7 @@
 // forwards, it does not validate.
 
 import type { LoadLayoutResult, SaveLayoutResult, LayoutVersion } from '../shared/layoutFile'
-import type { WebStatus } from '../main/webService'
+import type { WebStatus } from '../shared/webStatus'
 
 export interface SocketLike {
   send(data: string | Uint8Array): void
@@ -474,6 +474,10 @@ export function createAmber(deps: AmberDeps): Window['amber'] {
     // an uncaught throw there would take the whole toolbar down.
     webStatus: (): Promise<WebStatus> =>
       Promise.resolve({
+        // A page served BY `amber web` cannot manage the service serving it.
+        // `main.tsx` hides the pill on this flag rather than painting a
+        // permanent red error badge on every phone.
+        managed: false,
         unit: 'unknown',
         port: 0,
         url: '',
