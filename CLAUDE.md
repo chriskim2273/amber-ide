@@ -929,7 +929,12 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   rollout restored all six sessions, placed daemon/supervisor/workload processes
   in their delegated leaves, launched the new AppImage, and reduced Amber from a
   10.7 GiB pre-upgrade peak to about 1.4 GiB with zero cgroup OOM events. This
-  host keeps a calibrated persistent 8 GiB `MemoryHigh` drop-in. **Still open:**
+  host keeps a dual-mode memory split on the 32 GiB box: Codex-off default
+  is Amber `MemoryHigh=20G` inside `app.slice` 24G/26G; when ChatGPT/Codex
+  desktop is running, `amber-codex-mem-balance` live-lowers Amber to 10G
+  (4G `MemoryLow`) and `app.slice` to 12G/14G so highs stay ≈ RAM
+  (Codex 14 + app 12 + session 5) and Codex keeps its 8G protected floor.
+  **Still open:**
   real-Mac verification, live mobile/banner gestures, and repository-wide
   formatting cleanup.
 
