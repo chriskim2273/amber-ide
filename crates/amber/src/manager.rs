@@ -784,6 +784,11 @@ impl SessionManager {
         metas.sort_by(|a, b| a.name.cmp(&b.name));
         let mut used: BTreeSet<u32> = BTreeSet::new();
         let mut lost = Vec::new();
+
+        // Phase A — SERIAL preparation. Slot repair, kind normalization and
+        // cgroup-leaf creation mutate shared store/slot state and must run
+        // deterministically in name order.
+        let mut ready = Vec::new();
         for mut meta in metas {
             if meta.slot < 1 || !used.insert(meta.slot) {
                 meta.slot = alloc_slot(&used);
@@ -816,7 +821,49 @@ impl SessionManager {
                 lost.push(meta.name.clone());
                 continue;
             }
-            match self.restore_one(&meta) {
+            ready.push(meta);
+        }
+
+        // Phase B — CONCURRENT spawns. Each spawn is a pty open + fork/exec +
+        // a login-shell PATH probe (+ supervisor setup for agent kinds), so
+        // serially the cost multiplied by pane count landed exactly at boot —
+        // the busiest moment this machine ever sees. Results stay keyed to
+        // their metadata so the commit phase below is deterministic.
+        //
+        // Concurrency is capped: a dozen simultaneous claude forks would
+        // spike load worse than the serial boot they replace.
+        let workers = ready
+            .len()
+            .min(8)
+            .min(std::thread::available_parallelism().map_or(1, |n| n.get()))
+            .max(1);
+        let chunk_len = ready.len().div_ceil(workers).max(1);
+        let outcomes: Vec<(SessionMeta, anyhow::Result<Arc<PtySession>>)> =
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = ready
+                    .chunks(chunk_len)
+                    .map(|chunk| {
+                        let chunk = chunk.to_vec();
+                        scope.spawn(move || {
+                            chunk.into_iter()
+                                .map(|meta| {
+                                    let res = self.restore_one(&meta);
+                                    (meta, res)
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .flat_map(|h| h.join().unwrap_or_default())
+                    .collect()
+            });
+
+        // Phase C — SERIAL commit: register under the live-table lock, apply
+        // deferred overrides, clean up failures — in the original name order.
+        for (meta, result) in outcomes {
+            match result {
                 Ok(sess) => {
                     let mut sessions = self.sessions.lock().unwrap();
                     if !recovery_complete {
