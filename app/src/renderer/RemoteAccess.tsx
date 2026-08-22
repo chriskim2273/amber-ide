@@ -100,16 +100,28 @@ export function RemoteAccess({ status, onClose, onRefresh }: Props): JSX.Element
   const rows = status ? diagnosticRows(status) : []
 
   return (
-    <div className="overlay" role="dialog" aria-modal="true" aria-label="Remote access">
-      <div className="dialog remote-dialog" ref={dialogRef}>
-        <div className="dialog-head">
-          <strong>Remote access</strong>
-          <button className="icon-btn" aria-label="close" onClick={onClose}>
+    // Reuses the repo's own dialog shell (`.help-overlay` / `.help-card` /
+    // `.help-head`), the same one the Sessions and save/load dialogs use — the
+    // first pass invented `.overlay`/`.dialog`, which matched no stylesheet and
+    // rendered unstyled in the top-left corner.
+    <div className="help-overlay" onClick={onClose}>
+      <div
+        className="help-card dialog-card remote-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Remote access"
+        ref={dialogRef}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="help-head">
+          <span className="help-title">Remote access</span>
+          <button className="icon-btn" aria-label="close" title="close" onClick={onClose}>
             ✕
           </button>
         </div>
+        <div className="dialog-body">
 
-        <p className="dialog-note">
+        <p className="dialog-text">
           Runs the browser build of amber on this machine so you can reach these
           sessions from a phone or another computer. The server keeps running when
           this app is closed.
@@ -203,7 +215,7 @@ export function RemoteAccess({ status, onClose, onRefresh }: Props): JSX.Element
               ))}
             </ul>
           ) : (
-            <div className="dialog-note">nothing connected</div>
+            <div className="dialog-text">nothing connected</div>
           )}
         </div>
 
@@ -213,7 +225,15 @@ export function RemoteAccess({ status, onClose, onRefresh }: Props): JSX.Element
             <button className="btn" onClick={() => void window.amber.webLogTail().then(setLog)}>
               {log === null ? 'Load log' : 'Refresh log'}
             </button>
-            <div className="spacer" />
+          </div>
+          {log !== null && <pre className="remote-log">{log}</pre>}
+        </div>
+
+        {/* Its own section: rotating logs out every device, and a destructive
+            control sitting inside a row of benign ones invites a misclick. */}
+        <div className="remote-section">
+          <div className="label">danger</div>
+          <div className="remote-row">
             <button
               className="btn btn-danger"
               disabled={busy !== null}
@@ -229,8 +249,11 @@ export function RemoteAccess({ status, onClose, onRefresh }: Props): JSX.Element
             >
               Rotate token
             </button>
+            <span className="remote-check-hint">
+              invalidates every existing link, QR and signed-in device
+            </span>
           </div>
-          {log !== null && <pre className="remote-log">{log}</pre>}
+        </div>
         </div>
       </div>
     </div>

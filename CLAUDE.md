@@ -989,7 +989,22 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   `https://<tailnet-host>/app` whenever a tailnet existed at all, even when
   `tailscale serve` mapped a DIFFERENT port — an address reaching another
   service entirely; `public_url()` now claims the tailnet host only for
-  `TailState::Serving`. **Not verified:** `enable`/`disable` (they write a real
+  `TailState::Serving`. **GUI-verified too** (xvfb+CDP): pill renders, dialog
+  opens, check rows compute live, Reveal puts a 43-char token in the FRAGMENT
+  only (nothing before the `#`) with its warning banner, QR renders as a 220x220
+  data URI under Electron's CSP, the log tail returns 22 k of real
+  `journalctl`, and `webAction('bogus')` is refused by the allowlist without
+  spawning. That pass caught three things typecheck and vitest could not: the
+  dialog used invented CSS classes (`.overlay`/`.dialog`) and rendered unstyled
+  in the top-left — rewritten onto the repo's own `.help-overlay`/`.help-card`
+  shell; "Rotate token" sat in the same row as "Load log" and moved to its own
+  danger section; and **the web build would have shipped a permanently red
+  `remote` pill** — the shim's `webStatus()` returned an `error` string, which
+  `webDot` maps to the error colour, so every phone would have shown a broken
+  badge over buttons that always fail. Fixed with an explicit `managed` flag
+  (and `WebStatus` moved to `app/src/shared/`, where renderer and web can reach
+  it without importing from `main/`). Gates after those fixes: app 495 tests +
+  typecheck + `build` + `build:web` green. **Not verified:** `enable`/`disable` (they write a real
   unit into `~/.config/systemd/user/` and run `tailscale serve --bg` on the
   user's actual machine — rendering and argv are unit-tested instead), macOS
   launchd, a real phone over the tailnet, and the packaged AppImage path. Known

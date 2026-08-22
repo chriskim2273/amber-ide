@@ -971,11 +971,13 @@ body {
 .web-pill-error .web-dot { background: #f85149; }
 
 .remote-dialog {
-  min-width: 520px;
-  max-width: 720px;
+  /* Wider than `.dialog-card`'s 380px default: this one carries a QR, a client
+     table and a log tail. */
+  width: min(640px, calc(100vw - 2 * var(--sp-4)));
   max-height: 80vh;
   overflow-y: auto;
 }
+.remote-dialog .dialog-body { padding-top: var(--sp-2); }
 .remote-row {
   display: flex;
   align-items: center;

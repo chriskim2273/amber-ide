@@ -132,3 +132,52 @@ server:    up 30335s, 1 sessions, 0 clients
   `__HOME__` log-path substitution and the port rewrite are unit-tested.
 - A real tailnet round trip from a phone.
 - The packaged AppImage path.
+
+## 6. GUI pass (xvfb + CDP)
+
+The dialog, the pill and the five IPC handlers were driven in a real Electron
+window. Findings and fixes:
+
+- **The pill renders**, class `web-pill web-pill-serving`.
+- **The dialog rendered unstyled in the top-left corner.** It invented
+  `.overlay`/`.dialog`/`.dialog-head`/`.dialog-note`, none of which exist in
+  `theme.css`. The repo's dialogs (Sessions, save/load) use
+  `.help-overlay` / `.help-card dialog-card` / `.help-head` / `.dialog-body` /
+  `.dialog-text`. Rewritten onto those; now a centred 640px card over a dimmed
+  overlay, click-outside and Escape both close it. Typecheck and vitest were
+  both green while it was broken — only rendering it caught this.
+- **Check rows compute live**: `✓ service up 0s`, `✓ tailscale serving
+  teapot-dev…`, `✗ daemon server unreachable`, `✓ token present (0600)`.
+- **Reveal** puts the token in the fragment only: `has_fragment_token: true`,
+  43-char token, nothing hex-shaped before the `#`, and the warning banner
+  ("Anyone with this link or code has full control of your sessions") appears
+  with it. Address renders token-free until pressed.
+- **QR renders** — 220×220 `data:image/png` `<img>`, so Electron's CSP allows
+  the data URI.
+- **Log tail** returns 22,227 characters of real `journalctl` output and the
+  button flips to "Refresh log".
+- **The action allowlist holds**: `webAction('bogus-action')` →
+  `{ok: false, error: "unknown action bogus-action"}`, no spawn.
+- **Rotate token moved to its own "danger" section.** It had been sitting in
+  the same row as "Load log"; a destructive control beside a benign one invites
+  a misclick.
+
+### The web build would have shipped a permanently red pill
+
+Not a GUI finding but caught in the same review: the web shim's `webStatus()`
+returned an error string, and `webDot` maps a non-null `error` to `'error'`. So
+every phone and browser client would have shown a red "remote" pill opening a
+dialog whose every button fails — on the exact surface this work exists to
+improve. Fixed with an explicit `managed: false` flag that hides the control
+where the host cannot manage the service, rather than overloading `error`.
+`WebStatus` also moved to `app/src/shared/`, where `proto`/`layoutFile`/
+`socketPath` already live; renderer and web had been importing from `main/`.
+
+### Caveat on this GUI pass
+
+The `AMBER_SOCKET` override did not take, so the window attached to the
+**real** daemon rather than the private one (`XDG_STATE_HOME` did apply, so the
+layout sidecar written was the private one and the user's was untouched; no
+session was created or killed). Consequence: the reveal/QR steps displayed the
+**user's real production token**, and it is visible in a screenshot captured
+during this pass. Recommend `amber ctl web rotate-token`.
