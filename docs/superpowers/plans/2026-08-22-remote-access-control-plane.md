@@ -73,6 +73,23 @@ mod tests {
     }
 
     #[test]
+    fn systemd_rewrite_survives_a_reformatted_template() {
+        // The regression the structural rewrite exists for: exactly one
+        // ExecStart line, and it is OURS, whatever the shipped file looks like.
+        let u = render_systemd_unit(Path::new("/x/amber"), 9999);
+        assert_eq!(u.lines().filter(|l| l.starts_with("ExecStart=")).count(), 1, "{u}");
+        assert!(u.contains("--port 9999"), "{u}");
+    }
+
+    #[test]
+    fn plist_port_is_rewritten_positionally_after_the_flag() {
+        let p = render_launchd_plist(Path::new("/x/amber"), 9999);
+        assert!(p.contains("<string>--port</string>"), "{p}");
+        assert!(p.contains("<string>9999</string>"), "{p}");
+        assert!(!p.contains("<string>7717</string>"), "{p}");
+    }
+
+    #[test]
     fn unit_path_is_under_the_users_home() {
         let p = unit_path(Path::new("/home/u"));
         let s = p.to_string_lossy();
@@ -143,16 +160,42 @@ fn argv(cmd: &str, args: &[&str]) -> Argv {
 /// `%h/.local/bin/amber`: the packaged app may install `amber` elsewhere, and
 /// `%h` would silently point at a binary that is not the one we control.
 pub fn render_systemd_unit(bin: &Path, port: u16) -> String {
-    SYSTEMD_TEMPLATE.replace(
-        "ExecStart=%h/.local/bin/amber web --port 7717",
-        &format!("ExecStart={} web --port {port}", bin.display()),
-    )
+    // STRUCTURAL, not textual: an exact-string replace of the whole
+    // `ExecStart=%h/.local/bin/amber web --port 7717` line silently no-ops the
+    // day someone reformats the shipped unit, and the packaged app would then
+    // enable a service pointing at `%h/.local/bin/amber` on port 7717
+    // regardless of its arguments. Rewrite the line by prefix instead.
+    SYSTEMD_TEMPLATE
+        .lines()
+        .map(|l| {
+            if l.starts_with("ExecStart=") {
+                format!("ExecStart={} web --port {port}", bin.display())
+            } else {
+                l.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 pub fn render_launchd_plist(bin: &Path, port: u16) -> String {
-    LAUNCHD_TEMPLATE
-        .replace("__AMBER_BIN__", &bin.display().to_string())
-        .replace("<string>7717</string>", &format!("<string>{port}</string>"))
+    // Same reasoning, and the plist is worse: a bare `<string>7717</string>`
+    // could appear for an unrelated reason in a future template. Rewrite the
+    // ARGUMENT that follows `--port`, positionally.
+    let mut out: Vec<String> = Vec::new();
+    let mut after_port_flag = false;
+    for line in LAUNCHD_TEMPLATE.lines() {
+        let replaced = line.replace("__AMBER_BIN__", &bin.display().to_string());
+        if after_port_flag && replaced.trim().starts_with("<string>") {
+            let indent = &replaced[..replaced.len() - replaced.trim_start().len()];
+            out.push(format!("{indent}<string>{port}</string>"));
+            after_port_flag = false;
+            continue;
+        }
+        after_port_flag = replaced.trim() == "<string>--port</string>";
+        out.push(replaced);
+    }
+    out.join("\n")
 }
 
 /// Where the unit file belongs for this platform.
@@ -495,7 +538,11 @@ fn test_hub() -> Hub {
 }
 ```
 
-(Check the real `Hub::new` signature first with `grep -n "impl Hub" -A 20 crates/amber/src/web.rs` and match it — do not guess.)
+(Check the real `Hub::new` signature first with `grep -n "impl Hub" -A 20
+crates/amber/src/web.rs` and match it — do not guess. Also check whether
+`Hub::new` connects to the socket eagerly; if it does, a `/nonexistent.sock`
+argument panics instead of failing informatively, and the helper needs the
+same construction the existing tests use.)
 
 - [ ] **Step 2: Run to verify failure**
 
@@ -546,7 +593,10 @@ Route, immediately after the `/api/sessions` arm:
         }
 ```
 
-`handle_conn` does not currently know the port; thread it through from `serve()` (which already binds the listener) as a `u16` parameter alongside `hub`/`auth`.
+`handle_conn` does not currently know the port; thread it through from `serve()`
+as a `u16` parameter alongside `hub`/`auth`. Take it from
+`listener.local_addr()?.port()`, not from the caller's argument — that is the
+honest value when the bind used port 0, which the tests do.
 
 - [ ] **Step 4: Run to verify pass**
 
@@ -585,12 +635,38 @@ git commit -m "feat(web): authenticated GET /api/status for operator tooling"
 - Consumes: `webctl::*` (Task 1), `tailscale::*` (Task 2), `/api/status` (Task 3), `amber::web::{load_or_create_token, TOKEN_FILE}`.
 - Produces: CLI surface
   `amber ctl web status|start|stop|restart|enable|disable|url|rotate-token [--json] [--port N] [--root PATH]`.
-  `--json` shape for `status`:
+  `--json` shape for `status` — **carries no token, ever**:
   ```json
-  {"unit":"active","port":7717,"url":"https://desk.ts.net/app#t=…","tailscale":"serving",
-   "host":"desk.ts.net","clients":[…],"sessions":6,"uptime_secs":123,"error":null}
+  {"unit":"active","port":7717,"url":"https://desk.ts.net/app","has_token":true,
+   "tailscale":"serving","host":"desk.ts.net","clients":[…],"sessions":6,
+   "uptime_secs":123,"error":null}
   ```
+  The tokenised URL comes only from `amber ctl web url`, called on demand when
+  the user presses Reveal / Copy / Show QR. Two reasons this is not paranoia:
+  `status` is polled every 3 s while the dialog is open, so a token in the
+  payload would sit in renderer memory and every IPC trace continuously — a
+  weaker posture than §9.6's "render on demand"; and `load_or_create_token`
+  **creates** the file, so a read-only status query would mint a credential as
+  a side effect.
+  Requires a new read-only accessor in `web.rs`:
+  `pub fn load_token(root: &Path) -> Option<String>` — reads, never creates.
   `tailscale` is one of `not-installed|not-logged-in|not-running|serve-not-mapped|serving`.
+
+- [ ] **Step 0: Check clap accepts the arg shape BEFORE writing the task**
+
+`global = true` propagates a flag downward to subcommands and must be declared
+on an ancestor of where it is used. The tests below invoke
+`ctl web status --json --root <dir>` — flags AFTER the leaf subcommand. Add the
+enum from Step 3, then run:
+
+```bash
+cargo run -p amber -- ctl web status --json --root /tmp 2>&1 | head -5
+```
+
+Expected: it parses (any runtime error is fine; an `unexpected argument`
+parse error is not). If clap rejects it, drop `global` and declare `port`,
+`json` and `root` on each `WebAction` variant instead. Five minutes here gates
+every test in this task.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -637,13 +713,13 @@ fn url_prints_the_token_only_on_the_url_subcommand() {
         .expect("runs");
     let status = String::from_utf8_lossy(&status_out.stdout);
     let token = url.split("#t=").nth(1).unwrap().to_string();
-    // `status --json` MAY carry the url (the app renders it), but must never
-    // leak the token through any other field.
+    // `status --json` must never carry the token in ANY field, url included:
+    // it is polled every 3 s by the dialog.
     let v: serde_json::Value = serde_json::from_str(&status).expect("json");
     for (k, val) in v.as_object().unwrap() {
-        if k == "url" { continue }
         assert!(!val.to_string().contains(&token), "token leaked in field {k}");
     }
+    assert_eq!(v["has_token"], true);
 }
 ```
 
@@ -804,7 +880,10 @@ Status arm:
                 Err(_) => "unknown",
             };
             let tail = tailscale::detect(port);
-            let token = amber::web::load_or_create_token(&root, false)?;
+            // READ-ONLY: `load_or_create_token` would mint a credential as a
+            // side effect of a status query (and the fresh-tempdir test below
+            // would hide it by passing).
+            let token = amber::web::load_token(&root);
             let (tail_label, host) = match &tail {
                 tailscale::TailState::NotInstalled => ("not-installed", String::new()),
                 tailscale::TailState::NotRunning => ("not-running", String::new()),
@@ -812,10 +891,11 @@ Status arm:
                 tailscale::TailState::ServeNotMapped { host } => ("serve-not-mapped", host.clone()),
                 tailscale::TailState::Serving { host } => ("serving", host.clone()),
             };
+            // NO token in this URL — see the Interfaces block.
             let url = if host.is_empty() {
-                local_url(port, &token)
+                format!("http://127.0.0.1:{port}/app")
             } else {
-                tailscale::https_url(&host, &token)
+                format!("https://{host}/app")
             };
             let live = fetch_status(port, &token);   // None when the server is down
             if json {
@@ -823,6 +903,7 @@ Status arm:
                     "unit": unit_state,
                     "port": port,
                     "url": url,
+                    "has_token": token.is_some(),
                     "tailscale": tail_label,
                     "host": host,
                     "error": serde_json::Value::Null,
@@ -923,6 +1004,7 @@ git commit -m "feat(cli): amber ctl web status/start/stop/enable/url/rotate-toke
     url: string
     tailscale: TailscaleState
     host: string
+    hasToken: boolean
     clients: WebClient[]
     sessions: number | null
     uptimeSecs: number | null
@@ -949,7 +1031,7 @@ describe('webCtlArgv', () => {
 
 describe('parseWebStatus', () => {
   const ok = JSON.stringify({
-    unit: 'active', port: 7717, url: 'https://desk.ts.net/app#t=abc',
+    unit: 'active', port: 7717, url: 'https://desk.ts.net/app', has_token: true,
     tailscale: 'serving', host: 'desk.ts.net',
     clients: [{ id: 3, open: 'amber-1-1-0-ab', borrow: null }],
     sessions: 6, uptime_secs: 90, error: null,
@@ -960,6 +1042,11 @@ describe('parseWebStatus', () => {
     expect(s.unit).toBe('active')
     expect(s.uptimeSecs).toBe(90)
     expect(s.clients[0]?.open).toBe('amber-1-1-0-ab')
+    expect(s.hasToken).toBe(true)
+  })
+
+  it('never carries a token, so the dialog must fetch one on demand', () => {
+    expect(parseWebStatus(ok).url).not.toContain('#t=')
   })
 
   it('never throws on garbage — a broken CLI must not kill the dialog', () => {
@@ -1010,6 +1097,9 @@ export interface WebStatus {
   url: string
   tailscale: TailscaleState
   host: string
+  /** Whether a token file exists. The token itself is fetched on demand by
+   *  `ctl web url` — never carried in a 3-second poll. */
+  hasToken: boolean
   clients: WebClient[]
   sessions: number | null
   uptimeSecs: number | null
@@ -1025,7 +1115,7 @@ export function webCtlArgv(action: string, port: number): string[] {
 export function parseWebStatus(stdout: string): WebStatus {
   const base: WebStatus = {
     unit: 'unknown', port: 0, url: '', tailscale: 'not-installed', host: '',
-    clients: [], sessions: null, uptimeSecs: null, error: null,
+    hasToken: false, clients: [], sessions: null, uptimeSecs: null, error: null,
   }
   let raw: Record<string, unknown>
   try {
@@ -1042,6 +1132,7 @@ export function parseWebStatus(stdout: string): WebStatus {
     url: typeof raw['url'] === 'string' ? raw['url'] : '',
     tailscale: TAIL_STATES.includes(tail as TailscaleState) ? (tail as TailscaleState) : 'not-installed',
     host: typeof raw['host'] === 'string' ? raw['host'] : '',
+    hasToken: raw['has_token'] === true,
     clients: Array.isArray(raw['clients'])
       ? (raw['clients'] as Record<string, unknown>[]).map((c) => ({
           id: typeof c['id'] === 'number' ? c['id'] : 0,
@@ -1095,6 +1186,7 @@ git commit -m "feat(app): typed parser for amber ctl web --json"
   webAction(action: 'start'|'stop'|'restart'|'enable'|'disable'|'rotate-token'): Promise<{ ok: boolean; error?: string }>
   webLogTail(): Promise<string>
   webOpenLocal(): Promise<void>
+  webUrl(): Promise<string>          // tokenised, on demand only
   ```
 
 - [ ] **Step 1: Add the main-process handlers**
@@ -1148,6 +1240,13 @@ ipcMain.handle('web:logTail', async (): Promise<string> => {
   }
 })
 
+// On-demand ONLY: called when the user presses Reveal / Copy / Show QR. Never
+// on the status poll — see webService.ts's `hasToken`.
+ipcMain.handle('web:url', async (): Promise<string> => {
+  const { stdout } = await runAmber(['ctl', 'web', 'url', '--port', String(WEB_PORT)])
+  return stdout.trim()
+})
+
 ipcMain.handle('web:openLocal', async () => {
   // The LOCAL url, token included — this opens the user's own browser on the
   // user's own machine. Log the redacted form only.
@@ -1169,6 +1268,7 @@ macOS note: the launchd plist must gain `StandardErrorPath` pointing at `~/Libra
   webAction: (action: string) => ipcRenderer.invoke('web:action', action),
   webLogTail: () => ipcRenderer.invoke('web:logTail'),
   webOpenLocal: () => ipcRenderer.invoke('web:openLocal'),
+  webUrl: () => ipcRenderer.invoke('web:url'),
 ```
 
 - [ ] **Step 3: No-op the methods in the web shim**
@@ -1178,12 +1278,13 @@ macOS note: the launchd plist must gain `StandardErrorPath` pointing at `~/Libra
 ```ts
     webStatus: async () => ({
       unit: 'unknown' as const, port: 0, url: '', tailscale: 'not-installed' as const,
-      host: '', clients: [], sessions: null, uptimeSecs: null,
+      host: '', hasToken: false, clients: [], sessions: null, uptimeSecs: null,
       error: 'remote access is managed from the desktop app',
     }),
     webAction: async () => ({ ok: false, error: 'not available in the browser' }),
     webLogTail: async () => '',
     webOpenLocal: async () => {},
+    webUrl: async () => '',
 ```
 
 - [ ] **Step 4: Add the pill**
@@ -1277,8 +1378,8 @@ import { diagnosticRows } from './RemoteAccess'
 import type { WebStatus } from '../main/webService'
 
 const base: WebStatus = {
-  unit: 'active', port: 7717, url: 'https://d.ts.net/app#t=x', tailscale: 'serving',
-  host: 'd.ts.net', clients: [], sessions: 0, uptimeSecs: 1, error: null,
+  unit: 'active', port: 7717, url: 'https://d.ts.net/app', tailscale: 'serving',
+  host: 'd.ts.net', hasToken: true, clients: [], sessions: 0, uptimeSecs: 1, error: null,
 }
 
 describe('diagnosticRows', () => {
@@ -1341,7 +1442,11 @@ Component behaviour, in order of the dialog:
 1. Header: title + close.
 2. Toggle row: Start / Stop / Restart buttons calling `window.amber.webAction`, then re-poll.
 3. "Enable at boot" button → `webAction('enable')`.
-4. URL row: `redactUrl` shown by default with a **Reveal** toggle; Copy button copies the real URL.
+4. URL row: the token-free `status.url` is shown plainly. **Reveal**, **Copy**
+   and **Show QR** each call `window.amber.webUrl()` (a new IPC that runs
+   `amber ctl web url`) to fetch the tokenised URL at that moment — it is never
+   held in React state longer than the interaction, and never arrives on the
+   3-second status poll.
 5. **Show QR** button — renders `await QRCode.toDataURL(status.url)` into an `<img>`, hidden until clicked, with the warning line: *"Anyone with this code has full control of your sessions."*
 6. Rotate token: `window.confirm('Rotate the token? Every phone and browser is logged out.')` then `webAction('rotate-token')`.
 7. Clients table: `id`, `open`, borrow marker (`borrow` is `null` in Phase A → render `—`).
@@ -1355,7 +1460,9 @@ Component behaviour, in order of the dialog:
 cd app && npm install qrcode && npm install -D @types/qrcode
 ```
 
-`qrcode` is pure JS (no native addon — core rule #8). Verify: `node -e "require('qrcode')"` from `app/`.
+`qrcode` is claimed pure JS (no native addon — core rule #8). **Verify, do not
+assert:** `npm ls qrcode` and confirm no optional native dependency appears in
+the lockfile, then `node -e "require('qrcode')"` from `app/`.
 
 - [ ] **Step 5: Run to verify pass**
 
@@ -1410,7 +1517,7 @@ Expected: **204**, not 429. Twelve status calls must not lock out a real client.
 
 ```bash
 target/debug/amber ctl web status --json --root "$AMBER_TEST_ROOT" --port 7919 > /dev/null
-printf 'wrong' > "$AMBER_TEST_ROOT/web-token"
+printf 'wrong' > "$AMBER_TEST_ROOT/web-token" && chmod 600 "$AMBER_TEST_ROOT/web-token"
 target/debug/amber ctl web status --json --root "$AMBER_TEST_ROOT" --port 7919 | grep -c unreachable
 ```
 Expected: `1` — reports the failure, exits 0, one auth attempt.
@@ -1446,4 +1553,14 @@ git commit -m "docs: record remote-access control plane verification"
 
 **Not in this plan, by design:** §1–§8 (mobile UX) are Phase B. §2.2's borrow appears only as a `null` field so the status payload does not change shape when Phase B lands.
 
-**Known follow-ups for Phase B's plan:** `borrow` population, and whether `WEB_PORT` should stop being a constant in `index.ts` once the dialog can edit the port.
+**Known follow-ups for Phase B's plan:**
+
+1. `borrow` population (spec §2.2).
+2. **The port has three sources** — `WEB_PORT` in `index.ts`,
+   `--port 7717` baked into `infra/daemon/amber-web.service`, and
+   `webctl::render_*`'s argument. `ctl web enable --port N` therefore produces
+   a service the app cannot see: every `web:status` / `web:action` call queries
+   7717, so the dialog reports `unit: inactive` while the service runs fine on
+   N. Accepted for Phase A because the dialog offers no port editor; the fix is
+   for `web:status` to read the port out of the installed unit file rather than
+   a constant.
