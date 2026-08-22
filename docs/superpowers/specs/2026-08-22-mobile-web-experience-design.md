@@ -336,15 +336,24 @@ line · select all · copy · paste*.
 
 ### 9.1 Service
 
-`amber web` becomes boot-managed, like the daemon (core rule #6: persistence is
-not the app's job). A second unit pair ships alongside the existing one:
+**Correction to an earlier draft of this section: the units already exist.**
+`infra/daemon/amber-web.service`, `infra/daemon/com.amber-ide.web.plist.in`
+(label `com.amber-ide.web`), their install/uninstall paths in
+`infra/daemon/install.sh`, and the `amber ctl install --web` /
+`amber ctl uninstall --web` opt-in flags are all in the tree today. Phase A
+does **not** re-create them.
 
-- Linux: `amber-web.service` (systemd user unit),
-- macOS: `com.amber.web.plist` (launchd agent).
+What is missing is the packaged path and the controls. `install.sh` needs a git
+checkout; the packaged app's cargo-free first-run install writes only
+`amber.service` / the daemon plist (`app/src/main/index.ts:124`, `:146`) and no
+web unit at all, so an AppImage user cannot boot-manage `amber web`.
 
-Installed by `infra/daemon/install.sh` and `amber ctl install`, **opt-in** —
-it opens a local port, and the existing spec language already treats that as
-opt-in. The desktop app is a *controller*, never the owner: closing the IDE
+Phase A closes that by making **Rust** own unit installation for the web
+service: `amber ctl web enable` writes the unit itself from templates embedded
+via `include_str!` from those same `infra/daemon/` files, then enables and
+starts it. One implementation serves the repo install, the packaged install and
+the app dialog; the app shells to the CLI and never writes a unit itself.
+Boot-management stays **opt-in** — it opens a local port. The desktop app is a *controller*, never the owner: closing the IDE
 must not kill phone access, since being away from the desk is the entire use
 case.
 
