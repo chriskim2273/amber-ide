@@ -61,6 +61,12 @@ export type ControlMsg =
   | { kind: 'Suspend'; name: string }
   | { kind: 'Resume'; name: string }
   | { kind: 'Resize'; name: string; cols: number; rows: number }
+  // Aggregate memory budget (see shared/budget.ts for the display side).
+  // `mb` is MiB; 0 = auto (half of physical RAM, capped by the service cap).
+  | { kind: 'SetMemoryBudget'; mb: number }
+  | { kind: 'GetMemoryBudget' }
+  // Daemon reply to both. Numeric fields default to 0 = absent on the wire.
+  | { kind: 'BudgetApplied'; mb: number; effective_budget_kb: number; cgroup_limit_kb: number; session_high_kb: number }
   | { kind: 'SessionList'; names: string[] }
   | { kind: 'Sessions'; sessions: SessionInfo[] }
   | { kind: 'SessionsChanged'; added: SessionInfo[]; removed: string[] }
@@ -134,6 +140,10 @@ function msgToJson(m: ControlMsg): unknown {
       return { Resume: { name: m.name } }
     case 'Resize':
       return { Resize: { name: m.name, cols: m.cols, rows: m.rows } }
+    case 'SetMemoryBudget':
+      return { SetMemoryBudget: { mb: m.mb } }
+    case 'GetMemoryBudget':
+      return 'GetMemoryBudget'
     case 'SessionList':
       return { SessionList: { names: m.names } }
     case 'Sessions':
@@ -191,6 +201,16 @@ function jsonToMsg(v: unknown): ControlMsg | null {
       case 'Kill': return { kind: 'Kill', name: body['name'] as string }
       case 'Rename': return { kind: 'Rename', from: body['from'] as string, to: body['to'] as string }
       case 'Resize': return { kind: 'Resize', name: body['name'] as string, cols: body['cols'] as number, rows: body['rows'] as number }
+      case 'SetMemoryBudget': return { kind: 'SetMemoryBudget', mb: (body['mb'] as number) ?? 0 }
+      case 'GetMemoryBudget': return { kind: 'GetMemoryBudget' }
+      case 'BudgetApplied':
+        return {
+          kind: 'BudgetApplied',
+          mb: (body['mb'] as number) ?? 0,
+          effective_budget_kb: (body['effective_budget_kb'] as number) ?? 0,
+          cgroup_limit_kb: (body['cgroup_limit_kb'] as number) ?? 0,
+          session_high_kb: (body['session_high_kb'] as number) ?? 0,
+        }
       case 'SessionList': return { kind: 'SessionList', names: body['names'] as string[] }
       case 'Sessions': return { kind: 'Sessions', sessions: body['sessions'] as SessionInfo[] }
       case 'SessionsChanged': return { kind: 'SessionsChanged', added: body['added'] as SessionInfo[], removed: body['removed'] as string[] }

@@ -465,5 +465,9 @@ export function createAmber(deps: AmberDeps): Window['amber'] {
     editorDraftClear: notImplemented('editorDraftClear'),
     editorInlineImages: notImplemented('editorInlineImages'),
     claudeNames: notImplemented('claudeNames'),
+    // Desktop-only: the daemon-side budget control messages are not on the
+    // browser whitelist, so there is nothing honest to send.
+    getMemoryBudget: notImplemented('getMemoryBudget'),
+    setMemoryBudget: notImplemented('setMemoryBudget'),
   }
 }

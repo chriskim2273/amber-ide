@@ -46,6 +46,8 @@ process.parentPort.on('message', (event) => {
         | { cmd: 'suspend'; name: string }
         | { cmd: 'resume'; name: string }
         | { cmd: 'focus'; name: string }
+        | { cmd: 'getMemoryBudget' }
+        | { cmd: 'setMemoryBudget'; mb: number }
       if (cmd.cmd === 'create') {
         conn.send({ type: 'control', msg: { kind: 'Create', name: cmd.name, cwd: cmd.cwd, sessionKind: cmd.sessionKind } })
       } else if (cmd.cmd === 'kill') {
@@ -60,6 +62,10 @@ process.parentPort.on('message', (event) => {
         conn.send({ type: 'control', msg: { kind: 'Resume', name: cmd.name } })
       } else if (cmd.cmd === 'focus') {
         conn.send({ type: 'control', msg: { kind: 'Focus', name: cmd.name } })
+      } else if (cmd.cmd === 'getMemoryBudget') {
+        conn.send({ type: 'control', msg: { kind: 'GetMemoryBudget' } })
+      } else if (cmd.cmd === 'setMemoryBudget') {
+        conn.send({ type: 'control', msg: { kind: 'SetMemoryBudget', mb: cmd.mb } })
       }
     })
     port.start()
