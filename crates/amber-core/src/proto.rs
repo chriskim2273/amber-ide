@@ -238,6 +238,30 @@ pub enum ControlMsg {
         end_offset: u64,
         full: bool,
     },
+    /// Client -> daemon: change amber's aggregate memory budget to `mb` MiB
+    /// (0 = auto: half of physical RAM, still capped by the OS cgroup limit).
+    /// The daemon persists it to config, re-derives the effective budget
+    /// against the LIVE service cap, re-applies every session leaf's
+    /// `memory.high`, and switches the running guardian over — no restart.
+    /// Replies `BudgetApplied`, or `Error` on a rejected value.
+    SetMemoryBudget { mb: u64 },
+    /// Client -> daemon: report the current budget state. Replies
+    /// `BudgetApplied`.
+    GetMemoryBudget,
+    /// Daemon -> client: the memory-budget truth. `mb` is the CONFIGURED
+    /// budget in MiB (0 = auto). `effective_budget_kb` is what the guardian
+    /// uses right now (0 = no usable aggregate: automatic parking disabled).
+    /// `cgroup_limit_kb` is the live lowest finite ancestor cap (0 = none).
+    /// `session_high_kb` is each session leaf's soft ceiling.
+    BudgetApplied {
+        mb: u64,
+        #[serde(default)]
+        effective_budget_kb: u64,
+        #[serde(default)]
+        cgroup_limit_kb: u64,
+        #[serde(default)]
+        session_high_kb: u64,
+    },
     SessionList { names: Vec<String> },
     Created { name: String },
     Killed { name: String },
@@ -313,6 +337,9 @@ fn known_control_variant(name: &str) -> bool {
             | "MemoryPressure"
             | "RunStateAck"
             | "AttachBacklog"
+            | "SetMemoryBudget"
+            | "GetMemoryBudget"
+            | "BudgetApplied"
             | "SessionList"
             | "Created"
             | "Killed"
@@ -654,6 +681,29 @@ mod tests {
         assert_eq!(roundtrip(&Frame::Control(msg.clone())), Frame::Control(msg.clone()));
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains(r#""epoch":"9007199254740993""#), "{json}");
+    }
+
+    #[test]
+    fn memory_budget_messages_roundtrip_with_additive_defaults() {
+        let set = Frame::Control(ControlMsg::SetMemoryBudget { mb: 20_480 });
+        assert_eq!(roundtrip(&set), set);
+        assert_eq!(roundtrip(&Frame::Control(ControlMsg::GetMemoryBudget)), Frame::Control(ControlMsg::GetMemoryBudget));
+
+        // A peer that predates the numeric fields decodes them as 0.
+        let applied: ControlMsg =
+            serde_json::from_str(r#"{"BudgetApplied":{"mb":20480}}"#).unwrap();
+        assert_eq!(
+            applied,
+            ControlMsg::BudgetApplied { mb: 20_480, effective_budget_kb: 0, cgroup_limit_kb: 0, session_high_kb: 0 }
+        );
+
+        let full = Frame::Control(ControlMsg::BudgetApplied {
+            mb: 0, // auto
+            effective_budget_kb: 8_388_608,
+            cgroup_limit_kb: 8_388_608,
+            session_high_kb: 4_194_304,
+        });
+        assert_eq!(roundtrip(&full), full);
     }
 
     #[test]

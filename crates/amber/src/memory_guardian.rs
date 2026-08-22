@@ -165,31 +165,31 @@ fn select_pressure_sample(
 }
 
 /// Start the daemon's single memory monitor/guardian thread. Cgroup charge is
-/// sampled every second when available; the process table is read once every
-/// three ticks for the existing per-session RSS telemetry and as the fallback
-/// aggregate on unsupported platforms.
-pub fn start(
-    manager: Arc<SessionManager>,
-    watchers: Arc<Watchers>,
-    config: MemoryConfig,
-    budget_kb: Option<u64>,
-) {
-    match budget_kb {
+/// sampled every second when available; per-session telemetry comes from the
+/// same sample (see the tick loop) and the process-table walk survives only
+/// as the no-containment fallback.
+///
+/// The budget is read FRESH from the manager every tick, not captured here:
+/// `SetMemoryBudget` moves it on a live daemon (`amber ctl budget`, the app's
+/// memory dialog), and a restart would defeat the point.
+pub fn start(manager: Arc<SessionManager>, watchers: Arc<Watchers>, config: MemoryConfig) {
+    match manager.effective_budget_kb() {
         Some(budget) => eprintln!("amber daemon: memory guardian budget {budget} KiB"),
         None => eprintln!(
             "amber daemon: memory guardian has no aggregate budget; automatic parking disabled"
         ),
     }
-        thread::spawn(move || {
-            let cgroup_enabled = manager.cgroup_memory_enabled();
-            let mut level = PressureLevel::Normal;
-            let mut blocked = false;
-            let mut last_pressure_broadcast_ms: Option<u64> = None;
-            let mut samples: HashMap<String, VecDeque<u64>> = HashMap::new();
-            let mut tick = 0u64;
-            loop {
-                thread::sleep(Duration::from_secs(1));
-                tick = tick.wrapping_add(1);
+    thread::spawn(move || {
+        let cgroup_enabled = manager.cgroup_memory_enabled();
+        let mut level = PressureLevel::Normal;
+        let mut blocked = false;
+        let mut last_pressure_broadcast_ms: Option<u64> = None;
+        let mut samples: HashMap<String, VecDeque<u64>> = HashMap::new();
+        let mut tick = 0u64;
+        loop {
+            thread::sleep(Duration::from_secs(1));
+            tick = tick.wrapping_add(1);
+            let budget_kb = manager.effective_budget_kb();
                 let mut cgroup_sample = match manager.cgroup_memory_sample() {
                     Ok(sample) => sample,
                     Err(error) => {

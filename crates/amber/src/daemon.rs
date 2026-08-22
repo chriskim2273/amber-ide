@@ -467,6 +467,32 @@ fn handle_control(
                 );
             }
         }
+        ControlMsg::SetMemoryBudget { mb } => {
+            // mb == 0 means "auto". Persist + re-derive + move the session
+            // leaves + flip the guardian's live handle, all in the manager.
+            let reply = match manager.set_memory_budget((mb != 0).then_some(mb)) {
+                Ok(status) => ControlMsg::BudgetApplied {
+                    mb: status.configured_mb.unwrap_or(0),
+                    effective_budget_kb: status.effective_budget_kb.unwrap_or(0),
+                    cgroup_limit_kb: status.cgroup_limit_kb.unwrap_or(0),
+                    session_high_kb: status.session_high_kb,
+                },
+                Err(e) => ControlMsg::Error { msg: e.to_string() },
+            };
+            let _ = write_frame(writer, &Frame::Control(reply));
+        }
+        ControlMsg::GetMemoryBudget => {
+            let reply = match manager.get_memory_budget() {
+                Ok(status) => ControlMsg::BudgetApplied {
+                    mb: status.configured_mb.unwrap_or(0),
+                    effective_budget_kb: status.effective_budget_kb.unwrap_or(0),
+                    cgroup_limit_kb: status.cgroup_limit_kb.unwrap_or(0),
+                    session_high_kb: status.session_high_kb,
+                },
+                Err(e) => ControlMsg::Error { msg: e.to_string() },
+            };
+            let _ = write_frame(writer, &Frame::Control(reply));
+        }
         ControlMsg::Focus { name } => {
             if let Err(e) = manager.focus_session(&name) {
                 let _ = write_frame(

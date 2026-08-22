@@ -5,6 +5,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -128,6 +129,11 @@ pub struct SessionManager {
     cfg: Config,
     root: PathBuf,
     sessions: Mutex<HashMap<String, Arc<PtySession>>>,
+    /// The guardian's LIVE aggregate budget in KiB (0 = none). An
+    /// `Arc<AtomicU64>` so `SetMemoryBudget` can move it while the guardian
+    /// thread reads it every tick — a budget change takes effect without a
+    /// daemon restart. Seeded from config at startup by `run_daemon`.
+    budget_kb: Arc<AtomicU64>,
     /// Effective metadata that could not yet be persisted because a retained
     /// rename journal still validates the pre-repair bytes. The weak identity
     /// prevents a later session reusing the same name from inheriting it.
@@ -184,6 +190,24 @@ pub enum ResumeCause {
 /// with no claude before it stops being restored as claude.
 const CLAUDE_ABSENT_THRESHOLD: u32 = 2;
 
+/// The memory-budget truth as one struct — the body of `BudgetApplied` and
+/// what `amber ctl budget` prints. All KiB fields are 0/None when the
+/// corresponding limit does not exist.
+pub struct BudgetStatus {
+    /// Configured budget in MiB; `None` = auto (half of physical, capped).
+    pub configured_mb: Option<u64>,
+    /// What the guardian actually uses right now.
+    pub effective_budget_kb: Option<u64>,
+    /// The live lowest finite ancestor cap on the daemon's cgroup.
+    pub cgroup_limit_kb: Option<u64>,
+    /// Each session leaf's soft ceiling (`memory.high`).
+    pub session_high_kb: u64,
+    /// Total physical RAM, when the platform reports it.
+    pub physical_kb: Option<u64>,
+    /// Whether automatic parking acts on pressure at all.
+    pub enabled: bool,
+}
+
 /// Decide a shell session's `resume_as_claude` on a PERIODIC snapshot, with
 /// downgrade hysteresis. Upgrades immediately when claude is detected; downgrades
 /// true→false only after `threshold` CONSECUTIVE absences, so one transient miss
@@ -237,6 +261,7 @@ impl SessionManager {
             cfg,
             root,
             sessions: Mutex::new(HashMap::new()),
+            budget_kb: Arc::new(AtomicU64::new(0)),
             deferred_meta: Mutex::new(HashMap::new()),
             socket: None,
             watchers: None,
@@ -1133,6 +1158,79 @@ impl SessionManager {
         self.cgroups.is_enabled()
     }
 
+    /// Seed the guardian's live budget handle (startup). `None` = no usable
+    /// aggregate: automatic parking stays off until a budget is set.
+    pub fn store_effective_budget_kb(&self, kb: Option<u64>) {
+        self.budget_kb.store(kb.unwrap_or(0), Ordering::SeqCst);
+    }
+
+    /// The guardian's current aggregate budget in KiB, read fresh every tick.
+    pub fn effective_budget_kb(&self) -> Option<u64> {
+        let value = self.budget_kb.load(Ordering::SeqCst);
+        (value != 0).then_some(value)
+    }
+
+    /// The full memory-budget truth, without changing anything. Re-reads the
+    /// persisted config (not the startup copy) so a `SetMemoryBudget` from
+    /// any connection is immediately visible here; the read is one small
+    /// file on a rare call. Also the reply body for `GetMemoryBudget`.
+    pub fn get_memory_budget(&self) -> anyhow::Result<BudgetStatus> {
+        let cfg = self.store.load_config()?;
+        let physical_kb = crate::procinfo::total_memory_kb();
+        let cgroup_limit_kb = self.cgroups.lowest_finite_limit_kb().ok().flatten();
+        let effective = cfg.memory.budget_kb(physical_kb, cgroup_limit_kb);
+        Ok(BudgetStatus {
+            configured_mb: cfg.memory.budget_mb,
+            effective_budget_kb: effective,
+            cgroup_limit_kb,
+            session_high_kb: cfg.memory.session_high_kb(effective),
+            physical_kb,
+            enabled: cfg.memory.enabled,
+        })
+    }
+
+    /// Change the aggregate memory budget (`None` = auto) and make it LIVE:
+    /// persist to config, re-derive against the CURRENT service cap (a
+    /// `systemctl --user set-property` may have moved it under us), move
+    /// every existing session leaf's `memory.high`, and flip the guardian's
+    /// handle — all without a restart. Returns the new truth.
+    pub fn set_memory_budget(&self, mb: Option<u64>) -> anyhow::Result<BudgetStatus> {
+        const MAX_BUDGET_MB: u64 = 1024 * 1024; // 1 TiB: only rejects nonsense
+        if let Some(mb) = mb {
+            if mb > MAX_BUDGET_MB {
+                anyhow::bail!("budget {mb} MiB exceeds the sanity ceiling of {MAX_BUDGET_MB} MiB");
+            }
+        }
+        let mut cfg = self.cfg.clone();
+        cfg.memory.budget_mb = mb;
+        self.store.save_config(&cfg)?;
+        let status = self.get_memory_budget()?;
+        self.cgroups.set_session_high_kb(status.session_high_kb);
+        self.store_effective_budget_kb(status.effective_budget_kb);
+        // Move existing leaves to the new ceiling. Best-effort per slot: one
+        // unwritable leaf must not stop the others.
+        let slots: Vec<u32> = {
+            let sessions = self.sessions.lock().unwrap();
+            sessions
+                .iter()
+                .filter_map(|(name, sess)| {
+                    self.effective_meta_for(name, sess)
+                        .ok()
+                        .flatten()
+                        .map(|meta| meta.slot)
+                })
+                .collect()
+        };
+        for slot in slots {
+            if let Err(error) = self.cgroups.rewrite_session_high(slot) {
+                eprintln!(
+                    "amber daemon: could not move session-{slot} memory.high: {error}"
+                );
+            }
+        }
+        Ok(status)
+    }
+
     /// The effective live kind of a session. During pending rename cleanup it
     /// may intentionally be newer than the journal-owned persisted metadata.
     /// Consulted on Attach to apply the spec-§5 reconnect semantics.
@@ -1628,6 +1726,52 @@ mod tests {
             CgroupManager::test_root(cgroup_root),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn set_memory_budget_persists_and_moves_the_live_handle_and_leaves() {
+        // The whole feature: a budget change survives (config write) AND takes
+        // effect immediately (guardian handle + existing session leaves),
+        // without a daemon restart.
+        let dir = tempdir().unwrap();
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let cgroup_root = dir.path().join("cg");
+        std::fs::create_dir_all(&cgroup_root).unwrap();
+        let shell = dir.path().join("quiet-shell");
+        std::fs::write(&shell, "#!/bin/sh\nprintf READY\\n\nsleep 60\n").unwrap();
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mgr = SessionManager::new_with_cgroups(
+            &state,
+            Config::default(),
+            CgroupManager::test_root(&cgroup_root),
+        )
+        .unwrap()
+        .with_test_shell(shell.into_os_string());
+        mgr.store_effective_budget_kb(Some(4 * 1024 * 1024));
+
+        // A live session so one materialised leaf exists to be moved.
+        let sess = mgr.create("amber-1-1-0-a", "/tmp", SessionKind::Shell).unwrap();
+        wait_for_output(&sess, b"READY");
+        let high = cgroup_root.join("session-1").join("memory.high");
+        assert!(high.exists(), "prepare_session must have written the leaf");
+        assert_eq!(std::fs::read_to_string(&high).unwrap().trim(), "0");
+
+        let status = mgr.set_memory_budget(Some(20_480)).unwrap();
+        assert_eq!(status.configured_mb, Some(20_480));
+        assert_eq!(
+            mgr.effective_budget_kb(),
+            status.effective_budget_kb,
+            "the guardian handle must move with the set"
+        );
+
+        // Persisted: a fresh manager loads the same configured value.
+        let reloaded = SessionManager::new(&state).unwrap();
+        assert_eq!(reloaded.get_memory_budget().unwrap().configured_mb, Some(20_480));
+
+        // Auto clears the override.
+        let auto = mgr.set_memory_budget(None).unwrap();
+        assert_eq!(auto.configured_mb, None);
     }
 
     fn wait_for_output(session: &PtySession, needle: &[u8]) {
