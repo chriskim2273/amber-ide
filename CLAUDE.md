@@ -938,6 +938,65 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   real-Mac verification, live mobile/banner gestures, and repository-wide
   formatting cleanup.
 
+- [x] Remote-access control plane (2026-08-22, Phase A) — the desktop IDE can
+  now run, host and share the browser build without a hand-run CLI. Spec:
+  `docs/superpowers/specs/2026-08-22-mobile-web-experience-design.md` §9 (Phase
+  B, §1–§8, is the mobile UX and is NOT built). **The boot units already
+  existed** (`infra/daemon/amber-web.service`, `com.amber-ide.web.plist.in`,
+  `amber ctl install --web`); the gap was the packaged path — `install.sh`
+  needs a git checkout and the AppImage's cargo-free first-run install writes
+  only the DAEMON unit — plus the absence of any UI. So **Rust owns unit
+  installation now**: `crates/amber/src/webctl.rs` embeds both templates with
+  `include_str!` and `amber ctl web enable` writes, enables and starts the
+  service itself. The `ExecStart`/`--port` substitution is **structural** (line
+  rewritten by prefix, plist argument rewritten positionally after
+  `<string>--port</string>`) — an exact-string replace silently no-ops the day
+  someone reformats the shipped unit, and the packaged app would then enable a
+  service pointing at `%h/.local/bin/amber` regardless of its arguments.
+  `crates/amber/src/tailscale.rs` classifies the tailnet into four named states
+  (not-installed / not-logged-in / not-running / serve-not-mapped) so the UI
+  shows which one to fix instead of a dead red row; `serve status --json` is
+  matched by a recursive value walk because that payload's shape has moved
+  across releases. New authenticated `GET /api/status` on `amber web` (same
+  cookie boundary as `/api/sessions`) reports port/uptime/sessions/clients,
+  each client carrying a `borrow` field that is `null` until Phase B §2.2 fills
+  it. New `amber ctl web status|start|stop|restart|enable|disable|url|
+  rotate-token`, all `--json`; the app parses **only** `--json`.
+  App: `app/src/main/webService.ts` (pure argv + a never-throwing parser),
+  IPC, a toolbar pill (off/local/serving/error) and a Remote access dialog
+  (start/stop/restart, enable-at-boot, address, reveal/copy/QR, rotate token
+  behind a confirm, connected clients, `amber ctl doctor`-style check rows, log
+  tail via `journalctl --user -u amber-web` / the launchd stderr file, "open on
+  this machine"). **Security shape, deliberate:** the login URL grants full
+  session control, so `status` carries NO token at all — it reports
+  `has_token` and a token-free url, and the tokenised one is fetched on demand
+  by Reveal/Copy/QR only (a 3 s poll would otherwise park a credential in
+  renderer memory and every IPC trace); `load_token()` was added because
+  `load_or_create_token` would have MINTED a credential as a side effect of a
+  read-only status query; the QR is hidden until pressed; and the CLI makes
+  **exactly one** `/api/auth` attempt — `Auth::throttled` buckets by peer IP and
+  behind `tailscale serve` every peer is 127.0.0.1, so a retry loop would burn
+  the 8-failure budget and lock the PHONE out. Gates: Rust 325 lib tests + every
+  integration suite green, clippy `--workspace --all-targets -D warnings`
+  clean. **Live-verified** against a private daemon + private `amber web` on
+  port 7919 — full report `.reports/remote-access.md`: the two-step auth
+  exchange returning real `uptime_secs`/`sessions` (and the count moving when a
+  session is created), 401 on a forged cookie and on no cookie, twelve status
+  polls followed by a successful `204` auth (throttle not burned), a wrong
+  token reported after ONE attempt with a good token still working right after,
+  and zero token leakage across every field of the status payload.
+  **A bug live-testing caught and fixed:** the CLI claimed
+  `https://<tailnet-host>/app` whenever a tailnet existed at all, even when
+  `tailscale serve` mapped a DIFFERENT port — an address reaching another
+  service entirely; `public_url()` now claims the tailnet host only for
+  `TailState::Serving`. **Not verified:** `enable`/`disable` (they write a real
+  unit into `~/.config/systemd/user/` and run `tailscale serve --bg` on the
+  user's actual machine — rendering and argv are unit-tested instead), macOS
+  launchd, a real phone over the tailnet, and the packaged AppImage path. Known
+  limitation recorded in the plan: the port lives in three places, so
+  `ctl web enable --port N` yields a service the dialog cannot see (it queries
+  7717 and reports `inactive`).
+
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**
   `std::io::Read` (dedicated thread); `take_writer()` is one-shot;

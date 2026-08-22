@@ -91,7 +91,7 @@ if (compat) {
  * KNOWN LIMITATION (plan follow-up 2): this is one of three places the port
  * lives — here, `infra/daemon/amber-web.service`, and `webctl::render_*`'s
  * argument. `amber ctl web enable --port N` therefore produces a service this
- * dialog cannot see: it would query 7717 and report `unit: inactive` while the
+ * dialog cannot see: it queries 7717 and reports `unit: inactive` while the
  * service runs fine on N. The fix is to read the port out of the installed
  * unit; the dialog offers no port editor yet, so this is deliberate for now.
  */
@@ -746,4 +746,46 @@ async function main(): Promise<void> {
   ipcMain.handle('claude-names', (_e, entries: unknown) =>
     claudeNames(
       Array.isArray(entries)
-        ? entr
+        ? entries.flatMap((e) => {
+            const o = e as { id?: unknown; cwd?: unknown }
+            return typeof o?.id === 'string' ? [{ id: o.id, cwd: typeof o.cwd === 'string' ? o.cwd : '' }] : []
+          })
+        : [],
+    ))
+  ipcMain.handle('editor-read', (_e, path: string) => readEditorFile(String(path)))
+  ipcMain.handle('editor-save', (_e, path: string, text: string, expectedMtimeMs: number | null) =>
+    saveEditorFile(String(path), String(text), typeof expectedMtimeMs === 'number' ? expectedMtimeMs : null))
+  ipcMain.handle('editor-save-dialog', async (_e, suggestedName: string, text: string) => {
+    const r = await dialog.showSaveDialog(win, { defaultPath: suggestedName, filters: EDITOR_FILTERS })
+    if (r.canceled || !r.filePath) return null
+    return { path: r.filePath, ...(await saveEditorFile(r.filePath, String(text), null)) }
+  })
+  ipcMain.handle('editor-draft-write', (_e, paneId: string, text: string) =>
+    writeDraft(draftsDir(), String(paneId), String(text)))
+  ipcMain.handle('editor-draft-read', (_e, paneId: string) => readDraft(draftsDir(), String(paneId)))
+  ipcMain.handle('editor-draft-clear', (_e, paneId: string) => clearDraft(draftsDir(), String(paneId)))
+  // Markdown preview images: the sandboxed srcdoc frame inherits the renderer
+  // CSP (img-src 'self' data:), so local file: images never load — main inlines
+  // them as data: URIs. Remote srcs are deliberately left alone.
+  ipcMain.handle('editor-inline-images', (_e, mdDir: string, html: string) =>
+    inlineImages(String(mdDir), String(html)))
+}
+
+// Single-instance lock: a second launch (or a dev run whose predecessor didn't
+// fully exit) would open a second window + utilityProcess attaching the same
+// daemon sessions — duplicate subscriptions that read as "input sent twice".
+// Refuse to run a duplicate; the first instance keeps ownership.
+if (!app.requestSingleInstanceLock()) {
+  app.quit()
+} else {
+  app.whenReady().then(main).catch((e) => {
+    console.error(e)
+    app.quit()
+  })
+}
+// Single-window app: red traffic-light / window close must quit the process on
+// every platform, including macOS. The common Electron pattern of keeping the
+// app alive with zero windows on darwin left amber-ide headless in the Dock
+// (no activate handler recreates a window) until Force Quit. Spec §6/§7: window
+// close never stops the daemon, but it DOES exit the GUI.
+app.on('window-all-closed', () => { app.quit() })
