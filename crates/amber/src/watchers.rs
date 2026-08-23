@@ -216,6 +216,14 @@ impl Watchers {
         self.broadcast_where(msg, |entry| entry.pressure_version >= 1);
     }
 
+    /// Queue a resource-pressure control only for clients that advertised
+    /// version 2 of the pressure-watch capability. Version-1 clients know
+    /// only `MemoryPressure`, so they must never receive this additive event.
+    pub fn broadcast_resource_pressure(&self, msg: &ControlMsg) {
+        debug_assert!(matches!(msg, ControlMsg::ResourcePressure { .. }));
+        self.broadcast_where(msg, |entry| entry.pressure_version >= 2);
+    }
+
     fn broadcast_where(&self, msg: &ControlMsg, include: impl Fn(&Entry) -> bool) {
         let frame = Arc::new(proto::encode(&Frame::Control(msg.clone())));
         self.entries.lock().unwrap().retain(|e| {
@@ -434,6 +442,54 @@ mod tests {
             Some(Frame::Control(ControlMsg::Sessions { sessions })) if sessions.is_empty()
         ));
         assert_eq!(read_next(&mut client, &mut decoder), Some(Frame::Control(delta)));
+    }
+
+    #[test]
+    fn resource_pressure_is_delivered_only_to_version_two_watchers() {
+        // Sending ResourcePressure to a version-1 strict decoder would make
+        // it disconnect. Version 2 explicitly opts into the additive event.
+        let watchers = Watchers::new();
+        let (mut version_one_client, version_one_server) = UnixStream::pair().unwrap();
+        let (mut version_two_client, version_two_server) = UnixStream::pair().unwrap();
+        let version_one = Arc::new(Mutex::new(version_one_server));
+        let version_two = Arc::new(Mutex::new(version_two_server));
+        watchers.register_pressure(&version_one, 1);
+        watchers.register_pressure(&version_two, 2);
+
+        let memory = ControlMsg::MemoryPressure {
+            level: "critical".into(),
+            current_kb: 7_000_000,
+            budget_kb: 8_000_000,
+            blocked: false,
+        };
+        let resource = ControlMsg::ResourcePressure {
+            level: amber_core::proto::ResourcePressureLevel::Critical,
+            causes: vec![amber_core::proto::ResourcePressureCause::Cpu],
+            blocked: false,
+        };
+
+        watchers.broadcast_pressure(&memory);
+        watchers.broadcast_resource_pressure(&resource);
+
+        let mut version_one_decoder = Decoder::new();
+        let mut version_two_decoder = Decoder::new();
+        assert_eq!(
+            read_next(&mut version_one_client, &mut version_one_decoder),
+            Some(Frame::Control(memory.clone()))
+        );
+        assert_eq!(
+            read_next(&mut version_one_client, &mut version_one_decoder),
+            None,
+            "version-1 watcher received ResourcePressure"
+        );
+        assert_eq!(
+            read_next(&mut version_two_client, &mut version_two_decoder),
+            Some(Frame::Control(memory))
+        );
+        assert_eq!(
+            read_next(&mut version_two_client, &mut version_two_decoder),
+            Some(Frame::Control(resource))
+        );
     }
 
     #[test]

@@ -1077,6 +1077,22 @@ impl Hub {
                 ));
                 Self::queue(&mut inner, |_| true, out);
             }
+            Frame::Control(ControlMsg::ResourcePressure {
+                level,
+                causes,
+                blocked,
+            }) => {
+                let out = Out::Text(Arc::new(
+                    serde_json::json!({
+                        "t": "resourcePressure",
+                        "level": level,
+                        "causes": causes,
+                        "blocked": blocked,
+                    })
+                    .to_string(),
+                ));
+                Self::queue(&mut inner, |_| true, out);
+            }
             // Acks (Created/Killed/SessionList/…): nothing the UI needs.
             _ => {}
         }
@@ -1125,7 +1141,7 @@ fn run_daemon_link(hub: Arc<Hub>) {
                     Hub::write_daemon(&mut inner, &Frame::Control(ControlMsg::WatchSessions));
                     Hub::write_daemon(
                         &mut inner,
-                        &Frame::Control(ControlMsg::WatchMemoryPressure { version: 1 }),
+                        &Frame::Control(ControlMsg::WatchMemoryPressure { version: 2 }),
                     );
                     let mut reattach: Vec<String> =
                         inner.clients.iter().filter_map(|c| c.open.clone()).collect();
@@ -2249,6 +2265,60 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn resource_pressure_is_broadcast_to_every_browser_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = Hub::new(dir.path().join("daemon.sock"), dir.path().to_path_buf());
+        let (_a, rx_a) = hub.add_client();
+        let (_b, rx_b) = hub.add_client();
+        for rx in [&rx_a, &rx_b] {
+            let _ = recv_out(rx);
+            let _ = recv_out(rx);
+        }
+
+        hub.on_frame(Frame::Control(ControlMsg::ResourcePressure {
+            level: amber_core::proto::ResourcePressureLevel::Critical,
+            causes: vec![amber_core::proto::ResourcePressureCause::Cpu],
+            blocked: false,
+        }));
+
+        for rx in [&rx_a, &rx_b] {
+            let Out::Text(text) = recv_out(rx) else { panic!("expected resource-pressure text") };
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+                serde_json::json!({
+                    "t": "resourcePressure",
+                    "level": "critical",
+                    "causes": ["cpu"],
+                    "blocked": false,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn daemon_link_subscribes_to_resource_pressure_version_two() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("fake-daemon.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let hub = Hub::new(sock, dir.path().to_path_buf());
+        {
+            let hub = Arc::clone(&hub);
+            thread::spawn(move || run_daemon_link(hub));
+        }
+
+        let (conn, _) = listener.accept().unwrap();
+        conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut reader = FrameReader::new(&conn);
+        let first = reader.next();
+        let second = reader.next();
+        assert!(matches!(
+            [first, second].as_slice(),
+            [Frame::Control(ControlMsg::WatchSessions), Frame::Control(ControlMsg::WatchMemoryPressure { version: 2 })]
+                | [Frame::Control(ControlMsg::WatchMemoryPressure { version: 2 }), Frame::Control(ControlMsg::WatchSessions)]
+        ));
     }
 
     #[test]
