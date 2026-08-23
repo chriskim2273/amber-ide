@@ -1129,6 +1129,47 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   so the soft-keyboard path has never actually run — plus long-press arming,
   real-finger touch scrolling, clipboard gestures, and PWA install.
 
+- [x] SSH remote windows (2026-08-23) — open another machine's amber in its own
+  window. Spec:
+  `docs/superpowers/specs/2026-08-23-ssh-remote-windows-design.md`; report
+  `.reports/ssh-remote.md`. **No daemon change, no protocol change**: the app's
+  client already connected to a unix socket path taken from the environment, so
+  a remote window is `ssh -N -T -L <local>:<remote>` plus a client forked with
+  `AMBER_SOCKET` pointing at the local end. `resolveSocketPath` gains that
+  override — its absence had already cost a live test in this repo, where an
+  `AMBER_SOCKET` that looked set was silently ignored and a verification GUI
+  attached to the user's REAL daemon. Layout is a **read-only mirror** of the
+  remote's `ui-layout.json` (fetched over the same ssh), and read-only is
+  enforced in **main**, which owns the disk, so a renderer bug can never write
+  one machine's layout over another's; grouping still comes from session names
+  (rule #2), so a missing sidecar degrades to correct panes at default geometry.
+  One window per host: `main()`'s per-window wiring became `openWindow(target)`
+  and the three per-window IPC handlers (`daemon-command`, `open-pane`,
+  `close-pane`) now route by `event.sender` through a `windowCtxs` registry.
+  **Host strings are validated before reaching ssh** — a leading `-` would let
+  `-oProxyCommand=…` execute an arbitrary LOCAL command, which is the sharp
+  edge of this feature. amber never parses ssh config, never stores or prompts
+  for a credential, and never passes `StrictHostKeyChecking=no`; auth, host keys
+  and jump hosts are all the user's own ssh. Tunnels die with their window and
+  with the app (a leaked `ssh -N` is the failure mode to avoid). Gates: app 540
+  tests + typecheck + `build` + `build:web`; Rust untouched by this pass.
+  **Live-verified** against a real `ssh localhost` (a genuine remote from the
+  code's point of view): `amber ls` through the tunnel, a window following the
+  forwarded socket, `Connect to host…` opening a SECOND window with its OWN
+  tunnel showing the real daemon's 8 sessions, a deliberate `saveLayout` from
+  that window leaving the real sidecar **byte-identical**, and
+  `-oProxyCommand=touch /tmp/pwned` refused before reaching ssh. **Two bugs
+  live testing caught:** Electron does not implement `window.prompt`, so the
+  first "Connect to host…" silently did nothing (now a real in-app dialog); and
+  a GUI-launched app can inherit **no `SSH_AUTH_SOCK` at all** — measured —
+  making every host "Permission denied (publickey)" however well ssh works in a
+  terminal. Same class as the 2026-07-29 display-env bug and the same fix:
+  recover it from `systemctl --user show-environment`, per call, never cached,
+  and when it still cannot be found say *that* instead of parroting ssh's
+  misleading message. **Not verified:** a genuinely remote host over a network,
+  tunnel relaunch after a mid-session ssh death, macOS (`sshEnv` no-ops off
+  Linux), and protocol skew against an older remote daemon.
+
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**
   `std::io::Read` (dedicated thread); `take_writer()` is one-shot;
