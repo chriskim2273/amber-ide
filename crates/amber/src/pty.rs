@@ -59,7 +59,14 @@ pub(crate) fn monotonic_ms() -> u64 {
 pub enum SuspendOrigin {
     None = 0,
     Manual = 1,
-    Memory = 2,
+    Pressure = 2,
+}
+
+impl SuspendOrigin {
+    /// Source-compatible name for older in-tree callers. The runtime has one
+    /// generalized automatic origin; memory and host PSI share `Pressure`.
+    #[allow(non_upper_case_globals)]
+    pub const Memory: Self = Self::Pressure;
 }
 
 /// Rounds of [`STALL_POLL`] a full subscriber is tolerated for WHILE other
@@ -427,7 +434,7 @@ impl PtySession {
     pub fn suspend_origin(&self) -> SuspendOrigin {
         match self.suspend_origin.load(Ordering::SeqCst) {
             1 => SuspendOrigin::Manual,
-            2 => SuspendOrigin::Memory,
+            2 => SuspendOrigin::Pressure,
             _ => SuspendOrigin::None,
         }
     }
@@ -439,7 +446,7 @@ impl PtySession {
         loop {
             let previous = self.suspend_origin();
             let allowed = match origin {
-                SuspendOrigin::Memory => previous == SuspendOrigin::None,
+                SuspendOrigin::Pressure => previous == SuspendOrigin::None,
                 SuspendOrigin::Manual => previous != SuspendOrigin::Manual,
                 SuspendOrigin::None => false,
             };
@@ -473,13 +480,20 @@ impl PtySession {
     pub fn clear_suspend_origin(&self) -> SuspendOrigin {
         match self.suspend_origin.swap(SuspendOrigin::None as u8, Ordering::SeqCst) {
             1 => SuspendOrigin::Manual,
-            2 => SuspendOrigin::Memory,
+            2 => SuspendOrigin::Pressure,
             _ => SuspendOrigin::None,
         }
     }
 
     pub fn mark_user_activity(&self) {
         self.last_user_ms.store(monotonic_ms().max(1), Ordering::Relaxed);
+    }
+
+    /// The most recent direct user focus or input. Unlike [`last_used_ms`],
+    /// this deliberately excludes PTY output so host-pressure policy can park
+    /// a noisy background agent without weakening memory-budget safety.
+    pub fn last_user_ms(&self) -> u64 {
+        self.last_user_ms.load(Ordering::Relaxed)
     }
 
     pub fn last_used_ms(&self) -> u64 {
@@ -822,10 +836,10 @@ mod tests {
         let cmd = CommandBuilder::new("cat");
         let sess = PtySession::spawn(cmd, 24, 80, 4096).unwrap();
 
-        assert_eq!(sess.claim_suspend(SuspendOrigin::Memory), Ok(SuspendOrigin::None));
-        assert_eq!(sess.claim_suspend(SuspendOrigin::Manual), Ok(SuspendOrigin::Memory));
+        assert_eq!(sess.claim_suspend(SuspendOrigin::Pressure), Ok(SuspendOrigin::None));
+        assert_eq!(sess.claim_suspend(SuspendOrigin::Manual), Ok(SuspendOrigin::Pressure));
         assert_eq!(
-            sess.claim_suspend(SuspendOrigin::Memory),
+            sess.claim_suspend(SuspendOrigin::Pressure),
             Err(SuspendOrigin::Manual)
         );
         assert_eq!(sess.suspend_origin(), SuspendOrigin::Manual);
@@ -847,6 +861,19 @@ mod tests {
         sess.write(b"activity\n").unwrap();
         wait_for(&sess, b"activity");
         assert!(sess.last_used_ms() > before);
+    }
+
+    #[test]
+    fn output_does_not_refresh_user_activity() {
+        // Host-pressure parking ranks only actual focus/input. A noisy hidden
+        // agent must not gain protection simply by continuing to print output.
+        let cmd = CommandBuilder::new("/bin/cat");
+        let sess = PtySession::spawn(cmd, 24, 80, 4096).unwrap();
+        let before = sess.last_user_ms();
+        std::thread::sleep(Duration::from_millis(2));
+        sess.write(b"background-output\n").unwrap();
+        wait_for(&sess, b"background-output");
+        assert_eq!(sess.last_user_ms(), before);
     }
 
     #[test]

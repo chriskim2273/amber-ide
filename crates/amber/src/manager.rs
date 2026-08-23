@@ -5,7 +5,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -14,7 +14,7 @@ use amber_core::state::{Config, SessionKind, SessionMeta, StateStore};
 use portable_pty::CommandBuilder;
 
 use crate::cgroup::{CgroupManager, CgroupRole};
-use crate::memory_guardian::{Candidate, RECENT_USE_MS};
+use crate::memory_guardian::{Candidate, HostPressureCandidate, RECENT_USE_MS};
 use crate::pty::{PtySession, SuspendOrigin};
 use crate::watchers::Watchers;
 
@@ -129,6 +129,10 @@ pub struct SessionManager {
     cfg: Config,
     root: PathBuf,
     sessions: Mutex<HashMap<String, Arc<PtySession>>>,
+    /// Stable slot of the terminal most recently focused or written to. Zero
+    /// means no foreground session yet; slots make rename unable to drop this
+    /// protection by changing only the session name.
+    foreground_slot: AtomicU32,
     /// The guardian's LIVE aggregate budget in KiB (0 = none). An
     /// `Arc<AtomicU64>` so `SetMemoryBudget` can move it while the guardian
     /// thread reads it every tick — a budget change takes effect without a
@@ -183,6 +187,14 @@ struct LiveMetaOverride {
 pub enum ResumeCause {
     Manual,
     Focus,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AutomaticSuspendRecency {
+    /// The existing aggregate-memory guardian protects recent output too.
+    Memory,
+    /// Host PSI policy protects only direct focus and terminal input.
+    Host,
 }
 
 /// Consecutive absent periodic snapshots before `resume_as_claude` downgrades
@@ -261,6 +273,7 @@ impl SessionManager {
             cfg,
             root,
             sessions: Mutex::new(HashMap::new()),
+            foreground_slot: AtomicU32::new(0),
             budget_kb: Arc::new(AtomicU64::new(0)),
             deferred_meta: Mutex::new(HashMap::new()),
             socket: None,
@@ -1071,7 +1084,112 @@ impl SessionManager {
             .collect()
     }
 
+    /// The stable slot protected from host-pressure parking. Exposed for the
+    /// optional cgroup CPU weighting pass as well as candidate selection.
+    pub fn foreground_slot(&self) -> u32 {
+        self.foreground_slot.load(Ordering::SeqCst)
+    }
+
+    fn set_foreground_locked(&self, name: &str, session: &Arc<PtySession>) -> anyhow::Result<()> {
+        let meta = self
+            .effective_meta_for(name, session)?
+            .ok_or_else(|| anyhow::anyhow!("session {name} vanished from the store"))?;
+        self.foreground_slot.store(meta.slot, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn clear_foreground_slot(&self, slot: u32) {
+        let _ = self.foreground_slot.compare_exchange(
+            slot,
+            0,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+    }
+
+    /// Snapshot host-pressure-safe candidates. This is intentionally separate
+    /// from [`memory_candidates`]: memory policy preserves output recency,
+    /// while host policy ranks only focus/input and excludes the foreground
+    /// stable slot.
+    pub fn host_pressure_candidates(
+        &self,
+        now_ms: u64,
+        per_session_kb: &HashMap<String, u64>,
+    ) -> Vec<HostPressureCandidate> {
+        let foreground_slot = self.foreground_slot();
+        let sessions: Vec<(String, Arc<PtySession>)> = self
+            .sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, session)| (name.clone(), Arc::clone(session)))
+            .collect();
+        let mut candidates: Vec<HostPressureCandidate> = sessions
+            .into_iter()
+            .filter_map(|(name, session)| {
+                let meta = match self.effective_meta_for(&name, &session) {
+                    Ok(Some(meta)) => meta,
+                    Ok(None) => return None,
+                    Err(error) => {
+                        eprintln!(
+                            "amber daemon: host-pressure candidate {name} metadata failed: {error}"
+                        );
+                        return None;
+                    }
+                };
+                if meta.slot == foreground_slot
+                    || !meta.kind.is_agent()
+                    || !session.is_alive()
+                    || session.run_state().as_deref() != Some("claude")
+                    || session.suspend_origin() != SuspendOrigin::None
+                    || now_ms.saturating_sub(session.last_user_ms()) < RECENT_USE_MS
+                {
+                    return None;
+                }
+                let has_resume_id = match self.store.read_claude(&name) {
+                    Ok(recorded) => {
+                        recorded.is_some_and(|recorded| !recorded.session_id.is_empty())
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "amber daemon: host-pressure candidate {name} resume id failed: {error}"
+                        );
+                        false
+                    }
+                };
+                has_resume_id.then(|| HostPressureCandidate {
+                    memory_kb: per_session_kb.get(&name).copied().unwrap_or(0),
+                    last_user_ms: session.last_user_ms(),
+                    name,
+                })
+            })
+            .collect();
+        candidates.sort_by(|left, right| {
+            left.last_user_ms
+                .cmp(&right.last_user_ms)
+                .then_with(|| right.memory_kb.cmp(&left.memory_kb))
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        candidates
+    }
+
+    /// Preserve the aggregate-memory path's conservative output-recency check.
     pub fn suspend_for_memory(&self, name: &str, now_ms: u64) -> anyhow::Result<()> {
+        self.suspend_for_automatic(name, now_ms, AutomaticSuspendRecency::Memory)
+    }
+
+    /// Host PSI parking uses user recency only and refuses the stable
+    /// foreground slot. All checks run under the session transition lock.
+    pub fn suspend_for_pressure(&self, name: &str, now_ms: u64) -> anyhow::Result<()> {
+        self.suspend_for_automatic(name, now_ms, AutomaticSuspendRecency::Host)
+    }
+
+    fn suspend_for_automatic(
+        &self,
+        name: &str,
+        now_ms: u64,
+        recency: AutomaticSuspendRecency,
+    ) -> anyhow::Result<()> {
         let session = self
             .session(name)
             .ok_or_else(|| anyhow::anyhow!("no such session: {name}"))?;
@@ -1081,7 +1199,7 @@ impl SessionManager {
             .effective_meta_for(name, &session)?
             .ok_or_else(|| anyhow::anyhow!("session {name} vanished from the store"))?;
         if !meta.kind.is_agent() {
-            anyhow::bail!("automatic memory suspend applies only to agent sessions: {name}");
+            anyhow::bail!("automatic pressure suspend applies only to agent sessions: {name}");
         }
         if session.run_state().as_deref() != Some("claude") {
             anyhow::bail!("session {name} no longer has a running agent");
@@ -1096,35 +1214,48 @@ impl SessionManager {
         if session.suspend_origin() != SuspendOrigin::None {
             anyhow::bail!("session {name} is already suspended");
         }
-        if now_ms.saturating_sub(session.last_used_ms()) < RECENT_USE_MS {
+        if recency == AutomaticSuspendRecency::Host && meta.slot == self.foreground_slot() {
+            anyhow::bail!("session {name} is the foreground session");
+        }
+        let last_activity_ms = match recency {
+            AutomaticSuspendRecency::Memory => session.last_used_ms(),
+            AutomaticSuspendRecency::Host => session.last_user_ms(),
+        };
+        if now_ms.saturating_sub(last_activity_ms) < RECENT_USE_MS {
             anyhow::bail!("session {name} received recent activity");
         }
 
         session
-            .claim_suspend(SuspendOrigin::Memory)
+            .claim_suspend(SuspendOrigin::Pressure)
             .map_err(|origin| anyhow::anyhow!("session {name} is already suspended by {origin:?}"))?;
         let previous_started = session.memory_suspend_started_ms();
         session.set_memory_suspend_started_ms(now_ms.max(1));
         if let Err(error) = Self::signal_supervisor(name, &session, nix::libc::SIGUSR1) {
-            session.restore_suspend_origin(SuspendOrigin::Memory, SuspendOrigin::None);
+            session.restore_suspend_origin(SuspendOrigin::Pressure, SuspendOrigin::None);
             session.set_memory_suspend_started_ms(previous_started);
             return Err(error);
         }
         Ok(())
     }
 
-    pub fn memory_suspend_pending_since(&self) -> Option<u64> {
+    pub fn pressure_suspend_pending_since(&self) -> Option<u64> {
         let sessions: Vec<Arc<PtySession>> =
             self.sessions.lock().unwrap().values().cloned().collect();
         sessions
             .into_iter()
             .filter(|session| {
-                session.suspend_origin() == SuspendOrigin::Memory
+                session.suspend_origin() == SuspendOrigin::Pressure
                     && session.run_state().as_deref() != Some("suspended")
             })
             .map(|session| session.memory_suspend_started_ms())
             .filter(|started| *started != 0)
             .min()
+    }
+
+    /// Compatibility name for the existing memory guardian; automatic
+    /// suspension is now shared by memory-budget and host-PSI policy.
+    pub fn memory_suspend_pending_since(&self) -> Option<u64> {
+        self.pressure_suspend_pending_since()
     }
 
     pub fn cgroup_memory_sample(
@@ -1376,7 +1507,7 @@ impl SessionManager {
             return Self::signal_supervisor(name, &session, nix::libc::SIGUSR1);
         }
         if current != SuspendOrigin::None
-            && !(current == SuspendOrigin::Memory && origin == SuspendOrigin::Manual)
+            && !(current == SuspendOrigin::Pressure && origin == SuspendOrigin::Manual)
         {
             anyhow::bail!("session {name} is already suspended by {current:?}");
         }
@@ -1389,14 +1520,14 @@ impl SessionManager {
             .map_err(|existing| anyhow::anyhow!("session {name} is already suspended by {existing:?}"))?;
         let previous_started = session.memory_suspend_started_ms();
         match origin {
-            SuspendOrigin::Memory => {
+            SuspendOrigin::Pressure => {
                 session.set_memory_suspend_started_ms(crate::pty::monotonic_ms().max(1));
             }
             SuspendOrigin::Manual => session.set_memory_suspend_started_ms(0),
             SuspendOrigin::None => unreachable!(),
         }
 
-        if previous == SuspendOrigin::Memory && state.as_deref() == Some("suspended") {
+        if previous == SuspendOrigin::Pressure && state.as_deref() == Some("suspended") {
             return Ok(());
         }
         if let Err(error) = Self::signal_supervisor(name, &session, nix::libc::SIGUSR1) {
@@ -1416,7 +1547,7 @@ impl SessionManager {
         let origin = session.suspend_origin();
         let eligible = match cause {
             ResumeCause::Manual => origin != SuspendOrigin::None,
-            ResumeCause::Focus => origin == SuspendOrigin::Memory,
+            ResumeCause::Focus => origin == SuspendOrigin::Pressure,
         };
         if !eligible {
             return Ok(false);
@@ -1462,6 +1593,7 @@ impl SessionManager {
             .ok_or_else(|| anyhow::anyhow!("no such session: {name}"))?;
         let _transition = session.lock_suspend_transition();
         self.ensure_current_session(name, &session)?;
+        self.set_foreground_locked(name, &session)?;
         session.mark_user_activity();
         self.resume_for_focus_locked(name, &session)
     }
@@ -1498,8 +1630,8 @@ impl SessionManager {
                     alive: sess.is_alive(),
                     updated: meta.updated,
                     run_state: match (sess.run_state(), sess.suspend_origin()) {
-                        (Some(state), SuspendOrigin::Memory) if state == "suspended" => {
-                            Some("memory-suspended".to_string())
+                        (Some(state), SuspendOrigin::Pressure) if state == "suspended" => {
+                            Some("resource-suspended".to_string())
                         }
                         (state, _) => state,
                     },
@@ -1520,6 +1652,7 @@ impl SessionManager {
             .ok_or_else(|| anyhow::anyhow!("no such session: {name}"))?;
         let _transition = session.lock_suspend_transition();
         self.ensure_current_session(name, &session)?;
+        self.set_foreground_locked(name, &session)?;
         session.mark_user_activity();
         self.resume_for_focus_locked(name, &session)?;
         if session.suspend_origin() == SuspendOrigin::Manual {
@@ -1559,6 +1692,7 @@ impl SessionManager {
                 self.stop_session_locked(meta.slot, Some(&session))?;
                 self.store.remove_session(&name)?;
                 self.sessions.lock().unwrap().remove(&name);
+                self.clear_foreground_slot(meta.slot);
                 Ok(())
             })();
             match result {
@@ -1695,7 +1829,7 @@ impl SessionManager {
             None => self.store.read_session(name)?,
         };
         let _transition = sess.as_ref().map(|session| session.lock_suspend_transition());
-        if let Some(meta) = meta {
+        if let Some(ref meta) = meta {
             self.stop_session_locked(meta.slot, sess.as_ref())?;
         } else if let Some(sess) = &sess {
             sess.kill()?;
@@ -1705,6 +1839,9 @@ impl SessionManager {
         }
         self.store.remove_session(name)?;
         self.sessions.lock().unwrap().remove(name);
+        if let Some(meta) = meta {
+            self.clear_foreground_slot(meta.slot);
+        }
         Ok(())
     }
 }
@@ -1783,6 +1920,10 @@ mod tests {
     }
 
     fn fake_agent(mgr: &SessionManager, name: &str) -> Arc<PtySession> {
+        fake_agent_with_slot(mgr, name, 1)
+    }
+
+    fn fake_agent_with_slot(mgr: &SessionManager, name: &str, slot: u32) -> Arc<PtySession> {
         let mut cmd = CommandBuilder::new("/bin/sh");
         cmd.arg("-c");
         cmd.arg(
@@ -1804,12 +1945,25 @@ mod tests {
                 updated: 1,
                 resume_as_claude: false,
                 run_state: None,
-                slot: 1,
+                slot,
             })
             .unwrap();
         session.set_run_state(Some("claude".into()));
         mgr.sessions.lock().unwrap().insert(name.to_string(), Arc::clone(&session));
         session
+    }
+
+    fn record_resume_id(mgr: &SessionManager, name: &str, cwd: &Path) {
+        mgr.store
+            .write_claude(
+                name,
+                &amber_core::state::ClaudeMeta {
+                    session_id: format!("resume-{name}"),
+                    cwd: cwd.to_path_buf(),
+                    updated: 1,
+                },
+            )
+            .unwrap();
     }
 
     fn write_rename_journal(root: &Path, from: &str, to: &str, mut source: SessionMeta) {
@@ -2611,9 +2765,9 @@ mod tests {
         let mgr = SessionManager::new(dir.path()).unwrap();
         let session = fake_agent(&mgr, "agent");
 
-        mgr.suspend("agent", SuspendOrigin::Memory).unwrap();
+        mgr.suspend("agent", SuspendOrigin::Pressure).unwrap();
         wait_for_output(&session, b"SUSPEND_SIGNAL");
-        assert_eq!(session.suspend_origin(), SuspendOrigin::Memory);
+        assert_eq!(session.suspend_origin(), SuspendOrigin::Pressure);
         assert_ne!(session.memory_suspend_started_ms(), 0);
 
         session.set_run_state(Some("suspended".into()));
@@ -2652,6 +2806,116 @@ mod tests {
 
         session.claim_suspend(SuspendOrigin::Manual).unwrap();
         assert!(mgr.memory_candidates(&HashMap::new())[0].suspended);
+    }
+
+    #[test]
+    fn host_pressure_candidates_ignore_output_but_protect_recent_user_input() {
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        let session = fake_agent_with_slot(&mgr, "background", 1);
+        record_resume_id(&mgr, "background", dir.path());
+
+        let eligible_at = session.last_user_ms() + RECENT_USE_MS;
+        session.write(b"noisy-background-output\n").unwrap();
+        wait_for_output(&session, b"INPUT:noisy-background-output");
+        assert_eq!(
+            mgr.host_pressure_candidates(
+                eligible_at,
+                &HashMap::from([("background".to_string(), 321)]),
+            )
+            .iter()
+            .map(|candidate| candidate.name.as_str())
+            .collect::<Vec<_>>(),
+            vec!["background"],
+            "PTY output must not refresh host-pressure recency",
+        );
+
+        mgr.write("background", b"actual-user-input\n").unwrap();
+        wait_for_output(&session, b"INPUT:actual-user-input");
+        mgr.create("foreground-shell", dir.path(), SessionKind::Shell).unwrap();
+        mgr.focus_session("foreground-shell").unwrap();
+        let too_recent = session.last_user_ms() + RECENT_USE_MS - 1;
+        assert!(
+            mgr.host_pressure_candidates(
+                too_recent,
+                &HashMap::from([("background".to_string(), 321)]),
+            )
+            .is_empty(),
+            "actual user input must retain the 120-second protection",
+        );
+    }
+
+    #[test]
+    fn foreground_slot_remains_excluded_after_rename() {
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        let from = "foreground-before-rename";
+        let to = "foreground-after-rename";
+        mgr.create(from, dir.path(), SessionKind::Shell).unwrap();
+        assert!(!mgr.focus_session(from).unwrap());
+        let slot = mgr.store.read_session(from).unwrap().unwrap().slot;
+
+        mgr.rename(from, to).unwrap();
+        let session = mgr.session(to).unwrap();
+        session.set_run_state(Some("claude".into()));
+        let mut meta = mgr.store.read_session(to).unwrap().unwrap();
+        meta.kind = SessionKind::Claude;
+        mgr.store.write_session(&meta).unwrap();
+        record_resume_id(&mgr, to, dir.path());
+
+        assert_eq!(mgr.store.read_session(to).unwrap().unwrap().slot, slot);
+        assert!(
+            mgr.host_pressure_candidates(
+                session.last_user_ms() + RECENT_USE_MS,
+                &HashMap::from([(to.to_string(), 321)]),
+            )
+            .is_empty(),
+            "the stable foreground slot must survive a name change",
+        );
+        mgr.remove(to).unwrap();
+    }
+
+    #[test]
+    fn host_pressure_candidates_keep_existing_automatic_safety_exclusions() {
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        let eligible = fake_agent_with_slot(&mgr, "eligible", 1);
+        let manual = fake_agent_with_slot(&mgr, "manual", 2);
+        let retrying = fake_agent_with_slot(&mgr, "retrying", 3);
+        let missing_id = fake_agent_with_slot(&mgr, "missing-id", 4);
+        mgr.create("shell", dir.path(), SessionKind::Shell).unwrap();
+        record_resume_id(&mgr, "eligible", dir.path());
+        record_resume_id(&mgr, "manual", dir.path());
+        record_resume_id(&mgr, "retrying", dir.path());
+        manual.claim_suspend(SuspendOrigin::Manual).unwrap();
+        retrying.set_run_state(Some("claude-retrying".into()));
+
+        let now_ms = [
+            eligible.last_user_ms(),
+            manual.last_user_ms(),
+            retrying.last_user_ms(),
+            missing_id.last_user_ms(),
+        ]
+        .into_iter()
+        .max()
+        .unwrap()
+            + RECENT_USE_MS;
+        assert_eq!(
+            mgr.host_pressure_candidates(
+                now_ms,
+                &HashMap::from([
+                    ("eligible".to_string(), 1),
+                    ("manual".to_string(), 2),
+                    ("retrying".to_string(), 3),
+                    ("missing-id".to_string(), 4),
+                    ("shell".to_string(), 5),
+                ]),
+            )
+            .iter()
+            .map(|candidate| candidate.name.as_str())
+            .collect::<Vec<_>>(),
+            vec!["eligible"],
+        );
     }
 
     #[test]
@@ -2716,9 +2980,9 @@ mod tests {
         let mgr = SessionManager::new(dir.path()).unwrap();
         let first = fake_agent(&mgr, "first");
         let second = fake_agent(&mgr, "second");
-        first.claim_suspend(SuspendOrigin::Memory).unwrap();
+        first.claim_suspend(SuspendOrigin::Pressure).unwrap();
         first.set_memory_suspend_started_ms(20);
-        second.claim_suspend(SuspendOrigin::Memory).unwrap();
+        second.claim_suspend(SuspendOrigin::Pressure).unwrap();
         second.set_memory_suspend_started_ms(10);
         assert_eq!(mgr.memory_suspend_pending_since(), Some(10));
 
@@ -2748,7 +3012,7 @@ mod tests {
         let mgr = SessionManager::new(dir.path()).unwrap();
         let session = fake_agent(&mgr, "agent");
         session.set_run_state(Some("suspended".into()));
-        session.claim_suspend(SuspendOrigin::Memory).unwrap();
+        session.claim_suspend(SuspendOrigin::Pressure).unwrap();
 
         assert!(mgr.focus_session("agent").unwrap());
         wait_for_output(&session, b"RESUME_SIGNAL");
@@ -2765,7 +3029,7 @@ mod tests {
         let mgr = SessionManager::new(dir.path()).unwrap();
         let session = fake_agent(&mgr, "agent");
         session.set_run_state(Some("suspended".into()));
-        session.claim_suspend(SuspendOrigin::Memory).unwrap();
+        session.claim_suspend(SuspendOrigin::Pressure).unwrap();
 
         mgr.write("agent", b"memory-input\n").unwrap();
         wait_for_output(&session, b"RESUME_SIGNAL");
@@ -2785,7 +3049,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let mgr = SessionManager::new(dir.path()).unwrap();
         let session = fake_agent(&mgr, "agent");
-        session.claim_suspend(SuspendOrigin::Memory).unwrap();
+        session.claim_suspend(SuspendOrigin::Pressure).unwrap();
         session.set_memory_suspend_started_ms(77);
         session.kill().unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -2795,12 +3059,12 @@ mod tests {
         }
 
         assert!(mgr.resume("agent", ResumeCause::Manual).is_err());
-        assert_eq!(session.suspend_origin(), SuspendOrigin::Memory);
+        assert_eq!(session.suspend_origin(), SuspendOrigin::Pressure);
         assert_eq!(session.memory_suspend_started_ms(), 77);
 
         session.set_run_state(Some("claude".into()));
         assert!(mgr.suspend("agent", SuspendOrigin::Manual).is_err());
-        assert_eq!(session.suspend_origin(), SuspendOrigin::Memory);
+        assert_eq!(session.suspend_origin(), SuspendOrigin::Pressure);
         assert_eq!(session.memory_suspend_started_ms(), 77);
     }
 
@@ -2810,7 +3074,7 @@ mod tests {
         let mgr = Arc::new(SessionManager::new(dir.path()).unwrap());
         let session = fake_agent(&mgr, "agent");
         session.set_run_state(Some("suspended".into()));
-        session.claim_suspend(SuspendOrigin::Memory).unwrap();
+        session.claim_suspend(SuspendOrigin::Pressure).unwrap();
         let guard = session.lock_suspend_transition();
         let (tx, rx) = mpsc::channel();
         let worker = Arc::clone(&mgr);
@@ -2829,7 +3093,7 @@ mod tests {
         let mgr = Arc::new(SessionManager::new(dir.path()).unwrap());
         let session = fake_agent(&mgr, "agent");
         session.set_run_state(Some("suspended".into()));
-        session.claim_suspend(SuspendOrigin::Memory).unwrap();
+        session.claim_suspend(SuspendOrigin::Pressure).unwrap();
 
         // Hold the child-killer lock so remove owns the transition lock but
         // cannot finish. Focus then deterministically queues behind teardown.
@@ -2874,8 +3138,8 @@ mod tests {
         let mgr = SessionManager::new(dir.path()).unwrap();
         let session = fake_agent(&mgr, "agent");
         session.set_run_state(Some("suspended".into()));
-        session.claim_suspend(SuspendOrigin::Memory).unwrap();
-        assert_eq!(mgr.session_infos().unwrap()[0].run_state.as_deref(), Some("memory-suspended"));
+        session.claim_suspend(SuspendOrigin::Pressure).unwrap();
+        assert_eq!(mgr.session_infos().unwrap()[0].run_state.as_deref(), Some("resource-suspended"));
 
         session.claim_suspend(SuspendOrigin::Manual).unwrap();
         assert_eq!(mgr.session_infos().unwrap()[0].run_state.as_deref(), Some("suspended"));
@@ -3047,16 +3311,16 @@ mod tests {
         let to = "amber-1-2-0-memory";
         let before = fake_agent(&mgr, from);
         before.set_run_state(Some("suspended".into()));
-        before.claim_suspend(SuspendOrigin::Memory).unwrap();
+        before.claim_suspend(SuspendOrigin::Pressure).unwrap();
         before.set_memory_suspend_started_ms(77);
 
         mgr.rename(from, to).unwrap();
 
         let after = mgr.session(to).unwrap();
-        assert_eq!(after.suspend_origin(), SuspendOrigin::Memory);
+        assert_eq!(after.suspend_origin(), SuspendOrigin::Pressure);
         assert_eq!(after.memory_suspend_started_ms(), 77);
         assert!(mgr.focus_session(to).unwrap(), "memory suspension must resume on focus");
-        assert_eq!(after.suspend_origin(), SuspendOrigin::Memory, "focus waits for the new supervisor");
+        assert_eq!(after.suspend_origin(), SuspendOrigin::Pressure, "focus waits for the new supervisor");
         assert!(after.pending_resume_for_test());
     }
 
@@ -3066,11 +3330,11 @@ mod tests {
         let mgr = SessionManager::new(dir.path()).unwrap();
         let session = fake_agent(&mgr, "agent");
         session.set_run_state(Some("suspended".into()));
-        session.claim_suspend(SuspendOrigin::Memory).unwrap();
+        session.claim_suspend(SuspendOrigin::Pressure).unwrap();
         session.await_initial_suspend_ready();
 
         assert!(mgr.focus_session("agent").unwrap());
-        assert_eq!(session.suspend_origin(), SuspendOrigin::Memory);
+        assert_eq!(session.suspend_origin(), SuspendOrigin::Pressure);
         assert!(session.pending_resume_for_test());
 
         mgr.set_run_state("agent", "suspended").unwrap();
@@ -3084,10 +3348,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let mgr = SessionManager::new(dir.path()).unwrap();
         let session = fake_agent(&mgr, "agent");
-        session.claim_suspend(SuspendOrigin::Memory).unwrap();
+        session.claim_suspend(SuspendOrigin::Pressure).unwrap();
 
         assert!(mgr.focus_session("agent").unwrap());
-        assert_eq!(session.suspend_origin(), SuspendOrigin::Memory);
+        assert_eq!(session.suspend_origin(), SuspendOrigin::Pressure);
         assert!(session.pending_resume_for_test());
         std::thread::sleep(std::time::Duration::from_millis(100));
         assert!(
@@ -3113,8 +3377,8 @@ mod tests {
             for (origin, queue_resume) in [
                 (SuspendOrigin::Manual, false),
                 (SuspendOrigin::Manual, true),
-                (SuspendOrigin::Memory, false),
-                (SuspendOrigin::Memory, true),
+                (SuspendOrigin::Pressure, false),
+                (SuspendOrigin::Pressure, true),
             ] {
                 let dir = tempdir().unwrap();
                 let mgr = SessionManager::new(dir.path()).unwrap();
@@ -3286,7 +3550,7 @@ mod tests {
 
     #[test]
     fn agent_rename_rollback_restores_the_original_suspension() {
-        for (origin, started) in [(SuspendOrigin::Manual, 0), (SuspendOrigin::Memory, 91)] {
+        for (origin, started) in [(SuspendOrigin::Manual, 0), (SuspendOrigin::Pressure, 91)] {
             let dir = tempdir().unwrap();
             let mgr = SessionManager::new(dir.path()).unwrap();
             let from = "amber-1-1-0-rollback";

@@ -3,15 +3,17 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use amber_core::proto::ControlMsg;
-use amber_core::state::MemoryConfig;
+use amber_core::proto::{ControlMsg, ResourcePressureCause, ResourcePressureLevel};
+use amber_core::state::{MemoryConfig, PressureConfig};
 
+use crate::host_pressure::{HostPressureCause, HostPressureDecision, HostPressureState};
 use crate::manager::SessionManager;
 use crate::watchers::Watchers;
 
 pub const RECENT_USE_MS: u64 = 120_000;
 const SUSPEND_STALL_MS: u64 = 10_000;
 const PRESSURE_REFRESH_MS: u64 = 3_000;
+const PSI_ERROR_LOG_MS: u64 = 60_000;
 const WINDOW: usize = 5;
 const MIN_GROWTH_KB: u64 = 100_000;
 const NOISE_KB: u64 = 20_000;
@@ -31,6 +33,14 @@ pub struct Candidate {
     pub running: bool,
     pub has_resume_id: bool,
     pub suspended: bool,
+}
+
+/// A host-pressure victim. It carries only host-policy truth: user activity
+/// deliberately excludes PTY output, while measured memory breaks ties.
+pub struct HostPressureCandidate {
+    pub name: String,
+    pub memory_kb: u64,
+    pub last_user_ms: u64,
 }
 
 pub fn pressure_level(previous: PressureLevel, current_kb: u64, budget_kb: u64) -> PressureLevel {
@@ -134,6 +144,105 @@ fn should_broadcast(
         || last_broadcast_ms.is_none_or(|last| now_ms.saturating_sub(last) >= PRESSURE_REFRESH_MS)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResourcePressureStatus {
+    level: ResourcePressureLevel,
+    causes: Vec<ResourcePressureCause>,
+    blocked: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct HostStepDecision {
+    status: Option<ResourcePressureStatus>,
+    candidate: Option<String>,
+    blocked: bool,
+}
+
+fn resource_pressure_cause(cause: HostPressureCause) -> ResourcePressureCause {
+    match cause {
+        HostPressureCause::Cpu => ResourcePressureCause::Cpu,
+        HostPressureCause::Io => ResourcePressureCause::Io,
+        HostPressureCause::Memory => ResourcePressureCause::Memory,
+    }
+}
+
+fn host_step(
+    now_ms: u64,
+    pressure: HostPressureDecision,
+    pending_since_ms: Option<u64>,
+    candidates: &[HostPressureCandidate],
+) -> HostStepDecision {
+    match pressure {
+        HostPressureDecision::Unavailable => HostStepDecision {
+            status: None,
+            candidate: None,
+            blocked: false,
+        },
+        HostPressureDecision::Normal => HostStepDecision {
+            status: Some(ResourcePressureStatus {
+                level: ResourcePressureLevel::Normal,
+                causes: Vec::new(),
+                blocked: false,
+            }),
+            candidate: None,
+            blocked: false,
+        },
+        HostPressureDecision::Critical { causes, can_park } => {
+            let mut blocked = false;
+            let candidate = if !can_park {
+                None
+            } else if let Some(started) = pending_since_ms {
+                blocked = now_ms.saturating_sub(started) >= SUSPEND_STALL_MS;
+                None
+            } else {
+                let candidate = candidates.first().map(|candidate| candidate.name.clone());
+                blocked = candidate.is_none();
+                candidate
+            };
+            HostStepDecision {
+                status: Some(ResourcePressureStatus {
+                    level: ResourcePressureLevel::Critical,
+                    causes: causes.into_iter().map(resource_pressure_cause).collect(),
+                    blocked,
+                }),
+                candidate,
+                blocked,
+            }
+        }
+    }
+}
+
+/// Snapshot immediately before the manager's locked final recheck. `true`
+/// means the signal succeeded, which is the sole authorization to start the
+/// host policy cooldown.
+fn apply_host_action(
+    decision: &mut HostStepDecision,
+    snapshot: impl FnOnce() -> anyhow::Result<()>,
+    suspend: impl FnOnce(&str) -> anyhow::Result<()>,
+) -> anyhow::Result<bool> {
+    let Some(name) = decision.candidate.as_deref() else {
+        return Ok(false);
+    };
+    let result = snapshot().and_then(|()| suspend(name));
+    if result.is_err() {
+        decision.blocked = true;
+        if let Some(status) = &mut decision.status {
+            status.blocked = true;
+        }
+    }
+    result.map(|()| true)
+}
+
+fn should_broadcast_resource(
+    previous: Option<&ResourcePressureStatus>,
+    last_broadcast_ms: Option<u64>,
+    now_ms: u64,
+    next: &ResourcePressureStatus,
+) -> bool {
+    previous != Some(next)
+        || last_broadcast_ms.is_none_or(|last| now_ms.saturating_sub(last) >= PRESSURE_REFRESH_MS)
+}
+
 fn record_rss_stat(
     histories: &mut HashMap<String, VecDeque<u64>>,
     name: String,
@@ -164,15 +273,21 @@ fn select_pressure_sample(
     }
 }
 
-/// Start the daemon's single memory monitor/guardian thread. Cgroup charge is
-/// sampled every second when available; per-session telemetry comes from the
-/// same sample (see the tick loop) and the process-table walk survives only
-/// as the no-containment fallback.
+/// Start the daemon's single resource-pressure guardian thread. Cgroup charge
+/// is sampled every second when available; per-session telemetry comes from
+/// the same sample (see the tick loop) and the process-table walk survives
+/// only as the no-containment fallback. Host PSI is sampled on this same
+/// worker, never from a connection or PTY thread.
 ///
 /// The budget is read FRESH from the manager every tick, not captured here:
 /// `SetMemoryBudget` moves it on a live daemon (`amber ctl budget`, the app's
 /// memory dialog), and a restart would defeat the point.
-pub fn start(manager: Arc<SessionManager>, watchers: Arc<Watchers>, config: MemoryConfig) {
+pub fn start(
+    manager: Arc<SessionManager>,
+    watchers: Arc<Watchers>,
+    config: MemoryConfig,
+    pressure_config: PressureConfig,
+) {
     match manager.effective_budget_kb() {
         Some(budget) => eprintln!("amber daemon: memory guardian budget {budget} KiB"),
         None => eprintln!(
@@ -184,6 +299,11 @@ pub fn start(manager: Arc<SessionManager>, watchers: Arc<Watchers>, config: Memo
         let mut level = PressureLevel::Normal;
         let mut blocked = false;
         let mut last_pressure_broadcast_ms: Option<u64> = None;
+        let mut host_pressure = HostPressureState::new(pressure_config);
+        let mut last_resource_status: Option<ResourcePressureStatus> = None;
+        let mut last_resource_broadcast_ms: Option<u64> = None;
+        let mut last_psi_error_log_ms: Option<u64> = None;
+        let mut last_per_session_kb: HashMap<String, u64> = HashMap::new();
         let mut samples: HashMap<String, VecDeque<u64>> = HashMap::new();
         let mut tick = 0u64;
         loop {
@@ -252,69 +372,136 @@ pub fn start(manager: Arc<SessionManager>, watchers: Arc<Watchers>, config: Memo
                     None
                 };
 
-            let Some(budget) = budget_kb else { continue };
-            let Some((current_kb, per_session_kb)) =
-                select_pressure_sample(cgroup_enabled, cgroup_sample, rss_sample)
-            else {
-                continue;
-            };
             let now_ms = crate::pty::monotonic_ms();
+            if let (Some(budget), Some((current_kb, per_session_kb))) = (
+                budget_kb,
+                select_pressure_sample(cgroup_enabled, cgroup_sample, rss_sample),
+            ) {
+                last_per_session_kb = per_session_kb.clone();
+                let pending_since = config
+                    .enabled
+                    .then(|| manager.pressure_suspend_pending_since())
+                    .flatten();
+                let next_level = pressure_level(level, current_kb, budget);
+                let candidates = if config.enabled
+                    && next_level == PressureLevel::Critical
+                    && pending_since.is_none()
+                {
+                    manager.memory_candidates(&per_session_kb)
+                } else {
+                    Vec::new()
+                };
+                let mut decision = step(
+                    level,
+                    now_ms,
+                    current_kb,
+                    budget,
+                    pending_since,
+                    &candidates,
+                );
+                if config.enabled {
+                    if let Err(error) = apply_action(
+                        &mut decision,
+                        || manager.snapshot(),
+                        |name| manager.suspend_for_memory(name, now_ms),
+                    ) {
+                        eprintln!("amber daemon: automatic memory suspend failed: {error}");
+                    }
+                } else {
+                    decision.candidate = None;
+                    decision.blocked = false;
+                }
+
+                if should_broadcast(
+                    level,
+                    blocked,
+                    last_pressure_broadcast_ms,
+                    now_ms,
+                    &decision,
+                ) {
+                    watchers.broadcast_pressure(&ControlMsg::MemoryPressure {
+                        level: match decision.level {
+                            PressureLevel::Normal => "normal",
+                            PressureLevel::Warning => "warning",
+                            PressureLevel::Critical => "critical",
+                        }
+                        .to_string(),
+                        current_kb,
+                        budget_kb: budget,
+                        blocked: decision.blocked,
+                    });
+                    last_pressure_broadcast_ms = Some(now_ms);
+                }
+                level = decision.level;
+                blocked = decision.blocked;
+            }
+
+            let psi_sample = crate::host_pressure::sample_linux();
+            if psi_sample.is_none()
+                && last_psi_error_log_ms
+                    .is_none_or(|last| now_ms.saturating_sub(last) >= PSI_ERROR_LOG_MS)
+            {
+                eprintln!("amber daemon: host PSI sample unavailable; host parking skipped");
+                last_psi_error_log_ms = Some(now_ms);
+            }
+            let host_decision = host_pressure.step(now_ms, psi_sample);
             let pending_since = config
                 .enabled
-                .then(|| manager.memory_suspend_pending_since())
+                .then(|| manager.pressure_suspend_pending_since())
                 .flatten();
-            let next_level = pressure_level(level, current_kb, budget);
-            let candidates = if config.enabled
-                && next_level == PressureLevel::Critical
+            let host_candidates = if config.enabled
+                && matches!(
+                    &host_decision,
+                    HostPressureDecision::Critical { can_park: true, .. }
+                )
                 && pending_since.is_none()
             {
-                manager.memory_candidates(&per_session_kb)
+                manager.host_pressure_candidates(now_ms, &last_per_session_kb)
             } else {
                 Vec::new()
             };
-            let mut decision = step(
-                level,
+            let mut host_action = host_step(
                 now_ms,
-                current_kb,
-                budget,
+                host_decision,
                 pending_since,
-                &candidates,
+                &host_candidates,
             );
             if config.enabled {
-                if let Err(error) = apply_action(
-                    &mut decision,
+                match apply_host_action(
+                    &mut host_action,
                     || manager.snapshot(),
-                    |name| manager.suspend_for_memory(name, now_ms),
+                    |name| manager.suspend_for_pressure(name, now_ms),
                 ) {
-                    eprintln!("amber daemon: automatic memory suspend failed: {error}");
+                    Ok(true) => host_pressure.record_parked(now_ms),
+                    Ok(false) => {}
+                    Err(error) => {
+                        eprintln!("amber daemon: automatic host-pressure suspend failed: {error}");
+                    }
                 }
             } else {
-                decision.candidate = None;
-                decision.blocked = false;
+                host_action.candidate = None;
+                host_action.blocked = false;
+                if let Some(status) = &mut host_action.status {
+                    status.blocked = false;
+                }
             }
 
-            if should_broadcast(
-                level,
-                blocked,
-                last_pressure_broadcast_ms,
-                now_ms,
-                &decision,
-            ) {
-                watchers.broadcast_pressure(&ControlMsg::MemoryPressure {
-                    level: match decision.level {
-                        PressureLevel::Normal => "normal",
-                        PressureLevel::Warning => "warning",
-                        PressureLevel::Critical => "critical",
-                    }
-                    .to_string(),
-                    current_kb,
-                    budget_kb: budget,
-                    blocked: decision.blocked,
-                });
-                last_pressure_broadcast_ms = Some(now_ms);
+            if let Some(status) = host_action.status {
+                if should_broadcast_resource(
+                    last_resource_status.as_ref(),
+                    last_resource_broadcast_ms,
+                    now_ms,
+                    &status,
+                ) {
+                    watchers.broadcast_resource_pressure(&ControlMsg::ResourcePressure {
+                        level: status.level,
+                        causes: status.causes.clone(),
+                        blocked: status.blocked,
+                    });
+                    last_resource_broadcast_ms = Some(now_ms);
+                }
+                last_resource_status = Some(status);
             }
-            level = decision.level;
-            blocked = decision.blocked;
         }
     });
 }
@@ -629,6 +816,126 @@ mod tests {
         .unwrap();
         assert_eq!(decision.level, PressureLevel::Normal);
         assert_eq!(calls.get(), 0);
+    }
+
+    fn host_candidate(name: &str) -> HostPressureCandidate {
+        HostPressureCandidate {
+            name: name.to_string(),
+            memory_kb: 10,
+            last_user_ms: 0,
+        }
+    }
+
+    fn cpu_pressure_sample() -> crate::host_pressure::HostPressureSample {
+        crate::host_pressure::HostPressureSample {
+            cpu_some_percent: 25.0,
+            io_full_percent: 0.0,
+            memory_full_percent: 0.0,
+        }
+    }
+
+    #[test]
+    fn host_pressure_waits_snapshots_and_honors_cooldown() {
+        let mut policy = crate::host_pressure::HostPressureState::new(
+            amber_core::state::PressureConfig::default(),
+        );
+        policy.step(0, Some(cpu_pressure_sample()));
+        let candidates = [host_candidate("oldest")];
+
+        let early = host_step(
+            119_999,
+            policy.step(119_999, Some(cpu_pressure_sample())),
+            None,
+            &candidates,
+        );
+        assert_eq!(early.candidate, None, "host PSI must sustain for 120 seconds");
+
+        let mut ready = host_step(
+            120_000,
+            policy.step(120_000, Some(cpu_pressure_sample())),
+            None,
+            &candidates,
+        );
+        assert_eq!(ready.candidate.as_deref(), Some("oldest"));
+        let calls = RefCell::new(Vec::new());
+        assert!(
+            apply_host_action(
+                &mut ready,
+                || {
+                    calls.borrow_mut().push("snapshot".to_string());
+                    Ok(())
+                },
+                |name| {
+                    calls.borrow_mut().push(format!("suspend:{name}"));
+                    Ok(())
+                },
+            )
+            .unwrap(),
+        );
+        assert_eq!(&*calls.borrow(), &["snapshot", "suspend:oldest"]);
+        policy.record_parked(120_000);
+
+        let cooling = host_step(
+            129_999,
+            policy.step(129_999, Some(cpu_pressure_sample())),
+            None,
+            &candidates,
+        );
+        assert_eq!(cooling.candidate, None, "cooldown must defer a second park");
+        let after_cooldown = host_step(
+            130_000,
+            policy.step(130_000, Some(cpu_pressure_sample())),
+            None,
+            &candidates,
+        );
+        assert_eq!(after_cooldown.candidate.as_deref(), Some("oldest"));
+    }
+
+    #[test]
+    fn host_pressure_reports_blocked_and_never_selects_during_pending_suspend() {
+        let mut policy = crate::host_pressure::HostPressureState::new(
+            amber_core::state::PressureConfig::default(),
+        );
+        policy.step(0, Some(cpu_pressure_sample()));
+        let eligible = policy.step(120_000, Some(cpu_pressure_sample()));
+
+        let blocked = host_step(120_000, eligible.clone(), None, &[]);
+        assert!(blocked.blocked);
+        assert_eq!(blocked.candidate, None);
+
+        let pending = host_step(
+            120_001,
+            eligible,
+            Some(120_000),
+            &[host_candidate("otherwise-safe")],
+        );
+        assert!(!pending.blocked, "a fresh pending transition is not stalled");
+        assert_eq!(pending.candidate, None, "never choose a second victim while pending");
+    }
+
+    #[test]
+    fn host_snapshot_failure_is_blocked_and_does_not_start_a_cooldown() {
+        let mut decision = host_step(
+            120_000,
+            crate::host_pressure::HostPressureDecision::Critical {
+                causes: vec![crate::host_pressure::HostPressureCause::Cpu],
+                can_park: true,
+            },
+            None,
+            &[host_candidate("oldest")],
+        );
+        let suspended = std::cell::Cell::new(0);
+        assert!(apply_host_action(
+            &mut decision,
+            || anyhow::bail!("disk full"),
+            |_| {
+                suspended.set(suspended.get() + 1);
+                Ok(())
+            },
+        )
+        .is_err());
+        assert!(decision.blocked);
+        assert_eq!(suspended.get(), 0);
     }
 
     #[test]
