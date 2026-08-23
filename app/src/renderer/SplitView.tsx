@@ -1,11 +1,17 @@
-import { useRef, useState, useEffect } from 'react'
+import { useRef, useState, useEffect, lazy, Suspense } from 'react'
 import { Pane, type SearchApi } from './Pane'
 import { Browser } from './Browser'
-import { Editor, type EditorApi } from './Editor'
+import type { EditorApi } from './Editor'
 import { paneRects, handles, nextPaneInDirection, focusCandidates, ratioAt, leaves, type Node, type Rect, type Zone, type FocusDir } from './layout'
 import { appChord, chordLabel } from './keys'
 import { paneDot, shouldHintTerminalFocus, shouldResumeMemoryParked } from './store'
 import { reloadAgentCommand } from './reloadAgent'
+// CodeMirror + marked (the editor's whole dependency graph) load LAZILY: they
+// are the largest single block in the bundle but matter only when an editor
+// pane actually mounts. A static import here made every app start pay for
+// them (~1.1 MB of the main chunk). The EditorApi type import is erased at
+// compile time — no runtime edge.
+const Editor = lazy(() => import('./Editor').then((m) => ({ default: m.Editor })))
 
 export interface PaneMeta { kind: string; title: string; cwd: string; runState?: string | undefined; rssKb?: number | undefined; growing?: boolean | undefined; claudeId?: string | undefined }
 
@@ -709,15 +715,17 @@ export function SplitView(props: {
               {isEditor
                 ? (() => {
                     const e = props.editors[paneId] ?? { path: null }
-                    return <Editor paneId={paneId} path={e.path}
-                      view={e.view ?? 'code'} outline={e.outline ?? false}
-                      wrap={e.wrap ?? true}
-                      active={props.active && !hidden} fontSize={props.fontSize}
-                      onChangePath={props.onEditorPath}
-                      onChangeViewState={props.onEditorViewState}
-                      onDirtyChange={props.onEditorDirty}
-                      onReady={props.onEditorReady}
-                      onTitle={props.onPaneTitle} />
+                    return <Suspense fallback={<div className="editor-loading">loading editor…</div>}>
+                      <Editor paneId={paneId} path={e.path}
+                        view={e.view ?? 'code'} outline={e.outline ?? false}
+                        wrap={e.wrap ?? true}
+                        active={props.active && !hidden} fontSize={props.fontSize}
+                        onChangePath={props.onEditorPath}
+                        onChangeViewState={props.onEditorViewState}
+                        onDirtyChange={props.onEditorDirty}
+                        onReady={props.onEditorReady}
+                        onTitle={props.onPaneTitle} />
+                    </Suspense>
                   })()
                 : isBrowser
                 ? <Browser paneId={paneId} url={props.browsers[paneId]?.url ?? ''}

@@ -19,11 +19,32 @@ pub enum CgroupRole {
     Workload,
 }
 
-#[derive(Clone, Debug)]
+/// Sentinel for "no session `memory.high` configured yet" in the atomic.
+const SESSION_HIGH_UNSET: u64 = u64::MAX;
+
+#[derive(Debug)]
 pub struct CgroupManager {
     root: Option<PathBuf>,
     mount_point: Option<PathBuf>,
-    session_high_bytes: Option<u64>,
+    /// Shared with `SetMemoryBudget`'s live update path, which holds only
+    /// `&self` — the manager is shared across connection threads. The unset
+    /// sentinel is [`SESSION_HIGH_UNSET`] (0 is a REAL value: a test layout's
+    /// leaves are written with `memory.high = 0`). Manual `Clone`: the std
+    /// atomic integer types do not implement it, and a clone must snapshot
+    /// the current ceiling, not reset it to "unset".
+    session_high_bytes: std::sync::atomic::AtomicU64,
+}
+
+impl Clone for CgroupManager {
+    fn clone(&self) -> Self {
+        CgroupManager {
+            root: self.root.clone(),
+            mount_point: self.mount_point.clone(),
+            session_high_bytes: std::sync::atomic::AtomicU64::new(
+                self.session_high_bytes.load(std::sync::atomic::Ordering::SeqCst),
+            ),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -62,7 +83,7 @@ impl CgroupManager {
         Self {
             root: None,
             mount_point: None,
-            session_high_bytes: None,
+            session_high_bytes: std::sync::atomic::AtomicU64::new(SESSION_HIGH_UNSET),
         }
     }
 
@@ -73,7 +94,7 @@ impl CgroupManager {
         Self {
             root: Some(root),
             mount_point: None,
-            session_high_bytes: Some(0),
+            session_high_bytes: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -133,12 +154,20 @@ impl CgroupManager {
         Ok(Self {
             root: Some(root),
             mount_point: Some(mount.mount_point),
-            session_high_bytes: None,
+            session_high_bytes: std::sync::atomic::AtomicU64::new(SESSION_HIGH_UNSET),
         })
     }
 
-    pub fn set_session_high_kb(&mut self, session_high_kb: u64) {
-        self.session_high_bytes = Some(session_high_kb.saturating_mul(1024));
+    pub fn set_session_high_kb(&self, session_high_kb: u64) {
+        self.session_high_bytes
+            .store(session_high_kb.saturating_mul(1024), std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn current_session_high_bytes(&self) -> Option<u64> {
+        match self.session_high_bytes.load(std::sync::atomic::Ordering::SeqCst) {
+            SESSION_HIGH_UNSET => None,
+            value => Some(value),
+        }
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -169,7 +198,7 @@ impl CgroupManager {
             fs::write(paths.parent.join("memory.high"), "0")?;
             return Ok(());
         }
-        let high = self.session_high_bytes.ok_or_else(|| {
+        let high = self.current_session_high_bytes().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "session memory.high is not configured",
@@ -236,6 +265,27 @@ impl CgroupManager {
         };
         let paths = SessionPaths::new(root, slot)?;
         self.read_current_kb(Some(&paths.parent))
+    }
+
+    /// Rewrite an EXISTING session leaf's `memory.high` — the live-budget
+    /// path. Unlike [`prepare_session`](Self::prepare_session) this must not
+    /// kill or recreate anything: the pane keeps running and only its soft
+    /// ceiling moves. Returns `Ok(false)` when there is nothing to write
+    /// (containment disabled, or the non-delegated test layout whose leaves
+    /// are plain directories).
+    pub fn rewrite_session_high(&self, slot: u32) -> io::Result<bool> {
+        let Some(root) = &self.root else {
+            return Ok(false);
+        };
+        let Some(high) = self.current_session_high_bytes() else {
+            return Ok(false);
+        };
+        let paths = SessionPaths::new(root, slot)?;
+        if !paths.parent.join("cgroup.procs").exists() {
+            return Ok(false); // leaf not materialised (dead/unreaped): nothing to move
+        }
+        write_control_nonblocking(&paths.parent.join("memory.high"), &high.to_string())?;
+        Ok(true)
     }
 
     pub fn kill_workload(&self, slot: u32) -> io::Result<bool> {
@@ -779,7 +829,7 @@ mod tests {
         let manager = CgroupManager {
             root: Some(service),
             mount_point: Some(temp.path().to_path_buf()),
-            session_high_bytes: None,
+            session_high_bytes: std::sync::atomic::AtomicU64::new(SESSION_HIGH_UNSET),
         };
         assert_eq!(manager.lowest_finite_limit_kb().unwrap(), Some(4096));
     }
@@ -801,7 +851,7 @@ mod tests {
         let manager = CgroupManager {
             root: Some(service),
             mount_point: Some(mount),
-            session_high_bytes: None,
+            session_high_bytes: std::sync::atomic::AtomicU64::new(SESSION_HIGH_UNSET),
         };
         assert_eq!(manager.lowest_finite_limit_kb().unwrap(), Some(4096));
     }
@@ -828,7 +878,7 @@ mod tests {
         let enabled = CgroupManager {
             root: Some(temp.path().to_path_buf()),
             mount_point: Some(temp.path().to_path_buf()),
-            session_high_bytes: None,
+            session_high_bytes: std::sync::atomic::AtomicU64::new(SESSION_HIGH_UNSET),
         };
         assert!(enabled.prepare_session(1).is_err());
         assert!(!temp.path().join("session-1").exists());

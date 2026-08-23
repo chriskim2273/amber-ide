@@ -165,16 +165,15 @@ fn select_pressure_sample(
 }
 
 /// Start the daemon's single memory monitor/guardian thread. Cgroup charge is
-/// sampled every second when available; the process table is read once every
-/// three ticks for the existing per-session RSS telemetry and as the fallback
-/// aggregate on unsupported platforms.
-pub fn start(
-    manager: Arc<SessionManager>,
-    watchers: Arc<Watchers>,
-    config: MemoryConfig,
-    budget_kb: Option<u64>,
-) {
-    match budget_kb {
+/// sampled every second when available; per-session telemetry comes from the
+/// same sample (see the tick loop) and the process-table walk survives only
+/// as the no-containment fallback.
+///
+/// The budget is read FRESH from the manager every tick, not captured here:
+/// `SetMemoryBudget` moves it on a live daemon (`amber ctl budget`, the app's
+/// memory dialog), and a restart would defeat the point.
+pub fn start(manager: Arc<SessionManager>, watchers: Arc<Watchers>, config: MemoryConfig) {
+    match manager.effective_budget_kb() {
         Some(budget) => eprintln!("amber daemon: memory guardian budget {budget} KiB"),
         None => eprintln!(
             "amber daemon: memory guardian has no aggregate budget; automatic parking disabled"
@@ -190,38 +189,68 @@ pub fn start(
         loop {
             thread::sleep(Duration::from_secs(1));
             tick = tick.wrapping_add(1);
-            let cgroup_sample = match manager.cgroup_memory_sample() {
-                Ok(sample) => sample,
-                Err(error) => {
-                    eprintln!("amber daemon: cgroup memory sample failed: {error}");
-                    None
-                }
-            };
-
-            let rss_sample = if tick.is_multiple_of(3) {
-                let table = crate::procinfo::process_table();
-                if table.is_empty() {
-                    None
-                } else {
-                    let pids = manager.live_pids();
-                    let live: HashSet<&str> = pids.iter().map(|(name, _)| name.as_str()).collect();
-                    samples.retain(|name, _| live.contains(name.as_str()));
-                    let mut per_session = HashMap::new();
-                    for (name, pid) in pids {
-                        let rss_kb = crate::procinfo::subtree_rss_kb(&table, pid);
-                        per_session.insert(name.clone(), rss_kb);
-                        let event = record_rss_stat(&mut samples, name, rss_kb);
-                        watchers.broadcast(&event);
+            let budget_kb = manager.effective_budget_kb();
+                let mut cgroup_sample = match manager.cgroup_memory_sample() {
+                    Ok(sample) => sample,
+                    Err(error) => {
+                        eprintln!("amber daemon: cgroup memory sample failed: {error}");
+                        None
                     }
-                    let total = per_session
-                        .values()
-                        .copied()
-                        .fold(0u64, u64::saturating_add);
-                    Some((total, per_session))
-                }
-            } else {
-                None
-            };
+                };
+
+                // Per-session telemetry (MemoryStat) + the no-containment
+                // fallback aggregate, every 3rd tick as before. WITH
+                // containment the cgroup leaf sample taken above already IS
+                // the per-session truth — the same numbers the pressure math
+                // and parking decisions consume — so deriving the events from
+                // it retires the periodic full-process-table walk here
+                // (~450 ms of smaps_rollup reads per walk on a busy desktop,
+                // forever). Semantics shift, deliberately: a leaf's
+                // memory.current charges page cache too, so a pane's MB label
+                // now matches `systemd-cgtop` rather than the sum of smaps
+                // RSS. macOS / non-delegated hosts keep the walk.
+                let rss_sample = if tick.is_multiple_of(3) {
+                    if cgroup_enabled {
+                        match cgroup_sample.take() {
+                            Some((total, per_session)) => {
+                                let live: HashSet<&str> =
+                                    per_session.keys().map(String::as_str).collect();
+                                samples.retain(|name, _| live.contains(name.as_str()));
+                                for (name, kb) in &per_session {
+                                    let event =
+                                        record_rss_stat(&mut samples, name.clone(), *kb);
+                                    watchers.broadcast(&event);
+                                }
+                                Some((total, per_session))
+                            }
+                            None => None, // transient read failure; skip this tick
+                        }
+                    } else {
+                        let table = crate::procinfo::process_table();
+                        if table.is_empty() {
+                            None
+                        } else {
+                            let pids = manager.live_pids();
+                            let live: HashSet<&str> =
+                                pids.iter().map(|(name, _)| name.as_str()).collect();
+                            samples.retain(|name, _| live.contains(name.as_str()));
+                            let mut per_session = HashMap::new();
+                            for (name, pid) in pids {
+                                let rss_kb = crate::procinfo::subtree_rss_kb(&table, pid);
+                                per_session.insert(name.clone(), rss_kb);
+                                let event = record_rss_stat(&mut samples, name, rss_kb);
+                                watchers.broadcast(&event);
+                            }
+                            let total = per_session
+                                .values()
+                                .copied()
+                                .fold(0u64, u64::saturating_add);
+                            Some((total, per_session))
+                        }
+                    }
+                } else {
+                    None
+                };
 
             let Some(budget) = budget_kb else { continue };
             let Some((current_kb, per_session_kb)) =

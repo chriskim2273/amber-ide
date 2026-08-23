@@ -100,7 +100,10 @@ describe('Router', () => {
 
     router.reattachAll()
 
-    expect(conn.sent).toEqual([{ type: 'control', msg: { kind: 'Attach', name: 'live' } }])
+    expect(conn.sent).toEqual([{
+      type: 'control',
+      msg: { kind: 'Attach', name: 'live', resume: { epoch: '0', offset: 0 } },
+    }])
   })
 
   it('re-attaching a session closes the port it supersedes', () => {
@@ -165,5 +168,80 @@ describe('Router', () => {
     const router = new Router(conn)
     router.detach('never-attached')
     expect(conn.sent).toEqual([])
+  })
+
+  it('an acked full replay is tagged; a delta replay is appended without a reset', () => {
+    // The whole point of the watermark: a surviving terminal (reconnect) must
+    // NOT be reset-and-replayed — only the missing tail arrives, untagged.
+    const conn = new FakeConn()
+    const router = new Router(conn)
+    const port = new FakePort()
+    router.attach('s', port)
+
+    // The attach opted in via {epoch:'0'}; the daemon announces a FULL replay.
+    conn.emit({
+      type: 'control',
+      msg: { kind: 'AttachBacklog', name: 's', epoch: '7', end_offset: 100, full: true },
+    })
+    conn.emit({ type: 'data', session: 's', bytes: new Uint8Array([1]) })
+    expect(port.posted).toEqual([{ data: new Uint8Array([1]), backlog: true }])
+
+    // Detach + reconnect with the tracked watermark.
+    router.detach('s')
+    const port2 = new FakePort()
+    router.attach('s', port2) // fresh mount: epoch '0' again
+    conn.sent.length = 0
+    conn.emit({
+      type: 'control',
+      msg: { kind: 'AttachBacklog', name: 's', epoch: '7', end_offset: 150, full: false },
+    })
+    conn.emit({ type: 'data', session: 's', bytes: new Uint8Array([2]) })
+    // Delta: NO backlog tag — the renderer must append, never reset here.
+    expect(port2.posted).toEqual([{ data: new Uint8Array([2]) }])
+  })
+
+  it('reattachAll presents the tracked watermark so a healthy daemon answers with a delta', () => {
+    const conn = new FakeConn()
+    const router = new Router(conn)
+    const port = new FakePort()
+    router.attach('s', port)
+    // The ack'd replay is covered by end_offset (100)...
+    conn.emit({
+      type: 'control',
+      msg: { kind: 'AttachBacklog', name: 's', epoch: '7', end_offset: 100, full: true },
+    })
+    conn.emit({ type: 'data', session: 's', bytes: new Uint8Array([1]) })
+    // ...and the live tail after it advances the watermark to 130.
+    conn.emit({ type: 'data', session: 's', bytes: new Uint8Array(30) })
+    port.posted.length = 0
+    conn.sent.length = 0
+
+    router.reattachAll()
+    expect(conn.sent).toEqual([{
+      type: 'control',
+      msg: { kind: 'Attach', name: 's', resume: { epoch: '7', offset: 130 } },
+    }])
+  })
+
+  it('a data frame in the awaiting window is treated as an old daemon legacy replay', () => {
+    // An old daemon ignores `resume` and never announces; its untagged one-frame
+    // replay must still be tagged for the renderer (reset), and no watermark may
+    // survive it (nothing on that wire maintains one).
+    const conn = new FakeConn()
+    const router = new Router(conn)
+    const port = new FakePort()
+    router.attach('s', port)
+
+    // No AttachBacklog ever comes...
+    conn.emit({ type: 'data', session: 's', bytes: new Uint8Array([9]) })
+    expect(port.posted).toEqual([{ data: new Uint8Array([9]), backlog: true }])
+
+    // ...so the next reconnect goes out without credentials again.
+    conn.sent.length = 0
+    router.reattachAll()
+    expect(conn.sent).toEqual([{
+      type: 'control',
+      msg: { kind: 'Attach', name: 's', resume: { epoch: '0', offset: 0 } },
+    }])
   })
 })

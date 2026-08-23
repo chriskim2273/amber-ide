@@ -38,7 +38,20 @@ export type ControlMsg =
   | { kind: 'Snapshot' }
   | { kind: 'SnapshotOk' }
   | { kind: 'Create'; name: string; cwd: string; sessionKind: string }
-  | { kind: 'Attach'; name: string }
+  // `resume` carries the client's delta-replay watermark. Its KEY PRESENCE is
+  // the opt-in to `AttachBacklog` replies: `{ epoch: '0', offset: 0 }` means
+  // "new-style client, no watermark yet" (0 is reserved — rings never mint
+  // it). The epoch is a STRING because it is a nanos-scale u64 that exceeds
+  // JS Number's 2^53 precision; a rounded value would never match again and
+  // silently disable delta replay.
+  | { kind: 'Attach'; name: string; resume?: { epoch: string; offset: number } }
+  // Daemon -> client reply to a resume-carrying Attach: the next ONE Data
+  // frame is the replay — `full` true = whole scrollback (terminal must reset
+  // first; stale epoch or evicted offset), false = only the missing tail.
+  // epoch/end_offset are the client's next watermark once that frame plus all
+  // following live bytes are consumed. Decode-only: sent only to clients that
+  // opted in via `resume`.
+  | { kind: 'AttachBacklog'; name: string; epoch: string; end_offset: number; full: boolean }
   | { kind: 'Detach'; name: string }
   | { kind: 'Focus'; name: string }
   | { kind: 'DumpBacklog'; name: string }
@@ -48,6 +61,12 @@ export type ControlMsg =
   | { kind: 'Suspend'; name: string }
   | { kind: 'Resume'; name: string }
   | { kind: 'Resize'; name: string; cols: number; rows: number }
+  // Aggregate memory budget (see shared/budget.ts for the display side).
+  // `mb` is MiB; 0 = auto (half of physical RAM, capped by the service cap).
+  | { kind: 'SetMemoryBudget'; mb: number }
+  | { kind: 'GetMemoryBudget' }
+  // Daemon reply to both. Numeric fields default to 0 = absent on the wire.
+  | { kind: 'BudgetApplied'; mb: number; effective_budget_kb: number; cgroup_limit_kb: number; session_high_kb: number }
   | { kind: 'SessionList'; names: string[] }
   | { kind: 'Sessions'; sessions: SessionInfo[] }
   | { kind: 'SessionsChanged'; added: SessionInfo[]; removed: string[] }
@@ -88,12 +107,20 @@ function msgToJson(m: ControlMsg): unknown {
       return { WatchMemoryPressure: { version: m.version } }
     case 'Create':
       return { Create: { name: m.name, cwd: m.cwd, kind: m.sessionKind } }
-    case 'Attach':
-      // `preview` (mosaic tile attach, spec 2026-08-01), like `raw_client`
-      // above it, is never set by the Electron app — it always wants the
-      // full backlog — so it is simply omitted; the daemon's
-      // `#[serde(default)]` decodes the absence as `false`.
-      return { Attach: { name: m.name } }
+    case 'Attach': {
+      // `preview` (mosaic tile attach), like `raw_client`, is never set by the
+      // Electron app — it always wants the full backlog on a fresh mount — so
+      // it is simply omitted; the daemon's `#[serde(default)]` decodes the
+      // absence as `false`. `resume` rides whenever the caller supplied one —
+      // including `{ epoch: '0' }` for "new-style client, no watermark yet" —
+      // because its key presence opts this connection into AttachBacklog.
+      const body: Record<string, unknown> = { name: m.name }
+      if (m.resume) body['resume'] = m.resume
+      return { Attach: body }
+    }
+    case 'AttachBacklog':
+      // Daemon -> client only; never encoded by this app (mirrors MemoryStat).
+      return { AttachBacklog: { name: m.name } }
     case 'Detach':
       return { Detach: { name: m.name } }
     case 'Focus':
@@ -113,6 +140,10 @@ function msgToJson(m: ControlMsg): unknown {
       return { Resume: { name: m.name } }
     case 'Resize':
       return { Resize: { name: m.name, cols: m.cols, rows: m.rows } }
+    case 'SetMemoryBudget':
+      return { SetMemoryBudget: { mb: m.mb } }
+    case 'GetMemoryBudget':
+      return 'GetMemoryBudget'
     case 'SessionList':
       return { SessionList: { names: m.names } }
     case 'Sessions':
@@ -145,7 +176,23 @@ function jsonToMsg(v: unknown): ControlMsg | null {
     switch (key) {
       case 'Create': return { kind: 'Create', name: body['name'] as string, cwd: body['cwd'] as string, sessionKind: body['kind'] as string }
       case 'WatchMemoryPressure': return { kind: 'WatchMemoryPressure', version: body['version'] as number }
-      case 'Attach': return { kind: 'Attach', name: body['name'] as string }
+      case 'Attach': {
+        const rawResume = body['resume'] as Record<string, unknown> | undefined
+        const resume = rawResume
+          ? { epoch: String(rawResume['epoch']), offset: Number(rawResume['offset']) }
+          : undefined
+        return resume
+          ? { kind: 'Attach', name: body['name'] as string, resume }
+          : { kind: 'Attach', name: body['name'] as string }
+      }
+      case 'AttachBacklog':
+        return {
+          kind: 'AttachBacklog',
+          name: body['name'] as string,
+          epoch: String(body['epoch']),
+          end_offset: (body['end_offset'] as number) ?? 0,
+          full: body['full'] === true,
+        }
       case 'Detach': return { kind: 'Detach', name: body['name'] as string }
       case 'Focus': return { kind: 'Focus', name: body['name'] as string }
       case 'DumpBacklog': return { kind: 'DumpBacklog', name: body['name'] as string }
@@ -154,6 +201,16 @@ function jsonToMsg(v: unknown): ControlMsg | null {
       case 'Kill': return { kind: 'Kill', name: body['name'] as string }
       case 'Rename': return { kind: 'Rename', from: body['from'] as string, to: body['to'] as string }
       case 'Resize': return { kind: 'Resize', name: body['name'] as string, cols: body['cols'] as number, rows: body['rows'] as number }
+      case 'SetMemoryBudget': return { kind: 'SetMemoryBudget', mb: (body['mb'] as number) ?? 0 }
+      case 'GetMemoryBudget': return { kind: 'GetMemoryBudget' }
+      case 'BudgetApplied':
+        return {
+          kind: 'BudgetApplied',
+          mb: (body['mb'] as number) ?? 0,
+          effective_budget_kb: (body['effective_budget_kb'] as number) ?? 0,
+          cgroup_limit_kb: (body['cgroup_limit_kb'] as number) ?? 0,
+          session_high_kb: (body['session_high_kb'] as number) ?? 0,
+        }
       case 'SessionList': return { kind: 'SessionList', names: body['names'] as string[] }
       case 'Sessions': return { kind: 'Sessions', sessions: body['sessions'] as SessionInfo[] }
       case 'SessionsChanged': return { kind: 'SessionsChanged', added: body['added'] as SessionInfo[], removed: body['removed'] as string[] }

@@ -49,6 +49,39 @@ describe('proto', () => {
     expect(json).toBe('{"Attach":{"name":"a"}}')
   })
 
+  it('encodes a resume watermark as an opt-in key with a string epoch', () => {
+    // Key presence opts the connection into AttachBacklog replies; the epoch
+    // exceeds Number's 2^53 precision, so it must ride as a string.
+    const f: Frame = {
+      type: 'control',
+      msg: { kind: 'Attach', name: 'a', resume: { epoch: '1712345678901234567', offset: 42 } },
+    }
+    const wire = encode(f)
+    const bodyLen = new DataView(wire.buffer).getUint32(0, false)
+    const json = new TextDecoder().decode(wire.slice(5, 4 + bodyLen))
+    expect(json).toBe(
+      '{"Attach":{"name":"a","resume":{"epoch":"1712345678901234567","offset":42}}}',
+    )
+  })
+
+  it('parses an AttachBacklog announcement', () => {
+    // Shape-lock against the Rust decoder: epoch is a JSON string (it exceeds
+    // Number's 2^53 precision), full is a bool, end_offset a plain number.
+    const frame = decodeControlJson(
+      '{"AttachBacklog":{"name":"s","epoch":"9007199254740993","end_offset":2048,"full":false}}',
+    )
+    expect(frame).toEqual({
+      type: 'control',
+      msg: {
+        kind: 'AttachBacklog',
+        name: 's',
+        epoch: '9007199254740993',
+        end_offset: 2048,
+        full: false,
+      },
+    })
+  })
+
   it('parses a Sessions reply', () => {
     const f: Frame = {
       type: 'control',

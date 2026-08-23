@@ -60,6 +60,35 @@ pub struct SessionInfo {
     pub slot: u32,
 }
 
+/// Epochs ride the JSON wire as STRINGS: they are nanos-derived u64s whose
+/// magnitude exceeds JavaScript's 2^53 integer precision. `JSON.parse` would
+/// silently round one, and a rounded epoch fails its equality check on every
+/// re-attach — silently disabling delta replay while everything looks fine.
+mod epoch_string {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub(crate) fn serialize<S: Serializer>(value: &u64, serializer: S) -> Result<S::Ok, S::Error> {
+        value.to_string().serialize(serializer)
+    }
+
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// A client's "I have already been fed up to here" watermark, sent on an
+/// Attach that wants delta backlog replay (the app's reconnect / pane remount
+/// path). `epoch` identifies the ring lifetime (`Ring::epoch`), `offset` the
+/// absolute byte position within it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachResume {
+    #[serde(with = "epoch_string")]
+    pub epoch: u64,
+    pub offset: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlMsg {
     Hello,
@@ -82,6 +111,16 @@ pub enum ControlMsg {
         /// full-backlog attach.
         #[serde(default)]
         preview: bool,
+        /// Delta-replay watermark (the Electron app's re-attach). **Presence
+        /// is the opt-in**: a client that sends `resume` understands the
+        /// [`ControlMsg::AttachBacklog`] reply; a client that omits it (`amber
+        /// attach`, `amber web`, older apps — whose strict decoders reject
+        /// unknown variants) keeps today's legacy full-backlog `Data` replay
+        /// and must never receive the new variant. `skip_serializing_if`
+        /// keeps this build's own first-attach bytes identical to the legacy
+        /// form, and `#[serde(default)]` accepts its absence from anyone.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resume: Option<AttachResume>,
     },
     Detach { name: String },
     /// Client -> daemon: mark a live terminal session as recently used. This
@@ -183,6 +222,46 @@ pub enum ControlMsg {
     /// Daemon -> supervisor: an ordered run-state report was accepted (or was
     /// already superseded by a report with a higher sequence).
     RunStateAck { name: String, seq: u64 },
+    /// Daemon -> client: reply to an Attach that carried a `resume` watermark.
+    /// Announces the replay that follows as ONE `Data` frame: `full` means the
+    /// whole scrollback (the terminal must be reset first — stale epoch or an
+    /// evicted offset), `false` means only the missing tail (append). `epoch`
+    /// is the ring's current identity and `end_offset` the client's next
+    /// watermark once that frame is consumed.
+    ///
+    /// Sent ONLY to clients whose Attach carried `resume` — they declared they
+    /// understand this variant; legacy clients keep the untagged legacy replay.
+    AttachBacklog {
+        name: String,
+        #[serde(with = "epoch_string")]
+        epoch: u64,
+        end_offset: u64,
+        full: bool,
+    },
+    /// Client -> daemon: change amber's aggregate memory budget to `mb` MiB
+    /// (0 = auto: half of physical RAM, still capped by the OS cgroup limit).
+    /// The daemon persists it to config, re-derives the effective budget
+    /// against the LIVE service cap, re-applies every session leaf's
+    /// `memory.high`, and switches the running guardian over — no restart.
+    /// Replies `BudgetApplied`, or `Error` on a rejected value.
+    SetMemoryBudget { mb: u64 },
+    /// Client -> daemon: report the current budget state. Replies
+    /// `BudgetApplied`.
+    GetMemoryBudget,
+    /// Daemon -> client: the memory-budget truth. `mb` is the CONFIGURED
+    /// budget in MiB (0 = auto). `effective_budget_kb` is what the guardian
+    /// uses right now (0 = no usable aggregate: automatic parking disabled).
+    /// `cgroup_limit_kb` is the live lowest finite ancestor cap (0 = none).
+    /// `session_high_kb` is each session leaf's soft ceiling.
+    BudgetApplied {
+        mb: u64,
+        #[serde(default)]
+        effective_budget_kb: u64,
+        #[serde(default)]
+        cgroup_limit_kb: u64,
+        #[serde(default)]
+        session_high_kb: u64,
+    },
     SessionList { names: Vec<String> },
     Created { name: String },
     Killed { name: String },
@@ -257,6 +336,10 @@ fn known_control_variant(name: &str) -> bool {
             | "MemoryStat"
             | "MemoryPressure"
             | "RunStateAck"
+            | "AttachBacklog"
+            | "SetMemoryBudget"
+            | "GetMemoryBudget"
+            | "BudgetApplied"
             | "SessionList"
             | "Created"
             | "Killed"
@@ -518,7 +601,7 @@ mod tests {
 
     #[test]
     fn control_frame_roundtrips() {
-        let f = Frame::Control(ControlMsg::Attach { name: "a".into(), raw_client: true, preview: false });
+        let f = Frame::Control(ControlMsg::Attach { name: "a".into(), raw_client: true, preview: false, resume: None });
         assert_eq!(roundtrip(&f), f);
     }
 
@@ -528,7 +611,7 @@ mod tests {
         // send Attach without `raw_client`; they must decode as the
         // full-backlog behavior, not an error.
         let msg: ControlMsg = serde_json::from_str(r#"{"Attach":{"name":"a"}}"#).unwrap();
-        assert_eq!(msg, ControlMsg::Attach { name: "a".into(), raw_client: false, preview: false });
+        assert_eq!(msg, ControlMsg::Attach { name: "a".into(), raw_client: false, preview: false, resume: None });
     }
 
     #[test]
@@ -538,7 +621,89 @@ mod tests {
         // must still decode, as `false` = today's full-backlog attach.
         let msg: ControlMsg =
             serde_json::from_str(r#"{"Attach":{"name":"a","raw_client":true}}"#).unwrap();
-        assert_eq!(msg, ControlMsg::Attach { name: "a".into(), raw_client: true, preview: false });
+        assert_eq!(msg, ControlMsg::Attach { name: "a".into(), raw_client: true, preview: false, resume: None });
+    }
+
+    #[test]
+    fn attach_resume_is_absent_from_the_wire_when_unset() {
+        // The KEY's presence is the opt-in for AttachBacklog replies, so a
+        // first attach must serialize byte-identically to the legacy form.
+        let json = serde_json::to_string(&ControlMsg::Attach {
+            name: "a".into(),
+            raw_client: false,
+            preview: false,
+            resume: None,
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"Attach":{"name":"a","raw_client":false,"preview":false}}"#);
+    }
+
+    #[test]
+    fn attach_resume_roundtrips_with_a_string_epoch() {
+        // The epoch exceeds 2^53, so it MUST be a JSON string — a number would
+        // be silently rounded by JS and never match again.
+        let msg = ControlMsg::Attach {
+            name: "a".into(),
+            raw_client: false,
+            preview: false,
+            resume: Some(AttachResume { epoch: 1_712_345_678_901_234_567, offset: 42 }),
+        };
+        assert_eq!(roundtrip(&Frame::Control(msg.clone())), Frame::Control(msg.clone()));
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(
+            json.contains(r#""resume":{"epoch":"1712345678901234567","offset":42}"#),
+            "epoch must ride as a string: {json}"
+        );
+        // And decodes back from that exact shape.
+        let decoded: ControlMsg = serde_json::from_str(
+            r#"{"Attach":{"name":"a","resume":{"epoch":"7","offset":9}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            decoded,
+            ControlMsg::Attach {
+                name: "a".into(),
+                raw_client: false,
+                preview: false,
+                resume: Some(AttachResume { epoch: 7, offset: 9 }),
+            }
+        );
+    }
+
+    #[test]
+    fn attach_backlog_roundtrips() {
+        let msg = ControlMsg::AttachBacklog {
+            name: "amber-1-1-0-a".into(),
+            epoch: 9_007_199_254_740_993, // 2^53 + 1: string-encoded
+            end_offset: 2048,
+            full: false,
+        };
+        assert_eq!(roundtrip(&Frame::Control(msg.clone())), Frame::Control(msg.clone()));
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""epoch":"9007199254740993""#), "{json}");
+    }
+
+    #[test]
+    fn memory_budget_messages_roundtrip_with_additive_defaults() {
+        let set = Frame::Control(ControlMsg::SetMemoryBudget { mb: 20_480 });
+        assert_eq!(roundtrip(&set), set);
+        assert_eq!(roundtrip(&Frame::Control(ControlMsg::GetMemoryBudget)), Frame::Control(ControlMsg::GetMemoryBudget));
+
+        // A peer that predates the numeric fields decodes them as 0.
+        let applied: ControlMsg =
+            serde_json::from_str(r#"{"BudgetApplied":{"mb":20480}}"#).unwrap();
+        assert_eq!(
+            applied,
+            ControlMsg::BudgetApplied { mb: 20_480, effective_budget_kb: 0, cgroup_limit_kb: 0, session_high_kb: 0 }
+        );
+
+        let full = Frame::Control(ControlMsg::BudgetApplied {
+            mb: 0, // auto
+            effective_budget_kb: 8_388_608,
+            cgroup_limit_kb: 8_388_608,
+            session_high_kb: 4_194_304,
+        });
+        assert_eq!(roundtrip(&full), full);
     }
 
     #[test]

@@ -289,7 +289,7 @@ fn handle_control(
             let names = manager.names();
             let _ = write_frame(writer, &Frame::Control(ControlMsg::SessionList { names }));
         }
-        ControlMsg::Attach { name, raw_client, preview: _preview } => {
+        ControlMsg::Attach { name, raw_client, preview: _preview, resume } => {
             let Some(sess) = manager.session(&name) else {
                 let _ = write_frame(
                     writer,
@@ -312,7 +312,14 @@ fn handle_control(
                     true
                 }
             });
-            let (sub_id, backlog, rx) = sess.subscribe();
+            // Delta replay: a client presenting a valid (epoch, offset)
+            // watermark gets only the bytes it has not seen; everyone else —
+            // raw CLI clients, amber web, first attaches — gets today's full
+            // replay. `subscribe_from` makes that call against the ring.
+            let sub = sess.subscribe_from(
+                resume.as_ref().map_or(0, |r| r.epoch),
+                resume.as_ref().map_or(0, |r| r.offset),
+            );
             // Spec §5 reconnect semantics: a raw client (plain terminal)
             // attaching to an alt-screen (claude) session gets NO historical
             // backlog — replaying alt-screen/cursor sequences into a cold
@@ -322,7 +329,7 @@ fn handle_control(
             // Registered BEFORE the forwarder starts so connection teardown
             // always releases it (unsubscribe is retain-based, so the
             // forwarder's own error-path unsubscribe stays safe/idempotent).
-            subscriptions.push((name.clone(), Arc::clone(&sess), sub_id));
+            subscriptions.push((name.clone(), Arc::clone(&sess), sub.id));
             if skip_backlog {
                 // Repaint nudge: resize one column away and back delivers two
                 // SIGWINCHes with a real size change, which alt-screen TUIs
@@ -332,6 +339,27 @@ fn handle_control(
                 if let Some((rows, cols)) = sess.size() {
                     let _ = sess.resize(rows, cols.saturating_sub(1).max(1));
                     let _ = sess.resize(rows, cols);
+                }
+            }
+            // Announce the replay to clients that opted in via `resume`:
+            // whether the next ONE Data frame is the whole scrollback (reset
+            // first) or just the missing tail (append), plus their next
+            // watermark. Written HERE on the read thread under the shared
+            // writer mutex BEFORE the forwarder exists, so it strictly
+            // precedes that frame. Never sent to legacy clients — a strict
+            // decoder (`amber attach`) would reject an unknown variant and
+            // drop the connection. If the announce fails the client is gone:
+            // release the subscription and skip the forwarder entirely.
+            if resume.is_some() && !skip_backlog {
+                let announce = Frame::Control(ControlMsg::AttachBacklog {
+                    name: name.clone(),
+                    epoch: sess.scrollback_epoch(),
+                    end_offset: sub.end_offset,
+                    full: sub.full,
+                });
+                if write_frame(writer, &announce).is_err() {
+                    sess.unsubscribe(sub.id);
+                    return;
                 }
             }
             let writer = Arc::clone(writer);
@@ -350,13 +378,14 @@ fn handle_control(
                 // (Pane.tsx MOUSE_RESET), so splitting the replay would fire that
                 // reset mid-backlog and let later bytes re-enable mouse tracking.
                 // Ordering holds: this snapshot predates every chunk in `rx`.
-                if !skip_backlog {
-                    let frame = Frame::Data { session: name.clone(), bytes: backlog };
+                if !skip_backlog && !sub.backlog.is_empty() {
+                    let frame = Frame::Data { session: name.clone(), bytes: sub.backlog };
                     if write_frame(&writer, &frame).is_err() {
-                        sess.unsubscribe(sub_id);
+                        sess.unsubscribe(sub.id);
                         return;
                     }
                 }
+                let rx = sub.rx;
                 while let Ok(chunk) = rx.recv() {
                     let frame = Frame::Data { session: name.clone(), bytes: chunk };
                     if write_frame(&writer, &frame).is_err() {
@@ -437,6 +466,32 @@ fn handle_control(
                     &Frame::Control(ControlMsg::Error { msg: e.to_string() }),
                 );
             }
+        }
+        ControlMsg::SetMemoryBudget { mb } => {
+            // mb == 0 means "auto". Persist + re-derive + move the session
+            // leaves + flip the guardian's live handle, all in the manager.
+            let reply = match manager.set_memory_budget((mb != 0).then_some(mb)) {
+                Ok(status) => ControlMsg::BudgetApplied {
+                    mb: status.configured_mb.unwrap_or(0),
+                    effective_budget_kb: status.effective_budget_kb.unwrap_or(0),
+                    cgroup_limit_kb: status.cgroup_limit_kb.unwrap_or(0),
+                    session_high_kb: status.session_high_kb,
+                },
+                Err(e) => ControlMsg::Error { msg: e.to_string() },
+            };
+            let _ = write_frame(writer, &Frame::Control(reply));
+        }
+        ControlMsg::GetMemoryBudget => {
+            let reply = match manager.get_memory_budget() {
+                Ok(status) => ControlMsg::BudgetApplied {
+                    mb: status.configured_mb.unwrap_or(0),
+                    effective_budget_kb: status.effective_budget_kb.unwrap_or(0),
+                    cgroup_limit_kb: status.cgroup_limit_kb.unwrap_or(0),
+                    session_high_kb: status.session_high_kb,
+                },
+                Err(e) => ControlMsg::Error { msg: e.to_string() },
+            };
+            let _ = write_frame(writer, &Frame::Control(reply));
         }
         ControlMsg::Focus { name } => {
             if let Err(e) = manager.focus_session(&name) {

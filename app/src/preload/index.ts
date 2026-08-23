@@ -27,6 +27,10 @@ contextBridge.exposeInMainWorld('amber', {
   // Request the daemon dump a session's scrollback ring; the reply arrives as a
   // `Backlog` control frame via onDaemonEvent (correlated by name renderer-side).
   dumpBacklog: (name: string) => ipcRenderer.send('daemon-command', { cmd: 'dumpBacklog', name }),
+  // Memory budget: view (`getMemoryBudget`) / change (`setMemoryBudget`, MiB;
+  // 0 = auto). The `BudgetApplied` reply arrives via onDaemonEvent.
+  getMemoryBudget: () => ipcRenderer.send('daemon-command', { cmd: 'getMemoryBudget' }),
+  setMemoryBudget: (mb: number) => ipcRenderer.send('daemon-command', { cmd: 'setMemoryBudget', mb }),
   // Absolute home dir (default cwd for new panes) + a native folder picker so
   // panes carry a real absolute cwd, not a relative '.' that drifts on restore.
   homeDir: homeArg || '/',
