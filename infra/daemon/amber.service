@@ -6,7 +6,7 @@ Documentation=https://github.com/chriskim2273/amber-ide
 
 [Service]
 Type=simple
-Delegate=memory
+Delegate=cpu memory
 MemoryAccounting=yes
 MemoryHigh=50%
 OOMPolicy=continue

@@ -15,7 +15,7 @@ Description=amber session daemon (persistent terminal workspace)
 
 [Service]
 Type=simple
-Delegate=memory
+Delegate=cpu memory
 MemoryAccounting=yes
 MemoryHigh=50%
 OOMPolicy=continue

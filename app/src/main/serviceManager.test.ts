@@ -1,4 +1,6 @@
+import { readFileSync } from 'node:fs'
 import { describe, it, expect } from 'vitest'
+import { fileURLToPath } from 'node:url'
 import { restartDaemonCommand,
   AMBER_SYSTEMD_UNIT,
   linuxInstallServiceArgv,
@@ -111,12 +113,31 @@ describe('constants', () => {
     expect(SYSTEMD_SERVICE).toBe('amber.service')
   })
 
-  it('delegates memory with a soft aggregate boundary and no hard max', () => {
-    expect(AMBER_SYSTEMD_UNIT).toContain('Delegate=memory')
+  it('delegates CPU and memory with a soft aggregate boundary and no hard max', () => {
+    expect(AMBER_SYSTEMD_UNIT).toContain('Delegate=cpu memory')
     expect(AMBER_SYSTEMD_UNIT).toContain('MemoryAccounting=yes')
     expect(AMBER_SYSTEMD_UNIT).toContain('MemoryHigh=50%')
     expect(AMBER_SYSTEMD_UNIT).toContain('OOMPolicy=continue')
     expect(AMBER_SYSTEMD_UNIT).not.toContain('MemoryMax=')
+  })
+
+  it('keeps the installed and embedded resource directives in lockstep', () => {
+    const installedUnit = readFileSync(
+      fileURLToPath(new URL('../../../infra/daemon/amber.service', import.meta.url)),
+      'utf8',
+    )
+    const resourceDirectives = (unit: string) => unit
+      .split('\n')
+      .filter((line) => /^(Delegate|Memory(?:Accounting|High|Max)|OOMPolicy|CPU)/.test(line))
+
+    const expected = [
+      'Delegate=cpu memory',
+      'MemoryAccounting=yes',
+      'MemoryHigh=50%',
+      'OOMPolicy=continue',
+    ]
+    expect(resourceDirectives(installedUnit)).toEqual(expected)
+    expect(resourceDirectives(AMBER_SYSTEMD_UNIT)).toEqual(expected)
   })
 
   it('linux upgrade reloads, enables, then explicitly restarts', () => {
