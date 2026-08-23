@@ -364,44 +364,19 @@ systemctl --user show amber-task6-rpg-cfnp89.service \
 
 The private root contained a fake `claude` executable and explicit
 `config.toml`; two temporary agent sessions were created with `amber create
-... --socket /tmp/amber-task6-rpg.cFnP89/amberd.sock`. The unit was inspected
-with `cat`/`tr` over its cgroup control files and, after an explicitly
-socket-scoped `timeout 1 ./target/debug/amber attach foreground --socket
-/tmp/amber-task6-rpg.cFnP89/amberd.sock`, returned:
-
-```text
-controllers: cpu memory pids
-subtree: cpu memory
-daemon=10000
-foreground-slot1=1000
-background-slot2=100
-workload-slot1-procs=1501086 1524275
-workload-slot2-procs=1501108 1524293
-```
-
-The manually inspected daemon process in
-`amber-task6-rpg-cfnp89.service` ran only
-`target/debug/amber daemon --root /tmp/amber-task6-rpg.cFnP89 --socket
-/tmp/amber-task6-rpg.cFnP89/amberd.sock` with `Delegate=cpu memory`.
-Its cgroup was
-`/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/amber-task6-rpg-cfnp89.service`.
-Observed controls were `cgroup.controllers = cpu memory pids`,
-`cgroup.subtree_control = cpu memory`, `_daemon/cpu.weight = 10000`,
-`session-1/cpu.weight = 1000` after focus, and
-`session-2/cpu.weight = 100`; live fake workloads were in their matching
-`session-{slot}/workload` leaves. This proves actual direct-child placement
-and weights, not a CPU-share benchmark.
+... --socket /tmp/amber-task6-rpg.cFnP89/amberd.sock`. No exact inspection
+command/output transcript was retained for cgroup placement, controller state,
+weights, workload processes, or per-PID validation. Those former operator
+notes are therefore omitted and do **not** constitute live proof.
 
 The first normal stop request did not complete before the task was interrupted.
-Cleanup then verified each remaining PID by command line, temporary
-root/socket, and private cgroup before sending TERM only to daemon `1494362`,
-supervisors `1501012`/`1501061`, and fake workload shells
-`1501086`/`1501108`. All exited within one second. Subsequent read-only unit
-inspection returned `MainPID=0`, `ActiveState=inactive`, and `SubState=dead`;
-the private cgroup was absent. The explicitly validated root's contents were
-listed, then only `/tmp/amber-task6-rpg.cFnP89` (including its socket) was
-removed. The exact earlier `systemctl stop` result is unavailable because that
-command was interrupted; no stronger graceful-stop claim is made.
+The captured cleanup command/result record below shows TERM to the listed
+private-proof PIDs, no survivors, an inactive/dead unit, cgroup removal, and
+removal of only the named root. The contemporaneous per-PID command-line,
+root/socket, and cgroup-validation transcript was not retained; it is an
+unverified operator note, not proof. The exact earlier `systemctl stop` result
+is unavailable because that command was interrupted; no stronger
+graceful-stop claim is made.
 
 Captured cleanup commands/results were:
 
