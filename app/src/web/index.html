@@ -3,6 +3,21 @@
   <head>
     <meta charset="UTF-8" />
     <title>amber-ide</title>
+    <!-- `viewport-fit=cover` lets the page paint under the notch and home
+         indicator; the chrome pads itself back with env(safe-area-inset-*).
+         `user-scalable=no` because the app owns pinch (font size on a borrowed
+         agent pane, CSS scale on a following one) — browser pinch-zoom on top
+         of that fights every gesture. -->
+    <meta name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+    <!-- Standalone launch from the home screen on iOS; Android reads the
+         manifest's display field instead. -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="amber" />
+    <meta name="theme-color" content="#0c0c0f" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="/icon.png" />
     <style>html, body, #root { margin: 0; height: 100%; background: #000; }</style>
   </head>
   <body>

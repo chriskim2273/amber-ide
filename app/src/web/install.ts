@@ -73,7 +73,7 @@ async function layoutSave(text: string, version: LayoutVersion): Promise<SaveLay
  * so a placeholder patched in later would permanently stick every new pane's
  * default cwd at that placeholder. */
 export function installAmber(home: string): void {
-  window.amber = createAmber({
+  const amber = createAmber({
     connectSocket,
     newChannel: () => {
       const ch = new MessageChannel()
@@ -90,5 +90,18 @@ export function installAmber(home: string): void {
     softwareGl: probeSoftwareGl(),
     layoutGet,
     layoutSave,
+  })
+  window.amber = amber
+
+  // Hand borrowed pty grids back when the page stops being looked at (spec
+  // §2.3). The server releases on socket death too, but that waits out a TCP
+  // timeout — during which the desktop stays squeezed to phone width.
+  //
+  // `pagehide` rather than `unload`: iOS Safari does not reliably fire
+  // `unload`, and `pagehide` also covers the back/forward cache.
+  const release = (): void => amber.releaseGrids()
+  window.addEventListener('pagehide', release)
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') release()
   })
 }

@@ -452,6 +452,14 @@ function App(): JSX.Element {
     if (!(zoomKey in z)) return z
     const c = { ...z }; delete c[zoomKey]; return c
   })
+  // Leaving a full-screen pane hands back any borrowed pty grid immediately
+  // (spec §2.3). Capability-shaped, not host-shaped: the desktop has no
+  // borrow to release, so `releaseGrids` simply is not there and this is a
+  // no-op — the renderer never asks which host it is on.
+  useEffect(() => {
+    if (zoomedPane !== null) return
+    ;(window.amber as unknown as { releaseGrids?: () => void }).releaseGrids?.()
+  }, [zoomedPane])
   // Zooming pushes a history entry so the platform BACK gesture un-zooms — the
   // way a phone user expects to leave a full-screen view. Guarded so popping
   // the last entry never navigates away from the app: we only ever push while

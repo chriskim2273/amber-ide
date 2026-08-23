@@ -348,9 +348,25 @@ export class PaneLink {
    * `{t:'close'}` after the daemon has already forgotten the session (or
    * before the very first `open` lands) would just draw a spurious
    * "no such session" error back at nobody. */
+  /**
+   * Hand back a borrowed pty grid (spec §2.3) without closing the pane.
+   *
+   * The server releases on socket death anyway — that is what covers a phone
+   * that walks out of Wi-Fi range — but waiting for a TCP timeout would leave
+   * the desktop squeezed for as long as it takes. This is the fast path for
+   * the common case: the user un-zoomed, backgrounded the tab, or closed it.
+   */
+  release(): void {
+    if (this.closed || this.socket.readyState !== SOCKET_OPEN) return
+    this.socket.send(JSON.stringify({ t: 'release' }))
+  }
+
   close(): void {
     this.closed = true
     if (this.resizeTimer !== null) clearTimeout(this.resizeTimer)
+    // Ask for the grid back before the socket goes; the server-side release on
+    // close is the backstop, not the primary path.
+    this.release()
     this.port.close()
     this.socket.close()
   }
@@ -384,7 +400,23 @@ function notImplemented(name: string): () => never {
  * declares globally) over `deps`. Kept separate from `install.ts` so this
  * whole file stays free of `WebSocket`/`MessageChannel`/`window` and is
  * importable under vitest's `node` environment. */
-export function createAmber(deps: AmberDeps): Window['amber'] {
+/**
+ * Web-only extension to the `window.amber` surface.
+ *
+ * NOT added to the renderer's `Window['amber']` declaration on purpose: the
+ * renderer must never learn a host-specific method (spec §0.1). Only
+ * `install.ts` — which is web-only by definition — sees this type.
+ */
+export type WebAmber = Window['amber'] & {
+  /**
+   * Hand back every borrowed pty grid without tearing panes down (spec §2.3).
+   * Called on `visibilitychange:hidden` and `pagehide`: a phone in a pocket
+   * must not keep the desktop squeezed to phone width.
+   */
+  releaseGrids: () => void
+}
+
+export function createAmber(deps: AmberDeps): WebAmber {
   let onEvent: ((d: unknown) => void) | null = null
   const pending: unknown[] = []
   const dispatch = (ev: unknown): void => {
@@ -395,7 +427,7 @@ export function createAmber(deps: AmberDeps): Window['amber'] {
   const control = new ControlLink(deps.connectSocket, dispatch)
   const panes = new Map<string, PaneLink>()
 
-  return {
+  const api: Window['amber'] = {
     softwareGl: deps.softwareGl,
     homeDir: deps.home,
 
@@ -494,5 +526,11 @@ export function createAmber(deps: AmberDeps): Window['amber'] {
     webUrl: (): Promise<string> => Promise.resolve(''),
     webLogTail: (): Promise<string> => Promise.resolve(''),
     webOpenLocal: (): Promise<void> => Promise.resolve(),
+  }
+  return {
+    ...api,
+    releaseGrids: (): void => {
+      for (const link of panes.values()) link.release()
+    },
   }
 }

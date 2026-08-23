@@ -865,6 +865,9 @@ export function SplitView(props: {
         const run = (fn: () => void) => (): void => { fn(); close() }
         const isZoomed = props.zoomedPane === paneId
         const isFrozen = props.frozen[paneId] !== undefined
+        // Browser/editor panes have no terminal, so no selection to copy.
+        const menuKind = props.meta[paneId]?.kind
+        const menuHasTerm = menuKind !== 'browser' && menuKind !== 'editor'
         // Kind picker variant: every pane kind, for the requested direction.
         if (menu.split) {
           const dir = menu.split
@@ -887,6 +890,30 @@ export function SplitView(props: {
               onClick={() => setMenu({ paneId, x: menu.x, y: menu.y, split: 'v' })}>Split down…</button>
             <div className="ctx-sep" />
             <button className="ctx-item" role="menuitem" onClick={run(() => props.onToggleZoom(paneId))}>{isZoomed ? 'Restore' : 'Zoom'}</button>
+            {/* Touch copy/paste (spec §8). A phone has no copy chord and
+                xterm's own touch selection is not good enough to build on, so
+                the long-press menu — which is already the touch gesture for
+                this pane — carries them. Mobile-only: the desktop has chords
+                and a real selection, and these rows would be clutter. */}
+            {mobile && menuHasTerm && (() => {
+              const api = searchApis.current.get(paneId)
+              if (!api) return null
+              return (
+                <>
+                  <div className="ctx-sep" />
+                  <button className="ctx-item" role="menuitem" onClick={run(() => {
+                    const sel = api.copySelection()
+                    if (sel) window.amber.clipboardWrite(sel)
+                  })}>Copy selection</button>
+                  <button className="ctx-item" role="menuitem" onClick={run(() => {
+                    // Reads the system clipboard through the same bridge the
+                    // paste chord uses; on the web build that is
+                    // navigator.clipboard, which needs this user gesture.
+                    void window.amber.clipboardRead().then((t) => { if (t) api.paste(t) })
+                  })}>Paste</button>
+                </>
+              )
+            })()}
             {isFrozen
               ? <button className="ctx-item" role="menuitem" onClick={run(() => props.onUnfreeze(paneId))}>Unfreeze</button>
               : <button className="ctx-item" role="menuitem" onClick={run(() => setNotePane(paneId))}>Freeze pane…</button>}

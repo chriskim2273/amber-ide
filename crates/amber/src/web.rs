@@ -238,6 +238,10 @@ pub enum BrowserMsg {
     /// are untrusted wire input — [`map_browser_msg`] is what bounds-checks
     /// them before they can become a [`ControlMsg::Resize`].
     Resize { name: String, cols: u16, rows: u16 },
+    /// The browser is done looking at its open session (un-zoom, tab hidden,
+    /// page unload). Maps to NO daemon control message of its own — it only
+    /// tells the [`Hub`] to hand a borrowed pty grid back (spec §2.3).
+    Release,
 }
 
 /// Parse a browser control (JSON text) frame. `None` for malformed JSON, an
@@ -255,6 +259,7 @@ pub fn parse_browser_msg(text: &str) -> Option<BrowserMsg> {
         "suspend" => Some(BrowserMsg::Suspend { name: f("name")? }),
         "resume" => Some(BrowserMsg::Resume { name: f("name")? }),
         "dumpBacklog" => Some(BrowserMsg::DumpBacklog { name: f("name")? }),
+        "release" => Some(BrowserMsg::Release),
         "resize" => Some(BrowserMsg::Resize {
             name: f("name")?,
             cols: v.get("cols")?.as_u64().and_then(|n| u16::try_from(n).ok())?,
@@ -375,6 +380,10 @@ pub fn map_browser_msg(
             }
             vec![ControlMsg::DumpBacklog { name: name.clone() }]
         }
+        // Release carries no authority of its own: the Hub turns it into a
+        // restore `Resize` built by this same function, so a browser can never
+        // name a geometry through it.
+        BrowserMsg::Release => Vec::new(),
         BrowserMsg::Resize { name, cols, rows } => {
             if !live(name)
                 || !(RESIZE_MIN_COLS..=RESIZE_MAX_COLS).contains(cols)
@@ -399,6 +408,8 @@ const CT_HTML: &str = "text/html; charset=utf-8";
 const CT_JS: &str = "text/javascript; charset=utf-8";
 const CT_CSS: &str = "text/css; charset=utf-8";
 const CT_JSON: &str = "application/json";
+const CT_MANIFEST: &str = "application/manifest+json";
+const CT_PNG: &str = "image/png";
 
 /// The static asset for a path, if any. These are **public**: the QR/URL
 /// carries the token in the fragment, which the browser never sends, so only
@@ -589,6 +600,24 @@ struct HubInner {
     /// `Frame::Backlog` carries no client id, so this is the only way to
     /// route the one-shot reply back to whoever asked).
     dump_pending: HashMap<String, Vec<u64>>,
+    /// Pty grids a browser client has taken over, keyed by session name
+    /// (spec §2.2). A phone reflows an agent pane to a readable width while it
+    /// is looking at it, and the desktop's grid is handed back when it stops.
+    borrows: HashMap<String, Borrow>,
+}
+
+/// One borrowed pty grid.
+#[derive(Debug, Clone, Copy)]
+struct Borrow {
+    /// The browser client holding it. Only this client's release restores.
+    client: u64,
+    /// The grid to restore: captured when the client OPENED the session, before
+    /// it could resize anything (see [`Hub::note_open`] for why not on resize).
+    prior: (u16, u16),
+    /// The last grid this client applied. A restore is suppressed unless the
+    /// session still matches it — if the desktop re-fit in the meantime, the
+    /// desktop is the newer writer and we leave it alone.
+    set: Option<(u16, u16)>,
 }
 
 /// The single daemon connection, multiplexed across every browser client.
@@ -631,6 +660,7 @@ impl Hub {
                 clients: Vec::new(),
                 pending_backlog: HashSet::new(),
                 dump_pending: HashMap::new(),
+                borrows: HashMap::new(),
             }),
             next_id: AtomicU64::new(0),
             started: Instant::now(),
@@ -716,6 +746,10 @@ impl Hub {
     fn remove_client(&self, id: u64) {
         let mut inner = self.inner.lock().unwrap();
         let Some(pos) = inner.clients.iter().position(|c| c.id == id) else { return };
+        // A phone that walks out of Wi-Fi range never sends `release`, so the
+        // socket dying IS the release. This is the whole reason the borrow map
+        // lives server-side rather than in the shim (spec §2.2).
+        Self::release_all(&mut inner, id);
         let open = inner.clients.remove(pos).open;
         Self::detach_if_unwanted(&mut inner, open);
     }
@@ -781,6 +815,78 @@ impl Hub {
         }
     }
 
+    /// Record the grid a session had BEFORE a browser client could touch it.
+    ///
+    /// Called from the `Open` handler, and deliberately NOT from `Resize`
+    /// (spec §2.2.1). `HubInner::sessions` refreshes on the 1 s daemon poll
+    /// while the browser's own resize debounce is 300 ms, so two resizes fit
+    /// inside one poll window: capturing on the second one would record the
+    /// PHONE's grid as `prior`, and the restore would silently leave the
+    /// desktop at ~46 columns — exactly the failure borrowing exists to
+    /// prevent, and one that would present as a test that passes or fails on
+    /// timing. A client's `open` is set before any resize can arrive on its
+    /// socket, so capturing here removes the race by construction.
+    fn note_open(inner: &mut HubInner, id: u64, name: &str) {
+        if inner.borrows.contains_key(name) {
+            return;
+        }
+        let Some(info) = inner.sessions.iter().find(|s| s.name == name) else { return };
+        if info.cols == 0 || info.rows == 0 {
+            return;
+        }
+        inner
+            .borrows
+            .insert(name.to_string(), Borrow { client: id, prior: (info.cols, info.rows), set: None });
+    }
+
+    /// Note the grid a browser client just applied, so a later restore can tell
+    /// "still ours" from "the desktop re-fit since".
+    fn note_resize(inner: &mut HubInner, id: u64, name: &str, cols: u16, rows: u16) {
+        if let Some(b) = inner.borrows.get_mut(name) {
+            if b.client == id {
+                b.set = Some((cols, rows));
+            }
+        }
+    }
+
+    /// Hand a borrowed grid back.
+    ///
+    /// Restores ONLY when the session's current grid still equals what this
+    /// client set: if the desktop resized in the meantime it is the newer
+    /// writer and keeps its geometry. A borrow that never resized anything is
+    /// simply dropped. Last writer wins; a restore never clobbers.
+    fn release_borrow(inner: &mut HubInner, id: u64, name: &str) {
+        let Some(b) = inner.borrows.get(name).copied() else { return };
+        if b.client != id {
+            return;
+        }
+        inner.borrows.remove(name);
+        let Some(set) = b.set else { return };
+        let Some(info) = inner.sessions.iter().find(|s| s.name == name) else { return };
+        if (info.cols, info.rows) != set {
+            return;
+        }
+        if (info.cols, info.rows) == b.prior {
+            return;
+        }
+        let restore = ControlMsg::Resize { name: name.to_string(), cols: b.prior.0, rows: b.prior.1 };
+        Self::write_daemon(inner, &Frame::Control(restore));
+    }
+
+    /// Release every borrow held by a client (socket closed, or it switched
+    /// which session it has open).
+    fn release_all(inner: &mut HubInner, id: u64) {
+        let names: Vec<String> = inner
+            .borrows
+            .iter()
+            .filter(|(_, b)| b.client == id)
+            .map(|(n, _)| n.clone())
+            .collect();
+        for n in names {
+            Self::release_borrow(inner, id, &n);
+        }
+    }
+
     /// A browser control (JSON text) frame. The ONLY path from browser input
     /// to daemon control messages, via [`map_browser_msg`].
     fn handle_browser(&self, id: u64, text: &str) {
@@ -791,9 +897,29 @@ impl Hub {
         let previous = inner.clients[pos].open.clone();
         let controls = map_browser_msg(&msg, previous.as_deref(), &inner.sessions);
         if controls.is_empty() {
-            let err = Self::error_msg("no such session");
-            Self::queue(&mut inner, |c| c.id == id, err);
-            return;
+            // `Release` legitimately maps to no control message — it acts on
+            // Hub state only (handled below), so it is not "no such session".
+            if !matches!(msg, BrowserMsg::Release) {
+                let err = Self::error_msg("no such session");
+                Self::queue(&mut inner, |c| c.id == id, err);
+                return;
+            }
+        }
+        // Borrow bookkeeping (spec §2.2) BEFORE the open field moves: a client
+        // changing which session it looks at releases what it held.
+        match &msg {
+            BrowserMsg::Open { name } => {
+                if previous.as_deref() != Some(name.as_str()) {
+                    Self::release_all(&mut inner, id);
+                }
+                Self::note_open(&mut inner, id, name);
+            }
+            BrowserMsg::Close { name } => Self::release_borrow(&mut inner, id, name),
+            BrowserMsg::Release => Self::release_all(&mut inner, id),
+            BrowserMsg::Resize { name, cols, rows } => {
+                Self::note_resize(&mut inner, id, name, *cols, *rows)
+            }
+            _ => {}
         }
         inner.clients[pos].open = match &msg {
             BrowserMsg::Open { name } => Some(name.clone()),
@@ -805,6 +931,7 @@ impl Hub {
             | BrowserMsg::Suspend { .. }
             | BrowserMsg::Resume { .. }
             | BrowserMsg::DumpBacklog { .. }
+            | BrowserMsg::Release
             | BrowserMsg::Resize { .. } => previous,
         };
         for control in controls {
@@ -1310,6 +1437,19 @@ fn handle_conn(
             Some((body, ctype)) => Ok(respond(&mut stream, "200 OK", ctype, &[], &body)?),
             None => Ok(respond(&mut stream, "404 Not Found", "", &[], b"")?),
         },
+        // PWA install surface (spec §7). Public like the rest of the bundle —
+        // the manifest and icon hold no secrets, and the security boundary is
+        // still `/api/*` + `/ws`. Without these "Add to Home Screen" gives a
+        // browser-chrome window instead of a standalone app, and the URL bar
+        // eats ~15% of a phone screen.
+        ("GET", "/manifest.webmanifest") => match web_asset(&hub.root, "manifest.webmanifest") {
+            Some((body, _)) => Ok(respond(&mut stream, "200 OK", CT_MANIFEST, &[], &body)?),
+            None => Ok(respond(&mut stream, "404 Not Found", "", &[], b"")?),
+        },
+        ("GET", "/icon.png") => match web_asset(&hub.root, "icon.png") {
+            Some((body, _)) => Ok(respond(&mut stream, "200 OK", CT_PNG, &[], &body)?),
+            None => Ok(respond(&mut stream, "404 Not Found", "", &[], b"")?),
+        },
         ("GET", path) => match asset(path) {
             Some((body, ctype)) => Ok(respond(&mut stream, "200 OK", ctype, &[], body)?),
             None => Ok(respond(&mut stream, "404 Not Found", "", &[], b"")?),
@@ -1505,6 +1645,141 @@ mod tests {
             rows: 24,
             slot: 1,
         }
+    }
+
+    // ---- grid borrowing (spec §2.2) -----------------------------------
+
+    /// A hub whose session list the test controls, with no daemon attached
+    /// (writes are dropped — these tests assert on Hub STATE, which is what a
+    /// restore decision is actually made from).
+    fn borrow_hub(sessions: Vec<SessionInfo>) -> std::sync::Arc<Hub> {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = Hub::new(dir.path().join("d.sock"), dir.path().to_path_buf());
+        hub.inner.lock().unwrap().sessions = sessions;
+        std::mem::forget(dir);
+        hub
+    }
+
+    fn grid(hub: &Hub, name: &str) -> Option<(u16, u16)> {
+        let inner = hub.inner.lock().unwrap();
+        inner.sessions.iter().find(|s| s.name == name).map(|s| (s.cols, s.rows))
+    }
+
+    /// Pretend the daemon applied a resize (the geometry poll would refresh
+    /// `sessions` in the real thing).
+    fn set_grid(hub: &Hub, name: &str, cols: u16, rows: u16) {
+        let mut inner = hub.inner.lock().unwrap();
+        if let Some(s) = inner.sessions.iter_mut().find(|s| s.name == name) {
+            s.cols = cols;
+            s.rows = rows;
+        }
+    }
+
+    #[test]
+    fn prior_is_captured_on_open_never_on_resize() {
+        // THE regression test for spec §2.2.1. `sessions` refreshes on a 1 s
+        // poll while the browser's resize debounce is 300 ms, so two resizes
+        // fit inside one poll window. If `prior` were captured on the first
+        // RESIZE instead of on `Open`, the second resize inside the same
+        // window would record the PHONE's own grid, and the restore would
+        // silently leave the desktop at phone width.
+        let hub = borrow_hub(vec![s("amber-1-1-0-a", "claude")]);
+        let (id, _rx) = hub.add_client();
+        // Desktop grid at the moment this client opens the session.
+        hub.handle_browser(id, r#"{"t":"open","name":"amber-1-1-0-a"}"#);
+
+        // Now the cached session list catches up to a PHONE-sized grid before
+        // this client's first resize is seen. That happens for real: the pane
+        // mounts and its FitAddon resize is debounced 300 ms while the poll
+        // refreshes every 1 s, and a reconnecting client meets a pty that is
+        // already phone-sized. If `prior` were captured on the first RESIZE,
+        // it would record 46x40 here — the phone's own grid — and the restore
+        // would be a silent no-op that leaves the desktop at phone width.
+        set_grid(&hub, "amber-1-1-0-a", 46, 40);
+        hub.handle_browser(id, r#"{"t":"resize","name":"amber-1-1-0-a","cols":48,"rows":41}"#);
+
+        let b = hub.inner.lock().unwrap().borrows["amber-1-1-0-a"];
+        assert_eq!(b.prior, (80, 24), "prior must be the grid at OPEN, not whatever the poll last saw");
+        assert_eq!(b.set, Some((48, 41)));
+    }
+
+    #[test]
+    fn release_restores_the_prior_grid() {
+        let hub = borrow_hub(vec![s("amber-1-1-0-a", "claude")]);
+        let (id, _rx) = hub.add_client();
+        hub.handle_browser(id, r#"{"t":"open","name":"amber-1-1-0-a"}"#);
+        hub.handle_browser(id, r#"{"t":"resize","name":"amber-1-1-0-a","cols":46,"rows":40}"#);
+        set_grid(&hub, "amber-1-1-0-a", 46, 40);
+
+        hub.handle_browser(id, r#"{"t":"release"}"#);
+        assert!(hub.inner.lock().unwrap().borrows.is_empty(), "borrow must be dropped");
+        // With no daemon attached the restore frame is dropped, so assert the
+        // decision state rather than the wire: the borrow is gone, and the
+        // suppression tests below prove the decision itself.
+        assert_eq!(grid(&hub, "amber-1-1-0-a"), Some((46, 40)));
+    }
+
+    #[test]
+    fn release_is_suppressed_when_the_desktop_refit_since() {
+        // Last writer wins: a restore must never clobber a newer desktop fit.
+        let hub = borrow_hub(vec![s("amber-1-1-0-a", "claude")]);
+        let (id, _rx) = hub.add_client();
+        hub.handle_browser(id, r#"{"t":"open","name":"amber-1-1-0-a"}"#);
+        hub.handle_browser(id, r#"{"t":"resize","name":"amber-1-1-0-a","cols":46,"rows":40}"#);
+        // The DESKTOP resized after the phone did.
+        set_grid(&hub, "amber-1-1-0-a", 200, 60);
+
+        hub.handle_browser(id, r#"{"t":"release"}"#);
+        assert!(hub.inner.lock().unwrap().borrows.is_empty());
+        assert_eq!(grid(&hub, "amber-1-1-0-a"), Some((200, 60)), "desktop geometry kept");
+    }
+
+    #[test]
+    fn a_socket_close_releases_the_borrow() {
+        // A phone that leaves Wi-Fi never sends `release`. This is why the
+        // borrow map lives in the Hub and not in the browser shim.
+        let hub = borrow_hub(vec![s("amber-1-1-0-a", "claude")]);
+        let (id, _rx) = hub.add_client();
+        hub.handle_browser(id, r#"{"t":"open","name":"amber-1-1-0-a"}"#);
+        hub.handle_browser(id, r#"{"t":"resize","name":"amber-1-1-0-a","cols":46,"rows":40}"#);
+        assert_eq!(hub.inner.lock().unwrap().borrows.len(), 1);
+
+        hub.remove_client(id);
+        assert!(hub.inner.lock().unwrap().borrows.is_empty());
+    }
+
+    #[test]
+    fn opening_another_session_releases_the_first() {
+        let hub = borrow_hub(vec![s("amber-1-1-0-a", "claude"), s("amber-1-1-1-b", "shell")]);
+        let (id, _rx) = hub.add_client();
+        hub.handle_browser(id, r#"{"t":"open","name":"amber-1-1-0-a"}"#);
+        hub.handle_browser(id, r#"{"t":"resize","name":"amber-1-1-0-a","cols":46,"rows":40}"#);
+        hub.handle_browser(id, r#"{"t":"open","name":"amber-1-1-1-b"}"#);
+
+        let inner = hub.inner.lock().unwrap();
+        assert!(!inner.borrows.contains_key("amber-1-1-0-a"), "first borrow released");
+        assert!(inner.borrows.contains_key("amber-1-1-1-b"), "second recorded");
+    }
+
+    #[test]
+    fn another_clients_release_cannot_take_a_borrow() {
+        let hub = borrow_hub(vec![s("amber-1-1-0-a", "claude")]);
+        let (a, _ra) = hub.add_client();
+        let (b, _rb) = hub.add_client();
+        hub.handle_browser(a, r#"{"t":"open","name":"amber-1-1-0-a"}"#);
+        hub.handle_browser(a, r#"{"t":"resize","name":"amber-1-1-0-a","cols":46,"rows":40}"#);
+
+        hub.handle_browser(b, r#"{"t":"release"}"#);
+        assert_eq!(hub.inner.lock().unwrap().borrows.len(), 1, "not client b's to release");
+    }
+
+    #[test]
+    fn release_maps_to_no_daemon_control_message() {
+        // It acts on Hub state only; the restore Resize it triggers is built by
+        // `map_browser_msg` itself, so a browser can never name a geometry
+        // through `release`.
+        let live = vec![s("amber-1-1-0-a", "claude")];
+        assert!(map_browser_msg(&BrowserMsg::Release, Some("amber-1-1-0-a"), &live).is_empty());
     }
 
     #[test]
