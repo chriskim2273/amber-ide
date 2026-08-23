@@ -113,6 +113,11 @@ pub struct Config {
     pub scrollback_bytes: usize,
     #[serde(default)]
     pub memory: MemoryConfig,
+    /// Host PSI thresholds and timing for automatic resource-pressure parking.
+    /// `#[serde(default)]` keeps configuration files written before this
+    /// policy valid.
+    #[serde(default)]
+    pub pressure: PressureConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,6 +155,83 @@ impl MemoryConfig {
     }
 }
 
+/// Configurable Linux PSI policy thresholds and timings.
+///
+/// Percentages are PSI `avg10` percentages. They are normalized while
+/// deserializing so malformed configuration cannot accidentally create a
+/// permanently disabled or hot-looping policy.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PressureConfig {
+    pub cpu_some_percent: f64,
+    pub io_full_percent: f64,
+    pub memory_full_percent: f64,
+    pub sustain_seconds: u64,
+    pub cooldown_seconds: u64,
+}
+
+impl Default for PressureConfig {
+    fn default() -> Self {
+        Self {
+            cpu_some_percent: 25.0,
+            io_full_percent: 20.0,
+            memory_full_percent: 2.0,
+            sustain_seconds: 120,
+            cooldown_seconds: 10,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct RawPressureConfig {
+    cpu_some_percent: Option<f64>,
+    io_full_percent: Option<f64>,
+    memory_full_percent: Option<f64>,
+    sustain_seconds: Option<u64>,
+    cooldown_seconds: Option<u64>,
+}
+
+impl PressureConfig {
+    fn normalized_percent(value: Option<f64>, default: f64) -> f64 {
+        value
+            .filter(|value| value.is_finite())
+            .map(|value| value.clamp(0.0, 100.0))
+            .unwrap_or(default)
+    }
+
+    fn normalized_interval(value: Option<u64>, default: u64) -> u64 {
+        value.filter(|value| *value != 0).unwrap_or(default)
+    }
+}
+
+impl<'de> Deserialize<'de> for PressureConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = RawPressureConfig::deserialize(deserializer)?;
+        let defaults = Self::default();
+        Ok(Self {
+            cpu_some_percent: Self::normalized_percent(
+                raw.cpu_some_percent,
+                defaults.cpu_some_percent,
+            ),
+            io_full_percent: Self::normalized_percent(
+                raw.io_full_percent,
+                defaults.io_full_percent,
+            ),
+            memory_full_percent: Self::normalized_percent(
+                raw.memory_full_percent,
+                defaults.memory_full_percent,
+            ),
+            sustain_seconds: Self::normalized_interval(
+                raw.sustain_seconds,
+                defaults.sustain_seconds,
+            ),
+            cooldown_seconds: Self::normalized_interval(
+                raw.cooldown_seconds,
+                defaults.cooldown_seconds,
+            ),
+        })
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -159,6 +241,7 @@ impl Default for Config {
             snapshot_interval_secs: 10,
             scrollback_bytes: 2 * 1024 * 1024,
             memory: MemoryConfig::default(),
+            pressure: PressureConfig::default(),
         }
     }
 }
@@ -1151,6 +1234,64 @@ mod tests {
     }
 
     #[test]
+    fn config_written_before_pressure_guardian_uses_pressure_defaults() {
+        // A config from before host-pressure support has no `[pressure]`
+        // section, but must still enable the policy with its safe defaults.
+        let cfg: Config = toml::from_str(
+            "snapshot_interval_secs = 10\nscrollback_bytes = 2048\n",
+        )
+        .unwrap();
+
+        assert_eq!(cfg.pressure.cpu_some_percent, 25.0);
+        assert_eq!(cfg.pressure.io_full_percent, 20.0);
+        assert_eq!(cfg.pressure.memory_full_percent, 2.0);
+        assert_eq!(cfg.pressure.sustain_seconds, 120);
+        assert_eq!(cfg.pressure.cooldown_seconds, 10);
+    }
+
+    #[test]
+    fn pressure_config_round_trips_explicit_values() {
+        // Persisting an operator's non-default policy must retain each value;
+        // otherwise a restart can silently change when automatic parking acts.
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        let mut cfg = Config::default();
+        cfg.pressure = PressureConfig {
+            cpu_some_percent: 30.5,
+            io_full_percent: 12.25,
+            memory_full_percent: 4.0,
+            sustain_seconds: 240,
+            cooldown_seconds: 30,
+        };
+
+        store.save_config(&cfg).unwrap();
+        assert_eq!(store.load_config().unwrap(), cfg);
+    }
+
+    #[test]
+    fn pressure_config_normalizes_invalid_thresholds_and_intervals() {
+        // Invalid operator input must not create an impossible policy or a
+        // zero-duration loop: finite percentages clamp, NaN falls back, and
+        // zero intervals fall back to their defaults.
+        let cfg: Config = toml::from_str(
+            "snapshot_interval_secs = 10\nscrollback_bytes = 2048\n\
+             [pressure]\n\
+             cpu_some_percent = 150\n\
+             io_full_percent = -1\n\
+             memory_full_percent = nan\n\
+             sustain_seconds = 0\n\
+             cooldown_seconds = 0\n",
+        )
+        .unwrap();
+
+        assert_eq!(cfg.pressure.cpu_some_percent, 100.0);
+        assert_eq!(cfg.pressure.io_full_percent, 0.0);
+        assert_eq!(cfg.pressure.memory_full_percent, 2.0);
+        assert_eq!(cfg.pressure.sustain_seconds, 120);
+        assert_eq!(cfg.pressure.cooldown_seconds, 10);
+    }
+
+    #[test]
     fn memory_config_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::new(dir.path());
@@ -1211,6 +1352,7 @@ mod tests {
             snapshot_interval_secs: 42,
             scrollback_bytes: 4096,
             memory: MemoryConfig::default(),
+            pressure: PressureConfig::default(),
         };
 
         store.save_config(&cfg).unwrap();
