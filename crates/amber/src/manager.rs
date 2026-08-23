@@ -1224,6 +1224,12 @@ impl SessionManager {
         if now_ms.saturating_sub(last_activity_ms) < RECENT_USE_MS {
             anyhow::bail!("session {name} received recent activity");
         }
+        // This is deliberately the final check before claiming the automatic
+        // origin: a selected process may have exited while snapshotting or
+        // while the preceding metadata/recency checks ran.
+        if !session.is_alive() {
+            anyhow::bail!("session {name} no longer has a running agent");
+        }
 
         session
             .claim_suspend(SuspendOrigin::Pressure)
@@ -2916,6 +2922,27 @@ mod tests {
             .collect::<Vec<_>>(),
             vec!["eligible"],
         );
+    }
+
+    #[test]
+    fn automatic_pressure_suspend_rechecks_liveness_under_the_transition_lock() {
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        let session = fake_agent(&mgr, "agent");
+        record_resume_id(&mgr, "agent", dir.path());
+        let now_ms = session.last_user_ms() + RECENT_USE_MS;
+
+        session.kill().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while session.is_alive() {
+            assert!(std::time::Instant::now() < deadline, "agent never exited");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        let error = mgr.suspend_for_pressure("agent", now_ms).unwrap_err();
+        assert!(error.to_string().contains("no such session"));
+        assert_eq!(session.suspend_origin(), SuspendOrigin::None);
+        assert_eq!(session.memory_suspend_started_ms(), 0);
     }
 
     #[test]

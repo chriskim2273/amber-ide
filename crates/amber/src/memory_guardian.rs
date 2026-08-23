@@ -939,7 +939,7 @@ mod tests {
     }
 
     #[test]
-    fn focus_after_selection_fails_the_managers_final_eligibility_recheck() {
+    fn host_focus_after_selection_fails_the_managers_final_eligibility_recheck() {
         let dir = tempdir().unwrap();
         let manager = Arc::new(crate::manager::SessionManager::new(dir.path()).unwrap());
         let name = "race-agent";
@@ -967,22 +967,20 @@ mod tests {
             )
             .unwrap();
 
-        let stale = [candidate(name, 10, 0, true, true, true, false)];
-        let decision = step(
-            PressureLevel::Normal,
-            RECENT_USE_MS,
-            900,
-            1000,
-            None,
-            &stale,
+        let selected_at = session.last_user_ms() + RECENT_USE_MS;
+        assert_eq!(
+            manager
+                .host_pressure_candidates(selected_at, &HashMap::from([(name.to_string(), 10)]))
+                .first()
+                .map(|candidate| candidate.name.as_str()),
+            Some(name),
         );
-        assert_eq!(decision.candidate.as_deref(), Some(name));
 
         assert!(!manager.focus_session(name).unwrap());
         let error = manager
-            .suspend_for_memory(name, crate::pty::monotonic_ms())
+            .suspend_for_pressure(name, session.last_user_ms() + RECENT_USE_MS)
             .unwrap_err();
-        assert!(error.to_string().contains("recent"));
+        assert!(error.to_string().contains("foreground"));
         assert_eq!(session.suspend_origin(), crate::pty::SuspendOrigin::None);
         manager.remove(name).unwrap();
     }
