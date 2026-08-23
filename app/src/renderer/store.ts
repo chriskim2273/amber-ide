@@ -165,13 +165,17 @@ export function shouldHintTerminalFocus(active: boolean, terminalTarget: boolean
 // because React/xterm restored focus during mount or keep-alive activation.
 // `directTarget` excludes focus bubbling from the explicit Resume button,
 // whose click remains its own single Focus request.
+export function shouldResumeParkedPane(active: boolean, trusted: boolean): boolean {
+  return active && trusted
+}
+
 export function shouldResumeMemoryParked(
   active: boolean,
   directTarget: boolean,
   userArmed: boolean,
   alreadySent = false,
 ): boolean {
-  return active && directTarget && userArmed && !alreadySent
+  return directTarget && !alreadySent && shouldResumeParkedPane(active, userArmed)
 }
 
 export function parkedOverlayText(runState: string | undefined): string | null {
