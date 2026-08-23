@@ -1534,6 +1534,12 @@ target/debug/amber ctl web status --json --root "$AMBER_TEST_ROOT" --port 7919 \
 ```
 Expected: `[]`.
 
+- [ ] **NOT DONE — `enable` / `disable` were never run live.** They write a real
+  unit into `~/.config/systemd/user/` and run `tailscale serve --bg` on the
+  user's own machine. Unit rendering and argv are unit-tested instead.
+- [ ] **NOT DONE — macOS launchd**, a real phone over the tailnet, and the
+  packaged AppImage path.
+
 - [x] **Step 6: Verify the app dialog end-to-end**
 
 Use the `verify` skill (`Skill(verify)`) to drive the GUI headless (xvfb + CDP) against this private instance: open the Remote access dialog, confirm the pill colour matches the CLI's `unit`/`tailscale`, reveal + copy the URL, render the QR, run the log tail, and press Restart and see the pill go `off → serving`.

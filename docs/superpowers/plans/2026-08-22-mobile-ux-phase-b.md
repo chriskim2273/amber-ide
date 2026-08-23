@@ -150,5 +150,7 @@ Ported from `crates/amber/assets/app.js:600-720`, which is proven on a real phon
 
 ### Task 9: Verification
 
-- [x] Playwright/CDP with an iPhone-13-sized and a Pixel-7-sized viewport plus `hasTouch`, against a private daemon + private `amber web`: tap-to-zoom borrows the grid and un-zoom restores it; ⇧Tab reaches the pty; an alt-screen drag sends arrows, not scrollback; opening the keyboard does not change `rows`; a long-press sheet opens; a divider drags by touch after a long-press while a plain drag scrolls.
-- [x] Write `.reports/mobile-ux.md`; add the CLAUDE.md build-status entry; state plainly that a real-device pass on both platforms did not happen.
+- [x] CDP at a 390x844 phone viewport with touch emulation, against a private daemon + private `amber web`: mobile chrome swaps in on capability alone, all eleven key-bar keys at 44px, manifest + icon served, and **tile 80x24 -> zoomed 44x41 -> un-zoomed 80x24**.
+- [x] Write `.reports/mobile-ux.md`; add the CLAUDE.md build-status entry.
+- [ ] **NOT DONE — a real device on either platform.** Emulation gives touch events and a coarse pointer, not a soft keyboard: §3's rule (opening the keyboard must not re-fit the pty) is implemented and unit-tested but has never actually run. Long-press drag arming, real-finger touch scrolling with momentum, clipboard gestures and PWA install are likewise unexercised.
+- [ ] **NOT DONE — a Pixel-sized profile.** Only the 390x844 iPhone-class viewport was driven.
