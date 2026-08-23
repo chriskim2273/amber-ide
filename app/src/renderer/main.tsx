@@ -2,7 +2,8 @@ import { useCallback, useEffect, useReducer, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { SplitView, fmtMem, type PaneMeta } from './SplitView'
 import type { EditorApi } from './Editor'
-import { initialState, reduce, groupSessions, mergeBrowsers, mergeEditors, tabDot, hasActivity, isAgentKind, resourcePressureMessage, type DaemonEvent } from './store'
+import { initialState, reduce, groupSessions, mergeBrowsers, mergeEditors, tabDot, hasActivity, isAgentKind, type DaemonEvent } from './store'
+import { ResourcePressureBanner } from './PressureBanners'
 import type { ControlMsg } from '../shared/proto'
 import { sessionRows } from './sessionRows'
 import { deriveTab, shortCwd } from './tabView'
@@ -1179,10 +1180,7 @@ function App(): JSX.Element {
         </div>
       })()}
       {state.resourcePressure?.level === 'critical' && (
-        <div className="banner memory-banner critical" role="alert">
-          <span className="dot" />
-          <span className="banner-msg">{resourcePressureMessage(state.resourcePressure)}</span>
-        </div>
+        <ResourcePressureBanner pressure={state.resourcePressure} />
       )}
       {notice && (
         <div className="banner notice-banner" role="status" aria-live="polite">
