@@ -92,6 +92,29 @@ enum TestDaemon {
     Direct(Child),
     #[cfg(target_os = "linux")]
     Systemd(String),
+    #[cfg(target_os = "linux")]
+    PrivateSystemd(PrivateSystemdDaemon),
+}
+
+#[cfg(target_os = "linux")]
+struct PrivateSystemdDaemon {
+    unit: String,
+    root: PathBuf,
+    systemctl: OsString,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for PrivateSystemdDaemon {
+    fn drop(&mut self) {
+        for action in ["stop", "reset-failed"] {
+            let _ = Command::new(&self.systemctl)
+                .args(["--user", action, &self.unit])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        let _ = fs::remove_dir_all(&self.root);
+    }
 }
 
 impl Drop for TestDaemon {
@@ -109,6 +132,8 @@ impl Drop for TestDaemon {
                     .stderr(Stdio::null())
                     .status();
             }
+            #[cfg(target_os = "linux")]
+            TestDaemon::PrivateSystemd(_daemon) => {}
         }
     }
 }
@@ -270,6 +295,21 @@ fn create_private_session(root: &Path, socket: &Path, name: &str) {
 
 #[cfg(target_os = "linux")]
 fn start_required_delegated_daemon(root: &Path, socket: &Path) -> RunningDaemon {
+    start_required_delegated_daemon_with_programs(
+        root,
+        socket,
+        OsStr::new("systemd-run"),
+        OsStr::new("systemctl"),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn start_required_delegated_daemon_with_programs(
+    root: &Path,
+    socket: &Path,
+    systemd_run: &OsStr,
+    systemctl: &OsStr,
+) -> RunningDaemon {
     assert_private_root_socket(root, socket);
     static NEXT_UNIT: AtomicUsize = AtomicUsize::new(0);
     let unit = format!(
@@ -277,7 +317,7 @@ fn start_required_delegated_daemon(root: &Path, socket: &Path) -> RunningDaemon 
         std::process::id(),
         NEXT_UNIT.fetch_add(1, Ordering::SeqCst),
     );
-    let output = Command::new("systemd-run")
+    let output = Command::new(systemd_run)
         .args([
             "--user",
             "--unit",
@@ -294,12 +334,12 @@ fn start_required_delegated_daemon(root: &Path, socket: &Path) -> RunningDaemon 
         .arg(socket)
         .output()
         .expect("systemd-run must be invokable for delegated cgroup proof");
+    let daemon = PrivateSystemdDaemon {
+        unit,
+        root: root.to_path_buf(),
+        systemctl: systemctl.to_os_string(),
+    };
     if !output.status.success() || !wait_for_socket(socket, Duration::from_secs(5)) {
-        let _ = Command::new("systemctl")
-            .args(["--user", "stop", &unit])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
         panic!(
             "required delegated private daemon did not start: {}{}",
             String::from_utf8_lossy(&output.stdout),
@@ -307,8 +347,14 @@ fn start_required_delegated_daemon(root: &Path, socket: &Path) -> RunningDaemon 
         );
     }
 
-    let control_group = Command::new("systemctl")
-        .args(["--user", "show", &unit, "--property=ControlGroup", "--value"])
+    let control_group = Command::new(&daemon.systemctl)
+        .args([
+            "--user",
+            "show",
+            &daemon.unit,
+            "--property=ControlGroup",
+            "--value",
+        ])
         .output()
         .expect("systemctl show must be invokable for delegated cgroup proof");
     assert!(
@@ -337,7 +383,7 @@ fn start_required_delegated_daemon(root: &Path, socket: &Path) -> RunningDaemon 
         }
     }
     RunningDaemon {
-        _handle: TestDaemon::Systemd(unit),
+        _handle: TestDaemon::PrivateSystemd(daemon),
         delegated_root: Some(delegated_root),
     }
 }
@@ -522,6 +568,106 @@ fn write_sleeping_fake_claude(root: &Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(&claude_path, fs::Permissions::from_mode(0o755)).unwrap();
     claude_path
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn delegated_daemon_inspection_failure_cleans_exact_private_unit_and_root() {
+    let _exec_guard = exec_guard();
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().join("private-state");
+    fs::create_dir(&root).unwrap();
+    let socket = root.join("amberd.sock");
+    let sibling = fixture.path().join("must-survive");
+    fs::write(&sibling, "sentinel").unwrap();
+
+    let fake_bin = fixture.path().join("fake-bin");
+    fs::create_dir(&fake_bin).unwrap();
+    let calls = fixture.path().join("systemctl.calls");
+    let daemon_pid = fixture.path().join("daemon.pid");
+    let systemd_run = fake_bin.join("systemd-run");
+    fs::write(
+        &systemd_run,
+        format!(
+            r#"#!/bin/sh
+/usr/bin/python3 -c 'import socket,time; s=socket.socket(socket.AF_UNIX); s.bind({socket:?}); s.listen(); time.sleep(60)' </dev/null >/dev/null 2>&1 &
+printf '%s\n' "$!" > {daemon_pid}
+exit 0
+"#,
+            socket = socket.to_string_lossy(),
+            daemon_pid = daemon_pid.display(),
+        ),
+    )
+    .unwrap();
+    let systemctl = fake_bin.join("systemctl");
+    fs::write(
+        &systemctl,
+        format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> {calls}
+if [ "$2" = "show" ]; then
+  exit 23
+fi
+if [ "$2" = "stop" ] && [ -f {daemon_pid} ]; then
+  kill "$(/bin/cat {daemon_pid})" 2>/dev/null || true
+fi
+exit 0
+"#,
+            calls = calls.display(),
+            daemon_pid = daemon_pid.display(),
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    for executable in [&systemd_run, &systemctl] {
+        fs::set_permissions(executable, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let inspection = std::panic::catch_unwind(|| {
+        start_required_delegated_daemon_with_programs(
+            &root,
+            &socket,
+            systemd_run.as_os_str(),
+            systemctl.as_os_str(),
+        );
+    });
+
+    let actual_calls = fs::read_to_string(&calls).unwrap_or_default();
+    let root_was_removed = !root.exists();
+    let sibling_survived = sibling.exists();
+
+    // Keep the RED phase hermetic even before the cleanup guard exists.
+    if let Ok(pid) = fs::read_to_string(&daemon_pid).and_then(|pid| {
+        pid.trim()
+            .parse::<u32>()
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }) {
+        let _ = Command::new("kill").arg(pid.to_string()).status();
+    }
+    let _ = fs::remove_dir_all(&root);
+
+    assert!(inspection.is_err(), "the fake cgroup inspection must fail");
+    let call_lines = actual_calls.lines().collect::<Vec<_>>();
+    let unit = call_lines
+        .first()
+        .and_then(|line| line.split_whitespace().nth(2))
+        .expect("systemctl show must name the generated private unit");
+    assert!(
+        unit.starts_with(&format!("amber-task6-cgroup-{}-", std::process::id()))
+            && unit.ends_with(".service"),
+        "unexpected private unit name: {unit}",
+    );
+    assert_eq!(
+        call_lines,
+        [
+            format!("--user show {unit} --property=ControlGroup --value"),
+            format!("--user stop {unit}"),
+            format!("--user reset-failed {unit}"),
+        ],
+        "inspection failure must clean only the exact generated unit",
+    );
+    assert!(root_was_removed, "inspection failure leaked the private state root");
+    assert!(sibling_survived, "cleanup escaped the exact private state root");
 }
 
 #[test]

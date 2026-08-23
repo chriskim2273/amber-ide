@@ -319,80 +319,63 @@ introduced, so an older daemon can read the same state store.
 
 ## Task 6 verification record (2026-08-23)
 
-Verification ran in the resource-pressure-guardian worktree at commit
-`5c7aa5daf5dbe52cb3b14eb1a3d745f57596fb82`, on Linux with a user systemd
-manager and cgroup v2. **This run is noncompliant with the private-proof
-safety requirement and blocks rollout approval**; the production Focus/Attach
-incident is recorded below. No evidence in this record may be treated as a
-production-rollout approval.
+Corrective verification ran in the resource-pressure-guardian worktree through
+fix-round-4 commit `1b18cb5bb87f529296dbbc7f368be9f788a24df1`, on
+Linux with a user systemd manager and cgroup v2. Round 5 then added and checked
+the transient-unit cleanup regression described below. The corrective proof
+used only a validated temporary state root, an explicit socket under that root,
+and a unique private transient unit. It did not query, restart, stop, attach to,
+or focus the production Amber service or its default socket.
 
 | Gate | Command | Result |
 | --- | --- | --- |
-| Rust formatting | `cargo fmt --all -- --check` | **failed** (exit 1): rustfmt reported repository-wide formatting differences (7,815 displayed diff lines; output was truncated). No formatting changes were made in this task. |
-| Rust lint | `RUSTFLAGS='-D warnings' cargo clippy --workspace --all-targets` | **failed** (exit 101): `clippy::field_reassign_with_default` at `crates/amber-core/src/state.rs:1258-1265`, promoted by `-D warnings`. |
+| Rust formatting (branch) | `cargo fmt --all -- --check` | **failed** (exit 1): repository-wide formatting differences; output was truncated after 7,913 lines. No broad formatting rewrite was applied. |
+| Rust formatting (merge base) | `cargo fmt --all -- --check` at merge base `ae889630c8ffcf5f435b665a0a5a7541653c47a6` in a temporary worktree | **failed** (exit 1): the same repository-wide drift was already present; output was truncated after 8,837 lines. The temporary worktree was removed. |
+| Rust lint | `RUSTFLAGS='-D warnings' cargo clippy --workspace --all-targets` | passed (exit 0). |
 | TypeScript | `cd app && npm run typecheck` | passed (exit 0). |
-| Rust tests | `cargo test --workspace` | passed (exit 0): 569 tests, 23 suites. |
-| App tests | `cd app && npm test -- --run` | passed (exit 0): 560 passed, 1 skipped, 42 files (41 passed). Expected malformed-frame stderr was emitted by a connection test. |
+| Rust tests | `cargo test --workspace` | passed on the second full run: 570 passed, 1 ignored, 23 suites. The first full run had one failure in `agent_rename_keeps_memory_suspension_resumable_on_focus`; its exact rerun passed before the clean full rerun. |
+| App tests | `cd app && npm test -- --run` | passed: 561 passed, 1 skipped, 42 files. Expected malformed-frame stderr was emitted by a connection test. |
 | Unit parity | `cd app && npm test -- --run src/main/serviceManager.test.ts` | passed (exit 0): 21 tests. |
-| Unit syntax | `systemd-analyze --user verify infra/daemon/amber.service` | passed (exit 0). |
+| Unit syntax | `systemd-analyze --user verify infra/daemon/amber.service` | passed with no diagnostics. This verifies the file; it does not install or restart the unit. |
+| Patch hygiene | `git diff --check` | passed. |
+| Cleanup regression | `cargo test -p amber --test claude_supervise delegated_daemon_inspection_failure_cleans_exact_private_unit_and_root -- --exact --nocapture` | passed: 1 test. Fake `systemd-run`/`systemctl` executables force inspection failure without contacting systemd, then verify exact-unit stop/reset, private-root removal, and preservation of an adjacent sentinel. |
+| Focused lint after cleanup fix | `RUSTFLAGS='-D warnings' cargo clippy -p amber --test claude_supervise` | passed. |
+| Guarded private Linux proof | `target/debug/deps/claude_supervise-0267583557aef905 --ignored isolated_delegated_cgroup_places_workloads_and_weights_sessions --nocapture` | passed after the cleanup fix: 1 test. |
 
-### Isolated Linux evidence and cleanup
+### Guarded private Linux proof
 
-The existing `claude_supervise` fixture was run as
-`cargo test -p amber --test claude_supervise suspend_reclaims_a_stubborn_descendant_before_reporting_suspended -- --exact --nocapture`
-and passed (1 test, 9 filtered). The fixture *attempts* a temporary user unit
-with `systemd-run --user --property=Delegate=yes`, but falls back to direct
-spawn if that path is unavailable. The captured test result does not identify
-which path ran, so it is evidence for fake-agent suspension/reclamation and
-exact `--resume conv-42` only; it is **not** evidence of transient-unit or
-delegated-cgroup success.
+The ignored, fail-closed proof
+`isolated_delegated_cgroup_places_workloads_and_weights_sessions` passed in
+round 4 and was rerun successfully after the round-5 cleanup-guard change. The
+round-5 run used root `/tmp/.tmpFlEGyQ`, socket
+`/tmp/.tmpFlEGyQ/amberd.sock`, and unique unit
+`amber-task6-cgroup-676007-0.service`. Its cgroup root was:
 
-An additional manually inspected private unit was created with:
-
-```bash
-task6_root=$(mktemp -d /tmp/amber-task6-rpg.XXXXXX)
-# Result: /tmp/amber-task6-rpg.cFnP89
-systemd-run --user --unit=amber-task6-rpg-cfnp89.service \
-  --property='Delegate=cpu memory' --collect --quiet \
-  /home/poyto/Projects/amber-ide/.worktrees/resource-pressure-guardian/target/debug/amber \
-  daemon --root /tmp/amber-task6-rpg.cFnP89 \
-  --socket /tmp/amber-task6-rpg.cFnP89/amberd.sock
-systemctl --user show amber-task6-rpg-cfnp89.service \
-  -p ActiveState -p MainPID -p Delegate --no-pager
-# MainPID=1494362; Delegate=yes; ActiveState=active
+```text
+/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/amber-task6-cgroup-676007-0.service
 ```
 
-The private root contained a fake `claude` executable and explicit
-`config.toml`; two temporary agent sessions were created with `amber create
-... --socket /tmp/amber-task6-rpg.cFnP89/amberd.sock`. No exact inspection
-command/output transcript was retained for cgroup placement, controller state,
-weights, workload processes, or per-PID validation. Those former operator
-notes are therefore omitted and do **not** constitute live proof.
+The proof asserts all of the following against the real private cgroup v2
+hierarchy:
 
-The first normal stop request did not complete before the task was interrupted.
-The captured cleanup command/result record below shows TERM to the listed
-PIDs, no survivors, an inactive/dead unit, cgroup removal, and
-removal of only the named root. The contemporaneous per-PID command-line,
-root/socket, and cgroup-validation transcript was not retained; it is an
-unverified operator note, not proof. The exact earlier `systemctl stop` result
-is unavailable because that command was interrupted; no stronger
-graceful-stop claim is made.
+- `cpu` and `memory` are present in both `cgroup.controllers` and
+  `cgroup.subtree_control`.
+- Foreground slot 1 and background slot 2 each have populated `supervisor` and
+  `workload` leaves. Every PID in each leaf reports the matching
+  `session-<slot>/<role>` suffix in `/proc/<pid>/cgroup`.
+- CPU weights are exactly `_daemon=10000`, foreground session `=1000`, and
+  background session `=100`.
+- Both private sessions are removed. The guard invokes stop/reset using the
+  exact generated unit name, and the proof observes that the quoted cgroup root
+  no longer exists.
 
-Captured cleanup commands/results were:
-
-```bash
-kill -TERM 1501086 1501108 1501012 1501061 1494362
-# remaining-after-term: (none)
-systemctl --user show amber-task6-rpg-cfnp89.service \
-  -p ActiveState -p SubState -p MainPID -p ControlGroup --no-pager
-# MainPID=0; ControlGroup=; ActiveState=inactive; SubState=dead
-test ! -e /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/amber-task6-rpg-cfnp89.service
-# cgroup-removed=yes
-find /tmp/amber-task6-rpg.cFnP89 -maxdepth 2 -mindepth 1 -printf '%P\n' | sort
-rm -rf /tmp/amber-task6-rpg.cFnP89
-test ! -e /tmp/amber-task6-rpg.cFnP89
-# temp-root-removed=yes
-```
+The round-5 guard is constructed immediately after `systemd-run` returns and
+before socket waiting, `systemctl show`, cgroup-path assertions, controller
+reads, or weight/placement inspection. Successful startup transfers the guard
+to `RunningDaemon`; any panic or early return drops it. The focused fake-command
+regression proves that an inspection failure issues `stop` and `reset-failed`
+only for that generated unit, removes only its validated private state root,
+and preserves an adjacent sentinel.
 
 Synthetic unit-policy evidence, rather than a live 120-second episode, comes
 from `host_pressure_waits_snapshots_and_honors_cooldown`: no candidate at
@@ -402,7 +385,26 @@ foreground-after-rename exclusion, ignored background output vs user input,
 safety exclusions, protocol capability gating, configuration defaults,
 partial CPU activation, and UI reducer/banner/parked-overlay behavior.
 
-### Requirement audit and remaining risk
+### Original production Focus/Attach incident
+
+The first Task 6 verification run at
+`5c7aa5daf5dbe52cb3b14eb1a3d745f57596fb82` was noncompliant. It ran:
+
+```bash
+AMBER_SOCK=/tmp/amber-task6-rpg.cFnP89/amberd.sock timeout 1 \
+  ./target/debug/amber attach foreground
+```
+
+The command omitted the required `--socket` flag. That CLI ignores
+`AMBER_SOCK` for this command, resolved the default production user socket, and
+sent Focus/Attach for a production session named `foreground` for up to one
+second. Production `amber.service` was not installed, restarted, stopped, or
+killed, but production focus/session state could have changed. No restoration
+was attempted by guessing the prior state. The later guarded proof is separate
+corrective evidence; it does not erase or relabel this original safety
+incident.
+
+### Requirement audit, rollout status, and remaining risk
 
 Automated coverage supports PSI parsing/thresholds, synthetic sustain/cooldown
 policy, capability-gated watcher v2, configuration normalization, candidate
@@ -411,20 +413,16 @@ memory-path preservation, degraded PSI/CPU branches, additive UI handling,
 rollback settings, and service-unit parity. It does not prove every goal or
 success criterion in a live system.
 
-The following remain unproven: foreground responsiveness or CPU-share under
-contention; live PSI injection and `ResourcePressure` watcher delivery;
-automatic one-at-a-time host-pressure parking; Firefox/Discord/Amber client
-responsiveness; and all other user-visible success criteria requiring a live
-contention scenario. Existing fixtures do not expose a safe live PSI source.
-The two failed static gates and the safety incident block rollout.
+The proof establishes delegated controller availability, real process
+placement, and configured relative weights. It does **not** measure foreground
+responsiveness or actual CPU share under contention. Live PSI injection,
+`ResourcePressure` watcher delivery, a live automatic one-at-a-time parking
+episode, and user-visible Firefox/Discord/Amber responsiveness all remain
+unproven. Existing fixtures expose no safe injectable live PSI source.
 
-Safety incident: during the private proof, the command
-`AMBER_SOCK=/tmp/amber-task6-rpg.cFnP89/amberd.sock timeout 1 ./target/debug/amber attach foreground`
-was used without the CLI's required `--socket` flag. This CLI ignores
-`AMBER_SOCK` for that command and resolved the default production user socket;
-it resolved a production session named `foreground` and sent Focus/Attach for
-up to one second. Production `amber.service` was **not** installed, restarted,
-stopped, or killed, but the Focus/Attach altered or could have altered
-production session state. No attempt was made to guess or restore focus. This
-is a critical verification-safety failure: the private-proof requirement was
-violated and rollout is blocked.
+Production rollout is therefore **not approved by this record**. Clippy,
+workspace tests, app tests, typecheck, unit parity/syntax, the private cgroup
+proof, and patch hygiene are green. The repository formatting gate remains red,
+with merge-base evidence that the drift predates this branch. More importantly,
+the required live PSI/automatic-parking and responsiveness acceptance evidence
+is still absent. No production installation or restart has been performed.
