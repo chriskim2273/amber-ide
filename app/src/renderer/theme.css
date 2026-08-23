@@ -1128,3 +1128,8 @@ body {
   bottom: 0;
   z-index: 6;
 }
+
+/* An armed divider drag must not fight the browser's own pan/zoom on the same
+   finger. `none` only on the 4px handle itself — the terminal body keeps its
+   native gestures, which is what the touch-scroll code in Pane.tsx builds on. */
+.split-handle { touch-action: none; }

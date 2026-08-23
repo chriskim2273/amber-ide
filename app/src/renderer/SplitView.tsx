@@ -9,6 +9,9 @@ import { appChord, chordLabel } from './keys'
 import { paneDot, shouldHintTerminalFocus, shouldResumeMemoryParked } from './store'
 import { reloadAgentCommand } from './reloadAgent'
 
+/** How long a finger must rest before a drag arms instead of scrolling. */
+const LONG_PRESS_MS = 400
+
 export interface PaneMeta { kind: string; title: string; cwd: string; runState?: string | undefined; rssKb?: number | undefined; growing?: boolean | undefined; claudeId?: string | undefined }
 
 /** Which agent binary a pane's recorded conversation id belongs to. Explicit
@@ -395,9 +398,9 @@ export function SplitView(props: {
     if (!menu) return
     const onDown = (): void => setMenu(null)
     const onKey = (e: KeyboardEvent): void => { if (e.key === 'Escape') setMenu(null) }
-    window.addEventListener('mousedown', onDown)
+    window.addEventListener('pointerdown', onDown)
     window.addEventListener('keydown', onKey)
-    return () => { window.removeEventListener('mousedown', onDown); window.removeEventListener('keydown', onKey) }
+    return () => { window.removeEventListener('pointerdown', onDown); window.removeEventListener('keydown', onKey) }
   }, [menu])
 
   useEffect(() => {
@@ -516,44 +519,58 @@ export function SplitView(props: {
   // a stale zoomed id (pane already gone): only zoom if it's a real pane here.
   const zoomActive = props.zoomedPane != null && panes.some((p) => p.paneId === props.zoomedPane)
 
-  const startDrag = (path: Array<'a' | 'b'>, dir: 'h' | 'v') => (e: React.MouseEvent) => {
+  // POINTER events, not mouse: identical for a mouse (which fires both), and the
+  // only way a finger can drag a divider at all. Capability-gated behaviour —
+  // touch has to arm on a long-press so a scroll is not stolen — lives below.
+  const startDrag = (path: Array<'a' | 'b'>, dir: 'h' | 'v') => (e: React.PointerEvent) => {
     e.preventDefault()
     // Capture the pre-drag ratio so Escape can restore it (divider drag applies
     // live via onSetRatio, so aborting means putting the stored ratio back).
     const startRatio = ratioAt(props.tree, path)
-    const move = (ev: MouseEvent) => {
+    const touchLike = e.pointerType !== 'mouse'
+    // A finger landing on a 4px divider is usually the START OF A SCROLL, not a
+    // resize. Arm on a long press instead, the same contract the pane grip uses.
+    let armed = !touchLike
+    const armTimer = touchLike
+      ? window.setTimeout(() => { armed = true }, LONG_PRESS_MS)
+      : null
+    const move = (ev: PointerEvent) => {
+      if (!armed) return
       const ratio = dir === 'h' ? (ev.clientX - size.x) / size.w : (ev.clientY - size.y) / size.h
       props.onSetRatio(path, ratio)
     }
     const cleanup = () => {
-      window.removeEventListener('mousemove', move)
-      window.removeEventListener('mouseup', up)
+      if (armTimer !== null) clearTimeout(armTimer)
+      window.removeEventListener('pointermove', move)
+      window.removeEventListener('pointerup', up)
+      window.removeEventListener('pointercancel', up)
       window.removeEventListener('keydown', onKey)
     }
     const up = () => cleanup()
-    // Escape aborts: removing `up` before the (still-held) mouse releases stops a
-    // later mouseup from committing; then restore the ratio captured at start.
+    // Escape aborts: removing `up` before the (still-held) pointer releases stops
+    // a later pointerup from committing; then restore the ratio captured at start.
     const onKey = (ev: KeyboardEvent) => {
       if (ev.key !== 'Escape') return
       ev.preventDefault()
       cleanup()
       if (startRatio !== null) props.onSetRatio(path, startRatio)
     }
-    window.addEventListener('mousemove', move)
-    window.addEventListener('mouseup', up)
+    window.addEventListener('pointermove', move)
+    window.addEventListener('pointerup', up)
+    window.addEventListener('pointercancel', up)
     window.addEventListener('keydown', onKey)
   }
 
   // Whole-pane drag: starts on the grip (never the terminal body — xterm needs
   // its own mouse events). Hit-tests the cursor against paneRects via a window
   // listener (mirrors the divider drag) rather than per-terminal DnD wiring.
-  const startPaneDrag = (source: string) => (e: React.MouseEvent) => {
+  const startPaneDrag = (source: string) => (e: React.PointerEvent) => {
     e.preventDefault()
     e.stopPropagation()
     const box = ref.current?.getBoundingClientRect()
     if (!box) return
     const rects = paneRects(props.tree, size)
-    const hitZone = (ev: MouseEvent): { targetId: string; zone: Zone } | null => {
+    const hitZone = (ev: PointerEvent): { targetId: string; zone: Zone } | null => {
       const cx = ev.clientX - box.left, cy = ev.clientY - box.top
       const hit = rects.find(({ rect }) => cx >= rect.x && cx < rect.x + rect.w && cy >= rect.y && cy < rect.y + rect.h)
       return hit ? { targetId: hit.paneId, zone: zoneAt(hit.rect, cx, cy) } : null
@@ -562,12 +579,20 @@ export function SplitView(props: {
     // travels ≥4 px from mousedown, so a plain click on the grip does nothing.
     const sx = e.clientX, sy = e.clientY
     let started = false
+    // On touch, movement alone must not start a drag — the same gesture is how
+    // the user scrolls. A long press arms it; until then a move is ignored and
+    // the browser keeps the scroll.
+    const touchLike = e.pointerType !== 'mouse'
+    let armed = !touchLike
+    const armTimer = touchLike
+      ? window.setTimeout(() => { armed = true }, LONG_PRESS_MS)
+      : null
     // Tab header / workspace pill under the cursor, if any. Those live OUTSIDE
     // this view (App's toolbar), so hit-testing goes through the DOM rather than
     // the geometry tree; the highlight is applied imperatively for the same reason
     // (a React state round-trip per mousemove would reconcile every terminal).
     let dropEl: HTMLElement | null = null
-    const hitGroup = (ev: MouseEvent): HTMLElement | null =>
+    const hitGroup = (ev: PointerEvent): HTMLElement | null =>
       (document.elementFromPoint(ev.clientX, ev.clientY) as HTMLElement | null)
         ?.closest<HTMLElement>('[data-drop-tab],[data-drop-ws]') ?? null
     const markGroup = (el: HTMLElement | null): void => {
@@ -578,11 +603,14 @@ export function SplitView(props: {
     }
     const cleanup = () => {
       markGroup(null)
-      window.removeEventListener('mousemove', move)
-      window.removeEventListener('mouseup', up)
+      if (armTimer !== null) clearTimeout(armTimer)
+      window.removeEventListener('pointermove', move)
+      window.removeEventListener('pointerup', up)
+      window.removeEventListener('pointercancel', up)
       window.removeEventListener('keydown', onKey)
     }
-    const move = (ev: MouseEvent) => {
+    const move = (ev: PointerEvent) => {
+      if (!armed) return
       if (!started) {
         if (Math.hypot(ev.clientX - sx, ev.clientY - sy) < 4) return
         started = true
@@ -591,7 +619,7 @@ export function SplitView(props: {
       markGroup(g)
       setDrag({ source, hover: g ? null : hitZone(ev) })
     }
-    const up = (ev: MouseEvent) => {
+    const up = (ev: PointerEvent) => {
       const g = started ? hitGroup(ev) : null
       cleanup()
       if (started) {
@@ -613,8 +641,9 @@ export function SplitView(props: {
       cleanup()
       setDrag(null)
     }
-    window.addEventListener('mousemove', move)
-    window.addEventListener('mouseup', up)
+    window.addEventListener('pointermove', move)
+    window.addEventListener('pointerup', up)
+    window.addEventListener('pointercancel', up)
     window.addEventListener('keydown', onKey)
   }
 
@@ -714,7 +743,7 @@ export function SplitView(props: {
               {isZoomedPane &&
                 <span className="zoom-badge">zoomed — {chordLabel('zoom')} to restore</span>}
               <div className="pane-actions">
-                <button className="icon-btn" aria-label="move pane" title="drag to move" onMouseDown={startPaneDrag(paneId)} style={{ cursor: 'grab' }}>⠿</button>
+                <button className="icon-btn" aria-label="move pane" title="drag to move" onPointerDown={startPaneDrag(paneId)} style={{ cursor: 'grab', touchAction: 'none' }}>⠿</button>
                 {!noTerm &&
                   <button className="icon-btn" aria-label="refresh pane" title="force refresh (rebuild the terminal from the daemon)"
                     onClick={() => setRebuild((r) => ({ ...r, [paneId]: (r[paneId] ?? 0) + 1 }))}>⟳</button>}
@@ -810,7 +839,7 @@ export function SplitView(props: {
       })}
       {/* No dividers or drop targets while a pane is zoomed — the others are hidden. */}
       {!zoomActive && hs.map((h, i) => (
-        <div key={i} onMouseDown={startDrag(h.path, h.dir)}
+        <div key={i} onPointerDown={startDrag(h.path, h.dir)}
           className={'split-handle ' + h.dir}
           style={{ left: h.rect.x, top: h.rect.y, width: h.rect.w, height: h.rect.h }} />
       ))}
