@@ -73,6 +73,7 @@ export type ControlMsg =
   | { kind: 'Activity'; name: string }
   | { kind: 'MemoryStat'; name: string; rss_kb: number; growing: boolean }
   | { kind: 'MemoryPressure'; level: 'normal' | 'warning' | 'critical'; current_kb: number; budget_kb: number; blocked: boolean }
+  | { kind: 'ResourcePressure'; level: 'normal' | 'critical'; causes: Array<'cpu' | 'io' | 'memory'>; blocked: boolean }
   | { kind: 'Created'; name: string }
   | { kind: 'Exit'; name: string; code: number }
   | { kind: 'Error'; msg: string }
@@ -154,6 +155,8 @@ function msgToJson(m: ControlMsg): unknown {
       return { Activity: { name: m.name } }
     case 'MemoryPressure':
       return { MemoryPressure: { level: m.level, current_kb: m.current_kb, budget_kb: m.budget_kb, blocked: m.blocked } }
+    case 'ResourcePressure':
+      return { ResourcePressure: { level: m.level, causes: m.causes, blocked: m.blocked } }
     case 'Created':
       return { Created: { name: m.name } }
     case 'Exit':
@@ -228,6 +231,17 @@ function jsonToMsg(v: unknown): ControlMsg | null {
           budget_kb: (body['budget_kb'] as number) ?? 0,
           blocked: (body['blocked'] as boolean) ?? false,
         }
+      }
+      case 'ResourcePressure': {
+        const level = body['level']
+        if (level !== 'normal' && level !== 'critical') {
+          throw new Error(`invalid resource pressure level: ${String(level)}`)
+        }
+        const causes = body['causes']
+        if (!Array.isArray(causes) || !causes.every((cause) => cause === 'cpu' || cause === 'io' || cause === 'memory')) {
+          throw new Error(`invalid resource pressure cause: ${String(causes)}`)
+        }
+        return { kind: 'ResourcePressure', level, causes: [...causes] as Array<'cpu' | 'io' | 'memory'>, blocked: (body['blocked'] as boolean) ?? false }
       }
       case 'Created': return { kind: 'Created', name: body['name'] as string }
       case 'Exit': return { kind: 'Exit', name: body['name'] as string, code: body['code'] as number }

@@ -6,7 +6,7 @@ import { Browser } from './Browser'
 import type { EditorApi } from './Editor'
 import { paneRects, handles, nextPaneInDirection, focusCandidates, ratioAt, leaves, type Node, type Rect, type Zone, type FocusDir } from './layout'
 import { appChord, chordLabel } from './keys'
-import { paneDot, shouldHintTerminalFocus, shouldResumeMemoryParked } from './store'
+import { paneDot, parkedOverlayText, shouldHintTerminalFocus, shouldResumeMemoryParked } from './store'
 import { reloadAgentCommand } from './reloadAgent'
 // CodeMirror + marked (the editor's whole dependency graph) load LAZILY: they
 // are the largest single block in the bundle but matter only when an editor
@@ -680,6 +680,7 @@ export function SplitView(props: {
         // freeze) are meaningless for a pane that owns no pty.
         const noTerm = isBrowser || isEditor
         const dot = paneDot(meta?.kind ?? 'shell', meta?.runState)
+        const parkedText = parkedOverlayText(meta?.runState)
         const frozenEntry = props.frozen[paneId]
         const isFrozen = frozenEntry !== undefined
         const isZoomedPane = zoomActive && props.zoomedPane === paneId
@@ -847,10 +848,10 @@ export function SplitView(props: {
                   <button className="frozen-unfreeze" aria-label="unfreeze pane"
                     onClick={() => props.onUnfreeze(paneId)}>⏵ unfreeze</button>
                 </div>}
-              {meta?.runState === 'memory-suspended' && !isFrozen && dead === undefined &&
+              {parkedText && !isFrozen && dead === undefined &&
                 <div className="memory-parked-overlay" role="status" tabIndex={0}
-                  aria-label="Pane parked to protect system memory; focus to resume">
-                  <span>Parked to protect system memory</span>
+                  aria-label={`${parkedText}; focus to resume`}>
+                  <span>{parkedText}</span>
                   <button type="button" onClick={() => props.onPaneFocus(paneId)}>Resume</button>
                 </div>}
             </div>

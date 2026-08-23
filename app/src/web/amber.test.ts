@@ -42,6 +42,8 @@ describe('parseServerMsg', () => {
       .toEqual({ t: 'memory', name: 's', rss_kb: 12, growing: true })
     expect(parseServerMsg('{"t":"memoryPressure","level":"critical","current_kb":7000000,"budget_kb":8000000,"blocked":false}'))
       .toEqual({ t: 'memoryPressure', level: 'critical', current_kb: 7000000, budget_kb: 8000000, blocked: false })
+    expect(parseServerMsg('{"t":"resourcePressure","level":"critical","causes":["cpu","io"]}'))
+      .toEqual({ t: 'resourcePressure', level: 'critical', causes: ['cpu', 'io'], blocked: false })
   })
 
   it('returns null for an unknown t or malformed JSON', () => {
@@ -63,6 +65,8 @@ describe('toDaemonEvent', () => {
       .toEqual({ frame: { type: 'control', msg: { kind: 'MemoryStat', name: 's', rss_kb: 5, growing: false } } })
     expect(toDaemonEvent({ t: 'memoryPressure', level: 'warning', current_kb: 7, budget_kb: 10, blocked: true }))
       .toEqual({ frame: { type: 'control', msg: { kind: 'MemoryPressure', level: 'warning', current_kb: 7, budget_kb: 10, blocked: true } } })
+    expect(toDaemonEvent({ t: 'resourcePressure', level: 'critical', causes: ['memory'], blocked: false }))
+      .toEqual({ frame: { type: 'control', msg: { kind: 'ResourcePressure', level: 'critical', causes: ['memory'], blocked: false } } })
   })
 })
 

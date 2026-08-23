@@ -2,7 +2,7 @@ import { useCallback, useEffect, useReducer, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { SplitView, fmtMem, type PaneMeta } from './SplitView'
 import type { EditorApi } from './Editor'
-import { initialState, reduce, groupSessions, mergeBrowsers, mergeEditors, tabDot, hasActivity, isAgentKind, type DaemonEvent } from './store'
+import { initialState, reduce, groupSessions, mergeBrowsers, mergeEditors, tabDot, hasActivity, isAgentKind, resourcePressureMessage, type DaemonEvent } from './store'
 import type { ControlMsg } from '../shared/proto'
 import { sessionRows } from './sessionRows'
 import { deriveTab, shortCwd } from './tabView'
@@ -100,6 +100,10 @@ function toEvent(d: unknown): DaemonEvent | null {
   if (m.kind === 'MemoryPressure') return {
     kind: 'MemoryPressure', level: m.level, currentKb: m.current_kb,
     budgetKb: m.budget_kb, blocked: m.blocked,
+  }
+  if (m.kind === 'ResourcePressure') return {
+    kind: 'ResourcePressure', level: m.level, causes: m.causes,
+    blocked: m.blocked,
   }
   if (m.kind === 'Exit') return { kind: 'Exit', name: m['name'] as string, code: m['code'] as number }
   if (m.kind === 'Error') return { kind: 'Error', msg: m['msg'] as string }
@@ -380,9 +384,10 @@ function App(): JSX.Element {
       const st = (d as { status?: string }).status
       if (st === 'connected') setConnected(true)
       else if (st === 'disconnected') {
-        // A reconnect to an older daemon may never send MemoryPressure, so a
-        // prior connection's warning must not survive the socket boundary.
-        dispatch({ kind: 'ClearMemoryPressure' })
+        // A reconnect to an older daemon may never send either pressure event,
+        // so stale host and aggregate-memory warnings cannot cross the socket
+        // boundary.
+        dispatch({ kind: 'ClearPressure' })
         setConnected(false)
       }
       // The client utilityProcess was relaunched: its old pane ports are dead,
@@ -1173,6 +1178,12 @@ function App(): JSX.Element {
           <span className="banner-msg">{message}</span>
         </div>
       })()}
+      {state.resourcePressure?.level === 'critical' && (
+        <div className="banner memory-banner critical" role="alert">
+          <span className="dot" />
+          <span className="banner-msg">{resourcePressureMessage(state.resourcePressure)}</span>
+        </div>
+      )}
       {notice && (
         <div className="banner notice-banner" role="status" aria-live="polite">
           <span className="dot" />

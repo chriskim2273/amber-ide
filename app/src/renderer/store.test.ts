@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { initialState, reduce, groupSessions, mergeBrowsers, paneDot, tabDot, hasActivity, shouldHintTerminalFocus, shouldResumeMemoryParked, type PaneModel, type WorkspaceModel } from './store'
+import { initialState, reduce, groupSessions, mergeBrowsers, paneDot, tabDot, hasActivity, shouldHintTerminalFocus, shouldResumeMemoryParked, parkedOverlayText, resourcePressureMessage, type PaneModel, type WorkspaceModel } from './store'
 import type { SessionInfo } from '../shared/proto'
 
 describe('mergeBrowsers', () => {
@@ -212,6 +212,60 @@ describe('reduce MemoryPressure', () => {
   })
 })
 
+describe('reduce ResourcePressure', () => {
+  it('tracks resource causes separately and no-ops an identical refresh', () => {
+    const memory = reduce(initialState(), {
+      kind: 'MemoryPressure', level: 'critical', currentKb: 7_000_000,
+      budgetKb: 8_000_000, blocked: false,
+    })
+    const cpu = reduce(memory, {
+      kind: 'ResourcePressure', level: 'critical', causes: ['cpu'], blocked: false,
+    })
+    expect(cpu.pressure).toEqual({ level: 'critical', currentKb: 7_000_000, budgetKb: 8_000_000, blocked: false })
+    expect(cpu.resourcePressure).toEqual({ level: 'critical', causes: ['cpu'], blocked: false })
+    expect(reduce(cpu, {
+      kind: 'ResourcePressure', level: 'critical', causes: ['cpu'], blocked: false,
+    })).toBe(cpu)
+  })
+
+  it('updates the resource causes when the daemon reports a new pressure source', () => {
+    const cpu = reduce(initialState(), {
+      kind: 'ResourcePressure', level: 'critical', causes: ['cpu'], blocked: false,
+    })
+    const io = reduce(cpu, {
+      kind: 'ResourcePressure', level: 'critical', causes: ['io'], blocked: false,
+    })
+    expect(io).not.toBe(cpu)
+    expect(io.resourcePressure?.causes).toEqual(['io'])
+  })
+
+  it('clears memory and resource pressure on reconnect to an older daemon', () => {
+    let state = reduce(initialState(), {
+      kind: 'MemoryPressure', level: 'warning', currentKb: 7_000_000,
+      budgetKb: 8_000_000, blocked: false,
+    })
+    state = reduce(state, {
+      kind: 'ResourcePressure', level: 'critical', causes: ['memory'], blocked: true,
+    })
+    const cleared = reduce(state, { kind: 'ClearPressure' })
+    expect(cleared.pressure).toBeNull()
+    expect(cleared.resourcePressure).toBeNull()
+    expect(reduce(cleared, { kind: 'ClearPressure' })).toBe(cleared)
+  })
+})
+
+describe('resource-pressure presentation', () => {
+  it('names every active resource source in the critical banner', () => {
+    expect(resourcePressureMessage({ level: 'critical', causes: ['cpu', 'io'], blocked: false }))
+      .toBe('Amber CPU and I/O pressure is critical. Idle agent panes may be parked.')
+  })
+
+  it('uses the generalized parked copy while retaining the legacy memory copy', () => {
+    expect(parkedOverlayText('resource-suspended')).toBe('Parked to protect system resources')
+    expect(parkedOverlayText('memory-suspended')).toBe('Parked to protect system memory')
+  })
+})
+
 describe('paneDot', () => {
   it('shell kind is always the shell dot', () => {
     expect(paneDot('shell', undefined)).toEqual({ cls: 'shell', label: 'shell' })
@@ -232,6 +286,13 @@ describe('paneDot', () => {
     })
     expect(paneDot('grok', 'memory-suspended').cls).toBe('memory-suspended')
     expect(paneDot('codex', 'memory-suspended').cls).toBe('memory-suspended')
+  })
+
+  it('renders resource-suspended with the generalized parked status', () => {
+    expect(paneDot('claude', 'resource-suspended')).toEqual({
+      cls: 'memory-suspended',
+      label: 'claude (parked for system resources)',
+    })
   })
 })
 
@@ -286,6 +347,11 @@ describe('tabDot', () => {
   it('all memory-parked agents use the memory-suspended dot', () => {
     expect(tabDot([pane('claude', 'memory-suspended'), pane('claude', 'memory-suspended')])).toEqual({
       cls: 'memory-suspended', label: 'claude (parked for memory)',
+    })
+  })
+  it('all resource-parked agents use the generalized parked dot', () => {
+    expect(tabDot([pane('claude', 'resource-suspended'), pane('claude', 'resource-suspended')])).toEqual({
+      cls: 'memory-suspended', label: 'claude (parked for system resources)',
     })
   })
   it('a memory-parked agent remains parked beside a shell fallback', () => {
