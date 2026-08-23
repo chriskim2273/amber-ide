@@ -84,3 +84,41 @@ export function hostLabel(host: string): string {
   const at = host.lastIndexOf('@')
   return at === -1 ? host : host.slice(at + 1)
 }
+
+/**
+ * Pick `SSH_AUTH_SOCK` out of `systemctl --user show-environment` output.
+ *
+ * Why this exists: an app started from a desktop launcher (or a systemd user
+ * unit) can inherit an environment with NO ssh agent, and then every host is
+ * "Permission denied (publickey)" no matter how well the user's ssh works in a
+ * terminal. Measured here: the app process had no `SSH_AUTH_SOCK` at all.
+ *
+ * Exactly the same class as the 2026-07-29 display-env fix, which reads
+ * `DISPLAY`/`WAYLAND_DISPLAY` from the same place for the same reason — the
+ * minimal env a service inherits is not the env a user-facing action needs.
+ */
+export function parseAgentSock(showEnvironment: string): string | null {
+  for (const line of showEnvironment.split('\n')) {
+    const eq = line.indexOf('=')
+    if (eq === -1) continue
+    if (line.slice(0, eq) !== 'SSH_AUTH_SOCK') continue
+    const v = line.slice(eq + 1).trim()
+    return v.length > 0 ? v : null
+  }
+  return null
+}
+
+/**
+ * A human explanation for an ssh failure, or null to fall back to ssh's own
+ * stderr (which is usually better than anything we could invent).
+ */
+export function explainSshFailure(stderr: string, hasAgent: boolean): string | null {
+  if (/permission denied/i.test(stderr) && !hasAgent) {
+    return (
+      'No ssh agent is available to this app, so key authentication could not be attempted.\n\n' +
+      'Start the app from a terminal where `ssh` works, or make the agent visible to your ' +
+      'user session:\n  systemctl --user import-environment SSH_AUTH_SOCK'
+    )
+  }
+  return null
+}

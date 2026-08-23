@@ -432,6 +432,8 @@ export function createAmber(deps: AmberDeps): WebAmber {
     homeDir: deps.home,
     // The browser build is never an ssh mirror; it IS the remote surface.
     remoteHost: '',
+    connectHost: notImplemented('connectHost'),
+    onConnectHostPrompt: (): void => {},
 
     onDaemonEvent: (cb): void => {
       onEvent = cb

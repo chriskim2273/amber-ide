@@ -4,7 +4,7 @@ import { ipcMain, dialog, clipboard } from 'electron'
 import { fileURLToPath } from 'node:url'
 import { basename, dirname, join, resolve as resolvePathJoin, isAbsolute } from 'node:path'
 import { homedir, release as osRelease, tmpdir } from 'node:os'
-import { spawn } from 'node:child_process'
+import { spawn, execFileSync } from 'node:child_process'
 import { readFile, writeFile, rename, mkdir, copyFile, chmod, realpath, rm, stat, mkdtemp } from 'node:fs/promises'
 import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
 import { resolveSocketPath } from '../shared/socketPath'
@@ -46,7 +46,7 @@ import { installBinary } from './installBinary'
 import { spawnOkWithStderr } from './spawnOk'
 import {
   sshTunnelArgv, sshProbeArgv, isValidHost, localSocketPath, hostLabel,
-  REMOTE_SOCKET_PROBE, REMOTE_LAYOUT_PROBE,
+  REMOTE_SOCKET_PROBE, REMOTE_LAYOUT_PROBE, parseAgentSock, explainSshFailure,
 } from './sshRemote'
 import { webCtlArgv, parseWebStatus, redactUrl, type WebStatus } from './webService'
 import clientPath from '../client/index?modulePath'
@@ -434,11 +434,38 @@ interface Tunnel {
 
 const tunnels = new Map<number, Tunnel>()
 
+/**
+ * The environment ssh children run in.
+ *
+ * A GUI-launched app (desktop launcher, systemd user unit) can inherit no
+ * `SSH_AUTH_SOCK` at all — measured on this box — and then every host is
+ * "Permission denied (publickey)" however well ssh works in the user's
+ * terminal. Recover it from the user session the same way the daemon recovers
+ * DISPLAY (2026-07-29): ask systemd, per call, never cached — a cached value
+ * would freeze whatever was true at login for the app's whole life.
+ */
+function sshEnv(): NodeJS.ProcessEnv {
+  if (process.env['SSH_AUTH_SOCK']) return process.env
+  if (process.platform !== 'linux') return process.env
+  try {
+    const out = execFileSync('systemctl', ['--user', 'show-environment'], {
+      encoding: 'utf8',
+      timeout: 2000,
+    })
+    const sock = parseAgentSock(out)
+    // A missing key is left UNSET rather than set empty: an empty
+    // SSH_AUTH_SOCK fails differently, and worse, than an absent one.
+    return sock !== null ? { ...process.env, SSH_AUTH_SOCK: sock } : process.env
+  } catch {
+    return process.env
+  }
+}
+
 /** Run a one-shot command on the remote and return its stdout (trimmed). */
 function sshProbe(host: string, script: string): Promise<{ out: string; err: string; code: number }> {
   const a = sshProbeArgv(host, script)
   return new Promise((resolveProbe) => {
-    const p = spawn(a.cmd, a.args, { stdio: ['ignore', 'pipe', 'pipe'] })
+    const p = spawn(a.cmd, a.args, { stdio: ['ignore', 'pipe', 'pipe'], env: sshEnv() })
     let out = ''
     let err = ''
     p.stdout?.on('data', (d: Buffer) => { out += d.toString() })
@@ -467,12 +494,14 @@ async function openRemoteWindow(host: string): Promise<void> {
 
   const probe = await sshProbe(host, REMOTE_SOCKET_PROBE)
   if (probe.code !== 0) {
+    // ssh's own message is usually better than anything we could invent
+    // (unknown host, name resolution, refused). The one case it under-reports
+    // is a missing agent, which it can only call "permission denied".
+    const explained = explainSshFailure(probe.err, sshEnv()['SSH_AUTH_SOCK'] !== undefined)
     await dialog.showMessageBox({
       type: 'error',
       message: `Could not reach ${host}`,
-      // ssh's own message is far more useful than anything we could invent
-      // (permission denied, unknown host, name resolution).
-      detail: probe.err || `ssh exited ${probe.code}`,
+      detail: explained ?? (probe.err || `ssh exited ${probe.code}`),
     })
     return
   }
@@ -491,7 +520,7 @@ async function openRemoteWindow(host: string): Promise<void> {
   await chmod(dir, 0o700)
   const localSock = localSocketPath(dir)
   const a = sshTunnelArgv(host, localSock, probe.out)
-  const proc = spawn(a.cmd, a.args, { stdio: ['ignore', 'pipe', 'pipe'] })
+  const proc = spawn(a.cmd, a.args, { stdio: ['ignore', 'pipe', 'pipe'], env: sshEnv() })
   let tunnelErr = ''
   proc.stderr?.on('data', (d: Buffer) => { tunnelErr += d.toString() })
 
@@ -537,20 +566,18 @@ async function openRemoteWindow(host: string): Promise<void> {
 /**
  * Ask for an ssh destination and open a window onto it.
  *
+ * The prompt is a RENDERER dialog, not `window.prompt`: Electron does not
+ * implement `prompt()` at all, so an earlier version of this silently did
+ * nothing when the menu item was clicked.
+ *
  * No host manager UI by design (spec §5): `~/.ssh/config` is the address book,
  * so anything ssh accepts — an alias, `user@host`, a jump-host alias — works
- * here without amber ever parsing ssh config or touching a credential.
+ * without amber ever parsing ssh config or touching a credential.
  */
-async function promptConnectHost(): Promise<void> {
+function promptConnectHost(): void {
   const win = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0]
-  if (!win) return
-  const host = await win.webContents.executeJavaScript(
-    `window.prompt(${JSON.stringify('Connect to which host? (ssh destination, e.g. user@box)')}, '')`,
-  ) as string | null
-  if (host === null) return
-  const trimmed = host.trim()
-  if (trimmed.length === 0) return
-  await openRemoteWindow(trimmed)
+  if (!win || win.isDestroyed()) return
+  win.webContents.send('connect-host-prompt')
 }
 
 /** Kill every tunnel. Called on quit so no `ssh -N` outlives the app. */
@@ -602,7 +629,7 @@ async function openWindow(target: WindowTarget): Promise<WindowCtx> {
       () => { void quitDaemonAndApp(win) },
       canInstallDesktop ? () => { void installDesktopShortcut(win) } : null,
       () => { void restartDaemon(win) },
-      () => { void promptConnectHost() },
+      () => promptConnectHost(),
     ),
   )
 
@@ -799,6 +826,11 @@ async function main(): Promise<void> {
   // for the app's whole life (names are never reused), each entry pinning a live
   // MessagePortMain, and every reconnect re-Attached long-dead names — which the
   // daemon answers with an Error the app shows in its red banner.
+  ipcMain.handle('connect-host', async (_e, host: unknown) => {
+    if (typeof host !== 'string') return
+    await openRemoteWindow(host.trim())
+  })
+
   ipcMain.on('close-pane', (e, session: string) => {
     ctxFor(e)?.child()?.postMessage({ kind: 'pane-close', session })
   })

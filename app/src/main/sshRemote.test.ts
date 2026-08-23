@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import {
   sshTunnelArgv, sshProbeArgv, isValidHost, localSocketPath, hostLabel,
-  REMOTE_SOCKET_PROBE,
+  REMOTE_SOCKET_PROBE, parseAgentSock, explainSshFailure,
 } from './sshRemote'
 
 describe('sshTunnelArgv', () => {
@@ -79,5 +79,34 @@ describe('localSocketPath / hostLabel', () => {
   it('labels a window by host, dropping the user', () => {
     expect(hostLabel('me@box.local')).toBe('box.local')
     expect(hostLabel('box')).toBe('box')
+  })
+})
+
+describe('parseAgentSock', () => {
+  it('finds the agent socket in show-environment output', () => {
+    const out = 'LANG=en_US.UTF-8\nSSH_AUTH_SOCK=/run/user/1000/keyring/ssh\nDISPLAY=:1\n'
+    expect(parseAgentSock(out)).toBe('/run/user/1000/keyring/ssh')
+  })
+  it('returns null when absent or empty', () => {
+    expect(parseAgentSock('DISPLAY=:1\n')).toBeNull()
+    expect(parseAgentSock('SSH_AUTH_SOCK=\n')).toBeNull()
+  })
+  it('does not match a key that merely ends with the name', () => {
+    expect(parseAgentSock('XSSH_AUTH_SOCK=/nope\n')).toBeNull()
+  })
+})
+
+describe('explainSshFailure', () => {
+  it('names the missing agent, which ssh reports only as permission denied', () => {
+    const msg = explainSshFailure('poyto@localhost: Permission denied (publickey,password).', false)
+    expect(msg).toContain('No ssh agent')
+    expect(msg).toContain('import-environment SSH_AUTH_SOCK')
+  })
+  it('stays out of the way when an agent WAS available', () => {
+    // Then permission-denied means what it says, and ssh's own text is better.
+    expect(explainSshFailure('Permission denied (publickey).', true)).toBeNull()
+  })
+  it('stays out of the way for unrelated failures', () => {
+    expect(explainSshFailure('ssh: Could not resolve hostname box', false)).toBeNull()
   })
 })

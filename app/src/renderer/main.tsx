@@ -57,6 +57,8 @@ declare global {
       homeDir: string
       /** `user@host` when this window mirrors a remote machine's amber. */
       remoteHost?: string
+      connectHost?: (host: string) => Promise<void>
+      onConnectHostPrompt?: (cb: () => void) => void
       pickFolder: () => Promise<string | null>
       resolvePath: (cwd: string, raw: string) => Promise<string | null>
       revealPath: (abs: string) => void
@@ -174,6 +176,12 @@ function App(): JSX.Element {
   // arrangement and never writes its sidecar. Read once — a window is local or
   // remote for its whole life.
   const [remoteHost] = useState<string>(() => window.amber?.remoteHost ?? '')
+  // "Connect to host…" (menu) asks the RENDERER for the destination: Electron
+  // has no window.prompt, so main sends this and we show a real dialog.
+  const [connectOpen, setConnectOpen] = useState(false)
+  useEffect(() => {
+    window.amber?.onConnectHostPrompt?.(() => setConnectOpen(true))
+  }, [])
   const [connected, setConnected] = useState(true)
   const [showHelp, setShowHelp] = useState(false)
   // Workspace save/load UI. `saveScopeOpen` shows the one-vs-all scope dialog;
@@ -1230,6 +1238,14 @@ function App(): JSX.Element {
         </button>
         <div className="spacer" />
         <button className="btn btn-accent" onClick={startPane}>+ Pane</button>
+        {remoteHost.length > 0 && (
+          <span
+            className="remote-marker"
+            title={`Mirroring ${remoteHost} over ssh — this window does not write that machine's layout`}
+          >
+            {remoteHost} · read-only
+          </span>
+        )}
         {webManaged && <button
           className={`btn web-pill web-pill-${webDot}`}
           // NEVER the url here: a title attribute is read by screen readers,
@@ -1641,6 +1657,33 @@ function App(): JSX.Element {
           </div>
         )
       })()}
+      {connectOpen && (
+        <div className="help-overlay" onClick={() => setConnectOpen(false)}>
+          <div className="help-card dialog-card" role="dialog" aria-modal="true" aria-label="Connect to host"
+            onClick={(e) => e.stopPropagation()}>
+            <div className="help-head">
+              <span className="help-title">Connect to host</span>
+              <button className="icon-btn" aria-label="close" onClick={() => setConnectOpen(false)}>✕</button>
+            </div>
+            <div className="dialog-body">
+              <p className="dialog-text">
+                Opens another machine's amber in a new window, over ssh. Any destination
+                ssh accepts works — an alias from your <code>~/.ssh/config</code>, or
+                <code> user@host</code>. That machine's pane layout is mirrored read-only.
+              </p>
+              <RenameInput
+                initial=""
+                onCommit={(v) => {
+                  setConnectOpen(false)
+                  const host = v.trim()
+                  if (host.length > 0) void window.amber.connectHost?.(host)
+                }}
+                onCancel={() => setConnectOpen(false)}
+              />
+            </div>
+          </div>
+        </div>
+      )}
       {remoteOpen && (
         <RemoteAccess status={webStatus} onClose={() => setRemoteOpen(false)} onRefresh={() => { void window.amber.webStatus().then(setWebStatus) }} />
       )}

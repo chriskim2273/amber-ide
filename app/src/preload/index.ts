@@ -62,6 +62,9 @@ contextBridge.exposeInMainWorld('amber', {
   clipboardRead: (): Promise<string> => ipcRenderer.invoke('clipboard-read'),
   /** `user@host` when this window mirrors a remote machine, else ''. */
   remoteHost: remoteArg ?? '',
+  /** SSH remote windows (spec 2026-08-23). */
+  connectHost: (host: string): Promise<void> => ipcRenderer.invoke('connect-host', host),
+  onConnectHostPrompt: (cb: () => void): void => { ipcRenderer.on('connect-host-prompt', () => cb()) },
   // Remote access (spec 2026-08-22 §9). `webUrl` is on-demand ONLY: it returns
   // the tokenised login url, which must never ride the 3-second status poll.
   webStatus: (): Promise<unknown> => ipcRenderer.invoke('web:status'),
