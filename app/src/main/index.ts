@@ -624,7 +624,11 @@ async function openWindow(target: WindowTarget): Promise<WindowCtx> {
   // The AppImage runtime exports $APPIMAGE (path to the image) — its presence
   // implies packaged Linux, the only place desktop install applies.
   const canInstallDesktop = process.platform === 'linux' && !!process.env['APPIMAGE']
-  Menu.setApplicationMenu(
+  // The application menu is GLOBAL, and its items act on THIS machine's daemon
+  // (restart/quit) and this machine's install. Building it from a remote window
+  // would rebind those to a window that mirrors someone else's daemon, so only
+  // the local window owns it.
+  if (target.kind === 'local') Menu.setApplicationMenu(
     buildAppMenu(
       () => { void quitDaemonAndApp(win) },
       canInstallDesktop ? () => { void installDesktopShortcut(win) } : null,
@@ -644,7 +648,14 @@ async function openWindow(target: WindowTarget): Promise<WindowCtx> {
   // that has nothing to do with amber — silently relaunched the app into
   // software rendering and left it there. See renderCompat.ts for the measured
   // case that cost ~11 cores for 23 hours.
-  if (!compat) {
+  // Local window ONLY. `app.on('child-process-gone')` is process-global, so a
+  // second window would register a SECOND listener whose disarm timer removes
+  // only its own — and this path calls `app.relaunch()`/`app.exit(0)`, so a
+  // remote window could relaunch the whole app into software GL. The 2026-07-26
+  // entry exists because this detector misfired once and cost ~11 cores for 23
+  // hours; duplicating its listeners is the same trap. A remote window has no
+  // business deciding this machine's GL mode.
+  if (!compat && target.kind === 'local') {
     let switching = false
     const enterCompat = (): void => {
       if (switching) return

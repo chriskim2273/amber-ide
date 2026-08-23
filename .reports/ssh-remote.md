@@ -31,8 +31,14 @@ window 1: remoteHost "",          1 pane    <- the tunnel-launched local window
 
 **The mirror is read-only, enforced in main.** A deliberate
 `saveLayout({activeWorkspace: 99})` from the remote window returned ok and left
-the real sidecar **byte-identical** (same md5 before and after). The renderer
-cannot write another machine's layout even if it tries.
+the sidecar **byte-identical** (same md5 before and after).
+
+Stated precisely: the guarantee is *by construction* — `layout-save` returns
+early on `target.kind === 'remote'` before touching disk — and the live run is a
+spot check, not a proof. Because the host was `localhost`, the file read for the
+mirror and the file checked for writes are the SAME file; against a real remote
+they are different files, and this assertion alone would not distinguish "write
+refused" from "wrote to the wrong place".
 
 **Option injection is refused.** `connectHost('-oProxyCommand=touch /tmp/pwned')`
 was rejected by `isValidHost` before reaching ssh; no file was created. This is
@@ -54,7 +60,19 @@ from `systemctl --user show-environment`, per call, never cached. When it still
 cannot be found, the error names the missing agent instead of parroting ssh's
 misleading "permission denied".
 
-A third, smaller: the read-only marker's first edit silently no-opped (its
+**3. The app menu and the GL compat detector were per-window.** The extraction
+that made `openWindow(target)` carried both inside it. `Menu.setApplicationMenu`
+is global and its items act on THIS machine's daemon, so a remote window would
+rebind Restart/Quit-daemon to a window mirroring someone else's. Worse, the
+compat detector registers `app.on('child-process-gone')` — also global — and can
+call `app.relaunch()`/`app.exit(0)`: a second window meant a second listener
+whose disarm timer removes only its own, and a remote window able to relaunch
+the whole app into software GL. That detector is exactly the one whose misfire
+cost ~11 cores for 23 hours (CLAUDE.md 2026-07-26). Both are now local-window
+only. Caught by review of the extraction, not by the live run — two windows were
+open and nothing visibly broke.
+
+A fourth, smaller: the read-only marker's first edit silently no-opped (its
 anchor had moved and that one `replace` lacked an assert), so the window ran
 without the badge until a live check caught it.
 
