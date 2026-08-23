@@ -1117,3 +1117,14 @@ body {
   border-color: var(--accent, #7c6cff);
   color: #fff;
 }
+
+/* The bar docks to the bottom of the split area, above the home indicator.
+   `visualViewport`-anchored on a phone so it rides above the soft keyboard
+   rather than hiding beneath it (spec §3). */
+.key-bar-dock {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 6;
+}

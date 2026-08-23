@@ -2,6 +2,7 @@ import { memo, useEffect, useRef, useState } from 'react'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { WebglAddon } from '@xterm/addon-webgl'
+import { altScrollKeys, takeWholeLines, AXIS_LOCK_PX, FLICK_DECAY, FLICK_MIN_LINES } from './touchInput'
 import { SearchAddon } from '@xterm/addon-search'
 import '@xterm/xterm/css/xterm.css'
 import { appChord } from './keys'
@@ -28,6 +29,18 @@ export interface SearchApi {
   // when the running program requested that mode (so multiline paste doesn't
   // submit line-by-line in claude/vim). Routes through onData → the port.
   paste(text: string): void
+}
+
+/**
+ * Imperative input handle for the on-screen key bar (spec §5). The bar lives in
+ * `SplitView` chrome, outside this component, and must reach the SAME port
+ * `term.onData` writes to — never a second transport.
+ */
+export interface InputApi {
+  send(data: string): void
+  /** Application cursor-key mode: decides SS3 vs CSI arrows. */
+  appMode(): boolean
+  focus(): void
 }
 
 // Search decoration colors. Like XTERM_THEME, the addon can't read CSS vars, so
@@ -88,8 +101,8 @@ const MOUSE_RESET = '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l'
 // (honors "xterm instances live outside React reconciliation").
 // Focus is tracked by SplitView via `focusin` on the wrapper; nothing here.
 export const Pane = memo(function Pane(
-  { session, epoch, portEpoch, activateSeq, fontSize, cwd, onTitle, onSearchReady }:
-    { session: string; epoch: number; portEpoch: number; activateSeq: number; fontSize: number; cwd: string; onTitle?: (title: string) => void; onSearchReady?: (api: SearchApi) => void },
+  { session, epoch, portEpoch, activateSeq, fontSize, cwd, onTitle, onSearchReady, onInputReady }:
+    { session: string; epoch: number; portEpoch: number; activateSeq: number; fontSize: number; cwd: string; onTitle?: (title: string) => void; onSearchReady?: (api: SearchApi) => void; onInputReady?: (api: InputApi) => void },
 ): JSX.Element {
   const containerRef = useRef<HTMLDivElement>(null)
   const hostRef = useRef<HTMLDivElement>(null)
@@ -115,6 +128,8 @@ export const Pane = memo(function Pane(
   onTitleRef.current = onTitle
   const onSearchReadyRef = useRef(onSearchReady)
   onSearchReadyRef.current = onSearchReady
+  const onInputReadyRef = useRef(onInputReady)
+  onInputReadyRef.current = onInputReady
   // True once this Pane has consumed one Attach backlog. A LATER backlog is a
   // RE-attach replay of history the terminal already shows, so it must clear
   // first — see the `term.reset()` in the port handler. Deliberately not armed
@@ -237,6 +252,117 @@ export const Pane = memo(function Pane(
     // per (re)acquire would stack handlers and double-send every keystroke.
     term.onData((s) => port?.postMessage({ data: new TextEncoder().encode(s) }))
 
+    // Key-bar handle: the same `port` every keystroke uses, so a bar press is
+    // indistinguishable from a keyboard press downstream.
+    onInputReadyRef.current?.({
+      send: (data) => port?.postMessage({ data: new TextEncoder().encode(data) }),
+      appMode: () => term.modes.applicationCursorKeysMode,
+      focus: () => term.focus(),
+    })
+
+    // ---- touch scrolling (spec §5) --------------------------------------
+    //
+    // xterm ships none: on a phone a drag inside the terminal selects text, so
+    // the scrollback is simply unreachable. Ported from the hand-written phone
+    // UI (assets/app.js:634-720), which is device-proven.
+    //
+    // Capability-gated, not host-gated — a touch laptop gets it too.
+    const coarse = window.matchMedia?.('(pointer: coarse)').matches ?? false
+    let touch: { x: number; y: number; last: number; acc: number; axis: 'x' | 'y' | null; t: number; v: number } | null = null
+    let flick = 0
+    let flickAcc = 0
+    let flickTimer: number | null = null
+
+    const cellPx = (): number => {
+      const scr = term.element?.querySelector('.xterm-screen') as HTMLElement | null
+      const h = (scr?.offsetHeight ?? 0) / (term.rows || 1)
+      return h > 4 ? h : 0
+    }
+    const onAltScreen = (): boolean => term.buffer.active.type === 'alternate'
+    // Positive `lines` scrolls DOWN (towards newer output), matching wheel sign.
+    const scrollLines = (lines: number): void => {
+      if (!lines) return
+      if (!onAltScreen()) {
+        term.scrollLines(lines)
+        return
+      }
+      // A full-screen TUI owns its own paging and has no scrollback of its own,
+      // so send arrows instead — mirroring xterm's alternateScrollMode.
+      const keys = altScrollKeys(lines, term.modes.applicationCursorKeysMode)
+      if (keys) port?.postMessage({ data: new TextEncoder().encode(keys) })
+    }
+    const stopFlick = (): void => {
+      if (flickTimer !== null) cancelAnimationFrame(flickTimer)
+      flickTimer = null
+      flick = 0
+      flickAcc = 0
+    }
+    const runFlick = (): void => {
+      flickTimer = null
+      if (Math.abs(flick) < FLICK_MIN_LINES) {
+        flick = 0
+        flickAcc = 0
+        return
+      }
+      flickAcc += flick
+      const { whole, rest } = takeWholeLines(flickAcc)
+      flickAcc = rest
+      if (whole) scrollLines(whole)
+      flick *= FLICK_DECAY
+      flickTimer = requestAnimationFrame(runFlick)
+    }
+    const onTouchStart = (ev: TouchEvent): void => {
+      stopFlick()
+      if (ev.touches.length !== 1) {
+        touch = null
+        return
+      }
+      const t = ev.touches[0]
+      if (!t) return
+      touch = { x: t.clientX, y: t.clientY, last: t.clientY, acc: 0, axis: null, t: Date.now(), v: 0 }
+    }
+    const onTouchMove = (ev: TouchEvent): void => {
+      // Two fingers stay the browser's: pinch must keep working.
+      if (!touch || ev.touches.length !== 1) return
+      const t = ev.touches[0]
+      if (!t) return
+      const dx = t.clientX - touch.x
+      const dy = t.clientY - touch.y
+      // Lock the axis once: vertical scrolls the terminal, horizontal is left
+      // alone so a zoomed pane can still be panned.
+      if (touch.axis === null && (Math.abs(dx) > AXIS_LOCK_PX || Math.abs(dy) > AXIS_LOCK_PX)) {
+        touch.axis = Math.abs(dy) > Math.abs(dx) ? 'y' : 'x'
+      }
+      if (touch.axis !== 'y') return
+      const cell = cellPx()
+      if (!cell) return
+      if (ev.cancelable) ev.preventDefault() // don't also rubber-band the page
+      const step = t.clientY - touch.last
+      touch.last = t.clientY
+      const now = Date.now()
+      const dt = Math.max(1, now - touch.t)
+      touch.t = now
+      touch.v = ((-step / cell) / dt) * 16 // lines per frame, for the flick
+      // Dragging content DOWN reveals older output -> scroll up.
+      touch.acc += -step / cell
+      const { whole, rest } = takeWholeLines(touch.acc)
+      touch.acc = rest
+      if (whole) scrollLines(whole)
+    }
+    const onTouchEnd = (): void => {
+      if (touch && touch.axis === 'y' && Math.abs(touch.v) > FLICK_MIN_LINES) {
+        flick = touch.v
+        flickTimer = requestAnimationFrame(runFlick)
+      }
+      touch = null
+    }
+    if (coarse) {
+      host.addEventListener('touchstart', onTouchStart, { passive: true })
+      host.addEventListener('touchmove', onTouchMove, { passive: false })
+      host.addEventListener('touchend', onTouchEnd, { passive: true })
+      host.addEventListener('touchcancel', onTouchEnd, { passive: true })
+    }
+
     // OSC 2 title changes (e.g. shell PROMPT_COMMAND). Registered once; the
     // latest consumer lives in a ref so a stable prop identity isn't required
     // to keep the callback fresh. Fires only on title sequences, not per byte.
@@ -322,6 +448,13 @@ export const Pane = memo(function Pane(
       window.removeEventListener('message', onPortMsg)
       host.removeEventListener('click', focus)
       host.removeEventListener('mouseup', onMouseUp)
+      if (coarse) {
+        stopFlick()
+        host.removeEventListener('touchstart', onTouchStart)
+        host.removeEventListener('touchmove', onTouchMove)
+        host.removeEventListener('touchend', onTouchEnd)
+        host.removeEventListener('touchcancel', onTouchEnd)
+      }
       ro.disconnect()
       resultsSub.dispose()
       port?.close()

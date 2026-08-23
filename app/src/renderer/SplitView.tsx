@@ -1,5 +1,7 @@
 import { useRef, useState, useEffect } from 'react'
-import { Pane, type SearchApi } from './Pane'
+import { Pane, type SearchApi, type InputApi } from './Pane'
+import { KeyBar } from './KeyBar'
+import { useMobile } from './mobile'
 import { Browser } from './Browser'
 import { Editor, type EditorApi } from './Editor'
 import { paneRects, handles, nextPaneInDirection, focusCandidates, ratioAt, leaves, type Node, type Rect, type Zone, type FocusDir } from './layout'
@@ -190,6 +192,7 @@ export function SplitView(props: {
   // Focused pane lives HERE (not App) so a focus change doesn't churn App's
   // reconcile/persist effects. `focusin` bubbles up from xterm's textarea.
   const [focused, setFocused] = useState<string | null>(null)
+  const mobile = useMobile()
   const focusedRef = useRef<string | null>(null)
   focusedRef.current = focused
   // Live `active` for the once-registered window keydown handler (read via ref so
@@ -340,6 +343,18 @@ export function SplitView(props: {
   // screen from the daemon's raw backlog. Client-local by design: a resize nudge
   // would SIGWINCH the pty, which is shared with `amber web` and every attach.
   const [rebuild, setRebuild] = useState<Record<string, number>>({})
+  // Same stability contract as `searchApis` below, for the on-screen key bar's
+  // handle into the focused pane's pty (spec §5).
+  const inputApis = useRef<Map<string, InputApi>>(new Map())
+  const inputReadyCbs = useRef<Map<string, (api: InputApi) => void>>(new Map())
+  const inputReadyFor = (paneId: string): ((api: InputApi) => void) => {
+    let cb = inputReadyCbs.current.get(paneId)
+    if (!cb) {
+      cb = (api) => { inputApis.current.set(paneId, api) }
+      inputReadyCbs.current.set(paneId, cb)
+    }
+    return cb
+  }
   const searchApis = useRef<Map<string, SearchApi>>(new Map())
   const searchReadyCbs = useRef<Map<string, (api: SearchApi) => void>>(new Map())
   const searchReadyFor = (paneId: string): ((api: SearchApi) => void) => {
@@ -610,8 +625,17 @@ export function SplitView(props: {
       })()
     : null
 
+  // The key bar is mounted only on a coarse-pointer, phone-width viewport —
+  // that is the whole of its host-awareness (spec §0.1: capability, not host).
+  const keyBarTarget = mobile && focused !== null ? (inputApis.current.get(focused) ?? null) : null
+
   return (
     <div ref={ref} style={{ position: 'absolute', inset: 0 }}>
+      {mobile && keyBarTarget !== null && (
+        <div className="key-bar-dock">
+          <KeyBar target={keyBarTarget} />
+        </div>
+      )}
       {panes.map(({ paneId, rect }) => {
         const meta = props.meta[paneId]
         const dead = props.deadCodes[paneId]
@@ -723,7 +747,8 @@ export function SplitView(props: {
                 ? <Browser paneId={paneId} url={props.browsers[paneId]?.url ?? ''}
                     active={props.active && !hidden} onNav={props.onBrowserNav} onTitle={props.onPaneTitle} />
                 : <Pane key={`${paneId}:${rebuild[paneId] ?? 0}`} session={paneId} epoch={props.epoch} portEpoch={props.portEpoch} activateSeq={activateSeq}
-                    fontSize={props.fontSize} cwd={meta?.cwd ?? ''} onTitle={titleCbFor(paneId)} onSearchReady={searchReadyFor(paneId)} />}
+                    fontSize={props.fontSize} cwd={meta?.cwd ?? ''} onTitle={titleCbFor(paneId)} onSearchReady={searchReadyFor(paneId)}
+                    onInputReady={inputReadyFor(paneId)} />}
               {!noTerm && findPane === paneId && !isFrozen && searchApis.current.get(paneId) &&
                 <FindBar api={searchApis.current.get(paneId)!} focusSeq={findSeq}
                   onClose={() => { setFindPane(null); focusPane(paneId) }} />}
