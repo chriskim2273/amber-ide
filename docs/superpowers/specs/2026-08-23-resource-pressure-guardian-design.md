@@ -279,10 +279,11 @@ Automated Rust tests cover:
 Electron tests cover reducer behavior, banner causes, legacy state acceptance,
 the generalized parked overlay, and focus resume.
 
-A private transient Linux service verifies real cgroup placement, CPU weights,
-foreground responsiveness, PSI event delivery, one-at-a-time parking, exact
-resume, and graceful operation when CPU delegation or PSI access is removed.
-This proof must not restart the user's production Amber daemon.
+Before rollout, a private transient Linux service must verify real cgroup
+placement, CPU weights, foreground responsiveness, PSI event delivery,
+one-at-a-time parking, exact resume, and graceful operation when CPU
+delegation or PSI access is removed. It must not restart the user's production
+Amber daemon.
 
 Before production rollout, run workspace Rust tests, app tests, TypeScript
 typecheck, clippy with warnings denied, systemd unit parity checks, and the
@@ -357,9 +358,8 @@ systemd-run --user --unit=amber-task6-rpg-cfnp89.service \
   daemon --root /tmp/amber-task6-rpg.cFnP89 \
   --socket /tmp/amber-task6-rpg.cFnP89/amberd.sock
 systemctl --user show amber-task6-rpg-cfnp89.service \
-  -p ActiveState -p MainPID -p ControlGroup -p Delegate --no-pager
-# MainPID=1494362; ControlGroup=/user.slice/user-1000.slice/user@1000.service/app.slice/amber-task6-rpg-cfnp89.service
-# Delegate=yes; ActiveState=active
+  -p ActiveState -p MainPID -p Delegate --no-pager
+# MainPID=1494362; Delegate=yes; ActiveState=active
 ```
 
 The private root contained a fake `claude` executable and explicit
@@ -371,7 +371,7 @@ notes are therefore omitted and do **not** constitute live proof.
 
 The first normal stop request did not complete before the task was interrupted.
 The captured cleanup command/result record below shows TERM to the listed
-private-proof PIDs, no survivors, an inactive/dead unit, cgroup removal, and
+PIDs, no survivors, an inactive/dead unit, cgroup removal, and
 removal of only the named root. The contemporaneous per-PID command-line,
 root/socket, and cgroup-validation transcript was not retained; it is an
 unverified operator note, not proof. The exact earlier `systemctl stop` result
