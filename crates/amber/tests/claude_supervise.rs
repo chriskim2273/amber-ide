@@ -5,12 +5,13 @@
 use amber::supervisor::{supervise_agent, Agent, SuperviseOutcome, SuspendControl};
 use amber_core::proto::{self, ControlMsg, Decoder, Frame, SessionInfo};
 use amber_core::state::{ClaudeMeta, StateStore};
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -186,6 +187,161 @@ fn start_test_daemon(root: &Path, socket: &Path) -> RunningDaemon {
     RunningDaemon { _handle: TestDaemon::Direct(child), delegated_root: None }
 }
 
+#[cfg(target_os = "linux")]
+fn assert_normal_absolute(path: &Path, label: &str) {
+    assert!(path.is_absolute(), "{label} must be absolute: {}", path.display());
+    assert!(
+        path.components()
+            .all(|component| matches!(component, Component::RootDir | Component::Normal(_))),
+        "{label} must not contain relative or prefix components: {}",
+        path.display(),
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn assert_private_root_socket(root: &Path, socket: &Path) {
+    assert_normal_absolute(root, "private state root");
+    assert_normal_absolute(socket, "private daemon socket");
+    let temp_root = std::env::temp_dir()
+        .canonicalize()
+        .unwrap_or_else(|_| std::env::temp_dir());
+    let root_canonical = root.canonicalize().expect("private state root must exist");
+    assert!(
+        root_canonical.starts_with(&temp_root),
+        "private state root must be inside the OS temp directory: {}",
+        root.display(),
+    );
+    assert_eq!(
+        socket.parent(),
+        Some(root),
+        "private socket must be directly under the private state root",
+    );
+    assert_eq!(
+        socket.file_name(),
+        Some(OsStr::new("amberd.sock")),
+        "private socket must use the expected test-only filename",
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn private_amber_command(root: &Path, socket: &Path, args: Vec<OsString>) -> Command {
+    assert_private_root_socket(root, socket);
+    assert!(
+        args.windows(2).any(|pair| {
+            pair[0].as_os_str() == OsStr::new("--socket") && pair[1].as_os_str() == socket
+        }),
+        "private CLI invocation must include an explicit --socket {}",
+        socket.display(),
+    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_amber"));
+    command
+        .args(args)
+        .current_dir(root)
+        .env_remove("AMBER_SOCK")
+        .env_remove("HOME")
+        .env_remove("CODEX_HOME");
+    command
+}
+
+#[cfg(target_os = "linux")]
+fn create_private_session(root: &Path, socket: &Path, name: &str) {
+    let output = private_amber_command(
+        root,
+        socket,
+        vec![
+            OsString::from("create"),
+            OsString::from(name),
+            OsString::from("--cwd"),
+            root.as_os_str().to_os_string(),
+            OsString::from("--kind"),
+            OsString::from("claude"),
+            OsString::from("--socket"),
+            socket.as_os_str().to_os_string(),
+        ],
+    )
+    .output()
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "private create {name} failed: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn start_required_delegated_daemon(root: &Path, socket: &Path) -> RunningDaemon {
+    assert_private_root_socket(root, socket);
+    static NEXT_UNIT: AtomicUsize = AtomicUsize::new(0);
+    let unit = format!(
+        "amber-task6-cgroup-{}-{}.service",
+        std::process::id(),
+        NEXT_UNIT.fetch_add(1, Ordering::SeqCst),
+    );
+    let output = Command::new("systemd-run")
+        .args([
+            "--user",
+            "--unit",
+            &unit,
+            "--property=Delegate=cpu memory",
+            "--collect",
+            "--quiet",
+        ])
+        .args(["/usr/bin/env", "-u", "HOME", "-u", "CODEX_HOME"])
+        .arg(env!("CARGO_BIN_EXE_amber"))
+        .args(["daemon", "--root"])
+        .arg(root)
+        .arg("--socket")
+        .arg(socket)
+        .output()
+        .expect("systemd-run must be invokable for delegated cgroup proof");
+    if !output.status.success() || !wait_for_socket(socket, Duration::from_secs(5)) {
+        let _ = Command::new("systemctl")
+            .args(["--user", "stop", &unit])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        panic!(
+            "required delegated private daemon did not start: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    let control_group = Command::new("systemctl")
+        .args(["--user", "show", &unit, "--property=ControlGroup", "--value"])
+        .output()
+        .expect("systemctl show must be invokable for delegated cgroup proof");
+    assert!(
+        control_group.status.success(),
+        "could not inspect private unit cgroup: {}",
+        String::from_utf8_lossy(&control_group.stderr),
+    );
+    let control_group = String::from_utf8(control_group.stdout).unwrap();
+    let delegated_root =
+        PathBuf::from("/sys/fs/cgroup").join(control_group.trim().trim_start_matches('/'));
+    assert!(
+        delegated_root.starts_with("/sys/fs/cgroup") && delegated_root.join("_daemon").is_dir(),
+        "private daemon did not activate inside a delegated cgroup: {}",
+        delegated_root.display(),
+    );
+    for (file, expected) in [
+        ("cgroup.controllers", ["cpu", "memory"]),
+        ("cgroup.subtree_control", ["cpu", "memory"]),
+    ] {
+        let body = fs::read_to_string(delegated_root.join(file)).unwrap();
+        for controller in expected {
+            assert!(
+                body.split_whitespace().any(|token| token == controller),
+                "{file} missing {controller}: {body:?}",
+            );
+        }
+    }
+    RunningDaemon {
+        _handle: TestDaemon::Systemd(unit),
+        delegated_root: Some(delegated_root),
+    }
+}
+
 fn send_control(socket: &Path, message: ControlMsg) {
     let mut stream = UnixStream::connect(socket).unwrap();
     stream.write_all(&proto::encode(&Frame::Control(message))).unwrap();
@@ -302,6 +458,70 @@ fn workload_populated(path: &Path) -> Option<bool> {
             let mut fields = line.split_whitespace();
             (fields.next() == Some("populated")).then(|| fields.next() == Some("1"))
         })
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_cgroup_populated(path: &Path, expected: bool, label: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while workload_populated(path) != Some(expected) {
+        assert!(
+            Instant::now() < deadline,
+            "{label} cgroup did not reach populated={expected}: {}",
+            path.display(),
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_control_value(path: &Path, expected: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if fs::read_to_string(path)
+            .map(|value| value.trim() == expected)
+            .unwrap_or(false)
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "control file {} did not become {expected:?}",
+            path.display(),
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn assert_cgroup_has_pids(path: &Path, expected_suffix: &str) {
+    let pids: Vec<i32> = fs::read_to_string(path.join("cgroup.procs"))
+        .unwrap()
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect();
+    assert!(!pids.is_empty(), "{} had no placed pids", path.display());
+    for pid in pids {
+        let proc_cgroup = fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap();
+        assert!(
+            proc_cgroup.contains(expected_suffix),
+            "pid {pid} was not in {expected_suffix}: {proc_cgroup}",
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn write_sleeping_fake_claude(root: &Path) -> PathBuf {
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let claude_path = bin.join("claude");
+    fs::write(
+        &claude_path,
+        "#!/bin/sh\necho \"$@\" >> \"$AMBER_STATE_DIR/claude_argv.log\"\nsleep 30\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&claude_path, fs::Permissions::from_mode(0o755)).unwrap();
+    claude_path
 }
 
 #[test]
@@ -599,6 +819,92 @@ fn duplicate_suspend_while_parked_does_not_repark_after_resume() {
     assert!(matches!(outcome, SuperviseOutcome::CleanExit));
     assert_eq!(reparks, 1, "a duplicate suspend request leaked into the resumed launch");
     assert_eq!(log_lines(&root).len(), 2);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires user systemd with delegated cgroup controllers; run explicitly for private Linux proof"]
+fn isolated_delegated_cgroup_places_workloads_and_weights_sessions() {
+    let _exec_guard = exec_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let socket = root.join("amberd.sock");
+    assert_private_root_socket(&root, &socket);
+
+    let claude_path = write_sleeping_fake_claude(&root);
+    let store = StateStore::new(&root);
+    let mut config = store.load_config().unwrap();
+    config.claude_path = Some(claude_path);
+    store.save_config(&config).unwrap();
+
+    let daemon = start_required_delegated_daemon(&root, &socket);
+    let service_root = daemon
+        .delegated_root
+        .as_ref()
+        .expect("required delegated daemon must expose its cgroup root")
+        .clone();
+    eprintln!(
+        "private cgroup proof: root={} socket={} cgroup={}",
+        root.display(),
+        socket.display(),
+        service_root.display(),
+    );
+
+    create_private_session(&root, &socket, "foreground");
+    create_private_session(&root, &socket, "background");
+    wait_for_session(&socket, "foreground", |info| {
+        info.run_state.as_deref() == Some("claude")
+    });
+    wait_for_session(&socket, "background", |info| {
+        info.run_state.as_deref() == Some("claude")
+    });
+
+    send_control(&socket, ControlMsg::Focus { name: "foreground".into() });
+    let foreground_slot = store.read_session("foreground").unwrap().unwrap().slot;
+    let background_slot = store.read_session("background").unwrap().unwrap().slot;
+    let foreground = service_root.join(format!("session-{foreground_slot}"));
+    let background = service_root.join(format!("session-{background_slot}"));
+    eprintln!(
+        "private cgroup proof: foreground-slot={foreground_slot} background-slot={background_slot}",
+    );
+
+    for (label, slot, session) in [
+        ("foreground", foreground_slot, foreground.as_path()),
+        ("background", background_slot, background.as_path()),
+    ] {
+        wait_for_cgroup_populated(&session.join("supervisor"), true, label);
+        wait_for_cgroup_populated(&session.join("workload"), true, label);
+        assert_cgroup_has_pids(
+            &session.join("supervisor"),
+            &format!("session-{slot}/supervisor"),
+        );
+        assert_cgroup_has_pids(
+            &session.join("workload"),
+            &format!("session-{slot}/workload"),
+        );
+    }
+
+    wait_for_control_value(&service_root.join("_daemon/cpu.weight"), "10000");
+    wait_for_control_value(&foreground.join("cpu.weight"), "1000");
+    wait_for_control_value(&background.join("cpu.weight"), "100");
+    eprintln!(
+        "private cgroup proof: weights daemon=10000 foreground=1000 background=100",
+    );
+
+    send_control(&socket, ControlMsg::Kill { name: "foreground".into() });
+    send_control(&socket, ControlMsg::Kill { name: "background".into() });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !detailed_sessions(&socket).is_empty() {
+        assert!(Instant::now() < deadline, "private sessions were not removed");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop(daemon);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while service_root.exists() {
+        assert!(Instant::now() < deadline, "private cgroup was not removed");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    eprintln!("private cgroup proof: cleanup removed {}", service_root.display());
 }
 
 #[test]

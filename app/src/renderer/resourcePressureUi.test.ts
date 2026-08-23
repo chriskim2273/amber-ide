@@ -435,6 +435,15 @@ function installFakeDom(): { container: FakeElement; restore: () => void } {
   }
 }
 
+async function withFakeDom<T>(body: (dom: { container: FakeElement }) => Promise<T>): Promise<T> {
+  const dom = installFakeDom()
+  try {
+    return await body(dom)
+  } finally {
+    dom.restore()
+  }
+}
+
 describe('resource-pressure renderer UI', () => {
   it('renders every critical pressure cause in the banner', () => {
     const html = renderToStaticMarkup(createElement(ResourcePressureBanner, {
@@ -471,31 +480,41 @@ describe('resource-pressure renderer UI', () => {
     expect(onPaneFocus).toHaveBeenCalledWith(PANE)
   })
 
+  it('restores fake DOM globals if client setup fails before root creation', async () => {
+    const previousDocument = globalThis.document
+
+    await expect(withFakeDom(async () => {
+      throw new Error('setup failed before createRoot')
+    })).rejects.toThrow('setup failed before createRoot')
+
+    expect(globalThis.document).toBe(previousDocument)
+  })
+
   it('suppresses the programmatic focus caused by keep-alive activation', async () => {
-    const dom = installFakeDom()
-    const { createRoot } = await import('react-dom/client')
-    const onPaneFocus = vi.fn()
-    const root = createRoot(dom.container as unknown as Element)
-    try {
-      await act(async () => {
-        root.render(splitView(false, onPaneFocus))
-      })
-      const textarea = dom.container.querySelector('textarea')
-      expect(textarea?.focusCount).toBe(0)
-      expect(paneCapture.lastActivateSeq).toBe(0)
+    await withFakeDom(async (dom) => {
+      const { createRoot } = await import('react-dom/client')
+      const onPaneFocus = vi.fn()
+      const root = createRoot(dom.container as unknown as Element)
+      try {
+        await act(async () => {
+          root.render(splitView(false, onPaneFocus))
+        })
+        const textarea = dom.container.querySelector('textarea')
+        expect(textarea?.focusCount).toBe(0)
+        expect(paneCapture.lastActivateSeq).toBe(0)
 
-      await act(async () => {
-        root.render(splitView(true, onPaneFocus))
-      })
+        await act(async () => {
+          root.render(splitView(true, onPaneFocus))
+        })
 
-      expect(paneCapture.lastActivateSeq).toBe(1)
-      expect(textarea?.focusCount).toBe(1)
-      expect(onPaneFocus).not.toHaveBeenCalled()
-    } finally {
-      await act(async () => {
-        root.unmount()
-      })
-      dom.restore()
-    }
+        expect(paneCapture.lastActivateSeq).toBe(1)
+        expect(textarea?.focusCount).toBe(1)
+        expect(onPaneFocus).not.toHaveBeenCalled()
+      } finally {
+        await act(async () => {
+          root.unmount()
+        })
+      }
+    })
   })
 })

@@ -1255,13 +1255,15 @@ mod tests {
         // otherwise a restart can silently change when automatic parking acts.
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::new(dir.path());
-        let mut cfg = Config::default();
-        cfg.pressure = PressureConfig {
-            cpu_some_percent: 30.5,
-            io_full_percent: 12.25,
-            memory_full_percent: 4.0,
-            sustain_seconds: 240,
-            cooldown_seconds: 30,
+        let cfg = Config {
+            pressure: PressureConfig {
+                cpu_some_percent: 30.5,
+                io_full_percent: 12.25,
+                memory_full_percent: 4.0,
+                sustain_seconds: 240,
+                cooldown_seconds: 30,
+            },
+            ..Config::default()
         };
 
         store.save_config(&cfg).unwrap();

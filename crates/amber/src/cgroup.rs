@@ -275,28 +275,12 @@ impl CgroupManager {
         .err();
         match fs::read_dir(root) {
             Ok(entries) => {
-                for entry in entries.flatten() {
-                    let Some(slot) = entry
-                        .file_name()
-                        .to_str()
-                        .and_then(|name| name.strip_prefix("session-"))
-                        .and_then(|slot| slot.parse::<u32>().ok())
-                        .filter(|slot| *slot > 0)
-                    else {
-                        continue;
-                    };
-                    let weight = if slot == foreground_slot {
-                        FOREGROUND_CPU_WEIGHT
-                    } else {
-                        BACKGROUND_CPU_WEIGHT
-                    };
-                    if let Err(error) = write_control_nonblocking(
-                        &entry.path().join("cpu.weight"),
-                        &weight.to_string(),
-                    ) {
-                        if first_error.is_none() {
-                            first_error = Some(error);
-                        }
+                if let Some(error) = reconcile_session_cpu_weights(
+                    entries.map(|entry| entry.map(|entry| (entry.file_name(), entry.path()))),
+                    foreground_slot,
+                ) {
+                    if first_error.is_none() {
+                        first_error = Some(error);
                     }
                 }
             }
@@ -497,6 +481,45 @@ impl CgroupManager {
             Err(error) => Err(error),
         }
     }
+}
+
+fn reconcile_session_cpu_weights<I>(entries: I, foreground_slot: u32) -> Option<io::Error>
+where
+    I: IntoIterator<Item = io::Result<(OsString, PathBuf)>>,
+{
+    let mut first_error = None;
+    for entry in entries {
+        let (file_name, path) = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+                continue;
+            }
+        };
+        let Some(slot) = file_name
+            .to_str()
+            .and_then(|name| name.strip_prefix("session-"))
+            .and_then(|slot| slot.parse::<u32>().ok())
+            .filter(|slot| *slot > 0)
+        else {
+            continue;
+        };
+        let weight = if slot == foreground_slot {
+            FOREGROUND_CPU_WEIGHT
+        } else {
+            BACKGROUND_CPU_WEIGHT
+        };
+        if let Err(error) =
+            write_control_nonblocking(&path.join("cpu.weight"), &weight.to_string())
+        {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
+    first_error
 }
 
 /// Move this short-lived launcher into a numeric session leaf, then replace it
@@ -978,6 +1001,30 @@ mod tests {
         assert_eq!(
             fs::read_to_string(temp.path().join("session-2/cpu.weight")).unwrap(),
             "1000",
+        );
+    }
+
+    #[test]
+    fn cpu_weight_reconcile_reports_directory_entry_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let session = temp.path().join("session-1");
+        fs::create_dir(&session).unwrap();
+        fs::write(session.join("cpu.weight"), "").unwrap();
+
+        let error = reconcile_session_cpu_weights(
+            [
+                Ok((OsString::from("session-1"), session.clone())),
+                Err(io::Error::other("broken read_dir entry")),
+            ],
+            1,
+        )
+        .expect("directory entry errors must be reported");
+
+        assert_eq!(error.to_string(), "broken read_dir entry");
+        assert_eq!(
+            fs::read_to_string(session.join("cpu.weight")).unwrap(),
+            "1000",
+            "valid entries must still be reconciled before reporting the diagnostic",
         );
     }
 
