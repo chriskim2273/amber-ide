@@ -1012,6 +1012,63 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   `ctl web enable --port N` yields a service the dialog cannot see (it queries
   7717 and reports `inactive`).
 
+- [x] Mobile UX (2026-08-22, Phase B) — the hosted IDE is usable on a phone,
+  agent sessions above all. Spec:
+  `docs/superpowers/specs/2026-08-22-mobile-web-experience-design.md` §1–§8;
+  plan `docs/superpowers/plans/2026-08-22-mobile-ux-phase-b.md`; report
+  `.reports/mobile-ux.md`. **The webapp spec's §2.1 ("the renderer is not
+  modified") is amended, not broken**: renderer changes that are
+  *host-agnostic* are in scope — they improve the Electron app in a small or
+  touch-capable window exactly as much as the browser build — while changes
+  that branch on the HOST stay forbidden and stay the signal that the shim is
+  wrong. Enforceable form: nothing under `app/src/renderer/` imports from
+  `app/src/web/`, reads a web-only global, or tests for Electron; mobile keys
+  off `pointer: coarse` + viewport width (`mobile.ts`, unit-tested), never off
+  the host. New: `touchInput.ts` (key-bar byte sequences + scroll math **ported
+  from `crates/amber/assets/app.js`**, which is device-proven — re-deriving
+  arrow forms is how you type escape junk into a claude prompt), `KeyBar.tsx`
+  (esc/tab/**⇧tab**/sticky ctrl/arrows/enter///^C at 44 px; ⇧tab is claude's
+  mode cycle and the bar could not ship without it), `Drawer.tsx` (the ws-pill
+  and tab rows do not fit 390 px, so they collapse to `ws · tab · ☰`), touch
+  scrolling in `Pane.tsx` (alt screen sends ARROWS — a full-screen TUI owns its
+  own paging), pointer-event drags with 400 ms long-press arming (a finger on a
+  4 px divider is usually the start of a scroll), tap-to-zoom reusing the
+  EXISTING zoom state with a history entry so the platform back gesture
+  un-zooms, long-press sheets reusing the existing context-menu state, PWA
+  manifest + safe-area insets (**no service worker** — the app is useless
+  without a live socket and SW cache invalidation is a footgun), and touch
+  copy/paste. **Grid borrowing** (the load-bearing part): a phone reflows an
+  agent pane to a readable width while it is looking at it and hands the grid
+  back on un-zoom / `visibilitychange` / `pagehide` / socket death. Bookkeeping
+  is server-side in `Hub` because only the server survives a phone that leaves
+  Wi-Fi. **`prior` is captured in the `Open` handler, never on `Resize`** —
+  `HubInner::sessions` refreshes on the 1 s poll while `PaneLink` debounces
+  resizes at 300 ms, so capturing on resize can record the PHONE's own grid and
+  make the restore a silent no-op; mutation-checked (the test fails if the
+  capture point moves). A restore is suppressed unless the session still
+  matches what this client set — last writer wins, a restore never clobbers a
+  newer desktop fit. Mobile font default **14 px ≈ 46 cols**, chosen from a
+  measurement, not a guess: `.reports/mobile-agent-cols.md` renders
+  claude/codex/grok through a real VT emulator (pyte) at 40/46/54/80 and finds
+  all three reflow correctly at 40 — a first pass that counted newlines was
+  meaningless for codex and grok, which paint by absolute cursor positioning.
+  Gates: Rust tests + clippy clean, app 511 tests + typecheck + `build` +
+  `build:web`. **Live-verified** at 390×844 with touch emulation against a
+  private daemon + private `amber web`: mobile chrome swaps in on capability
+  alone with no reload, all eleven keys at 44 px, manifest + icon served, and
+  the full cycle **tile 80×24 → zoomed 44×41 → un-zoomed 80×24**. **The bug
+  live testing caught, which no unit test could:** an unzoomed mosaic tile is
+  ~180 px wide, and its FitAddon reflowed a live session to **13 COLUMNS** —
+  and a pty's winsize is shared with the desktop, so that lands on whoever is
+  at the desk. Panes gained a `fitMode`: a tile SCALES its pixels with a CSS
+  transform and leaves the grid alone; only a zoomed pane reflows. Two further
+  paths were resizing regardless (the font-size effect, which fires on the
+  phone's 13→14 px flip, and the reconnect nudge) and now respect it. **Not
+  verified:** any real device on either platform — so §3's soft-keyboard rule
+  (opening the keyboard must never re-fit the pty) is untested, since
+  `visualViewport` does not move under emulation — plus long-press arming,
+  real-finger touch scrolling, clipboard gestures, and PWA install.
+
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**
   `std::io::Read` (dedicated thread); `take_writer()` is one-shot;
