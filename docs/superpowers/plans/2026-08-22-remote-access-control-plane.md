@@ -1,12 +1,16 @@
 # Remote Access Control Plane (Phase A) Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Give the desktop IDE first-class controls for running, hosting and sharing the browser build of amber (`amber web`) — service lifecycle, tailnet URL + QR, token rotation, connected clients, diagnostics — without ever hand-running a CLI.
 
 **Architecture:** Rust owns everything stateful: a new `amber ctl web <action>` subcommand installs/enables/starts/stops the existing `amber-web` boot unit (templates embedded from `infra/daemon/` with `include_str!`, so the packaged AppImage path works without a git checkout), drives `tailscale serve`, and reads a new authenticated `GET /api/status` on `amber web` itself. The Electron app is a thin controller: `webService.ts` builds argv and parses `--json`, IPC carries it to a toolbar status pill and a "Remote access" dialog. No new daemon protocol, no daemon change at all.
 
 **Tech Stack:** Rust (`crates/amber`, std + `serde_json` + `anyhow`, no new crates), TypeScript strict (Electron main + React renderer), vitest, `qrcode` (pure-JS npm dep, renderer only).
+
+**Status: implemented** (2026-08-22). Report: `.reports/remote-access.md`.
+`enable`/`disable` were deliberately NOT run live — they write a real unit and
+run `tailscale serve` on the user's machine.
 
 **Spec:** `docs/superpowers/specs/2026-08-22-mobile-web-experience-design.md` (§9 in full; §2.2's borrow bookkeeping is Phase B and only appears here as a nullable field in the status payload).
 
@@ -41,7 +45,7 @@
   - `pub struct Argv { pub cmd: String, pub args: Vec<String> }`
   - `pub fn enable_argv() -> Vec<Argv>`, `disable_argv`, `start_argv`, `stop_argv`, `restart_argv`, `is_active_argv` — each `Vec<Argv>`/`Argv`, platform-gated by `cfg!(target_os)`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Create `crates/amber/src/webctl.rs` with only the test module plus `use` lines:
 
@@ -115,12 +119,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p amber webctl`
 Expected: FAIL to compile — `render_systemd_unit` etc. not found.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 Put this ABOVE the test module in `crates/amber/src/webctl.rs`:
 
@@ -271,17 +275,17 @@ Add to `crates/amber/src/lib.rs`:
 pub mod webctl;
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p amber webctl`
 Expected: PASS, 4 tests.
 
-- [ ] **Step 5: Clippy**
+- [x] **Step 5: Clippy**
 
 Run: `cargo clippy -p amber --all-targets -- -D warnings`
 Expected: clean.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/amber/src/webctl.rs crates/amber/src/lib.rs
@@ -307,7 +311,7 @@ git commit -m "feat(webctl): embed amber-web unit templates and lifecycle argv"
   - `pub fn detect(port: u16) -> TailState` (runs the commands)
   - `pub fn enable_serve(port: u16) -> Result<(), String>`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[cfg(test)]
@@ -376,12 +380,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `cargo test -p amber tailscale`
 Expected: FAIL to compile — functions not found.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```rust
 //! `tailscale` integration for `amber web`.
@@ -469,12 +473,12 @@ pub fn enable_serve(port: u16) -> Result<(), String> {
 }
 ```
 
-- [ ] **Step 4: Run to verify pass**
+- [x] **Step 4: Run to verify pass**
 
 Run: `cargo test -p amber tailscale`
 Expected: PASS, 5 tests.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/amber/src/tailscale.rs crates/amber/src/lib.rs
@@ -498,7 +502,7 @@ git commit -m "feat(tailscale): classify tailnet state and build the phone URL"
   ```
   `borrow` is always `null` in Phase A; Phase B (§2.2) fills it.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Add to `web.rs`'s existing test module:
 
@@ -544,12 +548,12 @@ crates/amber/src/web.rs` and match it — do not guess. Also check whether
 argument panics instead of failing informatively, and the helper needs the
 same construction the existing tests use.)
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `cargo test -p amber status_json`
 Expected: FAIL — `status_json` not found.
 
-- [ ] **Step 3: Implement `Hub::status_json` + the route**
+- [x] **Step 3: Implement `Hub::status_json` + the route**
 
 Add a `started: Instant` field to `Hub` (set in `Hub::new`), then beside `sessions_json`:
 
@@ -598,12 +602,12 @@ as a `u16` parameter alongside `hub`/`auth`. Take it from
 `listener.local_addr()?.port()`, not from the caller's argument — that is the
 honest value when the bind used port 0, which the tests do.
 
-- [ ] **Step 4: Run to verify pass**
+- [x] **Step 4: Run to verify pass**
 
 Run: `cargo test -p amber status_json` then `cargo test -p amber`
 Expected: PASS; the whole `amber` suite still green.
 
-- [ ] **Step 5: Add the auth test**
+- [x] **Step 5: Add the auth test**
 
 ```rust
 #[test]
@@ -616,7 +620,7 @@ fn status_requires_the_cookie() {
 
 Fill it in from the neighbouring `/api/sessions` test rather than inventing a new harness.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/amber/src/web.rs
@@ -652,7 +656,7 @@ git commit -m "feat(web): authenticated GET /api/status for operator tooling"
   `pub fn load_token(root: &Path) -> Option<String>` — reads, never creates.
   `tailscale` is one of `not-installed|not-logged-in|not-running|serve-not-mapped|serving`.
 
-- [ ] **Step 0: Check clap accepts the arg shape BEFORE writing the task**
+- [x] **Step 0: Check clap accepts the arg shape BEFORE writing the task**
 
 `global = true` propagates a flag downward to subcommands and must be declared
 on an ancestor of where it is used. The tests below invoke
@@ -668,7 +672,7 @@ parse error is not). If clap rejects it, drop `global` and declare `port`,
 `json` and `root` on each `WebAction` variant instead. Five minutes here gates
 every test in this task.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 `crates/amber/tests/ctl_web.rs`:
 
@@ -725,12 +729,12 @@ fn url_prints_the_token_only_on_the_url_subcommand() {
 
 Add `tempfile` to `[dev-dependencies]` of `crates/amber/Cargo.toml` if it is not already there (check first: `grep -n tempfile crates/amber/Cargo.toml`).
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `cargo test -p amber --test ctl_web`
 Expected: FAIL — `error: unrecognized subcommand 'web'`.
 
-- [ ] **Step 3: Add the CLI variant**
+- [x] **Step 3: Add the CLI variant**
 
 In `enum CtlAction`:
 
@@ -772,7 +776,7 @@ enum WebAction {
 }
 ```
 
-- [ ] **Step 4: Implement `run_ctl_web`**
+- [x] **Step 4: Implement `run_ctl_web`**
 
 ```rust
 /// `amber ctl web <action>`.
@@ -970,12 +974,12 @@ Wire the dispatch in `main()`'s `Command::Ctl { action } => match action { … }
                 CtlAction::Web { action, port, json, root } => run_ctl_web(action, port, json, root),
 ```
 
-- [ ] **Step 5: Run to verify pass**
+- [x] **Step 5: Run to verify pass**
 
 Run: `cargo test -p amber --test ctl_web`
 Expected: PASS, 2 tests.
 
-- [ ] **Step 6: Full gate + commit**
+- [x] **Step 6: Full gate + commit**
 
 ```bash
 cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings
@@ -1015,7 +1019,7 @@ git commit -m "feat(cli): amber ctl web status/start/stop/enable/url/rotate-toke
   export function redactUrl(url: string): string
   ```
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `app/src/main/webService.test.ts`:
 
@@ -1071,12 +1075,12 @@ describe('redactUrl', () => {
 })
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `cd app && npx vitest run src/main/webService.test.ts`
 Expected: FAIL — cannot resolve `./webService`.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```ts
 // Typed view of `amber ctl web --json`. The app parses ONLY json (a plan-level
@@ -1154,12 +1158,12 @@ export function redactUrl(url: string): string {
 }
 ```
 
-- [ ] **Step 4: Run to verify pass**
+- [x] **Step 4: Run to verify pass**
 
 Run: `cd app && npx vitest run src/main/webService.test.ts`
 Expected: PASS, 5 tests.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add app/src/main/webService.ts app/src/main/webService.test.ts
@@ -1189,7 +1193,7 @@ git commit -m "feat(app): typed parser for amber ctl web --json"
   webUrl(): Promise<string>          // tokenised, on demand only
   ```
 
-- [ ] **Step 1: Add the main-process handlers**
+- [x] **Step 1: Add the main-process handlers**
 
 In `app/src/main/index.ts`:
 
@@ -1259,7 +1263,7 @@ ipcMain.handle('web:openLocal', async () => {
 
 macOS note: the launchd plist must gain `StandardErrorPath` pointing at `~/Library/Logs/amber-web.log` for that read to find anything — add it to `infra/daemon/com.amber-ide.web.plist.in` in this task (spec §12.2 records the asymmetry).
 
-- [ ] **Step 2: Expose in preload**
+- [x] **Step 2: Expose in preload**
 
 `app/src/preload/index.ts`, alongside the existing methods:
 
@@ -1271,7 +1275,7 @@ macOS note: the launchd plist must gain `StandardErrorPath` pointing at `~/Libra
   webUrl: () => ipcRenderer.invoke('web:url'),
 ```
 
-- [ ] **Step 3: No-op the methods in the web shim**
+- [x] **Step 3: No-op the methods in the web shim**
 
 `app/src/web/install.ts` — the browser build has no service to manage, and the renderer must not crash reading `window.amber.webStatus`:
 
@@ -1287,7 +1291,7 @@ macOS note: the launchd plist must gain `StandardErrorPath` pointing at `~/Libra
     webUrl: async () => '',
 ```
 
-- [ ] **Step 4: Add the pill**
+- [x] **Step 4: Add the pill**
 
 In `main.tsx`'s toolbar, next to the existing controls:
 
@@ -1341,12 +1345,12 @@ const webDot =
 .web-pill-error   .web-dot { background: #f85149; }
 ```
 
-- [ ] **Step 5: Gate**
+- [x] **Step 5: Gate**
 
 Run: `cd app && npm run typecheck && npx vitest run`
 Expected: both green.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add app/src/main/index.ts app/src/preload/index.ts app/src/web/install.ts \
@@ -1370,7 +1374,7 @@ git commit -m "feat(app): remote-access IPC and toolbar status pill"
 - Consumes: `window.amber.web*` (Task 6), `WebStatus` (Task 5).
 - Produces: `export function diagnosticRows(s: WebStatus): { label: string; ok: boolean; hint: string }[]` — the pure part, unit-tested; the component itself is not.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```ts
 import { describe, it, expect } from 'vitest'
@@ -1407,12 +1411,12 @@ describe('diagnosticRows', () => {
 })
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `cd app && npx vitest run src/renderer/remoteAccess.test.ts`
 Expected: FAIL — cannot resolve `./RemoteAccess`.
 
-- [ ] **Step 3: Implement the pure helper + component**
+- [x] **Step 3: Implement the pure helper + component**
 
 ```tsx
 import { useEffect, useState } from 'react'
@@ -1454,7 +1458,7 @@ Component behaviour, in order of the dialog:
 9. Log tail: `<pre>` filled from `webLogTail()`, refresh button.
 10. "Open on this machine" → `webOpenLocal()`.
 
-- [ ] **Step 4: Add the dependency**
+- [x] **Step 4: Add the dependency**
 
 ```bash
 cd app && npm install qrcode && npm install -D @types/qrcode
@@ -1464,12 +1468,12 @@ cd app && npm install qrcode && npm install -D @types/qrcode
 assert:** `npm ls qrcode` and confirm no optional native dependency appears in
 the lockfile, then `node -e "require('qrcode')"` from `app/`.
 
-- [ ] **Step 5: Run to verify pass**
+- [x] **Step 5: Run to verify pass**
 
 Run: `cd app && npx vitest run src/renderer/remoteAccess.test.ts && npm run typecheck && npm run build`
 Expected: all green.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add app/src/renderer/RemoteAccess.tsx app/src/renderer/remoteAccess.test.ts \
@@ -1487,7 +1491,7 @@ git commit -m "feat(app): remote access dialog with QR, diagnostics and clients"
 
 Verification runs against an **isolated** instance so the user's real daemon, sessions and tailnet config are never touched — the established pattern in this repo (see the `verify-isolated-dev-instance` memory).
 
-- [ ] **Step 1: Start a private daemon + web server**
+- [x] **Step 1: Start a private daemon + web server**
 
 ```bash
 export AMBER_TEST_ROOT=$(mktemp -d /tmp/amber-rt.XXXX)
@@ -1495,14 +1499,14 @@ target/debug/amber daemon --root "$AMBER_TEST_ROOT" --socket "$AMBER_TEST_ROOT/s
 target/debug/amber web --root "$AMBER_TEST_ROOT" --socket "$AMBER_TEST_ROOT/s" --port 7919 &
 ```
 
-- [ ] **Step 2: Verify `status --json` reports a LIVE server**
+- [x] **Step 2: Verify `status --json` reports a LIVE server**
 
 ```bash
 target/debug/amber ctl web status --json --root "$AMBER_TEST_ROOT" --port 7919 | tee /tmp/st.json
 ```
 Expected: valid JSON; `sessions` and `uptime_secs` are numbers (proves the auth exchange + `/api/status` worked, not just the unit probe).
 
-- [ ] **Step 3: Verify the throttle is not burned by status polling**
+- [x] **Step 3: Verify the throttle is not burned by status polling**
 
 ```bash
 for i in $(seq 1 12); do
@@ -1513,7 +1517,7 @@ target/debug/amber ctl web url --root "$AMBER_TEST_ROOT" --port 7919
 Then exchange that URL's token by hand (`curl -si -X POST --data "<token>" http://127.0.0.1:7919/api/auth`).
 Expected: **204**, not 429. Twelve status calls must not lock out a real client.
 
-- [ ] **Step 4: Verify a bad token is rejected once, without a retry storm**
+- [x] **Step 4: Verify a bad token is rejected once, without a retry storm**
 
 ```bash
 target/debug/amber ctl web status --json --root "$AMBER_TEST_ROOT" --port 7919 > /dev/null
@@ -1522,7 +1526,7 @@ target/debug/amber ctl web status --json --root "$AMBER_TEST_ROOT" --port 7919 |
 ```
 Expected: `1` — reports the failure, exits 0, one auth attempt.
 
-- [ ] **Step 5: Verify the token never leaks**
+- [x] **Step 5: Verify the token never leaks**
 
 ```bash
 target/debug/amber ctl web status --json --root "$AMBER_TEST_ROOT" --port 7919 \
@@ -1530,15 +1534,15 @@ target/debug/amber ctl web status --json --root "$AMBER_TEST_ROOT" --port 7919 \
 ```
 Expected: `[]`.
 
-- [ ] **Step 6: Verify the app dialog end-to-end**
+- [x] **Step 6: Verify the app dialog end-to-end**
 
 Use the `verify` skill (`Skill(verify)`) to drive the GUI headless (xvfb + CDP) against this private instance: open the Remote access dialog, confirm the pill colour matches the CLI's `unit`/`tailscale`, reveal + copy the URL, render the QR, run the log tail, and press Restart and see the pill go `off → serving`.
 
-- [ ] **Step 7: Write the report and update CLAUDE.md**
+- [x] **Step 7: Write the report and update CLAUDE.md**
 
 `.reports/remote-access.md` records each command, its real output, and anything that did NOT get verified (a real tailnet, macOS launchd, the packaged AppImage path). Then add a build-status entry to `CLAUDE.md` in the established style, stating plainly what is proven and what is still manual.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add .reports/remote-access.md CLAUDE.md
