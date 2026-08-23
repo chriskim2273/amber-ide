@@ -129,7 +129,7 @@ fn large_backlog_does_not_block_control_on_shared_connection() {
     // marker, then dropping that connection (the ring retains the bytes).
     {
         let mut drain = UnixStream::connect(&sock).unwrap();
-        send(&drain, ControlMsg::Attach { name: "amber-1-1-0-a".into(), raw_client: false, preview: false });
+        send(&drain, ControlMsg::Attach { name: "amber-1-1-0-a".into(), raw_client: false, preview: false, resume: None });
         drain_until_marker(&mut drain, "amber-1-1-0-a", b"RINGFULL");
     }
 
@@ -154,7 +154,7 @@ fn large_backlog_does_not_block_control_on_shared_connection() {
         };
         assert_eq!(rc, 0, "setsockopt SO_RCVBUF failed");
     }
-    send(&victim, ControlMsg::Attach { name: "amber-1-1-0-a".into(), raw_client: false, preview: false });
+    send(&victim, ControlMsg::Attach { name: "amber-1-1-0-a".into(), raw_client: false, preview: false, resume: None });
     send(
         &victim,
         ControlMsg::Create { name: "amber-2-2-0-b".into(), cwd, kind: "shell".into() },

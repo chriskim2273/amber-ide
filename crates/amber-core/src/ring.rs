@@ -34,6 +34,34 @@ pub struct Ring {
     /// Total bytes ever pushed. Monotonic; the snapshot timer compares it to
     /// skip rewriting a scrollback file whose ring has not changed.
     written: u64,
+    /// Identity of THIS ring instance's byte stream. A fresh ring gets a fresh
+    /// epoch (unique within the process, time/pid-seeded so it differs across
+    /// daemon restarts), which is what lets a client's "I have seen N bytes"
+    /// watermark be trusted: a watermark from a previous spawn/restart carries
+    /// a stale epoch and can never address this stream.
+    epoch: u64,
+}
+
+/// Process-wide epoch allocator. Starts at 1 (0 is reserved: an epoch of 0
+/// must never be handed out, because clients use it to mean "no watermark").
+fn next_epoch() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    // Seed once per process from wall-clock nanos mixed with the pid, so two
+    // daemon lifetimes never share an epoch sequence (a client reconnecting to
+    // a RESTARTED daemon must fall back to a full replay, not a delta against
+    // a stream that no longer exists).
+    NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+        (v == 1).then(|| {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos() as u64);
+            (nanos ^ ((std::process::id() as u64) << 32)) | 1
+        })
+    })
+    .ok();
+    let value = NEXT.fetch_add(1, Ordering::Relaxed);
+    if value == 0 { 1 } else { value }
 }
 
 /// First allocation once a ring starts filling. Small enough that an idle pane
@@ -48,6 +76,7 @@ impl Ring {
             buf: Vec::new(),
             head: 0,
             written: 0,
+            epoch: next_epoch(),
         }
     }
 
@@ -154,6 +183,36 @@ impl Ring {
     /// so the snapshot can skip both the clone and the disk write.
     pub fn written(&self) -> u64 {
         self.written
+    }
+
+    /// The identity of this ring's byte stream — see [`Ring::since`].
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// The bytes pushed after absolute stream offset `offset`, if this ring
+    /// still retains every one of them.
+    ///
+    /// This is the delta-replay primitive: a client that was fed up to
+    /// `(epoch, offset)` and reconnects needs exactly `since(offset)`. It
+    /// answers `None` — meaning "cannot serve a delta, replay everything" —
+    /// when the offset is in the future (a different/lifetime-reset stream)
+    /// or older than the oldest retained byte (evicted past the cap). The
+    /// caller checks [`epoch`](Self::epoch) FIRST: a matching offset under a
+    /// stale epoch is meaningless.
+    pub fn since(&self, offset: u64) -> Option<Vec<u8>> {
+        if offset > self.written {
+            return None;
+        }
+        let have = (self.written - offset) as usize;
+        if have > self.buf.len() {
+            return None;
+        }
+        if have == 0 {
+            return Some(Vec::new());
+        }
+        let mut snap = self.snapshot();
+        Some(snap.split_off(snap.len() - have))
     }
 
     /// The last `n` bytes, trimmed forward to just after the first `\n` in the
@@ -405,5 +464,76 @@ mod tests {
         r.push(b"anything");
         assert_eq!(r.written(), 0);
         assert_eq!(r.allocated(), 0);
+    }
+
+    #[test]
+    fn epochs_are_nonzero_and_unique_per_ring() {
+        // 0 is reserved (clients use it to mean "no watermark"); two rings —
+        // even back-to-back, as across a session respawn — must never share
+        // one, or a stale watermark would address the wrong stream.
+        let a = Ring::new(16);
+        let b = Ring::new(16);
+        assert_ne!(a.epoch(), 0);
+        assert_ne!(b.epoch(), 0);
+        assert_ne!(a.epoch(), b.epoch());
+    }
+
+    #[test]
+    fn since_returns_the_bytes_after_an_offset() {
+        let mut r = Ring::new(64);
+        r.push(b"hello ");
+        let mark = r.written();
+        r.push(b"world");
+        assert_eq!(r.since(mark).as_deref(), Some(&b"world"[..]));
+    }
+
+    #[test]
+    fn since_at_the_current_offset_is_empty_not_none() {
+        // A fully-caught-up client is servable: an empty delta means "nothing
+        // missed", which is different from "cannot serve a delta".
+        let mut r = Ring::new(64);
+        r.push(b"data");
+        assert_eq!(r.since(r.written()), Some(Vec::new()));
+    }
+
+    #[test]
+    fn since_serves_a_delta_across_the_wrap_point() {
+        // The wrap is where a naive suffix slice goes wrong: the retained
+        // bytes are logically contiguous but physically split.
+        let cap = 8;
+        let mut r = Ring::new(cap);
+        r.push(b"abcdefgh"); // exactly full
+        let mark = r.written(); // = 8
+        r.push(b"ijk"); // wraps -> ring holds "defghijk"
+        assert_eq!(r.since(mark).as_deref(), Some(&b"ijk"[..]));
+        // An offset from BEFORE the wrap that is still fully retained:
+        // byte offset 5 = after "abcde"; stream since then = "fghijk".
+        assert_eq!(r.since(5).as_deref(), Some(&b"fghijk"[..]));
+    }
+
+    #[test]
+    fn since_refuses_evicted_offsets() {
+        let mut r = Ring::new(4);
+        r.push(b"abcdef"); // retains "cdef", written = 6
+        // Offset 1 needs bytes 1..6; byte 1 was evicted.
+        assert_eq!(r.since(1), None);
+        // Boundary: offset 2 needs exactly the retained window.
+        assert_eq!(r.since(2).as_deref(), Some(&b"cdef"[..]));
+    }
+
+    #[test]
+    fn since_refuses_future_offsets() {
+        // A future offset means the caller's stream is not this stream (a
+        // previous daemon life that had written more) — never servable.
+        let mut r = Ring::new(64);
+        r.push(b"abc");
+        assert_eq!(r.since(r.written() + 1), None);
+    }
+
+    #[test]
+    fn since_on_an_empty_ring_only_accepts_zero() {
+        let r = Ring::new(16);
+        assert_eq!(r.since(0), Some(Vec::new()));
+        assert_eq!(r.since(1), None);
     }
 }

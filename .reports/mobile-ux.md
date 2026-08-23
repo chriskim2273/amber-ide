@@ -58,12 +58,24 @@ A third symptom explained by the same root cause: an early cycle restored to
 *desktop*-sized grid, never a phone one — the contract §2.2.1 promises. Once
 the leak was fixed, a fresh session round-tripped exactly.
 
+## Post-merge note
+
+`main` advanced during this work (`perf/optimization-pass`: delta re-attach
+watermarks on `Attach`, a memory-budget dialog, lazy CodeMirror). Merged before
+gating; the conflicts were additive on both sides (SplitView imports, the web
+shim's method table, two CLAUDE.md entries) and the borrow code was untouched
+by the protocol change.
+
 ## Not verified
 
 - **A real device, either platform.** Emulation gives touch events and a coarse
   pointer, not a real soft keyboard, real momentum, or Safari's behaviour.
   The soft-keyboard rule (§3: opening the keyboard must not re-fit the pty) is
-  therefore **untested** — `visualViewport` does not move under emulation.
+  **implemented and unit-tested** (`keyboardViewport.test.ts` pins the
+  discriminator, including that an orientation change — which moves BOTH
+  heights — must still re-fit), but it is **not verified on a device**:
+  `visualViewport` does not move under emulation, so the code path that keeps
+  the cursor row above the keyboard has never run for real.
 - Long-press drag arming (§6) and long-press sheets: synthetic pointer events
   were not driven through the 400ms arming path.
 - Touch scrolling and its alt-screen arrow translation: the ported logic is

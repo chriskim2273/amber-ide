@@ -3,6 +3,7 @@ import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { WebglAddon } from '@xterm/addon-webgl'
 import { altScrollKeys, takeWholeLines, AXIS_LOCK_PX, FLICK_DECAY, FLICK_MIN_LINES } from './touchInput'
+import { keyboardOpen, KEYBOARD_MIN_PX } from './keyboardViewport'
 import { SearchAddon } from '@xterm/addon-search'
 import '@xterm/xterm/css/xterm.css'
 import { appChord } from './keys'
@@ -277,6 +278,17 @@ export const Pane = memo(function Pane(
       el.style.transform = `scale(${k})`
     }
 
+    /**
+     * Is the soft keyboard (or any other browser-owned overlay) currently
+     * eating part of the viewport?
+     *
+     * `visualViewport.height` shrinks when the on-screen keyboard opens while
+     * `innerHeight` does not, so the difference is the discriminator. A real
+     * orientation change moves BOTH, which is why it still re-fits.
+     */
+    const isKeyboardOpen = (): boolean =>
+      keyboardOpen(window.innerHeight, window.visualViewport?.height ?? null)
+
     const sendResize = (): void => {
       // A collapsed host (window crushed below the chrome's own height) makes
       // FitAddon clamp to its 2x1 floor; posting that would SIGWINCH every pty
@@ -288,11 +300,32 @@ export const Pane = memo(function Pane(
         applyScale()
         return
       }
+      // Spec §3: opening the soft keyboard must NEVER re-fit the pty. The
+      // naive path (bind height to visualViewport) flaps the grid every time
+      // the keyboard opens or closes, and on an agent TUI that is a full
+      // repaint each way — plus, with a borrow active, a Resize over the wire
+      // each way. Keep the rows we have; the container scrolls the cursor row
+      // above the keyboard instead.
+      if (isKeyboardOpen()) return
       try { fit.fit() } catch { /* host has zero size mid-layout; ignore */ }
       port?.postMessage({ resize: { cols: term.cols, rows: term.rows } })
     }
     const ro = new ResizeObserver(() => sendResize())
     ro.observe(host)
+
+    // With rows pinned (above), the keyboard would simply cover the bottom of
+    // the terminal — including the prompt. Scroll the cursor row back into the
+    // visible strip instead, which is what a native app does. Bounded to the
+    // keyboard-open case; on a desktop `visualViewport` never shrinks.
+    const onViewport = (): void => {
+      if (fitModeRef.current === 'scale') return
+      const vv = window.visualViewport
+      if (!vv) return
+      const covered = window.innerHeight - vv.height
+      host.style.paddingBottom = covered > KEYBOARD_MIN_PX ? `${covered}px` : ''
+      if (covered > KEYBOARD_MIN_PX) term.scrollToBottom()
+    }
+    window.visualViewport?.addEventListener('resize', onViewport)
     const focus = (): void => term.focus()
 
     // Input goes to whatever the CURRENT port is. Registered ONCE — re-running it
@@ -495,6 +528,7 @@ export const Pane = memo(function Pane(
       window.removeEventListener('message', onPortMsg)
       host.removeEventListener('click', focus)
       host.removeEventListener('mouseup', onMouseUp)
+      window.visualViewport?.removeEventListener('resize', onViewport)
       if (coarse) {
         stopFlick()
         host.removeEventListener('touchstart', onTouchStart)

@@ -323,7 +323,7 @@ pub fn map_browser_msg(
                     out.push(ControlMsg::Detach { name: prev.to_string() });
                 }
             }
-            out.push(ControlMsg::Attach { name: name.clone(), raw_client: false, preview: false });
+            out.push(ControlMsg::Attach { name: name.clone(), raw_client: false, preview: false, resume: None });
             out
         }
         BrowserMsg::Close { name } => {
@@ -1140,7 +1140,7 @@ fn run_daemon_link(hub: Arc<Hub>) {
                         // gets tagged too.
                         Hub::write_daemon_tracking(
                             &mut inner,
-                            &Frame::Control(ControlMsg::Attach { name, raw_client: false, preview: false }),
+                            &Frame::Control(ControlMsg::Attach { name, raw_client: false, preview: false, resume: None }),
                         );
                     }
                 }
@@ -1862,20 +1862,20 @@ mod tests {
         // open with nothing open -> just Attach.
         assert_eq!(
             map_browser_msg(&BrowserMsg::Open { name: "s".into() }, None, &live),
-            vec![ControlMsg::Attach { name: "s".into(), raw_client: false, preview: false }]
+            vec![ControlMsg::Attach { name: "s".into(), raw_client: false, preview: false, resume: None }]
         );
         // open while another is open -> switch (Detach old, Attach new).
         assert_eq!(
             map_browser_msg(&BrowserMsg::Open { name: "t".into() }, Some("s"), &live),
             vec![
                 ControlMsg::Detach { name: "s".into() },
-                ControlMsg::Attach { name: "t".into(), raw_client: false, preview: false },
+                ControlMsg::Attach { name: "t".into(), raw_client: false, preview: false, resume: None },
             ]
         );
         // re-open the same session -> no churn.
         assert_eq!(
             map_browser_msg(&BrowserMsg::Open { name: "s".into() }, Some("s"), &live),
-            vec![ControlMsg::Attach { name: "s".into(), raw_client: false, preview: false }]
+            vec![ControlMsg::Attach { name: "s".into(), raw_client: false, preview: false, resume: None }]
         );
         // close -> Detach.
         assert_eq!(

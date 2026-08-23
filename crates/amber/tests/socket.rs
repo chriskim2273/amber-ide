@@ -206,7 +206,7 @@ fn disconnecting_client_releases_its_subscription() {
     let sess = manager.session("idle").unwrap();
 
     let mut stream = connect_with_retry(&socket_path);
-    send(&mut stream, &Frame::Control(ControlMsg::Attach { name: "idle".into(), raw_client: false, preview: false }));
+    send(&mut stream, &Frame::Control(ControlMsg::Attach { name: "idle".into(), raw_client: false, preview: false, resume: None }));
 
     let deadline = Instant::now() + Duration::from_secs(5);
     while sess.subscriber_count() != 1 {
@@ -249,7 +249,7 @@ fn reattach_replaces_subscription_not_stacks_it() {
     let sess = manager.session("idle").unwrap();
 
     let mut stream = connect_with_retry(&socket_path);
-    send(&mut stream, &Frame::Control(ControlMsg::Attach { name: "idle".into(), raw_client: false, preview: false }));
+    send(&mut stream, &Frame::Control(ControlMsg::Attach { name: "idle".into(), raw_client: false, preview: false, resume: None }));
 
     let deadline = Instant::now() + Duration::from_secs(5);
     while sess.subscriber_count() != 1 {
@@ -258,7 +258,7 @@ fn reattach_replaces_subscription_not_stacks_it() {
     }
 
     // Re-Attach on the same connection; the count must never stack to 2.
-    send(&mut stream, &Frame::Control(ControlMsg::Attach { name: "idle".into(), raw_client: false, preview: false }));
+    send(&mut stream, &Frame::Control(ControlMsg::Attach { name: "idle".into(), raw_client: false, preview: false, resume: None }));
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
         assert!(
@@ -293,7 +293,7 @@ fn socket_roundtrip_create_attach_write_read() {
         Duration::from_secs(5),
     );
 
-    send(&mut stream, &Frame::Control(ControlMsg::Attach { name: "s".into(), raw_client: false, preview: false }));
+    send(&mut stream, &Frame::Control(ControlMsg::Attach { name: "s".into(), raw_client: false, preview: false, resume: None }));
     send(
         &mut stream,
         &Frame::Data {
@@ -387,7 +387,7 @@ fn attached_client_receives_exit_when_child_dies() {
         Duration::from_secs(5),
     );
 
-    send(&mut stream, &Frame::Control(ControlMsg::Attach { name: "mortal".into(), raw_client: false, preview: false }));
+    send(&mut stream, &Frame::Control(ControlMsg::Attach { name: "mortal".into(), raw_client: false, preview: false, resume: None }));
     send(
         &mut stream,
         &Frame::Data { session: "mortal".into(), bytes: b"exit\n".to_vec() },
@@ -833,7 +833,7 @@ fn raw_attach_to_claude_session_skips_backlog() {
 
     let mut stream = connect_with_retry(&socket_path);
     let mut decoder = Decoder::new();
-    send(&mut stream, &Frame::Control(ControlMsg::Attach { name: "c".into(), raw_client: true, preview: false }));
+    send(&mut stream, &Frame::Control(ControlMsg::Attach { name: "c".into(), raw_client: true, preview: false, resume: None }));
     // Same connection, so the daemon handles Attach before this input.
     send(&mut stream, &Frame::Data { session: "c".into(), bytes: b"echo LIVE_MARKER\n".to_vec() });
 
@@ -864,7 +864,7 @@ fn raw_attach_to_shell_session_replays_backlog() {
 
     let mut stream = connect_with_retry(&socket_path);
     let mut decoder = Decoder::new();
-    send(&mut stream, &Frame::Control(ControlMsg::Attach { name: "sh".into(), raw_client: true, preview: false }));
+    send(&mut stream, &Frame::Control(ControlMsg::Attach { name: "sh".into(), raw_client: true, preview: false, resume: None }));
     read_data_until(
         &mut stream,
         &mut decoder,
@@ -893,6 +893,7 @@ fn raw_attach_to_live_resume_flagged_shell_still_replays_backlog() {
             name: "flagged-shell".into(),
             raw_client: true,
             preview: false,
+            resume: None,
         }),
     );
     read_data_until(
@@ -917,7 +918,7 @@ fn default_attach_to_claude_session_replays_backlog() {
 
     let mut stream = connect_with_retry(&socket_path);
     let mut decoder = Decoder::new();
-    send(&mut stream, &Frame::Control(ControlMsg::Attach { name: "c2".into(), raw_client: false, preview: false }));
+    send(&mut stream, &Frame::Control(ControlMsg::Attach { name: "c2".into(), raw_client: false, preview: false, resume: None }));
     read_data_until(
         &mut stream,
         &mut decoder,

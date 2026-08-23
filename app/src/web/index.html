@@ -5,11 +5,14 @@
     <title>amber-ide</title>
     <!-- `viewport-fit=cover` lets the page paint under the notch and home
          indicator; the chrome pads itself back with env(safe-area-inset-*).
-         `user-scalable=no` because the app owns pinch (font size on a borrowed
-         agent pane, CSS scale on a following one) — browser pinch-zoom on top
-         of that fights every gesture. -->
+
+         Browser pinch-zoom is deliberately LEFT ENABLED. An earlier draft set
+         `user-scalable=no` to make room for app-owned pinch (font size on a
+         borrowed pane, CSS scale on a tile) — but that pinch is not built, so
+         disabling the browser's would leave a phone with no way to zoom at
+         all. Re-evaluate only if app-owned pinch actually lands. -->
     <meta name="viewport"
-      content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+      content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <!-- Standalone launch from the home screen on iOS; Android reads the
          manifest's display field instead. -->
     <meta name="apple-mobile-web-app-capable" content="yes" />

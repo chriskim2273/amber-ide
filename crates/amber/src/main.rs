@@ -182,6 +182,27 @@ enum CtlAction {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
+    /// View or change amber's aggregate memory budget — the soft ceiling the
+    /// guardian enforces by parking agent panes under real pressure, which
+    /// also caps every pane leaf's `memory.high`. Changes persist to config
+    /// and take effect immediately (no restart).
+    ///
+    /// The budget cannot exceed the OS-level service cap (`amber.service`
+    /// `MemoryHigh`, default 50% of RAM); pass --systemd to move that too.
+    Budget {
+        /// New budget: `20G`, `1536M`, a bare MiB count like `20480`, or
+        /// `auto` (half of physical RAM, capped by the service). Omit to
+        /// view the current state.
+        set: Option<String>,
+        /// ALSO raise/lower `amber.service`'s `MemoryHigh` to match, live +
+        /// persistently (`systemctl --user set-property`). This overwrites
+        /// any hand-written calibration drop-in. Without it, a budget above
+        /// the existing cap is silently clamped to the cap.
+        #[arg(long)]
+        systemd: bool,
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
     /// Ask the running daemon to flush a snapshot to the state store now.
     SnapshotNow {
         #[arg(long)]
@@ -311,6 +332,9 @@ fn main() -> anyhow::Result<()> {
         Command::Ctl { action } => match action {
             CtlAction::Doctor { root } => run_doctor(root),
             CtlAction::Status { socket } => run_status(&resolve_socket(socket)),
+            CtlAction::Budget { set, systemd, socket } => {
+                run_budget(set.as_deref(), systemd, &resolve_socket(socket))
+            }
             CtlAction::SnapshotNow { socket } => run_snapshot_now(&resolve_socket(socket)),
             CtlAction::Install { dry_run, web } => run_install(dry_run, web),
             CtlAction::Uninstall { dry_run, purge_binary, purge_state, web } => {
@@ -566,6 +590,183 @@ fn run_snapshot_now(socket: &Path) -> anyhow::Result<()> {
             anyhow::bail!("daemon closed the connection before replying");
         }
         decoder.feed(&buf[..n]);
+    }
+}
+
+/// Parse a human budget size into MiB. Binary units: `20G`, `1536M`, `512K`,
+/// `1T`, a bare number is MiB, and `auto` clears the override. Pure.
+fn parse_size_mb(text: &str) -> anyhow::Result<Option<u64>> {
+    let trimmed = text.trim();
+    if trimmed.eq_ignore_ascii_case("auto") {
+        return Ok(None);
+    }
+    let (digits, unit) = trimmed.split_at(trimmed.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(trimmed.len()));
+    let value: u64 = digits
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("bad size {text:?}: expected like 20G, 1536M or auto"))?;
+    let mb = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "m" => value,
+        "g" => value.checked_mul(1024).ok_or_else(|| anyhow::anyhow!("size too large"))?,
+        "t" => value
+            .checked_mul(1024 * 1024)
+            .ok_or_else(|| anyhow::anyhow!("size too large"))?,
+        "k" => (value / 1024).max(if value > 0 { 1 } else { 0 }),
+        other => anyhow::bail!("unknown size unit {other:?} in {text:?}"),
+    };
+    Ok(Some(mb))
+}
+
+/// Render MiB the way systemctl accepts MemoryHigh values (binary units).
+fn format_mb_for_systemctl(mb: u64) -> String {
+    if mb.is_multiple_of(1024 * 1024) && mb > 0 {
+        format!("{}T", mb / (1024 * 1024))
+    } else if mb.is_multiple_of(1024) && mb > 0 {
+        format!("{}G", mb / 1024)
+    } else {
+        format!("{mb}M")
+    }
+}
+
+/// The human-readable view both the get path and the set path print.
+fn render_budget(
+    configured_mb: Option<u64>,
+    effective_kb: Option<u64>,
+    cgroup_limit_kb: Option<u64>,
+    session_high_kb: u64,
+    physical_kb: Option<u64>,
+) -> String {
+    let fmt_gib = |kb: u64| {
+        if kb.is_multiple_of(1024 * 1024) && kb > 0 {
+            format!("{} GiB", kb / (1024 * 1024))
+        } else {
+            format!("{} MiB", kb / 1024)
+        }
+    };
+    let mut lines = Vec::new();
+    lines.push(match configured_mb {
+        Some(mb) => format!("configured budget : {} MiB", mb),
+        None => "configured budget : auto (half of physical RAM)".to_string(),
+    });
+    if let Some(kb) = effective_kb {
+        lines.push(format!("effective budget  : {}", fmt_gib(kb)));
+    } else {
+        lines.push("effective budget  : none — automatic parking disabled".to_string());
+    }
+    if let Some(kb) = physical_kb {
+        lines.push(format!("physical RAM      : {}", fmt_gib(kb)));
+    }
+    match cgroup_limit_kb {
+        Some(kb) => lines.push(format!(
+            "service cap       : {} (amber.service MemoryHigh)",
+            fmt_gib(kb)
+        )),
+        None => lines.push("service cap       : none".to_string()),
+    }
+    lines.push(format!("per-pane ceiling  : {}", fmt_gib(session_high_kb)));
+    if let (Some(effective), Some(limit)) = (effective_kb, cgroup_limit_kb) {
+        if effective == limit {
+            lines.push(
+                "note: the budget is clamped by the service cap; raise it with \
+                 `amber ctl budget <size> --systemd`"
+                    .to_string(),
+            );
+        }
+    }
+    lines.join("\n")
+}
+
+fn run_budget(set: Option<&str>, systemd: bool, socket: &Path) -> anyhow::Result<()> {
+    // Parse first so a typo never half-applies anything.
+    let requested = set.map(parse_size_mb).transpose()?;
+
+    // --systemd moves the OS-level cap FIRST, so the daemon's live re-derive
+    // below sees the new limit rather than clamping the ask to the old one.
+    if systemd {
+        #[cfg(target_os = "linux")]
+        {
+            let target_mib = match requested {
+                Some(Some(mb)) => mb,
+                // "auto": the same half-of-physical the daemon derives.
+                Some(None) | None => {
+                    amber::procinfo::total_memory_kb()
+                        .map(|kb| kb / 2 / 1024)
+                        .filter(|_| requested.is_some())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("--systemd needs a size, or resolvable physical RAM for 'auto'")
+                        })?
+                }
+            };
+            let value = format_mb_for_systemctl(target_mib);
+            let status = std::process::Command::new("systemctl")
+                .args(["--user", "set-property", "amber.service", &format!("MemoryHigh={value}")])
+                .status()
+                .map_err(|e| anyhow::anyhow!("could not run systemctl: {e}"))?;
+            if !status.success() {
+                anyhow::bail!("systemctl set-property failed with {status}");
+            }
+            println!("amber.service MemoryHigh := {value} (live + persistent drop-in)");
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            eprintln!("warning: --systemd has no effect off-Linux (no systemd MemoryHigh)");
+        }
+    }
+
+    // View asks the daemon for its LIVE truth (it knows its real cap); a set
+    // goes through the daemon so config persistence, session leaves, and the
+    // guardian's budget handle all move together. "auto" is mb=0 on the wire.
+    let mut stream = UnixStream::connect(socket)
+        .map_err(|e| anyhow::anyhow!("daemon unreachable at {}: {e}", socket.display()))?;
+    let request = match set {
+        None => ControlMsg::GetMemoryBudget,
+        Some(_) => ControlMsg::SetMemoryBudget { mb: requested.and_then(|r| r).unwrap_or(0) },
+    };
+    stream.write_all(&proto::encode(&Frame::Control(request)))?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+
+    match read_budget_reply(&mut stream)? {
+        ControlMsg::BudgetApplied { mb, effective_budget_kb, cgroup_limit_kb, session_high_kb } => {
+            if set.is_some() {
+                println!("budget saved; live immediately (no restart)");
+            }
+            println!(
+                "{}",
+                render_budget(
+                    (mb != 0).then_some(mb),
+                    (effective_budget_kb != 0).then_some(effective_budget_kb),
+                    (cgroup_limit_kb != 0).then_some(cgroup_limit_kb),
+                    session_high_kb,
+                    amber::procinfo::total_memory_kb(),
+                )
+            );
+            Ok(())
+        }
+        ControlMsg::Error { msg } => anyhow::bail!("{msg}"),
+        _ => unreachable!("read_budget_reply only yields BudgetApplied/Error"),
+    }
+}
+
+/// Wait for the BudgetApplied/Error reply to a budget request.
+fn read_budget_reply(stream: &mut UnixStream) -> anyhow::Result<ControlMsg> {
+    let mut decoder = Decoder::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match decoder.next_frame()? {
+            Some(Frame::Control(msg @ ControlMsg::BudgetApplied { .. }))
+            | Some(Frame::Control(msg @ ControlMsg::Error { .. })) => return Ok(msg),
+            _ => {}
+        }
+        match stream.read(&mut buf) {
+            Ok(0) => anyhow::bail!(
+                "no reply from the daemon — is it older than this command? restart amber and retry"
+            ),
+            Ok(n) => decoder.feed(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
+                anyhow::bail!("timed out waiting for the daemon's reply — is it older than this command? restart amber and retry")
+            }
+            Err(e) => return Err(e.into()),
+        }
     }
 }
 
@@ -920,7 +1121,7 @@ fn run_daemon(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Result<
     // hook wired (a restored pane that produces output must light its tab dot).
     let watchers = std::sync::Arc::new(amber::watchers::Watchers::new());
     let config = StateStore::new(&root).load_config()?;
-    let mut cgroups = amber::cgroup::CgroupManager::activate();
+    let cgroups = amber::cgroup::CgroupManager::activate();
     let cgroup_limit_kb = match cgroups.lowest_finite_limit_kb() {
         Ok(limit) => limit,
         Err(error) => {
@@ -936,6 +1137,9 @@ fn run_daemon(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Result<
             .with_socket(socket_path.clone())
             .with_watchers(Arc::clone(&watchers)),
     );
+    // The guardian reads its budget FRESH from this handle every tick, so
+    // `SetMemoryBudget` (CLI / app) moves it without a restart.
+    manager.store_effective_budget_kb(budget_kb);
     // Global SessionStart hooks: claude (also covers hand-started claude in a
     // shell); codex (no per-session settings file — the global hook is the only
     // id-capture path for amber-launched codex panes).
@@ -979,12 +1183,7 @@ fn run_daemon(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Result<
         });
     }
 
-    amber::memory_guardian::start(
-        Arc::clone(&manager),
-        Arc::clone(&watchers),
-        memory_config,
-        budget_kb,
-    );
+    amber::memory_guardian::start(Arc::clone(&manager), Arc::clone(&watchers), memory_config);
 
     // SIGTERM/SIGINT -> final snapshot, then exit (spec §7 pre-reboot gap).
     {
@@ -1325,6 +1524,41 @@ fn create_session(socket: &Path, name: &str, cwd: &Path, kind: &str) -> anyhow::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_budget_sizes_in_binary_units() {
+        assert_eq!(parse_size_mb("20G").unwrap(), Some(20 * 1024));
+        assert_eq!(parse_size_mb("1536M").unwrap(), Some(1536));
+        assert_eq!(parse_size_mb("20480").unwrap(), Some(20_480)); // bare = MiB
+        assert_eq!(parse_size_mb("512K").unwrap(), Some(1)); // rounds up to 1 MiB
+        assert_eq!(parse_size_mb(" 2t ").unwrap(), Some(2 * 1024 * 1024));
+        assert_eq!(parse_size_mb("auto").unwrap(), None);
+        assert_eq!(parse_size_mb("AUTO").unwrap(), None);
+        assert!(parse_size_mb("12X").is_err());
+        assert!(parse_size_mb("G").is_err());
+        assert!(parse_size_mb("-5G").is_err());
+        assert!(parse_size_mb("").is_err());
+    }
+
+    #[test]
+    fn formats_whole_gibibytes_for_systemctl() {
+        assert_eq!(format_mb_for_systemctl(20 * 1024), "20G");
+        assert_eq!(format_mb_for_systemctl(1536), "1536M");
+        assert_eq!(format_mb_for_systemctl(1024 * 1024), "1T");
+    }
+
+    #[test]
+    fn budget_view_renders_the_clamp_note_only_when_actually_clamped() {
+        let clamped = render_budget(Some(20_480), Some(8_388_608), Some(8_388_608), 4_194_304, Some(33_554_432));
+        assert!(clamped.contains("clamped by the service cap"), "{clamped}");
+        assert!(clamped.contains("configured budget : 20480 MiB"), "{clamped}");
+
+        let headroom = render_budget(Some(4_096), Some(4_194_304), Some(8_388_608), 4_194_304, None);
+        assert!(!headroom.contains("clamped"), "{headroom}");
+
+        let disabled = render_budget(None, None, None, 0, None);
+        assert!(disabled.contains("automatic parking disabled"), "{disabled}");
+    }
 
     #[test]
     fn parses_hidden_cgroup_launcher_without_rewriting_agent_flags() {

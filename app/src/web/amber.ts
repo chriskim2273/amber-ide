@@ -498,6 +498,10 @@ export function createAmber(deps: AmberDeps): WebAmber {
     editorDraftClear: notImplemented('editorDraftClear'),
     editorInlineImages: notImplemented('editorInlineImages'),
     claudeNames: notImplemented('claudeNames'),
+    // Desktop-only: the daemon-side budget control messages are not on the
+    // browser whitelist, so there is nothing honest to send.
+    getMemoryBudget: notImplemented('getMemoryBudget'),
+    setMemoryBudget: notImplemented('setMemoryBudget'),
 
     // --- remote access (spec 2026-08-22 §9) --------------------------------
     // The browser IS the remote client; it has no service to manage and no

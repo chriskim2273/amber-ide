@@ -938,6 +938,61 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   real-Mac verification, live mobile/banner gestures, and repository-wide
   formatting cleanup.
 
+- [x] Optimization pass (2026-08-22) — five perf/feature items, branch
+  `perf/optimization-pass`. **Delta re-attach backlog**: every re-attach
+  replayed the full ≤2 MiB ring into a terminal that already had it; clients
+  now present an `(epoch, offset)` watermark on `Attach`
+  (`Ring::epoch` per-ring, time/pid-seeded so daemon restarts never match;
+  `Ring::since` serves the missing suffix only while fully retained;
+  `PtySession::subscribe_from` under the same ring→subs lock discipline).
+  Wire: `Attach.resume` whose KEY PRESENCE opts in — only those clients get
+  the new `AttachBacklog{name, epoch, end_offset, full}` ack, written by the
+  read thread BEFORE the forwarder spawns so it strictly precedes the one
+  replay `Data` frame; legacy strict decoders (`amber attach`, amber web)
+  never see it. Epochs ride JSON as STRINGS (nanos u64 > JS 2^53; a rounded
+  epoch would fail equality every reconnect and silently kill the feature).
+  App router: `reattachAll` sends tracked watermarks (surviving terminals →
+  delta), fresh mounts send `{epoch:'0'}` (full + ack establishes the
+  watermark); ack'd `full` keeps the renderer reset tag, `delta` appends
+  untagged, a Data frame in the awaiting window = old-daemon legacy replay.
+  Daemon restart can NEVER delta (new epochs by design) — that is correct:
+  growth came from same-terminal re-attach, which deltas now. Integration:
+  `crates/amber/tests/resume_attach.rs`. **Parallel boot restore**:
+  `restore()` split serial-prepare (slot repair/normalize/cgroup leaves) →
+  scoped-thread spawn pool capped min(panes, cores, 8) → serial commit with
+  identical deferred/cleanup/crash-report semantics; 6 sessions visible
+  648 ms after start (live). **Stat-keyed metadata cache**
+  (`amber-core::state::FileCache`, (mtime,len)-keyed): session_infos' N+1
+  open/read/parse per control gesture and the mosaic's 1 s poll now cost one
+  stat per file; corrupt-file tolerance preserved; adds
+  `StateStore::remove_claude`. **Guardian /proc walk retired under
+  containment**: MemoryStat telemetry derives from the cgroup leaf sample
+  already taken for pressure (~450 ms of smaps_rollup reads per walk gone);
+  pane MB labels now mean cgroup charge (`systemd-cgtop` semantics); macOS /
+  non-delegated keep the walk. **Memory budgets are live-adjustable**
+  (answers "the 8 GiB": a hand-written MemoryHigh drop-in over the unit's
+  50% default, which caps both the guardian budget and per-session highs):
+  `SetMemoryBudget{mb}/GetMemoryBudget → BudgetApplied`; manager owns the
+  guardian's budget as an Arc<AtomicU64> read every tick; a set persists
+  config, re-derives against the LIVE cap, moves existing session leaves'
+  memory.high IN PLACE (`CgroupManager::rewrite_session_high`;
+  session_high_bytes now an atomic with an unset sentinel + manual Clone),
+  no restart. CLI `amber ctl budget [SIZE|auto] [--systemd]` (--systemd
+  pushes amber.service MemoryHigh via systemctl --user set-property BEFORE
+  the daemon re-derives so raising past the old cap lands; old-daemon silence
+  surfaces a restart hint). App ⚖ dialog over the same messages (shared/
+  budget.ts parsing TDD'd; web build gets visible-throw stubs).
+  **Lazy editor chunk**: SplitView React.lazy's Editor — CodeMirror+marked
+  (1,164 KB) out of the main bundle: 2,156 → 990 KB; source maps verified
+  already absent. Gates: Rust 514 ×2 + clippy clean, app 491 tests +
+  typecheck + electron/web builds green. **Live-verified** on an isolated
+  private daemon + private GUI (xvfb+CDP): ctl budget view/set/auto round-
+  trips config.toml and survives restart; restore of 6 sessions all present;
+  utilityProcess kill -9 inside the snapshot window → reconnect with markers
+  intact (2→2, no dup, no wipe); budget dialog set/auto updates config.
+  **A running daemon must be restarted to gain Attach.resume /
+  AttachBacklog / SetMemoryBudget.** Still open: `amber web` has no budget
+  surface; delta replay for `amber attach` raw clients deliberately absent.
 - [x] Remote-access control plane (2026-08-22, Phase A) — the desktop IDE can
   now run, host and share the browser build without a hand-run CLI. Spec:
   `docs/superpowers/specs/2026-08-22-mobile-web-experience-design.md` §9 (Phase
@@ -1063,10 +1118,15 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   at the desk. Panes gained a `fitMode`: a tile SCALES its pixels with a CSS
   transform and leaves the grid alone; only a zoomed pane reflows. Two further
   paths were resizing regardless (the font-size effect, which fires on the
-  phone's 13→14 px flip, and the reconnect nudge) and now respect it. **Not
-  verified:** any real device on either platform — so §3's soft-keyboard rule
-  (opening the keyboard must never re-fit the pty) is untested, since
-  `visualViewport` does not move under emulation — plus long-press arming,
+  phone's 13→14 px flip, and the reconnect nudge) and now respect it. §3's soft-keyboard rule is implemented
+  (`keyboardViewport.ts` + `Pane.tsx`): a `visualViewport` shrink that
+  `innerHeight` does not match is the keyboard, and the pane pins its rows and
+  scrolls the cursor above it instead of re-fitting — an orientation change,
+  which moves BOTH heights, still re-fits. Unit-tested both ways. Browser
+  pinch-zoom is left ENABLED: an earlier draft set `user-scalable=no` to make
+  room for app-owned pinch that was never built, which would have left a phone
+  unable to zoom at all. **Not verified:** any real device on either platform —
+  so the soft-keyboard path has never actually run — plus long-press arming,
   real-finger touch scrolling, clipboard gestures, and PWA install.
 
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees

@@ -15,26 +15,64 @@ interface ConnLike {
 // Renderer -> utility messages over a pane port.
 type Outbound = { data: Uint8Array } | { resize: { cols: number; rows: number } }
 
+/** The client's delta-replay watermark: ring epoch + absolute byte position. */
+export interface Watermark {
+  epoch: string
+  offset: number
+}
+
+/**
+ * What replay we expect next for a session. `awaiting-ack` covers the window
+ * between sending Attach and the daemon's AttachBacklog announcement; if a
+ * Data frame lands in that window the peer is an OLD daemon that never
+ * announces — that frame is then the untagged legacy full replay.
+ */
+type PendingReplay = 'awaiting-ack' | 'full' | 'delta'
+
 export class Router {
   private readonly ports = new Map<string, PortLike>()
-  // Sessions whose next Data frame is an Attach backlog replay.
-  //
-  // The daemon replays the whole scrollback as ONE Data frame, before any live
-  // output, in response to Attach — so "the first Data frame after an Attach"
-  // identifies the replay exactly. The renderer needs that fact (a re-attach
-  // replays history the terminal already shows, so it must clear first) and
-  // cannot derive it: guessing "the next message after a reconnect" races the
-  // frame itself, and getting it wrong wipes a live pane. We send the Attach, so
-  // we are the one place that knows for certain.
-  private readonly awaitingBacklog = new Set<string>()
+  // Per-session delta-replay watermarks, set by every AttachBacklog ack.
+  // Consulted ONLY by reattachAll() — whose terminals are ALIVE and already
+  // hold their history, so they want just the missing tail. A fresh mount
+  // (attach()) sends `{epoch:'0'}` instead: its new xterm is empty and must
+  // take the full replay anyway, but the opt-in key still buys the ack that
+  // establishes this watermark for the next reconnect. Entries for closed
+  // panes linger (names are never reused) but are two small values — bounded
+  // by panes-ever-opened per utilityProcess, no ports pinned.
+  private readonly watermarks = new Map<string, Watermark>()
+  private readonly pendingReplay = new Map<string, PendingReplay>()
 
   constructor(private readonly conn: ConnLike) {
     this.conn.on('frame', (f) => {
+      if (f.type === 'control' && f.msg.kind === 'AttachBacklog') {
+        const { name, epoch, end_offset, full } = f.msg
+        this.watermarks.set(name, { epoch, offset: end_offset })
+        this.pendingReplay.set(name, full ? 'full' : 'delta')
+        return
+      }
       if (f.type === 'data') {
         const port = this.ports.get(f.session)
-        if (!port) return
-        const backlog = this.awaitingBacklog.delete(f.session)
-        port.postMessage(backlog ? { data: f.bytes, backlog: true } : { data: f.bytes })
+        const pending = this.pendingReplay.get(f.session)
+        if (pending !== undefined) {
+          this.pendingReplay.delete(f.session)
+          if (pending === 'awaiting-ack') {
+            // Old daemon: no announcement exists on its wire, so this Data IS
+            // the legacy replay. Tag it so the renderer resets — and drop any
+            // watermark, which nothing on that wire maintains.
+            this.watermarks.delete(f.session)
+            port?.postMessage({ data: f.bytes, backlog: true })
+            return
+          }
+          // Ack'd replay: 'full' resets the terminal first; 'delta' appends to
+          // what the surviving terminal already shows. The replay bytes are
+          // covered by the ack's end_offset — not re-counted below.
+          port?.postMessage(pending === 'full' ? { data: f.bytes, backlog: true } : { data: f.bytes })
+          return
+        }
+        // Live output after the replay.
+        port?.postMessage({ data: f.bytes })
+        const wm = this.watermarks.get(f.session)
+        if (wm) wm.offset += f.bytes.length
       }
     })
   }
@@ -59,13 +97,22 @@ export class Router {
   }
 
   reattachAll(): void {
-    for (const session of this.ports.keys()) this.sendAttach(session)
+    for (const [session] of this.ports) this.sendAttach(session)
   }
 
-  /** Attach, and arm the backlog tag for the reply that follows. */
+  /**
+   * Attach with this session's delta credentials: a tracked watermark when we
+   * have one (reconnect path), else `{epoch:'0'}` — "new-style client, no
+   * watermark yet" — which still opts the connection into the AttachBacklog
+   * ack. Arms which reply shape we expect.
+   */
   private sendAttach(session: string): void {
-    this.awaitingBacklog.add(session)
-    this.conn.send({ type: 'control', msg: { kind: 'Attach', name: session } })
+    const watermark = this.watermarks.get(session)
+    this.pendingReplay.set(session, 'awaiting-ack')
+    this.conn.send({
+      type: 'control',
+      msg: { kind: 'Attach', name: session, resume: watermark ?? { epoch: '0', offset: 0 } },
+    })
   }
 
   /**
@@ -74,7 +121,7 @@ export class Router {
    *
    * This had no callers, which cost three ways in a process designed to outlive
    * every pane: the map grew unboundedly (session names are minted fresh and
-   * never reused), each entry pinned a live MessagePortMain, and
+   * never reused), each entry pinned a live `MessagePortMain`, and
    * `reattachAll()` re-`Attach`ed long-dead names on every reconnect — each one
    * drawing a daemon `Error: no such session` into the app's red error banner.
    * It also left the daemon streaming a closed pane's output into nothing.
@@ -84,7 +131,7 @@ export class Router {
     if (!port) return // unknown/already detached: no port to close, nothing to tell the daemon
     port.close()
     this.ports.delete(session)
-    this.awaitingBacklog.delete(session)
+    this.pendingReplay.delete(session)
     this.conn.send({ type: 'control', msg: { kind: 'Detach', name: session } })
   }
 

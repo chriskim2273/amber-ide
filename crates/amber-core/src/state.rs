@@ -11,9 +11,11 @@
 //! final file, then `fs::rename` over it. Missing/partial files are tolerated
 //! at restore (see [`StateStore::list_sessions`], [`StateStore::read_session`]).
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
@@ -164,11 +166,78 @@ impl Default for Config {
 /// Filesystem-backed state store rooted at a directory.
 pub struct StateStore {
     root: PathBuf,
+    /// Stat-keyed parse caches for the small per-session metadata JSON files.
+    /// `session_infos()` reads every one of them on every control gesture, and
+    /// the web mosaic re-reads them once a second; a stat (one syscall) then
+    /// replaces an open+read+parse per file per call. See [`FileCache`].
+    session_cache: FileCache<SessionMeta>,
+    claude_cache: FileCache<ClaudeMeta>,
+}
+
+/// Stat-keyed parse cache for small metadata files that are read far more
+/// often than they are written.
+///
+/// A hit is one `stat` (mtime + len match) returning the previously parsed
+/// value; anything else — created, rewritten, deleted, recreated — falls
+/// through to `load`, whose result is cached under the stat observed BEFORE
+/// the load. That ordering is deliberately conservative: if the file changes
+/// between the stat and the load, the stale stamp guarantees the NEXT call
+/// re-reads (one wasted read, never a wrong value served twice).
+///
+/// Correctness does not depend on writers cooperating: every write path here
+/// is an atomic tmp+rename, so a changed file always has a new inode/mtime,
+/// and an externally deleted file fails its stat and is evicted.
+/// (mtime, len) stamp paired with the parsed value — the cache key + payload.
+type CacheEntry<T> = (Option<std::time::SystemTime>, u64, T);
+
+struct FileCache<T> {
+    entries: Mutex<HashMap<PathBuf, CacheEntry<T>>>,
+}
+
+impl<T: Clone> FileCache<T> {
+    fn new() -> Self {
+        FileCache { entries: Mutex::new(HashMap::new()) }
+    }
+    /// Return the parsed contents of `path`, re-running `load` only when the
+    /// file's (mtime, len) no longer matches the cached entry. `load` mirrors
+    /// [`StateStore::read_json`]: `Ok(None)` for a missing file.
+    fn get<F>(&self, path: &Path, load: F) -> anyhow::Result<Option<T>>
+    where
+        F: FnOnce(&Path) -> anyhow::Result<Option<T>>,
+    {
+        let stamp = fs::metadata(path).ok().map(|m| (m.modified().ok(), m.len()));
+        if let Some((Some(mtime), len)) = &stamp {
+            if let Some((cached_mtime, cached_len, value)) =
+                self.entries.lock().unwrap().get(path)
+            {
+                if *cached_mtime == Some(*mtime) && *cached_len == *len {
+                    return Ok(Some(value.clone()));
+                }
+            }
+        }
+        let loaded = load(path)?;
+        let mut entries = self.entries.lock().unwrap();
+        match (&stamp, &loaded) {
+            (Some((Some(mtime), len)), Some(value)) => {
+                entries.insert(path.to_path_buf(), (Some(*mtime), *len, value.clone()));
+            }
+            _ => {
+                // Deleted/unstattable, or nothing to remember: drop any stale
+                // entry so it cannot outlive its file.
+                entries.remove(path);
+            }
+        }
+        Ok(loaded)
+    }
 }
 
 impl StateStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        StateStore { root: root.into() }
+        StateStore {
+            root: root.into(),
+            session_cache: FileCache::new(),
+            claude_cache: FileCache::new(),
+        }
     }
 
     fn sessions_dir(&self) -> PathBuf {
@@ -276,7 +345,7 @@ impl StateStore {
     }
 
     pub fn read_session(&self, name: &str) -> anyhow::Result<Option<SessionMeta>> {
-        Self::read_json(&self.session_path(name))
+        self.session_cache.get(&self.session_path(name), Self::read_json)
     }
 
     pub fn list_sessions(&self) -> anyhow::Result<Vec<SessionMeta>> {
@@ -297,10 +366,11 @@ impl StateStore {
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            if let Ok(bytes) = fs::read(&path) {
-                if let Ok(meta) = serde_json::from_slice::<SessionMeta>(&bytes) {
-                    sessions.push(meta);
-                }
+            // Tolerate a corrupt/unreadable file exactly like the original
+            // inline read did: skip it, never fail the whole listing (a single
+            // bad JSON must not abort daemon start).
+            if let Ok(Some(meta)) = self.session_cache.get(&path, Self::read_json) {
+                sessions.push(meta);
             }
         }
         Ok(sessions)
@@ -595,7 +665,13 @@ impl StateStore {
     }
 
     pub fn read_claude(&self, name: &str) -> anyhow::Result<Option<ClaudeMeta>> {
-        Self::read_json(&self.claude_path(name))
+        self.claude_cache.get(&self.claude_path(name), Self::read_json)
+    }
+
+    /// Remove a session's recorded agent id, if any. Missing file is not an
+    /// error (mirrors `remove_if_exists` discipline of the other removers).
+    pub fn remove_claude(&self, name: &str) -> anyhow::Result<()> {
+        Self::remove_if_exists(&self.claude_path(name))
     }
 
     pub fn load_config(&self) -> anyhow::Result<Config> {
@@ -630,6 +706,152 @@ mod tests {
             slot: 1,
         }
     }
+
+    #[test]
+    fn file_cache_loads_once_until_the_file_changes() {
+        // The whole point: a stat match must NOT re-run the loader (the
+        // open+read+parse this cache exists to skip), and any real change —
+        // content rewrite, deletion, recreation — must be seen on the next get.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("meta.json");
+        fs::write(&path, b"one").unwrap();
+        let cache: FileCache<Vec<u8>> = FileCache::new();
+        let loads = std::cell::Cell::new(0u32);
+        let load = |p: &Path| {
+            loads.set(loads.get() + 1);
+            Ok(fs::read(p).ok())
+        };
+
+        assert_eq!(cache.get(&path, load).unwrap(), Some(b"one".to_vec()));
+        assert_eq!(cache.get(&path, load).unwrap(), Some(b"one".to_vec()));
+        assert_eq!(loads.get(), 1, "second get re-ran the loader");
+
+        // Rewrite with a DIFFERENT size (deterministic stat change; a same-size
+        // same-mtime write is not distinguishable by stat alone and does not
+        // need to be — every writer here goes through atomic rename).
+        fs::write(&path, b"three-bytes-longer").unwrap();
+        assert_eq!(
+            cache.get(&path, load).unwrap(),
+            Some(b"three-bytes-longer".to_vec())
+        );
+        assert_eq!(loads.get(), 2);
+
+        fs::remove_file(&path).unwrap();
+        assert_eq!(cache.get(&path, load).unwrap(), None);
+        assert_eq!(loads.get(), 3);
+
+        fs::write(&path, b"reborn").unwrap();
+        assert_eq!(cache.get(&path, load).unwrap(), Some(b"reborn".to_vec()));
+        assert_eq!(loads.get(), 4);
+    }
+
+    #[test]
+    fn file_cache_is_shareable_across_threads() {
+        // session_infos runs on connection threads while the snapshot timer
+        // runs in its own thread — the cache must tolerate that sharing.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("x.json");
+        fs::write(&path, b"data").unwrap();
+        let cache: FileCache<String> = FileCache::new();
+        let cache = std::sync::Arc::new(cache);
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let cache = Arc::clone(&cache);
+            let path = path.clone();
+            handles.push(std::thread::spawn(move || {
+                cache
+                    .get(&path, |p| Ok(fs::read_to_string(p).ok()))
+                    .unwrap()
+                    .unwrap()
+            }));
+        }
+        for h in handles {
+            assert_eq!(h.join().unwrap(), "data");
+        }
+    }
+
+    #[test]
+    fn list_sessions_reflects_rewrites_and_removals_without_stale_entries() {
+        // The cache must never resurrect a removed session or serve a stale
+        // rewrite — session_infos() feeds the app's grouping on every control
+        // gesture and the web mosaic's 1 s poll.
+        let dir = tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        let mut a = sample_session("amber-1-1-0-a");
+        a.slot = 1;
+        store.write_session(&a).unwrap();
+        let mut b = sample_session("amber-1-1-1-b");
+        b.slot = 2;
+        store.write_session(&b).unwrap();
+
+        let names = || -> Vec<String> {
+            let mut v: Vec<String> =
+                store.list_sessions().unwrap().into_iter().map(|m| m.name).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(names(), vec!["amber-1-1-0-a", "amber-1-1-1-b"]);
+
+        a.updated += 5;
+        store.write_session(&a).unwrap();
+        let listed = store
+            .list_sessions()
+            .unwrap()
+            .into_iter()
+            .find(|m| m.name == a.name)
+            .unwrap();
+        assert_eq!(listed.updated, a.updated, "stale rewrite served");
+
+        store.remove_session("amber-1-1-1-b").unwrap();
+        assert_eq!(names(), vec!["amber-1-1-0-a"], "removed session resurrected");
+
+        store.write_session(&b).unwrap();
+        assert_eq!(names(), vec!["amber-1-1-0-a", "amber-1-1-1-b"]);
+    }
+
+    #[test]
+    fn read_claude_sees_hook_rewrites_and_deletions() {
+        // The SessionStart hook rewrites claude/<name>.json while the daemon
+        // runs; a cached read that missed the rewrite would offer a stale
+        // `--resume` id (and memory_candidates would misjudge parkability).
+        let dir = tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        let mk = |id: &str| ClaudeMeta {
+            session_id: id.to_string(),
+            cwd: PathBuf::from("/tmp"),
+            updated: 1,
+        };
+        store.write_claude("s", &mk("id-one")).unwrap();
+        assert_eq!(store.read_claude("s").unwrap().unwrap().session_id, "id-one");
+        assert_eq!(store.read_claude("s").unwrap().unwrap().session_id, "id-one");
+
+        store.write_claude("s", &mk("id-two")).unwrap();
+        assert_eq!(store.read_claude("s").unwrap().unwrap().session_id, "id-two");
+
+        store.remove_claude("s").unwrap();
+        assert_eq!(store.read_claude("s").unwrap(), None);
+    }
+
+    #[test]
+    fn budget_kb_explicit_setting_overrides_the_physical_half() {
+        // Auto (None): half of physical. Explicit: the setting itself — both
+        // still capped by the OS cgroup limit, floored at 512 MiB. This pins
+        // the semantics `amber ctl budget` relies on before any wiring exists.
+        let cfg = MemoryConfig::default(); // budget_mb: None
+        assert_eq!(cfg.budget_kb(Some(8_388_608), None), Some(4_194_304));
+
+        let explicit = MemoryConfig { budget_mb: Some(20_480), ..MemoryConfig::default() };
+        assert_eq!(explicit.budget_kb(Some(8_388_608), None), Some(20_971_520));
+        // Capped by the service MemoryHigh when the explicit ask exceeds it.
+        assert_eq!(
+            explicit.budget_kb(Some(8_388_608), Some(8_388_608)),
+            Some(8_388_608)
+        );
+        // Floor holds even for a tiny explicit value.
+        let tiny = MemoryConfig { budget_mb: Some(1), ..MemoryConfig::default() };
+        assert_eq!(tiny.budget_kb(None, None), Some(512 * 1024));
+    }
+
 
     #[test]
     fn session_round_trip() {

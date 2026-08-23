@@ -24,6 +24,7 @@ import {
 } from '../shared/workspaceFile'
 import { collectDumps, matchDumpError } from './dumps'
 import { stageReplay } from './replay'
+import { formatKb, parseBudgetInput, type BudgetView } from '../shared/budget'
 import { appChord, chordLabel, modLabel, CHORD_TABLE } from './keys'
 import './theme.css'
 
@@ -41,6 +42,10 @@ declare global {
       resumeSession: (name: string) => void
       focusSession: (name: string) => void
       dumpBacklog: (name: string) => void
+      // Memory budget view/change; the BudgetApplied reply arrives via
+      // onDaemonEvent. mb is MiB, 0 = auto.
+      getMemoryBudget: () => void
+      setMemoryBudget: (mb: number) => void
       // CAS (spec 2026-08-01 §6): `saveLayout` must be given the version
       // `loadLayout`/the previous `saveLayout` returned, so a concurrent
       // writer (the browser, or another desktop instance) is detected rather
@@ -184,6 +189,13 @@ function App(): JSX.Element {
   const [sessionsOpen, setSessionsOpen] = useState(false)
   const [claudeNames, setClaudeNames] = useState<Record<string, string>>({})
   const [picked, setPicked] = useState<Set<string>>(new Set())
+  // Memory-budget dialog: the daemon's last BudgetApplied truth, the raw text
+  // in the input, and a local parse error. The daemon owns the truth; this is
+  // only a form over SetMemoryBudget/GetMemoryBudget.
+  const [budgetOpen, setBudgetOpen] = useState(false)
+  const [budget, setBudget] = useState<BudgetView | null>(null)
+  const [budgetInput, setBudgetInput] = useState('')
+  const [budgetError, setBudgetError] = useState<string | null>(null)
   // A load in flight: created sessions not yet all confirmed by the daemon. The
   // sidecar (trees/labels/frozen) + scrollback replay commit ONCE the daemon
   // confirms every created session AND (replace mode) the killed old panes are
@@ -323,6 +335,18 @@ function App(): JSX.Element {
       if (bf?.type === 'control' && bf.msg?.kind === 'Backlog' && typeof bf.msg.name === 'string') {
         const cb = dumpResolvers.current.get(bf.msg.name)
         if (cb) { dumpResolvers.current.delete(bf.msg.name); cb(bf.msg.data ?? new Uint8Array()) }
+        return
+      }
+      // Budget replies feed the memory dialog directly (local state — not
+      // store truth; the daemon remains the only authority).
+      if (bf?.type === 'control' && bf.msg?.kind === 'BudgetApplied') {
+        const m = bf.msg as ControlMsg & { kind: 'BudgetApplied' }
+        setBudget({
+          configuredMb: m.mb > 0 ? m.mb : null,
+          effectiveKb: m.effective_budget_kb,
+          cgroupLimitKb: m.cgroup_limit_kb,
+          sessionHighKb: m.session_high_kb,
+        })
         return
       }
       // A pane that died mid-save makes its in-flight DumpBacklog reply come back
@@ -727,17 +751,23 @@ function App(): JSX.Element {
     return () => window.removeEventListener('keydown', h)
   }, [showHelp])
 
-  // Esc dismisses the save-scope / load-mode dialogs.
+  // Esc dismisses the save-scope / load-mode / budget dialogs.
   useEffect(() => {
-    if (!saveScopeOpen && !loadDoc && !closeAsk && !killAsk && !sessionsOpen) return
+    if (!saveScopeOpen && !loadDoc && !closeAsk && !killAsk && !sessionsOpen && !budgetOpen) return
     const h = (e: KeyboardEvent): void => {
       if (e.key !== 'Escape') return
       setSaveScopeOpen(false); setLoadDoc(null); setCloseAsk(null)
-      setKillAsk(null); setSessionsOpen(false)
+      setKillAsk(null); setSessionsOpen(false); setBudgetOpen(false)
     }
     window.addEventListener('keydown', h)
     return () => window.removeEventListener('keydown', h)
-  }, [saveScopeOpen, loadDoc, closeAsk, killAsk, sessionsOpen])
+  }, [saveScopeOpen, loadDoc, closeAsk, killAsk, sessionsOpen, budgetOpen])
+
+  // Opening the budget dialog fetches the daemon's live truth; the reply (and
+  // every later one) lands here and refreshes the dialog in place.
+  useEffect(() => {
+    if (budgetOpen) window.amber.getMemoryBudget()
+  }, [budgetOpen])
 
   // Conversation labels for the cleanup dialog. Fetched when it opens (and on
   // the session list changing while it is open) rather than kept live: it is a
@@ -1175,6 +1205,8 @@ function App(): JSX.Element {
           onClick={() => void doLoad()}>📂</button>
         <button className="icon-btn ws-io" aria-label="manage daemon sessions" title="Sessions — see and kill every live amber session"
           onClick={() => setSessionsOpen(true)}>🧹</button>
+        <button className="icon-btn ws-io" aria-label="memory budget" title="Memory — view and set amber's aggregate budget"
+          onClick={() => { setBudgetError(null); setBudgetOpen(true) }}>⚖</button>
         <div className="divider" />
         <span className="label">new</span>
         <select className="select" value={kind} onChange={(e) => setKind(e.target.value as 'shell' | 'claude' | 'grok' | 'codex' | 'browser' | 'editor')}>
@@ -1486,6 +1518,74 @@ function App(): JSX.Element {
                   </button>
                   <button className="btn btn-ghost" onClick={() => setSessionsOpen(false)}>Close</button>
                 </div>
+              </div>
+            </div>
+          </div>
+        )
+      })()}
+      {budgetOpen && (() => {
+        const apply = (text: string): void => {
+          const req = parseBudgetInput(text)
+          if (req === null) { setBudgetError('use 20G / 1536M / a MiB count / auto'); return }
+          setBudgetError(null)
+          window.amber.setMemoryBudget(req.kind === 'auto' ? 0 : req.mb)
+          // The BudgetApplied reply refreshes `budget`; confirm out loud so a
+          // silent daemon is never mistaken for success.
+          setNotice(req.kind === 'auto' ? 'memory budget: auto' : `memory budget: ${req.mb} MiB`)
+        }
+        const clamped = budget !== null && budget.effectiveKb > 0 &&
+          budget.cgroupLimitKb > 0 && budget.effectiveKb === budget.cgroupLimitKb
+        return (
+          <div className="help-overlay" onClick={() => setBudgetOpen(false)}>
+            <div className="help-card dialog-card" role="dialog" aria-modal="true" aria-label="Memory budget"
+              onClick={(e) => e.stopPropagation()}>
+              <div className="help-head">
+                <span className="help-title">Memory</span>
+                <button className="icon-btn" aria-label="close" title="close" onClick={() => setBudgetOpen(false)}>✕</button>
+              </div>
+              <div className="dialog-body">
+                <p className="dialog-text">
+                  The aggregate soft ceiling amber's panes may occupy before the guardian starts
+                  parking agent panes to reclaim RAM. Changes save to config and take effect
+                  immediately — no restart.
+                </p>
+                {budget === null ? (
+                  <p className="dialog-text">asking the daemon…</p>
+                ) : (
+                  <ul className="session-list" style={{ listStyle: 'none', padding: 0 }}>
+                    <li className="session-row">
+                      <span className="session-main">
+                        <span className="session-name">
+                          configured: {budget.configuredMb === null ? 'auto' : `${budget.configuredMb} MiB`}
+                        </span>
+                        <span className="session-sub">
+                          effective {budget.effectiveKb > 0 ? formatKb(budget.effectiveKb) : 'none — parking disabled'}
+                          {' · '}per-pane {formatKb(budget.sessionHighKb)}
+                          {' · '}service cap {budget.cgroupLimitKb > 0 ? formatKb(budget.cgroupLimitKb) : 'none'}
+                        </span>
+                      </span>
+                    </li>
+                  </ul>
+                )}
+                {clamped && (
+                  <p className="dialog-text">
+                    Clamped by the service cap — raise that too with{' '}
+                    <code>amber ctl budget &lt;size&gt; --systemd</code>.
+                  </p>
+                )}
+                <div className="dialog-actions" style={{ gap: 8 }}>
+                  <input
+                    aria-label="new budget"
+                    placeholder="20G · 1536M · auto"
+                    value={budgetInput}
+                    onChange={(e) => { setBudgetInput(e.target.value); setBudgetError(null) }}
+                    onKeyDown={(e) => { if (e.key === 'Enter') apply(budgetInput) }}
+                  />
+                  <button className="btn btn-accent" onClick={() => apply(budgetInput)}>Set</button>
+                  <button className="btn btn-ghost" title="half of physical RAM"
+                    onClick={() => { setBudgetInput('auto'); apply('auto') }}>Auto</button>
+                </div>
+                {budgetError && <p className="dialog-text" style={{ color: 'crimson' }}>{budgetError}</p>}
               </div>
             </div>
           </div>
