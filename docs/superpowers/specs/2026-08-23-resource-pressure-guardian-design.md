@@ -203,6 +203,12 @@ ResourcePressure {
 }
 ```
 
+`WatchMemoryPressure { version: 2 }` advertises support for this new event.
+Version-1 watchers continue receiving only `MemoryPressure`; the daemon never
+sends `ResourcePressure` to a strict older client. The existing decoder's
+unknown-control skip remains a second compatibility boundary, not the primary
+negotiation mechanism.
+
 Transition events broadcast immediately. Unchanged state follows the existing
 bounded watcher refresh behavior.
 
