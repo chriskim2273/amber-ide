@@ -99,6 +99,8 @@ function toEvent(d: unknown): DaemonEvent | null {
 
 
 const DEFAULT_FONT_SIZE = 13
+/** Phone default — see `.reports/mobile-agent-cols.md`. */
+const MOBILE_FONT_SIZE = 14
 // Stable empty frozen map so `layout.frozen ?? EMPTY_FROZEN` doesn't mint a new
 // object every render (keeps SplitView's `frozen` prop referentially stable).
 const EMPTY_FROZEN: Record<string, { note?: string }> = {}
@@ -236,7 +238,13 @@ function App(): JSX.Element {
   const saveChainRef = useRef<Promise<void>>(Promise.resolve()) // serializes overlapping debounced saves
   // App-wide terminal font size lives in the layout sidecar (single source of
   // truth → auto-persists via the debounced save, no separate state to sync).
-  const fontSize = clampFont(layout.fontSize ?? DEFAULT_FONT_SIZE)
+  // Phone default: 14px ≈ 46 columns at 390 CSS px. Measured, not guessed —
+  // `.reports/mobile-agent-cols.md` renders claude/codex/grok through a real
+  // VT emulator at 40/46/54/80 and finds 40 the floor where all three still
+  // reflow correctly, so 46 leaves headroom while giving bigger glyphs than
+  // the desktop's 13px. FALLBACK ONLY: an explicit sidecar `fontSize` still
+  // wins, so pinch-to-resize and the desktop font chords keep working.
+  const fontSize = clampFont(layout.fontSize ?? (mobile ? MOBILE_FONT_SIZE : DEFAULT_FONT_SIZE))
   // Parked panes (display-only, keyed by session name). Kept referentially stable
   // when absent so SplitView's memo'd children don't churn.
   const frozen = layout.frozen ?? EMPTY_FROZEN
