@@ -3,10 +3,10 @@ import type { MenuItemConstructorOptions } from 'electron'
 import { ipcMain, dialog, clipboard } from 'electron'
 import { fileURLToPath } from 'node:url'
 import { basename, dirname, join, resolve as resolvePathJoin, isAbsolute } from 'node:path'
-import { homedir, release as osRelease } from 'node:os'
+import { homedir, release as osRelease, tmpdir } from 'node:os'
 import { spawn } from 'node:child_process'
-import { readFile, writeFile, rename, mkdir, copyFile, chmod, realpath, rm, stat } from 'node:fs/promises'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { readFile, writeFile, rename, mkdir, copyFile, chmod, realpath, rm, stat, mkdtemp } from 'node:fs/promises'
+import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
 import { resolveSocketPath } from '../shared/socketPath'
 import { pathCandidates } from '../shared/pathSel'
 import { ensureDaemon, probeSocket } from './daemonBoot'
@@ -44,6 +44,10 @@ import { loadLayoutFile, saveLayoutFile } from './layoutIO'
 import { compatSignature, shouldUseCompat, compatWorthyReason, COMPAT_SWITCHES, DETECT_WINDOW_MS } from './renderCompat'
 import { installBinary } from './installBinary'
 import { spawnOkWithStderr } from './spawnOk'
+import {
+  sshTunnelArgv, sshProbeArgv, isValidHost, localSocketPath, hostLabel,
+  REMOTE_SOCKET_PROBE, REMOTE_LAYOUT_PROBE,
+} from './sshRemote'
 import { webCtlArgv, parseWebStatus, redactUrl, type WebStatus } from './webService'
 import clientPath from '../client/index?modulePath'
 
@@ -365,6 +369,7 @@ function buildAppMenu(
   onQuitDaemon: () => void,
   onInstallDesktop: (() => void) | null,
   onRestartDaemon: () => void,
+  onConnectHost: () => void,
 ): Menu {
   const isMac = process.platform === 'darwin'
   const template: MenuItemConstructorOptions[] = []
@@ -378,6 +383,8 @@ function buildAppMenu(
           { type: 'separator' } as MenuItemConstructorOptions,
         ]
       : []),
+    { label: 'Connect to host…', accelerator: 'CmdOrCtrl+Shift+O', click: () => onConnectHost() },
+    { type: 'separator' } as MenuItemConstructorOptions,
     { label: 'Restart amber daemon', click: () => onRestartDaemon() },
     { label: 'Quit amber daemon', click: () => onQuitDaemon() },
   ]
@@ -387,16 +394,177 @@ function buildAppMenu(
   return Menu.buildFromTemplate(template)
 }
 
-async function main(): Promise<void> {
-  const socket = resolveSocketPath(process.env)
-  await ensureDaemon(socket, {
-    probe: probeSocket,
-    install: installDaemon,
-    delayMs: (a) => Math.min(2000, 100 * 2 ** a),
-    attempts: 8,
+/**
+ * One amber window and the client process that feeds it.
+ *
+ * A LOCAL window talks to this machine's daemon; a REMOTE one talks to a
+ * daemon on another machine through an ssh -L tunnel (spec 2026-08-23). The
+ * only difference is the socket path the client is forked with, which is why
+ * this needed no protocol change: `resolveSocketPath` honours AMBER_SOCKET.
+ */
+export interface WindowTarget {
+  kind: 'local' | 'remote'
+  /** `user@host`, remote only — window title and read-only marker. */
+  host?: string
+  /** Socket the client should connect to. Undefined = this machine's default. */
+  socket?: string
+}
+
+interface WindowCtx {
+  win: BrowserWindow
+  target: WindowTarget
+  controlPort: () => Electron.MessagePortMain | null
+  child: () => Electron.UtilityProcess | null
+}
+
+/** Per-window state, keyed by webContents id so IPC can route by sender. */
+const windowCtxs = new Map<number, WindowCtx>()
+
+/** The window an IPC message came from. */
+function ctxFor(e: { sender: Electron.WebContents }): WindowCtx | undefined {
+  return windowCtxs.get(e.sender.id)
+}
+
+/** A live ssh tunnel backing one remote window. */
+interface Tunnel {
+  proc: ReturnType<typeof spawn>
+  dir: string
+  socket: string
+}
+
+const tunnels = new Map<number, Tunnel>()
+
+/** Run a one-shot command on the remote and return its stdout (trimmed). */
+function sshProbe(host: string, script: string): Promise<{ out: string; err: string; code: number }> {
+  const a = sshProbeArgv(host, script)
+  return new Promise((resolveProbe) => {
+    const p = spawn(a.cmd, a.args, { stdio: ['ignore', 'pipe', 'pipe'] })
+    let out = ''
+    let err = ''
+    p.stdout?.on('data', (d: Buffer) => { out += d.toString() })
+    p.stderr?.on('data', (d: Buffer) => { err += d.toString() })
+    p.on('close', (code) => resolveProbe({ out: out.trim(), err: err.trim(), code: code ?? -1 }))
+    p.on('error', (e) => resolveProbe({ out: '', err: String(e), code: -1 }))
+  })
+}
+
+/**
+ * Open a window onto another machine's amber (spec 2026-08-23).
+ *
+ * Order matters: probe FIRST, so "no daemon over there" and "ssh refused you"
+ * are reported as themselves instead of surfacing later as a mysteriously dead
+ * window.
+ */
+async function openRemoteWindow(host: string): Promise<void> {
+  if (!isValidHost(host)) {
+    await dialog.showMessageBox({
+      type: 'error',
+      message: 'Invalid host',
+      detail: `"${host}" is not a valid ssh destination.`,
+    })
+    return
+  }
+
+  const probe = await sshProbe(host, REMOTE_SOCKET_PROBE)
+  if (probe.code !== 0) {
+    await dialog.showMessageBox({
+      type: 'error',
+      message: `Could not reach ${host}`,
+      // ssh's own message is far more useful than anything we could invent
+      // (permission denied, unknown host, name resolution).
+      detail: probe.err || `ssh exited ${probe.code}`,
+    })
+    return
+  }
+  if (probe.out.length === 0) {
+    await dialog.showMessageBox({
+      type: 'error',
+      message: `No amber daemon on ${host}`,
+      detail: 'Start one there first: `systemctl --user start amber` (or run `amber daemon`).',
+    })
+    return
+  }
+
+  // Private per-window directory: 0700 so no other local user can reach the
+  // tunnel, which carries full session control.
+  const dir = await mkdtemp(join(tmpdir(), 'amber-ssh-'))
+  await chmod(dir, 0o700)
+  const localSock = localSocketPath(dir)
+  const a = sshTunnelArgv(host, localSock, probe.out)
+  const proc = spawn(a.cmd, a.args, { stdio: ['ignore', 'pipe', 'pipe'] })
+  let tunnelErr = ''
+  proc.stderr?.on('data', (d: Buffer) => { tunnelErr += d.toString() })
+
+  // Wait for the socket to appear rather than guessing a delay: ssh creates it
+  // once the forward is established, and ExitOnForwardFailure means a failure
+  // kills the child instead of leaving us waiting forever.
+  const ready = await new Promise<boolean>((resolveReady) => {
+    let settled = false
+    const finish = (v: boolean): void => { if (!settled) { settled = true; resolveReady(v) } }
+    proc.on('exit', () => finish(false))
+    proc.on('error', () => finish(false))
+    const started = Date.now()
+    const poll = setInterval(() => {
+      if (existsSync(localSock)) { clearInterval(poll); finish(true) }
+      else if (Date.now() - started > 15000) { clearInterval(poll); finish(false) }
+    }, 100)
   })
 
+  if (!ready) {
+    try { proc.kill() } catch { /* already gone */ }
+    await rm(dir, { recursive: true, force: true })
+    await dialog.showMessageBox({
+      type: 'error',
+      message: `Could not forward ${host}'s amber socket`,
+      detail: tunnelErr || 'ssh exited before the forward was established.',
+    })
+    return
+  }
+
+  const ctx = await openWindow({ kind: 'remote', host, socket: localSock })
+  tunnels.set(ctx.win.webContents.id, { proc, dir, socket: localSock })
+  const id = ctx.win.webContents.id
+  ctx.win.on('closed', () => {
+    const t = tunnels.get(id)
+    if (!t) return
+    tunnels.delete(id)
+    // A leaked `ssh -N` outliving its window is the failure mode to avoid.
+    try { t.proc.kill() } catch { /* already gone */ }
+    void rm(t.dir, { recursive: true, force: true })
+  })
+}
+
+/**
+ * Ask for an ssh destination and open a window onto it.
+ *
+ * No host manager UI by design (spec §5): `~/.ssh/config` is the address book,
+ * so anything ssh accepts — an alias, `user@host`, a jump-host alias — works
+ * here without amber ever parsing ssh config or touching a credential.
+ */
+async function promptConnectHost(): Promise<void> {
+  const win = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0]
+  if (!win) return
+  const host = await win.webContents.executeJavaScript(
+    `window.prompt(${JSON.stringify('Connect to which host? (ssh destination, e.g. user@box)')}, '')`,
+  ) as string | null
+  if (host === null) return
+  const trimmed = host.trim()
+  if (trimmed.length === 0) return
+  await openRemoteWindow(trimmed)
+}
+
+/** Kill every tunnel. Called on quit so no `ssh -N` outlives the app. */
+function killTunnels(): void {
+  for (const [, t] of tunnels) {
+    try { t.proc.kill() } catch { /* already gone */ }
+    try { rmSync(t.dir, { recursive: true, force: true }) } catch { /* ignore */ }
+  }
+  tunnels.clear()
+}
+
+async function openWindow(target: WindowTarget): Promise<WindowCtx> {
   const win = new BrowserWindow({
+    title: target.kind === 'remote' ? `amber — ${hostLabel(target.host ?? '')}` : 'amber',
     width: 1100,
     height: 720,
     // Floor the window at the chrome's own footprint plus a usable stage. The
@@ -420,6 +588,7 @@ async function main(): Promise<void> {
       // before exposeInMainWorld and the whole bridge silently vanishes.
       additionalArguments: [
         `--amber-home=${process.env['HOME'] ?? ''}`,
+        ...(target.kind === 'remote' ? [`--amber-remote=${target.host ?? ''}`] : []),
         ...(process.env['AMBER_SOFTWARE_GL'] ? ['--amber-software-gl'] : []),
       ],
     },
@@ -433,6 +602,7 @@ async function main(): Promise<void> {
       () => { void quitDaemonAndApp(win) },
       canInstallDesktop ? () => { void installDesktopShortcut(win) } : null,
       () => { void restartDaemon(win) },
+      () => { void promptConnectHost() },
     ),
   )
 
@@ -514,6 +684,7 @@ async function main(): Promise<void> {
   // window-all-closed, the red traffic-light left a headless Electron process
   // in the Dock that required Force Quit.
   app.on('before-quit', () => {
+    killTunnels()
     quitting = true
     try { controlPort?.close() } catch { /* already closed */ }
     controlPort = null
@@ -542,7 +713,16 @@ async function main(): Promise<void> {
   }
 
   const wireChild = (): void => {
-    const c = utilityProcess.fork(clientPath)
+    // The ONLY thing that makes a window remote: which socket its client
+    // opens. `resolveSocketPath` honours AMBER_SOCKET, and an ssh -L tunnel
+    // puts a remote daemon behind a local socket file (spec 2026-08-23 §2).
+    const c = utilityProcess.fork(
+      clientPath,
+      [],
+      target.socket !== undefined
+        ? { env: { ...process.env, AMBER_SOCKET: target.socket } }
+        : undefined,
+    )
     child = c
     const spawnedAt = Date.now()
     const { port1, port2 } = new MessageChannelMain()
@@ -572,15 +752,46 @@ async function main(): Promise<void> {
     })
   }
   wireChild()
+  wireChild()
 
-  ipcMain.on('daemon-command', (_e, cmd: unknown) => controlPort?.postMessage(cmd))
+  const ctx: WindowCtx = {
+    win,
+    target,
+    controlPort: () => controlPort,
+    child: () => child,
+  }
+  windowCtxs.set(win.webContents.id, ctx)
+  const id = win.webContents.id
+  win.on('closed', () => { windowCtxs.delete(id) })
+  return ctx
+}
 
-  ipcMain.on('open-pane', (_e, session: string) => {
-    const c = child
-    if (!c || win.isDestroyed()) return
+async function main(): Promise<void> {
+  const socket = resolveSocketPath(process.env)
+  await ensureDaemon(socket, {
+    probe: probeSocket,
+    install: installDaemon,
+    delayMs: (a) => Math.min(2000, 100 * 2 ** a),
+    attempts: 8,
+  })
+
+  const ctx = await openWindow({ kind: 'local' })
+  const win = ctx.win
+
+  // These three are the only per-WINDOW handlers: each window has its own
+  // client process (a remote window's talks through an ssh tunnel), so they
+  // route by sender rather than closing over one window's refs.
+  ipcMain.on('daemon-command', (e, cmd: unknown) => {
+    ctxFor(e)?.controlPort()?.postMessage(cmd)
+  })
+
+  ipcMain.on('open-pane', (e, session: string) => {
+    const c = ctxFor(e)
+    const proc = c?.child()
+    if (!c || !proc || c.win.isDestroyed()) return
     const { port1: rPort, port2: uPort } = new MessageChannelMain()
-    c.postMessage({ kind: 'pane', session }, [uPort])
-    win.webContents.postMessage('pane-port', { session }, [rPort])
+    proc.postMessage({ kind: 'pane', session }, [uPort])
+    c.win.webContents.postMessage('pane-port', { session }, [rPort])
   })
 
   // A Pane unmounted: tell the client to close that pane's port, forget the
@@ -588,8 +799,8 @@ async function main(): Promise<void> {
   // for the app's whole life (names are never reused), each entry pinning a live
   // MessagePortMain, and every reconnect re-Attached long-dead names — which the
   // daemon answers with an Error the app shows in its red banner.
-  ipcMain.on('close-pane', (_e, session: string) => {
-    child?.postMessage({ kind: 'pane-close', session })
+  ipcMain.on('close-pane', (e, session: string) => {
+    ctxFor(e)?.child()?.postMessage({ kind: 'pane-close', session })
   })
 
   // Resolve a terminal selection to an EXISTING absolute path so the pane's
@@ -697,9 +908,26 @@ async function main(): Promise<void> {
   // and `amber web`'s Rust side), so a plain read/write would let whichever
   // writes last silently discard the other's edit. `layoutIO.ts` does the
   // actual version check under the same call that does the atomic rename.
-  ipcMain.handle('layout-load', async () => loadLayoutFile(layoutPath()))
-  ipcMain.handle('layout-save', async (_e, text: string, version: string | null) =>
-    saveLayoutFile(layoutPath(), text, version))
+  // A REMOTE window mirrors the other machine's arrangement (spec 2026-08-23
+  // §2.4). Read-only, and enforced HERE rather than in the renderer: main owns
+  // the disk, so a bug in the UI can never write one machine's layout over
+  // another's — and the remote's own app is probably open on that desktop,
+  // holding the sidecar it expects to own.
+  ipcMain.handle('layout-load', async (e) => {
+    const ctx = ctxFor(e)
+    if (ctx?.target.kind === 'remote' && ctx.target.host !== undefined) {
+      const probe = await sshProbe(ctx.target.host, REMOTE_LAYOUT_PROBE)
+      // A missing or unreadable sidecar is not an error: grouping comes from
+      // session names (rule #2), so the window still shows the right panes at
+      // default geometry — the same fallback core rule #3 already requires.
+      return { text: probe.out.length > 0 ? probe.out : null, version: null }
+    }
+    return loadLayoutFile(layoutPath())
+  })
+  ipcMain.handle('layout-save', async (e, text: string, version: string | null) => {
+    if (ctxFor(e)?.target.kind === 'remote') return { ok: true, version: null }
+    return saveLayoutFile(layoutPath(), text, version)
+  })
 
   // Portable workspace file: native save dialog + atomic write (layout-save
   // precedent). Returns true on write, false on cancel.

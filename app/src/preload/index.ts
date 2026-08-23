@@ -6,6 +6,10 @@ import type { LoadLayoutResult, SaveLayoutResult } from '../shared/layoutFile'
 // (set in main's webPreferences), read here off `process.argv`.
 const argv = process.argv
 const homeArg = argv.find((a) => a.startsWith('--amber-home='))?.slice('--amber-home='.length)
+// Non-empty only in an SSH remote window (spec 2026-08-23): the renderer shows
+// a read-only marker and suppresses layout persistence chatter. The ENFORCEMENT
+// of read-only lives in main, which owns the disk — this is presentation.
+const remoteArg = argv.find((a) => a.startsWith('--amber-remote='))?.slice('--amber-remote='.length)
 
 contextBridge.exposeInMainWorld('amber', {
   // True when the app was launched with software GL (SwiftShader); the renderer
@@ -56,6 +60,8 @@ contextBridge.exposeInMainWorld('amber', {
   // menu, so the native copy role can't reach it).
   clipboardWrite: (text: string): void => ipcRenderer.send('clipboard-write', text),
   clipboardRead: (): Promise<string> => ipcRenderer.invoke('clipboard-read'),
+  /** `user@host` when this window mirrors a remote machine, else ''. */
+  remoteHost: remoteArg ?? '',
   // Remote access (spec 2026-08-22 §9). `webUrl` is on-demand ONLY: it returns
   // the tokenised login url, which must never ride the 3-second status poll.
   webStatus: (): Promise<unknown> => ipcRenderer.invoke('web:status'),

@@ -55,6 +55,8 @@ declare global {
       saveWorkspaceFile: (json: string, suggestedName: string) => Promise<boolean>
       openWorkspaceFile: () => Promise<string | null>
       homeDir: string
+      /** `user@host` when this window mirrors a remote machine's amber. */
+      remoteHost?: string
       pickFolder: () => Promise<string | null>
       resolvePath: (cwd: string, raw: string) => Promise<string | null>
       revealPath: (abs: string) => void
@@ -168,6 +170,10 @@ function App(): JSX.Element {
   // 390px, so they collapse into one bar plus this drawer.
   const mobile = useMobile()
   const [drawerOpen, setDrawerOpen] = useState(false)
+  // SSH remote window (spec 2026-08-23): this window mirrors another machine's
+  // arrangement and never writes its sidecar. Read once — a window is local or
+  // remote for its whole life.
+  const [remoteHost] = useState<string>(() => window.amber?.remoteHost ?? '')
   const [connected, setConnected] = useState(true)
   const [showHelp, setShowHelp] = useState(false)
   // Workspace save/load UI. `saveScopeOpen` shows the one-vs-all scope dialog;
