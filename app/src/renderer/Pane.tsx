@@ -36,6 +36,22 @@ export interface SearchApi {
  * `SplitView` chrome, outside this component, and must reach the SAME port
  * `term.onData` writes to — never a second transport.
  */
+/**
+ * How a pane reacts to its container's size.
+ *
+ * `'fit'` — reflow the pty to the container (every desktop pane, and a phone
+ * pane the user has zoomed to full screen).
+ *
+ * `'scale'` — keep the pty's current grid and CSS-scale the rendered terminal
+ * into the container. This exists because a pty's winsize is SHARED with the
+ * desktop and every other client: an unzoomed mosaic tile on a 390px phone is
+ * ~180px wide, and fitting it reflowed a real session to **13 columns** —
+ * measured, not hypothetical — which wrecks an agent TUI for whoever is
+ * sitting at the desk. A tile is for looking at; only a zoomed pane earns the
+ * right to reflow (spec §2.4).
+ */
+export type FitMode = 'fit' | 'scale'
+
 export interface InputApi {
   send(data: string): void
   /** Application cursor-key mode: decides SS3 vs CSI arrows. */
@@ -101,8 +117,8 @@ const MOUSE_RESET = '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l'
 // (honors "xterm instances live outside React reconciliation").
 // Focus is tracked by SplitView via `focusin` on the wrapper; nothing here.
 export const Pane = memo(function Pane(
-  { session, epoch, portEpoch, activateSeq, fontSize, cwd, onTitle, onSearchReady, onInputReady }:
-    { session: string; epoch: number; portEpoch: number; activateSeq: number; fontSize: number; cwd: string; onTitle?: (title: string) => void; onSearchReady?: (api: SearchApi) => void; onInputReady?: (api: InputApi) => void },
+  { session, epoch, portEpoch, activateSeq, fontSize, cwd, onTitle, onSearchReady, onInputReady, fitMode = 'fit' }:
+    { session: string; epoch: number; portEpoch: number; activateSeq: number; fontSize: number; cwd: string; onTitle?: (title: string) => void; onSearchReady?: (api: SearchApi) => void; onInputReady?: (api: InputApi) => void; fitMode?: FitMode },
 ): JSX.Element {
   const containerRef = useRef<HTMLDivElement>(null)
   const hostRef = useRef<HTMLDivElement>(null)
@@ -130,6 +146,8 @@ export const Pane = memo(function Pane(
   onSearchReadyRef.current = onSearchReady
   const onInputReadyRef = useRef(onInputReady)
   onInputReadyRef.current = onInputReady
+  const fitModeRef = useRef(fitMode)
+  fitModeRef.current = fitMode
   // True once this Pane has consumed one Attach backlog. A LATER backlog is a
   // RE-attach replay of history the terminal already shows, so it must clear
   // first — see the `term.reset()` in the port handler. Deliberately not armed
@@ -235,12 +253,41 @@ export const Pane = memo(function Pane(
       return true
     })
 
+    /**
+     * Scale mode: fit the terminal's RENDERED pixels into the host with a CSS
+     * transform, leaving the pty's grid alone. Measured cause for this
+     * existing: an unzoomed mosaic tile on a 390px phone is ~180px wide, and
+     * fitting it reflowed a live session to 13 columns — and a pty's winsize
+     * is shared with the desktop, so that lands on whoever is at the desk.
+     */
+    const applyScale = (): void => {
+      const el = term.element
+      if (!el) return
+      if (fitModeRef.current !== 'scale') {
+        el.style.transform = ''
+        el.style.transformOrigin = ''
+        el.style.width = ''
+        return
+      }
+      const w = el.scrollWidth
+      const h = el.scrollHeight
+      if (w === 0 || h === 0 || host.clientWidth === 0 || host.clientHeight === 0) return
+      const k = Math.min(host.clientWidth / w, host.clientHeight / h, 1)
+      el.style.transformOrigin = 'top left'
+      el.style.transform = `scale(${k})`
+    }
+
     const sendResize = (): void => {
       // A collapsed host (window crushed below the chrome's own height) makes
       // FitAddon clamp to its 2x1 floor; posting that would SIGWINCH every pty
       // to 1 row and make each program repaint its whole screen. The size is
       // not real — skip it and let the next non-degenerate fire carry the truth.
       if (host.clientWidth === 0 || host.clientHeight === 0) return
+      // Scale mode never touches the shared pty geometry.
+      if (fitModeRef.current === 'scale') {
+        applyScale()
+        return
+      }
       try { fit.fit() } catch { /* host has zero size mid-layout; ignore */ }
       port?.postMessage({ resize: { cols: term.cols, rows: term.rows } })
     }
@@ -503,6 +550,13 @@ export const Pane = memo(function Pane(
     const nudge = (): void => {
       const term = termRef.current, fit = fitRef.current, port = portRef.current
       if (!term || !port) return
+      // The mouse reset is always safe; the RE-FIT is not. In scale mode this
+      // pane is a tile whose pixels are CSS-scaled, and fitting it would
+      // reflow the shared pty to tile size on every reconnect.
+      if (fitModeRef.current === 'scale') {
+        term.write(MOUSE_RESET)
+        return
+      }
       try { fit?.fit() } catch { /* ignore */ }
       term.write(MOUSE_RESET)
       port.postMessage({ resize: { cols: term.cols, rows: term.rows } })
@@ -528,15 +582,53 @@ export const Pane = memo(function Pane(
   // [session] effect doesn't re-run, so the Terminal instance persists — we just
   // retune its options and refit (cell size changed → new cols/rows → SIGWINCH
   // the pty). Skips a degenerate 0-size host (see sendResize).
+  // Switching between tile (scale) and full-screen (fit) on a phone: entering
+  // `fit` reflows the pty to the phone — that is the borrow (spec §2.2);
+  // leaving it drops back to scaling and lets the server hand the grid back.
+  useEffect(() => {
+    const term = termRef.current
+    const el = term?.element
+    const host = hostRef.current
+    if (!term || !el || !host) return
+    if (fitMode === 'scale') {
+      const w = el.scrollWidth, h = el.scrollHeight
+      if (w > 0 && h > 0 && host.clientWidth > 0 && host.clientHeight > 0) {
+        el.style.transformOrigin = 'top left'
+        el.style.transform = `scale(${Math.min(host.clientWidth / w, host.clientHeight / h, 1)})`
+      }
+      return
+    }
+    el.style.transform = ''
+    el.style.transformOrigin = ''
+    if (host.clientWidth === 0 || host.clientHeight === 0) return
+    try { fitRef.current?.fit() } catch { /* mid-layout */ }
+    portRef.current?.postMessage({ resize: { cols: term.cols, rows: term.rows } })
+  }, [fitMode])
+
   useEffect(() => {
     const term = termRef.current
     if (!term || term.options.fontSize === fontSize) return
     term.options.fontSize = fontSize
     const host = hostRef.current
     if (host && (host.clientWidth === 0 || host.clientHeight === 0)) return
+    // Scale mode must not touch the SHARED pty geometry — measured: this
+    // effect fires on the phone's 13→14px default flip, and fitting an
+    // unzoomed ~180px tile reflowed a live session to a phone grid, exactly
+    // what `fitMode` exists to prevent. Rescale instead.
+    if (fitMode === 'scale') {
+      const el = term.element
+      if (el && host && host.clientWidth > 0 && host.clientHeight > 0) {
+        const w = el.scrollWidth, h = el.scrollHeight
+        if (w > 0 && h > 0) {
+          el.style.transformOrigin = 'top left'
+          el.style.transform = `scale(${Math.min(host.clientWidth / w, host.clientHeight / h, 1)})`
+        }
+      }
+      return
+    }
     try { fitRef.current?.fit() } catch { /* host has zero size mid-layout; ignore */ }
     portRef.current?.postMessage({ resize: { cols: term.cols, rows: term.rows } })
-  }, [fontSize])
+  }, [fontSize, fitMode])
 
   // Clamp the button inside the pane so it never spills past the right/bottom
   // edge (approx button box: 84×26). translate keeps a right-edge selection's

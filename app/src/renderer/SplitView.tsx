@@ -786,7 +786,10 @@ export function SplitView(props: {
                     active={props.active && !hidden} onNav={props.onBrowserNav} onTitle={props.onPaneTitle} />
                 : <Pane key={`${paneId}:${rebuild[paneId] ?? 0}`} session={paneId} epoch={props.epoch} portEpoch={props.portEpoch} activateSeq={activateSeq}
                     fontSize={props.fontSize} cwd={meta?.cwd ?? ''} onTitle={titleCbFor(paneId)} onSearchReady={searchReadyFor(paneId)}
-                    onInputReady={inputReadyFor(paneId)} />}
+                    onInputReady={inputReadyFor(paneId)}
+                    // A phone tile SCALES; only a zoomed pane reflows the
+                    // shared pty (spec §2.4). Desktop always fits.
+                    fitMode={mobile && props.zoomedPane !== paneId ? 'scale' : 'fit'} />}
               {!noTerm && findPane === paneId && !isFrozen && searchApis.current.get(paneId) &&
                 <FindBar api={searchApis.current.get(paneId)!} focusSeq={findSeq}
                   onClose={() => { setFindPane(null); focusPane(paneId) }} />}

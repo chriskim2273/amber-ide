@@ -55,3 +55,12 @@ Applied as a **fallback only**: an explicit `fontSize` in the layout sidecar
 still wins, so pinch-to-resize on the phone and the desktop's font chords both
 keep working and keep persisting. A user who has never set one gets 14px on a
 phone and 13px on the desktop.
+
+## Live check on a 390×844 phone viewport
+
+Chrome DevTools emulation (`390x844x3,mobile,touch`) against a private daemon +
+private `amber web`, 14px default:
+
+- terminal configured at **14px** (`.xterm-char-measure-element` reports it);
+- a zoomed pane reflowed its pty to **44×41** — above the 40-column floor this
+  report established, and the agent-visible grid a phone actually gets.
