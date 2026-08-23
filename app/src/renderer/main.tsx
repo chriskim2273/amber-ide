@@ -7,6 +7,8 @@ import type { ControlMsg } from '../shared/proto'
 import { sessionRows } from './sessionRows'
 import { deriveTab, shortCwd } from './tabView'
 import { RemoteAccess } from './RemoteAccess'
+import { Drawer } from './Drawer'
+import { useMobile } from './mobile'
 import type { WebStatus } from '../shared/webStatus'
 import { formatName, makeId, retargetPane } from '../shared/names'
 import { formatBrowserName, isBrowserName } from '../shared/browserName'
@@ -155,6 +157,10 @@ function App(): JSX.Element {
   // the tokenised url is fetched on demand by the dialog.
   const [webStatus, setWebStatus] = useState<WebStatus | null>(null)
   const [remoteOpen, setRemoteOpen] = useState(false)
+  // Phone chrome (spec §6): the workspace pill row and tab row do not fit at
+  // 390px, so they collapse into one bar plus this drawer.
+  const mobile = useMobile()
+  const [drawerOpen, setDrawerOpen] = useState(false)
   const [connected, setConnected] = useState(true)
   const [showHelp, setShowHelp] = useState(false)
   // Workspace save/load UI. `saveScopeOpen` shows the one-vs-all scope dialog;
@@ -446,6 +452,31 @@ function App(): JSX.Element {
     if (!(zoomKey in z)) return z
     const c = { ...z }; delete c[zoomKey]; return c
   })
+  // Zooming pushes a history entry so the platform BACK gesture un-zooms — the
+  // way a phone user expects to leave a full-screen view. Guarded so popping
+  // the last entry never navigates away from the app: we only ever push while
+  // zoomed, and only pop our own entry.
+  const zoomHistoryRef = useRef(false)
+  useEffect(() => {
+    if (zoomedPane !== null && !zoomHistoryRef.current) {
+      zoomHistoryRef.current = true
+      history.pushState({ amberZoom: true }, '')
+    } else if (zoomedPane === null && zoomHistoryRef.current) {
+      zoomHistoryRef.current = false
+    }
+  }, [zoomedPane])
+  useEffect(() => {
+    const onPop = (): void => {
+      if (zoomHistoryRef.current) {
+        zoomHistoryRef.current = false
+        clearZoom()
+      }
+    }
+    window.addEventListener('popstate', onPop)
+    return () => window.removeEventListener('popstate', onPop)
+    // `clearZoom` closes over the current zoomKey; re-binding per key keeps the
+    // handler clearing the tab the user is actually looking at.
+  }, [zoomKey])
   // Structural-change guard: when the visible tab's live pane set changes (a
   // split lands, a pane is closed/reaped — via our gesture OR the daemon), drop
   // that tab's zoom. Moves don't change the set, so those gestures clear zoom
@@ -1028,7 +1059,40 @@ function App(): JSX.Element {
           : 'off'
 
   return (
-    <div className="app">
+    <div className={mobile ? 'app mobile' : 'app'}>
+      {mobile && (
+        <div className="mobile-bar">
+          <span className="crumb">
+            {layout.workspaces[wsKey]?.label ?? `ws ${ws?.ws ?? 1}`}
+            <span className="sep">·</span>
+            {layout.workspaces[wsKey]?.tabs[tabKey]?.label ?? `tab ${tab?.tab ?? 1}`}
+          </span>
+          <span className="spacer" />
+          <button aria-label="new pane" title="new pane" onClick={startPane}>+</button>
+          <button aria-label="workspaces and tabs" title="workspaces and tabs"
+            onClick={() => setDrawerOpen(true)}>☰</button>
+        </div>
+      )}
+      {mobile && drawerOpen && (
+        <Drawer
+          workspaces={workspaces.map((w) => ({
+            ws: w.ws,
+            label: layout.workspaces[String(w.ws)]?.label ?? `workspace ${w.ws}`,
+            active: w.ws === (ws?.ws ?? -1),
+          }))}
+          tabs={orderedTabs.map((t) => ({
+            tab: t.tab,
+            label: layout.workspaces[wsKey]?.tabs[String(t.tab)]?.label ?? `tab ${t.tab}`,
+            active: t.tab === (tab?.tab ?? -1),
+            activity: hasActivity(state, t.panes, frozenSet),
+          }))}
+          onPickWs={setActiveWs}
+          onPickTab={setActiveTab}
+          onNewWs={() => { setActiveWs(nextWs); setActiveTab(1) }}
+          onNewTab={() => setActiveTab(nextTab)}
+          onClose={() => setDrawerOpen(false)}
+        />
+      )}
       {!connected && <div className="banner" role="status" aria-live="polite"><span className="dot" />daemon disconnected — reconnecting…</div>}
       {state.error && (
         <div className="banner error-banner" role="alert">

@@ -725,6 +725,15 @@ export function SplitView(props: {
             }}>
             <div className="pane-header"
               onDoubleClick={(e) => { if (!(e.target as HTMLElement).closest('button')) props.onToggleZoom(paneId) }}
+              // Mobile: a SINGLE tap on the header zooms (spec §4 — the mosaic
+              // tile is the tap target). A double-tap is not a phone gesture,
+              // and the terminal body must stay untouched: a tap there is how
+              // you focus and type.
+              onClick={(e) => {
+                if (!mobile) return
+                if ((e.target as HTMLElement).closest('button')) return
+                props.onToggleZoom(paneId)
+              }}
               onContextMenu={(e) => {
                 e.preventDefault()
                 const b = ref.current?.getBoundingClientRect()
