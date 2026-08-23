@@ -315,3 +315,84 @@ To disable CPU prioritization, restore `Delegate=memory`, reload the user
 systemd manager, and restart `amber.service`. Memory containment and the
 existing guardian continue to work. No persisted session-state migration is
 introduced, so an older daemon can read the same state store.
+
+## Task 6 verification record (2026-08-23)
+
+Verification ran in the resource-pressure-guardian worktree at commit
+`5c7aa5daf5dbe52cb3b14eb1a3d745f57596fb82`, on Linux with a user systemd
+manager and cgroup v2. This record is evidence, not a production-rollout
+approval.
+
+| Gate | Command | Result |
+| --- | --- | --- |
+| Rust formatting | `cargo fmt --all -- --check` | **failed** (exit 1): rustfmt reported repository-wide formatting differences (7,815 displayed diff lines; output was truncated). No formatting changes were made in this task. |
+| Rust lint | `RUSTFLAGS='-D warnings' cargo clippy --workspace --all-targets` | **failed** (exit 101): `clippy::field_reassign_with_default` at `crates/amber-core/src/state.rs:1258-1265`, promoted by `-D warnings`. |
+| TypeScript | `cd app && npm run typecheck` | passed (exit 0). |
+| Rust tests | `cargo test --workspace` | passed (exit 0): 569 tests, 23 suites. |
+| App tests | `cd app && npm test -- --run` | passed (exit 0): 560 passed, 1 skipped, 42 files (41 passed). Expected malformed-frame stderr was emitted by a connection test. |
+| Unit parity | `cd app && npm test -- --run src/main/serviceManager.test.ts` | passed (exit 0): 21 tests. |
+| Unit syntax | `systemd-analyze --user verify infra/daemon/amber.service` | passed (exit 0). |
+
+### Isolated Linux evidence and cleanup
+
+The existing `claude_supervise` fixture was run as
+`cargo test -p amber --test claude_supervise suspend_reclaims_a_stubborn_descendant_before_reporting_suspended -- --exact --nocapture`
+and passed (1 test, 9 filtered). It launches the worktree test binary under a
+temporary user unit, creates a fake recorded Claude workload, proves a
+workload leaf is emptied before suspension completes, then resumes the exact
+recorded id (`--resume conv-42`) and drops its temporary state.
+
+An additional manually inspected private unit,
+`amber-task6-rpg-cfnp89.service`, ran only
+`target/debug/amber daemon --root /tmp/amber-task6-rpg.cFnP89 --socket
+/tmp/amber-task6-rpg.cFnP89/amberd.sock` with `Delegate=cpu memory`.
+Its cgroup was
+`/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/amber-task6-rpg-cfnp89.service`.
+Observed controls were `cgroup.controllers = cpu memory pids`,
+`cgroup.subtree_control = cpu memory`, `_daemon/cpu.weight = 10000`,
+`session-1/cpu.weight = 1000` after focus, and
+`session-2/cpu.weight = 100`; live fake workloads were in their matching
+`session-{slot}/workload` leaves. This proves actual direct-child placement
+and weights, not a CPU-share benchmark.
+
+The private unit initially did not stop through the normal stop request. Each
+remaining PID was then verified by command line, temporary root/socket, and
+private cgroup before TERM was sent: daemon `1494362`, supervisors `1501012`
+and `1501061`, and fake workload shells `1501086` and `1501108`. All exited
+within one second. The unit then reported `MainPID=0`, `ActiveState=inactive`,
+`SubState=dead`; its cgroup was absent. Only the validated temporary root
+`/tmp/amber-task6-rpg.cFnP89` (including its socket) was removed.
+
+Deterministic policy proof used the existing test suite rather than waiting
+120 real seconds: `host_pressure_waits_snapshots_and_honors_cooldown` proves
+no candidate at 119,999 ms, one at 120,000 ms, and no second selection until
+the 10-second cooldown expires. The workspace test run also covers
+foreground-after-rename exclusion, ignored background output vs user input,
+safety exclusions, protocol capability gating, configuration defaults,
+partial CPU activation, and UI reducer/banner/parked-overlay behavior.
+
+### Requirement audit and remaining risk
+
+Goals and thresholds (CPU 25%, I/O 20%, memory 2%; 120-second sustain;
+10-second cooldown), capability-gated watcher v2, configuration normalization,
+safe candidate ordering/exclusions, snapshot-before-park, exact resume,
+memory-path preservation, degraded PSI/CPU behavior, additive UI handling,
+rollback settings, and service-unit parity all have automated evidence above.
+
+The following are **not** fully live-proven: deterministic PSI injection into
+the running private daemon, delivery of a live `ResourcePressure` watcher
+event, an automatic one-at-a-time host-pressure parking transition, and an
+actual CPU-share/foreground-responsiveness benchmark. Existing fixtures prove
+the relevant state-machine and suspension/resume components but do not expose
+a safe live PSI source. The two failed static gates also block a green
+pre-rollout gate.
+
+Safety incident: during the private proof, the command
+`AMBER_SOCK=/tmp/amber-task6-rpg.cFnP89/amberd.sock timeout 1 ./target/debug/amber attach foreground`
+was used without the CLI's required `--socket` flag. This CLI ignores
+`AMBER_SOCK` for that command and resolved the default production user socket;
+it resolved a production session named `foreground` and sent Focus/Attach for
+up to one second. Production `amber.service` was **not** installed, restarted,
+stopped, killed, or otherwise lifecycle-mutated. No attempt was made to guess
+or restore production focus state. Treat this as a verification-safety failure
+when deciding rollout approval.
