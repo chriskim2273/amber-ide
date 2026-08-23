@@ -1049,3 +1049,71 @@ body {
   font-size: 11px;
   white-space: pre-wrap;
 }
+
+/* ---- touch sizing (spec 2026-08-22 §1/§6) -----------------------------
+   Capability-gated, not host-gated: a touch laptop gets these too, and the
+   desktop app in a narrow window keeps its mouse chrome. Applies only where
+   the pointer is genuinely coarse AND the viewport is phone-sized — the same
+   pair `isMobileViewport()` tests, kept in sync by hand because CSS cannot
+   read the constant. */
+@media (pointer: coarse) and (max-width: 820px) {
+  .btn,
+  .icon-btn,
+  .ws-pill,
+  .select,
+  .cwd-chip {
+    min-height: 44px;
+    font-size: 13px;
+  }
+  .tab {
+    min-height: 44px;
+    font-size: 13px;
+    padding: 0 var(--sp-3);
+  }
+  .label {
+    font-size: 12px;
+  }
+  /* The toolbar is the densest row in the app and the first thing to overflow
+     a phone; mobile chrome (§6) replaces most of it, this keeps what remains
+     legible and reachable. */
+  .toolbar {
+    min-height: 52px;
+    gap: var(--sp-2);
+  }
+}
+
+/* ---- on-screen key bar (spec §5) --------------------------------------- */
+
+.key-bar {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  overflow-x: auto;
+  padding: 6px 8px;
+  /* Clears the home indicator / gesture bar. */
+  padding-bottom: calc(6px + env(safe-area-inset-bottom, 0px));
+  background: var(--bg-raised, #16181c);
+  border-top: 1px solid var(--border, #30363d);
+  scrollbar-width: none;
+}
+.key-bar::-webkit-scrollbar { display: none; }
+.key-bar .key {
+  flex: 0 0 auto;
+  min-width: 44px;
+  min-height: 44px;
+  border-radius: 6px;
+  border: 1px solid var(--border, #30363d);
+  background: var(--bg, #0c0c0f);
+  color: var(--text, #e6e6ec);
+  font-size: 13px;
+  font-family: inherit;
+  cursor: pointer;
+}
+.key-bar .key.wide { min-width: 60px; }
+/* Sticky Ctrl is a mode, so it has to look latched — a phone user cannot see a
+   held modifier any other way. */
+.key-bar .key.armed {
+  background: var(--accent, #7c6cff);
+  border-color: var(--accent, #7c6cff);
+  color: #fff;
+}
