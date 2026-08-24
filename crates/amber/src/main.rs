@@ -1120,7 +1120,13 @@ fn run_daemon(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Result<
     // Created before the manager so restored sessions get their output-activity
     // hook wired (a restored pane that produces output must light its tab dot).
     let watchers = std::sync::Arc::new(amber::watchers::Watchers::new());
-    let config = StateStore::new(&root).load_config()?;
+    let (config, pressure_was_normalized) =
+        StateStore::new(&root).load_config_with_diagnostics()?;
+    if pressure_was_normalized {
+        eprintln!(
+            "amber daemon: warning: configured [pressure] values were normalized to safe limits/defaults"
+        );
+    }
     let cgroups = amber::cgroup::CgroupManager::activate();
     let cgroup_limit_kb = match cgroups.lowest_finite_limit_kb() {
         Ok(limit) => limit,
@@ -1132,6 +1138,7 @@ fn run_daemon(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Result<
     let budget_kb = config.memory.budget_kb(amber::procinfo::total_memory_kb(), cgroup_limit_kb);
     cgroups.set_session_high_kb(config.memory.session_high_kb(budget_kb));
     let memory_config = config.memory.clone();
+    let pressure_config = config.pressure.clone();
     let manager = Arc::new(
         SessionManager::new_with_cgroups(&root, config, cgroups)?
             .with_socket(socket_path.clone())
@@ -1183,7 +1190,12 @@ fn run_daemon(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Result<
         });
     }
 
-    amber::memory_guardian::start(Arc::clone(&manager), Arc::clone(&watchers), memory_config);
+    amber::memory_guardian::start(
+        Arc::clone(&manager),
+        Arc::clone(&watchers),
+        memory_config,
+        pressure_config,
+    );
 
     // SIGTERM/SIGINT -> final snapshot, then exit (spec §7 pre-reboot gap).
     {

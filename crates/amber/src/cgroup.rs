@@ -10,6 +10,9 @@ use std::time::{Duration, Instant};
 use std::os::unix::fs::OpenOptionsExt;
 
 const DAEMON_MEMORY_LOW_BYTES: u64 = 128 * 1024 * 1024;
+const DAEMON_CPU_WEIGHT: u64 = 10_000;
+const FOREGROUND_CPU_WEIGHT: u64 = 1_000;
+const BACKGROUND_CPU_WEIGHT: u64 = 100;
 const KILL_TIMEOUT: Duration = Duration::from_secs(2);
 const KILL_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -26,6 +29,13 @@ const SESSION_HIGH_UNSET: u64 = u64::MAX;
 pub struct CgroupManager {
     root: Option<PathBuf>,
     mount_point: Option<PathBuf>,
+    /// Memory containment and CPU weighting are negotiated independently:
+    /// missing CPU delegation must never turn off the required memory path.
+    cpu_enabled: bool,
+    /// A persistent cgroup permission/configuration error must not flood the
+    /// daemon log on every focus/input event. A successful full reconciliation
+    /// clears this latch so a later regression is still visible once.
+    cpu_weight_error_reported: std::sync::atomic::AtomicBool,
     /// Shared with `SetMemoryBudget`'s live update path, which holds only
     /// `&self` — the manager is shared across connection threads. The unset
     /// sentinel is [`SESSION_HIGH_UNSET`] (0 is a REAL value: a test layout's
@@ -40,8 +50,14 @@ impl Clone for CgroupManager {
         CgroupManager {
             root: self.root.clone(),
             mount_point: self.mount_point.clone(),
+            cpu_enabled: self.cpu_enabled,
+            cpu_weight_error_reported: std::sync::atomic::AtomicBool::new(
+                self.cpu_weight_error_reported
+                    .load(std::sync::atomic::Ordering::SeqCst),
+            ),
             session_high_bytes: std::sync::atomic::AtomicU64::new(
-                self.session_high_bytes.load(std::sync::atomic::Ordering::SeqCst),
+                self.session_high_bytes
+                    .load(std::sync::atomic::Ordering::SeqCst),
             ),
         }
     }
@@ -83,6 +99,8 @@ impl CgroupManager {
         Self {
             root: None,
             mount_point: None,
+            cpu_enabled: false,
+            cpu_weight_error_reported: std::sync::atomic::AtomicBool::new(false),
             session_high_bytes: std::sync::atomic::AtomicU64::new(SESSION_HIGH_UNSET),
         }
     }
@@ -94,6 +112,22 @@ impl CgroupManager {
         Self {
             root: Some(root),
             mount_point: None,
+            cpu_enabled: false,
+            cpu_weight_error_reported: std::sync::atomic::AtomicBool::new(false),
+            session_high_bytes: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_root_with_cpu(root: impl Into<PathBuf>) -> Self {
+        let root = root.into();
+        fs::create_dir_all(root.join("_daemon")).expect("create fake cgroup daemon");
+        fs::write(root.join("_daemon/cpu.weight"), "").expect("create fake daemon cpu weight");
+        Self {
+            root: Some(root),
+            mount_point: None,
+            cpu_enabled: true,
+            cpu_weight_error_reported: std::sync::atomic::AtomicBool::new(false),
             session_high_bytes: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -120,6 +154,13 @@ impl CgroupManager {
         let unified = parse_unified_path(&fs::read_to_string("/proc/self/cgroup")?)?;
         let mount = parse_cgroup2_mount(&fs::read_to_string("/proc/self/mountinfo")?, &unified)?;
         let root = resolve_cgroup_path(&mount, &unified)?;
+        Self::activate_at(root, mount.mount_point)
+    }
+
+    /// Activate the mandatory memory controller and, when delegated, the
+    /// optional CPU controller. Kept path-based so fake cgroup layouts can
+    /// exercise the exact activation behavior without touching `/sys`.
+    fn activate_at(root: PathBuf, mount_point: PathBuf) -> io::Result<Self> {
         let controllers = fs::read_to_string(root.join("cgroup.controllers"))?;
         if !controllers.split_whitespace().any(|name| name == "memory") {
             return Err(io::Error::new(
@@ -136,7 +177,29 @@ impl CgroupManager {
         }
         let pid = std::process::id().to_string();
         write_control(&daemon.join("cgroup.procs"), &pid)?;
-        if let Err(error) = write_control(&root.join("cgroup.subtree_control"), "+memory") {
+        let cpu_offered = controllers.split_whitespace().any(|name| name == "cpu");
+        let cpu_enabled = if cpu_offered {
+            match write_control(&root.join("cgroup.subtree_control"), "+cpu +memory") {
+                Ok(()) => true,
+                Err(error) => {
+                    eprintln!(
+                        "amber: optional CPU cgroup delegation unavailable; continuing with memory containment: {error}"
+                    );
+                    if let Err(memory_error) =
+                        write_control(&root.join("cgroup.subtree_control"), "+memory")
+                    {
+                        if let Err(rollback) = write_control(&root.join("cgroup.procs"), &pid) {
+                            eprintln!("amber: cgroup activation rollback failed: {rollback}");
+                        }
+                        if let Err(cleanup) = fs::remove_dir(&daemon) {
+                            eprintln!("amber: cgroup activation cleanup failed: {cleanup}");
+                        }
+                        return Err(memory_error);
+                    }
+                    false
+                }
+            }
+        } else if let Err(error) = write_control(&root.join("cgroup.subtree_control"), "+memory") {
             if let Err(rollback) = write_control(&root.join("cgroup.procs"), &pid) {
                 eprintln!("amber: cgroup activation rollback failed: {rollback}");
             }
@@ -144,27 +207,40 @@ impl CgroupManager {
                 eprintln!("amber: cgroup activation cleanup failed: {cleanup}");
             }
             return Err(error);
-        }
+        } else {
+            false
+        };
         if let Err(error) = write_control(
             &daemon.join("memory.low"),
             &DAEMON_MEMORY_LOW_BYTES.to_string(),
         ) {
             eprintln!("amber: could not reserve daemon memory.low: {error}");
         }
-        Ok(Self {
+        let manager = Self {
             root: Some(root),
-            mount_point: Some(mount.mount_point),
+            mount_point: Some(mount_point),
+            cpu_enabled,
+            cpu_weight_error_reported: std::sync::atomic::AtomicBool::new(false),
             session_high_bytes: std::sync::atomic::AtomicU64::new(SESSION_HIGH_UNSET),
-        })
+        };
+        if cpu_enabled {
+            manager.reconcile_cpu_weights(0);
+        }
+        Ok(manager)
     }
 
     pub fn set_session_high_kb(&self, session_high_kb: u64) {
-        self.session_high_bytes
-            .store(session_high_kb.saturating_mul(1024), std::sync::atomic::Ordering::SeqCst);
+        self.session_high_bytes.store(
+            session_high_kb.saturating_mul(1024),
+            std::sync::atomic::Ordering::SeqCst,
+        );
     }
 
     fn current_session_high_bytes(&self) -> Option<u64> {
-        match self.session_high_bytes.load(std::sync::atomic::Ordering::SeqCst) {
+        match self
+            .session_high_bytes
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
             SESSION_HIGH_UNSET => None,
             value => Some(value),
         }
@@ -172,6 +248,63 @@ impl CgroupManager {
 
     pub fn is_enabled(&self) -> bool {
         self.root.is_some() && self.mount_point.is_some()
+    }
+
+    /// Whether this manager can apply optional CPU weights. This says nothing
+    /// about memory containment, which remains governed by [`Self::is_enabled`].
+    pub fn cpu_enabled(&self) -> bool {
+        self.cpu_enabled
+    }
+
+    /// Reapply CPU priority without imposing a CPU quota. The daemon is kept
+    /// responsive at 10000, the focused session receives 1000, and every
+    /// other session gets 100. Any filesystem/controller failure is strictly
+    /// best-effort: session lifecycle and focus/input must continue normally.
+    pub fn reconcile_cpu_weights(&self, foreground_slot: u32) {
+        if !self.cpu_enabled {
+            return;
+        }
+        let Some(root) = &self.root else {
+            return;
+        };
+
+        let mut first_error = write_control_nonblocking(
+            &root.join("_daemon/cpu.weight"),
+            &DAEMON_CPU_WEIGHT.to_string(),
+        )
+        .err();
+        match fs::read_dir(root) {
+            Ok(entries) => {
+                if let Some(error) = reconcile_session_cpu_weights(
+                    entries.map(|entry| entry.map(|entry| (entry.file_name(), entry.path()))),
+                    foreground_slot,
+                ) {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+            Err(error) if first_error.is_none() => first_error = Some(error),
+            Err(_) => {}
+        }
+
+        if let Some(error) = first_error {
+            if self
+                .cpu_weight_error_reported
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
+                .is_ok()
+            {
+                eprintln!("amber: optional CPU weighting unavailable; continuing: {error}");
+            }
+        } else {
+            self.cpu_weight_error_reported
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     pub fn prepare_session(&self, slot: u32) -> io::Result<()> {
@@ -196,6 +329,9 @@ impl CgroupManager {
             }
             fs::write(paths.parent.join("cgroup.subtree_control"), "+memory")?;
             fs::write(paths.parent.join("memory.high"), "0")?;
+            if self.cpu_enabled {
+                fs::write(paths.parent.join("cpu.weight"), "")?;
+            }
             return Ok(());
         }
         let high = self.current_session_high_bytes().ok_or_else(|| {
@@ -347,15 +483,53 @@ impl CgroupManager {
     }
 }
 
+fn reconcile_session_cpu_weights<I>(entries: I, foreground_slot: u32) -> Option<io::Error>
+where
+    I: IntoIterator<Item = io::Result<(OsString, PathBuf)>>,
+{
+    let mut first_error = None;
+    for entry in entries {
+        let (file_name, path) = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+                continue;
+            }
+        };
+        let Some(slot) = file_name
+            .to_str()
+            .and_then(|name| name.strip_prefix("session-"))
+            .and_then(|slot| slot.parse::<u32>().ok())
+            .filter(|slot| *slot > 0)
+        else {
+            continue;
+        };
+        let weight = if slot == foreground_slot {
+            FOREGROUND_CPU_WEIGHT
+        } else {
+            BACKGROUND_CPU_WEIGHT
+        };
+        if let Err(error) =
+            write_control_nonblocking(&path.join("cpu.weight"), &weight.to_string())
+        {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
+    first_error
+}
+
 /// Move this short-lived launcher into a numeric session leaf, then replace it
 /// with the requested process. A placement failure must not lose the pane.
-pub fn exec_current_into(
-    slot: u32,
-    role: CgroupRole,
-    command: Vec<OsString>,
-) -> io::Result<()> {
+pub fn exec_current_into(slot: u32, role: CgroupRole, command: Vec<OsString>) -> io::Result<()> {
     let Some((program, args)) = command.split_first() else {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "missing command"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "missing command",
+        ));
     };
     #[cfg(target_os = "linux")]
     if let Err(error) = place_current(slot, role) {
@@ -383,7 +557,10 @@ pub(crate) fn open_workload_procs_from_current(slot: u32) -> io::Result<Option<F
     let Some(workload) = workload_from_current(&current, slot) else {
         return Ok(None);
     };
-    OpenOptions::new().write(true).open(workload.join("cgroup.procs")).map(Some)
+    OpenOptions::new()
+        .write(true)
+        .open(workload.join("cgroup.procs"))
+        .map(Some)
 }
 
 #[cfg(target_os = "linux")]
@@ -692,6 +869,15 @@ mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
 
+    fn fake_delegated_root(root: &Path, controllers: &str) {
+        fs::create_dir_all(root.join("_daemon")).unwrap();
+        fs::write(root.join("cgroup.controllers"), controllers).unwrap();
+        fs::write(root.join("cgroup.subtree_control"), "").unwrap();
+        fs::write(root.join("cgroup.procs"), "").unwrap();
+        fs::write(root.join("_daemon/cgroup.procs"), "").unwrap();
+        fs::write(root.join("_daemon/cpu.weight"), "").unwrap();
+    }
+
     #[test]
     fn parses_only_the_unified_cgroup_entry() {
         let body = "11:memory:/legacy\n0::/user.slice/user-1000.slice/user@1000.service/app.slice/amber.service\n";
@@ -732,12 +918,9 @@ mod tests {
             service.join("session-7/supervisor")
         );
         assert!(placement_target(service, 7, CgroupRole::Workload).is_none());
-        assert!(placement_target(
-            &service.join("other/supervisor"),
-            7,
-            CgroupRole::Workload,
-        )
-        .is_none());
+        assert!(
+            placement_target(&service.join("other/supervisor"), 7, CgroupRole::Workload,).is_none()
+        );
     }
 
     #[test]
@@ -765,6 +948,84 @@ mod tests {
 
         manager.remove_session(3).unwrap();
         assert!(!temp.path().join("session-3").exists());
+    }
+
+    #[test]
+    fn memory_delegation_stays_active_when_cpu_is_unavailable() {
+        let temp = tempfile::tempdir().unwrap();
+        fake_delegated_root(temp.path(), "memory pids");
+
+        let manager =
+            CgroupManager::activate_at(temp.path().to_path_buf(), temp.path().to_path_buf())
+                .unwrap();
+
+        assert!(
+            manager.is_enabled(),
+            "memory containment must remain active"
+        );
+        assert!(!manager.cpu_enabled(), "CPU weighting is optional");
+        assert_eq!(
+            fs::read_to_string(temp.path().join("cgroup.subtree_control")).unwrap(),
+            "+memory",
+        );
+    }
+
+    #[test]
+    fn cpu_delegation_enables_weights_and_prioritizes_the_foreground_slot() {
+        let temp = tempfile::tempdir().unwrap();
+        fake_delegated_root(temp.path(), "cpu memory pids");
+
+        let manager =
+            CgroupManager::activate_at(temp.path().to_path_buf(), temp.path().to_path_buf())
+                .unwrap();
+        assert!(manager.is_enabled());
+        assert!(manager.cpu_enabled());
+        assert_eq!(
+            fs::read_to_string(temp.path().join("cgroup.subtree_control")).unwrap(),
+            "+cpu +memory",
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("_daemon/cpu.weight")).unwrap(),
+            "10000",
+        );
+
+        let weights = CgroupManager::test_root_with_cpu(temp.path());
+        weights.prepare_session(1).unwrap();
+        weights.prepare_session(2).unwrap();
+        weights.reconcile_cpu_weights(2);
+
+        assert_eq!(
+            fs::read_to_string(temp.path().join("session-1/cpu.weight")).unwrap(),
+            "100",
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("session-2/cpu.weight")).unwrap(),
+            "1000",
+        );
+    }
+
+    #[test]
+    fn cpu_weight_reconcile_reports_directory_entry_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let session = temp.path().join("session-1");
+        fs::create_dir(&session).unwrap();
+        fs::write(session.join("cpu.weight"), "").unwrap();
+
+        let error = reconcile_session_cpu_weights(
+            [
+                Ok((OsString::from("session-1"), session.clone())),
+                Err(io::Error::other("broken read_dir entry")),
+            ],
+            1,
+        )
+        .expect("directory entry errors must be reported");
+
+        assert_eq!(error.to_string(), "broken read_dir entry");
+        assert_eq!(
+            fs::read_to_string(session.join("cpu.weight")).unwrap(),
+            "1000",
+            "valid entries must still be reconciled before reporting the diagnostic",
+        );
     }
 
     #[test]
@@ -829,6 +1090,8 @@ mod tests {
         let manager = CgroupManager {
             root: Some(service),
             mount_point: Some(temp.path().to_path_buf()),
+            cpu_enabled: false,
+            cpu_weight_error_reported: std::sync::atomic::AtomicBool::new(false),
             session_high_bytes: std::sync::atomic::AtomicU64::new(SESSION_HIGH_UNSET),
         };
         assert_eq!(manager.lowest_finite_limit_kb().unwrap(), Some(4096));
@@ -851,6 +1114,8 @@ mod tests {
         let manager = CgroupManager {
             root: Some(service),
             mount_point: Some(mount),
+            cpu_enabled: false,
+            cpu_weight_error_reported: std::sync::atomic::AtomicBool::new(false),
             session_high_bytes: std::sync::atomic::AtomicU64::new(SESSION_HIGH_UNSET),
         };
         assert_eq!(manager.lowest_finite_limit_kb().unwrap(), Some(4096));
@@ -878,6 +1143,8 @@ mod tests {
         let enabled = CgroupManager {
             root: Some(temp.path().to_path_buf()),
             mount_point: Some(temp.path().to_path_buf()),
+            cpu_enabled: false,
+            cpu_weight_error_reported: std::sync::atomic::AtomicBool::new(false),
             session_high_bytes: std::sync::atomic::AtomicU64::new(SESSION_HIGH_UNSET),
         };
         assert!(enabled.prepare_session(1).is_err());

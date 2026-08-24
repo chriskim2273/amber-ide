@@ -126,6 +126,22 @@ describe('proto', () => {
       .toThrow(/pressure level/)
   })
 
+  it('decodes ResourcePressure with a default blocked flag and rejects unknown variants', () => {
+    expect(decodeControlJson('{"ResourcePressure":{"level":"critical","causes":["cpu","io"]}}')).toEqual({
+      type: 'control',
+      msg: { kind: 'ResourcePressure', level: 'critical', causes: ['cpu', 'io'], blocked: false },
+    })
+    expect(() => decodeControlJson('{"ResourcePressure":{"level":"warning","causes":["cpu"]}}'))
+      .toThrow(/resource pressure level/)
+    expect(() => decodeControlJson('{"ResourcePressure":{"level":"critical","causes":["network"]}}'))
+      .toThrow(/resource pressure cause/)
+  })
+
+  it('roundtrips the version 2 resource-pressure subscription', () => {
+    const frame: Frame = { type: 'control', msg: { kind: 'WatchMemoryPressure', version: 2 } }
+    expect(roundtrip(frame)).toEqual(frame)
+  })
+
   it('skips a well-framed unknown control and decodes the following frame', () => {
     const unknownJson = new TextEncoder().encode('{"FutureControl":{"version":2}}')
     const unknown = new Uint8Array(5 + unknownJson.length)

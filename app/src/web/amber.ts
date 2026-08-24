@@ -77,6 +77,7 @@ export type ServerMsg =
   | { t: 'activity'; name: string }
   | { t: 'memory'; name: string; rss_kb: number; growing: boolean }
   | { t: 'memoryPressure'; level: 'normal' | 'warning' | 'critical'; current_kb: number; budget_kb: number; blocked: boolean }
+  | { t: 'resourcePressure'; level: 'normal' | 'critical'; causes: Array<'cpu' | 'io' | 'memory'>; blocked: boolean }
 
 /** Parse one JSON text frame from `amber web`. `null` for anything this
  * shim has no use for (malformed JSON, an unknown `t`). */
@@ -118,6 +119,14 @@ export function parseServerMsg(text: string): ServerMsg | null {
         blocked: (raw['blocked'] as boolean) ?? false,
       }
     }
+    case 'resourcePressure': {
+      const level = raw['level']
+      const causes = raw['causes']
+      if ((level !== 'normal' && level !== 'critical')
+        || !Array.isArray(causes)
+        || !causes.every((cause) => cause === 'cpu' || cause === 'io' || cause === 'memory')) return null
+      return { t: 'resourcePressure', level, causes: [...causes] as Array<'cpu' | 'io' | 'memory'>, blocked: (raw['blocked'] as boolean) ?? false }
+    }
     default:
       return null
   }
@@ -130,7 +139,7 @@ export function parseServerMsg(text: string): ServerMsg | null {
  * passthrough), and the backlog messages need the binary payload that
  * arrives in a separate frame — see `ControlLink`. */
 export function toDaemonEvent(
-  m: Extract<ServerMsg, { t: 'sessions' | 'error' | 'activity' | 'memory' | 'memoryPressure' }>,
+  m: Extract<ServerMsg, { t: 'sessions' | 'error' | 'activity' | 'memory' | 'memoryPressure' | 'resourcePressure' }>,
 ): unknown {
   switch (m.t) {
     case 'sessions':
@@ -157,6 +166,13 @@ export function toDaemonEvent(
             budget_kb: m.budget_kb,
             blocked: m.blocked,
           },
+        },
+      }
+    case 'resourcePressure':
+      return {
+        frame: {
+          type: 'control',
+          msg: { kind: 'ResourcePressure', level: m.level, causes: m.causes, blocked: m.blocked },
         },
       }
   }

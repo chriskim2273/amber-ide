@@ -5,7 +5,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -14,7 +14,7 @@ use amber_core::state::{Config, SessionKind, SessionMeta, StateStore};
 use portable_pty::CommandBuilder;
 
 use crate::cgroup::{CgroupManager, CgroupRole};
-use crate::memory_guardian::{Candidate, RECENT_USE_MS};
+use crate::memory_guardian::{Candidate, HostPressureCandidate, RECENT_USE_MS};
 use crate::pty::{PtySession, SuspendOrigin};
 use crate::watchers::Watchers;
 
@@ -101,9 +101,7 @@ fn display_env() -> Vec<(String, String)> {
         .args(["--user", "show-environment"])
         .output();
     match out {
-        Ok(out) if out.status.success() => {
-            pick_env(&String::from_utf8_lossy(&out.stdout), &KEYS)
-        }
+        Ok(out) if out.status.success() => pick_env(&String::from_utf8_lossy(&out.stdout), &KEYS),
         _ => Vec::new(),
     }
 }
@@ -129,6 +127,20 @@ pub struct SessionManager {
     cfg: Config,
     root: PathBuf,
     sessions: Mutex<HashMap<String, Arc<PtySession>>>,
+    /// Stable slot of the terminal most recently focused or written to. Zero
+    /// means no foreground session yet; slots make rename unable to drop this
+    /// protection by changing only the session name.
+    foreground_slot: AtomicU32,
+    /// Serializes each O(session-count) CPU-weight pass. Foreground changes
+    /// happen before taking this lock; the pass reads the latest slot only
+    /// after acquiring it, so the last queued pass always repairs the whole
+    /// tree to one coherent generation.
+    cpu_reconciliation: Mutex<()>,
+    /// Test-only observation point around the real cgroup reconciliation. It
+    /// lets concurrency tests control interleaving without replacing the
+    /// filesystem behavior under test.
+    #[cfg(test)]
+    cpu_reconcile_hook: Mutex<Option<CpuReconcileHook>>,
     /// The guardian's LIVE aggregate budget in KiB (0 = none). An
     /// `Arc<AtomicU64>` so `SetMemoryBudget` can move it while the guardian
     /// thread reads it every tick — a budget change takes effect without a
@@ -185,6 +197,24 @@ pub enum ResumeCause {
     Focus,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AutomaticSuspendRecency {
+    /// The existing aggregate-memory guardian protects recent output too.
+    Memory,
+    /// Host PSI policy protects only direct focus and terminal input.
+    Host,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CpuReconcilePoint {
+    Start,
+    Finish,
+}
+
+#[cfg(test)]
+type CpuReconcileHook = Arc<dyn Fn(CpuReconcilePoint, u32) + Send + Sync>;
+
 /// Consecutive absent periodic snapshots before `resume_as_claude` downgrades
 /// true→false. At the default ~10 s snapshot cadence this is ~20 s of a shell
 /// with no claude before it stops being restored as claude.
@@ -233,7 +263,9 @@ fn decide_resume(current: bool, detected: bool, streak: u32, threshold: u32) -> 
 /// LATER create — deliberately not a forever-unique id, which would grow
 /// without bound for a long-lived daemon.
 fn alloc_slot(used: &BTreeSet<u32>) -> u32 {
-    (1..).find(|n| !used.contains(n)).expect("session slots exhausted")
+    (1..)
+        .find(|n| !used.contains(n))
+        .expect("session slots exhausted")
 }
 
 fn require_cgroup_aggregate(current_kb: Option<u64>) -> anyhow::Result<u64> {
@@ -261,6 +293,10 @@ impl SessionManager {
             cfg,
             root,
             sessions: Mutex::new(HashMap::new()),
+            foreground_slot: AtomicU32::new(0),
+            cpu_reconciliation: Mutex::new(()),
+            #[cfg(test)]
+            cpu_reconcile_hook: Mutex::new(None),
             budget_kb: Arc::new(AtomicU64::new(0)),
             deferred_meta: Mutex::new(HashMap::new()),
             socket: None,
@@ -526,6 +562,7 @@ impl SessionManager {
             .lock()
             .unwrap()
             .insert(name.to_string(), Arc::clone(&sess));
+        self.reconcile_cpu_weights();
         Ok(sess)
     }
 
@@ -536,7 +573,11 @@ impl SessionManager {
     /// ambiguous, which is the exact bug slots exist to remove. A slot frees
     /// only when the session leaves the table (kill/reap).
     fn used_slots(metas: &[SessionMeta]) -> BTreeSet<u32> {
-        metas.iter().filter(|meta| meta.slot >= 1).map(|meta| meta.slot).collect()
+        metas
+            .iter()
+            .filter(|meta| meta.slot >= 1)
+            .map(|meta| meta.slot)
+            .collect()
     }
 
     /// Retry rename garbage collection before any metadata mutation. Restore
@@ -554,7 +595,10 @@ impl SessionManager {
                     .get(name)
                     .is_some_and(|session| Weak::ptr_eq(&entry.session, &Arc::downgrade(session)))
             });
-            deferred.values().map(|entry| entry.meta.clone()).collect::<Vec<_>>()
+            deferred
+                .values()
+                .map(|entry| entry.meta.clone())
+                .collect::<Vec<_>>()
         };
         for meta in &pending {
             self.store.write_session(meta)?;
@@ -584,11 +628,7 @@ impl SessionManager {
         self.store.read_session(name)
     }
 
-    fn stop_session(
-        &self,
-        slot: u32,
-        session: Option<&Arc<PtySession>>,
-    ) -> anyhow::Result<()> {
+    fn stop_session(&self, slot: u32, session: Option<&Arc<PtySession>>) -> anyhow::Result<()> {
         let _transition = session.map(|session| session.lock_suspend_transition());
         self.stop_session_locked(slot, session)
     }
@@ -646,7 +686,10 @@ impl SessionManager {
         if let Some((rows, cols)) = size {
             let _ = restored.resize(rows, cols);
         }
-        self.sessions.lock().unwrap().insert(from.to_string(), restored);
+        self.sessions
+            .lock()
+            .unwrap()
+            .insert(from.to_string(), restored);
         if let Some(error) = cleanup_error {
             eprintln!("amber daemon: rename rollback initial cleanup failed: {error}");
         }
@@ -682,12 +725,18 @@ impl SessionManager {
         // The sessions are `Arc`s, so cloning the map is a refcount bump each.
         let handles: Vec<(String, Arc<PtySession>)> = {
             let sessions = self.sessions.lock().unwrap();
-            self.claude_absent.lock().unwrap().retain(|k, _| sessions.contains_key(k));
+            self.claude_absent
+                .lock()
+                .unwrap()
+                .retain(|k, _| sessions.contains_key(k));
             self.persisted_scrollback
                 .lock()
                 .unwrap()
                 .retain(|k, _| sessions.contains_key(k));
-            sessions.iter().map(|(n, s)| (n.clone(), Arc::clone(s))).collect()
+            sessions
+                .iter()
+                .map(|(n, s)| (n.clone(), Arc::clone(s)))
+                .collect()
         };
 
         // One process-table scan for the whole snapshot, not one per session,
@@ -744,11 +793,16 @@ impl SessionManager {
         is_final: bool,
         table: &[crate::procinfo::ProcEntry],
     ) {
-        let Ok(Some(meta)) = self.store.read_session(name) else { return };
+        let Ok(Some(meta)) = self.store.read_session(name) else {
+            return;
+        };
         if meta.kind != SessionKind::Shell {
             return;
         }
-        let new_cwd = sess.live_cwd().filter(|d| d.is_dir()).unwrap_or_else(|| meta.cwd.clone());
+        let new_cwd = sess
+            .live_cwd()
+            .filter(|d| d.is_dir())
+            .unwrap_or_else(|| meta.cwd.clone());
         // Was the user running claude by hand in this shell? If so, restore it as
         // a resumable claude instead of a bare shell. Final snapshots preserve the
         // stored flag (detection is unreliable mid-shutdown); periodic snapshots
@@ -759,8 +813,12 @@ impl SessionManager {
             let detected = sess.is_running_claude_in(table);
             let mut streaks = self.claude_absent.lock().unwrap();
             let streak = streaks.get(name).copied().unwrap_or(0);
-            let (flag, next) =
-                decide_resume(meta.resume_as_claude, detected, streak, CLAUDE_ABSENT_THRESHOLD);
+            let (flag, next) = decide_resume(
+                meta.resume_as_claude,
+                detected,
+                streak,
+                CLAUDE_ABSENT_THRESHOLD,
+            );
             if next == 0 {
                 streaks.remove(name);
             } else {
@@ -842,7 +900,10 @@ impl SessionManager {
                 }
             };
             if let Err(error) = self.cgroups.prepare_session(meta.slot) {
-                eprintln!("amber daemon: restore skipped session {}: {error}", meta.name);
+                eprintln!(
+                    "amber daemon: restore skipped session {}: {error}",
+                    meta.name
+                );
                 lost.push(meta.name.clone());
                 continue;
             }
@@ -870,7 +931,8 @@ impl SessionManager {
                     .map(|chunk| {
                         let chunk = chunk.to_vec();
                         scope.spawn(move || {
-                            chunk.into_iter()
+                            chunk
+                                .into_iter()
                                 .map(|meta| {
                                     let res = self.restore_one(&meta);
                                     (meta, res)
@@ -923,6 +985,7 @@ impl SessionManager {
                 let _ = std::fs::write(self.root.join("last-crash-report.json"), body);
             }
         }
+        self.reconcile_cpu_weights();
         Ok(())
     }
 
@@ -983,7 +1046,8 @@ impl SessionManager {
         }
         if let Some((origin, started)) = suspension {
             debug_assert_ne!(origin, SuspendOrigin::None);
-            sess.claim_suspend(origin).expect("fresh session cannot already be suspended");
+            sess.claim_suspend(origin)
+                .expect("fresh session cannot already be suspended");
             sess.set_memory_suspend_started_ms(started);
             sess.set_run_state(Some("suspended".to_string()));
             sess.await_initial_suspend_ready();
@@ -999,13 +1063,11 @@ impl SessionManager {
         self.sessions.lock().unwrap().get(name).cloned()
     }
 
-    fn ensure_current_session(
-        &self,
-        name: &str,
-        session: &Arc<PtySession>,
-    ) -> anyhow::Result<()> {
+    fn ensure_current_session(&self, name: &str, session: &Arc<PtySession>) -> anyhow::Result<()> {
         let current = self.sessions.lock().unwrap().get(name).cloned();
-        if !current.as_ref().is_some_and(|live| Arc::ptr_eq(live, session))
+        if !current
+            .as_ref()
+            .is_some_and(|live| Arc::ptr_eq(live, session))
             || !session.is_alive()
         {
             anyhow::bail!("no such session: {name}");
@@ -1053,7 +1115,9 @@ impl SessionManager {
                         recorded.is_some_and(|recorded| !recorded.session_id.is_empty())
                     }
                     Err(error) => {
-                        eprintln!("amber daemon: memory candidate {name} resume id failed: {error}");
+                        eprintln!(
+                            "amber daemon: memory candidate {name} resume id failed: {error}"
+                        );
                         false
                     }
                 };
@@ -1061,8 +1125,7 @@ impl SessionManager {
                     memory_kb: per_session_kb.get(&name).copied().unwrap_or(0),
                     last_used_ms: session.last_used_ms(),
                     is_agent: meta.kind.is_agent(),
-                    running: session.is_alive()
-                        && session.run_state().as_deref() == Some("claude"),
+                    running: session.is_alive() && session.run_state().as_deref() == Some("claude"),
                     has_resume_id,
                     suspended: session.suspend_origin() != SuspendOrigin::None,
                     name,
@@ -1071,7 +1134,157 @@ impl SessionManager {
             .collect()
     }
 
+    /// The stable slot protected from host-pressure parking. Exposed for the
+    /// optional cgroup CPU weighting pass as well as candidate selection.
+    pub fn foreground_slot(&self) -> u32 {
+        self.foreground_slot.load(Ordering::SeqCst)
+    }
+
+    fn set_foreground_locked(
+        &self,
+        name: &str,
+        session: &Arc<PtySession>,
+    ) -> anyhow::Result<bool> {
+        let meta = self
+            .effective_meta_for(name, session)?
+            .ok_or_else(|| anyhow::anyhow!("session {name} vanished from the store"))?;
+        Ok(self.foreground_slot.swap(meta.slot, Ordering::SeqCst) != meta.slot)
+    }
+
+    fn clear_foreground_slot(&self, slot: u32) {
+        let _ = self
+            .foreground_slot
+            .compare_exchange(slot, 0, Ordering::SeqCst, Ordering::SeqCst);
+    }
+
+    /// CPU weighting is best-effort; its controller writes must not alter the
+    /// foreground slot, lifecycle, or suspend-transition semantics.
+    fn reconcile_cpu_weights(&self) {
+        let _reconciliation = self.cpu_reconciliation.lock().unwrap();
+        let foreground_slot = self.foreground_slot();
+        #[cfg(test)]
+        self.call_cpu_reconcile_hook(CpuReconcilePoint::Start, foreground_slot);
+        self.cgroups.reconcile_cpu_weights(foreground_slot);
+        #[cfg(test)]
+        self.call_cpu_reconcile_hook(CpuReconcilePoint::Finish, foreground_slot);
+    }
+
+    #[cfg(test)]
+    fn set_cpu_reconcile_hook(&self, hook: CpuReconcileHook) {
+        *self.cpu_reconcile_hook.lock().unwrap() = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn call_cpu_reconcile_hook(&self, point: CpuReconcilePoint, foreground_slot: u32) {
+        let hook = self.cpu_reconcile_hook.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook(point, foreground_slot);
+        }
+    }
+
+    /// Snapshot host-pressure-safe candidates. This is intentionally separate
+    /// from [`memory_candidates`]: memory policy preserves output recency,
+    /// while host policy ranks only focus/input and excludes the foreground
+    /// stable slot.
+    pub fn host_pressure_candidates(
+        &self,
+        now_ms: u64,
+        per_session_kb: &HashMap<String, u64>,
+    ) -> Vec<HostPressureCandidate> {
+        let foreground_slot = self.foreground_slot();
+        let sessions: Vec<(String, Arc<PtySession>)> = self
+            .sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, session)| (name.clone(), Arc::clone(session)))
+            .collect();
+        let mut candidates: Vec<HostPressureCandidate> = sessions
+            .into_iter()
+            .filter_map(|(name, session)| {
+                let meta = match self.effective_meta_for(&name, &session) {
+                    Ok(Some(meta)) => meta,
+                    Ok(None) => return None,
+                    Err(error) => {
+                        eprintln!(
+                            "amber daemon: host-pressure candidate {name} metadata failed: {error}"
+                        );
+                        return None;
+                    }
+                };
+                if meta.slot == foreground_slot
+                    || !meta.kind.is_agent()
+                    || !session.is_alive()
+                    || session.run_state().as_deref() != Some("claude")
+                    || session.suspend_origin() != SuspendOrigin::None
+                    || now_ms.saturating_sub(session.last_user_ms()) < RECENT_USE_MS
+                {
+                    return None;
+                }
+                let has_resume_id = match self.store.read_claude(&name) {
+                    Ok(recorded) => {
+                        recorded.is_some_and(|recorded| !recorded.session_id.is_empty())
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "amber daemon: host-pressure candidate {name} resume id failed: {error}"
+                        );
+                        false
+                    }
+                };
+                has_resume_id.then(|| HostPressureCandidate {
+                    memory_kb: per_session_kb.get(&name).copied().unwrap_or(0),
+                    last_user_ms: session.last_user_ms(),
+                    name,
+                })
+            })
+            .collect();
+        candidates.sort_by(|left, right| {
+            left.last_user_ms
+                .cmp(&right.last_user_ms)
+                .then_with(|| right.memory_kb.cmp(&left.memory_kb))
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        candidates
+    }
+
+    /// Preserve the aggregate-memory path's conservative output-recency check.
     pub fn suspend_for_memory(&self, name: &str, now_ms: u64) -> anyhow::Result<()> {
+        self.suspend_for_automatic_with_clock(
+            name,
+            AutomaticSuspendRecency::Memory,
+            || now_ms,
+        )
+        .map(|_| ())
+    }
+
+    /// Host PSI parking uses user recency only and refuses the stable
+    /// foreground slot. All checks run under the session transition lock. The
+    /// returned timestamp is sampled only after the supervisor signal succeeds
+    /// and is therefore the sole correct origin for the host cooldown.
+    pub fn suspend_for_pressure(&self, name: &str) -> anyhow::Result<u64> {
+        self.suspend_for_automatic_with_clock(
+            name,
+            AutomaticSuspendRecency::Host,
+            crate::pty::monotonic_ms,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn suspend_for_pressure_with_clock(
+        &self,
+        name: &str,
+        now_ms: impl FnMut() -> u64,
+    ) -> anyhow::Result<u64> {
+        self.suspend_for_automatic_with_clock(name, AutomaticSuspendRecency::Host, now_ms)
+    }
+
+    fn suspend_for_automatic_with_clock(
+        &self,
+        name: &str,
+        recency: AutomaticSuspendRecency,
+        mut now_ms: impl FnMut() -> u64,
+    ) -> anyhow::Result<u64> {
         let session = self
             .session(name)
             .ok_or_else(|| anyhow::anyhow!("no such session: {name}"))?;
@@ -1081,7 +1294,7 @@ impl SessionManager {
             .effective_meta_for(name, &session)?
             .ok_or_else(|| anyhow::anyhow!("session {name} vanished from the store"))?;
         if !meta.kind.is_agent() {
-            anyhow::bail!("automatic memory suspend applies only to agent sessions: {name}");
+            anyhow::bail!("automatic pressure suspend applies only to agent sessions: {name}");
         }
         if session.run_state().as_deref() != Some("claude") {
             anyhow::bail!("session {name} no longer has a running agent");
@@ -1096,30 +1309,49 @@ impl SessionManager {
         if session.suspend_origin() != SuspendOrigin::None {
             anyhow::bail!("session {name} is already suspended");
         }
-        if now_ms.saturating_sub(session.last_used_ms()) < RECENT_USE_MS {
+        if recency == AutomaticSuspendRecency::Host && meta.slot == self.foreground_slot() {
+            anyhow::bail!("session {name} is the foreground session");
+        }
+        let last_activity_ms = match recency {
+            AutomaticSuspendRecency::Memory => session.last_used_ms(),
+            AutomaticSuspendRecency::Host => session.last_user_ms(),
+        };
+        // Metadata and resume-id reads may block on storage. Sample only after
+        // they finish and while the transition lock is held, immediately
+        // before the final eligibility/claim boundary.
+        let pending_started_ms = now_ms().max(1);
+        if pending_started_ms.saturating_sub(last_activity_ms) < RECENT_USE_MS {
             anyhow::bail!("session {name} received recent activity");
+        }
+        // This is deliberately the final check before claiming the automatic
+        // origin: a selected process may have exited while snapshotting or
+        // while the preceding metadata/recency checks ran.
+        if !session.is_alive() {
+            anyhow::bail!("session {name} no longer has a running agent");
         }
 
         session
-            .claim_suspend(SuspendOrigin::Memory)
-            .map_err(|origin| anyhow::anyhow!("session {name} is already suspended by {origin:?}"))?;
+            .claim_suspend(SuspendOrigin::Pressure)
+            .map_err(|origin| {
+                anyhow::anyhow!("session {name} is already suspended by {origin:?}")
+            })?;
         let previous_started = session.memory_suspend_started_ms();
-        session.set_memory_suspend_started_ms(now_ms.max(1));
+        session.set_memory_suspend_started_ms(pending_started_ms);
         if let Err(error) = Self::signal_supervisor(name, &session, nix::libc::SIGUSR1) {
-            session.restore_suspend_origin(SuspendOrigin::Memory, SuspendOrigin::None);
+            session.restore_suspend_origin(SuspendOrigin::Pressure, SuspendOrigin::None);
             session.set_memory_suspend_started_ms(previous_started);
             return Err(error);
         }
-        Ok(())
+        Ok(now_ms().max(pending_started_ms))
     }
 
-    pub fn memory_suspend_pending_since(&self) -> Option<u64> {
+    pub fn pressure_suspend_pending_since(&self) -> Option<u64> {
         let sessions: Vec<Arc<PtySession>> =
             self.sessions.lock().unwrap().values().cloned().collect();
         sessions
             .into_iter()
             .filter(|session| {
-                session.suspend_origin() == SuspendOrigin::Memory
+                session.suspend_origin() == SuspendOrigin::Pressure
                     && session.run_state().as_deref() != Some("suspended")
             })
             .map(|session| session.memory_suspend_started_ms())
@@ -1127,9 +1359,13 @@ impl SessionManager {
             .min()
     }
 
-    pub fn cgroup_memory_sample(
-        &self,
-    ) -> anyhow::Result<Option<(u64, HashMap<String, u64>)>> {
+    /// Compatibility name for the existing memory guardian; automatic
+    /// suspension is now shared by memory-budget and host-PSI policy.
+    pub fn memory_suspend_pending_since(&self) -> Option<u64> {
+        self.pressure_suspend_pending_since()
+    }
+
+    pub fn cgroup_memory_sample(&self) -> anyhow::Result<Option<(u64, HashMap<String, u64>)>> {
         if !self.cgroups.is_enabled() {
             return Ok(None);
         }
@@ -1146,7 +1382,9 @@ impl SessionManager {
             if !session.is_alive() {
                 continue;
             }
-            let Some(meta) = self.effective_meta_for(&name, &session)? else { continue };
+            let Some(meta) = self.effective_meta_for(&name, &session)? else {
+                continue;
+            };
             if let Some(current_kb) = self.cgroups.session_current_kb(meta.slot)? {
                 per_session.insert(name, current_kb);
             }
@@ -1223,9 +1461,7 @@ impl SessionManager {
         };
         for slot in slots {
             if let Err(error) = self.cgroups.rewrite_session_high(slot) {
-                eprintln!(
-                    "amber daemon: could not move session-{slot} memory.high: {error}"
-                );
+                eprintln!("amber daemon: could not move session-{slot} memory.high: {error}");
             }
         }
         Ok(status)
@@ -1237,7 +1473,11 @@ impl SessionManager {
     pub fn session_kind(&self, name: &str) -> Option<SessionKind> {
         let session = self.session(name);
         match session {
-            Some(session) => self.effective_meta_for(name, &session).ok().flatten().map(|m| m.kind),
+            Some(session) => self
+                .effective_meta_for(name, &session)
+                .ok()
+                .flatten()
+                .map(|m| m.kind),
             None => self.store.read_session(name).ok().flatten().map(|m| m.kind),
         }
     }
@@ -1259,12 +1499,7 @@ impl SessionManager {
     /// successfully acknowledged but does not overwrite newer state. Legacy
     /// sequence-zero reporters remain supported until a versioned report has
     /// established authority for this live supervisor.
-    pub fn set_run_state_report(
-        &self,
-        name: &str,
-        state: &str,
-        seq: u64,
-    ) -> anyhow::Result<bool> {
+    pub fn set_run_state_report(&self, name: &str, state: &str, seq: u64) -> anyhow::Result<bool> {
         // "suspended" (Slice 3): the agent parked by a freeze grace — child
         // killed to free RAM, pty held idle, resumable.
         if !matches!(
@@ -1297,7 +1532,11 @@ impl SessionManager {
         // is the same reconciliation for a live cgroup reclaim failure.
         let release_suspension = state == "suspend-failed"
             || (state == "shell-fallback" && !sess.initial_suspend_ready());
-        let projected_state = if state == "suspend-failed" { "claude" } else { state };
+        let projected_state = if state == "suspend-failed" {
+            "claude"
+        } else {
+            state
+        };
         sess.set_run_state(Some(projected_state.to_string()));
         if seq > 0 {
             sess.set_run_state_seq(seq);
@@ -1362,7 +1601,10 @@ impl SessionManager {
 
         let state = session.run_state();
         if matches!(state.as_deref(), Some("claude-retrying" | "shell-fallback")) {
-            anyhow::bail!("cannot suspend session {name} while it is {}", state.unwrap());
+            anyhow::bail!(
+                "cannot suspend session {name} while it is {}",
+                state.unwrap()
+            );
         }
         if !matches!(state.as_deref(), Some("claude" | "suspended")) {
             anyhow::bail!("cannot suspend session {name} without a running agent");
@@ -1376,7 +1618,7 @@ impl SessionManager {
             return Self::signal_supervisor(name, &session, nix::libc::SIGUSR1);
         }
         if current != SuspendOrigin::None
-            && !(current == SuspendOrigin::Memory && origin == SuspendOrigin::Manual)
+            && !(current == SuspendOrigin::Pressure && origin == SuspendOrigin::Manual)
         {
             anyhow::bail!("session {name} is already suspended by {current:?}");
         }
@@ -1384,19 +1626,19 @@ impl SessionManager {
             anyhow::bail!("cannot newly suspend session {name} while it is suspended");
         }
 
-        let previous = session
-            .claim_suspend(origin)
-            .map_err(|existing| anyhow::anyhow!("session {name} is already suspended by {existing:?}"))?;
+        let previous = session.claim_suspend(origin).map_err(|existing| {
+            anyhow::anyhow!("session {name} is already suspended by {existing:?}")
+        })?;
         let previous_started = session.memory_suspend_started_ms();
         match origin {
-            SuspendOrigin::Memory => {
+            SuspendOrigin::Pressure => {
                 session.set_memory_suspend_started_ms(crate::pty::monotonic_ms().max(1));
             }
             SuspendOrigin::Manual => session.set_memory_suspend_started_ms(0),
             SuspendOrigin::None => unreachable!(),
         }
 
-        if previous == SuspendOrigin::Memory && state.as_deref() == Some("suspended") {
+        if previous == SuspendOrigin::Pressure && state.as_deref() == Some("suspended") {
             return Ok(());
         }
         if let Err(error) = Self::signal_supervisor(name, &session, nix::libc::SIGUSR1) {
@@ -1416,7 +1658,7 @@ impl SessionManager {
         let origin = session.suspend_origin();
         let eligible = match cause {
             ResumeCause::Manual => origin != SuspendOrigin::None,
-            ResumeCause::Focus => origin == SuspendOrigin::Memory,
+            ResumeCause::Focus => origin == SuspendOrigin::Pressure,
         };
         if !eligible {
             return Ok(false);
@@ -1460,10 +1702,19 @@ impl SessionManager {
         let session = self
             .session(name)
             .ok_or_else(|| anyhow::anyhow!("no such session: {name}"))?;
-        let _transition = session.lock_suspend_transition();
-        self.ensure_current_session(name, &session)?;
-        session.mark_user_activity();
-        self.resume_for_focus_locked(name, &session)
+        let foreground_changed;
+        let result;
+        {
+            let _transition = session.lock_suspend_transition();
+            self.ensure_current_session(name, &session)?;
+            foreground_changed = self.set_foreground_locked(name, &session)?;
+            session.mark_user_activity();
+            result = self.resume_for_focus_locked(name, &session);
+        }
+        if foreground_changed {
+            self.reconcile_cpu_weights();
+        }
+        result
     }
 
     pub fn names(&self) -> Vec<String> {
@@ -1498,12 +1749,17 @@ impl SessionManager {
                     alive: sess.is_alive(),
                     updated: meta.updated,
                     run_state: match (sess.run_state(), sess.suspend_origin()) {
-                        (Some(state), SuspendOrigin::Memory) if state == "suspended" => {
-                            Some("memory-suspended".to_string())
+                        (Some(state), SuspendOrigin::Pressure) if state == "suspended" => {
+                            Some("resource-suspended".to_string())
                         }
                         (state, _) => state,
                     },
-                    claude_id: self.store.read_claude(&meta.name).ok().flatten().map(|c| c.session_id),
+                    claude_id: self
+                        .store
+                        .read_claude(&meta.name)
+                        .ok()
+                        .flatten()
+                        .map(|c| c.session_id),
                     cols: sess.size().map(|(_, c)| c).unwrap_or(0),
                     rows: sess.size().map(|(r, _)| r).unwrap_or(0),
                     slot: meta.slot,
@@ -1518,14 +1774,25 @@ impl SessionManager {
         let session = self
             .session(name)
             .ok_or_else(|| anyhow::anyhow!("no such session: {name}"))?;
-        let _transition = session.lock_suspend_transition();
-        self.ensure_current_session(name, &session)?;
-        session.mark_user_activity();
-        self.resume_for_focus_locked(name, &session)?;
-        if session.suspend_origin() == SuspendOrigin::Manual {
-            anyhow::bail!("session is manually suspended: {name}");
+        let foreground_changed;
+        let result;
+        {
+            let _transition = session.lock_suspend_transition();
+            self.ensure_current_session(name, &session)?;
+            foreground_changed = self.set_foreground_locked(name, &session)?;
+            session.mark_user_activity();
+            result = (|| {
+                self.resume_for_focus_locked(name, &session)?;
+                if session.suspend_origin() == SuspendOrigin::Manual {
+                    anyhow::bail!("session is manually suspended: {name}");
+                }
+                session.write(bytes)
+            })();
         }
-        session.write(bytes)
+        if foreground_changed {
+            self.reconcile_cpu_weights();
+        }
+        result
     }
 
     pub fn resize(&self, name: &str, rows: u16, cols: u16) -> anyhow::Result<()> {
@@ -1559,6 +1826,7 @@ impl SessionManager {
                 self.stop_session_locked(meta.slot, Some(&session))?;
                 self.store.remove_session(&name)?;
                 self.sessions.lock().unwrap().remove(&name);
+                self.clear_foreground_slot(meta.slot);
                 Ok(())
             })();
             match result {
@@ -1567,6 +1835,9 @@ impl SessionManager {
                     eprintln!("amber daemon: could not reap session {name}: {error}");
                 }
             }
+        }
+        if !reaped.is_empty() {
+            self.reconcile_cpu_weights();
         }
         Ok(reaped)
     }
@@ -1591,8 +1862,7 @@ impl SessionManager {
         Self::validate_name(to)?;
         let _maint = self.maintenance.lock().unwrap();
         self.finish_pending_rename()?;
-        if self.sessions.lock().unwrap().contains_key(to)
-            || self.store.read_session(to)?.is_some()
+        if self.sessions.lock().unwrap().contains_key(to) || self.store.read_session(to)?.is_some()
         {
             anyhow::bail!("session already exists: {to}");
         }
@@ -1607,26 +1877,33 @@ impl SessionManager {
             .effective_meta_for(from, &sess)?
             .ok_or_else(|| anyhow::anyhow!("session {from} vanished from the store"))?;
         let size = sess.size();
-        let _transition = old_meta.kind.is_agent().then(|| sess.lock_suspend_transition());
-        let suspension = (sess.suspend_origin() != SuspendOrigin::None).then(|| {
-            (sess.suspend_origin(), sess.memory_suspend_started_ms())
-        });
+        let _transition = old_meta
+            .kind
+            .is_agent()
+            .then(|| sess.lock_suspend_transition());
+        let suspension = (sess.suspend_origin() != SuspendOrigin::None)
+            .then(|| (sess.suspend_origin(), sess.memory_suspend_started_ms()));
 
         if old_meta.kind.is_agent() {
             self.stop_session_locked(old_meta.slot, Some(&sess))?;
         }
         if let Err(error) = self.store.rename_session(from, to) {
             if old_meta.kind.is_agent() {
-                if let Err(rollback) =
-                    self.rollback_agent_rename(from, to, &old_meta, size, suspension, false)
-                {
+                let rollback =
+                    self.rollback_agent_rename(from, to, &old_meta, size, suspension, false);
+                drop(_transition);
+                self.reconcile_cpu_weights();
+                if let Err(rollback) = rollback {
                     anyhow::bail!("{error}; rename rollback failed: {rollback}");
                 }
             }
             return Err(error);
         }
 
-        let meta = SessionMeta { name: to.to_string(), ..old_meta.clone() };
+        let meta = SessionMeta {
+            name: to.to_string(),
+            ..old_meta.clone()
+        };
         let sess = if meta.kind.is_agent() {
             let fresh = match self
                 .cgroups
@@ -1636,9 +1913,11 @@ impl SessionManager {
             {
                 Ok(fresh) => fresh,
                 Err(error) => {
-                    if let Err(rollback) =
-                        self.rollback_agent_rename(from, to, &old_meta, size, suspension, true)
-                    {
+                    let rollback =
+                        self.rollback_agent_rename(from, to, &old_meta, size, suspension, true);
+                    drop(_transition);
+                    self.reconcile_cpu_weights();
+                    if let Err(rollback) = rollback {
                         anyhow::bail!("{error}; rename rollback failed: {rollback}");
                     }
                     return Err(error);
@@ -1665,6 +1944,8 @@ impl SessionManager {
             sessions.insert(to.to_string(), Arc::clone(&sess));
         }
         self.claude_absent.lock().unwrap().remove(from);
+        drop(_transition);
+        self.reconcile_cpu_weights();
 
         Ok(SessionInfo {
             name: meta.name,
@@ -1673,7 +1954,12 @@ impl SessionManager {
             alive: sess.is_alive(),
             updated: meta.updated,
             run_state: sess.run_state(),
-            claude_id: self.store.read_claude(to).ok().flatten().map(|c| c.session_id),
+            claude_id: self
+                .store
+                .read_claude(to)
+                .ok()
+                .flatten()
+                .map(|c| c.session_id),
             cols: sess.size().map(|(_, c)| c).unwrap_or(0),
             rows: sess.size().map(|(r, _)| r).unwrap_or(0),
             // A rename carries the slot across unchanged (spec §2): the slot
@@ -1694,17 +1980,25 @@ impl SessionManager {
             Some(session) => self.effective_meta_for(name, session)?,
             None => self.store.read_session(name)?,
         };
-        let _transition = sess.as_ref().map(|session| session.lock_suspend_transition());
-        if let Some(meta) = meta {
-            self.stop_session_locked(meta.slot, sess.as_ref())?;
-        } else if let Some(sess) = &sess {
-            sess.kill()?;
-            if !sess.wait_for_exit(CHILD_EXIT_TIMEOUT) {
-                anyhow::bail!("session child {name} did not exit after termination");
+        {
+            let _transition = sess
+                .as_ref()
+                .map(|session| session.lock_suspend_transition());
+            if let Some(ref meta) = meta {
+                self.stop_session_locked(meta.slot, sess.as_ref())?;
+            } else if let Some(sess) = &sess {
+                sess.kill()?;
+                if !sess.wait_for_exit(CHILD_EXIT_TIMEOUT) {
+                    anyhow::bail!("session child {name} did not exit after termination");
+                }
+            }
+            self.store.remove_session(name)?;
+            self.sessions.lock().unwrap().remove(name);
+            if let Some(ref meta) = meta {
+                self.clear_foreground_slot(meta.slot);
             }
         }
-        self.store.remove_session(name)?;
-        self.sessions.lock().unwrap().remove(name);
+        self.reconcile_cpu_weights();
         Ok(())
     }
 }
@@ -1716,7 +2010,8 @@ mod tests {
     use crate::pty::SuspendOrigin;
     use portable_pty::CommandBuilder;
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::{mpsc, Barrier};
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::{mpsc, Barrier, Condvar};
     use tempfile::tempdir;
 
     fn with_fake_cgroups(state: &Path, cgroup_root: &Path) -> SessionManager {
@@ -1724,6 +2019,15 @@ mod tests {
             state,
             Config::default(),
             CgroupManager::test_root(cgroup_root),
+        )
+        .unwrap()
+    }
+
+    fn with_fake_cpu_cgroups(state: &Path, cgroup_root: &Path) -> SessionManager {
+        SessionManager::new_with_cgroups(
+            state,
+            Config::default(),
+            CgroupManager::test_root_with_cpu(cgroup_root),
         )
         .unwrap()
     }
@@ -1751,7 +2055,9 @@ mod tests {
         mgr.store_effective_budget_kb(Some(4 * 1024 * 1024));
 
         // A live session so one materialised leaf exists to be moved.
-        let sess = mgr.create("amber-1-1-0-a", "/tmp", SessionKind::Shell).unwrap();
+        let sess = mgr
+            .create("amber-1-1-0-a", "/tmp", SessionKind::Shell)
+            .unwrap();
         wait_for_output(&sess, b"READY");
         let high = cgroup_root.join("session-1").join("memory.high");
         assert!(high.exists(), "prepare_session must have written the leaf");
@@ -1767,7 +2073,10 @@ mod tests {
 
         // Persisted: a fresh manager loads the same configured value.
         let reloaded = SessionManager::new(&state).unwrap();
-        assert_eq!(reloaded.get_memory_budget().unwrap().configured_mb, Some(20_480));
+        assert_eq!(
+            reloaded.get_memory_budget().unwrap().configured_mb,
+            Some(20_480)
+        );
 
         // Auto clears the override.
         let auto = mgr.set_memory_budget(None).unwrap();
@@ -1776,13 +2085,24 @@ mod tests {
 
     fn wait_for_output(session: &PtySession, needle: &[u8]) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !session.scrollback().windows(needle.len()).any(|bytes| bytes == needle) {
-            assert!(std::time::Instant::now() < deadline, "missing output {needle:?}");
+        while !session
+            .scrollback()
+            .windows(needle.len())
+            .any(|bytes| bytes == needle)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "missing output {needle:?}"
+            );
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
     }
 
     fn fake_agent(mgr: &SessionManager, name: &str) -> Arc<PtySession> {
+        fake_agent_with_slot(mgr, name, 1)
+    }
+
+    fn fake_agent_with_slot(mgr: &SessionManager, name: &str, slot: u32) -> Arc<PtySession> {
         let mut cmd = CommandBuilder::new("/bin/sh");
         cmd.arg("-c");
         cmd.arg(
@@ -1804,12 +2124,28 @@ mod tests {
                 updated: 1,
                 resume_as_claude: false,
                 run_state: None,
-                slot: 1,
+                slot,
             })
             .unwrap();
         session.set_run_state(Some("claude".into()));
-        mgr.sessions.lock().unwrap().insert(name.to_string(), Arc::clone(&session));
+        mgr.sessions
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), Arc::clone(&session));
         session
+    }
+
+    fn record_resume_id(mgr: &SessionManager, name: &str, cwd: &Path) {
+        mgr.store
+            .write_claude(
+                name,
+                &amber_core::state::ClaudeMeta {
+                    session_id: format!("resume-{name}"),
+                    cwd: cwd.to_path_buf(),
+                    updated: 1,
+                },
+            )
+            .unwrap();
     }
 
     fn write_rename_journal(root: &Path, from: &str, to: &str, mut source: SessionMeta) {
@@ -1959,8 +2295,10 @@ mod tests {
     fn session_infos_projects_metadata_for_live_sessions() {
         let dir = tempdir().unwrap();
         let mgr = SessionManager::new(dir.path()).unwrap();
-        mgr.create("amber-1-1-0-a", "/tmp", SessionKind::Shell).unwrap();
-        mgr.create("amber-1-1-1-b", dir.path(), SessionKind::Claude).unwrap();
+        mgr.create("amber-1-1-0-a", "/tmp", SessionKind::Shell)
+            .unwrap();
+        mgr.create("amber-1-1-1-b", dir.path(), SessionKind::Claude)
+            .unwrap();
 
         let mut infos = mgr.session_infos().unwrap();
         infos.sort_by(|a, b| a.name.cmp(&b.name));
@@ -2020,7 +2358,8 @@ mod tests {
         let sess = mgr.session("sh").unwrap();
 
         let target = std::fs::canonicalize(dir.path()).unwrap();
-        sess.write(format!("cd '{}'\n", target.display()).as_bytes()).unwrap();
+        sess.write(format!("cd '{}'\n", target.display()).as_bytes())
+            .unwrap();
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while sess.live_cwd() != Some(target.clone()) {
@@ -2043,21 +2382,28 @@ mod tests {
         let sess = mgr.session(to).unwrap();
         let expected = mgr.store.read_session(to).unwrap().unwrap();
         mgr.store
-            .write_session(&SessionMeta { name: from.to_string(), ..expected.clone() })
+            .write_session(&SessionMeta {
+                name: from.to_string(),
+                ..expected.clone()
+            })
             .unwrap();
         write_rename_journal(dir.path(), from, to, expected.clone());
         let obstruction = dir.path().join(format!("claude/{from}.json"));
         std::fs::create_dir_all(&obstruction).unwrap();
 
         let target = std::fs::canonicalize(dir.path()).unwrap();
-        sess.write(format!("cd '{}'\n", target.display()).as_bytes()).unwrap();
+        sess.write(format!("cd '{}'\n", target.display()).as_bytes())
+            .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while sess.live_cwd() != Some(target.clone()) {
             assert!(std::time::Instant::now() < deadline, "shell never cd'd");
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
 
-        assert!(mgr.snapshot().is_err(), "snapshot ignored pending rename cleanup");
+        assert!(
+            mgr.snapshot().is_err(),
+            "snapshot ignored pending rename cleanup"
+        );
         assert_eq!(mgr.store.read_session(to).unwrap(), Some(expected));
         assert!(dir.path().join("rename.json").exists());
 
@@ -2101,7 +2447,10 @@ mod tests {
                 break;
             }
             last = now;
-            assert!(std::time::Instant::now() < deadline, "shell never went quiet");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "shell never went quiet"
+            );
         }
 
         mgr.snapshot().unwrap();
@@ -2129,11 +2478,17 @@ mod tests {
         sess.write(b"printf SNAPSHOT_MARKER\n").unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while sess.scrollback_written() == before {
-            assert!(std::time::Instant::now() < deadline, "no output reached the ring");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no output reached the ring"
+            );
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         mgr.snapshot().unwrap();
-        assert!(path.exists(), "a changed scrollback must still be persisted");
+        assert!(
+            path.exists(),
+            "a changed scrollback must still be persisted"
+        );
     }
 
     #[test]
@@ -2142,7 +2497,8 @@ mod tests {
         // differs between hand-start and systemd), breaking claude resume.
         let dir = tempdir().unwrap();
         let mgr = SessionManager::new(dir.path()).unwrap();
-        mgr.create("amber-1-1-0-a", ".", SessionKind::Shell).unwrap();
+        mgr.create("amber-1-1-0-a", ".", SessionKind::Shell)
+            .unwrap();
         let cwd = mgr.session_infos().unwrap()[0].cwd.clone();
         let home = std::env::var("HOME").unwrap_or_default();
         assert_eq!(cwd, home, "'.' must resolve to an absolute, stable $HOME");
@@ -2158,9 +2514,15 @@ mod tests {
         let mgr = with_fake_cgroups(dir.path(), cgroups.path());
         mgr.create("removed", "/tmp", SessionKind::Shell).unwrap();
         let removed_slot = mgr.store.read_session("removed").unwrap().unwrap().slot;
-        assert!(cgroups.path().join(format!("session-{removed_slot}")).exists());
+        assert!(cgroups
+            .path()
+            .join(format!("session-{removed_slot}"))
+            .exists());
         mgr.remove("removed").unwrap();
-        assert!(!cgroups.path().join(format!("session-{removed_slot}")).exists());
+        assert!(!cgroups
+            .path()
+            .join(format!("session-{removed_slot}"))
+            .exists());
 
         mgr.create("dies", "/tmp", SessionKind::Shell).unwrap();
         mgr.create("lives", "/tmp", SessionKind::Shell).unwrap();
@@ -2180,6 +2542,192 @@ mod tests {
         assert!(!dir.path().join("sessions/dies.json").exists());
         assert!(dir.path().join("sessions/lives.json").exists());
         assert!(!cgroups.path().join(format!("session-{dead_slot}")).exists());
+    }
+
+    #[test]
+    fn cpu_weight_failures_do_not_block_session_create_or_focus() {
+        let dir = tempdir().unwrap();
+        let cgroups = tempdir().unwrap();
+        let mgr = with_fake_cpu_cgroups(dir.path(), cgroups.path());
+
+        mgr.create("background", "/tmp", SessionKind::Shell)
+            .unwrap();
+        mgr.create("foreground", "/tmp", SessionKind::Shell)
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(cgroups.path().join("session-1/cpu.weight")).unwrap(),
+            "100",
+            "new sessions must start with background CPU priority",
+        );
+
+        assert!(!mgr.focus_session("foreground").unwrap());
+        assert_eq!(
+            std::fs::read_to_string(cgroups.path().join("session-2/cpu.weight")).unwrap(),
+            "1000",
+            "the focused stable slot gets the foreground CPU priority",
+        );
+
+        std::fs::remove_file(cgroups.path().join("session-2/cpu.weight")).unwrap();
+        assert!(
+            mgr.focus_session("background").is_ok(),
+            "a missing optional cpu.weight must not break focus",
+        );
+        assert_eq!(mgr.foreground_slot(), 1);
+    }
+
+    #[test]
+    fn concurrent_focus_reconciliation_uses_latest_slot_without_holding_transition_lock() {
+        // Regression: two Focus handlers used to scan/write the cgroup tree
+        // concurrently. This hook holds the slot-1 scan until the slot-2 scan
+        // finishes, which deterministically left the older slot promoted.
+        #[derive(Default)]
+        struct RaceState {
+            first_started: bool,
+            second_finished: bool,
+        }
+
+        let dir = tempdir().unwrap();
+        let cgroups = tempdir().unwrap();
+        let mgr = Arc::new(with_fake_cpu_cgroups(dir.path(), cgroups.path()));
+        mgr.create("first", dir.path(), SessionKind::Shell)
+            .unwrap();
+        mgr.create("second", dir.path(), SessionKind::Shell)
+            .unwrap();
+        let first_session = mgr.session("first").unwrap();
+        let coordination = Arc::new((Mutex::new(RaceState::default()), Condvar::new()));
+        let transition_was_held = Arc::new(AtomicBool::new(false));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        mgr.set_cpu_reconcile_hook({
+            let cgroup_root = cgroups.path().to_path_buf();
+            let coordination = Arc::clone(&coordination);
+            let first_session = Arc::clone(&first_session);
+            let transition_was_held = Arc::clone(&transition_was_held);
+            let events = Arc::clone(&events);
+            Arc::new(move |point, foreground_slot| {
+                events.lock().unwrap().push((point, foreground_slot));
+                if point == CpuReconcilePoint::Start {
+                    // Regular fake files retain the trailing byte when "100"
+                    // overwrites "1000"; real cgroup control files do not.
+                    // Clear them at each pass boundary so assertions model the
+                    // kernel control-file semantics rather than regular-file
+                    // overwrite semantics.
+                    for slot in [1, 2] {
+                        std::fs::write(
+                            cgroup_root.join(format!("session-{slot}/cpu.weight")),
+                            "",
+                        )
+                        .unwrap();
+                    }
+                }
+                let (state, changed) = &*coordination;
+                match (point, foreground_slot) {
+                    (CpuReconcilePoint::Start, 1) => {
+                        transition_was_held.store(
+                            first_session.suspend_transition_locked_for_test(),
+                            Ordering::SeqCst,
+                        );
+                        let mut state = state.lock().unwrap();
+                        state.first_started = true;
+                        changed.notify_all();
+                        let _ = changed
+                            .wait_timeout_while(
+                                state,
+                                Duration::from_millis(500),
+                                |state| !state.second_finished,
+                            )
+                            .unwrap();
+                    }
+                    (CpuReconcilePoint::Finish, 2) => {
+                        let mut state = state.lock().unwrap();
+                        state.second_finished = true;
+                        changed.notify_all();
+                    }
+                    _ => {}
+                }
+            })
+        });
+
+        let first_start = Arc::new(Barrier::new(2));
+        let first_focus = {
+            let mgr = Arc::clone(&mgr);
+            let first_start = Arc::clone(&first_start);
+            std::thread::spawn(move || {
+                first_start.wait();
+                mgr.focus_session("first")
+            })
+        };
+        first_start.wait();
+        {
+            let (state, changed) = &*coordination;
+            let state = state.lock().unwrap();
+            let (state, timeout) = changed
+                .wait_timeout_while(state, Duration::from_secs(5), |state| {
+                    !state.first_started
+                })
+                .unwrap();
+            assert!(state.first_started && !timeout.timed_out());
+        }
+        let second_focus = {
+            let mgr = Arc::clone(&mgr);
+            std::thread::spawn(move || mgr.focus_session("second"))
+        };
+
+        assert!(!second_focus.join().unwrap().unwrap());
+        assert!(!first_focus.join().unwrap().unwrap());
+        assert_eq!(mgr.foreground_slot(), 2);
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                (CpuReconcilePoint::Start, 1),
+                (CpuReconcilePoint::Finish, 1),
+                (CpuReconcilePoint::Start, 2),
+                (CpuReconcilePoint::Finish, 2),
+            ],
+            "reconciliation passes must not overlap",
+        );
+        assert_eq!(
+            std::fs::read_to_string(cgroups.path().join("session-1/cpu.weight")).unwrap(),
+            "100",
+            "an older concurrent reconciliation must not leave its slot promoted",
+        );
+        assert_eq!(
+            std::fs::read_to_string(cgroups.path().join("session-2/cpu.weight")).unwrap(),
+            "1000",
+            "the latest foreground slot must own the final weight set",
+        );
+        assert!(
+            !transition_was_held.load(Ordering::SeqCst),
+            "the O(session-count) scan must run after releasing the per-session transition lock",
+        );
+    }
+
+    #[test]
+    fn repeated_input_on_the_foreground_slot_skips_cpu_reconciliation() {
+        let dir = tempdir().unwrap();
+        let cgroups = tempdir().unwrap();
+        let mgr = with_fake_cpu_cgroups(dir.path(), cgroups.path());
+        mgr.create("foreground", dir.path(), SessionKind::Shell)
+            .unwrap();
+        assert!(!mgr.focus_session("foreground").unwrap());
+
+        let reconciliations = Arc::new(AtomicUsize::new(0));
+        mgr.set_cpu_reconcile_hook({
+            let reconciliations = Arc::clone(&reconciliations);
+            Arc::new(move |point, _| {
+                if point == CpuReconcilePoint::Start {
+                    reconciliations.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        });
+
+        for input in [b"one\n".as_slice(), b"two\n", b"three\n"] {
+            mgr.write("foreground", input).unwrap();
+        }
+        assert_eq!(
+            reconciliations.load(Ordering::SeqCst),
+            0,
+            "input in the already-foreground pane must stay O(1)",
+        );
     }
 
     #[test]
@@ -2210,8 +2758,14 @@ mod tests {
         assert_eq!(reaped, vec!["clean".to_string()]);
         assert_eq!(mgr.names(), vec!["blocked".to_string()]);
         assert!(mgr.store.read_session("blocked").unwrap().is_some());
-        assert!(cgroups.path().join(format!("session-{blocked_slot}")).exists());
-        assert!(!cgroups.path().join(format!("session-{clean_slot}")).exists());
+        assert!(cgroups
+            .path()
+            .join(format!("session-{blocked_slot}"))
+            .exists());
+        assert!(!cgroups
+            .path()
+            .join(format!("session-{clean_slot}"))
+            .exists());
 
         std::fs::remove_dir(obstruction).unwrap();
         assert_eq!(mgr.reap().unwrap(), vec!["blocked".to_string()]);
@@ -2229,7 +2783,10 @@ mod tests {
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
         let result = mgr.create("orphan", "/tmp", SessionKind::Shell);
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(result.is_err(), "create must fail when the store is unwritable");
+        assert!(
+            result.is_err(),
+            "create must fail when the store is unwritable"
+        );
         assert!(mgr.names().is_empty(), "failed create must not be tracked");
         assert!(!dir.path().join("sessions/orphan.json").exists());
         assert!(!cgroups.path().join("session-1").exists());
@@ -2246,7 +2803,10 @@ mod tests {
         if let Ok(session) = created {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             while session.is_alive() {
-                assert!(std::time::Instant::now() < deadline, "missing shell stayed alive");
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "missing shell stayed alive"
+                );
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
             mgr.reap().unwrap();
@@ -2276,10 +2836,18 @@ mod tests {
             thread.join().unwrap();
         }
 
-        let slots: BTreeSet<u32> = mgr.session_infos().unwrap().into_iter().map(|i| i.slot).collect();
+        let slots: BTreeSet<u32> = mgr
+            .session_infos()
+            .unwrap()
+            .into_iter()
+            .map(|i| i.slot)
+            .collect();
         assert_eq!(slots.len(), 2);
         assert!(!slots.contains(&0));
-        assert_eq!(StateStore::new(dir.path()).list_sessions().unwrap().len(), 2);
+        assert_eq!(
+            StateStore::new(dir.path()).list_sessions().unwrap().len(),
+            2
+        );
     }
 
     #[test]
@@ -2296,7 +2864,10 @@ mod tests {
 
         let mgr = with_fake_cgroups(dir.path(), cgroups.path());
         mgr.restore().unwrap();
-        assert_eq!(mgr.store.read_session("restored").unwrap().unwrap().slot, slot);
+        assert_eq!(
+            mgr.store.read_session("restored").unwrap().unwrap().slot,
+            slot
+        );
         assert!(cgroups.path().join(format!("session-{slot}")).is_dir());
     }
 
@@ -2318,7 +2889,10 @@ mod tests {
         };
         store.write_session(&source).unwrap();
         store
-            .write_session(&SessionMeta { name: to.to_string(), ..source.clone() })
+            .write_session(&SessionMeta {
+                name: to.to_string(),
+                ..source.clone()
+            })
             .unwrap();
         write_rename_journal(dir.path(), from, to, source);
         let obstruction = dir.path().join(format!("claude/{from}.json"));
@@ -2327,7 +2901,10 @@ mod tests {
         let mgr = with_fake_cgroups(dir.path(), cgroups.path());
         let restored = mgr.restore();
 
-        assert!(restored.is_ok(), "retryable cleanup prevented startup: {restored:?}");
+        assert!(
+            restored.is_ok(),
+            "retryable cleanup prevented startup: {restored:?}"
+        );
         assert_eq!(mgr.names(), vec![to.to_string()]);
         assert!(store.read_session(from).unwrap().is_none());
         assert!(store.read_session(to).unwrap().is_some());
@@ -2356,7 +2933,10 @@ mod tests {
         };
         store.write_session(&source).unwrap();
         store
-            .write_session(&SessionMeta { name: to.to_string(), ..source.clone() })
+            .write_session(&SessionMeta {
+                name: to.to_string(),
+                ..source.clone()
+            })
             .unwrap();
         write_rename_journal(dir.path(), from, to, source);
         let obstruction = dir.path().join(format!("claude/{from}.json"));
@@ -2396,11 +2976,17 @@ mod tests {
             slot: 1,
         };
         store
-            .write_session(&SessionMeta { name: other.to_string(), ..source.clone() })
+            .write_session(&SessionMeta {
+                name: other.to_string(),
+                ..source.clone()
+            })
             .unwrap();
         store.write_session(&source).unwrap();
         store
-            .write_session(&SessionMeta { name: to.to_string(), ..source.clone() })
+            .write_session(&SessionMeta {
+                name: to.to_string(),
+                ..source.clone()
+            })
             .unwrap();
         write_rename_journal(dir.path(), from, to, source);
         let obstruction = dir.path().join(format!("claude/{from}.json"));
@@ -2450,7 +3036,10 @@ mod tests {
         };
         store.write_session(&source).unwrap();
         store
-            .write_session(&SessionMeta { name: to.to_string(), ..source.clone() })
+            .write_session(&SessionMeta {
+                name: to.to_string(),
+                ..source.clone()
+            })
             .unwrap();
         write_rename_journal(dir.path(), from, to, source);
         let obstruction = dir.path().join(format!("claude/{from}.json"));
@@ -2465,12 +3054,14 @@ mod tests {
         assert_eq!(first.session_infos().unwrap()[0].kind, "claude");
         assert_eq!(first.session_kind(to), Some(SessionKind::Claude));
         assert!(first.set_run_state(to, "claude").is_ok());
-        assert!(first
-            .memory_candidates(&HashMap::from([(to.to_string(), 1)]))
-            .into_iter()
-            .next()
-            .unwrap()
-            .is_agent);
+        assert!(
+            first
+                .memory_candidates(&HashMap::from([(to.to_string(), 1)]))
+                .into_iter()
+                .next()
+                .unwrap()
+                .is_agent
+        );
         std::fs::remove_dir(obstruction).unwrap();
         first.finish_pending_rename().unwrap();
         let flushed = store.read_session(to).unwrap().unwrap();
@@ -2501,7 +3092,10 @@ mod tests {
         repaired.kind = SessionKind::Grok;
         mgr.deferred_meta.lock().unwrap().insert(
             name.to_string(),
-            LiveMetaOverride { session: Arc::downgrade(&old), meta: repaired },
+            LiveMetaOverride {
+                session: Arc::downgrade(&old),
+                meta: repaired,
+            },
         );
 
         let replacement = fake_agent(&mgr, name);
@@ -2611,9 +3205,9 @@ mod tests {
         let mgr = SessionManager::new(dir.path()).unwrap();
         let session = fake_agent(&mgr, "agent");
 
-        mgr.suspend("agent", SuspendOrigin::Memory).unwrap();
+        mgr.suspend("agent", SuspendOrigin::Pressure).unwrap();
         wait_for_output(&session, b"SUSPEND_SIGNAL");
-        assert_eq!(session.suspend_origin(), SuspendOrigin::Memory);
+        assert_eq!(session.suspend_origin(), SuspendOrigin::Pressure);
         assert_ne!(session.memory_suspend_started_ms(), 0);
 
         session.set_run_state(Some("suspended".into()));
@@ -2645,13 +3239,147 @@ mod tests {
         let candidates = mgr.memory_candidates(&HashMap::from([("agent".to_string(), 321)]));
         assert_eq!(candidates.len(), 1);
         let candidate = &candidates[0];
-        assert_eq!((candidate.name.as_str(), candidate.memory_kb), ("agent", 321));
+        assert_eq!(
+            (candidate.name.as_str(), candidate.memory_kb),
+            ("agent", 321)
+        );
         assert!(candidate.is_agent && candidate.running && candidate.has_resume_id);
         assert!(!candidate.suspended);
         assert_eq!(candidate.last_used_ms, session.last_used_ms());
 
         session.claim_suspend(SuspendOrigin::Manual).unwrap();
         assert!(mgr.memory_candidates(&HashMap::new())[0].suspended);
+    }
+
+    #[test]
+    fn host_pressure_candidates_ignore_output_but_protect_recent_user_input() {
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        let session = fake_agent_with_slot(&mgr, "background", 1);
+        record_resume_id(&mgr, "background", dir.path());
+
+        let eligible_at = session.last_user_ms() + RECENT_USE_MS;
+        session.write(b"noisy-background-output\n").unwrap();
+        wait_for_output(&session, b"INPUT:noisy-background-output");
+        assert_eq!(
+            mgr.host_pressure_candidates(
+                eligible_at,
+                &HashMap::from([("background".to_string(), 321)]),
+            )
+            .iter()
+            .map(|candidate| candidate.name.as_str())
+            .collect::<Vec<_>>(),
+            vec!["background"],
+            "PTY output must not refresh host-pressure recency",
+        );
+
+        mgr.write("background", b"actual-user-input\n").unwrap();
+        wait_for_output(&session, b"INPUT:actual-user-input");
+        mgr.create("foreground-shell", dir.path(), SessionKind::Shell)
+            .unwrap();
+        mgr.focus_session("foreground-shell").unwrap();
+        let too_recent = session.last_user_ms() + RECENT_USE_MS - 1;
+        assert!(
+            mgr.host_pressure_candidates(
+                too_recent,
+                &HashMap::from([("background".to_string(), 321)]),
+            )
+            .is_empty(),
+            "actual user input must retain the 120-second protection",
+        );
+    }
+
+    #[test]
+    fn foreground_slot_remains_excluded_after_rename() {
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        let from = "foreground-before-rename";
+        let to = "foreground-after-rename";
+        mgr.create(from, dir.path(), SessionKind::Shell).unwrap();
+        assert!(!mgr.focus_session(from).unwrap());
+        let slot = mgr.store.read_session(from).unwrap().unwrap().slot;
+
+        mgr.rename(from, to).unwrap();
+        let session = mgr.session(to).unwrap();
+        session.set_run_state(Some("claude".into()));
+        let mut meta = mgr.store.read_session(to).unwrap().unwrap();
+        meta.kind = SessionKind::Claude;
+        mgr.store.write_session(&meta).unwrap();
+        record_resume_id(&mgr, to, dir.path());
+
+        assert_eq!(mgr.store.read_session(to).unwrap().unwrap().slot, slot);
+        assert!(
+            mgr.host_pressure_candidates(
+                session.last_user_ms() + RECENT_USE_MS,
+                &HashMap::from([(to.to_string(), 321)]),
+            )
+            .is_empty(),
+            "the stable foreground slot must survive a name change",
+        );
+        mgr.remove(to).unwrap();
+    }
+
+    #[test]
+    fn host_pressure_candidates_keep_existing_automatic_safety_exclusions() {
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        let eligible = fake_agent_with_slot(&mgr, "eligible", 1);
+        let manual = fake_agent_with_slot(&mgr, "manual", 2);
+        let retrying = fake_agent_with_slot(&mgr, "retrying", 3);
+        let missing_id = fake_agent_with_slot(&mgr, "missing-id", 4);
+        mgr.create("shell", dir.path(), SessionKind::Shell).unwrap();
+        record_resume_id(&mgr, "eligible", dir.path());
+        record_resume_id(&mgr, "manual", dir.path());
+        record_resume_id(&mgr, "retrying", dir.path());
+        manual.claim_suspend(SuspendOrigin::Manual).unwrap();
+        retrying.set_run_state(Some("claude-retrying".into()));
+
+        let now_ms = [
+            eligible.last_user_ms(),
+            manual.last_user_ms(),
+            retrying.last_user_ms(),
+            missing_id.last_user_ms(),
+        ]
+        .into_iter()
+        .max()
+        .unwrap()
+            + RECENT_USE_MS;
+        assert_eq!(
+            mgr.host_pressure_candidates(
+                now_ms,
+                &HashMap::from([
+                    ("eligible".to_string(), 1),
+                    ("manual".to_string(), 2),
+                    ("retrying".to_string(), 3),
+                    ("missing-id".to_string(), 4),
+                    ("shell".to_string(), 5),
+                ]),
+            )
+            .iter()
+            .map(|candidate| candidate.name.as_str())
+            .collect::<Vec<_>>(),
+            vec!["eligible"],
+        );
+    }
+
+    #[test]
+    fn automatic_pressure_suspend_rechecks_liveness_under_the_transition_lock() {
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        let session = fake_agent(&mgr, "agent");
+        record_resume_id(&mgr, "agent", dir.path());
+
+        session.kill().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while session.is_alive() {
+            assert!(std::time::Instant::now() < deadline, "agent never exited");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        let error = mgr.suspend_for_pressure("agent").unwrap_err();
+        assert!(error.to_string().contains("no such session"));
+        assert_eq!(session.suspend_origin(), SuspendOrigin::None);
+        assert_eq!(session.memory_suspend_started_ms(), 0);
     }
 
     #[test]
@@ -2679,7 +3407,10 @@ mod tests {
             session.write(format!("fill-{i}\n").as_bytes()).unwrap();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             while session.scrollback_written() == before_written {
-                assert!(std::time::Instant::now() < deadline, "fill frame {i} never flushed");
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "fill frame {i} never flushed"
+                );
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         }
@@ -2716,9 +3447,9 @@ mod tests {
         let mgr = SessionManager::new(dir.path()).unwrap();
         let first = fake_agent(&mgr, "first");
         let second = fake_agent(&mgr, "second");
-        first.claim_suspend(SuspendOrigin::Memory).unwrap();
+        first.claim_suspend(SuspendOrigin::Pressure).unwrap();
         first.set_memory_suspend_started_ms(20);
-        second.claim_suspend(SuspendOrigin::Memory).unwrap();
+        second.claim_suspend(SuspendOrigin::Pressure).unwrap();
         second.set_memory_suspend_started_ms(10);
         assert_eq!(mgr.memory_suspend_pending_since(), Some(10));
 
@@ -2748,7 +3479,7 @@ mod tests {
         let mgr = SessionManager::new(dir.path()).unwrap();
         let session = fake_agent(&mgr, "agent");
         session.set_run_state(Some("suspended".into()));
-        session.claim_suspend(SuspendOrigin::Memory).unwrap();
+        session.claim_suspend(SuspendOrigin::Pressure).unwrap();
 
         assert!(mgr.focus_session("agent").unwrap());
         wait_for_output(&session, b"RESUME_SIGNAL");
@@ -2765,7 +3496,7 @@ mod tests {
         let mgr = SessionManager::new(dir.path()).unwrap();
         let session = fake_agent(&mgr, "agent");
         session.set_run_state(Some("suspended".into()));
-        session.claim_suspend(SuspendOrigin::Memory).unwrap();
+        session.claim_suspend(SuspendOrigin::Pressure).unwrap();
 
         mgr.write("agent", b"memory-input\n").unwrap();
         wait_for_output(&session, b"RESUME_SIGNAL");
@@ -2785,22 +3516,25 @@ mod tests {
         let dir = tempdir().unwrap();
         let mgr = SessionManager::new(dir.path()).unwrap();
         let session = fake_agent(&mgr, "agent");
-        session.claim_suspend(SuspendOrigin::Memory).unwrap();
+        session.claim_suspend(SuspendOrigin::Pressure).unwrap();
         session.set_memory_suspend_started_ms(77);
         session.kill().unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while session.is_alive() {
-            assert!(std::time::Instant::now() < deadline, "fake supervisor stayed alive");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fake supervisor stayed alive"
+            );
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
 
         assert!(mgr.resume("agent", ResumeCause::Manual).is_err());
-        assert_eq!(session.suspend_origin(), SuspendOrigin::Memory);
+        assert_eq!(session.suspend_origin(), SuspendOrigin::Pressure);
         assert_eq!(session.memory_suspend_started_ms(), 77);
 
         session.set_run_state(Some("claude".into()));
         assert!(mgr.suspend("agent", SuspendOrigin::Manual).is_err());
-        assert_eq!(session.suspend_origin(), SuspendOrigin::Memory);
+        assert_eq!(session.suspend_origin(), SuspendOrigin::Pressure);
         assert_eq!(session.memory_suspend_started_ms(), 77);
     }
 
@@ -2810,17 +3544,20 @@ mod tests {
         let mgr = Arc::new(SessionManager::new(dir.path()).unwrap());
         let session = fake_agent(&mgr, "agent");
         session.set_run_state(Some("suspended".into()));
-        session.claim_suspend(SuspendOrigin::Memory).unwrap();
+        session.claim_suspend(SuspendOrigin::Pressure).unwrap();
         let guard = session.lock_suspend_transition();
         let (tx, rx) = mpsc::channel();
         let worker = Arc::clone(&mgr);
         std::thread::spawn(move || tx.send(worker.focus_session("agent")).unwrap());
 
-        assert!(rx.recv_timeout(std::time::Duration::from_millis(100)).is_err());
+        assert!(rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err());
         drop(guard);
-        assert!(
-            rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap().unwrap()
-        );
+        assert!(rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap());
     }
 
     #[test]
@@ -2829,7 +3566,7 @@ mod tests {
         let mgr = Arc::new(SessionManager::new(dir.path()).unwrap());
         let session = fake_agent(&mgr, "agent");
         session.set_run_state(Some("suspended".into()));
-        session.claim_suspend(SuspendOrigin::Memory).unwrap();
+        session.claim_suspend(SuspendOrigin::Pressure).unwrap();
 
         // Hold the child-killer lock so remove owns the transition lock but
         // cannot finish. Focus then deterministically queues behind teardown.
@@ -2839,7 +3576,10 @@ mod tests {
         std::thread::spawn(move || remove_tx.send(remover.remove("agent")).unwrap());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !session.suspend_transition_locked_for_test() {
-            assert!(std::time::Instant::now() < deadline, "remove never entered teardown");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "remove never entered teardown"
+            );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         let exit_record = session.lock_exit_for_test();
@@ -2847,25 +3587,41 @@ mod tests {
         let (focus_tx, focus_rx) = mpsc::channel();
         let focuser = Arc::clone(&mgr);
         std::thread::spawn(move || focus_tx.send(focuser.focus_session("agent")).unwrap());
-        assert!(focus_rx.recv_timeout(std::time::Duration::from_millis(100)).is_err());
+        assert!(focus_rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err());
 
         drop(killer);
-        let premature_remove = remove_rx.recv_timeout(std::time::Duration::from_secs(1)).ok();
+        let premature_remove = remove_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .ok();
         let returned_early = premature_remove.is_some();
         drop(exit_record);
         match premature_remove {
             Some(result) => result.unwrap(),
-            None => remove_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap().unwrap(),
+            None => remove_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+                .unwrap(),
         }
         let error = focus_rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap()
             .unwrap_err();
 
-        assert!(!returned_early, "remove returned before child exit was confirmed");
-        assert!(error.to_string().contains("no such session"), "unexpected focus result: {error}");
+        assert!(
+            !returned_early,
+            "remove returned before child exit was confirmed"
+        );
+        assert!(
+            error.to_string().contains("no such session"),
+            "unexpected focus result: {error}"
+        );
         assert!(mgr.session("agent").is_none());
-        assert!(!session.is_alive(), "remove returned before the child exit was confirmed");
+        assert!(
+            !session.is_alive(),
+            "remove returned before the child exit was confirmed"
+        );
     }
 
     #[test]
@@ -2874,11 +3630,17 @@ mod tests {
         let mgr = SessionManager::new(dir.path()).unwrap();
         let session = fake_agent(&mgr, "agent");
         session.set_run_state(Some("suspended".into()));
-        session.claim_suspend(SuspendOrigin::Memory).unwrap();
-        assert_eq!(mgr.session_infos().unwrap()[0].run_state.as_deref(), Some("memory-suspended"));
+        session.claim_suspend(SuspendOrigin::Pressure).unwrap();
+        assert_eq!(
+            mgr.session_infos().unwrap()[0].run_state.as_deref(),
+            Some("resource-suspended")
+        );
 
         session.claim_suspend(SuspendOrigin::Manual).unwrap();
-        assert_eq!(mgr.session_infos().unwrap()[0].run_state.as_deref(), Some("suspended"));
+        assert_eq!(
+            mgr.session_infos().unwrap()[0].run_state.as_deref(),
+            Some("suspended")
+        );
     }
 
     #[test]
@@ -2909,14 +3671,19 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("scrollback/poison.bin")).unwrap();
 
         let mgr = SessionManager::new(dir.path()).unwrap();
-        mgr.restore().expect("restore must not abort on one bad session");
+        mgr.restore()
+            .expect("restore must not abort on one bad session");
         assert_eq!(
             mgr.names(),
             vec!["good-a".to_string(), "good-b".to_string()],
             "healthy sessions restored, poison one skipped"
         );
         assert!(
-            mgr.session("good-a").unwrap().scrollback().windows(9).any(|w| w == b"history-a"),
+            mgr.session("good-a")
+                .unwrap()
+                .scrollback()
+                .windows(9)
+                .any(|w| w == b"history-a"),
             "healthy session's scrollback preloaded"
         );
     }
@@ -2925,9 +3692,11 @@ mod tests {
     fn set_run_state_stores_on_claude_and_surfaces_in_session_infos() {
         let dir = tempdir().unwrap();
         let mgr = SessionManager::new(dir.path()).unwrap();
-        mgr.create("amber-1-1-0-c", dir.path(), SessionKind::Claude).unwrap();
+        mgr.create("amber-1-1-0-c", dir.path(), SessionKind::Claude)
+            .unwrap();
 
-        mgr.set_run_state("amber-1-1-0-c", "claude-retrying").unwrap();
+        mgr.set_run_state("amber-1-1-0-c", "claude-retrying")
+            .unwrap();
         let info = mgr
             .session_infos()
             .unwrap()
@@ -2941,8 +3710,10 @@ mod tests {
     fn set_run_state_rejects_shell_unknown_and_bad_state() {
         let dir = tempdir().unwrap();
         let mgr = SessionManager::new(dir.path()).unwrap();
-        mgr.create("amber-1-1-0-s", "/tmp", SessionKind::Shell).unwrap();
-        mgr.create("amber-1-1-1-c", dir.path(), SessionKind::Claude).unwrap();
+        mgr.create("amber-1-1-0-s", "/tmp", SessionKind::Shell)
+            .unwrap();
+        mgr.create("amber-1-1-1-c", dir.path(), SessionKind::Claude)
+            .unwrap();
 
         // Shell session: run_state does not apply.
         assert!(mgr.set_run_state("amber-1-1-0-s", "claude").is_err());
@@ -2959,9 +3730,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let cgroups = tempdir().unwrap();
         let mgr = with_fake_cgroups(dir.path(), cgroups.path());
-        mgr.create("amber-1-1-0-a", "/tmp", SessionKind::Shell).unwrap();
+        mgr.create("amber-1-1-0-a", "/tmp", SessionKind::Shell)
+            .unwrap();
         let before = mgr.session("amber-1-1-0-a").unwrap();
-        let slot = mgr.store.read_session("amber-1-1-0-a").unwrap().unwrap().slot;
+        let slot = mgr
+            .store
+            .read_session("amber-1-1-0-a")
+            .unwrap()
+            .unwrap()
+            .slot;
 
         let info = mgr.rename("amber-1-1-0-a", "amber-1-2-0-a").unwrap();
 
@@ -2985,8 +3762,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let cgroups = tempdir().unwrap();
         let mgr = with_fake_cgroups(dir.path(), cgroups.path());
-        mgr.create("amber-1-1-0-c", dir.path(), SessionKind::Claude).unwrap();
-        let slot = mgr.store.read_session("amber-1-1-0-c").unwrap().unwrap().slot;
+        mgr.create("amber-1-1-0-c", dir.path(), SessionKind::Claude)
+            .unwrap();
+        let slot = mgr
+            .store
+            .read_session("amber-1-1-0-c")
+            .unwrap()
+            .unwrap()
+            .slot;
         mgr.store
             .write_claude(
                 "amber-1-1-0-c",
@@ -3010,12 +3793,20 @@ mod tests {
         assert_eq!(info.slot, slot);
         assert!(cgroups.path().join(format!("session-{slot}")).is_dir());
         assert_eq!(
-            mgr.store.read_claude("amber-1-2-0-c").unwrap().unwrap().session_id,
+            mgr.store
+                .read_claude("amber-1-2-0-c")
+                .unwrap()
+                .unwrap()
+                .session_id,
             "conv-42",
             "the conversation id must follow the rename so --resume still works"
         );
         assert_eq!(
-            mgr.store.read_session("amber-1-2-0-c").unwrap().unwrap().cwd,
+            mgr.store
+                .read_session("amber-1-2-0-c")
+                .unwrap()
+                .unwrap()
+                .cwd,
             std::fs::canonicalize(dir.path()).unwrap_or_else(|_| dir.path().to_path_buf()),
             "cwd preserved"
         );
@@ -3036,7 +3827,10 @@ mod tests {
         let after = mgr.session(to).unwrap();
         assert_eq!(after.suspend_origin(), SuspendOrigin::Manual);
         assert_eq!(after.memory_suspend_started_ms(), 0);
-        assert!(!mgr.focus_session(to).unwrap(), "focus must not resume a manual park");
+        assert!(
+            !mgr.focus_session(to).unwrap(),
+            "focus must not resume a manual park"
+        );
     }
 
     #[test]
@@ -3047,16 +3841,23 @@ mod tests {
         let to = "amber-1-2-0-memory";
         let before = fake_agent(&mgr, from);
         before.set_run_state(Some("suspended".into()));
-        before.claim_suspend(SuspendOrigin::Memory).unwrap();
+        before.claim_suspend(SuspendOrigin::Pressure).unwrap();
         before.set_memory_suspend_started_ms(77);
 
         mgr.rename(from, to).unwrap();
 
         let after = mgr.session(to).unwrap();
-        assert_eq!(after.suspend_origin(), SuspendOrigin::Memory);
+        assert_eq!(after.suspend_origin(), SuspendOrigin::Pressure);
         assert_eq!(after.memory_suspend_started_ms(), 77);
-        assert!(mgr.focus_session(to).unwrap(), "memory suspension must resume on focus");
-        assert_eq!(after.suspend_origin(), SuspendOrigin::Memory, "focus waits for the new supervisor");
+        assert!(
+            mgr.focus_session(to).unwrap(),
+            "memory suspension must resume on focus"
+        );
+        assert_eq!(
+            after.suspend_origin(),
+            SuspendOrigin::Pressure,
+            "focus waits for the new supervisor"
+        );
         assert!(after.pending_resume_for_test());
     }
 
@@ -3066,11 +3867,11 @@ mod tests {
         let mgr = SessionManager::new(dir.path()).unwrap();
         let session = fake_agent(&mgr, "agent");
         session.set_run_state(Some("suspended".into()));
-        session.claim_suspend(SuspendOrigin::Memory).unwrap();
+        session.claim_suspend(SuspendOrigin::Pressure).unwrap();
         session.await_initial_suspend_ready();
 
         assert!(mgr.focus_session("agent").unwrap());
-        assert_eq!(session.suspend_origin(), SuspendOrigin::Memory);
+        assert_eq!(session.suspend_origin(), SuspendOrigin::Pressure);
         assert!(session.pending_resume_for_test());
 
         mgr.set_run_state("agent", "suspended").unwrap();
@@ -3084,10 +3885,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let mgr = SessionManager::new(dir.path()).unwrap();
         let session = fake_agent(&mgr, "agent");
-        session.claim_suspend(SuspendOrigin::Memory).unwrap();
+        session.claim_suspend(SuspendOrigin::Pressure).unwrap();
 
         assert!(mgr.focus_session("agent").unwrap());
-        assert_eq!(session.suspend_origin(), SuspendOrigin::Memory);
+        assert_eq!(session.suspend_origin(), SuspendOrigin::Pressure);
         assert!(session.pending_resume_for_test());
         std::thread::sleep(std::time::Duration::from_millis(100));
         assert!(
@@ -3113,8 +3914,8 @@ mod tests {
             for (origin, queue_resume) in [
                 (SuspendOrigin::Manual, false),
                 (SuspendOrigin::Manual, true),
-                (SuspendOrigin::Memory, false),
-                (SuspendOrigin::Memory, true),
+                (SuspendOrigin::Pressure, false),
+                (SuspendOrigin::Pressure, true),
             ] {
                 let dir = tempdir().unwrap();
                 let mgr = SessionManager::new(dir.path()).unwrap();
@@ -3169,7 +3970,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let mgr = SessionManager::new(dir.path()).unwrap();
         let session = fake_agent(&mgr, "agent");
-        assert!(mgr.set_run_state_report("agent", "suspend-failed", 1).unwrap());
+        assert!(mgr
+            .set_run_state_report("agent", "suspend-failed", 1)
+            .unwrap());
         assert_eq!(session.suspend_origin(), SuspendOrigin::None);
 
         assert!(mgr.set_run_state_report("agent", "suspended", 2).unwrap());
@@ -3286,7 +4089,7 @@ mod tests {
 
     #[test]
     fn agent_rename_rollback_restores_the_original_suspension() {
-        for (origin, started) in [(SuspendOrigin::Manual, 0), (SuspendOrigin::Memory, 91)] {
+        for (origin, started) in [(SuspendOrigin::Manual, 0), (SuspendOrigin::Pressure, 91)] {
             let dir = tempdir().unwrap();
             let mgr = SessionManager::new(dir.path()).unwrap();
             let from = "amber-1-1-0-rollback";
@@ -3325,7 +4128,8 @@ mod tests {
             .unwrap();
         let old_meta = mgr.store.read_session(from).unwrap().unwrap();
         let size = session.size();
-        mgr.stop_session_locked(old_meta.slot, Some(&session)).unwrap();
+        mgr.stop_session_locked(old_meta.slot, Some(&session))
+            .unwrap();
         mgr.store.rename_session(from, to).unwrap();
         // Recreate the exact durable state left when a committed rename could
         // not unlink its journal before the replacement supervisor failed.
@@ -3336,7 +4140,8 @@ mod tests {
             .is_ok();
         if !first_ok {
             std::fs::remove_file(dir.path().join("rename.json")).unwrap();
-            mgr.rollback_agent_rename(from, to, &old_meta, size, None, true).unwrap();
+            mgr.rollback_agent_rename(from, to, &old_meta, size, None, true)
+                .unwrap();
         }
 
         assert!(first_ok, "stale committed journal blocked reverse rollback");
@@ -3365,7 +4170,10 @@ mod tests {
         if first_ok {
             mgr.remove(from).unwrap();
         }
-        assert!(!first_ok, "name was reused while its old artifact was still owned");
+        assert!(
+            !first_ok,
+            "name was reused while its old artifact was still owned"
+        );
         assert!(dir.path().join("rename.json").exists());
 
         mgr.create(from, "/tmp", SessionKind::Shell).unwrap();
@@ -3378,15 +4186,23 @@ mod tests {
         // Spec §7: a rename must never clobber another session.
         let dir = tempdir().unwrap();
         let mgr = SessionManager::new(dir.path()).unwrap();
-        mgr.create("amber-1-1-0-a", "/tmp", SessionKind::Shell).unwrap();
-        mgr.create("amber-1-1-1-b", "/tmp", SessionKind::Shell).unwrap();
+        mgr.create("amber-1-1-0-a", "/tmp", SessionKind::Shell)
+            .unwrap();
+        mgr.create("amber-1-1-1-b", "/tmp", SessionKind::Shell)
+            .unwrap();
 
-        assert!(mgr.rename("ghost", "amber-1-2-0-z").is_err(), "missing source");
+        assert!(
+            mgr.rename("ghost", "amber-1-2-0-z").is_err(),
+            "missing source"
+        );
         assert!(
             mgr.rename("amber-1-1-0-a", "amber-1-1-1-b").is_err(),
             "must not clobber an existing session"
         );
-        assert!(mgr.rename("amber-1-1-0-a", "../evil").is_err(), "invalid target");
+        assert!(
+            mgr.rename("amber-1-1-0-a", "../evil").is_err(),
+            "invalid target"
+        );
         assert!(mgr.rename("amber-1-1-0-a", "").is_err(), "empty target");
 
         // Every refusal leaves both sessions intact.
@@ -3474,7 +4290,11 @@ mod tests {
         mgr.create("after", "/tmp", SessionKind::Shell).unwrap();
         assert_eq!(
             slots(&mgr),
-            vec![("after".into(), 1), ("fresh".into(), 3), ("lives".into(), 2)]
+            vec![
+                ("after".into(), 1),
+                ("fresh".into(), 3),
+                ("lives".into(), 2)
+            ]
         );
     }
 
@@ -3482,8 +4302,10 @@ mod tests {
     fn rename_carries_the_slot_across_unchanged() {
         let dir = tempdir().unwrap();
         let mgr = SessionManager::new(dir.path()).unwrap();
-        mgr.create("amber-1-1-0-a", "/tmp", SessionKind::Shell).unwrap();
-        mgr.create("amber-1-1-1-b", "/tmp", SessionKind::Shell).unwrap();
+        mgr.create("amber-1-1-0-a", "/tmp", SessionKind::Shell)
+            .unwrap();
+        mgr.create("amber-1-1-1-b", "/tmp", SessionKind::Shell)
+            .unwrap();
 
         let info = mgr.rename("amber-1-1-1-b", "amber-1-2-0-b").unwrap();
         assert_eq!(info.slot, 2, "a rename must not change the slot");

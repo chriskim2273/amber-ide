@@ -24,6 +24,15 @@ export interface AppState {
     budgetKb: number
     blocked: boolean
   }
+  // Host-level PSI pressure is independent from Amber's aggregate memory
+  // telemetry above: both remain visible while a daemon reports them.
+  resourcePressure: ResourcePressure | null
+}
+export type ResourcePressureCause = 'cpu' | 'io' | 'memory'
+export interface ResourcePressure {
+  level: 'normal' | 'critical'
+  causes: ResourcePressureCause[]
+  blocked: boolean
 }
 export type DaemonEvent =
   | { kind: 'Sessions'; sessions: SessionInfo[] }
@@ -36,6 +45,9 @@ export type DaemonEvent =
   | { kind: 'Memory'; name: string; rssKb: number; growing: boolean }
   | { kind: 'MemoryPressure'; level: 'normal' | 'warning' | 'critical'; currentKb: number; budgetKb: number; blocked: boolean }
   | { kind: 'ClearMemoryPressure' }
+  | { kind: 'ResourcePressure'; level: 'normal' | 'critical'; causes: ResourcePressureCause[]; blocked: boolean }
+  // Connection boundary: an older daemon cannot send either pressure event.
+  | { kind: 'ClearPressure' }
   // UI-originated: the visible tab's panes have been seen (active tab/ws change,
   // or activity for the already-visible tab) — mark their activity as seen.
   | { kind: 'MarkSeen'; names: string[] }
@@ -46,7 +58,7 @@ export interface TabModel { tab: number; panes: PaneModel[] }
 export interface WorkspaceModel { ws: number; tabs: TabModel[] }
 
 export function initialState(): AppState {
-  return { sessions: [], dead: {}, error: null, lastActivity: {}, lastSeen: {}, seq: 0, mem: {}, pressure: null }
+  return { sessions: [], dead: {}, error: null, lastActivity: {}, lastSeen: {}, seq: 0, mem: {}, pressure: null, resourcePressure: null }
 }
 
 // Keep only the keys present in `live` (prunes per-session state for removed
@@ -105,6 +117,18 @@ export function reduce(state: AppState, ev: DaemonEvent): AppState {
     }
     case 'ClearMemoryPressure':
       return state.pressure === null ? state : { ...state, pressure: null }
+    case 'ResourcePressure': {
+      const resourcePressure: ResourcePressure = { level: ev.level, causes: [...ev.causes], blocked: ev.blocked }
+      const prev = state.resourcePressure
+      if (prev && prev.level === resourcePressure.level && prev.blocked === resourcePressure.blocked
+        && prev.causes.length === resourcePressure.causes.length
+        && prev.causes.every((cause, i) => cause === resourcePressure.causes[i])) return state
+      return { ...state, resourcePressure }
+    }
+    case 'ClearPressure':
+      return state.pressure === null && state.resourcePressure === null
+        ? state
+        : { ...state, pressure: null, resourcePressure: null }
     case 'MarkSeen': {
       let changed = false
       const lastSeen = { ...state.lastSeen }
@@ -141,13 +165,34 @@ export function shouldHintTerminalFocus(active: boolean, terminalTarget: boolean
 // because React/xterm restored focus during mount or keep-alive activation.
 // `directTarget` excludes focus bubbling from the explicit Resume button,
 // whose click remains its own single Focus request.
+export function shouldResumeParkedPane(active: boolean, trusted: boolean): boolean {
+  return active && trusted
+}
+
 export function shouldResumeMemoryParked(
   active: boolean,
   directTarget: boolean,
   userArmed: boolean,
   alreadySent = false,
 ): boolean {
-  return active && directTarget && userArmed && !alreadySent
+  return directTarget && !alreadySent && shouldResumeParkedPane(active, userArmed)
+}
+
+export function parkedOverlayText(runState: string | undefined): string | null {
+  if (runState === 'resource-suspended') return 'Parked to protect system resources'
+  if (runState === 'memory-suspended') return 'Parked to protect system memory'
+  return null
+}
+
+export function resourcePressureMessage(pressure: ResourcePressure): string {
+  const labels = pressure.causes.map((cause) => ({ cpu: 'CPU', io: 'I/O', memory: 'memory' })[cause])
+  const namedCauses = labels.length === 0 ? 'system resource'
+    : labels.length === 1 ? labels[0]!
+      : labels.length === 2 ? `${labels[0]} and ${labels[1]}`
+        : `${labels.slice(0, -1).join(', ')}, and ${labels.at(-1)}`
+  return pressure.blocked
+    ? `Amber ${namedCauses} pressure is critical, but no idle resumable agent pane can be parked. Close or freeze active work.`
+    : `Amber ${namedCauses} pressure is critical. Idle agent panes may be parked.`
 }
 
 // A pane's kind-dot appearance + tooltip, from its kind and agent run_state.
@@ -161,6 +206,7 @@ export function paneDot(kind: string, runState: string | undefined): KindDot {
     case 'claude-retrying': return { cls: `${kind}-retrying`, label: `${kind} (retrying)` }
     case 'shell-fallback': return { cls: 'shell-fallback', label: `shell (${kind} exited)` }
     case 'memory-suspended': return { cls: 'memory-suspended', label: `${kind} (parked for memory)` }
+    case 'resource-suspended': return { cls: 'memory-suspended', label: `${kind} (parked for system resources)` }
     // Slice 3: parked by a freeze grace — the agent killed to free RAM, resumable.
     case 'suspended': return { cls: 'suspended', label: 'suspended (RAM freed)' }
     default: return { cls: kind, label: kind }
@@ -178,6 +224,10 @@ export function tabDot(panes: PaneModel[]): KindDot {
   const k = kinds.size === 1 ? agents[0]!.kind : 'claude'
   if (agents.some((p) => p.runState === 'claude-retrying')) return { cls: `${k}-retrying`, label: `${k} (retrying)` }
   if (agents.every((p) => p.runState === 'shell-fallback')) return { cls: 'shell-fallback', label: `shell (${k} exited)` }
+  if (agents.some((p) => p.runState === 'resource-suspended')
+    && agents.every((p) => (p.runState === 'resource-suspended' || p.runState === 'shell-fallback'))) {
+    return { cls: 'memory-suspended', label: `${k} (parked for system resources)` }
+  }
   if (agents.some((p) => p.runState === 'memory-suspended')
     && agents.every((p) => (p.runState === 'memory-suspended' || p.runState === 'shell-fallback'))) {
     return { cls: 'memory-suspended', label: `${k} (parked for memory)` }

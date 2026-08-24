@@ -89,6 +89,23 @@ pub struct AttachResume {
     pub offset: u64,
 }
 
+/// Valid host resource-pressure levels on the control wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResourcePressureLevel {
+    Normal,
+    Critical,
+}
+
+/// A Linux PSI source contributing to host resource pressure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResourcePressureCause {
+    Cpu,
+    Io,
+    Memory,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlMsg {
     Hello,
@@ -219,6 +236,15 @@ pub enum ControlMsg {
         #[serde(default)]
         blocked: bool,
     },
+    /// Daemon -> version-2 pressure watchers: host PSI pressure. Strict enum
+    /// fields reject unknown values at decode time while preserving the
+    /// approved lowercase JSON strings for clients.
+    ResourcePressure {
+        level: ResourcePressureLevel,
+        causes: Vec<ResourcePressureCause>,
+        #[serde(default)]
+        blocked: bool,
+    },
     /// Daemon -> supervisor: an ordered run-state report was accepted (or was
     /// already superseded by a report with a higher sequence).
     RunStateAck { name: String, seq: u64 },
@@ -335,6 +361,7 @@ fn known_control_variant(name: &str) -> bool {
             | "Activity"
             | "MemoryStat"
             | "MemoryPressure"
+            | "ResourcePressure"
             | "RunStateAck"
             | "AttachBacklog"
             | "SetMemoryBudget"
@@ -747,6 +774,63 @@ mod tests {
             }
         );
         assert!(serde_json::from_str::<ControlMsg>(r#"{"MemoryPressure":{}}"#).is_err());
+    }
+
+    #[test]
+    fn resource_pressure_uses_the_approved_json_shape() {
+        // Watcher clients match this additive control message exactly; a field
+        // rename or enum spelling change would silently break their banner.
+        let message = ControlMsg::ResourcePressure {
+            level: ResourcePressureLevel::Critical,
+            causes: vec![ResourcePressureCause::Cpu, ResourcePressureCause::Io],
+            blocked: false,
+        };
+        assert_eq!(
+            serde_json::to_string(&message).unwrap(),
+            r#"{"ResourcePressure":{"level":"critical","causes":["cpu","io"],"blocked":false}}"#,
+        );
+        assert_eq!(roundtrip(&Frame::Control(message.clone())), Frame::Control(message));
+    }
+
+    #[test]
+    fn resource_pressure_rejects_unknown_levels_and_causes() {
+        // Strict decode prevents a newer or corrupt peer from showing a
+        // made-up pressure state as trustworthy host policy.
+        assert!(serde_json::from_str::<ControlMsg>(
+            r#"{"ResourcePressure":{"level":"urgent","causes":["cpu"],"blocked":false}}"#,
+        )
+        .is_err());
+        assert!(serde_json::from_str::<ControlMsg>(
+            r#"{"ResourcePressure":{"level":"critical","causes":["network"],"blocked":false}}"#,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn malformed_resource_pressure_is_not_skipped_as_an_unknown_variant() {
+        // Lenient decoding may skip future variants, but this build knows
+        // ResourcePressure and must reject a malformed instance outright.
+        let mut decoder = Decoder::new();
+        decoder.feed(&encode_raw_control(
+            br#"{"ResourcePressure":{"level":"urgent","causes":["cpu"],"blocked":false}}"#,
+        ));
+        assert!(decoder.next_decoded().is_err());
+    }
+
+    #[test]
+    fn memory_pressure_serialization_remains_byte_compatible() {
+        // ResourcePressure is additive. Existing version-1 watcher payloads
+        // must retain their exact serialized form during mixed upgrades.
+        let message = ControlMsg::MemoryPressure {
+            level: "critical".into(),
+            current_kb: 7_000_000,
+            budget_kb: 8_000_000,
+            blocked: true,
+        };
+        assert_eq!(
+            serde_json::to_string(&message).unwrap(),
+            r#"{"MemoryPressure":{"level":"critical","current_kb":7000000,"budget_kb":8000000,"blocked":true}}"#,
+        );
     }
 
     #[test]
