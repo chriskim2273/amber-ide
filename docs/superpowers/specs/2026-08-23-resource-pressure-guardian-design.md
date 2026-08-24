@@ -426,3 +426,78 @@ proof, and patch hygiene are green. The repository formatting gate remains red,
 with merge-base evidence that the drift predates this branch. More importantly,
 the required live PSI/automatic-parking and responsiveness acceptance evidence
 is still absent. No production installation or restart has been performed.
+
+## Final review fix wave (2026-08-23)
+
+Implementation commit `5c33e61ad620dc9d8d7c7d8a75866a4214c62c6a`
+addresses the final concurrency, timing, and safe-hardening findings.
+
+### Reconciliation and timing corrections
+
+- A manager-owned mutex now serializes every CPU-weight reconciliation. Each
+  pass reads the latest foreground slot only after taking that mutex. Focus and
+  input update the atomic slot under the session transition lock, release that
+  per-session lock, and run the O(session-count) cgroup pass only when the slot
+  changed. Create, restore, rename, remove, and reap retain membership-change
+  reconciliation.
+- Host PSI is timestamped immediately after the PSI files are sampled, after
+  earlier memory work. The manager takes a new monotonic timestamp after the
+  snapshot and final metadata checks when it records a pending pressure
+  suspend, then takes another timestamp after the supervisor signal succeeds.
+  Only that successful-signal timestamp starts the ten-second host cooldown.
+- Invalid explicit pressure percentages and zero intervals now produce one
+  daemon-start warning when deserialization clamps or replaces them. The
+  diagnostic stays outside `PressureConfig`, preserving its public and
+  serialized data shape.
+- Unsupported non-Linux targets skip PSI polling for the guardian run. Linux
+  does not mutate this capability flag after an unavailable sample, so a
+  transient read or parse failure is retried on the next tick.
+- The private cleanup validator now rejects the OS temporary directory itself,
+  requires a strict temporary-directory child, and requires an exact
+  test-owned marker before a cleanup guard may own that root.
+
+### TDD regression evidence
+
+| Regression | RED evidence before the fix | GREEN evidence |
+| --- | --- | --- |
+| `manager::tests::concurrent_focus_reconciliation_uses_latest_slot_without_holding_transition_lock` | Deterministic barrier/condition-variable interleaving left the older slot at weight `1000` instead of `100`. | passed: 1 test. The hook observed non-overlapping passes, latest-slot final weights, and a released session transition lock. |
+| `manager::tests::repeated_input_on_the_foreground_slot_skips_cpu_reconciliation` | Three writes to the already-foreground slot observed 3 reconciliation starts instead of 0. | passed: 1 test. |
+| `memory_guardian::tests::delayed_sampling_snapshot_and_signal_use_fresh_guardian_timestamps` | Failed to compile because the fresh-sample and injected-clock boundaries did not exist and host action returned only a boolean. | passed: 1 test. It proves a 60-second pre-sample delay does not shorten the 120-second episode, a 30-second snapshot delay does not backdate pending-stall time, and cooldown starts five seconds later only after the signal. |
+| `state::tests::pressure_config_reports_only_explicit_values_that_were_normalized` | Failed to compile before the normalization diagnostic existed. | passed: 1 test. |
+| `host_pressure::tests::host_psi_polling_matches_compile_time_platform_support` | Failed to compile before the explicit platform capability existed. | passed: 1 test. |
+| `private_root_validator_rejects_temp_directory_and_unmarked_children` | Failed to compile before the ownership marker helper existed. | passed: 1 test. |
+
+The current stderr-only startup logging has no injectable logging abstraction,
+so the focused configuration test covers the one-shot diagnostic input rather
+than capturing global process stderr.
+
+### Final-wave verification
+
+| Gate | Command | Result |
+| --- | --- | --- |
+| Focus race | `cargo test -p amber manager::tests::concurrent_focus_reconciliation_uses_latest_slot_without_holding_transition_lock -- --exact --nocapture` | passed: 1 passed, 463 filtered. |
+| Repeated input | `cargo test -p amber manager::tests::repeated_input_on_the_foreground_slot_skips_cpu_reconciliation -- --exact --nocapture` | passed: 1 passed, 463 filtered. |
+| Delayed clock | `cargo test -p amber memory_guardian::tests::delayed_sampling_snapshot_and_signal_use_fresh_guardian_timestamps -- --exact --nocapture` | passed: 1 passed, 463 filtered. |
+| Config diagnostic | `cargo test -p amber-core state::tests::pressure_config_reports_only_explicit_values_that_were_normalized -- --exact --nocapture` | passed: 1 passed, 113 filtered. |
+| PSI platform capability | `cargo test -p amber host_pressure::tests::host_psi_polling_matches_compile_time_platform_support -- --exact --nocapture` | passed: 1 passed, 463 filtered. |
+| Cleanup ownership | `cargo test -p amber --test claude_supervise private_root_validator_rejects_temp_directory_and_unmarked_children -- --exact --nocapture` | passed: 1 passed, 12 filtered. |
+| Cleanup failure path | `cargo test -p amber --test claude_supervise delegated_daemon_inspection_failure_cleans_exact_private_unit_and_root -- --exact --nocapture` | passed: 1 passed, 12 filtered. |
+| Rust lint | `RUSTFLAGS='-D warnings' cargo clippy --workspace --all-targets` | passed. |
+| Rust workspace | `cargo test --workspace` | passed: 577 passed, 1 ignored, 23 suites. |
+| Guarded private Linux proof | `target/debug/deps/claude_supervise-0267583557aef905 --ignored --exact isolated_delegated_cgroup_places_workloads_and_weights_sessions --nocapture` | passed: 1 passed, 12 filtered. Root `/tmp/.tmp76csA8`; unit `amber-task6-cgroup-870666-0.service`; exact weights `10000/1000/100`; quoted cgroup removed. |
+| Rust formatting | `cargo fmt --all -- --check` | failed with 8,011 repository-wide diff lines. The merge-base failure above proves this drift predates the branch; no broad `manager.rs` or repository formatting rewrite was applied. |
+| Patch hygiene | `git diff --check` | passed. |
+| App tests/typecheck | not run in this wave | No app file changed; the complete prior app gates remain recorded above. |
+
+No production/default socket or service command was run. The first Cargo
+wrapper attempt to run the ignored proof reported 0 passed and 1 ignored and
+started no daemon; the strengthened guarded test binary was then run directly.
+The original production Focus/Attach incident remains recorded above and is
+not superseded by this proof.
+
+Production rollout remains **not approved**. The private proof re-establishes
+controller delegation, process placement, relative weights, and fail-closed
+cleanup after the validator change. It still does not prove live PSI watcher
+delivery, a live automatic one-at-a-time parking episode, actual CPU share or
+foreground responsiveness under contention, or the user-visible
+Firefox/Discord/Amber success criteria.
