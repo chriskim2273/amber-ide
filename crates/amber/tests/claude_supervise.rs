@@ -224,6 +224,21 @@ fn assert_normal_absolute(path: &Path, label: &str) {
 }
 
 #[cfg(target_os = "linux")]
+const PRIVATE_TEST_ROOT_MARKER: &str = ".amber-private-test-root";
+
+#[cfg(target_os = "linux")]
+const PRIVATE_TEST_ROOT_MARKER_CONTENT: &[u8] = b"amber private integration test root\n";
+
+#[cfg(target_os = "linux")]
+fn mark_private_test_root(root: &Path) {
+    fs::write(
+        root.join(PRIVATE_TEST_ROOT_MARKER),
+        PRIVATE_TEST_ROOT_MARKER_CONTENT,
+    )
+    .expect("mark private test root");
+}
+
+#[cfg(target_os = "linux")]
 fn assert_private_root_socket(root: &Path, socket: &Path) {
     assert_normal_absolute(root, "private state root");
     assert_normal_absolute(socket, "private daemon socket");
@@ -232,8 +247,14 @@ fn assert_private_root_socket(root: &Path, socket: &Path) {
         .unwrap_or_else(|_| std::env::temp_dir());
     let root_canonical = root.canonicalize().expect("private state root must exist");
     assert!(
-        root_canonical.starts_with(&temp_root),
-        "private state root must be inside the OS temp directory: {}",
+        root_canonical != temp_root && root_canonical.starts_with(&temp_root),
+        "private state root must be a strict child of the OS temp directory: {}",
+        root.display(),
+    );
+    assert_eq!(
+        fs::read(root_canonical.join(PRIVATE_TEST_ROOT_MARKER)).ok().as_deref(),
+        Some(PRIVATE_TEST_ROOT_MARKER_CONTENT),
+        "private state root must carry the test-owned cleanup marker: {}",
         root.display(),
     );
     assert_eq!(
@@ -246,6 +267,33 @@ fn assert_private_root_socket(root: &Path, socket: &Path) {
         Some(OsStr::new("amberd.sock")),
         "private socket must use the expected test-only filename",
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn private_root_validator_rejects_temp_directory_and_unmarked_children() {
+    let temp_root = std::env::temp_dir()
+        .canonicalize()
+        .unwrap_or_else(|_| std::env::temp_dir());
+    assert!(
+        std::panic::catch_unwind(|| {
+            assert_private_root_socket(&temp_root, &temp_root.join("amberd.sock"));
+        })
+        .is_err(),
+        "the OS temp directory itself must never be cleanup-owned",
+    );
+
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().join("private-state");
+    fs::create_dir(&root).unwrap();
+    let socket = root.join("amberd.sock");
+    assert!(
+        std::panic::catch_unwind(|| assert_private_root_socket(&root, &socket)).is_err(),
+        "an arbitrary temp child must not become cleanup-owned",
+    );
+
+    mark_private_test_root(&root);
+    assert_private_root_socket(&root, &socket);
 }
 
 #[cfg(target_os = "linux")]
@@ -577,6 +625,7 @@ fn delegated_daemon_inspection_failure_cleans_exact_private_unit_and_root() {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path().join("private-state");
     fs::create_dir(&root).unwrap();
+    mark_private_test_root(&root);
     let socket = root.join("amberd.sock");
     let sibling = fixture.path().join("must-survive");
     fs::write(&sibling, "sentinel").unwrap();
@@ -974,6 +1023,7 @@ fn isolated_delegated_cgroup_places_workloads_and_weights_sessions() {
     let _exec_guard = exec_guard();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_path_buf();
+    mark_private_test_root(&root);
     let socket = root.join("amberd.sock");
     assert_private_root_socket(&root, &socket);
 

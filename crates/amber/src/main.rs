@@ -1120,7 +1120,13 @@ fn run_daemon(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Result<
     // Created before the manager so restored sessions get their output-activity
     // hook wired (a restored pane that produces output must light its tab dot).
     let watchers = std::sync::Arc::new(amber::watchers::Watchers::new());
-    let config = StateStore::new(&root).load_config()?;
+    let (config, pressure_was_normalized) =
+        StateStore::new(&root).load_config_with_diagnostics()?;
+    if pressure_was_normalized {
+        eprintln!(
+            "amber daemon: warning: configured [pressure] values were normalized to safe limits/defaults"
+        );
+    }
     let cgroups = amber::cgroup::CgroupManager::activate();
     let cgroup_limit_kb = match cgroups.lowest_finite_limit_kb() {
         Ok(limit) => limit,

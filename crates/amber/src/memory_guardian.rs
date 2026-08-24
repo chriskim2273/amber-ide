@@ -166,6 +166,20 @@ fn resource_pressure_cause(cause: HostPressureCause) -> ResourcePressureCause {
     }
 }
 
+/// Read PSI first, then timestamp that observation. Earlier memory sampling,
+/// process-table work, snapshots, or other slow work must not backdate the
+/// beginning of a sustained-pressure episode.
+fn sample_host_pressure(
+    state: &mut HostPressureState,
+    sample: impl FnOnce() -> Option<crate::host_pressure::HostPressureSample>,
+    now_ms: impl FnOnce() -> u64,
+) -> (u64, HostPressureDecision) {
+    let sample = sample();
+    let sampled_at_ms = now_ms();
+    let decision = state.step(sampled_at_ms, sample);
+    (sampled_at_ms, decision)
+}
+
 fn host_step(
     now_ms: u64,
     pressure: HostPressureDecision,
@@ -212,16 +226,16 @@ fn host_step(
     }
 }
 
-/// Snapshot immediately before the manager's locked final recheck. `true`
-/// means the signal succeeded, which is the sole authorization to start the
-/// host policy cooldown.
+/// Snapshot immediately before the manager's locked final recheck. A returned
+/// timestamp means the signal succeeded and records that completion instant,
+/// which is the sole authorization and correct origin for host cooldown.
 fn apply_host_action(
     decision: &mut HostStepDecision,
     snapshot: impl FnOnce() -> anyhow::Result<()>,
-    suspend: impl FnOnce(&str) -> anyhow::Result<()>,
-) -> anyhow::Result<bool> {
+    suspend: impl FnOnce(&str) -> anyhow::Result<u64>,
+) -> anyhow::Result<Option<u64>> {
     let Some(name) = decision.candidate.as_deref() else {
-        return Ok(false);
+        return Ok(None);
     };
     let result = snapshot().and_then(|()| suspend(name));
     if result.is_err() {
@@ -230,7 +244,7 @@ fn apply_host_action(
             status.blocked = true;
         }
     }
-    result.map(|()| true)
+    result.map(Some)
 }
 
 fn should_broadcast_resource(
@@ -296,6 +310,7 @@ pub fn start(
     }
     thread::spawn(move || {
         let cgroup_enabled = manager.cgroup_memory_enabled();
+        let host_psi_enabled = crate::host_pressure::polling_supported();
         let mut level = PressureLevel::Normal;
         let mut blocked = false;
         let mut last_pressure_broadcast_ms: Option<u64> = None;
@@ -436,15 +451,22 @@ pub fn start(
                 blocked = decision.blocked;
             }
 
-            let psi_sample = crate::host_pressure::sample_linux();
-            if psi_sample.is_none()
+            if !host_psi_enabled {
+                continue;
+            }
+
+            let (host_now_ms, host_decision) = sample_host_pressure(
+                &mut host_pressure,
+                crate::host_pressure::sample_linux,
+                crate::pty::monotonic_ms,
+            );
+            if matches!(&host_decision, HostPressureDecision::Unavailable)
                 && last_psi_error_log_ms
-                    .is_none_or(|last| now_ms.saturating_sub(last) >= PSI_ERROR_LOG_MS)
+                    .is_none_or(|last| host_now_ms.saturating_sub(last) >= PSI_ERROR_LOG_MS)
             {
                 eprintln!("amber daemon: host PSI sample unavailable; host parking skipped");
-                last_psi_error_log_ms = Some(now_ms);
+                last_psi_error_log_ms = Some(host_now_ms);
             }
-            let host_decision = host_pressure.step(now_ms, psi_sample);
             let pending_since = config
                 .enabled
                 .then(|| manager.pressure_suspend_pending_since())
@@ -456,12 +478,12 @@ pub fn start(
                 )
                 && pending_since.is_none()
             {
-                manager.host_pressure_candidates(now_ms, &last_per_session_kb)
+                manager.host_pressure_candidates(host_now_ms, &last_per_session_kb)
             } else {
                 Vec::new()
             };
             let mut host_action = host_step(
-                now_ms,
+                host_now_ms,
                 host_decision,
                 pending_since,
                 &host_candidates,
@@ -470,10 +492,10 @@ pub fn start(
                 match apply_host_action(
                     &mut host_action,
                     || manager.snapshot(),
-                    |name| manager.suspend_for_pressure(name, now_ms),
+                    |name| manager.suspend_for_pressure(name),
                 ) {
-                    Ok(true) => host_pressure.record_parked(now_ms),
-                    Ok(false) => {}
+                    Ok(Some(signaled_at_ms)) => host_pressure.record_parked(signaled_at_ms),
+                    Ok(None) => {}
                     Err(error) => {
                         eprintln!("amber daemon: automatic host-pressure suspend failed: {error}");
                     }
@@ -490,7 +512,7 @@ pub fn start(
                 if should_broadcast_resource(
                     last_resource_status.as_ref(),
                     last_resource_broadcast_ms,
-                    now_ms,
+                    host_now_ms,
                     &status,
                 ) {
                     watchers.broadcast_resource_pressure(&ControlMsg::ResourcePressure {
@@ -498,7 +520,7 @@ pub fn start(
                         causes: status.causes.clone(),
                         blocked: status.blocked,
                     });
-                    last_resource_broadcast_ms = Some(now_ms);
+                    last_resource_broadcast_ms = Some(host_now_ms);
                 }
                 last_resource_status = Some(status);
             }
@@ -510,7 +532,7 @@ pub fn start(
 mod tests {
     use super::*;
     use amber_core::state::{ClaudeMeta, SessionKind, StateStore};
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::path::PathBuf;
     use std::sync::Arc;
     use tempfile::tempdir;
@@ -834,6 +856,16 @@ mod tests {
         }
     }
 
+    fn critical_host_decision(decision: HostPressureDecision, can_park: bool) {
+        assert_eq!(
+            decision,
+            HostPressureDecision::Critical {
+                causes: vec![HostPressureCause::Cpu],
+                can_park,
+            },
+        );
+    }
+
     #[test]
     fn host_pressure_waits_snapshots_and_honors_cooldown() {
         let mut policy = crate::host_pressure::HostPressureState::new(
@@ -858,7 +890,7 @@ mod tests {
         );
         assert_eq!(ready.candidate.as_deref(), Some("oldest"));
         let calls = RefCell::new(Vec::new());
-        assert!(
+        assert_eq!(
             apply_host_action(
                 &mut ready,
                 || {
@@ -867,10 +899,11 @@ mod tests {
                 },
                 |name| {
                     calls.borrow_mut().push(format!("suspend:{name}"));
-                    Ok(())
+                    Ok(120_000)
                 },
             )
             .unwrap(),
+            Some(120_000),
         );
         assert_eq!(&*calls.borrow(), &["snapshot", "suspend:oldest"]);
         policy.record_parked(120_000);
@@ -889,6 +922,120 @@ mod tests {
             &candidates,
         );
         assert_eq!(after_cooldown.candidate.as_deref(), Some("oldest"));
+    }
+
+    #[test]
+    fn delayed_sampling_snapshot_and_signal_use_fresh_guardian_timestamps() {
+        let dir = tempdir().unwrap();
+        let manager = Arc::new(crate::manager::SessionManager::new(dir.path()).unwrap());
+        let name = "timed-agent";
+        manager
+            .create(name, dir.path(), SessionKind::Shell)
+            .unwrap();
+        let session = manager.session(name).unwrap();
+        session.set_run_state(Some("claude".into()));
+        let store = StateStore::new(dir.path());
+        let mut meta = store.read_session(name).unwrap().unwrap();
+        meta.kind = SessionKind::Claude;
+        store.write_session(&meta).unwrap();
+        store
+            .write_claude(
+                name,
+                &ClaudeMeta {
+                    session_id: "resume-id".into(),
+                    cwd: dir.path().to_path_buf(),
+                    updated: 1,
+                },
+            )
+            .unwrap();
+
+        let base_ms = session.last_user_ms();
+        let clock_ms = Cell::new(base_ms);
+        let mut policy = HostPressureState::new(PressureConfig::default());
+
+        let (started_at, first) = sample_host_pressure(
+            &mut policy,
+            || {
+                // Simulate slow memory work before PSI is finally sampled.
+                clock_ms.set(base_ms + 60_000);
+                Some(cpu_pressure_sample())
+            },
+            || clock_ms.get(),
+        );
+        assert_eq!(started_at, base_ms + 60_000);
+        critical_host_decision(first, false);
+
+        clock_ms.set(base_ms + 179_999);
+        let (early_at, early) = sample_host_pressure(
+            &mut policy,
+            || Some(cpu_pressure_sample()),
+            || clock_ms.get(),
+        );
+        assert_eq!(early_at, base_ms + 179_999);
+        critical_host_decision(early, false);
+
+        clock_ms.set(base_ms + 180_000);
+        let (ready_at, ready) = sample_host_pressure(
+            &mut policy,
+            || Some(cpu_pressure_sample()),
+            || clock_ms.get(),
+        );
+        let mut action = host_step(ready_at, ready, None, &[host_candidate(name)]);
+        assert_eq!(action.candidate.as_deref(), Some(name));
+
+        let signaled_at = apply_host_action(
+            &mut action,
+            || {
+                // Snapshot latency must not backdate either pending detection
+                // or cooldown accounting to the PSI sample at +180 seconds.
+                clock_ms.set(base_ms + 210_000);
+                Ok(())
+            },
+            |selected| {
+                let clock_reads = Cell::new(0);
+                manager.suspend_for_pressure_with_clock(selected, || {
+                    let read = clock_reads.get() + 1;
+                    clock_reads.set(read);
+                    if read == 2 {
+                        // The second read occurs only after the signal has
+                        // succeeded, five seconds after the pending timestamp.
+                        clock_ms.set(base_ms + 215_000);
+                    }
+                    clock_ms.get()
+                })
+            },
+        )
+        .unwrap()
+        .expect("the successful signal must return its fresh timestamp");
+        assert_eq!(session.memory_suspend_started_ms(), base_ms + 210_000);
+        assert_eq!(signaled_at, base_ms + 215_000);
+        policy.record_parked(signaled_at);
+
+        let critical = || HostPressureDecision::Critical {
+            causes: vec![HostPressureCause::Cpu],
+            can_park: true,
+        };
+        assert!(!host_step(
+            base_ms + 219_999,
+            critical(),
+            Some(session.memory_suspend_started_ms()),
+            &[host_candidate("other")],
+        )
+        .blocked);
+        assert!(host_step(
+            base_ms + 220_000,
+            critical(),
+            Some(session.memory_suspend_started_ms()),
+            &[host_candidate("other")],
+        )
+        .blocked);
+
+        let cooling = policy.step(base_ms + 224_999, Some(cpu_pressure_sample()));
+        critical_host_decision(cooling, false);
+        let cooled = policy.step(base_ms + 225_000, Some(cpu_pressure_sample()));
+        critical_host_decision(cooled, true);
+
+        manager.remove(name).unwrap();
     }
 
     #[test]
@@ -930,7 +1077,7 @@ mod tests {
             || anyhow::bail!("disk full"),
             |_| {
                 suspended.set(suspended.get() + 1);
-                Ok(())
+                Ok(120_000)
             },
         )
         .is_err());
@@ -977,9 +1124,7 @@ mod tests {
         );
 
         assert!(!manager.focus_session(name).unwrap());
-        let error = manager
-            .suspend_for_pressure(name, session.last_user_ms() + RECENT_USE_MS)
-            .unwrap_err();
+        let error = manager.suspend_for_pressure(name).unwrap_err();
         assert!(error.to_string().contains("foreground"));
         assert_eq!(session.suspend_origin(), crate::pty::SuspendOrigin::None);
         manager.remove(name).unwrap();

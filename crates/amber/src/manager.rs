@@ -131,6 +131,16 @@ pub struct SessionManager {
     /// means no foreground session yet; slots make rename unable to drop this
     /// protection by changing only the session name.
     foreground_slot: AtomicU32,
+    /// Serializes each O(session-count) CPU-weight pass. Foreground changes
+    /// happen before taking this lock; the pass reads the latest slot only
+    /// after acquiring it, so the last queued pass always repairs the whole
+    /// tree to one coherent generation.
+    cpu_reconciliation: Mutex<()>,
+    /// Test-only observation point around the real cgroup reconciliation. It
+    /// lets concurrency tests control interleaving without replacing the
+    /// filesystem behavior under test.
+    #[cfg(test)]
+    cpu_reconcile_hook: Mutex<Option<CpuReconcileHook>>,
     /// The guardian's LIVE aggregate budget in KiB (0 = none). An
     /// `Arc<AtomicU64>` so `SetMemoryBudget` can move it while the guardian
     /// thread reads it every tick — a budget change takes effect without a
@@ -194,6 +204,16 @@ enum AutomaticSuspendRecency {
     /// Host PSI policy protects only direct focus and terminal input.
     Host,
 }
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CpuReconcilePoint {
+    Start,
+    Finish,
+}
+
+#[cfg(test)]
+type CpuReconcileHook = Arc<dyn Fn(CpuReconcilePoint, u32) + Send + Sync>;
 
 /// Consecutive absent periodic snapshots before `resume_as_claude` downgrades
 /// true→false. At the default ~10 s snapshot cadence this is ~20 s of a shell
@@ -274,6 +294,9 @@ impl SessionManager {
             root,
             sessions: Mutex::new(HashMap::new()),
             foreground_slot: AtomicU32::new(0),
+            cpu_reconciliation: Mutex::new(()),
+            #[cfg(test)]
+            cpu_reconcile_hook: Mutex::new(None),
             budget_kb: Arc::new(AtomicU64::new(0)),
             deferred_meta: Mutex::new(HashMap::new()),
             socket: None,
@@ -667,7 +690,6 @@ impl SessionManager {
             .lock()
             .unwrap()
             .insert(from.to_string(), restored);
-        self.reconcile_cpu_weights();
         if let Some(error) = cleanup_error {
             eprintln!("amber daemon: rename rollback initial cleanup failed: {error}");
         }
@@ -1118,13 +1140,15 @@ impl SessionManager {
         self.foreground_slot.load(Ordering::SeqCst)
     }
 
-    fn set_foreground_locked(&self, name: &str, session: &Arc<PtySession>) -> anyhow::Result<()> {
+    fn set_foreground_locked(
+        &self,
+        name: &str,
+        session: &Arc<PtySession>,
+    ) -> anyhow::Result<bool> {
         let meta = self
             .effective_meta_for(name, session)?
             .ok_or_else(|| anyhow::anyhow!("session {name} vanished from the store"))?;
-        self.foreground_slot.store(meta.slot, Ordering::SeqCst);
-        self.reconcile_cpu_weights();
-        Ok(())
+        Ok(self.foreground_slot.swap(meta.slot, Ordering::SeqCst) != meta.slot)
     }
 
     fn clear_foreground_slot(&self, slot: u32) {
@@ -1136,7 +1160,26 @@ impl SessionManager {
     /// CPU weighting is best-effort; its controller writes must not alter the
     /// foreground slot, lifecycle, or suspend-transition semantics.
     fn reconcile_cpu_weights(&self) {
-        self.cgroups.reconcile_cpu_weights(self.foreground_slot());
+        let _reconciliation = self.cpu_reconciliation.lock().unwrap();
+        let foreground_slot = self.foreground_slot();
+        #[cfg(test)]
+        self.call_cpu_reconcile_hook(CpuReconcilePoint::Start, foreground_slot);
+        self.cgroups.reconcile_cpu_weights(foreground_slot);
+        #[cfg(test)]
+        self.call_cpu_reconcile_hook(CpuReconcilePoint::Finish, foreground_slot);
+    }
+
+    #[cfg(test)]
+    fn set_cpu_reconcile_hook(&self, hook: CpuReconcileHook) {
+        *self.cpu_reconcile_hook.lock().unwrap() = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn call_cpu_reconcile_hook(&self, point: CpuReconcilePoint, foreground_slot: u32) {
+        let hook = self.cpu_reconcile_hook.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook(point, foreground_slot);
+        }
     }
 
     /// Snapshot host-pressure-safe candidates. This is intentionally separate
@@ -1207,21 +1250,41 @@ impl SessionManager {
 
     /// Preserve the aggregate-memory path's conservative output-recency check.
     pub fn suspend_for_memory(&self, name: &str, now_ms: u64) -> anyhow::Result<()> {
-        self.suspend_for_automatic(name, now_ms, AutomaticSuspendRecency::Memory)
+        self.suspend_for_automatic_with_clock(
+            name,
+            AutomaticSuspendRecency::Memory,
+            || now_ms,
+        )
+        .map(|_| ())
     }
 
     /// Host PSI parking uses user recency only and refuses the stable
-    /// foreground slot. All checks run under the session transition lock.
-    pub fn suspend_for_pressure(&self, name: &str, now_ms: u64) -> anyhow::Result<()> {
-        self.suspend_for_automatic(name, now_ms, AutomaticSuspendRecency::Host)
+    /// foreground slot. All checks run under the session transition lock. The
+    /// returned timestamp is sampled only after the supervisor signal succeeds
+    /// and is therefore the sole correct origin for the host cooldown.
+    pub fn suspend_for_pressure(&self, name: &str) -> anyhow::Result<u64> {
+        self.suspend_for_automatic_with_clock(
+            name,
+            AutomaticSuspendRecency::Host,
+            crate::pty::monotonic_ms,
+        )
     }
 
-    fn suspend_for_automatic(
+    #[cfg(test)]
+    pub(crate) fn suspend_for_pressure_with_clock(
         &self,
         name: &str,
-        now_ms: u64,
+        now_ms: impl FnMut() -> u64,
+    ) -> anyhow::Result<u64> {
+        self.suspend_for_automatic_with_clock(name, AutomaticSuspendRecency::Host, now_ms)
+    }
+
+    fn suspend_for_automatic_with_clock(
+        &self,
+        name: &str,
         recency: AutomaticSuspendRecency,
-    ) -> anyhow::Result<()> {
+        mut now_ms: impl FnMut() -> u64,
+    ) -> anyhow::Result<u64> {
         let session = self
             .session(name)
             .ok_or_else(|| anyhow::anyhow!("no such session: {name}"))?;
@@ -1253,7 +1316,11 @@ impl SessionManager {
             AutomaticSuspendRecency::Memory => session.last_used_ms(),
             AutomaticSuspendRecency::Host => session.last_user_ms(),
         };
-        if now_ms.saturating_sub(last_activity_ms) < RECENT_USE_MS {
+        // Metadata and resume-id reads may block on storage. Sample only after
+        // they finish and while the transition lock is held, immediately
+        // before the final eligibility/claim boundary.
+        let pending_started_ms = now_ms().max(1);
+        if pending_started_ms.saturating_sub(last_activity_ms) < RECENT_USE_MS {
             anyhow::bail!("session {name} received recent activity");
         }
         // This is deliberately the final check before claiming the automatic
@@ -1269,13 +1336,13 @@ impl SessionManager {
                 anyhow::anyhow!("session {name} is already suspended by {origin:?}")
             })?;
         let previous_started = session.memory_suspend_started_ms();
-        session.set_memory_suspend_started_ms(now_ms.max(1));
+        session.set_memory_suspend_started_ms(pending_started_ms);
         if let Err(error) = Self::signal_supervisor(name, &session, nix::libc::SIGUSR1) {
             session.restore_suspend_origin(SuspendOrigin::Pressure, SuspendOrigin::None);
             session.set_memory_suspend_started_ms(previous_started);
             return Err(error);
         }
-        Ok(())
+        Ok(now_ms().max(pending_started_ms))
     }
 
     pub fn pressure_suspend_pending_since(&self) -> Option<u64> {
@@ -1635,11 +1702,19 @@ impl SessionManager {
         let session = self
             .session(name)
             .ok_or_else(|| anyhow::anyhow!("no such session: {name}"))?;
-        let _transition = session.lock_suspend_transition();
-        self.ensure_current_session(name, &session)?;
-        self.set_foreground_locked(name, &session)?;
-        session.mark_user_activity();
-        self.resume_for_focus_locked(name, &session)
+        let foreground_changed;
+        let result;
+        {
+            let _transition = session.lock_suspend_transition();
+            self.ensure_current_session(name, &session)?;
+            foreground_changed = self.set_foreground_locked(name, &session)?;
+            session.mark_user_activity();
+            result = self.resume_for_focus_locked(name, &session);
+        }
+        if foreground_changed {
+            self.reconcile_cpu_weights();
+        }
+        result
     }
 
     pub fn names(&self) -> Vec<String> {
@@ -1699,15 +1774,25 @@ impl SessionManager {
         let session = self
             .session(name)
             .ok_or_else(|| anyhow::anyhow!("no such session: {name}"))?;
-        let _transition = session.lock_suspend_transition();
-        self.ensure_current_session(name, &session)?;
-        self.set_foreground_locked(name, &session)?;
-        session.mark_user_activity();
-        self.resume_for_focus_locked(name, &session)?;
-        if session.suspend_origin() == SuspendOrigin::Manual {
-            anyhow::bail!("session is manually suspended: {name}");
+        let foreground_changed;
+        let result;
+        {
+            let _transition = session.lock_suspend_transition();
+            self.ensure_current_session(name, &session)?;
+            foreground_changed = self.set_foreground_locked(name, &session)?;
+            session.mark_user_activity();
+            result = (|| {
+                self.resume_for_focus_locked(name, &session)?;
+                if session.suspend_origin() == SuspendOrigin::Manual {
+                    anyhow::bail!("session is manually suspended: {name}");
+                }
+                session.write(bytes)
+            })();
         }
-        session.write(bytes)
+        if foreground_changed {
+            self.reconcile_cpu_weights();
+        }
+        result
     }
 
     pub fn resize(&self, name: &str, rows: u16, cols: u16) -> anyhow::Result<()> {
@@ -1804,9 +1889,11 @@ impl SessionManager {
         }
         if let Err(error) = self.store.rename_session(from, to) {
             if old_meta.kind.is_agent() {
-                if let Err(rollback) =
-                    self.rollback_agent_rename(from, to, &old_meta, size, suspension, false)
-                {
+                let rollback =
+                    self.rollback_agent_rename(from, to, &old_meta, size, suspension, false);
+                drop(_transition);
+                self.reconcile_cpu_weights();
+                if let Err(rollback) = rollback {
                     anyhow::bail!("{error}; rename rollback failed: {rollback}");
                 }
             }
@@ -1826,9 +1913,11 @@ impl SessionManager {
             {
                 Ok(fresh) => fresh,
                 Err(error) => {
-                    if let Err(rollback) =
-                        self.rollback_agent_rename(from, to, &old_meta, size, suspension, true)
-                    {
+                    let rollback =
+                        self.rollback_agent_rename(from, to, &old_meta, size, suspension, true);
+                    drop(_transition);
+                    self.reconcile_cpu_weights();
+                    if let Err(rollback) = rollback {
                         anyhow::bail!("{error}; rename rollback failed: {rollback}");
                     }
                     return Err(error);
@@ -1855,6 +1944,7 @@ impl SessionManager {
             sessions.insert(to.to_string(), Arc::clone(&sess));
         }
         self.claude_absent.lock().unwrap().remove(from);
+        drop(_transition);
         self.reconcile_cpu_weights();
 
         Ok(SessionInfo {
@@ -1890,21 +1980,23 @@ impl SessionManager {
             Some(session) => self.effective_meta_for(name, session)?,
             None => self.store.read_session(name)?,
         };
-        let _transition = sess
-            .as_ref()
-            .map(|session| session.lock_suspend_transition());
-        if let Some(ref meta) = meta {
-            self.stop_session_locked(meta.slot, sess.as_ref())?;
-        } else if let Some(sess) = &sess {
-            sess.kill()?;
-            if !sess.wait_for_exit(CHILD_EXIT_TIMEOUT) {
-                anyhow::bail!("session child {name} did not exit after termination");
+        {
+            let _transition = sess
+                .as_ref()
+                .map(|session| session.lock_suspend_transition());
+            if let Some(ref meta) = meta {
+                self.stop_session_locked(meta.slot, sess.as_ref())?;
+            } else if let Some(sess) = &sess {
+                sess.kill()?;
+                if !sess.wait_for_exit(CHILD_EXIT_TIMEOUT) {
+                    anyhow::bail!("session child {name} did not exit after termination");
+                }
             }
-        }
-        self.store.remove_session(name)?;
-        self.sessions.lock().unwrap().remove(name);
-        if let Some(meta) = meta {
-            self.clear_foreground_slot(meta.slot);
+            self.store.remove_session(name)?;
+            self.sessions.lock().unwrap().remove(name);
+            if let Some(ref meta) = meta {
+                self.clear_foreground_slot(meta.slot);
+            }
         }
         self.reconcile_cpu_weights();
         Ok(())
@@ -1918,7 +2010,8 @@ mod tests {
     use crate::pty::SuspendOrigin;
     use portable_pty::CommandBuilder;
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::{mpsc, Barrier};
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::{mpsc, Barrier, Condvar};
     use tempfile::tempdir;
 
     fn with_fake_cgroups(state: &Path, cgroup_root: &Path) -> SessionManager {
@@ -2480,6 +2573,161 @@ mod tests {
             "a missing optional cpu.weight must not break focus",
         );
         assert_eq!(mgr.foreground_slot(), 1);
+    }
+
+    #[test]
+    fn concurrent_focus_reconciliation_uses_latest_slot_without_holding_transition_lock() {
+        // Regression: two Focus handlers used to scan/write the cgroup tree
+        // concurrently. This hook holds the slot-1 scan until the slot-2 scan
+        // finishes, which deterministically left the older slot promoted.
+        #[derive(Default)]
+        struct RaceState {
+            first_started: bool,
+            second_finished: bool,
+        }
+
+        let dir = tempdir().unwrap();
+        let cgroups = tempdir().unwrap();
+        let mgr = Arc::new(with_fake_cpu_cgroups(dir.path(), cgroups.path()));
+        mgr.create("first", dir.path(), SessionKind::Shell)
+            .unwrap();
+        mgr.create("second", dir.path(), SessionKind::Shell)
+            .unwrap();
+        let first_session = mgr.session("first").unwrap();
+        let coordination = Arc::new((Mutex::new(RaceState::default()), Condvar::new()));
+        let transition_was_held = Arc::new(AtomicBool::new(false));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        mgr.set_cpu_reconcile_hook({
+            let cgroup_root = cgroups.path().to_path_buf();
+            let coordination = Arc::clone(&coordination);
+            let first_session = Arc::clone(&first_session);
+            let transition_was_held = Arc::clone(&transition_was_held);
+            let events = Arc::clone(&events);
+            Arc::new(move |point, foreground_slot| {
+                events.lock().unwrap().push((point, foreground_slot));
+                if point == CpuReconcilePoint::Start {
+                    // Regular fake files retain the trailing byte when "100"
+                    // overwrites "1000"; real cgroup control files do not.
+                    // Clear them at each pass boundary so assertions model the
+                    // kernel control-file semantics rather than regular-file
+                    // overwrite semantics.
+                    for slot in [1, 2] {
+                        std::fs::write(
+                            cgroup_root.join(format!("session-{slot}/cpu.weight")),
+                            "",
+                        )
+                        .unwrap();
+                    }
+                }
+                let (state, changed) = &*coordination;
+                match (point, foreground_slot) {
+                    (CpuReconcilePoint::Start, 1) => {
+                        transition_was_held.store(
+                            first_session.suspend_transition_locked_for_test(),
+                            Ordering::SeqCst,
+                        );
+                        let mut state = state.lock().unwrap();
+                        state.first_started = true;
+                        changed.notify_all();
+                        let _ = changed
+                            .wait_timeout_while(
+                                state,
+                                Duration::from_millis(500),
+                                |state| !state.second_finished,
+                            )
+                            .unwrap();
+                    }
+                    (CpuReconcilePoint::Finish, 2) => {
+                        let mut state = state.lock().unwrap();
+                        state.second_finished = true;
+                        changed.notify_all();
+                    }
+                    _ => {}
+                }
+            })
+        });
+
+        let first_start = Arc::new(Barrier::new(2));
+        let first_focus = {
+            let mgr = Arc::clone(&mgr);
+            let first_start = Arc::clone(&first_start);
+            std::thread::spawn(move || {
+                first_start.wait();
+                mgr.focus_session("first")
+            })
+        };
+        first_start.wait();
+        {
+            let (state, changed) = &*coordination;
+            let state = state.lock().unwrap();
+            let (state, timeout) = changed
+                .wait_timeout_while(state, Duration::from_secs(5), |state| {
+                    !state.first_started
+                })
+                .unwrap();
+            assert!(state.first_started && !timeout.timed_out());
+        }
+        let second_focus = {
+            let mgr = Arc::clone(&mgr);
+            std::thread::spawn(move || mgr.focus_session("second"))
+        };
+
+        assert!(!second_focus.join().unwrap().unwrap());
+        assert!(!first_focus.join().unwrap().unwrap());
+        assert_eq!(mgr.foreground_slot(), 2);
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                (CpuReconcilePoint::Start, 1),
+                (CpuReconcilePoint::Finish, 1),
+                (CpuReconcilePoint::Start, 2),
+                (CpuReconcilePoint::Finish, 2),
+            ],
+            "reconciliation passes must not overlap",
+        );
+        assert_eq!(
+            std::fs::read_to_string(cgroups.path().join("session-1/cpu.weight")).unwrap(),
+            "100",
+            "an older concurrent reconciliation must not leave its slot promoted",
+        );
+        assert_eq!(
+            std::fs::read_to_string(cgroups.path().join("session-2/cpu.weight")).unwrap(),
+            "1000",
+            "the latest foreground slot must own the final weight set",
+        );
+        assert!(
+            !transition_was_held.load(Ordering::SeqCst),
+            "the O(session-count) scan must run after releasing the per-session transition lock",
+        );
+    }
+
+    #[test]
+    fn repeated_input_on_the_foreground_slot_skips_cpu_reconciliation() {
+        let dir = tempdir().unwrap();
+        let cgroups = tempdir().unwrap();
+        let mgr = with_fake_cpu_cgroups(dir.path(), cgroups.path());
+        mgr.create("foreground", dir.path(), SessionKind::Shell)
+            .unwrap();
+        assert!(!mgr.focus_session("foreground").unwrap());
+
+        let reconciliations = Arc::new(AtomicUsize::new(0));
+        mgr.set_cpu_reconcile_hook({
+            let reconciliations = Arc::clone(&reconciliations);
+            Arc::new(move |point, _| {
+                if point == CpuReconcilePoint::Start {
+                    reconciliations.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        });
+
+        for input in [b"one\n".as_slice(), b"two\n", b"three\n"] {
+            mgr.write("foreground", input).unwrap();
+        }
+        assert_eq!(
+            reconciliations.load(Ordering::SeqCst),
+            0,
+            "input in the already-foreground pane must stay O(1)",
+        );
     }
 
     #[test]
@@ -3120,7 +3368,6 @@ mod tests {
         let mgr = SessionManager::new(dir.path()).unwrap();
         let session = fake_agent(&mgr, "agent");
         record_resume_id(&mgr, "agent", dir.path());
-        let now_ms = session.last_user_ms() + RECENT_USE_MS;
 
         session.kill().unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -3129,7 +3376,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
 
-        let error = mgr.suspend_for_pressure("agent", now_ms).unwrap_err();
+        let error = mgr.suspend_for_pressure("agent").unwrap_err();
         assert!(error.to_string().contains("no such session"));
         assert_eq!(session.suspend_origin(), SuspendOrigin::None);
         assert_eq!(session.memory_suspend_started_ms(), 0);

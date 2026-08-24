@@ -120,6 +120,13 @@ fn parse_psi_kind(contents: &str, kind: &str) -> Option<f64> {
         .and_then(parse_psi_avg10)
 }
 
+/// Unsupported platforms disable PSI polling for the whole guardian run.
+/// Linux keeps this enabled after unavailable samples so a transient `/proc`
+/// read or parse error is retried on the next tick.
+pub const fn polling_supported() -> bool {
+    cfg!(target_os = "linux")
+}
+
 /// Read the three Linux PSI inputs as one all-or-nothing observation.
 ///
 /// Keeping this adapter small makes parsing and policy transitions testable
@@ -174,6 +181,11 @@ mod tests {
             parse_psi_avg10("full avg10=2.00 avg60=1.00 avg300=0.50 total=3"),
             Some(2.0),
         );
+    }
+
+    #[test]
+    fn host_psi_polling_matches_compile_time_platform_support() {
+        assert_eq!(polling_supported(), cfg!(target_os = "linux"));
     }
 
     #[test]

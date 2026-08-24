@@ -181,13 +181,18 @@ impl Default for PressureConfig {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Copy, Deserialize)]
 struct RawPressureConfig {
     cpu_some_percent: Option<f64>,
     io_full_percent: Option<f64>,
     memory_full_percent: Option<f64>,
     sustain_seconds: Option<u64>,
     cooldown_seconds: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct RawConfigDiagnostics {
+    pressure: Option<RawPressureConfig>,
 }
 
 impl PressureConfig {
@@ -200,6 +205,23 @@ impl PressureConfig {
 
     fn normalized_interval(value: Option<u64>, default: u64) -> u64 {
         value.filter(|value| *value != 0).unwrap_or(default)
+    }
+}
+
+impl RawPressureConfig {
+    fn was_normalized(self) -> bool {
+        [
+            self.cpu_some_percent,
+            self.io_full_percent,
+            self.memory_full_percent,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|value| !value.is_finite() || !(0.0..=100.0).contains(&value))
+            || [self.sustain_seconds, self.cooldown_seconds]
+                .into_iter()
+                .flatten()
+                .any(|value| value == 0)
     }
 }
 
@@ -765,6 +787,27 @@ impl StateStore {
         }
     }
 
+    /// Load configuration plus a one-shot startup diagnostic indicating that
+    /// explicit pressure values were clamped or replaced with safe defaults.
+    /// The diagnostic is kept outside [`Config`] so its public data shape and
+    /// serialization contract remain unchanged.
+    pub fn load_config_with_diagnostics(&self) -> anyhow::Result<(Config, bool)> {
+        match fs::read_to_string(self.config_path()) {
+            Ok(source) => {
+                let config = toml::from_str(&source)?;
+                let diagnostics: RawConfigDiagnostics = toml::from_str(&source)?;
+                let pressure_was_normalized = diagnostics
+                    .pressure
+                    .is_some_and(RawPressureConfig::was_normalized);
+                Ok((config, pressure_was_normalized))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok((Config::default(), false))
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     pub fn save_config(&self, c: &Config) -> anyhow::Result<()> {
         let s = toml::to_string_pretty(c)?;
         Self::atomic_write(&self.config_path(), s.as_bytes())
@@ -1291,6 +1334,41 @@ mod tests {
         assert_eq!(cfg.pressure.memory_full_percent, 2.0);
         assert_eq!(cfg.pressure.sustain_seconds, 120);
         assert_eq!(cfg.pressure.cooldown_seconds, 10);
+    }
+
+    #[test]
+    fn pressure_config_reports_only_explicit_values_that_were_normalized() {
+        let dir = tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        fs::write(
+            dir.path().join("config.toml"),
+            "snapshot_interval_secs = 10\nscrollback_bytes = 2048\n\
+             [pressure]\n\
+             cpu_some_percent = 150\n\
+             sustain_seconds = 0\n",
+        )
+        .unwrap();
+        let (normalized, warned) = store.load_config_with_diagnostics().unwrap();
+        assert!(warned);
+        assert_eq!(normalized.pressure.cpu_some_percent, 100.0);
+        assert_eq!(normalized.pressure.sustain_seconds, 120);
+
+        fs::write(
+            dir.path().join("config.toml"),
+            "snapshot_interval_secs = 10\nscrollback_bytes = 2048\n\
+             [pressure]\n\
+             cpu_some_percent = 30\n\
+             sustain_seconds = 60\n",
+        )
+        .unwrap();
+        assert!(!store.load_config_with_diagnostics().unwrap().1);
+
+        fs::write(
+            dir.path().join("config.toml"),
+            "snapshot_interval_secs = 10\nscrollback_bytes = 2048\n",
+        )
+        .unwrap();
+        assert!(!store.load_config_with_diagnostics().unwrap().1);
     }
 
     #[test]
