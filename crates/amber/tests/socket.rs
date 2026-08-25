@@ -353,6 +353,23 @@ fn socket_create_pi_reports_pi_session_kind() {
 }
 
 #[test]
+fn cli_pi_extension_repair_fails_when_the_destination_is_unusable() {
+    let dir = tempfile::tempdir().unwrap();
+    let blocked = dir.path().join("not-a-directory");
+    std::fs::write(&blocked, "file blocks extension directory").unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .args(["ctl", "install-pi-extension"])
+        .env("HOME", dir.path())
+        .env("PI_CODING_AGENT_DIR", &blocked)
+        .output()
+        .unwrap();
+
+    assert!(!out.status.success(), "repair falsely succeeded: {out:?}");
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("installed"));
+}
+
+#[test]
 fn snapshot_control_flushes_scrollback_and_acks() {
     let (socket_path, dir) = start_daemon();
     let mut stream = connect_with_retry(&socket_path);

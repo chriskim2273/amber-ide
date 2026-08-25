@@ -646,6 +646,8 @@ mod tests {
         assert!(!suppress_backlog(false, Some(SessionKind::Codex)));
         assert!(suppress_backlog(true, Some(SessionKind::OpenCode)));
         assert!(!suppress_backlog(false, Some(SessionKind::OpenCode)));
+        assert!(suppress_backlog(true, Some(SessionKind::Pi)));
+        assert!(!suppress_backlog(false, Some(SessionKind::Pi)));
         assert!(!suppress_backlog(true, Some(SessionKind::Shell)));
         assert!(!suppress_backlog(false, Some(SessionKind::Claude)));
         assert!(!suppress_backlog(false, Some(SessionKind::Shell)));

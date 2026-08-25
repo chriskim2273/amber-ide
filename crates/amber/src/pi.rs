@@ -74,40 +74,39 @@ fn pi_agent_dir() -> Option<PathBuf> {
         })
 }
 
-/// Install (or refresh) Amber's global Pi extension when Pi has a home dir.
+/// Install or refresh Amber's global Pi extension and return its verified path.
+/// This fallible form is for explicit repair commands, which must never claim
+/// success if the exact-resume hook was not actually installed.
+pub fn install_global_pi_extension() -> anyhow::Result<PathBuf> {
+    let agent_dir = pi_agent_dir()
+        .ok_or_else(|| anyhow::anyhow!("Pi extension install requires HOME or PI_CODING_AGENT_DIR"))?;
+    install_extension_in(&agent_dir.join("extensions"))
+}
+
+/// Best-effort installation for daemon and supervisor launch paths. A broken
+/// extension filesystem must not prevent an otherwise usable interactive Pi
+/// pane from opening, but the exact failure remains visible to the operator.
 pub fn ensure_global_pi_extension() {
-    if let Some(agent_dir) = pi_agent_dir() {
-        ensure_extension_in(&agent_dir.join("extensions"));
+    if let Err(e) = install_global_pi_extension() {
+        eprintln!("amber: failed to install Pi extension: {e}");
     }
 }
 
-/// Testable core of [`ensure_global_pi_extension`].
-pub fn ensure_extension_in(dir: &Path) {
-    if let Err(e) = fs::create_dir_all(dir) {
-        eprintln!(
-            "amber: failed to create Pi extensions dir {}: {e}",
-            dir.display()
-        );
-        return;
-    }
+/// Testable core of [`install_global_pi_extension`]. Returns the owned file
+/// only after it exists unchanged or has been atomically installed/refreshed.
+pub fn install_extension_in(dir: &Path) -> anyhow::Result<PathBuf> {
+    fs::create_dir_all(dir)?;
 
     let path = dir.join(EXTENSION_FILE);
     match fs::read_to_string(&path) {
-        Ok(existing) if existing == EXTENSION_TS => return,
+        Ok(existing) if existing == EXTENSION_TS => return Ok(path),
         Ok(_) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => {
-            eprintln!("amber: failed to read Pi extension {}: {e}", path.display());
-            return;
-        }
+        Err(e) => return Err(e.into()),
     }
 
-    if let Err(e) = atomic_write_extension(&path, EXTENSION_TS.as_bytes()) {
-        eprintln!(
-            "amber: failed to write Pi extension {}: {e}",
-            path.display()
-        );
-    }
+    atomic_write_extension(&path, EXTENSION_TS.as_bytes())?;
+    Ok(path)
 }
 
 /// Atomically replace the owned extension from a unique same-directory file.
@@ -190,7 +189,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let extensions = dir.path().join("extensions");
 
-        ensure_extension_in(&extensions);
+        install_extension_in(&extensions).unwrap();
 
         let path = extensions.join("amber-hook.ts");
         let first = fs::read_to_string(&path).unwrap();
@@ -204,7 +203,7 @@ mod tests {
         assert!(first.contains("session_id"));
         assert!(first.contains("cwd"));
 
-        ensure_extension_in(&extensions);
+        install_extension_in(&extensions).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), first);
     }
 
@@ -218,7 +217,7 @@ mod tests {
         let owned = extensions.join("amber-hook.ts");
         fs::write(&owned, "// stale owned content\n").unwrap();
 
-        ensure_extension_in(&extensions);
+        install_extension_in(&extensions).unwrap();
 
         assert_ne!(
             fs::read_to_string(&owned).unwrap(),
@@ -232,5 +231,16 @@ mod tests {
                 .to_string_lossy()
                 .contains(".amber-tmp")
         }));
+    }
+
+    #[test]
+    fn fallible_extension_installer_reports_an_unusable_destination() {
+        // The explicit repair command must be able to distinguish a verified
+        // install from an extension directory that cannot be created.
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("not-a-directory");
+        fs::write(&blocked, "file blocks extension directory").unwrap();
+
+        assert!(install_extension_in(&blocked).is_err());
     }
 }

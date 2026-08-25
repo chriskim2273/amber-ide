@@ -466,19 +466,7 @@ fn run_purge_codex_skill() -> anyhow::Result<()> {
 /// filesystem failures instead of breaking Pi startup; this is the explicit
 /// repair path used by packaged setup.
 fn run_install_pi_extension() -> anyhow::Result<()> {
-    let agent_dir = std::env::var("PI_CODING_AGENT_DIR")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .filter(|value| !value.is_empty())
-                .map(|home| PathBuf::from(home).join(".pi").join("agent"))
-        })
-        .ok_or_else(|| anyhow::anyhow!("amber ctl install-pi-extension: HOME must be set and non-empty"))?;
-    let path = agent_dir.join("extensions").join("amber-hook.ts");
-    amber::pi::ensure_global_pi_extension();
+    let path = amber::pi::install_global_pi_extension()?;
     println!("installed {}", path.display());
     Ok(())
 }
