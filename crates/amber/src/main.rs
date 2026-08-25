@@ -128,8 +128,8 @@ enum Command {
     /// agent session's child process; not meant to be run directly by users).
     Run {
         name: String,
-        /// Which agent to supervise: `claude` (default), `grok`, `codex`, or
-        /// `opencode`. Passed by the daemon rather than read from the store,
+        /// Which agent to supervise: `claude` (default), `grok`, `codex`,
+        /// `opencode`, or `pi`. Passed by the daemon rather than read from the store,
         /// which the spawn races.
         #[arg(long, default_value = "claude")]
         kind: String,
@@ -145,7 +145,7 @@ enum Command {
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<OsString>,
     },
-    /// `SessionStart` hook target invoked by claude/codex/opencode; records the
+    /// `SessionStart` hook target invoked by claude/codex/opencode/pi; records the
     /// session id from stdin (`AMBER_SESSION`/`AMBER_STATE_DIR` env, spec §6.2).
     Hook,
     /// Print a read-only Claude-session handoff for the current Codex session.
@@ -185,7 +185,7 @@ fn parse_slot(value: &str) -> Result<u32, String> {
 
 #[derive(Subcommand)]
 enum CtlAction {
-    /// Resolve the agent binaries (claude, grok, codex, opencode) via your
+    /// Resolve the agent binaries (claude, grok, codex, opencode, pi) via your
     /// login shell and record them in config (the distribution-safe path —
     /// never the daemon's own PATH; spec §8).
     Doctor {
@@ -274,6 +274,8 @@ enum CtlAction {
     InstallCodexSkill,
     #[command(hide = true)]
     PurgeCodexSkill,
+    /// Install or repair Amber's global Pi session-id extension.
+    InstallPiExtension,
 }
 
 /// `$XDG_STATE_HOME/amber-ide`, falling back to `$HOME/.local/state/amber-ide`.
@@ -360,6 +362,7 @@ fn main() -> anyhow::Result<()> {
             CtlAction::Web { action, port, json, root } => run_ctl_web(action, port, json, root),
             CtlAction::InstallCodexSkill => run_install_codex_skill(),
             CtlAction::PurgeCodexSkill => run_purge_codex_skill(),
+            CtlAction::InstallPiExtension => run_install_pi_extension(),
         },
     }
 }
@@ -372,7 +375,7 @@ fn run_doctor(root: Option<PathBuf>) -> anyhow::Result<()> {
     std::fs::create_dir_all(&root)?;
     let store = StateStore::new(&root);
 
-    // grok/codex/opencode are optional: a machine with only claude installed is
+    // grok/codex/opencode/pi are optional: a machine with only claude installed is
     // a working amber, so a missing optional agent is reported but never fails
     // the doctor.
     if let Some(path) = amber::grok::resolve_grok() {
@@ -398,6 +401,14 @@ fn run_doctor(root: Option<PathBuf>) -> anyhow::Result<()> {
         println!("opencode: {} (recorded in config)", path.display());
     } else {
         println!("opencode: not found via your login shell (opencode panes will fall back to a shell)");
+    }
+    if let Some(path) = amber::pi::resolve_pi() {
+        let mut cfg = store.load_config()?;
+        cfg.pi_path = Some(path.clone());
+        store.save_config(&cfg)?;
+        println!("pi:     {} (recorded in config)", path.display());
+    } else {
+        println!("pi:     not found via your login shell (pi panes will fall back to a shell)");
     }
 
     match claude::resolve_claude() {
@@ -448,6 +459,27 @@ fn run_purge_codex_skill() -> anyhow::Result<()> {
         amber::codex_skill::RemoveOutcome::Missing => {}
         amber::codex_skill::RemoveOutcome::Conflict => codex_skill_conflict_warning(),
     }
+    Ok(())
+}
+
+/// Install Pi's Amber-owned extension. The installer is idempotent and logs
+/// filesystem failures instead of breaking Pi startup; this is the explicit
+/// repair path used by packaged setup.
+fn run_install_pi_extension() -> anyhow::Result<()> {
+    let agent_dir = std::env::var("PI_CODING_AGENT_DIR")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(|home| PathBuf::from(home).join(".pi").join("agent"))
+        })
+        .ok_or_else(|| anyhow::anyhow!("amber ctl install-pi-extension: HOME must be set and non-empty"))?;
+    let path = agent_dir.join("extensions").join("amber-hook.ts");
+    amber::pi::ensure_global_pi_extension();
+    println!("installed {}", path.display());
     Ok(())
 }
 
@@ -1165,6 +1197,12 @@ fn run_daemon(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Result<
     cgroups.set_session_high_kb(config.memory.session_high_kb(budget_kb));
     let memory_config = config.memory.clone();
     let pressure_config = config.pressure.clone();
+    let refresh_pi_extension = config.pi_path.as_ref().is_some_and(|path| path.exists())
+        || amber::pi::resolve_pi().is_some()
+        || StateStore::new(&root)
+            .list_sessions()?
+            .iter()
+            .any(|meta| meta.kind == amber_core::state::SessionKind::Pi);
     let manager = Arc::new(
         SessionManager::new_with_cgroups(&root, config, cgroups)?
             .with_socket(socket_path.clone())
@@ -1181,6 +1219,9 @@ fn run_daemon(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Result<
         claude::ensure_global_claude_hook(&hook);
         amber::codex::ensure_global_codex_hook(&hook);
         amber::opencode::ensure_global_opencode_plugin();
+    }
+    if refresh_pi_extension {
+        amber::pi::ensure_global_pi_extension();
     }
     manager.restore()?;
 

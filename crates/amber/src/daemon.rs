@@ -168,6 +168,7 @@ fn parse_kind(kind: &str) -> anyhow::Result<SessionKind> {
         "grok" => Ok(SessionKind::Grok),
         "codex" => Ok(SessionKind::Codex),
         "opencode" => Ok(SessionKind::OpenCode),
+        "pi" => Ok(SessionKind::Pi),
         other => anyhow::bail!("unknown session kind: {other}"),
     }
 }
