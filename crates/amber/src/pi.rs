@@ -194,6 +194,7 @@ mod tests {
 
         let path = extensions.join("amber-hook.ts");
         let first = fs::read_to_string(&path).unwrap();
+        assert_eq!(first, EXTENSION_TS);
         assert!(first.contains("ExtensionAPI"));
         assert!(first.contains("@earendil-works/pi-coding-agent"));
         assert!(first.contains("session_start"));

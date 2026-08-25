@@ -3,8 +3,8 @@
 //! Layout under a root dir:
 //! ```text
 //! config.toml
-//! sessions/<name>.json     { name, cwd, kind: "shell"|"claude"|"grok"|"codex"|"opencode", updated }
-//! claude/<name>.json       { session_id, cwd, updated }   (grok/codex/opencode ids live here too)
+//! sessions/<name>.json     { name, cwd, kind: "shell"|"claude"|"grok"|"codex"|"opencode"|"pi", updated }
+//! claude/<name>.json       { session_id, cwd, updated }   (grok/codex/opencode/pi ids live here too)
 //! scrollback/<name>.bin     raw bytes
 //! ```
 //! All writes are atomic: write to a `.tmp` file in the same directory as the
