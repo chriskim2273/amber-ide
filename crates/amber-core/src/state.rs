@@ -28,6 +28,7 @@ pub enum SessionKind {
     Grok,
     Codex,
     OpenCode,
+    Pi,
 }
 
 impl SessionKind {
@@ -40,7 +41,11 @@ impl SessionKind {
     pub fn is_agent(self) -> bool {
         matches!(
             self,
-            SessionKind::Claude | SessionKind::Grok | SessionKind::Codex | SessionKind::OpenCode
+            SessionKind::Claude
+                | SessionKind::Grok
+                | SessionKind::Codex
+                | SessionKind::OpenCode
+                | SessionKind::Pi
         )
     }
 
@@ -52,6 +57,7 @@ impl SessionKind {
             SessionKind::Grok => "grok",
             SessionKind::Codex => "codex",
             SessionKind::OpenCode => "opencode",
+            SessionKind::Pi => "pi",
         }
     }
 }
@@ -114,6 +120,9 @@ pub struct Config {
     /// Resolved `opencode` binary. Defaulted for older configs.
     #[serde(default)]
     pub opencode_path: Option<PathBuf>,
+    /// Resolved `pi` binary. Defaulted for older configs.
+    #[serde(default)]
+    pub pi_path: Option<PathBuf>,
     pub snapshot_interval_secs: u64,
     pub scrollback_bytes: usize,
     #[serde(default)]
@@ -266,6 +275,7 @@ impl Default for Config {
             grok_path: None,
             codex_path: None,
             opencode_path: None,
+            pi_path: None,
             snapshot_interval_secs: 10,
             scrollback_bytes: 2 * 1024 * 1024,
             memory: MemoryConfig::default(),
@@ -1235,6 +1245,7 @@ mod tests {
         assert!(SessionKind::Grok.is_agent());
         assert!(SessionKind::Codex.is_agent());
         assert!(SessionKind::OpenCode.is_agent());
+        assert!(SessionKind::Pi.is_agent());
         assert!(!SessionKind::Shell.is_agent());
     }
 
@@ -1255,6 +1266,22 @@ mod tests {
     fn opencode_kind_serializes_lowercase() {
         let json = serde_json::to_string(&SessionKind::OpenCode).unwrap();
         assert_eq!(json, "\"opencode\"");
+    }
+
+    #[test]
+    fn pi_kind_serializes_lowercase_and_is_an_agent() {
+        assert_eq!(serde_json::to_string(&SessionKind::Pi).unwrap(), "\"pi\"");
+        assert_eq!(
+            serde_json::from_str::<SessionKind>("\"pi\"").unwrap(),
+            SessionKind::Pi
+        );
+        assert!(SessionKind::Pi.is_agent());
+        assert_eq!(SessionKind::Pi.as_str(), "pi");
+    }
+
+    #[test]
+    fn pi_path_defaults_to_none() {
+        assert_eq!(Config::default().pi_path, None);
     }
 
     #[test]
@@ -1461,6 +1488,7 @@ mod tests {
             grok_path: Some(PathBuf::from("/usr/local/bin/grok")),
             codex_path: Some(PathBuf::from("/usr/local/bin/codex")),
             opencode_path: Some(PathBuf::from("/usr/local/bin/opencode")),
+            pi_path: Some(PathBuf::from("/usr/local/bin/pi")),
             snapshot_interval_secs: 42,
             scrollback_bytes: 4096,
             memory: MemoryConfig::default(),
