@@ -158,6 +158,12 @@ async function installDaemon(): Promise<void> {
     await spawnOkWithStderr(stable, ['ctl', 'install-codex-skill'], (stderr) => {
       process.stderr.write(stderr)
     })
+    // Pi self-repairs again before every supervised launch. Surface this
+    // first-run repair failure, but never let an extension filesystem problem
+    // block desktop startup or cause daemon lifecycle work.
+    const piRepair = await runCapture(stable, ['ctl', 'install-pi-extension'])
+    if (piRepair.stderr.length > 0) process.stderr.write(piRepair.stderr)
+    if (piRepair.code !== 0) process.stderr.write(`[amber] Pi extension repair failed (exit ${piRepair.code})\n`)
 
     if (process.platform === 'linux') {
       const unitDir = join(home, '.config', 'systemd', 'user')

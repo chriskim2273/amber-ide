@@ -3,8 +3,15 @@ import { reloadAgentCommand } from './reloadAgent'
 
 const CODEX_FLAGS = '--dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust'
 const UUID = '91b9f942-914d-4ea0-8c29-cef2c8b3b984'
+const PI_ID = 'a1b2c3d4-e5f6-7890'
 
 describe('reloadAgentCommand', () => {
+  it('resumes Pi by recorded id, uses its picker without one, and rejects option-shaped ids', () => {
+    expect(reloadAgentCommand('pi', PI_ID)).toBe(`pi --session '${PI_ID}'`)
+    expect(reloadAgentCommand('pi', null)).toBe('pi -r')
+    expect(reloadAgentCommand('pi', '--continue')).toBeNull()
+  })
+
   it('resumes the exact Codex string id with both required flags', () => {
     expect(reloadAgentCommand('codex', 'named session; still one argument'))
       .toBe(`codex resume ${CODEX_FLAGS} -- 'named session; still one argument'`)

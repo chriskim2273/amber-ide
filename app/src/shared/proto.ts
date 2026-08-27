@@ -2,10 +2,12 @@
 // tag 0 = Control (JSON of ControlMsg, serde externally-tagged).
 // tag 1 = Data ([u16 BE name_len][name utf8][raw bytes]).
 
+export type DaemonSessionKind = 'shell' | 'claude' | 'grok' | 'codex' | 'opencode' | 'pi'
+
 export interface SessionInfo {
   name: string
   cwd: string
-  kind: string
+  kind: DaemonSessionKind
   alive: boolean
   // Unix seconds of the session's last state-store write; the daemon's
   // ordering key for "most recent". Optional on the wire (serde default 0);
@@ -15,7 +17,7 @@ export interface SessionInfo {
   // 2026-07-19-stable-session-slots): what `amber ls` prints and what
   // `amber attach <n>` resolves. Absent/0 from an older daemon.
   slot?: number
-  // Supervision phase for an AGENT session (kind 'claude' | 'grok' | 'codex' | 'opencode'): 'claude'
+  // Supervision phase for an AGENT session (kind 'claude' | 'grok' | 'codex' | 'opencode' | 'pi'): 'claude'
   // (running), 'claude-retrying' (crashed, retrying), 'shell-fallback' (dropped
   // to a shell), 'suspended' (parked, RAM freed). The strings stay spelled
   // `claude*` for every agent — they name the phase, not the binary. Optional on

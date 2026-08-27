@@ -217,6 +217,8 @@ body {
   background: var(--text-faint);
 }
 .tab .kind-dot.claude { background: var(--warn); }
+/* pi follows Claude's supervision UI, so it uses the same amber identity. */
+.tab .kind-dot.pi { background: var(--warn); }
 /* grok: its own hue so a glance tells the two agents apart. */
 .tab .kind-dot.grok { background: var(--grok, #8ab4f8); }
 /* codex: green/teal, distinct from claude amber and grok blue. */

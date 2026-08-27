@@ -9,9 +9,19 @@ import type { LayoutFile, WsLayout, TabLayout, FrozenEntry, BrowserEntry, Editor
 // (`p0`, `p1`…) — session names are minted fresh on load.
 export const WORKSPACE_VERSION = 1
 
+export type WorkspacePaneKind = 'shell' | 'claude' | 'grok' | 'codex' | 'opencode' | 'pi' | 'browser' | 'editor'
+
+function isWorkspacePaneKind(kind: string): kind is WorkspacePaneKind {
+  return kind === 'shell' || kind === 'claude' || kind === 'grok' || kind === 'codex'
+    || kind === 'opencode' || kind === 'pi' || kind === 'browser' || kind === 'editor'
+}
+
 export interface WsPane {
   id: string // placeholder referenced by tree leaves (p0, p1…)
-  kind: string // 'shell' | 'claude' | 'grok' | 'codex' | 'opencode' | 'browser' | 'editor' (app-local kinds stored verbatim)
+  // Parsed values are validated by isWorkspacePaneKind. This stays string at
+  // the file boundary so callers can assemble a document from live sessions
+  // before their daemon response is narrowed.
+  kind: string
   cwd: string
   ord: number
   frozenNote?: string // presence (incl. '') = frozen; the value is the note
@@ -74,7 +84,7 @@ function parsePane(v: unknown): WsPane {
   if (typeof v !== 'object' || v === null || Array.isArray(v)) fail('pane is not an object')
   const p = v as Record<string, unknown>
   if (typeof p['id'] !== 'string') fail('pane.id must be a string')
-  if (typeof p['kind'] !== 'string') fail('pane.kind must be a string')
+  if (typeof p['kind'] !== 'string' || !isWorkspacePaneKind(p['kind'])) fail('pane.kind is unsupported')
   if (typeof p['cwd'] !== 'string') fail('pane.cwd must be a string')
   if (typeof p['ord'] !== 'number' || !Number.isFinite(p['ord'])) fail('pane.ord must be a number')
   if (typeof p['scrollback'] !== 'string') fail('pane.scrollback must be a string')

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { initialState, reduce, groupSessions, mergeBrowsers, paneDot, tabDot, hasActivity, shouldHintTerminalFocus, shouldResumeMemoryParked, parkedOverlayText, resourcePressureMessage, type PaneModel, type WorkspaceModel } from './store'
+import { initialState, reduce, groupSessions, mergeBrowsers, isAgentKind, paneDot, tabDot, hasActivity, shouldHintTerminalFocus, shouldResumeMemoryParked, parkedOverlayText, resourcePressureMessage, type PaneModel, type WorkspaceModel } from './store'
 import type { SessionInfo } from '../shared/proto'
 
 describe('mergeBrowsers', () => {
@@ -26,6 +26,13 @@ describe('mergeBrowsers', () => {
 describe('paneDot browser', () => {
   it('is a browser dot', () => {
     expect(paneDot('browser', undefined)).toEqual({ cls: 'browser', label: 'browser' })
+  })
+})
+
+describe('Pi agent panes', () => {
+  it('treats Pi as an agent and gives its retry state the same dot as Claude', () => {
+    expect(isAgentKind('pi')).toBe(true)
+    expect(paneDot('pi', 'claude-retrying')).toEqual(paneDot('claude', 'claude-retrying'))
   })
 })
 

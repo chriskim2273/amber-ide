@@ -152,7 +152,7 @@ export interface KindDot { cls: string; label: string }
 // the run_state vocabulary stays spelled `claude*` for all of them because it
 // names the supervision phase, not the binary.
 export function isAgentKind(kind: string): boolean {
-  return kind === 'claude' || kind === 'grok' || kind === 'codex' || kind === 'opencode'
+  return kind === 'claude' || kind === 'grok' || kind === 'codex' || kind === 'opencode' || kind === 'pi'
 }
 
 // Daemon Focus is a recent-use hint, so only a real interaction in the active
@@ -203,7 +203,11 @@ export function paneDot(kind: string, runState: string | undefined): KindDot {
   if (kind === 'editor') return { cls: 'editor', label: 'editor' }
   if (!isAgentKind(kind)) return { cls: 'shell', label: 'shell' }
   switch (runState) {
-    case 'claude-retrying': return { cls: `${kind}-retrying`, label: `${kind} (retrying)` }
+    // Pi follows Claude's supervisor phase and deliberately shares its retry
+    // dot, avoiding a new visual state for the same recovery behavior.
+    case 'claude-retrying': return kind === 'pi'
+      ? { cls: 'claude-retrying', label: 'claude (retrying)' }
+      : { cls: `${kind}-retrying`, label: `${kind} (retrying)` }
     case 'shell-fallback': return { cls: 'shell-fallback', label: `shell (${kind} exited)` }
     case 'memory-suspended': return { cls: 'memory-suspended', label: `${kind} (parked for memory)` }
     case 'resource-suspended': return { cls: 'memory-suspended', label: `${kind} (parked for system resources)` }
@@ -222,7 +226,9 @@ export function tabDot(panes: PaneModel[]): KindDot {
   if (agents.length === 0) return { cls: 'shell', label: 'shell' }
   const kinds = new Set(agents.map((p) => p.kind))
   const k = kinds.size === 1 ? agents[0]!.kind : 'claude'
-  if (agents.some((p) => p.runState === 'claude-retrying')) return { cls: `${k}-retrying`, label: `${k} (retrying)` }
+  if (agents.some((p) => p.runState === 'claude-retrying')) return k === 'pi'
+    ? paneDot('pi', 'claude-retrying')
+    : { cls: `${k}-retrying`, label: `${k} (retrying)` }
   if (agents.every((p) => p.runState === 'shell-fallback')) return { cls: 'shell-fallback', label: `shell (${k} exited)` }
   if (agents.some((p) => p.runState === 'resource-suspended')
     && agents.every((p) => (p.runState === 'resource-suspended' || p.runState === 'shell-fallback'))) {

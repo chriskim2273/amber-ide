@@ -1,10 +1,11 @@
 import { CLAUDE_SESSION_ID } from '../shared/ids'
 
-export type AgentName = 'claude' | 'grok' | 'codex' | 'opencode'
+export type AgentName = 'claude' | 'grok' | 'codex' | 'opencode' | 'pi'
 
 const CODEX_FLAGS = '--dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust'
 const CONTROL_CHARACTER = /[\u0000-\u001f\u007f-\u009f]/
 const OPENCODE_SESSION_ID = /^ses_[0-9A-Za-z]+$/
+const PI_SESSION_ID = /^[0-9A-Za-z](?:[0-9A-Za-z-]*[0-9A-Za-z])?$/
 
 function shellQuote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`
@@ -13,10 +14,14 @@ function shellQuote(value: string): string {
 export function reloadAgentCommand(agent: AgentName, id: string | null): string | null {
   if (id !== null) {
     if (id.trim() === '' || CONTROL_CHARACTER.test(id)) return null
-    if (agent === 'opencode') {
+    if (agent === 'pi') {
+      if (id.length < 8 || !PI_SESSION_ID.test(id)) return null
+    } else if (agent === 'opencode') {
       if (!OPENCODE_SESSION_ID.test(id)) return null
     } else if (agent !== 'codex' && !CLAUDE_SESSION_ID.test(id)) return null
   }
+
+  if (agent === 'pi') return id === null ? 'pi -r' : `pi --session ${shellQuote(id)}`
 
   if (agent === 'opencode') {
     return id === null
