@@ -39,9 +39,16 @@ export const resolvePeerExecutable = async ({
   try {
     executableStat = await statPath(executable)
   } catch (error) {
-    throw new Error(`${peerPathVariable} does not name an existing file: ${executable}`, {
-      cause: error,
-    })
+    const code = typeof error?.code === 'string' ? error.code : undefined
+    if (code === 'ENOENT' || code === 'ENOTDIR') {
+      throw new Error(`${peerPathVariable} does not name an existing file: ${executable}`, {
+        cause: error,
+      })
+    }
+    throw new Error(
+      `${peerPathVariable} could not inspect ${executable} (${code ?? 'unknown stat error'})`,
+      { cause: error },
+    )
   }
   if (!executableStat.isFile()) {
     throw new Error(`${peerPathVariable} is not a file: ${executable}`)
@@ -308,6 +315,30 @@ const releaseExitedChild = (child) => {
   }
   throw new Error(`refusing to release live peer ${child.pid}`)
 }
+const retainLivePeerUntilExit = (child) => {
+  if (!child || childExited(child) || child.pid === undefined) {
+    releaseExitedChild(child)
+    return Promise.resolve()
+  }
+
+  return new Promise((resolve) => {
+    let settled = false
+    const onError = () => {}
+    const onExit = () => {
+      if (settled) return
+      settled = true
+      child.off('error', onError)
+      child.off('exit', onExit)
+      releaseExitedChild(child)
+      resolve()
+    }
+    // A cleanup failure must leave an explicit process-handle lease behind.
+    // Do not unref the child: the entrypoint remains pending until real exit.
+    child.on('error', onError)
+    child.once('exit', onExit)
+    if (childExited(child)) onExit()
+  })
+}
 const waitForChildExit = (child, ms, signal) => new Promise((resolve, reject) => {
   if (childExited(child)) {
     resolve()
@@ -403,10 +434,16 @@ const run = async () => {
       }
       sockets.clear()
 
+      let peerStopped = false
       try {
         await stopPeer(peer)
+        peerStopped = true
       } finally {
-        peerLines?.dispose()
+        // Keep draining a known-live peer after cleanup failure. The entrypoint
+        // releases this monitor only after its explicit exit lease settles.
+        if (peerStopped || !peer || childExited(peer) || peer.pid === undefined) {
+          peerLines?.dispose()
+        }
       }
     })()
     return cleanupPromise
@@ -454,10 +491,31 @@ const run = async () => {
   }
 }
 
+export const runEntrypoint = async ({
+  execute = run,
+  getLivePeer = () => peer,
+  processState = process,
+  writeError = (message) => process.stderr.write(message),
+  releasePeerMonitor = () => peerLines?.dispose(),
+} = {}) => {
+  try {
+    await execute()
+  } catch (error) {
+    processState.exitCode = 1
+    const message = error instanceof Error ? (error.stack ?? error.message) : String(error)
+    writeError(`${message}\n`)
+    try {
+      await retainLivePeerUntilExit(getLivePeer())
+    } finally {
+      releasePeerMonitor()
+    }
+  }
+}
+
 if (path.resolve(process.argv[1] ?? '') === fileURLToPath(import.meta.url)) {
   if (process.platform !== 'win32') {
     console.log('SKIP windows-pipe.mjs: Windows named pipes require Windows')
   } else {
-    await run()
+    await runEntrypoint()
   }
 }

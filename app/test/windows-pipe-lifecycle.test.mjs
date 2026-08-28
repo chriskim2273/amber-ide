@@ -12,6 +12,7 @@ import {
   peerRunInvocation,
   readExactly,
   resolvePeerExecutable,
+  runEntrypoint,
   runWithDeadline,
   spawnPeer,
   stageWait,
@@ -153,6 +154,24 @@ test('Windows peer path must identify a file', async () => {
   )
 })
 
+test('Windows peer path reports access-denied stat failures with their cause', async () => {
+  const executable = String.raw`C:\amber-ci\windows_pipe_peer.exe`
+  const accessDenied = Object.assign(new Error('access denied by fixture'), { code: 'EACCES' })
+
+  await assert.rejects(
+    resolvePeerExecutable({
+      env: { AMBER_WINDOWS_PIPE_PEER: executable },
+      platform: 'win32',
+      statPath: async () => { throw accessDenied },
+    }),
+    (error) => {
+      assert.match(error.message, /could not inspect.*\(EACCES\)/)
+      assert.equal(error.cause, accessDenied)
+      return true
+    },
+  )
+})
+
 test('validated peer path is spawned directly with only the endpoint argument', async () => {
   const executable = String.raw`C:\amber-ci\windows_pipe_peer.exe`
   let invocation
@@ -182,6 +201,26 @@ test('validated peer path is spawned directly with only the endpoint argument', 
   assert.equal(invocation[2].shell, false)
   assert.equal(invocation[2].windowsHide, true)
   assert.equal(path.isAbsolute(invocation[2].cwd), true)
+})
+
+test('Windows executable paths containing spaces remain one direct spawn command', () => {
+  const executable = String.raw`C:\Program Files\Amber CI\windows_pipe_peer.exe`
+  let invocation
+  const child = new EventEmitter()
+
+  const returned = spawnPeer({
+    executable,
+    endpoint: 'amber proof endpoint',
+    spawnChild: (...args) => {
+      invocation = args
+      return child
+    },
+  })
+
+  assert.equal(returned, child)
+  assert.equal(invocation[0], executable)
+  assert.deepEqual(invocation[1], ['amber proof endpoint'])
+  assert.equal(invocation[2].shell, false)
 })
 
 test('harness contains no build launcher, process-tree killer, or target guess', async () => {
@@ -264,4 +303,48 @@ test('thrown termination error also clears wait listeners without releasing peer
   assert.equal(child.stderr.destroyed, false)
   assert.equal(child.listenerCount('error'), 0)
   assert.equal(child.listenerCount('exit'), 0)
+})
+
+test('entrypoint reports cleanup timeout and remains pending until the live peer exits', async () => {
+  const child = new EventEmitter()
+  child.pid = 4444
+  child.exitCode = null
+  child.signalCode = null
+  child.stdout = new PassThrough()
+  child.stderr = new PassThrough()
+  child.stdio = [null, child.stdout, child.stderr]
+  child.kill = () => true
+  child.unref = () => { throw new Error('live child must not be unreferenced') }
+  const processState = { exitCode: undefined }
+  let reported = ''
+  let finished = false
+  let monitorReleased = false
+
+  const entrypoint = runEntrypoint({
+    execute: () => terminateChild(child, 20),
+    getLivePeer: () => child,
+    processState,
+    writeError: (message) => { reported += message },
+    releasePeerMonitor: () => { monitorReleased = true },
+  }).then(() => { finished = true })
+
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  assert.equal(processState.exitCode, 1)
+  assert.match(reported, /peer 4444 did not exit within 20ms/)
+  assert.equal(finished, false)
+  assert.equal(child.listenerCount('error'), 1)
+  assert.equal(child.listenerCount('exit'), 1)
+  assert.equal(child.stdout.destroyed, false)
+  assert.equal(child.stderr.destroyed, false)
+  assert.equal(monitorReleased, false)
+
+  child.exitCode = 1
+  child.emit('exit', 1, null)
+  await entrypoint
+  assert.equal(finished, true)
+  assert.equal(child.listenerCount('error'), 0)
+  assert.equal(child.listenerCount('exit'), 0)
+  assert.equal(child.stdout.destroyed, true)
+  assert.equal(child.stderr.destroyed, true)
+  assert.equal(monitorReleased, true)
 })

@@ -669,3 +669,55 @@ exit, protocol-grace exit without a signal, and both false-returning and
 throwing termination failures retaining a known-live peer without leaked wait
 listeners. Native Windows runtime execution remains unavailable on this Linux
 host and is still a Task 8 gate, not reported as passing here.
+
+## Final Task 2 harness correction
+
+The executable entrypoint no longer uses a bare top-level `await run()`. It now
+catches a harness or cleanup failure, prints the error, sets `process.exitCode`
+to 1, and checks the directly owned peer. If that peer is still known live, the
+entrypoint installs explicit `error` and `exit` listeners and remains pending
+until the peer actually emits `exit`. The child and its stdio stay referenced;
+the existing line monitor also remains attached so peer output keeps draining,
+and there is still no `unref()` path. Only after observed exit are the streams
+destroyed and the lease/monitor listeners removed. Thus a successful `kill()`
+return followed by no exit can no longer let the harness report completion or
+orphan the peer: the process remains tied to it (and an outer CI job timeout
+can expose the unreaped child).
+
+`AMBER_WINDOWS_PIPE_PEER` resolution now distinguishes three cases. `ENOENT`
+and `ENOTDIR` mean the configured path is missing, a successful stat of a
+non-file reports that shape error, and all other stat failures report that the
+path could not be inspected. Inspection errors include their code (for example
+`EACCES` or `EPERM`) and retain the original error as `cause`; access denial is
+no longer mislabeled as a missing artifact.
+
+The direct-spawn regression also uses a Windows executable path containing
+spaces and a spaced endpoint. It proves the full executable string remains the
+single command, the endpoint remains one argument, and `shell: false` remains
+set, so no quoting or shell parsing is introduced.
+
+Final platform-neutral verification on Linux:
+
+```text
+$ node --check app/test/windows-pipe.mjs
+exit 0
+
+$ node --check app/test/windows-pipe-lifecycle.test.mjs
+exit 0
+
+$ node --unhandled-rejections=strict --test \
+    app/test/windows-pipe-lifecycle.test.mjs
+tests 16; pass 16; fail 0
+
+$ env -u AMBER_WINDOWS_PIPE_PEER node --unhandled-rejections=strict \
+    app/test/windows-pipe.mjs
+SKIP windows-pipe.mjs: Windows named pipes require Windows
+```
+
+The three added regressions cover access-denied stat classification with the
+original cause, direct spawn with a Windows path containing spaces, and the
+entrypoint-level cleanup failure where `kill()` returns true but the child does
+not exit. The last test proves the entrypoint reports failure yet remains
+pending with live-child listeners and intact streams, then releases only after
+a deterministic synthetic exit. Native Windows runtime execution remains
+unavailable on this Linux host and is still reported as unrun.
