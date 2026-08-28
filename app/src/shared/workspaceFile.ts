@@ -2,6 +2,7 @@ import type { Node } from '../renderer/layout'
 import { formatName } from './names'
 import { formatBrowserName } from './browserName'
 import { formatEditorName } from './editorName'
+import { isDaemonSessionKind, type DaemonSessionKind } from './proto'
 import type { LayoutFile, WsLayout, TabLayout, FrozenEntry, BrowserEntry, EditorEntry } from './layoutFile'
 
 // The `.amberws` portable workspace file. Structure (grouping/tree/labels) +
@@ -9,19 +10,20 @@ import type { LayoutFile, WsLayout, TabLayout, FrozenEntry, BrowserEntry, Editor
 // (`p0`, `p1`…) — session names are minted fresh on load.
 export const WORKSPACE_VERSION = 1
 
-export type WorkspacePaneKind = 'shell' | 'claude' | 'grok' | 'codex' | 'opencode' | 'pi' | 'browser' | 'editor'
+export type AppLocalPaneKind = 'browser' | 'editor'
+export type WorkspacePaneKind = DaemonSessionKind | AppLocalPaneKind
 
 function isWorkspacePaneKind(kind: string): kind is WorkspacePaneKind {
-  return kind === 'shell' || kind === 'claude' || kind === 'grok' || kind === 'codex'
-    || kind === 'opencode' || kind === 'pi' || kind === 'browser' || kind === 'editor'
+  return isDaemonSessionKind(kind) || kind === 'browser' || kind === 'editor'
+}
+
+function isAppLocalPaneKind(kind: WorkspacePaneKind): kind is AppLocalPaneKind {
+  return kind === 'browser' || kind === 'editor'
 }
 
 export interface WsPane {
   id: string // placeholder referenced by tree leaves (p0, p1…)
-  // Parsed values are validated by isWorkspacePaneKind. This stays string at
-  // the file boundary so callers can assemble a document from live sessions
-  // before their daemon response is narrowed.
-  kind: string
+  kind: WorkspacePaneKind
   cwd: string
   ord: number
   frozenNote?: string // presence (incl. '') = frozen; the value is the note
@@ -84,13 +86,14 @@ function parsePane(v: unknown): WsPane {
   if (typeof v !== 'object' || v === null || Array.isArray(v)) fail('pane is not an object')
   const p = v as Record<string, unknown>
   if (typeof p['id'] !== 'string') fail('pane.id must be a string')
-  if (typeof p['kind'] !== 'string' || !isWorkspacePaneKind(p['kind'])) fail('pane.kind is unsupported')
+  const kind = p['kind']
+  if (typeof kind !== 'string' || !isWorkspacePaneKind(kind)) fail('pane.kind is unsupported')
   if (typeof p['cwd'] !== 'string') fail('pane.cwd must be a string')
   if (typeof p['ord'] !== 'number' || !Number.isFinite(p['ord'])) fail('pane.ord must be a number')
   if (typeof p['scrollback'] !== 'string') fail('pane.scrollback must be a string')
   return {
     id: p['id'],
-    kind: p['kind'],
+    kind,
     cwd: p['cwd'],
     ord: p['ord'],
     scrollback: p['scrollback'],
@@ -204,6 +207,7 @@ export function assembleSave(
       // Placeholder per pane, in ord order (live groupings already sort by ord).
       const nameToId: Record<string, string> = {}
       const panes: WsPane[] = tab.panes.map((p, i) => {
+        if (!isWorkspacePaneKind(p.kind)) throw new Error(`unsupported pane kind: ${p.kind}`)
         const id = `p${i}`
         nameToId[p.name] = id
         const dump = dumps[p.name]
@@ -245,7 +249,7 @@ export type LoadOptions =
   | { mode: 'new'; nextWs: number; mintId: () => string }
   | { mode: 'replace'; ws: number; mintId: () => string }
 
-export interface LoadCreate { name: string; cwd: string; kind: string }
+export interface LoadCreate { name: string; cwd: string; kind: DaemonSessionKind }
 export interface LoadPlan {
   creates: LoadCreate[]
   workspaces: Record<string, WsLayout> // sidecar mutations, keyed by ws-number string
@@ -275,15 +279,15 @@ export function buildLoadPlan(doc: WorkspaceDoc, opts: LoadOptions): LoadPlan {
       for (const pane of tab.panes) {
         // Browser panes are app-local: mint a browser id, record a sidecar entry,
         // and DO NOT create a daemon session (no `creates` push).
-        if (pane.kind === 'browser') {
-          const bname = formatBrowserName({ ws: targetWs, tab: tab.tab, ord: pane.ord, id: opts.mintId() })
-          idToName[pane.id] = bname
-          browsers[bname] = { ws: targetWs, tab: tab.tab, ord: pane.ord, url: pane.url ?? '' }
-          continue
-        }
-        // Editor panes are app-local too (same class as browser): sidecar entry,
-        // no daemon session. Only the path is restored; contents come from disk.
-        if (pane.kind === 'editor') {
+        if (isAppLocalPaneKind(pane.kind)) {
+          if (pane.kind === 'browser') {
+            const bname = formatBrowserName({ ws: targetWs, tab: tab.tab, ord: pane.ord, id: opts.mintId() })
+            idToName[pane.id] = bname
+            browsers[bname] = { ws: targetWs, tab: tab.tab, ord: pane.ord, url: pane.url ?? '' }
+            continue
+          }
+          // Editor panes are app-local too (same class as browser): sidecar entry,
+          // no daemon session. Only the path is restored; contents come from disk.
           const ename = formatEditorName({ ws: targetWs, tab: tab.tab, ord: pane.ord, id: opts.mintId() })
           idToName[pane.id] = ename
           editors[ename] = { ws: targetWs, tab: tab.tab, ord: pane.ord, path: pane.path ?? null }

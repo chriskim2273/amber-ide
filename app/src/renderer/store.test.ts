@@ -30,9 +30,9 @@ describe('paneDot browser', () => {
 })
 
 describe('Pi agent panes', () => {
-  it('treats Pi as an agent and gives its retry state the same dot as Claude', () => {
+  it('treats Pi as an agent and gives its retry state a Pi-specific label and class', () => {
     expect(isAgentKind('pi')).toBe(true)
-    expect(paneDot('pi', 'claude-retrying')).toEqual(paneDot('claude', 'claude-retrying'))
+    expect(paneDot('pi', 'claude-retrying')).toEqual({ cls: 'pi-retrying', label: 'pi (retrying)' })
   })
 })
 

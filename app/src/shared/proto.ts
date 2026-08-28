@@ -4,6 +4,11 @@
 
 export type DaemonSessionKind = 'shell' | 'claude' | 'grok' | 'codex' | 'opencode' | 'pi'
 
+export function isDaemonSessionKind(kind: unknown): kind is DaemonSessionKind {
+  return kind === 'shell' || kind === 'claude' || kind === 'grok' || kind === 'codex'
+    || kind === 'opencode' || kind === 'pi'
+}
+
 export interface SessionInfo {
   name: string
   cwd: string
@@ -217,8 +222,8 @@ function jsonToMsg(v: unknown): ControlMsg | null {
           session_high_kb: (body['session_high_kb'] as number) ?? 0,
         }
       case 'SessionList': return { kind: 'SessionList', names: body['names'] as string[] }
-      case 'Sessions': return { kind: 'Sessions', sessions: body['sessions'] as SessionInfo[] }
-      case 'SessionsChanged': return { kind: 'SessionsChanged', added: body['added'] as SessionInfo[], removed: body['removed'] as string[] }
+      case 'Sessions': return { kind: 'Sessions', sessions: decodeSessionInfos(body['sessions']) }
+      case 'SessionsChanged': return { kind: 'SessionsChanged', added: decodeSessionInfos(body['added']), removed: body['removed'] as string[] }
       case 'Activity': return { kind: 'Activity', name: body['name'] as string }
       case 'MemoryStat': return { kind: 'MemoryStat', name: body['name'] as string, rss_kb: (body['rss_kb'] as number) ?? 0, growing: (body['growing'] as boolean) ?? false }
       case 'MemoryPressure': {
@@ -252,6 +257,16 @@ function jsonToMsg(v: unknown): ControlMsg | null {
     }
   }
   throw new Error('malformed control value')
+}
+
+function decodeSessionInfos(value: unknown): SessionInfo[] {
+  if (!Array.isArray(value)) throw new Error('invalid sessions payload')
+  return value.map((session) => {
+    if (!session || typeof session !== 'object' || !isDaemonSessionKind((session as Record<string, unknown>)['kind'])) {
+      throw new Error('invalid session kind')
+    }
+    return session as SessionInfo
+  })
 }
 
 export function encode(frame: Frame): Uint8Array {

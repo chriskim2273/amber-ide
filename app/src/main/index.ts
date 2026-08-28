@@ -43,7 +43,7 @@ import { claudeNames } from './claudeNames'
 import { loadLayoutFile, saveLayoutFile } from './layoutIO'
 import { compatSignature, shouldUseCompat, compatWorthyReason, COMPAT_SWITCHES, DETECT_WINDOW_MS } from './renderCompat'
 import { installBinary } from './installBinary'
-import { spawnOkWithStderr } from './spawnOk'
+import { repairAgentExtensions } from './agentSetup'
 import {
   sshTunnelArgv, sshProbeArgv, isValidHost, localSocketPath, hostLabel,
   REMOTE_SOCKET_PROBE, REMOTE_LAYOUT_PROBE, parseAgentSock, explainSshFailure,
@@ -155,15 +155,11 @@ async function installDaemon(): Promise<void> {
     const stable = join(home, '.local', 'bin', 'amber')
     await mkdir(dirname(stable), { recursive: true })
     await installBinary(amberBinary(), stable)
-    await spawnOkWithStderr(stable, ['ctl', 'install-codex-skill'], (stderr) => {
-      process.stderr.write(stderr)
+    // These repairs are independent and strictly best-effort: neither changes
+    // daemon lifecycle, and a failed Codex repair must not skip Pi's hook.
+    await repairAgentExtensions((args) => runCapture(stable, args), (warning) => {
+      process.stderr.write(warning)
     })
-    // Pi self-repairs again before every supervised launch. Surface this
-    // first-run repair failure, but never let an extension filesystem problem
-    // block desktop startup or cause daemon lifecycle work.
-    const piRepair = await runCapture(stable, ['ctl', 'install-pi-extension'])
-    if (piRepair.stderr.length > 0) process.stderr.write(piRepair.stderr)
-    if (piRepair.code !== 0) process.stderr.write(`[amber] Pi extension repair failed (exit ${piRepair.code})\n`)
 
     if (process.platform === 'linux') {
       const unitDir = join(home, '.config', 'systemd', 'user')

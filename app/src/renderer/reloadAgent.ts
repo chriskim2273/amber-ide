@@ -1,6 +1,11 @@
 import { CLAUDE_SESSION_ID } from '../shared/ids'
 
 export type AgentName = 'claude' | 'grok' | 'codex' | 'opencode' | 'pi'
+export interface ReloadAgentVisibility {
+  show: boolean
+  resumeSaved: boolean
+  pickSession: boolean
+}
 
 const CODEX_FLAGS = '--dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust'
 const CONTROL_CHARACTER = /[\u0000-\u001f\u007f-\u009f]/
@@ -9,6 +14,17 @@ const PI_SESSION_ID = /^[0-9A-Za-z](?:[0-9A-Za-z-]*[0-9A-Za-z])?$/
 
 function shellQuote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`
+}
+
+// The picker is a safe recovery path for every agent. Pi particularly needs it
+// before its extension has recorded a session id, so visibility cannot depend
+// on `claude_id` being present.
+export function reloadAgentVisibility(agent: AgentName, id: string | null): ReloadAgentVisibility {
+  return {
+    show: true,
+    resumeSaved: id !== null && reloadAgentCommand(agent, id) !== null,
+    pickSession: true,
+  }
 }
 
 export function reloadAgentCommand(agent: AgentName, id: string | null): string | null {

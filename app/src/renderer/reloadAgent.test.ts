@@ -1,11 +1,17 @@
 import { describe, expect, it } from 'vitest'
-import { reloadAgentCommand } from './reloadAgent'
+import { reloadAgentCommand, reloadAgentVisibility } from './reloadAgent'
 
 const CODEX_FLAGS = '--dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust'
 const UUID = '91b9f942-914d-4ea0-8c29-cef2c8b3b984'
 const PI_ID = 'a1b2c3d4-e5f6-7890'
 
 describe('reloadAgentCommand', () => {
+  it('shows Pi reload without a saved id, but gates exact resume on a valid id', () => {
+    expect(reloadAgentVisibility('pi', null)).toEqual({ show: true, resumeSaved: false, pickSession: true })
+    expect(reloadAgentVisibility('pi', '--continue')).toEqual({ show: true, resumeSaved: false, pickSession: true })
+    expect(reloadAgentVisibility('pi', PI_ID)).toEqual({ show: true, resumeSaved: true, pickSession: true })
+  })
+
   it('resumes Pi by recorded id, uses its picker without one, and rejects option-shaped ids', () => {
     expect(reloadAgentCommand('pi', PI_ID)).toBe(`pi --session '${PI_ID}'`)
     expect(reloadAgentCommand('pi', null)).toBe('pi -r')

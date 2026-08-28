@@ -234,6 +234,7 @@ body {
 .tab .kind-dot.grok-retrying { background: var(--grok, #8ab4f8); animation: pulse 1.2s ease-in-out infinite; }
 .tab .kind-dot.codex-retrying { background: var(--codex, #3dd68c); animation: pulse 1.2s ease-in-out infinite; }
 .tab .kind-dot.opencode-retrying { background: var(--opencode, #c084fc); animation: pulse 1.2s ease-in-out infinite; }
+.tab .kind-dot.pi-retrying { background: var(--warn); animation: pulse 1.2s ease-in-out infinite; }
 /* claude gave up / user quit — pane is a plain shell now (gray) */
 .tab .kind-dot.shell-fallback { background: var(--text-faint); }
 /* parked by a freeze grace — claude killed to free RAM, resumable (cyan) */
@@ -333,6 +334,8 @@ body {
   background: var(--text-faint); flex: none;
 }
 .pane-header .kind-dot.claude { background: var(--warn); }
+.pane-header .kind-dot.pi { background: var(--warn); }
+.pane-header .kind-dot.pi-retrying { background: var(--warn); animation: pulse 1.2s ease-in-out infinite; }
 .pane-header .kind-dot.grok { background: var(--grok, #8ab4f8); }
 .pane-header .kind-dot.codex { background: var(--codex, #3dd68c); }
 .pane-header .kind-dot.opencode { background: var(--opencode, #c084fc); }
@@ -921,6 +924,7 @@ body {
   background: var(--accent-2);
 }
 .session-row .kind-dot.claude { background: var(--warn); }
+.session-row .kind-dot.pi { background: var(--warn); }
 .session-row .kind-dot.grok { background: var(--grok, #8ab4f8); }
 .session-row .kind-dot.codex { background: var(--codex, #3dd68c); }
 .session-row .kind-dot.opencode { background: var(--opencode, #c084fc); }
