@@ -386,7 +386,8 @@ function main() {
   }
 
   // Match xterm to the pty's grid. `term.resize` is local xterm state only —
-  // the browser protocol has no resize message, so this can never reach the pty.
+  // this embedded client emits no Resize, although the server protocol accepts
+  // a separately validated, bounded Resize from a live browser session.
   // Re-runs on every `sessions` push, so a divider drag in the desktop app is
   // followed here instead of silently corrupting the render.
   function syncGeom() {
@@ -504,10 +505,10 @@ function main() {
   }
 
   /* ---------- pane gestures ---------- */
-  // create/kill/move/suspend/resume are the ONLY browser messages the server
-  // accepts (Task 4's whitelist in web.rs); everything else it silently
-  // ignores. Deliberately no `resize` here and none is ever added — a pty's
-  // winsize is shared with the desktop app's panes.
+  // This embedded UI sends create/kill/move/suspend/resume. The server's
+  // larger validated whitelist also accepts DumpBacklog and bounded Resize;
+  // this client deliberately emits no resize because a pty winsize is shared
+  // with desktop panes. Everything outside the server whitelist is ignored.
 
   function control(obj) {
     if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
