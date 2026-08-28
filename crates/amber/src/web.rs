@@ -782,7 +782,13 @@ impl Hub {
             None => false,
         };
         if !ok {
-            inner.daemon = None;
+            if let Some(mut writer) = inner.daemon.take() {
+                // The read half shares this local connection. Dropping only
+                // the writer leaves a Windows named-pipe reader polling the
+                // still-open handle forever, so force-close both directions
+                // and let `run_daemon_link` enter its reconnect state.
+                let _ = writer.shutdown();
+            }
         }
     }
 
@@ -2335,6 +2341,64 @@ mod tests {
             [Frame::Control(ControlMsg::WatchSessions), Frame::Control(ControlMsg::WatchMemoryPressure { version: 2 })]
                 | [Frame::Control(ControlMsg::WatchMemoryPressure { version: 2 }), Frame::Control(ControlMsg::WatchSessions)]
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_daemon_write_wakes_reader_and_reconnects() {
+        use std::net::Shutdown;
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("failed-write-reconnect.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let hub = Hub::new(sock, dir.path().to_path_buf());
+        {
+            let hub = Arc::clone(&hub);
+            thread::spawn(move || run_daemon_link(hub));
+        }
+
+        let (mut first, _) = listener.accept().unwrap();
+        first
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut decoder = Decoder::new();
+        let mut buf = [0_u8; 4096];
+        let mut frames = 0;
+        while frames < 2 {
+            while decoder.next_frame().unwrap().is_some() {
+                frames += 1;
+            }
+            if frames < 2 {
+                let read = first.read(&mut buf).unwrap();
+                assert_ne!(read, 0, "daemon link closed during initial subscription");
+                decoder.feed(&buf[..read]);
+            }
+        }
+
+        first.shutdown(Shutdown::Read).unwrap();
+        {
+            let mut inner = hub.inner.lock().unwrap();
+            assert!(inner.daemon.is_some());
+            Hub::write_daemon(&mut inner, &Frame::Control(ControlMsg::WatchSessions));
+            assert!(inner.daemon.is_none());
+        }
+
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match listener.accept() {
+                Ok((_second, _)) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "daemon reader stayed blocked after its writer failed"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("second daemon accept failed: {error}"),
+            }
+        }
     }
 
     #[cfg(unix)]

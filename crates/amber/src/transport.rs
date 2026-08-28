@@ -71,6 +71,31 @@ fn retry_busy_connect<T>(
     }
 }
 
+#[cfg(any(windows, test))]
+fn retry_nonblocking_read<T>(
+    timeout: std::time::Duration,
+    mut now: impl FnMut() -> std::time::Instant,
+    mut sleep: impl FnMut(std::time::Duration),
+    mut read_once: impl FnMut() -> io::Result<T>,
+) -> io::Result<T> {
+    let deadline = now() + timeout;
+    loop {
+        match read_once() {
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                let remaining = deadline.saturating_duration_since(now());
+                if remaining.is_zero() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("local read timed out after {} ms", timeout.as_millis()),
+                    ));
+                }
+                sleep(remaining.min(std::time::Duration::from_millis(1)));
+            }
+            result => return result,
+        }
+    }
+}
+
 #[cfg(unix)]
 mod imp {
     use super::*;
@@ -111,6 +136,15 @@ mod imp {
 
         pub fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> io::Result<()> {
             self.0.set_read_timeout(timeout)
+        }
+
+        pub fn read_with_timeout(
+            &mut self,
+            buf: &mut [u8],
+            timeout: std::time::Duration,
+        ) -> io::Result<usize> {
+            self.0.set_read_timeout(Some(timeout))?;
+            self.0.read(buf)
         }
 
         pub fn set_write_timeout(&self, timeout: Option<std::time::Duration>) -> io::Result<()> {
@@ -386,10 +420,21 @@ mod imp {
             Ok((LocalReader(Arc::clone(&self.0)), LocalWriter(self.0)))
         }
 
-        /// Named-pipe handles have no socket timeout option. I/O is already
-        /// nonblocking, and callers enforce their own wall-clock deadline.
+        /// Named-pipe handles have no socket timeout option. Callers that need
+        /// a bound must use [`Self::read_with_timeout`].
         pub fn set_read_timeout(&self, _timeout: Option<Duration>) -> io::Result<()> {
-            Ok(())
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "named pipes do not expose a persistent read timeout",
+            ))
+        }
+
+        pub fn read_with_timeout(
+            &mut self,
+            buf: &mut [u8],
+            timeout: Duration,
+        ) -> io::Result<usize> {
+            self.0.read_with_timeout(buf, timeout)
         }
 
         /// Named-pipe handles have no socket timeout option. I/O is already
@@ -455,10 +500,22 @@ mod imp {
 
     impl Pipe {
         fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
-            self.with_read_retry(|handle| unsafe {
+            self.with_read_retry(|| self.read_once(buf))
+        }
+
+        fn read_with_timeout(&self, buf: &mut [u8], timeout: Duration) -> io::Result<usize> {
+            retry_nonblocking_read(timeout, Instant::now, thread::sleep, || self.read_once(buf))
+        }
+
+        fn read_once(&self, buf: &mut [u8]) -> io::Result<usize> {
+            let handle = self.handle.lock().unwrap();
+            let handle = handle.as_ref().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "local reader is shut down")
+            })?;
+            unsafe {
                 let mut read = 0_u32;
                 if ReadFile(
-                    handle,
+                    handle.as_raw_handle(),
                     buf.as_mut_ptr(),
                     buf.len().try_into().unwrap_or(u32::MAX),
                     &mut read,
@@ -466,14 +523,18 @@ mod imp {
                 ) == 0
                 {
                     let error = io::Error::last_os_error();
-                    #[cfg(test)]
                     if error.raw_os_error() == Some(ERROR_NO_DATA as i32) {
+                        #[cfg(test)]
                         self.signal_read_retry();
+                        return Err(io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            "named pipe has no data available",
+                        ));
                     }
                     return Err(error);
                 }
                 Ok(read as usize)
-            })
+            }
         }
 
         fn write(&self, buf: &[u8]) -> io::Result<usize> {
@@ -503,20 +564,10 @@ mod imp {
             Ok(())
         }
 
-        fn with_read_retry<T>(
-            &self,
-            mut operation: impl FnMut(windows_sys::Win32::Foundation::HANDLE) -> io::Result<T>,
-        ) -> io::Result<T> {
+        fn with_read_retry<T>(&self, mut operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {
             loop {
-                let result = {
-                    let handle = self.handle.lock().unwrap();
-                    let handle = handle.as_ref().ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::BrokenPipe, "local writer is shut down")
-                    })?;
-                    operation(handle.as_raw_handle())
-                };
-                match result {
-                    Err(error) if error.raw_os_error() == Some(ERROR_NO_DATA as i32) => {
+                match operation() {
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(1));
                     }
                     result => return result,
@@ -877,6 +928,53 @@ fn nonblocking_write_preserves_partial_progress() {
         ),
         "a short successful write is returned for Write::write_all to continue"
     );
+}
+
+#[cfg(test)]
+#[test]
+fn bounded_nonblocking_read_retries_until_data_arrives() {
+    use std::collections::VecDeque;
+    use std::time::{Duration, Instant};
+
+    let started = Instant::now();
+    let mut times = VecDeque::from([started, started, started]);
+    let mut attempts = VecDeque::from([
+        Err(io::Error::from(io::ErrorKind::WouldBlock)),
+        Ok(7_usize),
+    ]);
+    let mut sleeps = Vec::new();
+    let read = retry_nonblocking_read(
+        Duration::from_secs(2),
+        || times.pop_front().expect("clock read"),
+        |duration| sleeps.push(duration),
+        || attempts.pop_front().expect("read attempt"),
+    );
+    assert_eq!(read.unwrap(), 7);
+    assert_eq!(sleeps, [Duration::from_millis(1)]);
+}
+
+#[cfg(test)]
+#[test]
+fn bounded_nonblocking_read_stops_at_wall_clock_deadline() {
+    use std::collections::VecDeque;
+    use std::time::{Duration, Instant};
+
+    let started = Instant::now();
+    let timeout = Duration::from_millis(5);
+    let mut times = VecDeque::from([started, started + timeout]);
+    let mut attempts = 0;
+    let error = retry_nonblocking_read(
+        timeout,
+        || times.pop_front().expect("clock read"),
+        |_| panic!("deadline leaves no time to sleep"),
+        || {
+            attempts += 1;
+            Err::<usize, _>(io::Error::from(io::ErrorKind::WouldBlock))
+        },
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert_eq!(attempts, 1);
 }
 
 #[cfg(test)]

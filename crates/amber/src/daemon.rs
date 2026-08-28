@@ -130,8 +130,13 @@ pub(crate) fn write_bounded<W: Write + ?Sized>(
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 // Windows named pipes are deliberately nonblocking. A full
                 // pipe is not a dead client until the existing wall-clock
-                // budget expires, so yield and retry within that budget.
-                thread::yield_now();
+                // budget expires, so retry with a small backoff rather than
+                // burning a CPU core in a yield-only spin.
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(std::io::ErrorKind::TimedOut.into());
+                }
+                thread::sleep(remaining.min(std::time::Duration::from_millis(1)));
             }
             Err(e) => return Err(e),
         }

@@ -2,7 +2,9 @@
 //! with resume/continue argv selection, falling back to an interactive shell
 //! so a pane never silently dies.
 
-use std::io::{Read, Write};
+use std::io::Write;
+#[cfg(test)]
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -666,7 +668,6 @@ fn try_report_run_state(
 ) -> anyhow::Result<()> {
     let mut stream = transport::connect(socket)?;
     stream.set_write_timeout(Some(REPORT_WRITE_TIMEOUT))?;
-    stream.set_read_timeout(Some(REPORT_WRITE_TIMEOUT))?;
     let frame = proto::encode(&Frame::Control(ControlMsg::ReportRunState {
         name: name.to_string(),
         state: state.to_string(),
@@ -675,6 +676,7 @@ fn try_report_run_state(
     stream.write_all(&frame)?;
     stream.flush()?;
 
+    let read_deadline = std::time::Instant::now() + REPORT_WRITE_TIMEOUT;
     let mut decoder = Decoder::new();
     let mut buf = [0u8; 4096];
     loop {
@@ -690,7 +692,11 @@ fn try_report_run_state(
                 Decoded::Frame(_) | Decoded::UndecodableControl(_) => {}
             }
         }
-        let n = stream.read(&mut buf)?;
+        let remaining = read_deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!("timed out waiting for run_state acknowledgement");
+        }
+        let n = stream.read_with_timeout(&mut buf, remaining)?;
         if n == 0 {
             anyhow::bail!("daemon closed before run_state acknowledgement");
         }

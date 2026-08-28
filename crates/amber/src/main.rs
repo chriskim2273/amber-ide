@@ -4,21 +4,15 @@
 use std::ffi::OsString;
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::thread;
 use std::time::Duration;
 
 use amber::attach;
 use amber::claude;
-use amber::daemon::Daemon;
-use amber::manager::SessionManager;
 use amber::supervisor;
 use amber::transport::{self, LocalStream};
 use amber_core::proto::{self, ControlMsg, Decoder, Frame};
 use amber_core::state::StateStore;
 use clap::{Parser, Subcommand, ValueEnum};
-use signal_hook::consts::{SIGINT, SIGTERM};
-use signal_hook::iterator::Signals;
 
 #[derive(Parser)]
 #[command(name = "amber", about = "amber session daemon + CLI")]
@@ -327,7 +321,7 @@ fn main() -> anyhow::Result<()> {
         return run_new(&resolve_socket(None));
     };
     match command {
-        Command::Daemon { root, socket } => daemon_main(root, socket),
+        Command::Daemon { root, socket } => amber::daemon_main(root, socket),
         Command::Attach { name, no_prefix, no_status, force, socket } => {
             run_attach(&resolve_socket(socket), name, no_prefix, no_status, force)
         }
@@ -775,9 +769,8 @@ fn run_budget(set: Option<&str>, systemd: bool, socket: &Path) -> anyhow::Result
         Some(_) => ControlMsg::SetMemoryBudget { mb: requested.and_then(|r| r).unwrap_or(0) },
     };
     stream.write_all(&proto::encode(&Frame::Control(request)))?;
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
 
-    match read_budget_reply(&mut stream)? {
+    match read_budget_reply(&mut stream, std::time::Duration::from_secs(5))? {
         ControlMsg::BudgetApplied { mb, effective_budget_kb, cgroup_limit_kb, session_high_kb } => {
             if set.is_some() {
                 println!("budget saved; live immediately (no restart)");
@@ -800,7 +793,11 @@ fn run_budget(set: Option<&str>, systemd: bool, socket: &Path) -> anyhow::Result
 }
 
 /// Wait for the BudgetApplied/Error reply to a budget request.
-fn read_budget_reply(stream: &mut LocalStream) -> anyhow::Result<ControlMsg> {
+fn read_budget_reply(
+    stream: &mut LocalStream,
+    timeout: std::time::Duration,
+) -> anyhow::Result<ControlMsg> {
+    let deadline = std::time::Instant::now() + timeout;
     let mut decoder = Decoder::new();
     let mut buf = [0u8; 8192];
     loop {
@@ -809,7 +806,11 @@ fn read_budget_reply(stream: &mut LocalStream) -> anyhow::Result<ControlMsg> {
             | Some(Frame::Control(msg @ ControlMsg::Error { .. })) => return Ok(msg),
             _ => {}
         }
-        match stream.read(&mut buf) {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!("timed out waiting for the daemon's reply — is it older than this command? restart amber and retry");
+        }
+        match stream.read_with_timeout(&mut buf, remaining) {
             Ok(0) => anyhow::bail!(
                 "no reply from the daemon — is it older than this command? restart amber and retry"
             ),
@@ -1159,129 +1160,6 @@ fn run_web(
     }
     eprintln!("amber web: expose it to your tailnet with: tailscale serve --bg {port}");
     amber::web::serve(listener, socket, root, token)
-}
-
-pub fn daemon_main(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Result<()> {
-    let root = root.unwrap_or_else(default_root);
-    std::fs::create_dir_all(&root)?;
-    let socket_path = socket.unwrap_or_else(|| default_socket(&root));
-    if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    // Created before the manager so restored sessions get their output-activity
-    // hook wired (a restored pane that produces output must light its tab dot).
-    let watchers = std::sync::Arc::new(amber::watchers::Watchers::new());
-    let (config, pressure_was_normalized) =
-        StateStore::new(&root).load_config_with_diagnostics()?;
-    if pressure_was_normalized {
-        eprintln!(
-            "amber daemon: warning: configured [pressure] values were normalized to safe limits/defaults"
-        );
-    }
-    let cgroups = amber::cgroup::CgroupManager::activate();
-    let cgroup_limit_kb = match cgroups.lowest_finite_limit_kb() {
-        Ok(limit) => limit,
-        Err(error) => {
-            eprintln!("amber daemon: could not read cgroup memory limits: {error}");
-            None
-        }
-    };
-    let budget_kb = config.memory.budget_kb(amber::procinfo::total_memory_kb(), cgroup_limit_kb);
-    cgroups.set_session_high_kb(config.memory.session_high_kb(budget_kb));
-    let memory_config = config.memory.clone();
-    let pressure_config = config.pressure.clone();
-    let refresh_pi_extension = config.pi_path.as_ref().is_some_and(|path| path.exists())
-        || amber::pi::resolve_pi().is_some()
-        || StateStore::new(&root)
-            .list_sessions()?
-            .iter()
-            .any(|meta| meta.kind == amber_core::state::SessionKind::Pi);
-    let manager = Arc::new(
-        SessionManager::new_with_cgroups(&root, config, cgroups)?
-            .with_socket(socket_path.clone())
-            .with_watchers(Arc::clone(&watchers)),
-    );
-    // The guardian reads its budget FRESH from this handle every tick, so
-    // `SetMemoryBudget` (CLI / app) moves it without a restart.
-    manager.store_effective_budget_kb(budget_kb);
-    // Global SessionStart hooks: claude (also covers hand-started claude in a
-    // shell); codex (no per-session settings file — the global hook is the only
-    // id-capture path for amber-launched codex panes).
-    if let Ok(exe) = amber::manager::resolve_current_exe() {
-        let hook = format!("{} hook", exe.display());
-        claude::ensure_global_claude_hook(&hook);
-        amber::codex::ensure_global_codex_hook(&hook);
-        amber::opencode::ensure_global_opencode_plugin();
-        if let Some(path) = amber::hermes::resolve_hermes() { amber::hermes::ensure_global_hermes_plugin(&path); }
-    }
-    if refresh_pi_extension {
-        amber::pi::ensure_global_pi_extension();
-    }
-    manager.restore()?;
-
-    // A stale socket file from a previous (crashed/killed) daemon run must
-    // not block bind() — but a LIVE daemon's socket must never be stolen.
-    let listener = amber::daemon::prepare_socket(&socket_path)?;
-
-    // Periodic snapshot thread (cadence from config, spec §7).
-    {
-        let manager = Arc::clone(&manager);
-        let watchers = Arc::clone(&watchers);
-        let interval = manager.snapshot_interval_secs().max(1);
-        thread::spawn(move || loop {
-            thread::sleep(Duration::from_secs(interval));
-            // Reap ended sessions first so the snapshot never re-persists a
-            // dead pane ("child exits -> session ends", spec §6.1).
-            match manager.reap() {
-                Ok(reaped) => {
-                    if !reaped.is_empty() {
-                        for name in &reaped {
-                            eprintln!("amber daemon: session {name} ended; reaped");
-                        }
-                        watchers.broadcast(&amber_core::proto::ControlMsg::SessionsChanged {
-                            added: vec![],
-                            removed: reaped,
-                        });
-                    }
-                }
-                Err(e) => eprintln!("amber daemon: reap failed: {e}"),
-            }
-            if let Err(e) = manager.snapshot() {
-                eprintln!("amber daemon: periodic snapshot failed: {e}");
-            }
-        });
-    }
-
-    amber::memory_guardian::start(
-        Arc::clone(&manager),
-        Arc::clone(&watchers),
-        memory_config,
-        pressure_config,
-    );
-
-    // SIGTERM/SIGINT -> final snapshot, then exit (spec §7 pre-reboot gap).
-    {
-        let manager = Arc::clone(&manager);
-        let mut signals = Signals::new([SIGTERM, SIGINT])?;
-        thread::spawn(move || {
-            if signals.forever().next().is_some() {
-                // Final snapshot PRESERVES resume_as_claude (claude is being
-                // cgroup-killed alongside us; re-detecting would clobber it).
-                if let Err(e) = manager.snapshot_final() {
-                    eprintln!("amber daemon: final snapshot failed: {e}");
-                }
-                if let Err(e) = manager.mark_clean_shutdown() {
-                    eprintln!("amber daemon: could not mark clean shutdown: {e}");
-                }
-                std::process::exit(0);
-            }
-        });
-    }
-
-    eprintln!("amber daemon: listening on {}", socket_path.display());
-    let daemon = Daemon::new(Arc::clone(&manager), Arc::clone(&watchers));
-    daemon.serve(listener)
 }
 
 /// `/home/me/proj` → `~/proj`, so the cwd column stays readable. Exact `$HOME`
