@@ -23,5 +23,6 @@ pub mod platform;
 pub mod supervisor;
 pub mod web;
 pub mod tailscale;
+pub mod transport;
 pub mod webctl;
 pub mod watchers;
