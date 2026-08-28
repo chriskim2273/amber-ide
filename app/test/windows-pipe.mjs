@@ -1,15 +1,20 @@
-// Windows-only named-pipe proof harness. It exercises Node's net client
-// against a local `\\\\.\\pipe\\` listener, carries an Amber protocol frame over
-// two independent connections, and then closes one intentionally stalled peer.
+// Windows-only Node <-> Rust named-pipe proof. It starts the test-only Rust
+// peer, exchanges one Amber protocol frame, connects a second stalled client,
+// and requires the Rust server to release that peer.
 import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
 import net from 'node:net'
+import path from 'node:path'
 
 if (process.platform !== 'win32') {
   console.log('SKIP windows-pipe.mjs: Windows named pipes require Windows')
   process.exit(0)
 }
 
-const path = `\\\\.\\pipe\\amber-node-pipe-${process.pid}-${Date.now()}`
+const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..')
+const endpoint = `amber-node-rust-pipe-${process.pid}-${Date.now()}`
+const pipePath = `\\\\.\\pipe\\${endpoint}`
 const body = Buffer.from(JSON.stringify({ SessionList: { names: [] } }))
 const frame = Buffer.concat([Buffer.from([0, 0, 0, body.length + 1, 0]), body])
 
@@ -18,32 +23,45 @@ const once = (emitter, event) => new Promise((resolve, reject) => {
   emitter.once('error', reject)
 })
 const connect = () => new Promise((resolve, reject) => {
-  const socket = net.createConnection({ path }, () => resolve(socket))
+  const socket = net.createConnection({ path: pipePath }, () => resolve(socket))
   socket.once('error', reject)
 })
-
-const clients = []
-const server = net.createServer((socket) => {
-  clients.push(socket)
-  if (clients.length === 1) {
-    socket.once('data', (received) => socket.write(received))
-  }
+const waitForLine = (child, line) => new Promise((resolve, reject) => {
+  let output = ''
+  child.stdout.setEncoding('utf8')
+  child.stderr.setEncoding('utf8')
+  child.stdout.on('data', (chunk) => {
+    output += chunk
+    if (output.split(/\r?\n/).includes(line)) resolve()
+  })
+  child.once('error', reject)
+  child.once('exit', (code) => {
+    if (!output.split(/\r?\n/).includes(line)) {
+      reject(new Error(`Rust peer exited before ${line} (code ${code})`))
+    }
+  })
 })
-server.listen(path)
-await once(server, 'listening')
+
+const cargo = process.env.CARGO ?? 'cargo'
+const peer = spawn(cargo, [
+  'run', '-q', '-p', 'amber', '--features', 'windows-pipe-harness',
+  '--bin', 'amber-windows-pipe-peer', '--', endpoint,
+], { cwd: repo, stdio: ['ignore', 'pipe', 'pipe'] })
+await waitForLine(peer, 'READY')
 
 const active = await connect()
-const stalled = await connect()
 active.write(frame)
 const echoed = await once(active, 'data')
-assert.deepEqual(echoed, frame, 'Node named-pipe connection must preserve Amber frame bytes')
+assert.deepEqual(echoed, frame, 'Rust transport must preserve Amber frame bytes for Node')
 
+const stalled = await connect()
 stalled.pause()
 const stalledClosed = once(stalled, 'close')
-stalled.destroy()
+const peerExited = once(peer, 'exit')
+await waitForLine(peer, 'RELEASED')
 await stalledClosed
 active.destroy()
-const serverClosed = once(server, 'close')
-server.close()
-await serverClosed
-console.log('PASS Node named-pipe frame round-trip, second client, stalled-peer close')
+
+const [exitCode] = await peerExited
+assert.equal(exitCode, 0, 'Rust peer must exit cleanly after releasing the second Node client')
+console.log('PASS Node<->Rust frame, multi-client acceptance, stalled-peer release')

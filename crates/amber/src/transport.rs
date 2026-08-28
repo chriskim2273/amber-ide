@@ -115,7 +115,11 @@ mod imp {
     use interprocess::os::windows::{
         local_socket::ListenerOptionsExt as _, security_descriptor::SecurityDescriptor,
     };
-    use std::{os::windows::io::AsRawHandle, sync::Arc};
+    use std::{
+        sync::{Arc, Mutex},
+        thread,
+        time::Duration,
+    };
     use widestring::U16CString;
     use windows_sys::Win32::{
         Foundation::LocalFree,
@@ -123,27 +127,33 @@ mod imp {
             Authorization::ConvertSidToStringSidW, GetTokenInformation, TokenUser, TOKEN_QUERY,
             TOKEN_USER,
         },
-        System::{
-            Pipes::DisconnectNamedPipe,
-            Threading::{GetCurrentProcess, OpenProcessToken},
-        },
+        System::Threading::{GetCurrentProcess, OpenProcessToken},
     };
 
     /// A local named-pipe byte stream.
-    pub struct LocalStream(Arc<interprocess::local_socket::Stream>);
+    pub struct LocalStream(interprocess::local_socket::Stream);
 
     /// The read half of a [`LocalStream`].
-    pub struct LocalReader(Arc<interprocess::local_socket::Stream>);
+    pub struct LocalReader(Arc<SplitStream>);
 
     /// The write half of a [`LocalStream`].
-    pub struct LocalWriter(Option<Arc<interprocess::local_socket::Stream>>);
+    pub struct LocalWriter(Arc<SplitStream>);
 
     /// A listener for local named-pipe streams.
     pub struct LocalListener(interprocess::local_socket::Listener);
 
+    /// `interprocess::local_socket::Stream` deliberately does not expose its
+    /// raw handle. Keep the one public stream behind a short-held lock and use
+    /// nonblocking operations while split. This gives `shutdown` ownership of
+    /// the only stream handle, so dropping it wakes a peer even if a reader is
+    /// waiting between poll attempts.
+    struct SplitStream {
+        stream: Mutex<Option<interprocess::local_socket::Stream>>,
+    }
+
     impl LocalListener {
         pub fn accept(&self) -> io::Result<LocalStream> {
-            self.0.accept().map(|stream| LocalStream(Arc::new(stream)))
+            self.0.accept().map(LocalStream)
         }
     }
 
@@ -158,79 +168,95 @@ mod imp {
 
     pub fn connect(path: &Path) -> io::Result<LocalStream> {
         let name = pipe_name(path)?;
-        interprocess::local_socket::Stream::connect(name)
-            .map(|stream| LocalStream(Arc::new(stream)))
+        interprocess::local_socket::Stream::connect(name).map(LocalStream)
     }
 
     impl LocalStream {
         pub fn into_split(self) -> io::Result<(LocalReader, LocalWriter)> {
-            Ok((LocalReader(Arc::clone(&self.0)), LocalWriter(Some(self.0))))
+            self.0.set_nonblocking(true)?;
+            let stream = Arc::new(SplitStream {
+                stream: Mutex::new(Some(self.0)),
+            });
+            Ok((LocalReader(Arc::clone(&stream)), LocalWriter(stream)))
         }
     }
 
     impl Read for LocalStream {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            (&*self.0).read(buf)
+            (&self.0).read(buf)
         }
     }
 
     impl Write for LocalStream {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            (&*self.0).write(buf)
+            (&self.0).write(buf)
         }
 
         fn flush(&mut self) -> io::Result<()> {
-            (&*self.0).flush()
+            (&self.0).flush()
         }
     }
 
     impl Read for LocalReader {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            (&*self.0).read(buf)
+            self.0.read(buf)
         }
     }
 
     impl Write for LocalWriter {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0
-                .as_ref()
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::BrokenPipe, "local writer is shut down")
-                })
-                .and_then(|stream| (&**stream).write(buf))
+            self.0.write(buf)
         }
 
         fn flush(&mut self) -> io::Result<()> {
-            self.0
-                .as_ref()
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::BrokenPipe, "local writer is shut down")
-                })
-                .and_then(|stream| (&**stream).flush())
+            self.0.flush()
         }
     }
 
     impl LocalWriter {
-        /// Disconnect an accepted named-pipe peer so a blocked client wakes.
+        /// Drop the only split-stream handle, releasing a blocked peer.
         ///
-        /// A daemon writer always comes from an accepted server stream. Windows
-        /// has no socket-style half-close; `DisconnectNamedPipe` is the
-        /// documented server-side equivalent and immediately releases the peer.
+        /// The public interprocess local-socket enum intentionally hides its
+        /// raw named-pipe handle, so this does not rely on an inaccessible enum
+        /// variant or raw Win32 handle operation.
         pub fn shutdown(&mut self) -> io::Result<()> {
-            let Some(stream) = self.0.take() else {
-                return Ok(());
-            };
-            let interprocess::local_socket::Stream::NamedPipe(pipe) = stream.as_ref();
-            if !pipe.inner().is_server() {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "only an accepted named-pipe writer can disconnect its peer",
-                ));
-            }
-            if unsafe { DisconnectNamedPipe(pipe.as_raw_handle().cast()) } == 0 {
-                return Err(io::Error::last_os_error());
-            }
+            self.0.stream.lock().unwrap().take();
             Ok(())
+        }
+    }
+
+    impl SplitStream {
+        fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+            self.with_retry(|stream| (&*stream).read(buf))
+        }
+
+        fn write(&self, buf: &[u8]) -> io::Result<usize> {
+            self.with_retry(|stream| (&*stream).write(buf))
+        }
+
+        fn flush(&self) -> io::Result<()> {
+            self.with_retry(|stream| (&*stream).flush())
+        }
+
+        fn with_retry<T>(
+            &self,
+            operation: impl Fn(&interprocess::local_socket::Stream) -> io::Result<T>,
+        ) -> io::Result<T> {
+            loop {
+                let result = {
+                    let stream = self.stream.lock().unwrap();
+                    let stream = stream.as_ref().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::BrokenPipe, "local writer is shut down")
+                    })?;
+                    operation(stream)
+                };
+                match result {
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    result => return result,
+                }
+            }
         }
     }
 
@@ -245,9 +271,10 @@ mod imp {
             .map(|name| name.into_owned())
     }
 
-    /// Build a protected DACL granting access only to the current process
-    /// token's user SID. Generic read/write is required for Node's named-pipe
-    /// client open mode; access remains local to this user.
+    /// Build a DACL granting access only to the current process token's user
+    /// SID. Node requires generic read/write for duplex pipe clients; generic
+    /// write also grants `FILE_CREATE_PIPE_INSTANCE`, so this intentionally
+    /// preserves same-user trust rather than claiming same-user isolation.
     fn current_user_dacl() -> io::Result<SecurityDescriptor> {
         let mut token = std::ptr::null_mut();
         if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
@@ -265,7 +292,10 @@ mod imp {
             {
                 return Err(io::Error::last_os_error());
             }
-            let user = &*(bytes.as_ptr().cast::<TOKEN_USER>());
+            // `Vec<u8>` only guarantees byte alignment. Read the fixed header
+            // by value; its SID points into `bytes`, which remains alive until
+            // after `ConvertSidToStringSidW` has copied it.
+            let user = std::ptr::read_unaligned(bytes.as_ptr().cast::<TOKEN_USER>());
             let mut sid = std::ptr::null_mut();
             if ConvertSidToStringSidW(user.User.Sid, &mut sid) == 0 {
                 return Err(io::Error::last_os_error());
