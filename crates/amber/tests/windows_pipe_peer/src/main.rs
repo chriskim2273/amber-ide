@@ -1,11 +1,15 @@
-//! Test-only peer for `app/test/windows-pipe.mjs`.
+//! Isolated Windows-only peer for `app/test/windows-pipe.mjs`.
+
+#![allow(dead_code, unused_imports)]
+
+#[path = "../../../src/transport.rs"]
+mod transport;
 
 #[cfg(windows)]
 fn main() -> std::io::Result<()> {
     use std::io::{Read, Write};
     use std::path::PathBuf;
 
-    use amber::transport;
     use amber_core::proto::{self, ControlMsg, Decoder, Frame};
 
     let endpoint = std::env::args_os()
@@ -44,6 +48,7 @@ fn main() -> std::io::Result<()> {
 
     let second = listener.accept()?;
     let (_reader, mut writer) = second.into_split()?;
+    writer.write_all(b"queued-before-forced-close")?;
     writer.shutdown()?;
     println!("RELEASED");
     std::io::stdout().flush()

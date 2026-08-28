@@ -1,9 +1,10 @@
 //! Platform-local byte-stream transport.
 //!
 //! Unix keeps the daemon's existing Unix-domain socket semantics. Windows uses
-//! `interprocess` named-pipe local sockets: `GenericNamespaced` supplies the
-//! mandatory local `\\\\.\\pipe\\` prefix, while the listener gets the current
-//! user's SID-only DACL and interprocess' first-pipe-instance ownership guard.
+//! raw named-pipe handles so shutdown can directly disconnect and close a
+//! wedged peer. `GenericNamespaced` remains the mandatory name-validation and
+//! mapping contract for the `\\\\.\\pipe\\` namespace, while the listener gets
+//! a current-user SID-only DACL and first-pipe-instance ownership guard.
 
 use std::io::{self, Read, Write};
 use std::path::Path;
@@ -108,92 +109,134 @@ mod imp {
 #[cfg(windows)]
 mod imp {
     use super::*;
-    use interprocess::local_socket::{
-        traits::{Listener as _, Stream as _},
-        GenericNamespaced, ListenerOptions, ToNsName as _,
-    };
-    use interprocess::os::windows::{
-        local_socket::ListenerOptionsExt as _, security_descriptor::SecurityDescriptor,
-    };
+    use interprocess::local_socket::{GenericNamespaced, ToNsName as _};
     use std::{
+        os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
         sync::{Arc, Mutex},
         thread,
         time::Duration,
     };
     use widestring::U16CString;
     use windows_sys::Win32::{
-        Foundation::LocalFree,
-        Security::{
-            Authorization::ConvertSidToStringSidW, GetTokenInformation, TokenUser, TOKEN_QUERY,
-            TOKEN_USER,
+        Foundation::{
+            GetLastError, LocalFree, ERROR_NO_DATA, ERROR_PIPE_CONNECTED, ERROR_PIPE_NOT_CONNECTED,
+            GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE,
         },
-        System::Threading::{GetCurrentProcess, OpenProcessToken},
+        Security::{
+            Authorization::{
+                ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+                SDDL_REVISION_1,
+            },
+            GetTokenInformation, TokenUser, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
+        },
+        Storage::FileSystem::{
+            CreateFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_FIRST_PIPE_INSTANCE,
+            OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
+        },
+        System::{
+            Pipes::{
+                ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_NOWAIT,
+                PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
+                PIPE_UNLIMITED_INSTANCES,
+            },
+            Threading::{GetCurrentProcess, OpenProcessToken},
+        },
     };
 
-    /// A local named-pipe byte stream.
-    pub struct LocalStream(interprocess::local_socket::Stream);
+    /// A local named-pipe byte stream owned directly by Amber. Do not use the
+    /// interprocess stream wrapper here: its drop path can linger/flush dirty
+    /// pipes, while a wedged peer must be forcibly disconnected promptly.
+    pub struct LocalStream(Arc<Pipe>);
 
     /// The read half of a [`LocalStream`].
-    pub struct LocalReader(Arc<SplitStream>);
+    pub struct LocalReader(Arc<Pipe>);
 
     /// The write half of a [`LocalStream`].
-    pub struct LocalWriter(Arc<SplitStream>);
+    pub struct LocalWriter(Arc<Pipe>);
 
     /// A listener for local named-pipe streams.
-    pub struct LocalListener(interprocess::local_socket::Listener);
+    pub struct LocalListener {
+        config: PipeConfig,
+        pending: Mutex<Option<OwnedHandle>>,
+    }
 
-    /// `interprocess::local_socket::Stream` deliberately does not expose its
-    /// raw handle. Keep the one public stream behind a short-held lock and use
-    /// nonblocking operations while split. This gives `shutdown` ownership of
-    /// the only stream handle, so dropping it wakes a peer even if a reader is
-    /// waiting between poll attempts.
-    struct SplitStream {
-        stream: Mutex<Option<interprocess::local_socket::Stream>>,
+    struct Pipe {
+        handle: Mutex<Option<OwnedHandle>>,
+    }
+
+    #[derive(Clone)]
+    struct PipeConfig {
+        path: U16CString,
+        sddl: U16CString,
     }
 
     impl LocalListener {
         pub fn accept(&self) -> io::Result<LocalStream> {
-            self.0.accept().map(LocalStream)
+            let handle =
+                self.pending.lock().unwrap().take().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "listener is closed")
+                })?;
+            connect_instance(handle.as_raw_handle())?;
+            let next = self.config.create_instance(false)?;
+            *self.pending.lock().unwrap() = Some(next);
+            Ok(LocalStream(Arc::new(Pipe {
+                handle: Mutex::new(Some(handle)),
+            })))
         }
     }
 
     pub fn bind(path: &Path) -> io::Result<LocalListener> {
-        let name = pipe_name(path)?;
-        ListenerOptions::new()
-            .name(name)
-            .security_descriptor(current_user_dacl()?)
-            .create_sync()
-            .map(LocalListener)
+        let config = PipeConfig {
+            path: pipe_path(path)?,
+            sddl: current_user_sddl()?,
+        };
+        let first = config.create_instance(true)?;
+        Ok(LocalListener {
+            config,
+            pending: Mutex::new(Some(first)),
+        })
     }
 
     pub fn connect(path: &Path) -> io::Result<LocalStream> {
-        let name = pipe_name(path)?;
-        interprocess::local_socket::Stream::connect(name).map(LocalStream)
+        let path = pipe_path(path)?;
+        let handle = unsafe {
+            CreateFileW(
+                path.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                0,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(LocalStream(Arc::new(Pipe {
+            handle: Mutex::new(Some(unsafe { OwnedHandle::from_raw_handle(handle) })),
+        })))
     }
 
     impl LocalStream {
         pub fn into_split(self) -> io::Result<(LocalReader, LocalWriter)> {
-            self.0.set_nonblocking(true)?;
-            let stream = Arc::new(SplitStream {
-                stream: Mutex::new(Some(self.0)),
-            });
-            Ok((LocalReader(Arc::clone(&stream)), LocalWriter(stream)))
+            Ok((LocalReader(Arc::clone(&self.0)), LocalWriter(self.0)))
         }
     }
 
     impl Read for LocalStream {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            (&self.0).read(buf)
+            self.0.read(buf)
         }
     }
 
     impl Write for LocalStream {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            (&self.0).write(buf)
+            self.0.write(buf)
         }
 
         fn flush(&mut self) -> io::Result<()> {
-            (&self.0).flush()
+            self.0.flush()
         }
     }
 
@@ -214,68 +257,171 @@ mod imp {
     }
 
     impl LocalWriter {
-        /// Drop the only split-stream handle, releasing a blocked peer.
-        ///
-        /// The public interprocess local-socket enum intentionally hides its
-        /// raw named-pipe handle, so this does not rely on an inaccessible enum
-        /// variant or raw Win32 handle operation.
+        /// Force a named-pipe disconnect and then close Amber's raw handle.
+        /// This deliberately bypasses the interprocess linger/flush drop path.
         pub fn shutdown(&mut self) -> io::Result<()> {
-            self.0.stream.lock().unwrap().take();
+            self.0.shutdown()?;
             Ok(())
         }
     }
 
-    impl SplitStream {
+    impl Pipe {
         fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
-            self.with_retry(|stream| (&*stream).read(buf))
+            self.with_retry(|handle| unsafe {
+                let mut read = 0_u32;
+                if ReadFile(
+                    handle,
+                    buf.as_mut_ptr(),
+                    buf.len().try_into().unwrap_or(u32::MAX),
+                    &mut read,
+                    std::ptr::null_mut(),
+                ) == 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(read as usize)
+            })
         }
 
         fn write(&self, buf: &[u8]) -> io::Result<usize> {
-            self.with_retry(|stream| (&*stream).write(buf))
+            self.with_retry(|handle| unsafe {
+                let mut written = 0_u32;
+                if WriteFile(
+                    handle,
+                    buf.as_ptr(),
+                    buf.len().try_into().unwrap_or(u32::MAX),
+                    &mut written,
+                    std::ptr::null_mut(),
+                ) == 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(written as usize)
+            })
         }
 
         fn flush(&self) -> io::Result<()> {
-            self.with_retry(|stream| (&*stream).flush())
+            Ok(())
         }
 
         fn with_retry<T>(
             &self,
-            operation: impl Fn(&interprocess::local_socket::Stream) -> io::Result<T>,
+            mut operation: impl FnMut(windows_sys::Win32::Foundation::HANDLE) -> io::Result<T>,
         ) -> io::Result<T> {
             loop {
                 let result = {
-                    let stream = self.stream.lock().unwrap();
-                    let stream = stream.as_ref().ok_or_else(|| {
+                    let handle = self.handle.lock().unwrap();
+                    let handle = handle.as_ref().ok_or_else(|| {
                         io::Error::new(io::ErrorKind::BrokenPipe, "local writer is shut down")
                     })?;
-                    operation(stream)
+                    operation(handle.as_raw_handle())
                 };
                 match result {
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    Err(error) if error.raw_os_error() == Some(ERROR_NO_DATA as i32) => {
                         thread::sleep(Duration::from_millis(1));
                     }
                     result => return result,
                 }
             }
         }
+
+        fn shutdown(&self) -> io::Result<()> {
+            let handle = self.handle.lock().unwrap().take();
+            if let Some(handle) = handle {
+                let raw = handle.as_raw_handle();
+                let disconnected = unsafe { DisconnectNamedPipe(raw) } != 0;
+                if !disconnected && unsafe { GetLastError() } != ERROR_PIPE_NOT_CONNECTED {
+                    return Err(io::Error::last_os_error());
+                }
+                drop(handle); // OwnedHandle => direct CloseHandle; no linger/flush.
+            }
+            Ok(())
+        }
     }
 
-    fn pipe_name(path: &Path) -> io::Result<interprocess::local_socket::Name<'static>> {
+    fn pipe_path(path: &Path) -> io::Result<U16CString> {
         let endpoint = path
             .to_str()
             .ok_or_else(|| io::Error::other("non-UTF8 pipe name"))?
             .strip_prefix(r"\\.\pipe\")
             .unwrap_or_else(|| path.to_str().expect("path was checked above"));
+        // Keep the protocol's GenericNamespaced validation/mapping contract;
+        // raw CreateNamedPipeW receives its documented concrete Windows path.
         endpoint
             .to_ns_name::<GenericNamespaced>()
-            .map(|name| name.into_owned())
+            .map_err(io::Error::other)?;
+        U16CString::from_str(format!(r"\\.\pipe\{endpoint}"))
+            .map_err(|_| io::Error::other("pipe name contained NUL"))
+    }
+
+    impl PipeConfig {
+        fn create_instance(&self, first: bool) -> io::Result<OwnedHandle> {
+            let mut descriptor = std::ptr::null_mut();
+            if unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    self.sddl.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut descriptor,
+                    std::ptr::null_mut(),
+                )
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            let attributes = SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: descriptor,
+                bInheritHandle: 0,
+            };
+            let mode =
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT | PIPE_REJECT_REMOTE_CLIENTS;
+            let open = PIPE_ACCESS_DUPLEX
+                | if first {
+                    FILE_FLAG_FIRST_PIPE_INSTANCE
+                } else {
+                    0
+                };
+            let handle = unsafe {
+                CreateNamedPipeW(
+                    self.path.as_ptr(),
+                    open,
+                    mode,
+                    PIPE_UNLIMITED_INSTANCES,
+                    64 * 1024,
+                    64 * 1024,
+                    0,
+                    &attributes,
+                )
+            };
+            let create_error = (handle == INVALID_HANDLE_VALUE).then(io::Error::last_os_error);
+            unsafe { LocalFree(descriptor) };
+            if let Some(error) = create_error {
+                return Err(error);
+            }
+            Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
+        }
+    }
+
+    fn connect_instance(handle: windows_sys::Win32::Foundation::HANDLE) -> io::Result<()> {
+        loop {
+            if unsafe { ConnectNamedPipe(handle, std::ptr::null_mut()) } != 0 {
+                return Ok(());
+            }
+            match unsafe { GetLastError() } {
+                ERROR_PIPE_CONNECTED => return Ok(()),
+                error if error == windows_sys::Win32::Foundation::ERROR_PIPE_LISTENING => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                _ => return Err(io::Error::last_os_error()),
+            }
+        }
     }
 
     /// Build a DACL granting access only to the current process token's user
     /// SID. Node requires generic read/write for duplex pipe clients; generic
     /// write also grants `FILE_CREATE_PIPE_INSTANCE`, so this intentionally
     /// preserves same-user trust rather than claiming same-user isolation.
-    fn current_user_dacl() -> io::Result<SecurityDescriptor> {
+    fn current_user_sddl() -> io::Result<U16CString> {
         let mut token = std::ptr::null_mut();
         if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
             return Err(io::Error::last_os_error());
@@ -296,19 +442,18 @@ mod imp {
             // by value; its SID points into `bytes`, which remains alive until
             // after `ConvertSidToStringSidW` has copied it.
             let user = std::ptr::read_unaligned(bytes.as_ptr().cast::<TOKEN_USER>());
-            let mut sid = std::ptr::null_mut();
-            if ConvertSidToStringSidW(user.User.Sid, &mut sid) == 0 {
+            let mut sid_ptr = std::ptr::null_mut();
+            if ConvertSidToStringSidW(user.User.Sid, &mut sid_ptr) == 0 {
                 return Err(io::Error::last_os_error());
             }
             let sid_len = (0..)
-                .find(|&i| *sid.add(i) == 0)
+                .find(|&i| *sid_ptr.add(i) == 0)
                 .expect("SID is NUL terminated");
-            let sid = String::from_utf16(std::slice::from_raw_parts(sid, sid_len))
-                .map_err(|_| io::Error::other("Windows returned a non-Unicode SID"))?;
-            LocalFree(sid.cast());
-            let sddl = U16CString::from_str(format!("D:P(A;;GRGW;;;{sid})"))
-                .map_err(|_| io::Error::other("current user SID contained NUL"))?;
-            SecurityDescriptor::deserialize(&sddl)
+            let sid = String::from_utf16(std::slice::from_raw_parts(sid_ptr, sid_len));
+            LocalFree(sid_ptr.cast());
+            let sid = sid.map_err(|_| io::Error::other("Windows returned a non-Unicode SID"))?;
+            U16CString::from_str(format!("D:P(A;;GRGW;;;{sid})"))
+                .map_err(|_| io::Error::other("current user SID contained NUL"))
         })();
         unsafe { windows_sys::Win32::Foundation::CloseHandle(token) };
         result

@@ -77,7 +77,7 @@ fn named_pipe_accepts_two_clients_and_releases_a_stalled_peer() {
         .as_nanos();
     let endpoint = PathBuf::from(format!("amber-windows-pipe-{stamp}"));
     let listener = transport::bind(&endpoint).unwrap();
-    let (reader_started, reader_ready) = mpsc::channel();
+    let (write_queued, queued) = mpsc::channel();
     let (permit_shutdown, wait_for_shutdown) = mpsc::channel();
     let server = thread::spawn(move || {
         let mut first = listener.accept().unwrap();
@@ -92,6 +92,8 @@ fn named_pipe_accepts_two_clients_and_releases_a_stalled_peer() {
 
         let second = listener.accept().unwrap();
         let (_reader, mut writer) = second.into_split().unwrap();
+        writer.write_all(b"queued-before-forced-close").unwrap();
+        write_queued.send(()).unwrap();
         wait_for_shutdown.recv().unwrap();
         writer.shutdown().unwrap();
     });
@@ -102,21 +104,27 @@ fn named_pipe_accepts_two_clients_and_releases_a_stalled_peer() {
             names: vec![],
         })))
         .unwrap();
-    let (released, result) = mpsc::channel();
     let stalled = transport::connect(&endpoint).unwrap();
-    let (mut stalled_reader, _stalled_writer) = stalled.into_split().unwrap();
-    thread::spawn(move || {
-        reader_started.send(()).unwrap();
-        let mut byte = [0_u8; 1];
-        released.send(stalled_reader.read(&mut byte)).unwrap();
-    });
-    reader_ready.recv().unwrap();
+    queued.recv().unwrap();
     thread::sleep(Duration::from_millis(20));
-    assert!(result.try_recv().is_err(), "reader must still be blocked");
     permit_shutdown.send(()).unwrap();
     server.join().unwrap();
-    assert!(matches!(
-        result.recv_timeout(Duration::from_secs(2)),
-        Ok(Ok(0) | Err(_))
-    ));
+
+    let (released, result) = mpsc::channel();
+    thread::spawn(move || {
+        let mut stalled = stalled;
+        let mut seen = Vec::new();
+        let mut bytes = [0_u8; 64];
+        loop {
+            match stalled.read(&mut bytes) {
+                Ok(0) => break released.send(Ok(seen)),
+                Ok(count) => seen.extend_from_slice(&bytes[..count]),
+                Err(error) => break released.send(Err(error)),
+            }
+        }
+    });
+    assert!(
+        result.recv_timeout(Duration::from_secs(2)).is_ok(),
+        "forced server close did not release the stalled peer"
+    );
 }

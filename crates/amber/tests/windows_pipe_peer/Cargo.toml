@@ -1,0 +1,18 @@
+[package]
+name = "amber-windows-pipe-peer"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# This deliberately keeps the probe outside Amber's Cargo workspace. It must
+# validate Task 2's transport before unrelated Unix-only application modules
+# become Windows-portable.
+[workspace]
+
+[dependencies]
+amber-core = { path = "../../../amber-core" }
+
+[target.'cfg(windows)'.dependencies]
+interprocess = "2.4.3"
+widestring = "1.2.1"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Pipes", "Win32_System_Threading"] }
