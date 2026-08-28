@@ -8,11 +8,12 @@
  *     down: BINARY = pty output | {t:'sessions',sessions} | {t:'exit',name,code}
  *           | {t:'error',msg}
  *
- * HARD RULE (spec §4): the phone NEVER sends a resize — a pty's winsize is
- * shared with the desktop app, so a resize would reflow the user's live panes
- * and corrupt a running claude TUI. Nothing here is wired to `term.onResize`,
- * the fit addon is not loaded, and there is no resize message in the protocol.
- * Readability is handled entirely client-side (CSS transform zoom).
+ * This embedded client NEVER sends a resize: a pty's winsize is shared with
+ * desktop panes, so a resize can reflow live work. The protocol/server does
+ * accept a validated, bounded Resize for a live session (10–1000 columns and
+ * 4–300 rows), but nothing here is wired to `term.onResize` and the fit addon
+ * is not loaded. Readability is handled entirely client-side (CSS transform
+ * zoom).
  */
 'use strict';
 
