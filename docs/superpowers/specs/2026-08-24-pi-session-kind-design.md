@@ -150,8 +150,14 @@ App tests:
 - reload command quoting and malformed-ID refusal;
 - workspace save/load planning with Pi panes.
 
-Gates: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, full
-Rust tests, app typecheck, app unit tests, and app bundle. If Pi is installed,
+Gates: direct stable `cargo clippy --all-targets -- -D warnings`, full Rust
+tests, app typecheck, app unit tests, app bundle, and `git diff --check` all
+passed. `cargo fmt --check` is an explicit, auditable exception: the installed
+formatter reports broad repository-wide version drift in unrelated committed
+files, so it cannot be used as a feature gate without a separate whole-repo
+formatting migration. Feature-scope hygiene is instead evidenced by review of
+the owned diff, a focused mobile-kind regression test, and passing
+`git diff --check`; no bulk reformat was applied or claimed. If Pi is installed,
 run an isolated private-daemon smoke: create Pi pane, observe extension record,
 terminate only isolated child/daemon, restore exact ID, rename, and restore
 again. Never contact, stop, or restart user's running Amber daemon.

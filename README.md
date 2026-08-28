@@ -136,9 +136,15 @@ straight to a single xterm.js emulator.
   Open the printed URL on the phone (swap the host for your tailnet name). The
   token rides in the URL **fragment**, so it never reaches the server logs; the
   page exchanges it for an HttpOnly cookie and strips it from history.
-- The phone can open sessions and type. It **cannot** create, kill, rename or
-  resize them — a pty's size is shared with your desktop panes, so a phone-sized
-  resize would reflow your live work.
+- The phone can open, close, focus, and type in live sessions. It can also
+  create a validated shell/agent pane, kill or rename a live pane, suspend or
+  resume a live agent pane, and request its scrollback. These controls are a
+  fixed, validated whitelist; a browser never supplies a shell command or argv.
+- A phone may resize a live pty only within the daemon's safe bounds (10–1000
+  columns and 4–300 rows). That size is still shared with desktop clients, so
+  resizing can reflow a live terminal and should be used deliberately.
+- Browser messages cannot reach `Snapshot` or `ReportRunState`; every control
+  outside the whitelist is ignored.
 
 **Platform & packaging**
 - Linux AppImage / macOS dmg via electron-builder, with the static `amber`
