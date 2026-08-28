@@ -29,9 +29,10 @@ enum WaitOutcome {
 }
 
 /// Apply Microsoft's `CreateFileW` -> `ERROR_PIPE_BUSY` -> `WaitNamedPipeW`
-/// client sequence with a wall-clock deadline. Fifty-millisecond waits retry
-/// availability races without an uninterruptible Win32 wait; the 250 ms cap
-/// returns control to the caller's reconnect/cancellation loop.
+/// client sequence with a busy-wait deadline. Fifty-millisecond waits retry
+/// availability races without an uninterruptible Win32 wait. After the first
+/// attempt, the deadline is checked immediately before every further
+/// `CreateFileW`, so no retry starts once the busy-wait budget is exhausted.
 #[cfg(any(windows, test))]
 fn retry_busy_connect<T>(
     timeout: std::time::Duration,
@@ -40,7 +41,15 @@ fn retry_busy_connect<T>(
     mut wait_once: impl FnMut(std::time::Duration) -> io::Result<WaitOutcome>,
 ) -> io::Result<T> {
     let deadline = now() + timeout;
+    let mut first_attempt = true;
     loop {
+        if !first_attempt && deadline.saturating_duration_since(now()).is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("named pipe remained busy for {} ms", timeout.as_millis()),
+            ));
+        }
+        first_attempt = false;
         match connect_once() {
             ConnectAttempt::Connected(value) => return Ok(value),
             #[cfg(windows)]
@@ -191,7 +200,7 @@ mod imp {
             Pipes::{
                 ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_NOWAIT,
                 PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
-                PIPE_UNLIMITED_INSTANCES, WaitNamedPipeW,
+                PIPE_UNLIMITED_INSTANCES, SetNamedPipeHandleState, WaitNamedPipeW,
             },
             Threading::{GetCurrentProcess, OpenProcessToken},
         },
@@ -270,6 +279,13 @@ mod imp {
     }
 
     pub fn connect(path: &Path) -> io::Result<LocalStream> {
+        connect_after_busy_wait(path, || {})
+    }
+
+    fn connect_after_busy_wait(
+        path: &Path,
+        mut after_wait: impl FnMut(),
+    ) -> io::Result<LocalStream> {
         let path = pipe_path(path)?;
         // A healthy listener can briefly have every pre-created instance
         // claimed while `accept` installs its replacement. Microsoft requires
@@ -304,10 +320,15 @@ mod imp {
             },
             |wait| {
                 let wait_ms = wait.as_millis().clamp(1, u32::MAX as u128) as u32;
-                if unsafe { WaitNamedPipeW(path.as_ptr(), wait_ms) } != 0 {
+                let ready = unsafe { WaitNamedPipeW(path.as_ptr(), wait_ms) } != 0;
+                let error = (!ready).then(io::Error::last_os_error);
+                // Test synchronization is deliberately after a real
+                // ERROR_PIPE_BUSY -> WaitNamedPipeW call, never a timing guess.
+                after_wait();
+                if ready {
                     return Ok(WaitOutcome::Ready);
                 }
-                let error = io::Error::last_os_error();
+                let error = error.expect("failed WaitNamedPipeW captured an error");
                 if error.raw_os_error() == Some(ERROR_SEM_TIMEOUT as i32) {
                     Ok(WaitOutcome::TimedOut)
                 } else {
@@ -315,6 +336,7 @@ mod imp {
                 }
             },
         )?;
+        set_nonblocking(handle.as_raw_handle())?;
         Ok(LocalStream(Arc::new(Pipe {
             handle: Mutex::new(Some(handle)),
             role: PipeRole::Client,
@@ -372,7 +394,7 @@ mod imp {
 
     impl Pipe {
         fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
-            self.with_retry(|handle| unsafe {
+            self.with_read_retry(|handle| unsafe {
                 let mut read = 0_u32;
                 if ReadFile(
                     handle,
@@ -394,11 +416,15 @@ mod imp {
         }
 
         fn write(&self, buf: &[u8]) -> io::Result<usize> {
-            retry_nonblocking_write(!buf.is_empty(), || {
-                self.with_retry(|handle| unsafe {
+            classify_nonblocking_write(!buf.is_empty(), || {
+                let handle = self.handle.lock().unwrap();
+                let handle = handle.as_ref().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "local writer is shut down")
+                })?;
+                unsafe {
                     let mut written = 0_u32;
                     if WriteFile(
-                        handle,
+                        handle.as_raw_handle(),
                         buf.as_ptr(),
                         buf.len().try_into().unwrap_or(u32::MAX),
                         &mut written,
@@ -408,7 +434,7 @@ mod imp {
                         return Err(io::Error::last_os_error());
                     }
                     Ok(written as usize)
-                })
+                }
             })
         }
 
@@ -416,7 +442,7 @@ mod imp {
             Ok(())
         }
 
-        fn with_retry<T>(
+        fn with_read_retry<T>(
             &self,
             mut operation: impl FnMut(windows_sys::Win32::Foundation::HANDLE) -> io::Result<T>,
         ) -> io::Result<T> {
@@ -464,6 +490,42 @@ mod imp {
                 hook();
             }
         }
+
+        #[cfg(test)]
+        fn is_nonblocking(&self) -> io::Result<bool> {
+            use windows_sys::Win32::System::Pipes::GetNamedPipeHandleStateW;
+
+            let handle = self.handle.lock().unwrap();
+            let handle = handle.as_ref().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "local stream is shut down")
+            })?;
+            let mut state = 0;
+            if unsafe {
+                GetNamedPipeHandleStateW(
+                    handle.as_raw_handle(),
+                    &mut state,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    0,
+                )
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(state & PIPE_NOWAIT != 0)
+        }
+    }
+
+    fn set_nonblocking(handle: windows_sys::Win32::Foundation::HANDLE) -> io::Result<()> {
+        let mode = PIPE_READMODE_BYTE | PIPE_NOWAIT;
+        if unsafe { SetNamedPipeHandleState(handle, &mode, std::ptr::null(), std::ptr::null()) }
+            == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
 
     fn pipe_path(path: &Path) -> io::Result<U16CString> {
@@ -656,20 +718,23 @@ mod imp {
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let endpoint =
-                std::path::PathBuf::from(format!("amber-windows-busy-pipe-{stamp}"));
+            let endpoint = std::path::PathBuf::from(format!("amber-windows-busy-pipe-{stamp}"));
             let listener = bind(&endpoint).unwrap();
             let first = connect(&endpoint).unwrap();
 
-            let (started_tx, started_rx) = mpsc::channel();
+            let (waited_tx, waited_rx) = mpsc::channel();
             let (result_tx, result_rx) = mpsc::channel();
             let retry_endpoint = endpoint.clone();
             let second = std::thread::spawn(move || {
-                started_tx.send(()).unwrap();
-                result_tx.send(connect(&retry_endpoint)).unwrap();
+                result_tx
+                    .send(connect_after_busy_wait(&retry_endpoint, || {
+                        waited_tx.send(()).unwrap();
+                    }))
+                    .unwrap();
             });
-            started_rx.recv().unwrap();
-            std::thread::sleep(Duration::from_millis(75));
+            waited_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("second client must observe ERROR_PIPE_BUSY and call WaitNamedPipeW");
             assert!(
                 result_rx.try_recv().is_err(),
                 "busy connect must remain retryable while the listener is healthy"
@@ -685,45 +750,68 @@ mod imp {
 
             drop((first, accepted_first, connected_second, accepted_second));
         }
-    }
-}
 
-/// Retry the only successful-but-no-progress result possible for a nonblocking
-/// byte-mode named-pipe write. `WriteFile` may report `TRUE, 0` when no buffer
-/// space is available; a positive short write is intentionally returned so
-/// `Write::write_all` preserves the remaining bytes. Sleeping prevents a busy
-/// spin; higher-level client-write deadlines remain Task 3 policy.
-#[cfg(any(windows, test))]
-fn retry_nonblocking_write(
-    nonempty: bool,
-    mut write_once: impl FnMut() -> io::Result<usize>,
-) -> io::Result<usize> {
-    loop {
-        match write_once()? {
-            0 if nonempty => std::thread::sleep(std::time::Duration::from_millis(1)),
-            written => return Ok(written),
+        #[test]
+        fn create_file_client_is_switched_to_nonblocking_mode() {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let endpoint = std::path::PathBuf::from(format!("amber-windows-nowait-pipe-{stamp}"));
+            let listener = bind(&endpoint).unwrap();
+            let client = connect(&endpoint).unwrap();
+            let _server = listener.accept().unwrap();
+
+            assert!(client.0.is_nonblocking().unwrap());
         }
     }
 }
 
-pub use imp::{bind, connect, LocalListener, LocalReader, LocalStream, LocalWriter};
+/// Classify the successful-but-no-progress result possible for a nonblocking
+/// byte-mode named-pipe write. `WriteFile` may report `TRUE, 0` when no buffer
+/// space is available; expose that as `WouldBlock` without retrying under the
+/// handle mutex. A positive short write is returned unchanged so a higher-level
+/// wall-clock deadline can preserve progress while bounding all retries.
+#[cfg(any(windows, test))]
+fn classify_nonblocking_write(
+    nonempty: bool,
+    mut write_once: impl FnMut() -> io::Result<usize>,
+) -> io::Result<usize> {
+    match write_once()? {
+        0 if nonempty => Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "nonblocking named-pipe write made no progress",
+        )),
+        written => Ok(written),
+    }
+}
+
+pub use imp::{LocalListener, LocalReader, LocalStream, LocalWriter, bind, connect};
 
 #[cfg(unix)]
 pub use imp::test_pair;
 
 #[cfg(test)]
 #[test]
-fn nonblocking_write_retries_zero_progress_without_losing_partial_progress() {
-    let mut results = [Ok(0), Ok(3)].into_iter();
-    assert!(matches!(
-        retry_nonblocking_write(true, || results.next().expect("retry called")),
-        Ok(3)
-    ));
+fn nonblocking_write_returns_would_block_on_zero_progress() {
+    let mut calls = 0;
+    let error = classify_nonblocking_write(true, || {
+        calls += 1;
+        Ok(0)
+    })
+    .unwrap_err();
 
+    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(calls, 1, "Write::write must not retry internally");
+}
+
+#[cfg(test)]
+#[test]
+fn nonblocking_write_preserves_partial_progress() {
     let mut partial = [Ok(2)].into_iter();
     assert!(
         matches!(
-            retry_nonblocking_write(true, || partial.next().expect("one write")),
+            classify_nonblocking_write(true, || partial.next().expect("one write")),
             Ok(2)
         ),
         "a short successful write is returned for Write::write_all to continue"
@@ -737,7 +825,7 @@ fn busy_connect_waits_then_retries_an_available_instance() {
     use std::time::{Duration, Instant};
 
     let started = Instant::now();
-    let mut times = VecDeque::from([started, started]);
+    let mut times = VecDeque::from([started, started, started]);
     let mut attempts = VecDeque::from([ConnectAttempt::Busy, ConnectAttempt::Connected(7)]);
     let mut waits = Vec::new();
 
@@ -764,11 +852,15 @@ fn busy_connect_stops_at_its_deadline() {
     let started = Instant::now();
     let mut times = VecDeque::from([started, started, started + Duration::from_millis(200)]);
     let mut waits = Vec::new();
+    let mut attempts = 0;
 
     let error = retry_busy_connect(
         Duration::from_millis(200),
         || times.pop_front().expect("clock read"),
-        || ConnectAttempt::<()>::Busy,
+        || {
+            attempts += 1;
+            ConnectAttempt::<()>::Busy
+        },
         |wait| {
             waits.push(wait);
             Ok(WaitOutcome::TimedOut)
@@ -778,4 +870,8 @@ fn busy_connect_stops_at_its_deadline() {
 
     assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     assert_eq!(waits, [Duration::from_millis(50)]);
+    assert_eq!(
+        attempts, 1,
+        "deadline must be checked before retrying CreateFileW"
+    );
 }
