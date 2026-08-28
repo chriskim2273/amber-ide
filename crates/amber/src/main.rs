@@ -272,29 +272,8 @@ enum CtlAction {
     InstallPiExtension,
 }
 
-/// `$XDG_STATE_HOME/amber-ide`, falling back to `$HOME/.local/state/amber-ide`.
-fn default_root() -> PathBuf {
-    if let Ok(state_home) = std::env::var("XDG_STATE_HOME") {
-        if !state_home.is_empty() {
-            return PathBuf::from(state_home).join("amber-ide");
-        }
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".local/state/amber-ide")
-}
-
-/// `$XDG_RUNTIME_DIR/amber-ide/amberd.sock`, falling back to `<root>/amberd.sock`.
-fn default_socket(root: &Path) -> PathBuf {
-    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
-        if !runtime_dir.is_empty() {
-            return PathBuf::from(runtime_dir).join("amber-ide").join("amberd.sock");
-        }
-    }
-    root.join("amberd.sock")
-}
-
-fn resolve_socket(explicit: Option<PathBuf>) -> PathBuf {
-    explicit.unwrap_or_else(|| default_socket(&default_root()))
+fn resolve_socket(explicit: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    explicit.map_or_else(amber::platform::socket_name, Ok)
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -318,21 +297,23 @@ enum WebAction {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let Some(command) = cli.command else {
-        return run_new(&resolve_socket(None));
+        return run_new(&resolve_socket(None)?);
     };
     match command {
         Command::Daemon { root, socket } => amber::daemon_main(root, socket),
         Command::Attach { name, no_prefix, no_status, force, socket } => {
-            run_attach(&resolve_socket(socket), name, no_prefix, no_status, force)
+            run_attach(&resolve_socket(socket)?, name, no_prefix, no_status, force)
         }
-        Command::Ls { socket } => run_ls(&resolve_socket(socket)),
+        Command::Ls { socket } => run_ls(&resolve_socket(socket)?),
         Command::Create { name, cwd, kind, socket } => {
-            run_create(&resolve_socket(socket), &name, &cwd, &kind)
+            run_create(&resolve_socket(socket)?, &name, &cwd, &kind)
         }
-        Command::Kill { name, socket } => run_kill(&resolve_socket(socket), &name),
-        Command::Freeze { name, socket } => run_suspend(&resolve_socket(socket), &name, true),
-        Command::Unfreeze { name, socket } => run_suspend(&resolve_socket(socket), &name, false),
-        Command::Rename { from, to, socket } => run_rename(&resolve_socket(socket), &from, &to),
+        Command::Kill { name, socket } => run_kill(&resolve_socket(socket)?, &name),
+        Command::Freeze { name, socket } => run_suspend(&resolve_socket(socket)?, &name, true),
+        Command::Unfreeze { name, socket } => run_suspend(&resolve_socket(socket)?, &name, false),
+        Command::Rename { from, to, socket } => {
+            run_rename(&resolve_socket(socket)?, &from, &to)
+        }
         Command::Web { port, new_token, print_url, root, socket } => {
             run_web(root, socket, port, new_token, print_url)
         }
@@ -344,11 +325,11 @@ fn main() -> anyhow::Result<()> {
         Command::Handoff { session_id } => run_handoff(&session_id),
         Command::Ctl { action } => match action {
             CtlAction::Doctor { root } => run_doctor(root),
-            CtlAction::Status { socket } => run_status(&resolve_socket(socket)),
+            CtlAction::Status { socket } => run_status(&resolve_socket(socket)?),
             CtlAction::Budget { set, systemd, socket } => {
-                run_budget(set.as_deref(), systemd, &resolve_socket(socket))
+                run_budget(set.as_deref(), systemd, &resolve_socket(socket)?)
             }
-            CtlAction::SnapshotNow { socket } => run_snapshot_now(&resolve_socket(socket)),
+            CtlAction::SnapshotNow { socket } => run_snapshot_now(&resolve_socket(socket)?),
             CtlAction::Install { dry_run, web } => run_install(dry_run, web),
             CtlAction::Uninstall { dry_run, purge_binary, purge_state, web } => {
                 run_uninstall(dry_run, purge_binary, purge_state, web)
@@ -365,7 +346,7 @@ fn main() -> anyhow::Result<()> {
 /// config, so the daemon (whose own PATH is stripped) always finds them. Fixes
 /// the exact class of bug that motivated this rearchitecture.
 fn run_doctor(root: Option<PathBuf>) -> anyhow::Result<()> {
-    let root = root.unwrap_or_else(default_root);
+    let root = amber::platform::resolve_state_root(root)?;
     std::fs::create_dir_all(&root)?;
     let store = StateStore::new(&root);
 
@@ -475,7 +456,10 @@ fn run_install_pi_extension() -> anyhow::Result<()> {
 /// previous shutdown unclean and lost sessions restoring. Best-effort: a
 /// missing/corrupt report is silently skipped, never fatal to `status`.
 fn print_crash_report() {
-    let path = default_root().join("last-crash-report.json");
+    let Ok(root) = amber::platform::state_root() else {
+        return;
+    };
+    let path = root.join("last-crash-report.json");
     let Ok(body) = std::fs::read_to_string(&path) else { return };
     let _ = std::fs::remove_file(&path);
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else { return };
@@ -826,27 +810,25 @@ fn read_budget_reply(
 /// Root used by `run`/`hook`: `AMBER_STATE_DIR` if set (the daemon sets it
 /// when spawning this binary as a session's supervisor), else the same
 /// default the daemon itself uses.
-fn supervisor_root() -> PathBuf {
-    std::env::var("AMBER_STATE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| default_root())
+fn supervisor_root() -> anyhow::Result<PathBuf> {
+    amber::platform::resolve_state_root(std::env::var_os("AMBER_STATE_DIR").map(PathBuf::from))
 }
 
 /// Socket the supervisor reports its run-state to. The daemon passes its actual
 /// socket via `AMBER_SOCK` when spawning `amber run`; absent that (a
 /// hand-started supervisor), fall back to the same default the daemon derives
 /// from the state root.
-fn supervisor_socket() -> PathBuf {
-    let root = supervisor_root();
-    std::env::var("AMBER_SOCK")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| default_socket(&root))
+fn supervisor_socket(root: &Path) -> anyhow::Result<PathBuf> {
+    let explicit = std::env::var_os("AMBER_SOCK")
+        .filter(|socket| !socket.is_empty())
+        .map(PathBuf::from);
+    explicit.map_or_else(|| amber::platform::socket_name_for_root(root), Ok)
 }
 
 fn run_supervisor(name: &str, kind: &str, slot: Option<u32>) -> anyhow::Result<()> {
-    supervisor::run_session(&supervisor_root(), name, &supervisor_socket(), kind, slot)
+    let root = supervisor_root()?;
+    let socket = supervisor_socket(&root)?;
+    supervisor::run_session(&root, name, &socket, kind, slot)
 }
 
 /// `SessionStart` hook: read the hook JSON from stdin and record the
@@ -859,7 +841,7 @@ fn run_hook() -> anyhow::Result<()> {
     if name.is_empty() {
         return Ok(());
     }
-    let root = supervisor_root();
+    let root = supervisor_root()?;
 
     let mut input = String::new();
     if let Err(e) = std::io::stdin().read_to_string(&mut input) {
@@ -902,7 +884,7 @@ fn run_ctl_web(
     json: bool,
     root: Option<PathBuf>,
 ) -> anyhow::Result<()> {
-    let root = root.unwrap_or_else(default_root);
+    let root = amber::platform::resolve_state_root(root)?;
     std::fs::create_dir_all(&root)?;
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".into()));
     let unit = amber::webctl::unit_path(&home);
@@ -1137,7 +1119,7 @@ fn run_web(
     new_token: bool,
     print_url: bool,
 ) -> anyhow::Result<()> {
-    let root = root.unwrap_or_else(default_root);
+    let (root, socket) = amber::platform::resolve_paths(root, socket)?;
     std::fs::create_dir_all(&root)?;
     let token = amber::web::load_or_create_token(&root, new_token)?;
     let url = format!("http://127.0.0.1:{port}/#t={token}");
@@ -1145,7 +1127,6 @@ fn run_web(
         println!("{url}");
         return Ok(());
     }
-    let socket = socket.unwrap_or_else(|| default_socket(&root));
     let listener = amber::web::bind(port)?;
     eprintln!("amber web: listening on 127.0.0.1:{port} (daemon {})", socket.display());
     // The tokenized URL is printed ONLY to an interactive terminal. Run as a

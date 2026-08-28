@@ -1,7 +1,7 @@
 //! amber daemon internals (Slice 0): pty session ownership, and later the
 //! socket server + attach client. Kept as a lib so the pieces are testable.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -45,15 +45,8 @@ pub mod watchers;
 /// This shared entry point is used by the CLI and platform-specific daemon
 /// binaries. Supplying neither path preserves the CLI's platform defaults.
 pub fn daemon_main(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Result<()> {
-    let root = match root {
-        Some(root) => root,
-        None => default_daemon_root()?,
-    };
+    let (root, socket_path) = platform::resolve_paths(root, socket)?;
     std::fs::create_dir_all(&root)?;
-    let socket_path = match socket {
-        Some(socket) => socket,
-        None => default_daemon_socket(&root)?,
-    };
     #[cfg(unix)]
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -159,39 +152,6 @@ pub fn daemon_main(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Re
     eprintln!("amber daemon: listening on {}", socket_path.display());
     let daemon = daemon::Daemon::new(Arc::clone(&manager), Arc::clone(&watchers));
     daemon.serve(listener)
-}
-
-#[cfg(unix)]
-fn default_daemon_root() -> anyhow::Result<PathBuf> {
-    if let Ok(state_home) = std::env::var("XDG_STATE_HOME") {
-        if !state_home.is_empty() {
-            return Ok(PathBuf::from(state_home).join("amber-ide"));
-        }
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    Ok(PathBuf::from(home).join(".local/state/amber-ide"))
-}
-
-#[cfg(windows)]
-fn default_daemon_root() -> anyhow::Result<PathBuf> {
-    platform::state_root()
-}
-
-#[cfg(unix)]
-fn default_daemon_socket(root: &Path) -> anyhow::Result<PathBuf> {
-    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
-        if !runtime_dir.is_empty() {
-            return Ok(PathBuf::from(runtime_dir)
-                .join("amber-ide")
-                .join("amberd.sock"));
-        }
-    }
-    Ok(root.join("amberd.sock"))
-}
-
-#[cfg(windows)]
-fn default_daemon_socket(_root: &Path) -> anyhow::Result<PathBuf> {
-    platform::socket_name()
 }
 
 #[cfg(test)]
