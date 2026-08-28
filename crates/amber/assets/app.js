@@ -359,7 +359,7 @@ function main() {
     var t = document.createElement('span');
     t.className = 'row-title';
     var p = parseName(s.name);
-    t.textContent = (s.kind === 'claude' ? 'claude' : 'shell') + (p ? ' · pane ' + p.ord : ' · ' + s.name);
+    t.textContent = (s.kind || 'shell') + (p ? ' · pane ' + p.ord : ' · ' + s.name);
     var sub = document.createElement('span');
     sub.className = 'row-sub';
     sub.textContent = shortCwd(s.cwd);

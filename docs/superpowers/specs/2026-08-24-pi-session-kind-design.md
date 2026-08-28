@@ -1,6 +1,6 @@
 # Pi as a session kind — design
 
-**Status:** approved for implementation (2026-08-24).
+**Status:** implemented (2026-08-27).
 
 ## Goal
 

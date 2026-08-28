@@ -1565,6 +1565,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn embedded_mobile_rows_preserve_the_actual_agent_kind_label() {
+        let app = std::str::from_utf8(APP_JS).unwrap();
+        assert!(
+            app.contains("t.textContent = (s.kind || 'shell') +"),
+            "the embedded mobile client must not render Pi (or another agent) as shell"
+        );
+    }
+
+    #[test]
     fn ct_eq_matches_semantics_of_equality() {
         assert!(ct_eq(b"abc", b"abc"));
         assert!(!ct_eq(b"abc", b"abd"));

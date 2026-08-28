@@ -45,9 +45,9 @@ daemon (`amber`) that owns everything.
   to disk on a timer *and* on `SIGTERM` (the pre-reboot final snapshot), then
   restores every session on start — deterministically, no `send-keys` replay.
 - **Coding-agent sessions are supervised and resumed precisely.** Claude Code,
-  OpenAI Codex, and Grok panes run through `amber run <name>`, which resumes the
-  exact recorded conversation id and falls back to a shell so a pane never
-  silently dies.
+  OpenAI Codex, Grok, OpenCode, and Pi panes run through `amber run <name>`,
+  which resumes the exact recorded conversation id and falls back to a shell so
+  a pane never silently dies.
 
 No tmux, no double terminal emulation. Raw pty bytes stream over a unix socket
 straight to a single xterm.js emulator.
@@ -80,9 +80,18 @@ straight to a single xterm.js emulator.
 - Tab + workspace rename, tab close, drag-to-reorder tabs.
 
 **Coding agents**
-- Claude Code, OpenAI Codex, Grok, and OpenCode are supported supervised pane
-  kinds. Their exact recorded conversations resume after agent crashes, unfreeze,
-  daemon restart, and machine reboot.
+- Claude Code, OpenAI Codex, Grok, OpenCode, and Pi are supported supervised
+  pane kinds. Their exact recorded conversations resume after agent crashes,
+  unfreeze, daemon restart, and machine reboot.
+- Pi is an optional user-installed prerequisite (`pi` must be available through
+  your login shell and already authenticated/configured as you prefer). Amber
+  installs and refreshes its owned session-id extension automatically at
+  `~/.pi/agent/extensions/amber-hook.ts` (or
+  `$PI_CODING_AGENT_DIR/extensions/amber-hook.ts`). Repair it explicitly with
+  `amber ctl install-pi-extension`; Amber never changes any other Pi extension.
+- Pi resumes only an exact recorded id with `pi --session <id>`. Amber never
+  uses Pi's `-c` / `--continue` newest-session fallback, because several panes
+  can share a working directory.
 - Codex remains its native terminal UI. Amber resolves the user-installed
   `codex` executable through the login shell; it does not bundle Codex or own
   authentication.
@@ -110,7 +119,8 @@ straight to a single xterm.js emulator.
 - `attach` extras: `Ctrl-b d` tmux-style detach (remappable, `--no-prefix` to
   disable), OSC terminal title, a bottom status bar, and refusal to nest inside
   an existing amber pane.
-- `ctl doctor` / `status` / `install` / `uninstall` / `snapshot-now`.
+- `ctl doctor` / `status` / `install` / `uninstall` / `snapshot-now` /
+  `install-pi-extension`.
 
 **Phone access — `amber web`**
 - `amber web` serves a mobile browser UI for your live sessions: tap a session,
@@ -211,10 +221,10 @@ Debian/Ubuntu; Xcode Command Line Tools on macOS) for native build steps.
 > `AMBER_NO_SANDBOX=1 AMBER_SOFTWARE_GL=1` to render (documented in `CLAUDE.md`).
 
 **4. Agent CLIs (optional)** — install the provider binaries you plan to use.
-Amber discovers `claude`, `codex`, `grok`, and `opencode` through your login
-shell. A missing provider only makes that pane fall back to a shell. `amber handoff`
-requires Claude Code because Claude itself summarizes the saved session without
-exposing its private transcript format.
+Amber discovers `claude`, `codex`, `grok`, `opencode`, and `pi` through your
+login shell. A missing provider only makes that pane fall back to a shell.
+`amber handoff` requires Claude Code because Claude itself summarizes the saved
+session without exposing its private transcript format.
 
 ### Build
 
@@ -263,7 +273,7 @@ amber ctl status            # daemon health
 ## Status
 
 Early — `v0.0.1`, single-developer project. The daemon spine, Claude Code,
-Codex, Grok, and OpenCode supervision, reboot restore, and the full Electron IDE surface
+Codex, Grok, OpenCode, and Pi supervision, reboot restore, and the full Electron IDE surface
 (tabs, workspaces, splits, drag-to-rearrange, browser panes, workspace
 save/load) work through automated coverage; live GUI verification remains
 feature-specific. See the build-status checklist at the bottom of

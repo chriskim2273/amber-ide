@@ -926,6 +926,26 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   `amber freeze` / `amber unfreeze` send Suspend/Resume. **A running daemon
   must be restarted to accept `kind:"opencode"`.**
 
+- [x] Pi session kind (2026-08-27) — a fifth supervised agent:
+  `kind:"pi"` runs `amber run <name> --kind pi`. Spec:
+  `docs/superpowers/specs/2026-08-24-pi-session-kind-design.md`. Pi is
+  Claude-shaped: Amber's owned global extension records Pi's current session
+  id in the existing shared recording store, so fresh sessions resume exactly
+  with `pi --session <id>` after a crash, daemon restart, or reboot. It never
+  uses `pi -c` / `--continue`, which would pick an arbitrary newest conversation
+  when panes share a cwd. The extension self-installs before Pi launches at
+  `~/.pi/agent/extensions/amber-hook.ts` (or `$PI_CODING_AGENT_DIR`); repair it
+  with `amber ctl install-pi-extension`. Pi remains a user-installed,
+  login-shell-resolved prerequisite. `SessionKind::is_agent()` /
+  `isAgentKind()` sites, desktop/mobile pickers, workspace files, run-state
+  dots, and reload commands include Pi. Direct stable Cargo clippy and the
+  complete Rust workspace test suite pass; app unit tests (579, one existing
+  real-daemon skip), typecheck, and build pass. A real Pi 0.84.3 private-daemon
+  smoke proved extension loading, `session_start` recording, and exact-id
+  restore after a private daemon restart. Rustfmt still reports broad
+  pre-existing formatter-version drift; no bulk reformat was applied. A running
+  daemon must be restarted to accept `kind:"pi"`.
+
 - [x] Memory containment + guardian (2026-08-13) — Linux implementation,
   review, soak, and production rollout are complete. Linux uses delegated
   cgroup-v2 slot leaves to isolate the daemon, supervisors, workloads, and
