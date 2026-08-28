@@ -73,7 +73,6 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
@@ -82,6 +81,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use amber_core::proto::{self, ControlMsg, Decoded, Decoder, Frame, SessionInfo};
+use crate::transport::{self, LocalReader, LocalWriter};
 
 use crate::layout_cas;
 use crate::mosaic;
@@ -589,7 +589,7 @@ struct Client {
 
 struct HubInner {
     /// Write half of the single daemon connection; `None` while unreachable.
-    daemon: Option<UnixStream>,
+    daemon: Option<LocalWriter>,
     sessions: Vec<SessionInfo>,
     file: mosaic::LayoutFile,
     layout: String,
@@ -770,12 +770,15 @@ impl Hub {
         Self::write_daemon(inner, &Frame::Control(ControlMsg::Detach { name }));
     }
 
-    /// Write one frame to the daemon. Bounded by `SO_SNDTIMEO`; a failure
-    /// drops the link so the supervisor reconnects.
+    /// Write one frame to the daemon. Unix retains `SO_SNDTIMEO`; every
+    /// platform also gets the same wall-clock bound. A failure drops the link
+    /// so the supervisor reconnects.
     fn write_daemon(inner: &mut HubInner, frame: &Frame) {
         let bytes = proto::encode(frame);
         let ok = match inner.daemon.as_mut() {
-            Some(s) => s.write_all(&bytes).and_then(|()| s.flush()).is_ok(),
+            Some(s) => crate::daemon::write_bounded(s, &bytes, DAEMON_WRITE_TIMEOUT)
+                .and_then(|()| s.flush())
+                .is_ok(),
             None => false,
         };
         if !ok {
@@ -1104,7 +1107,7 @@ impl Hub {
         }
     }
 
-    fn read_loop(&self, mut stream: UnixStream) {
+    fn read_loop(&self, mut stream: LocalReader) {
         let mut decoder = Decoder::new();
         let mut buf = [0u8; 65536];
         loop {
@@ -1136,14 +1139,14 @@ impl Hub {
 fn run_daemon_link(hub: Arc<Hub>) {
     let mut backoff = RECONNECT_MIN;
     loop {
-        match UnixStream::connect(&hub.socket) {
+        match transport::connect(&hub.socket) {
             Ok(stream) => {
                 backoff = RECONNECT_MIN;
-                let _ = stream.set_write_timeout(Some(DAEMON_WRITE_TIMEOUT));
-                let Ok(read_half) = stream.try_clone() else { continue };
+                let Ok((read_half, writer)) = stream.into_split() else { continue };
+                let _ = writer.set_write_timeout(Some(DAEMON_WRITE_TIMEOUT));
                 {
                     let mut inner = hub.inner.lock().unwrap();
-                    inner.daemon = Some(stream);
+                    inner.daemon = Some(writer);
                     Hub::write_daemon(&mut inner, &Frame::Control(ControlMsg::WatchSessions));
                     Hub::write_daemon(
                         &mut inner,
@@ -2309,20 +2312,22 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn daemon_link_subscribes_to_resource_pressure_version_two() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("fake-daemon.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let listener = transport::bind(&sock).unwrap();
         let hub = Hub::new(sock, dir.path().to_path_buf());
         {
             let hub = Arc::clone(&hub);
             thread::spawn(move || run_daemon_link(hub));
         }
 
-        let (conn, _) = listener.accept().unwrap();
+        let conn = listener.accept().unwrap();
         conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let mut reader = FrameReader::new(&conn);
+        let (mut conn_read, _conn_write) = conn.into_split().unwrap();
+        let mut reader = FrameReader::new(&mut conn_read);
         let first = reader.next();
         let second = reader.next();
         assert!(matches!(
@@ -2332,6 +2337,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn daemon_link_skips_unknown_control_and_keeps_decoding() {
         let dir = tempfile::tempdir().unwrap();
@@ -2339,21 +2345,23 @@ mod tests {
             dir.path().join("daemon.sock"),
             dir.path().to_path_buf(),
         ));
-        let (mut peer, web_end) = UnixStream::pair().unwrap();
+        let (peer, web_end) = transport::test_pair().unwrap();
+        let (_peer_read, mut peer_write) = peer.into_split().unwrap();
+        let (web_read, _web_write) = web_end.into_split().unwrap();
         let reader_hub = Arc::clone(&hub);
-        let reader = std::thread::spawn(move || reader_hub.read_loop(web_end));
+        let reader = std::thread::spawn(move || reader_hub.read_loop(web_read));
 
         let json = br#"{"FutureDaemonEvent":{"version":2}}"#;
         let mut unknown_body = vec![0u8];
         unknown_body.extend_from_slice(json);
         let mut unknown = (unknown_body.len() as u32).to_be_bytes().to_vec();
         unknown.extend_from_slice(&unknown_body);
-        peer.write_all(&unknown).unwrap();
-        peer.write_all(&proto::encode(&Frame::Control(ControlMsg::Sessions {
+        peer_write.write_all(&unknown).unwrap();
+        peer_write.write_all(&proto::encode(&Frame::Control(ControlMsg::Sessions {
             sessions: vec![s("still-connected", "shell")],
         })))
         .unwrap();
-        drop(peer);
+        peer_write.shutdown().unwrap();
         reader.join().unwrap();
 
         assert_eq!(hub.inner.lock().unwrap().sessions[0].name, "still-connected");
@@ -2361,16 +2369,14 @@ mod tests {
 
     /// Reads whole `Frame`s off a raw fake-daemon connection, keeping the
     /// `Decoder`'s state across calls (two frames can arrive in one `read()`).
+    #[cfg(unix)]
     struct FrameReader<'a> {
-        // A shared reference (not `&mut`): `UnixStream` implements `Read` for
-        // `&UnixStream` too, so this can coexist with `conn_write`'s own `&
-        // UnixStream` borrows of the same connection instead of fighting over
-        // exclusive access.
-        stream: &'a UnixStream,
+        stream: &'a mut LocalReader,
         dec: Decoder,
     }
+    #[cfg(unix)]
     impl<'a> FrameReader<'a> {
-        fn new(stream: &'a UnixStream) -> Self {
+        fn new(stream: &'a mut LocalReader) -> Self {
             Self { stream, dec: Decoder::new() }
         }
         fn next(&mut self) -> Frame {
@@ -2427,11 +2433,12 @@ mod tests {
     /// process. Revert `write_daemon_tracking`'s use in `run_daemon_link` (i.e.
     /// go back to plain `write_daemon` there) and this test fails on the
     /// second `backlog` assertion.
+    #[cfg(unix)]
     #[test]
     fn daemon_reconnect_reattach_tags_its_backlog_reply() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("fake-daemon.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let listener = transport::bind(&sock).unwrap();
 
         let hub = Hub::new(sock, dir.path().to_path_buf());
         {
@@ -2440,11 +2447,12 @@ mod tests {
         }
 
         // --- First "daemon" connection ---------------------------------
-        let (conn, _) = listener.accept().unwrap();
+        let conn = listener.accept().unwrap();
         conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let mut r1 = FrameReader::new(&conn);
+        let (mut conn_read, mut conn_write_half) = conn.into_split().unwrap();
+        let mut r1 = FrameReader::new(&mut conn_read);
 
-        conn_write(&conn, &Frame::Control(ControlMsg::Sessions { sessions: vec![s("s1", "shell")] }));
+        conn_write(&mut conn_write_half, &Frame::Control(ControlMsg::Sessions { sessions: vec![s("s1", "shell")] }));
         let deadline = Instant::now() + Duration::from_secs(5);
         while !hub.inner.lock().unwrap().sessions.iter().any(|x| x.name == "s1") {
             assert!(Instant::now() < deadline, "hub never learned about s1");
@@ -2467,16 +2475,17 @@ mod tests {
                 break;
             }
         }
-        conn_write(&conn, &Frame::Data { session: "s1".into(), bytes: b"first-backlog".to_vec() });
+        conn_write(&mut conn_write_half, &Frame::Data { session: "s1".into(), bytes: b"first-backlog".to_vec() });
         assert_eq!(expect_backlog(&rx, "s1"), b"first-backlog");
 
         // --- The daemon dies and a fresh connection replaces it, with NO
         // browser-side event at all: this is the bug's exact trigger. ------
         drop(r1);
-        drop(conn);
-        let (conn2, _) = listener.accept().unwrap();
+        conn_write_half.shutdown().unwrap();
+        let conn2 = listener.accept().unwrap();
         conn2.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let mut r2 = FrameReader::new(&conn2);
+        let (mut conn2_read, mut conn2_write) = conn2.into_split().unwrap();
+        let mut r2 = FrameReader::new(&mut conn2_read);
         // `run_daemon_link` sends WatchSessions before re-attaching every
         // session a client still has open — skip past it.
         loop {
@@ -2484,7 +2493,7 @@ mod tests {
                 break;
             }
         }
-        conn_write(&conn2, &Frame::Data { session: "s1".into(), bytes: b"replayed-after-restart".to_vec() });
+        conn_write(&mut conn2_write, &Frame::Data { session: "s1".into(), bytes: b"replayed-after-restart".to_vec() });
 
         // The fix: the browser gets the SAME tagged marker for this
         // reconnect-driven re-attach as it did for the browser-initiated one
@@ -2493,7 +2502,8 @@ mod tests {
         assert_eq!(expect_backlog(&rx, "s1"), b"replayed-after-restart");
     }
 
-    fn conn_write(mut stream: &UnixStream, frame: &Frame) {
+    #[cfg(unix)]
+    fn conn_write(stream: &mut LocalWriter, frame: &Frame) {
         stream.write_all(&proto::encode(frame)).unwrap();
     }
 

@@ -3,7 +3,6 @@
 
 use std::ffi::OsString;
 use std::io::{IsTerminal, Read, Write};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
@@ -14,6 +13,7 @@ use amber::claude;
 use amber::daemon::Daemon;
 use amber::manager::SessionManager;
 use amber::supervisor;
+use amber::transport::{self, LocalStream};
 use amber_core::proto::{self, ControlMsg, Decoder, Frame};
 use amber_core::state::StateStore;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -327,7 +327,7 @@ fn main() -> anyhow::Result<()> {
         return run_new(&resolve_socket(None));
     };
     match command {
-        Command::Daemon { root, socket } => run_daemon(root, socket),
+        Command::Daemon { root, socket } => daemon_main(root, socket),
         Command::Attach { name, no_prefix, no_status, force, socket } => {
             run_attach(&resolve_socket(socket), name, no_prefix, no_status, force)
         }
@@ -501,7 +501,7 @@ fn print_crash_report() {
 
 /// Connect to the daemon and report liveness + session count.
 fn run_status(socket: &Path) -> anyhow::Result<()> {
-    match UnixStream::connect(socket) {
+    match transport::connect(socket) {
         Ok(mut stream) => {
             stream.write_all(&proto::encode(&Frame::Control(ControlMsg::ListSessions)))?;
             let mut decoder = Decoder::new();
@@ -620,7 +620,7 @@ fn run_uninstall(
 
 /// Ask the daemon for an immediate snapshot and wait for the ack.
 fn run_snapshot_now(socket: &Path) -> anyhow::Result<()> {
-    let mut stream = UnixStream::connect(socket)
+    let mut stream = transport::connect(socket)
         .map_err(|e| anyhow::anyhow!("daemon unreachable at {}: {e}", socket.display()))?;
     stream.write_all(&proto::encode(&Frame::Control(ControlMsg::Snapshot)))?;
 
@@ -768,7 +768,7 @@ fn run_budget(set: Option<&str>, systemd: bool, socket: &Path) -> anyhow::Result
     // View asks the daemon for its LIVE truth (it knows its real cap); a set
     // goes through the daemon so config persistence, session leaves, and the
     // guardian's budget handle all move together. "auto" is mb=0 on the wire.
-    let mut stream = UnixStream::connect(socket)
+    let mut stream = transport::connect(socket)
         .map_err(|e| anyhow::anyhow!("daemon unreachable at {}: {e}", socket.display()))?;
     let request = match set {
         None => ControlMsg::GetMemoryBudget,
@@ -800,7 +800,7 @@ fn run_budget(set: Option<&str>, systemd: bool, socket: &Path) -> anyhow::Result
 }
 
 /// Wait for the BudgetApplied/Error reply to a budget request.
-fn read_budget_reply(stream: &mut UnixStream) -> anyhow::Result<ControlMsg> {
+fn read_budget_reply(stream: &mut LocalStream) -> anyhow::Result<ControlMsg> {
     let mut decoder = Decoder::new();
     let mut buf = [0u8; 8192];
     loop {
@@ -1161,7 +1161,7 @@ fn run_web(
     amber::web::serve(listener, socket, root, token)
 }
 
-fn run_daemon(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Result<()> {
+pub fn daemon_main(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Result<()> {
     let root = root.unwrap_or_else(default_root);
     std::fs::create_dir_all(&root)?;
     let socket_path = socket.unwrap_or_else(|| default_socket(&root));
@@ -1314,7 +1314,7 @@ fn ls_status(s: &proto::SessionInfo) -> String {
 }
 
 fn run_ls(socket: &Path) -> anyhow::Result<()> {
-    let mut stream = UnixStream::connect(socket)?;
+    let mut stream = transport::connect(socket)?;
     stream.write_all(&proto::encode(&Frame::Control(ControlMsg::ListSessionsDetailed)))?;
 
     let mut decoder = Decoder::new();
@@ -1394,8 +1394,8 @@ fn run_attach(
 /// Connect to the daemon, turning a bare ENOENT/ECONNREFUSED into the advice
 /// the user actually needs. Every interactive path (attach, bare `amber`) goes
 /// through it.
-fn connect_daemon(socket: &Path) -> anyhow::Result<UnixStream> {
-    UnixStream::connect(socket).map_err(|e| {
+fn connect_daemon(socket: &Path) -> anyhow::Result<LocalStream> {
+    transport::connect(socket).map_err(|e| {
         anyhow::anyhow!(
             "cannot reach the amber daemon at {} ({e}) — is it running? \
              start it with `amber daemon` or the systemd/launchd service",
@@ -1531,7 +1531,7 @@ fn resolve_existing(socket: &Path, arg: &str) -> anyhow::Result<String> {
 /// replies. A name or slot the daemon does not currently list is an error.
 fn run_kill(socket: &Path, arg: &str) -> anyhow::Result<()> {
     let name = resolve_existing(socket, arg)?;
-    let mut stream = UnixStream::connect(socket)?;
+    let mut stream = transport::connect(socket)?;
     stream.write_all(&proto::encode(&Frame::Control(ControlMsg::Kill {
         name: name.clone(),
     })))?;
@@ -1567,7 +1567,7 @@ fn run_suspend(socket: &Path, arg: &str, freeze: bool) -> anyhow::Result<()> {
     } else {
         ControlMsg::Resume { name: name.clone() }
     };
-    let mut stream = UnixStream::connect(socket)?;
+    let mut stream = transport::connect(socket)?;
     stream.write_all(&proto::encode(&Frame::Control(msg)))?;
     stream.write_all(&proto::encode(&Frame::Control(ControlMsg::ListSessionsDetailed)))?;
 
@@ -1608,7 +1608,7 @@ fn run_suspend(socket: &Path, arg: &str, freeze: bool) -> anyhow::Result<()> {
 /// that already exists, an invalid name) comes back as `Error` and exits
 /// nonzero.
 fn run_rename(socket: &Path, from: &str, to: &str) -> anyhow::Result<()> {
-    let mut stream = UnixStream::connect(socket)?;
+    let mut stream = transport::connect(socket)?;
     stream.write_all(&proto::encode(&Frame::Control(ControlMsg::Rename {
         from: from.to_string(),
         to: to.to_string(),

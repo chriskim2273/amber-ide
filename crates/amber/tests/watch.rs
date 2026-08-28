@@ -1,34 +1,31 @@
 //! A watcher connection sees session create/kill deltas; a non-watcher does not.
 
 use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::time::Duration;
 
 use amber::daemon::{prepare_socket, Daemon};
 use amber::manager::SessionManager;
+use amber::transport::{self, LocalReader, LocalWriter};
 use amber::watchers::Watchers;
 use amber_core::proto::{self, ControlMsg, Decoder, Frame};
 
-fn send(stream: &UnixStream, msg: ControlMsg) {
-    let mut w = stream;
-    w.write_all(&proto::encode(&Frame::Control(msg))).unwrap();
-    w.flush().unwrap();
+fn send(stream: &mut LocalWriter, msg: ControlMsg) {
+    stream.write_all(&proto::encode(&Frame::Control(msg))).unwrap();
+    stream.flush().unwrap();
 }
 
-fn send_raw_control(stream: &UnixStream, json: &str) {
+fn send_raw_control(stream: &mut LocalWriter, json: &str) {
     let mut body = vec![0];
     body.extend_from_slice(json.as_bytes());
     let mut wire = Vec::with_capacity(4 + body.len());
     wire.extend_from_slice(&(body.len() as u32).to_be_bytes());
     wire.extend_from_slice(&body);
-    let mut w = stream;
-    w.write_all(&wire).unwrap();
-    w.flush().unwrap();
+    stream.write_all(&wire).unwrap();
+    stream.flush().unwrap();
 }
 
-fn read_control_until<F: Fn(&ControlMsg) -> bool>(stream: &mut UnixStream, pred: F) -> ControlMsg {
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+fn read_control_until<F: Fn(&ControlMsg) -> bool>(stream: &mut LocalReader, pred: F) -> ControlMsg {
     let mut dec = Decoder::new();
     let mut buf = [0u8; 8192];
     loop {
@@ -55,17 +52,19 @@ fn watcher_sees_create_and_kill_deltas() {
         let _ = daemon.serve(listener);
     });
 
-    let watcher = UnixStream::connect(&sock).unwrap();
-    let bystander = UnixStream::connect(&sock).unwrap();
+    let watcher = transport::connect(&sock).unwrap();
+    watcher.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let (mut w, mut watcher_write) = watcher.into_split().unwrap();
+    let bystander = transport::connect(&sock).unwrap();
+    let (_bystander_read, mut bystander_write) = bystander.into_split().unwrap();
 
-    let mut w = watcher.try_clone().unwrap();
-    send(&watcher, ControlMsg::WatchSessions);
+    send(&mut watcher_write, ControlMsg::WatchSessions);
     // WatchSessions replies with the (empty) full set first.
     read_control_until(&mut w, |m| matches!(m, ControlMsg::Sessions { .. }));
 
     // Create a shell session over the bystander connection.
     send(
-        &bystander,
+        &mut bystander_write,
         ControlMsg::Create {
             name: "amber-1-1-0-a".into(),
             cwd: dir.path().to_string_lossy().into_owned(),
@@ -85,7 +84,7 @@ fn watcher_sees_create_and_kill_deltas() {
     }
 
     // Kill it; watcher sees a removal delta.
-    send(&bystander, ControlMsg::Kill { name: "amber-1-1-0-a".into() });
+    send(&mut bystander_write, ControlMsg::Kill { name: "amber-1-1-0-a".into() });
     let delta = read_control_until(&mut w, |m| {
         matches!(m, ControlMsg::SessionsChanged { removed, .. } if !removed.is_empty())
     });
@@ -109,11 +108,14 @@ fn watcher_snapshot_arrives_before_later_deltas() {
         let _ = daemon.serve(listener);
     });
 
-    let watcher = UnixStream::connect(&sock).unwrap();
-    let mut reader = watcher.try_clone().unwrap();
-    send(&watcher, ControlMsg::WatchSessions);
+    let watcher = transport::connect(&sock).unwrap();
+    watcher.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let (mut reader, mut watcher_write) = watcher.into_split().unwrap();
+    send(&mut watcher_write, ControlMsg::WatchSessions);
+    let creator = transport::connect(&sock).unwrap();
+    let (_creator_read, mut creator_write) = creator.into_split().unwrap();
     send(
-        &UnixStream::connect(&sock).unwrap(),
+        &mut creator_write,
         ControlMsg::Create {
             name: "amber-1-1-0-after-watch".into(),
             cwd: dir.path().to_string_lossy().into_owned(),
@@ -122,7 +124,6 @@ fn watcher_snapshot_arrives_before_later_deltas() {
     );
 
     let mut decoder = Decoder::new();
-    reader.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let mut buf = [0u8; 8192];
     let first = loop {
         if let Some(frame) = decoder.next_frame().unwrap() {
@@ -162,21 +163,23 @@ fn memory_pressure_reaches_only_versioned_opt_in_watchers() {
 
     // This connection models an older strict client: it knows WatchSessions
     // but has never advertised support for the newer pressure control.
-    let old = UnixStream::connect(&sock).unwrap();
-    let mut old_read = old.try_clone().unwrap();
-    send(&old, ControlMsg::WatchSessions);
+    let old = transport::connect(&sock).unwrap();
+    old.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let (mut old_read, mut old_write) = old.into_split().unwrap();
+    send(&mut old_write, ControlMsg::WatchSessions);
     read_control_until(&mut old_read, |m| matches!(m, ControlMsg::Sessions { .. }));
 
     // Send the new capability in raw serde shape so this test is RED before
     // the protocol enum learns the variant.
-    let current = UnixStream::connect(&sock).unwrap();
-    let mut current_read = current.try_clone().unwrap();
-    send(&current, ControlMsg::WatchSessions);
+    let current = transport::connect(&sock).unwrap();
+    current.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let (mut current_read, mut current_write) = current.into_split().unwrap();
+    send(&mut current_write, ControlMsg::WatchSessions);
     read_control_until(&mut current_read, |m| matches!(m, ControlMsg::Sessions { .. }));
-    send_raw_control(&current, r#"{"WatchMemoryPressure":{"version":1}}"#);
+    send_raw_control(&mut current_write, r#"{"WatchMemoryPressure":{"version":1}}"#);
     // A reply to the following request proves the daemon processed the
     // capability first (one ordered unix stream) before pressure is emitted.
-    send(&current, ControlMsg::ListSessionsDetailed);
+    send(&mut current_write, ControlMsg::ListSessionsDetailed);
     read_control_until(&mut current_read, |m| matches!(m, ControlMsg::Sessions { .. }));
 
     let pressure = ControlMsg::MemoryPressure {
@@ -194,8 +197,7 @@ fn memory_pressure_reaches_only_versioned_opt_in_watchers() {
     // If pressure leaked to the old connection, it is the next frame and this
     // exact assertion fails. Otherwise the old client remains connected and
     // receives its ordinary Sessions response.
-    send(&old, ControlMsg::ListSessionsDetailed);
-    old_read.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    send(&mut old_write, ControlMsg::ListSessionsDetailed);
     let mut decoder = Decoder::new();
     let mut buf = [0u8; 8192];
     let first = loop {

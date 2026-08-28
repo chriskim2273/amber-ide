@@ -3,7 +3,6 @@
 //! so a pane never silently dies.
 
 use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,7 +12,7 @@ use std::time::Duration;
 use amber_core::proto::{self, ControlMsg, Decoded, Decoder, Frame};
 use amber_core::state::{SessionKind, StateStore};
 
-use crate::{claude, codex, grok, hermes, opencode, pi};
+use crate::{claude, codex, grok, hermes, opencode, pi, transport};
 
 /// Upper bound on one run-state report attempt. The ordered reporter retries a
 /// timed-out attempt without blocking the child-monitoring loop.
@@ -665,7 +664,7 @@ fn try_report_run_state(
     state: &str,
     seq: u64,
 ) -> anyhow::Result<()> {
-    let mut stream = UnixStream::connect(socket)?;
+    let mut stream = transport::connect(socket)?;
     stream.set_write_timeout(Some(REPORT_WRITE_TIMEOUT))?;
     stream.set_read_timeout(Some(REPORT_WRITE_TIMEOUT))?;
     let frame = proto::encode(&Frame::Control(ControlMsg::ReportRunState {

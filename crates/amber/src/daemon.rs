@@ -1,8 +1,7 @@
-//! The unix-socket server: accepts connections, speaks the `amber_core::proto`
+//! The local transport server: accepts connections, speaks the `amber_core::proto`
 //! wire protocol, and dispatches to the [`SessionManager`].
 
 use std::io::{Read, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -12,6 +11,7 @@ use amber_core::state::SessionKind;
 
 use crate::manager::{ResumeCause, SessionManager};
 use crate::pty::{PtySession, SuspendOrigin};
+use crate::transport::{self, LocalListener, LocalReader, LocalStream, LocalWriter};
 
 /// Upper bound on a single daemon->client write (`SO_SNDTIMEO`), set once per
 /// accepted connection so it covers EVERY write on that socket: control
@@ -28,7 +28,7 @@ pub const CLIENT_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// Shared handle to a connection's write half — both the control-reply path
 /// and a per-attach output-forwarder thread write to it, so it must be
 /// mutex-guarded.
-type SharedWriter = Arc<Mutex<UnixStream>>;
+type SharedWriter = Arc<Mutex<LocalWriter>>;
 
 /// Subscriptions this connection holds: `(session name, session, sub id)`.
 /// Released on `Detach` and when the connection ends, so a vanished client
@@ -52,9 +52,9 @@ impl Daemon {
     /// Accept loop. Runs until the listener itself errors (e.g. the socket
     /// file is removed out from under it); per-connection errors are logged
     /// and otherwise ignored.
-    pub fn serve(&self, listener: UnixListener) -> anyhow::Result<()> {
-        for conn in listener.incoming() {
-            match conn {
+    pub fn serve(&self, listener: LocalListener) -> anyhow::Result<()> {
+        loop {
+            match listener.accept() {
                 Ok(stream) => {
                     let manager = Arc::clone(&self.manager);
                     let watchers = Arc::clone(&self.watchers);
@@ -64,12 +64,14 @@ impl Daemon {
                         }
                     });
                 }
-                Err(e) => {
-                    eprintln!("amber daemon: accept error: {e}");
-                }
+                Err(e) => eprintln!("amber daemon: accept error: {e}"),
             }
         }
-        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn serve_one_for_test(&self, stream: LocalStream) -> anyhow::Result<()> {
+        handle_connection(Arc::clone(&self.manager), Arc::clone(&self.watchers), stream)
     }
 }
 
@@ -79,17 +81,24 @@ impl Daemon {
 ///   a running daemon's socket out from under it;
 /// - a stale socket file (connect refused: previous daemon crashed/was
 ///   SIGKILLed) -> remove it and bind.
-pub fn prepare_socket(path: &std::path::Path) -> anyhow::Result<UnixListener> {
-    if path.exists() {
-        match UnixStream::connect(path) {
-            Ok(_) => anyhow::bail!(
-                "another daemon is already listening on {}",
-                path.display()
-            ),
-            Err(_) => std::fs::remove_file(path)?,
+pub fn prepare_socket(path: &std::path::Path) -> anyhow::Result<LocalListener> {
+    #[cfg(unix)]
+    {
+        if path.exists() {
+            match transport::connect(path) {
+                Ok(_) => anyhow::bail!(
+                    "another daemon is already listening on {}",
+                    path.display()
+                ),
+                Err(_) => std::fs::remove_file(path)?,
+            }
         }
+        Ok(transport::bind(path)?)
     }
-    Ok(UnixListener::bind(path)?)
+    #[cfg(windows)]
+    {
+        Ok(transport::bind(path)?)
+    }
 }
 
 /// Write every byte, giving up after `timeout` in total.
@@ -107,8 +116,8 @@ pub fn prepare_socket(path: &std::path::Path) -> anyhow::Result<UnixListener> {
 /// from stacking timeouts. The bound is one `timeout`, full stop. A partial
 /// frame is fine — the caller severs the connection, so nothing ever reads the
 /// desynchronised stream.
-pub(crate) fn write_bounded(
-    w: &mut UnixStream,
+pub(crate) fn write_bounded<W: Write + ?Sized>(
+    w: &mut W,
     mut buf: &[u8],
     timeout: std::time::Duration,
 ) -> std::io::Result<()> {
@@ -118,6 +127,12 @@ pub(crate) fn write_bounded(
             Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
             Ok(n) => buf = &buf[n..],
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // Windows named pipes are deliberately nonblocking. A full
+                // pipe is not a dead client until the existing wall-clock
+                // budget expires, so yield and retry within that budget.
+                thread::yield_now();
+            }
             Err(e) => return Err(e),
         }
         if !buf.is_empty() && std::time::Instant::now() >= deadline {
@@ -147,7 +162,7 @@ pub(crate) fn write_bounded(
 fn write_frame(writer: &SharedWriter, frame: &Frame) -> anyhow::Result<()> {
     let bytes = proto::encode(frame);
     let mut w = writer.lock().unwrap();
-    let res = write_bounded(&mut w, &bytes, CLIENT_WRITE_TIMEOUT);
+    let res = write_bounded(&mut *w, &bytes, CLIENT_WRITE_TIMEOUT);
     if let Err(e) = res {
         let who = match frame {
             Frame::Data { session, .. } | Frame::Backlog { session, .. } => {
@@ -156,7 +171,7 @@ fn write_frame(writer: &SharedWriter, frame: &Frame) -> anyhow::Result<()> {
             Frame::Control(_) => String::new(),
         };
         eprintln!("amber daemon: dropping client{who}: write failed: {e}");
-        let _ = w.shutdown(std::net::Shutdown::Both);
+        let _ = w.shutdown();
         return Err(e.into());
     }
     Ok(())
@@ -190,16 +205,23 @@ fn suppress_backlog(raw_client: bool, kind: Option<SessionKind>) -> bool {
 fn handle_connection(
     manager: Arc<SessionManager>,
     watchers: Arc<crate::watchers::Watchers>,
-    stream: UnixStream,
+    stream: LocalStream,
 ) -> anyhow::Result<()> {
-    // Bound EVERY write on this socket (see CLIENT_WRITE_TIMEOUT). SO_SNDTIMEO
-    // is a socket-level option, so setting it once here covers the read half's
-    // clone and the per-attach Output forwarders alike.
-    stream.set_write_timeout(Some(CLIENT_WRITE_TIMEOUT))?;
-    let writer: SharedWriter = Arc::new(Mutex::new(stream.try_clone()?));
+    let (read_half, writer) = stream.into_split()?;
+    // On Unix this retains the existing SO_SNDTIMEO protection. Windows pipes
+    // are nonblocking and rely on write_bounded's wall-clock deadline instead.
+    writer.set_write_timeout(Some(CLIENT_WRITE_TIMEOUT))?;
+    let writer: SharedWriter = Arc::new(Mutex::new(writer));
     let mut subscriptions: Subscriptions = Vec::new();
     let search_epoch = Arc::new(AtomicU64::new(0));
-    let result = connection_loop(&manager, &watchers, &writer, stream, &mut subscriptions, &search_epoch);
+    let result = connection_loop(
+        &manager,
+        &watchers,
+        &writer,
+        read_half,
+        &mut subscriptions,
+        &search_epoch,
+    );
     search_epoch.fetch_add(1, Ordering::Relaxed);
     // However the connection ended, release every subscription it held.
     for (_, sess, id) in subscriptions {
@@ -212,7 +234,7 @@ fn connection_loop(
     manager: &Arc<SessionManager>,
     watchers: &Arc<crate::watchers::Watchers>,
     writer: &SharedWriter,
-    mut read_half: UnixStream,
+    mut read_half: LocalReader,
     subscriptions: &mut Subscriptions,
     search_epoch: &Arc<AtomicU64>,
 ) -> anyhow::Result<()> {
@@ -726,6 +748,49 @@ fn handle_control(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    struct WouldBlockThenWrite {
+        remaining_blocks: usize,
+        writes: usize,
+    }
+
+    impl Write for WouldBlockThenWrite {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.writes += 1;
+            if self.remaining_blocks > 0 {
+                self.remaining_blocks -= 1;
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_accepts_local_transport_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(SessionManager::new(dir.path()).unwrap());
+        let daemon = Daemon::new(manager, Arc::new(crate::watchers::Watchers::new()));
+        let (client, server) = crate::transport::test_pair().unwrap();
+        drop(client);
+
+        assert!(daemon.serve_one_for_test(server).is_ok());
+    }
+
+    #[test]
+    fn write_bounded_retries_would_block_before_deadline() {
+        let mut writer = WouldBlockThenWrite { remaining_blocks: 3, writes: 0 };
+
+        write_bounded(&mut writer, b"frame", std::time::Duration::from_secs(1)).unwrap();
+
+        assert_eq!(writer.writes, 4);
+    }
 
     #[test]
     fn backlog_suppressed_only_for_raw_client_on_claude_sessions() {
@@ -748,6 +813,7 @@ mod tests {
         assert!(!suppress_backlog(true, None));
     }
 
+    #[cfg(unix)]
     #[test]
     fn parse_kind_accepts_hermes_as_an_agent() {
         let kind = parse_kind("hermes").expect("hermes must be a create kind");
@@ -779,6 +845,7 @@ mod tests {
         assert!(t0.elapsed() < std::time::Duration::from_secs(2), "took {:?}", t0.elapsed());
     }
 
+    #[cfg(unix)]
     #[test]
     fn prepare_socket_binds_fresh_path() {
         let dir = tempfile::tempdir().unwrap();
@@ -787,6 +854,7 @@ mod tests {
         assert!(path.exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn prepare_socket_refuses_to_steal_a_live_socket() {
         // A second daemon instance must fail loudly, not silently unbind the
@@ -794,11 +862,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("live.sock");
         let _live = UnixListener::bind(&path).unwrap();
-        let err = prepare_socket(&path).expect_err("stole a live socket");
+        let err = match prepare_socket(&path) {
+            Ok(_) => panic!("stole a live socket"),
+            Err(error) => error,
+        };
         assert!(err.to_string().contains("already listening"), "{err}");
         assert!(path.exists(), "live socket file must be left alone");
     }
 
+    #[cfg(unix)]
     #[test]
     fn prepare_socket_replaces_stale_socket_file() {
         // A crashed daemon leaves a socket file behind with nobody accepting:

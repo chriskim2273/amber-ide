@@ -108,6 +108,14 @@ mod imp {
             let writer = self.0.try_clone()?;
             Ok((LocalReader(self.0), LocalWriter(Some(writer))))
         }
+
+        pub fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> io::Result<()> {
+            self.0.set_read_timeout(timeout)
+        }
+
+        pub fn set_write_timeout(&self, timeout: Option<std::time::Duration>) -> io::Result<()> {
+            self.0.set_write_timeout(timeout)
+        }
     }
 
     impl Read for LocalStream {
@@ -153,6 +161,34 @@ mod imp {
     }
 
     impl LocalWriter {
+        pub fn write_timeout(&self) -> io::Result<Option<std::time::Duration>> {
+            self.0
+                .as_ref()
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "local writer is shut down")
+                })?
+                .write_timeout()
+        }
+
+        pub fn set_write_timeout(&self, timeout: Option<std::time::Duration>) -> io::Result<()> {
+            self.0
+                .as_ref()
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "local writer is shut down")
+                })?
+                .set_write_timeout(timeout)
+        }
+
+        #[cfg(test)]
+        pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+            self.0
+                .as_ref()
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "local writer is shut down")
+                })?
+                .set_nonblocking(nonblocking)
+        }
+
         /// Close both directions so a peer blocked in a read wakes immediately.
         pub fn shutdown(&mut self) -> io::Result<()> {
             match self.0.take() {
@@ -349,6 +385,18 @@ mod imp {
         pub fn into_split(self) -> io::Result<(LocalReader, LocalWriter)> {
             Ok((LocalReader(Arc::clone(&self.0)), LocalWriter(self.0)))
         }
+
+        /// Named-pipe handles have no socket timeout option. I/O is already
+        /// nonblocking, and callers enforce their own wall-clock deadline.
+        pub fn set_read_timeout(&self, _timeout: Option<Duration>) -> io::Result<()> {
+            Ok(())
+        }
+
+        /// Named-pipe handles have no socket timeout option. I/O is already
+        /// nonblocking, and callers enforce their own wall-clock deadline.
+        pub fn set_write_timeout(&self, _timeout: Option<Duration>) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     impl Read for LocalStream {
@@ -384,6 +432,19 @@ mod imp {
     }
 
     impl LocalWriter {
+        pub fn write_timeout(&self) -> io::Result<Option<Duration>> {
+            Ok(None)
+        }
+
+        pub fn set_write_timeout(&self, _timeout: Option<Duration>) -> io::Result<()> {
+            Ok(())
+        }
+
+        #[cfg(test)]
+        pub fn set_nonblocking(&self, _nonblocking: bool) -> io::Result<()> {
+            Ok(())
+        }
+
         /// A server force-disconnects its peer; a client simply closes its own
         /// handle. Both paths bypass the interprocess linger/flush drop path.
         pub fn shutdown(&mut self) -> io::Result<()> {

@@ -4,10 +4,10 @@
 use amber::daemon::Daemon;
 use amber::manager::SessionManager;
 use amber::pty::SuspendOrigin;
+use amber::transport::{self, LocalStream};
 use amber::watchers::Watchers;
 use amber_core::proto::{self, ControlMsg, Decoder, Frame};
 use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -24,7 +24,7 @@ fn start_daemon() -> (PathBuf, tempfile::TempDir) {
     let socket_path = dir.path().join("amberd.sock");
 
     let manager = Arc::new(SessionManager::new(&root).unwrap());
-    let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+    let listener = transport::bind(&socket_path).unwrap();
     let daemon = Daemon::new(manager, std::sync::Arc::new(Watchers::new()));
     thread::spawn(move || {
         let _ = daemon.serve(listener);
@@ -42,7 +42,7 @@ fn start_daemon_with_manager() -> (PathBuf, Arc<SessionManager>, tempfile::TempD
     let socket_path = dir.path().join("amberd.sock");
 
     let manager = Arc::new(SessionManager::new(&root).unwrap());
-    let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+    let listener = transport::bind(&socket_path).unwrap();
     let daemon = Daemon::new(Arc::clone(&manager), Arc::new(Watchers::new()));
     thread::spawn(move || {
         let _ = daemon.serve(listener);
@@ -72,7 +72,7 @@ fn mark_resume_as_claude(state_root: &Path, name: &str) {
 /// Accumulate Data-frame bytes from `stream` until `pred(acc)` matches, or
 /// panic after `timeout`. Returns everything accumulated.
 fn read_data_until<F: Fn(&[u8]) -> bool>(
-    stream: &mut UnixStream,
+    stream: &mut LocalStream,
     decoder: &mut Decoder,
     pred: F,
     timeout: Duration,
@@ -107,10 +107,10 @@ fn read_data_until<F: Fn(&[u8]) -> bool>(
     }
 }
 
-fn connect_with_retry(path: &Path) -> UnixStream {
+fn connect_with_retry(path: &Path) -> LocalStream {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        match UnixStream::connect(path) {
+        match transport::connect(path) {
             Ok(s) => return s,
             Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
             Err(e) => panic!("could not connect to daemon socket: {e}"),
@@ -118,7 +118,7 @@ fn connect_with_retry(path: &Path) -> UnixStream {
     }
 }
 
-fn send(stream: &mut UnixStream, frame: &Frame) {
+fn send(stream: &mut LocalStream, frame: &Frame) {
     stream.write_all(&proto::encode(frame)).unwrap();
 }
 
@@ -155,7 +155,7 @@ fn prepare_trapped_agent(manager: &SessionManager, state_root: &Path, name: &str
 /// Pull frames from `stream` (via `decoder`) until `pred` matches one, or
 /// panic after `timeout`.
 fn read_frame_until<F: Fn(&Frame) -> bool>(
-    stream: &mut UnixStream,
+    stream: &mut LocalStream,
     decoder: &mut Decoder,
     pred: F,
     timeout: Duration,
@@ -252,7 +252,7 @@ fn disconnecting_client_releases_its_subscription() {
     let socket_path = dir.path().join("amberd.sock");
 
     let manager = Arc::new(SessionManager::new(&root).unwrap());
-    let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+    let listener = transport::bind(&socket_path).unwrap();
     let daemon = Daemon::new(Arc::clone(&manager), std::sync::Arc::new(Watchers::new()));
     thread::spawn(move || {
         let _ = daemon.serve(listener);
@@ -296,7 +296,7 @@ fn reattach_replaces_subscription_not_stacks_it() {
     let socket_path = dir.path().join("amberd.sock");
 
     let manager = Arc::new(SessionManager::new(&root).unwrap());
-    let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+    let listener = transport::bind(&socket_path).unwrap();
     let daemon = Daemon::new(Arc::clone(&manager), std::sync::Arc::new(Watchers::new()));
     thread::spawn(move || {
         let _ = daemon.serve(listener);

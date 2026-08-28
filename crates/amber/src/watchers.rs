@@ -23,7 +23,7 @@
 //! - The forwarder writes with a bounded [`WRITE_TIMEOUT`] (`SO_SNDTIMEO`).
 //!   On timeout/error it **shuts the socket down** and exits. Shutdown
 //!   matters twice over: (1) the watcher's write half is an
-//!   `Arc<Mutex<UnixStream>>` SHARED with that connection's control-reply
+//!   `Arc<Mutex<LocalWriter>>` SHARED with that connection's control-reply
 //!   writes (daemon.rs), so the forwarder may hold that mutex only for a
 //!   bounded time — after the timeout the socket is dead and every later
 //!   write on it fails fast instead of blocking; (2) a timed-out write
@@ -43,8 +43,6 @@
 //! replays. So every hold of the shared writer is bounded, and no watcher can
 //! block the broadcast caller.
 
-use std::net::Shutdown;
-use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, Weak};
@@ -52,6 +50,7 @@ use std::thread;
 use std::time::Duration;
 
 use amber_core::proto::{self, ControlMsg, Frame};
+use crate::transport::LocalWriter;
 
 /// Bounded per-watcher event queue depth. SessionsChanged events are
 /// low-rate; a watcher this far behind is wedged, not merely slow.
@@ -101,13 +100,13 @@ impl Watchers {
     /// Register a connection's shared write half as a watcher, spawning its
     /// dedicated forwarder thread. Holds only a `Weak` to the writer, so a
     /// vanished connection is pruned automatically.
-    pub fn register(&self, writer: &Arc<Mutex<UnixStream>>) {
+    pub fn register(&self, writer: &Arc<Mutex<LocalWriter>>) {
         self.register_capability(writer, true, None);
     }
 
     /// Opt a connection in to versioned memory-pressure controls without
     /// changing what legacy `WatchSessions` means.
-    pub fn register_pressure(&self, writer: &Arc<Mutex<UnixStream>>, version: u16) {
+    pub fn register_pressure(&self, writer: &Arc<Mutex<LocalWriter>>, version: u16) {
         self.register_capability(writer, false, Some(version));
     }
 
@@ -117,7 +116,7 @@ impl Watchers {
     /// disk work.
     pub fn register_sessions(
         &self,
-        writer: &Arc<Mutex<UnixStream>>,
+        writer: &Arc<Mutex<LocalWriter>>,
         snapshot: impl FnOnce() -> Vec<amber_core::proto::SessionInfo>,
     ) {
         let writer_key = Arc::as_ptr(writer) as usize;
@@ -173,7 +172,7 @@ impl Watchers {
 
     fn register_capability(
         &self,
-        writer: &Arc<Mutex<UnixStream>>,
+        writer: &Arc<Mutex<LocalWriter>>,
         session_events: bool,
         pressure_version: Option<u16>,
     ) {
@@ -256,7 +255,7 @@ impl Watchers {
 fn forward(
     id: u64,
     rx: Receiver<QueuedFrame>,
-    weak: Weak<Mutex<UnixStream>>,
+    weak: Weak<Mutex<LocalWriter>>,
     entries: Arc<Mutex<Vec<Entry>>>,
 ) {
     let queue_closed = loop {
@@ -299,15 +298,15 @@ fn forward(
     entries.lock().unwrap().retain(|e| e.id != id);
 }
 
-fn shutdown_writer(weak: &Weak<Mutex<UnixStream>>) {
+fn shutdown_writer(weak: &Weak<Mutex<LocalWriter>>) {
     let Some(writer) = weak.upgrade() else {
         return;
     };
-    let s = writer.lock().unwrap();
-    let _ = s.shutdown(Shutdown::Both);
+    let mut s = writer.lock().unwrap();
+    let _ = s.shutdown();
 }
 
-fn write_frame(weak: &Weak<Mutex<UnixStream>>, frame: &[u8]) -> std::io::Result<()> {
+fn write_frame(weak: &Weak<Mutex<LocalWriter>>, frame: &[u8]) -> std::io::Result<()> {
     // Connection dropped its writer: nothing to write to, just exit.
     let Some(writer) = weak.upgrade() else {
         return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer dropped"));
@@ -323,29 +322,36 @@ fn write_frame(weak: &Weak<Mutex<UnixStream>>, frame: &[u8]) -> std::io::Result<
     let prev = s.write_timeout().ok().flatten();
     let res = s
         .set_write_timeout(Some(WRITE_TIMEOUT))
-        .and_then(|()| crate::daemon::write_bounded(&mut s, frame, WRITE_TIMEOUT));
+        .and_then(|()| crate::daemon::write_bounded(&mut *s, frame, WRITE_TIMEOUT));
     let _ = s.set_write_timeout(prev);
     if res.is_err() {
         // Wedged (timeout) or dead. A timed-out write may have left a partial
         // frame on the stream, so it can no longer carry a reply safely.
-        let _ = s.shutdown(Shutdown::Both);
+        let _ = s.shutdown();
     }
     res
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use amber_core::proto::{Decoder, SessionInfo};
+    use crate::transport::{self, LocalStream};
     use std::io::{Read, Write};
     use std::time::Duration;
 
-    fn read_one(stream: &mut UnixStream) -> Option<Frame> {
+    fn pair() -> (LocalStream, LocalWriter) {
+        let (client, server) = transport::test_pair().unwrap();
+        let (_, writer) = server.into_split().unwrap();
+        (client, writer)
+    }
+
+    fn read_one(stream: &mut LocalStream) -> Option<Frame> {
         let mut dec = Decoder::new();
         read_next(stream, &mut dec)
     }
 
-    fn read_next(stream: &mut UnixStream, dec: &mut Decoder) -> Option<Frame> {
+    fn read_next(stream: &mut LocalStream, dec: &mut Decoder) -> Option<Frame> {
         stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let mut buf = [0u8; 4096];
         loop {
@@ -366,7 +372,7 @@ mod tests {
         // must queue behind the initial full set, not overtake it on the
         // forwarder and make the client overwrite a newer state as stale.
         let watchers = Arc::new(Watchers::new());
-        let (mut client, server) = UnixStream::pair().unwrap();
+        let (mut client, server) = pair();
         let writer = Arc::new(Mutex::new(server));
         let (snapshot_started_tx, snapshot_started_rx) = std::sync::mpsc::channel();
         let (finish_snapshot_tx, finish_snapshot_rx) = std::sync::mpsc::channel();
@@ -414,7 +420,7 @@ mod tests {
     #[test]
     fn pressure_watcher_snapshot_precedes_delta_queued_while_it_is_built() {
         let watchers = Arc::new(Watchers::new());
-        let (mut client, server) = UnixStream::pair().unwrap();
+        let (mut client, server) = pair();
         let writer = Arc::new(Mutex::new(server));
         watchers.register_pressure(&writer, 1);
         let (snapshot_started_tx, snapshot_started_rx) = std::sync::mpsc::channel();
@@ -449,8 +455,8 @@ mod tests {
         // Sending ResourcePressure to a version-1 strict decoder would make
         // it disconnect. Version 2 explicitly opts into the additive event.
         let watchers = Watchers::new();
-        let (mut version_one_client, version_one_server) = UnixStream::pair().unwrap();
-        let (mut version_two_client, version_two_server) = UnixStream::pair().unwrap();
+        let (mut version_one_client, version_one_server) = pair();
+        let (mut version_two_client, version_two_server) = pair();
         let version_one = Arc::new(Mutex::new(version_one_server));
         let version_two = Arc::new(Mutex::new(version_two_server));
         watchers.register_pressure(&version_one, 1);
@@ -495,7 +501,7 @@ mod tests {
     #[test]
     fn repeat_session_watch_snapshot_precedes_later_delta() {
         let watchers = Arc::new(Watchers::new());
-        let (mut client, server) = UnixStream::pair().unwrap();
+        let (mut client, server) = pair();
         let writer = Arc::new(Mutex::new(server));
         watchers.register(&writer);
         let (snapshot_started_tx, snapshot_started_rx) = std::sync::mpsc::channel();
@@ -528,8 +534,8 @@ mod tests {
     #[test]
     fn broadcast_reaches_live_watchers_and_prunes_dropped_ones() {
         let watchers = Watchers::new();
-        let (mut client_a, server_a) = UnixStream::pair().unwrap();
-        let (mut client_b, server_b) = UnixStream::pair().unwrap();
+        let (mut client_a, server_a) = pair();
+        let (mut client_b, server_b) = pair();
         let wa = Arc::new(Mutex::new(server_a));
         let wb = Arc::new(Mutex::new(server_b));
         watchers.register(&wa);
@@ -556,12 +562,11 @@ mod tests {
 
     /// Fill `stream`'s send buffer to saturation (peer not reading), so the
     /// next blocking write on it wedges. Restores blocking mode afterward.
-    fn saturate(stream: &UnixStream) {
+    fn saturate(stream: &mut LocalWriter) {
         stream.set_nonblocking(true).unwrap();
         let junk = [0u8; 8192];
-        let mut w = stream;
         loop {
-            match w.write(&junk) {
+            match stream.write(&junk) {
                 Ok(_) => continue,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(e) => panic!("saturating write failed: {e}"),
@@ -583,7 +588,7 @@ mod tests {
         Ok(())
     }
 
-    fn assert_eof(stream: &mut UnixStream) {
+    fn assert_eof(stream: &mut LocalStream) {
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
@@ -602,7 +607,7 @@ mod tests {
         // A full queue while the initial barrier is held drops a delta. The
         // client must be disconnected, not left subscribed without that delta.
         let watchers = Arc::new(Watchers::new());
-        let (mut client, server) = UnixStream::pair().unwrap();
+        let (mut client, server) = pair();
         let writer = Arc::new(Mutex::new(server));
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (finish_tx, finish_rx) = std::sync::mpsc::channel();
@@ -640,7 +645,7 @@ mod tests {
         // fit behind the held snapshot, the client must reconnect for a full
         // resync rather than remain connected with no watcher entry.
         let watchers = Arc::new(Watchers::new());
-        let (mut client, server) = UnixStream::pair().unwrap();
+        let (mut client, server) = pair();
         let writer = Arc::new(Mutex::new(server));
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (finish_tx, finish_rx) = std::sync::mpsc::channel();
@@ -685,9 +690,9 @@ mod tests {
         // watcher. Registered FIRST so a blocking implementation wedges
         // before ever reaching the healthy one.
         let watchers = Arc::new(Watchers::new());
-        let (_wedged_peer, wedged_server) = UnixStream::pair().unwrap();
-        let (mut healthy_peer, healthy_server) = UnixStream::pair().unwrap();
-        saturate(&wedged_server);
+        let (_wedged_peer, mut wedged_server) = pair();
+        let (mut healthy_peer, healthy_server) = pair();
+        saturate(&mut wedged_server);
         let wedged = Arc::new(Mutex::new(wedged_server));
         let healthy = Arc::new(Mutex::new(healthy_server));
         watchers.register(&wedged);
@@ -722,9 +727,9 @@ mod tests {
         // wedged watcher's subscription is acceptable; a permanently blocked
         // daemon thread is not. Assert daemon-side state (registry count).
         let watchers = Arc::new(Watchers::new());
-        let (_wedged_peer, wedged_server) = UnixStream::pair().unwrap();
-        let (mut healthy_peer, healthy_server) = UnixStream::pair().unwrap();
-        saturate(&wedged_server);
+        let (_wedged_peer, mut wedged_server) = pair();
+        let (mut healthy_peer, healthy_server) = pair();
+        saturate(&mut wedged_server);
         let wedged = Arc::new(Mutex::new(wedged_server));
         let healthy = Arc::new(Mutex::new(healthy_server));
         watchers.register_pressure(&wedged, 1);
@@ -758,8 +763,8 @@ mod tests {
         // thread on that mutex only briefly (<= one WRITE_TIMEOUT), never
         // block it forever.
         let watchers = Arc::new(Watchers::new());
-        let (_peer, server) = UnixStream::pair().unwrap();
-        saturate(&server);
+        let (_peer, mut server) = pair();
+        saturate(&mut server);
         let wedged = Arc::new(Mutex::new(server));
         watchers.register(&wedged);
         watchers.broadcast(&ControlMsg::SessionsChanged { added: vec![], removed: vec![] });
@@ -783,7 +788,7 @@ mod tests {
     #[test]
     fn vanished_watcher_is_removed_before_reconnect_merges_capabilities() {
         let watchers = Watchers::new();
-        let (_old_peer, old_server) = UnixStream::pair().unwrap();
+        let (_old_peer, old_server) = pair();
         let old = Arc::new(Mutex::new(old_server));
         watchers.register(&old);
         drop(old);
@@ -798,7 +803,7 @@ mod tests {
         wait_until(Duration::from_secs(5), || watchers.watcher_count() == 0)
             .expect("vanished watcher left a stale registry entry");
 
-        let (mut peer, server) = UnixStream::pair().unwrap();
+        let (mut peer, server) = pair();
         let reconnect = Arc::new(Mutex::new(server));
         watchers.register(&reconnect);
         watchers.register_pressure(&reconnect, 1);

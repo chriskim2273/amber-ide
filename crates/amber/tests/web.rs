@@ -3,12 +3,12 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
-use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use amber::daemon::{prepare_socket, Daemon};
 use amber::manager::SessionManager;
+use amber::transport;
 use amber::watchers::Watchers;
 use amber::web;
 use amber_core::proto::{self, ControlMsg, Frame};
@@ -121,7 +121,7 @@ impl Fixture {
 
     fn create_named(&self, name: &str) -> String {
         let name = name.to_string();
-        let mut s = UnixStream::connect(&self.sock).unwrap();
+        let mut s = transport::connect(&self.sock).unwrap();
         s.write_all(&proto::encode(&Frame::Control(ControlMsg::Create {
             name: name.clone(),
             cwd: self.dir.path().to_string_lossy().into_owned(),
@@ -259,8 +259,8 @@ fn good_token_yields_a_cookie_that_lists_daemon_sessions_with_real_geometry() {
 
     // ...and it must TRACK a daemon-side resize (the desktop app moving a
     // divider), not report a stale snapshot.
-    let s = UnixStream::connect(&f.sock).unwrap();
-    (&s).write_all(&proto::encode(&Frame::Control(ControlMsg::Resize {
+    let mut s = transport::connect(&f.sock).unwrap();
+    s.write_all(&proto::encode(&Frame::Control(ControlMsg::Resize {
         name: name.clone(),
         cols: cols as u16 + 17,
         rows: rows as u16 + 3,
