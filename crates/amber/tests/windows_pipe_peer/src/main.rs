@@ -52,8 +52,9 @@ fn main() -> std::io::Result<()> {
     println!("QUEUED");
     std::io::stdout().flush()?;
 
-    // The Node probe drains the queued write, leaves its reader flowing, and
-    // sends this one-byte barrier over the first client before teardown.
+    // Node acknowledges that it drained the queued write while keeping a
+    // persistent data listener installed. Node cannot expose the exact
+    // underlying ReadFile entry point; the Rust transport unit test does.
     let mut barrier = [0_u8; 1];
     first.read_exact(&mut barrier)?;
     writer.shutdown()?;

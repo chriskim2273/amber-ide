@@ -58,10 +58,12 @@ fn local_writer_shutdown_releases_an_already_blocked_peer() {
 }
 
 /// Windows CI proves that the boundary supports two independently connected
-/// clients and that a server-side writer shutdown releases a stalled peer.
+/// clients and that a client which consumed queued output observes a forced
+/// server close. The exact read-loop entry proof lives beside `Pipe`'s
+/// test-only hook in `transport.rs`.
 #[cfg(windows)]
 #[test]
-fn named_pipe_accepts_two_clients_and_releases_a_stalled_peer() {
+fn named_pipe_accepts_two_clients_and_forces_a_live_peer_closed() {
     use std::io::{Read, Write};
     use std::path::PathBuf;
     use std::sync::mpsc;
@@ -78,7 +80,7 @@ fn named_pipe_accepts_two_clients_and_releases_a_stalled_peer() {
     let endpoint = PathBuf::from(format!("amber-windows-pipe-{stamp}"));
     let listener = transport::bind(&endpoint).unwrap();
     let (write_queued, queued) = mpsc::channel();
-    let (reader_pending, reader_started) = mpsc::channel();
+    let (reader_ready, reader_started) = mpsc::channel();
     let (permit_shutdown, wait_for_shutdown) = mpsc::channel();
     let server = thread::spawn(move || {
         let mut first = listener.accept().unwrap();
@@ -112,19 +114,20 @@ fn named_pipe_accepts_two_clients_and_releases_a_stalled_peer() {
     let (released, result) = mpsc::channel();
     thread::spawn(move || {
         let mut stalled = stalled;
-        let mut bytes = [0_u8; 64];
-        let queued = stalled.read(&mut bytes).unwrap();
-        assert_eq!(&bytes[..queued], b"queued-before-forced-close");
-        // The first read consumed the earlier output. This signal precedes the
-        // second read, which must remain blocked until server shutdown.
-        reader_pending.send(()).unwrap();
-        released.send(stalled.read(&mut bytes)).unwrap();
+        let mut queued = [0_u8; 26];
+        stalled.read_exact(&mut queued).unwrap();
+        assert_eq!(&queued, b"queued-before-forced-close");
+        // This integration-level signal proves the queued output was consumed;
+        // it intentionally does not claim the next ReadFile attempt has begun.
+        reader_ready.send(()).unwrap();
+        let mut byte = [0_u8; 1];
+        released.send(stalled.read(&mut byte)).unwrap();
     });
-    reader_pending.recv().unwrap();
+    reader_ready.recv().unwrap();
     thread::sleep(Duration::from_millis(20));
     assert!(
         result.try_recv().is_err(),
-        "reader must be pending after it consumed queued output"
+        "live reader must not finish before server shutdown"
     );
     permit_shutdown.send(()).unwrap();
     server.join().unwrap();
