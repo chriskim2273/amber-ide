@@ -340,7 +340,26 @@ const retainLivePeerUntilExit = (child) => {
   })
 }
 const describeError = (error) => {
-  if (error instanceof Error) return error.message
+  let isError = false
+  try {
+    isError = error instanceof Error
+  } catch {
+    // A Proxy can throw while Error checks walk its prototype chain.
+  }
+  if (isError) {
+    try {
+      const stack = error.stack
+      if (typeof stack === 'string' && stack.length > 0) return stack
+    } catch {
+      // Continue through the remaining representations.
+    }
+    try {
+      const message = error.message
+      if (typeof message === 'string' && message.length > 0) return message
+    } catch {
+      // Continue to String below.
+    }
+  }
   try {
     return String(error)
   } catch {
@@ -362,24 +381,27 @@ const writeStream = (stream, message) => new Promise((resolve, reject) => {
   }
 })
 const reportErrorSafely = async (message, writeError, errorStream, streamErrors) => {
-  let writeFailure
   try {
-    await writeError(message)
-  } catch (error) {
-    writeFailure = error
-  }
+    let writeFailure
+    try {
+      await writeError(message)
+    } catch (error) {
+      writeFailure = describeError(error)
+    }
 
-  if (writeFailure === undefined && streamErrors.length === 0) return
-  const failures = [...streamErrors]
-  if (writeFailure !== undefined) failures.push(writeFailure)
-  const details = failures.map(describeError).join('; ')
-  try {
-    await writeStream(
-      errorStream,
-      `${message}[nonfatal error while reporting the failure: ${details}]\n`,
-    )
+    if (writeFailure === undefined && streamErrors.length === 0) return
+    const failures = [...streamErrors]
+    if (writeFailure !== undefined) failures.push(writeFailure)
+    try {
+      await writeStream(
+        errorStream,
+        `${message}[nonfatal error while reporting the failure: ${failures.join('; ')}]\n`,
+      )
+    } catch {
+      // Reporting must never release or detach a peer that cleanup left live.
+    }
   } catch {
-    // Reporting must never release or detach a peer that cleanup left live.
+    // Keep this boundary no-throw even if an injected reporting dependency is hostile.
   }
 }
 const waitForChildExit = (child, ms, signal) => new Promise((resolve, reject) => {
@@ -545,20 +567,43 @@ export const runEntrypoint = async ({
   try {
     await execute()
   } catch (error) {
-    processState.exitCode = 1
-    const message = error instanceof Error ? (error.stack ?? error.message) : String(error)
-    // Install the child lease before reporting the cleanup failure: stderr can
-    // throw synchronously, reject asynchronously, or emit an error event.
+    // Install the child lease before inspecting or formatting the thrown value.
     const peerLease = retainLivePeerUntilExit(getLivePeer())
     const streamErrors = []
-    const onStreamError = (streamError) => { streamErrors.push(streamError) }
-    errorStream?.on?.('error', onStreamError)
+    const onStreamError = (streamError) => {
+      try {
+        streamErrors.push(describeError(streamError))
+      } catch {
+        // No stream error, including a hostile thrown value, escapes this callback.
+      }
+    }
+    let streamGuardInstalled = false
     try {
-      await reportErrorSafely(`${message}\n`, writeError, errorStream, streamErrors)
-      await peerLease
+      processState.exitCode = 1
+      try {
+        errorStream?.on?.('error', onStreamError)
+        streamGuardInstalled = true
+      } catch (streamError) {
+        onStreamError(streamError)
+      }
+      await reportErrorSafely(
+        `${describeError(error)}\n`,
+        writeError,
+        errorStream,
+        streamErrors,
+      )
     } finally {
-      errorStream?.off?.('error', onStreamError)
-      releasePeerMonitor()
+      try {
+        await peerLease
+      } finally {
+        try {
+          if (streamGuardInstalled) errorStream?.off?.('error', onStreamError)
+        } catch {
+          // Listener cleanup must not skip releasing the persistent line monitor.
+        } finally {
+          releasePeerMonitor()
+        }
+      }
     }
   }
 }

@@ -725,24 +725,36 @@ pending with live-child listeners and intact streams, then releases only after
 a deterministic synthetic exit. Native Windows runtime execution remains
 unavailable on this Linux host and is still reported as unrun.
 
-## Closeout writer-failure correction
+## Final defensive reporting correction
 
-Failure reporting now happens only after `retainLivePeerUntilExit` has
-synchronously installed the directly owned peer's `error` and `exit` listeners.
-The entrypoint also installs an `error` listener on stderr before invoking the
-writer, awaits a promise-returning writer, and catches both synchronous throws
-and asynchronous rejections. When the primary writer fails, it attempts a
-guarded nonfatal fallback containing the original cleanup failure and the
-reporting failure. A fallback write failure is also contained; it cannot settle
-the entrypoint or release the child.
+`retainLivePeerUntilExit` is now the first catch-path operation, before the
+thrown value is inspected or formatted. Error formatting separately guards the
+`instanceof Error` check, `stack` getter, `message` getter, and `String(value)`;
+an Error-shaped hostile value whose `stack`, `message`, and `toString` all throw
+is reported as `<unprintable error>` without escaping the reporter.
+
+The entrypoint installs an `error` listener on stderr before invoking the
+writer. That callback performs its own guarded conversion so a hostile emitted
+value cannot escape the event handler. The primary writer is awaited and both
+synchronous throws and asynchronous rejections are contained. When it fails,
+the harness attempts a no-throw nonfatal fallback containing the original
+cleanup failure and the safely formatted reporting failures. A fallback write
+failure is also contained.
 
 The peer lease, stderr guard, child streams, and persistent line monitor remain
-referenced until the peer actually emits `exit`. Only then are the child streams
-destroyed, the lease and stderr listeners removed, and the line monitor
-released. The new deterministic regression injects both a stderr `error` event
-and a rejected writer promise. It observes the lease before the writer runs,
-the nonfatal fallback, the still-pending entrypoint and intact streams, and the
-final release only after a synthetic child exit.
+referenced until the peer actually emits `exit`. A `finally` path awaits that
+lease regardless of any reporting failure, and nested cleanup ensures stderr
+listener removal cannot skip releasing the line monitor. Only after observed
+exit are the child streams destroyed and the listener/monitor leases released.
+Both failure tests assert `processState.exitCode === 1` while the entrypoint
+remains pending.
+
+The hostile-value regression verifies that the peer's listeners are already
+installed when the writer receives `<unprintable error>`, then verifies release
+only after a synthetic child exit. The writer-failure regression emits a second
+hostile value from stderr, rejects the writer promise, observes the guarded
+fallback, and likewise proves that the entrypoint, streams, stderr guard, and
+line monitor remain live until exit.
 
 Fresh platform-neutral verification on Linux:
 
@@ -755,7 +767,7 @@ exit 0
 
 $ node --unhandled-rejections=strict --test \
     app/test/windows-pipe-lifecycle.test.mjs
-tests 17; pass 17; fail 0
+tests 18; pass 18; fail 0
 
 $ env -u AMBER_WINDOWS_PIPE_PEER node --unhandled-rejections=strict \
     app/test/windows-pipe.mjs

@@ -21,6 +21,12 @@ import {
   terminateChild,
 } from './windows-pipe.mjs'
 
+const hostileThrownValue = () => Object.create(Error.prototype, {
+  stack: { get() { throw new Error('stack getter must stay contained') } },
+  message: { get() { throw new Error('message getter must stay contained') } },
+  toString: { value() { throw new Error('toString must stay contained') } },
+})
+
 test('line monitor delivers peer records and removes listeners on dispose', async () => {
   const child = spawn(process.execPath, ['-e', "console.log('READY')"], {
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -349,6 +355,59 @@ test('entrypoint reports cleanup timeout and remains pending until the live peer
   assert.equal(monitorReleased, true)
 })
 
+test('entrypoint retains a live peer before formatting a hostile thrown value', async () => {
+  const child = new EventEmitter()
+  child.pid = 4499
+  child.exitCode = null
+  child.signalCode = null
+  child.stdout = new PassThrough()
+  child.stderr = new PassThrough()
+  child.stdio = [null, child.stdout, child.stderr]
+  const processState = { exitCode: undefined }
+  let reported = ''
+  let leaseHeldDuringWrite = false
+  let finished = false
+  let rejected
+  let monitorReleased = false
+
+  const entrypoint = runEntrypoint({
+    execute: async () => { throw hostileThrownValue() },
+    getLivePeer: () => child,
+    processState,
+    writeError: (message) => {
+      leaseHeldDuringWrite = child.listenerCount('exit') === 1
+      reported += message
+    },
+    releasePeerMonitor: () => { monitorReleased = true },
+  }).then(
+    () => { finished = true },
+    (error) => { finished = true; rejected = error },
+  )
+
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(processState.exitCode, 1)
+  assert.equal(leaseHeldDuringWrite, true)
+  assert.match(reported, /<unprintable error>/)
+  assert.equal(finished, false)
+  assert.equal(rejected, undefined)
+  assert.equal(child.listenerCount('error'), 1)
+  assert.equal(child.listenerCount('exit'), 1)
+  assert.equal(child.stdout.destroyed, false)
+  assert.equal(child.stderr.destroyed, false)
+  assert.equal(monitorReleased, false)
+
+  child.exitCode = 1
+  child.emit('exit', 1, null)
+  await entrypoint
+  assert.equal(finished, true)
+  assert.equal(rejected, undefined)
+  assert.equal(child.listenerCount('error'), 0)
+  assert.equal(child.listenerCount('exit'), 0)
+  assert.equal(child.stdout.destroyed, true)
+  assert.equal(child.stderr.destroyed, true)
+  assert.equal(monitorReleased, true)
+})
+
 test('entrypoint retains a live peer when the error writer itself fails', async () => {
   const child = new EventEmitter()
   child.pid = 4545
@@ -362,8 +421,9 @@ test('entrypoint retains a live peer when the error writer itself fails', async 
   errorStream.setEncoding('utf8')
   errorStream.on('data', (chunk) => { fallback += chunk })
   const cleanupError = new Error('cleanup left peer live')
-  const streamError = new Error('stderr emitted an error')
+  const streamError = hostileThrownValue()
   const writerError = new Error('error writer rejected')
+  const processState = { exitCode: undefined }
   let leaseHeldDuringWrite = false
   let finished = false
   let rejected
@@ -372,7 +432,7 @@ test('entrypoint retains a live peer when the error writer itself fails', async 
   const entrypoint = runEntrypoint({
     execute: async () => { throw cleanupError },
     getLivePeer: () => child,
-    processState: { exitCode: undefined },
+    processState,
     errorStream,
     writeError: () => {
       leaseHeldDuringWrite = child.listenerCount('exit') === 1
@@ -386,6 +446,7 @@ test('entrypoint retains a live peer when the error writer itself fails', async 
   )
 
   await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(processState.exitCode, 1)
   assert.equal(leaseHeldDuringWrite, true)
   assert.equal(finished, false)
   assert.equal(rejected, undefined)
@@ -394,6 +455,7 @@ test('entrypoint retains a live peer when the error writer itself fails', async 
   assert.equal(errorStream.listenerCount('error'), 1)
   assert.match(fallback, /cleanup left peer live/)
   assert.match(fallback, /nonfatal.*error writer rejected/i)
+  assert.match(fallback, /<unprintable error>/)
   assert.equal(child.stdout.destroyed, false)
   assert.equal(child.stderr.destroyed, false)
   assert.equal(monitorReleased, false)
