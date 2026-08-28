@@ -68,8 +68,7 @@ pub fn validate_session_name(name: &str) -> anyhow::Result<()> {
     if name.is_empty() || name.len() > 200 || name.bytes().any(|b| !matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.')) {
         anyhow::bail!("invalid session name: {name:?}");
     }
-    #[cfg(windows)]
-    if name.ends_with(['.', ' ']) || reserved_device_name(name) { anyhow::bail!("invalid Windows session name: {name:?}"); }
+    if name.ends_with(['.', ' ']) || reserved_device_name(name) { anyhow::bail!("invalid portable session name: {name:?}"); }
     Ok(())
 }
 ```
@@ -130,7 +129,7 @@ fn pipe_name(path: &Path) -> io::Result<Name<'static>> {
 }
 ```
 
-Implement Windows listener creation with first-instance ownership and a user-scoped security descriptor. Keep `SO_SNDTIMEO` only on Unix; Windows eviction closes the writer handle after bounded queue grace.
+First run the Windows CI spike against `interprocess`: it must prove `GenericNamespaced` works with Node and exposes user-scoped DACL plus first-instance ownership. If either ownership property is unavailable, implement only the Windows listener with raw Win32 `CreateNamedPipeW` and `SECURITY_ATTRIBUTES`; retain the same `LocalListener` API and continue using the standard wrapper only where it preserves those properties. Keep `SO_SNDTIMEO` only on Unix; Windows eviction closes the writer handle after bounded queue grace.
 
 - [ ] **Step 4: Verify transport gates**
 
@@ -157,6 +156,7 @@ git commit -m "feat(win): add named-pipe transport boundary"
 - Consumes Task 2 `LocalStream` and split halves.
 - Produces no protocol changes; all call sites use `transport::connect` and `transport::bind`.
 - Adds `Daemon::serve_one_for_test(LocalStream) -> anyhow::Result<()>` under `#[cfg(test)]` so the transport boundary has a real daemon-level test.
+- Extracts `pub fn daemon_main(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Result<()>` from the CLI-only entrypoint for Task 5's `amberd` binary.
 
 - [ ] **Step 1: Write failing compile-gate test for platform-neutral daemon connection**
 
