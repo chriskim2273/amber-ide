@@ -59,6 +59,22 @@ describe('reloadAgentCommand', () => {
     expect(command).not.toContain('--continue')
   })
 
+  it('resumes Hermes by its exact recorded id', () => {
+    const id = '20260827_091523_a1b2c3'
+    const command = reloadAgentCommand('hermes', id)
+    expect(command).toBe(`hermes --yolo --resume '${id}'`)
+    expect(command).not.toContain('--continue')
+  })
+
+  it('starts a fresh Hermes session when no id is recorded', () => {
+    expect(reloadAgentCommand('hermes', null)).toBe('hermes --yolo')
+  })
+
+  it.each(['', '   ', 'latest', '20260827_091523_zzzzzz', '20260827-091523-a1b2c3', 'line\nbreak'])
+  ('rejects an invalid Hermes id %j', (id) => {
+    expect(reloadAgentCommand('hermes', id)).toBeNull()
+  })
+
   it.each(['', '   ', 'latest', 'ses_', 'ses_has-dash', 'line\nbreak'])
   ('rejects an invalid OpenCode id %j', (id) => {
     expect(reloadAgentCommand('opencode', id)).toBeNull()

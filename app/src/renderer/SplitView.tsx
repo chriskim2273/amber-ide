@@ -24,12 +24,12 @@ export interface PaneMeta { kind: string; title: string; cwd: string; runState?:
 /** Which agent binary a pane's recorded conversation id belongs to. Explicit
  *  agent kinds map to themselves; a shell pane with a recorded id got it from a
  *  hand-started claude (the global SessionStart hook), so it stays claude. */
-export function agentOf(kind: string): 'claude' | 'grok' | 'codex' | 'opencode' {
-  if (kind === 'grok' || kind === 'codex' || kind === 'opencode') return kind
+export function agentOf(kind: string): 'claude' | 'grok' | 'codex' | 'opencode' | 'hermes' {
+  if (kind === 'grok' || kind === 'codex' || kind === 'opencode' || kind === 'hermes') return kind
   return 'claude'
 }
 
-export type PaneKind = 'shell' | 'claude' | 'grok' | 'codex' | 'opencode' | 'browser' | 'editor'
+export type PaneKind = 'shell' | 'claude' | 'grok' | 'codex' | 'opencode' | 'hermes' | 'browser' | 'editor'
 
 // Compact memory label from resident KiB: "0" hidden by the caller; MB up to
 // ~1 GB, then GB with one decimal. Display-only.
@@ -823,6 +823,7 @@ export function SplitView(props: {
                   <div className="reload-claude-sub">Clears the current line, then runs <code>{
                     meta.kind === 'codex' ? 'codex resume'
                       : meta.kind === 'opencode' ? 'opencode -s'
+                        : meta.kind === 'hermes' ? 'hermes --resume'
                         : `${agentOf(meta.kind)} --resume`
                   }</code>.</div>
                   <div className="reload-claude-actions">
@@ -834,6 +835,7 @@ export function SplitView(props: {
                         meta.kind === 'grok' ? "resumes the most recent conversation in this folder"
                           : meta.kind === 'codex' ? "opens codex's session picker"
                             : meta.kind === 'opencode' ? "starts a fresh OpenCode session"
+                              : meta.kind === 'hermes' ? "starts a fresh Hermes session"
                               : "opens claude's own session list"
                       }>
                       Pick session…
@@ -889,7 +891,7 @@ export function SplitView(props: {
           return (
             <div className="ctx-menu" role="menu" aria-label={dir === 'h' ? 'split right as' : 'split down as'}
               style={{ left: x, top: y }} onMouseDown={(e) => e.stopPropagation()}>
-              {(['shell', 'claude', 'grok', 'codex', 'opencode', 'browser', 'editor'] as const).map((k) => (
+              {(['shell', 'claude', 'grok', 'codex', 'opencode', 'hermes', 'browser', 'editor'] as const).map((k) => (
                 <button key={k} className="ctx-item" role="menuitem"
                   onClick={run(() => props.onSplit(paneId, dir, k))}>{k}</button>
               ))}

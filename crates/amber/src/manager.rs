@@ -410,7 +410,8 @@ impl SessionManager {
             SessionKind::Claude
             | SessionKind::Grok
             | SessionKind::Codex
-            | SessionKind::OpenCode => {
+            | SessionKind::OpenCode
+            | SessionKind::Hermes => {
                 let exe = resolve_current_exe()?;
                 // The kind is passed EXPLICITLY, not looked up from the store:
                 // `create` spawns the pty before it persists the metadata (the
@@ -460,7 +461,8 @@ impl SessionManager {
             SessionKind::Claude
             | SessionKind::Grok
             | SessionKind::Codex
-            | SessionKind::OpenCode => {
+            | SessionKind::OpenCode
+            | SessionKind::Hermes => {
                 if let Some(sock) = &self.socket {
                     cmd.env("AMBER_SOCK", sock.to_string_lossy().to_string());
                 }

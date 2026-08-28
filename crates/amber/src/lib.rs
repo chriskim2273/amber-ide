@@ -9,6 +9,7 @@ pub mod cgroup;
 pub mod daemon;
 pub mod grok;
 pub mod host_pressure;
+pub mod hermes;
 pub mod layout_cas;
 pub mod manager;
 pub mod memory_guardian;

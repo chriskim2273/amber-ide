@@ -13,7 +13,7 @@ use std::time::Duration;
 use amber_core::proto::{self, ControlMsg, Decoded, Decoder, Frame};
 use amber_core::state::{SessionKind, StateStore};
 
-use crate::{claude, codex, grok, opencode};
+use crate::{claude, codex, grok, hermes, opencode};
 
 /// Upper bound on one run-state report attempt. The ordered reporter retries a
 /// timed-out attempt without blocking the child-monitoring loop.
@@ -81,6 +81,8 @@ pub enum Agent {
     /// opencode, whose session id is recorded by a global plugin (`amber hook`)
     /// — Claude-shaped (`-s` continues; amber cannot assign an id on create).
     OpenCode,
+    /// Hermes Agent, whose session id is recorded by Amber's global plugin.
+    Hermes,
 }
 
 impl Agent {
@@ -90,6 +92,7 @@ impl Agent {
             Agent::Grok => "grok",
             Agent::Codex => "codex",
             Agent::OpenCode => "opencode",
+            Agent::Hermes => "hermes",
         }
     }
 }
@@ -173,6 +176,7 @@ pub fn supervise_agent(
             Agent::OpenCode => {
                 opencode::opencode_argv(&select_opencode_start(session_id, escalation))
             }
+            Agent::Hermes => hermes::hermes_argv(&select_hermes_start(session_id, escalation)),
         };
 
         // Spawn (not `.status()`) so the run is interruptible: a SIGUSR1-set
@@ -425,6 +429,13 @@ fn select_opencode_start(session_id: Option<&str>, escalation: u32) -> opencode:
             opencode::OpenCodeStart::Resume(id.to_string())
         }
         _ => opencode::OpenCodeStart::Fresh,
+    }
+}
+
+fn select_hermes_start(session_id: Option<&str>, escalation: u32) -> hermes::HermesStart {
+    match (session_id, escalation) {
+        (Some(id), 0) if hermes::is_session_id(id) => hermes::HermesStart::Resume(id.to_string()),
+        _ => hermes::HermesStart::Fresh,
     }
 }
 
@@ -703,6 +714,7 @@ pub fn run_session(
         k if k == SessionKind::Grok.as_str() => "grok",
         k if k == SessionKind::Codex.as_str() => "codex",
         k if k == SessionKind::OpenCode.as_str() => "opencode",
+        k if k == SessionKind::Hermes.as_str() => "hermes",
         _ => "claude",
     };
 
@@ -714,6 +726,7 @@ pub fn run_session(
         "grok" => cfg.grok_path.clone(),
         "codex" => cfg.codex_path.clone(),
         "opencode" => cfg.opencode_path.clone(),
+        "hermes" => cfg.hermes_path.clone(),
         _ => cfg.claude_path.clone(),
     };
     let agent_path = match cached.filter(|p| p.exists()) {
@@ -723,6 +736,7 @@ pub fn run_session(
                 "grok" => grok::resolve_grok(),
                 "codex" => codex::resolve_codex(),
                 "opencode" => opencode::resolve_opencode(),
+                "hermes" => hermes::resolve_hermes(),
                 _ => claude::resolve_claude(),
             };
             if let Some(p) = resolved.clone() {
@@ -730,6 +744,7 @@ pub fn run_session(
                     "grok" => cfg.grok_path = Some(p),
                     "codex" => cfg.codex_path = Some(p),
                     "opencode" => cfg.opencode_path = Some(p),
+                    "hermes" => cfg.hermes_path = Some(p),
                     _ => cfg.claude_path = Some(p),
                 }
                 store.save_config(&cfg)?;
@@ -765,6 +780,10 @@ pub fn run_session(
                 // global plugin records `session.created` via `amber hook`.
                 opencode::ensure_global_opencode_plugin();
                 Agent::OpenCode
+            }
+            "hermes" => {
+                hermes::ensure_global_hermes_plugin(&agent_path);
+                Agent::Hermes
             }
             _ => {
                 // A detached claude blocks forever on the interactive folder-trust
@@ -1289,6 +1308,23 @@ mod tests {
         assert_eq!(
             select_opencode_start(Some("ses_fd8f8accaffeTWUvgvTimbhECs"), 1),
             opencode::OpenCodeStart::Fresh
+        );
+    }
+
+    #[test]
+    fn hermes_resumes_an_exact_recorded_id_once() {
+        let id = "20260827_091523_a1b2c3";
+        assert_eq!(
+            select_hermes_start(Some(id), 0),
+            hermes::HermesStart::Resume(id.into())
+        );
+        assert_eq!(
+            select_hermes_start(Some(id), 1),
+            hermes::HermesStart::Fresh
+        );
+        assert_eq!(
+            select_hermes_start(Some("latest"), 0),
+            hermes::HermesStart::Fresh
         );
     }
 

@@ -11,7 +11,7 @@ export const WORKSPACE_VERSION = 1
 
 export interface WsPane {
   id: string // placeholder referenced by tree leaves (p0, p1…)
-  kind: string // 'shell' | 'claude' | 'grok' | 'codex' | 'opencode' | 'browser' | 'editor' (app-local kinds stored verbatim)
+  kind: string // 'shell' | 'claude' | 'grok' | 'codex' | 'opencode' | 'hermes' | 'browser' | 'editor' (app-local kinds stored verbatim)
   cwd: string
   ord: number
   frozenNote?: string // presence (incl. '') = frozen; the value is the note

@@ -152,7 +152,7 @@ export interface KindDot { cls: string; label: string }
 // the run_state vocabulary stays spelled `claude*` for all of them because it
 // names the supervision phase, not the binary.
 export function isAgentKind(kind: string): boolean {
-  return kind === 'claude' || kind === 'grok' || kind === 'codex' || kind === 'opencode'
+  return kind === 'claude' || kind === 'grok' || kind === 'codex' || kind === 'opencode' || kind === 'hermes'
 }
 
 // Daemon Focus is a recent-use hint, so only a real interaction in the active

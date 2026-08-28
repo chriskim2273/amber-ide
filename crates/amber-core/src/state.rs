@@ -3,8 +3,8 @@
 //! Layout under a root dir:
 //! ```text
 //! config.toml
-//! sessions/<name>.json     { name, cwd, kind: "shell"|"claude"|"grok"|"codex"|"opencode", updated }
-//! claude/<name>.json       { session_id, cwd, updated }   (grok/codex/opencode ids live here too)
+//! sessions/<name>.json     { name, cwd, kind: "shell"|"claude"|"grok"|"codex"|"opencode"|"hermes", updated }
+//! claude/<name>.json       { session_id, cwd, updated }   (grok/codex/opencode/hermes ids live here too)
 //! scrollback/<name>.bin     raw bytes
 //! ```
 //! All writes are atomic: write to a `.tmp` file in the same directory as the
@@ -28,6 +28,7 @@ pub enum SessionKind {
     Grok,
     Codex,
     OpenCode,
+    Hermes,
 }
 
 impl SessionKind {
@@ -40,7 +41,7 @@ impl SessionKind {
     pub fn is_agent(self) -> bool {
         matches!(
             self,
-            SessionKind::Claude | SessionKind::Grok | SessionKind::Codex | SessionKind::OpenCode
+            SessionKind::Claude | SessionKind::Grok | SessionKind::Codex | SessionKind::OpenCode | SessionKind::Hermes
         )
     }
 
@@ -52,6 +53,7 @@ impl SessionKind {
             SessionKind::Grok => "grok",
             SessionKind::Codex => "codex",
             SessionKind::OpenCode => "opencode",
+            SessionKind::Hermes => "hermes",
         }
     }
 }
@@ -114,6 +116,9 @@ pub struct Config {
     /// Resolved `opencode` binary. Defaulted for older configs.
     #[serde(default)]
     pub opencode_path: Option<PathBuf>,
+    /// Resolved `hermes` binary. Defaulted for older configs.
+    #[serde(default)]
+    pub hermes_path: Option<PathBuf>,
     pub snapshot_interval_secs: u64,
     pub scrollback_bytes: usize,
     #[serde(default)]
@@ -266,6 +271,7 @@ impl Default for Config {
             grok_path: None,
             codex_path: None,
             opencode_path: None,
+            hermes_path: None,
             snapshot_interval_secs: 10,
             scrollback_bytes: 2 * 1024 * 1024,
             memory: MemoryConfig::default(),
@@ -1235,6 +1241,7 @@ mod tests {
         assert!(SessionKind::Grok.is_agent());
         assert!(SessionKind::Codex.is_agent());
         assert!(SessionKind::OpenCode.is_agent());
+        assert!(SessionKind::Hermes.is_agent());
         assert!(!SessionKind::Shell.is_agent());
     }
 
@@ -1258,6 +1265,11 @@ mod tests {
     }
 
     #[test]
+    fn hermes_kind_serializes_lowercase() {
+        assert_eq!(serde_json::to_string(&SessionKind::Hermes).unwrap(), "\"hermes\"");
+    }
+
+    #[test]
     fn config_written_before_codex_support_still_loads() {
         let dir = tempdir().unwrap();
         let store = StateStore::new(dir.path());
@@ -1273,6 +1285,7 @@ mod tests {
         assert_eq!(cfg.grok_path, Some(PathBuf::from("/usr/bin/grok")));
         assert_eq!(cfg.codex_path, None);
         assert_eq!(cfg.opencode_path, None);
+        assert_eq!(cfg.hermes_path, None);
     }
 
     #[test]
@@ -1461,6 +1474,7 @@ mod tests {
             grok_path: Some(PathBuf::from("/usr/local/bin/grok")),
             codex_path: Some(PathBuf::from("/usr/local/bin/codex")),
             opencode_path: Some(PathBuf::from("/usr/local/bin/opencode")),
+            hermes_path: Some(PathBuf::from("/usr/local/bin/hermes")),
             snapshot_interval_secs: 42,
             scrollback_bytes: 4096,
             memory: MemoryConfig::default(),

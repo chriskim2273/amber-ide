@@ -128,8 +128,8 @@ enum Command {
     /// agent session's child process; not meant to be run directly by users).
     Run {
         name: String,
-        /// Which agent to supervise: `claude` (default), `grok`, `codex`, or
-        /// `opencode`. Passed by the daemon rather than read from the store,
+        /// Which agent to supervise: `claude` (default), `grok`, `codex`,
+        /// `opencode`, or `hermes`. Passed by the daemon rather than read from the store,
         /// which the spawn races.
         #[arg(long, default_value = "claude")]
         kind: String,
@@ -145,7 +145,7 @@ enum Command {
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<OsString>,
     },
-    /// `SessionStart` hook target invoked by claude/codex/opencode; records the
+    /// Session hook target invoked by claude/codex/opencode/hermes; records the
     /// session id from stdin (`AMBER_SESSION`/`AMBER_STATE_DIR` env, spec §6.2).
     Hook,
     /// Print a read-only Claude-session handoff for the current Codex session.
@@ -185,7 +185,7 @@ fn parse_slot(value: &str) -> Result<u32, String> {
 
 #[derive(Subcommand)]
 enum CtlAction {
-    /// Resolve the agent binaries (claude, grok, codex, opencode) via your
+    /// Resolve agent binaries (claude, grok, codex, opencode, hermes) via your
     /// login shell and record them in config (the distribution-safe path —
     /// never the daemon's own PATH; spec §8).
     Doctor {
@@ -372,7 +372,7 @@ fn run_doctor(root: Option<PathBuf>) -> anyhow::Result<()> {
     std::fs::create_dir_all(&root)?;
     let store = StateStore::new(&root);
 
-    // grok/codex/opencode are optional: a machine with only claude installed is
+    // grok/codex/opencode/hermes are optional: a machine with only claude installed is
     // a working amber, so a missing optional agent is reported but never fails
     // the doctor.
     if let Some(path) = amber::grok::resolve_grok() {
@@ -398,6 +398,15 @@ fn run_doctor(root: Option<PathBuf>) -> anyhow::Result<()> {
         println!("opencode: {} (recorded in config)", path.display());
     } else {
         println!("opencode: not found via your login shell (opencode panes will fall back to a shell)");
+    }
+    if let Some(path) = amber::hermes::resolve_hermes() {
+        let mut cfg = store.load_config()?;
+        cfg.hermes_path = Some(path.clone());
+        store.save_config(&cfg)?;
+        amber::hermes::ensure_global_hermes_plugin(&path);
+        println!("hermes: {} (recorded in config)", path.display());
+    } else {
+        println!("hermes: not found via your login shell (hermes panes will fall back to a shell)");
     }
 
     match claude::resolve_claude() {
@@ -1181,6 +1190,7 @@ fn run_daemon(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Result<
         claude::ensure_global_claude_hook(&hook);
         amber::codex::ensure_global_codex_hook(&hook);
         amber::opencode::ensure_global_opencode_plugin();
+        if let Some(path) = amber::hermes::resolve_hermes() { amber::hermes::ensure_global_hermes_plugin(&path); }
     }
     manager.restore()?;
 

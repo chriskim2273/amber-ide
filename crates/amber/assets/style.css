@@ -146,6 +146,7 @@ html, body {
 .dot.k-grok { background: #8ab4f8; }
 .dot.k-codex { background: #3dd68c; }
 .dot.k-opencode { background: #c084fc; }
+.dot.k-hermes { background: #f472b6; }
 .dot.k-browser { background: #4d9fff; }
 .tag { font-size: 11px; color: var(--warn); flex: none; }
 .empty { color: var(--text-faint); font-size: 13px; padding: 24px 8px; text-align: center; }

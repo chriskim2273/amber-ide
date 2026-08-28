@@ -333,6 +333,14 @@ describe('paneDot opencode', () => {
   })
 })
 
+describe('paneDot hermes', () => {
+  it('maps run_state to dot + label', () => {
+    expect(paneDot('hermes', undefined)).toEqual({ cls: 'hermes', label: 'hermes' })
+    expect(paneDot('hermes', 'claude-retrying')).toEqual({ cls: 'hermes-retrying', label: 'hermes (retrying)' })
+    expect(paneDot('hermes', 'shell-fallback')).toEqual({ cls: 'shell-fallback', label: 'shell (hermes exited)' })
+  })
+})
+
 describe('tabDot', () => {
   it('no claude pane → shell', () => {
     expect(tabDot([pane('shell'), pane('shell')]).cls).toBe('shell')
