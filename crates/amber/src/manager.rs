@@ -343,21 +343,10 @@ impl SessionManager {
         self.cfg.snapshot_interval_secs
     }
 
-    /// Session names become file names in the state store and travel in
-    /// data-frame headers, so they must be non-empty, contain no path
-    /// separators/NULs, not be `.`/`..`, and stay short enough for any
-    /// filesystem (NAME_MAX) and the u16 wire header.
+    /// Session names become persisted filenames, so use the portable platform
+    /// grammar even when this daemon happens to run on Unix.
     fn validate_name(name: &str) -> anyhow::Result<()> {
-        if name.is_empty() {
-            anyhow::bail!("session name must not be empty");
-        }
-        if name.len() > 200 {
-            anyhow::bail!("session name too long ({} bytes, max 200)", name.len());
-        }
-        if name == "." || name == ".." || name.contains('/') || name.contains('\0') {
-            anyhow::bail!("invalid session name: {name:?}");
-        }
-        Ok(())
+        crate::platform::validate_session_name(name)
     }
 
     fn now() -> u64 {

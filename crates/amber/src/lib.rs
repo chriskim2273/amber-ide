@@ -19,6 +19,7 @@ pub mod pi;
 pub mod procinfo;
 pub mod pty;
 pub mod search;
+pub mod platform;
 pub mod supervisor;
 pub mod web;
 pub mod tailscale;

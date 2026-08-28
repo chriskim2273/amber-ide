@@ -18,6 +18,7 @@ dependencies = [
  "tempfile",
  "terminal_size",
  "tungstenite",
+ "windows-sys",
 ]
 
 [[package]]
