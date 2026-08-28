@@ -694,7 +694,10 @@ no longer mislabeled as a missing artifact.
 The direct-spawn regression also uses a Windows executable path containing
 spaces and a spaced endpoint. It proves the full executable string remains the
 single command, the endpoint remains one argument, and `shell: false` remains
-set, so no quoting or shell parsing is introduced.
+set, so no quoting or shell parsing is introduced. These injected-spawn tests
+validate only the Node invocation contract; they do not execute a native
+Windows process. Native Windows spawn execution remains part of the Task 8
+Windows runtime gate.
 
 Final platform-neutral verification on Linux:
 
@@ -721,3 +724,45 @@ not exit. The last test proves the entrypoint reports failure yet remains
 pending with live-child listeners and intact streams, then releases only after
 a deterministic synthetic exit. Native Windows runtime execution remains
 unavailable on this Linux host and is still reported as unrun.
+
+## Closeout writer-failure correction
+
+Failure reporting now happens only after `retainLivePeerUntilExit` has
+synchronously installed the directly owned peer's `error` and `exit` listeners.
+The entrypoint also installs an `error` listener on stderr before invoking the
+writer, awaits a promise-returning writer, and catches both synchronous throws
+and asynchronous rejections. When the primary writer fails, it attempts a
+guarded nonfatal fallback containing the original cleanup failure and the
+reporting failure. A fallback write failure is also contained; it cannot settle
+the entrypoint or release the child.
+
+The peer lease, stderr guard, child streams, and persistent line monitor remain
+referenced until the peer actually emits `exit`. Only then are the child streams
+destroyed, the lease and stderr listeners removed, and the line monitor
+released. The new deterministic regression injects both a stderr `error` event
+and a rejected writer promise. It observes the lease before the writer runs,
+the nonfatal fallback, the still-pending entrypoint and intact streams, and the
+final release only after a synthetic child exit.
+
+Fresh platform-neutral verification on Linux:
+
+```text
+$ node --check app/test/windows-pipe.mjs
+exit 0
+
+$ node --check app/test/windows-pipe-lifecycle.test.mjs
+exit 0
+
+$ node --unhandled-rejections=strict --test \
+    app/test/windows-pipe-lifecycle.test.mjs
+tests 17; pass 17; fail 0
+
+$ env -u AMBER_WINDOWS_PIPE_PEER node --unhandled-rejections=strict \
+    app/test/windows-pipe.mjs
+SKIP windows-pipe.mjs: Windows named pipes require Windows
+```
+
+The injected spawn regressions in this test suite validate argument and option
+construction at the `spawn` boundary only. They are not evidence of native
+Windows process creation; building and directly spawning the `.exe` on Windows
+remains a Task 8 runtime gate.

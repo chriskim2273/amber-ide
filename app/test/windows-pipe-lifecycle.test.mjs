@@ -348,3 +348,66 @@ test('entrypoint reports cleanup timeout and remains pending until the live peer
   assert.equal(child.stderr.destroyed, true)
   assert.equal(monitorReleased, true)
 })
+
+test('entrypoint retains a live peer when the error writer itself fails', async () => {
+  const child = new EventEmitter()
+  child.pid = 4545
+  child.exitCode = null
+  child.signalCode = null
+  child.stdout = new PassThrough()
+  child.stderr = new PassThrough()
+  child.stdio = [null, child.stdout, child.stderr]
+  const errorStream = new PassThrough()
+  let fallback = ''
+  errorStream.setEncoding('utf8')
+  errorStream.on('data', (chunk) => { fallback += chunk })
+  const cleanupError = new Error('cleanup left peer live')
+  const streamError = new Error('stderr emitted an error')
+  const writerError = new Error('error writer rejected')
+  let leaseHeldDuringWrite = false
+  let finished = false
+  let rejected
+  let monitorReleased = false
+
+  const entrypoint = runEntrypoint({
+    execute: async () => { throw cleanupError },
+    getLivePeer: () => child,
+    processState: { exitCode: undefined },
+    errorStream,
+    writeError: () => {
+      leaseHeldDuringWrite = child.listenerCount('exit') === 1
+      errorStream.emit('error', streamError)
+      return Promise.reject(writerError)
+    },
+    releasePeerMonitor: () => { monitorReleased = true },
+  }).then(
+    () => { finished = true },
+    (error) => { finished = true; rejected = error },
+  )
+
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(leaseHeldDuringWrite, true)
+  assert.equal(finished, false)
+  assert.equal(rejected, undefined)
+  assert.equal(child.listenerCount('error'), 1)
+  assert.equal(child.listenerCount('exit'), 1)
+  assert.equal(errorStream.listenerCount('error'), 1)
+  assert.match(fallback, /cleanup left peer live/)
+  assert.match(fallback, /nonfatal.*error writer rejected/i)
+  assert.equal(child.stdout.destroyed, false)
+  assert.equal(child.stderr.destroyed, false)
+  assert.equal(monitorReleased, false)
+
+  child.exitCode = 1
+  child.emit('exit', 1, null)
+  await entrypoint
+  assert.equal(finished, true)
+  assert.equal(rejected, undefined)
+  assert.equal(child.listenerCount('error'), 0)
+  assert.equal(child.listenerCount('exit'), 0)
+  assert.equal(errorStream.listenerCount('error'), 0)
+  assert.equal(child.stdout.destroyed, true)
+  assert.equal(child.stderr.destroyed, true)
+  assert.equal(monitorReleased, true)
+  errorStream.destroy()
+})

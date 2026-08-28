@@ -339,6 +339,49 @@ const retainLivePeerUntilExit = (child) => {
     if (childExited(child)) onExit()
   })
 }
+const describeError = (error) => {
+  if (error instanceof Error) return error.message
+  try {
+    return String(error)
+  } catch {
+    return '<unprintable error>'
+  }
+}
+const writeStream = (stream, message) => new Promise((resolve, reject) => {
+  if (typeof stream?.write !== 'function') {
+    resolve()
+    return
+  }
+  try {
+    stream.write(message, (error) => {
+      if (error) reject(error)
+      else resolve()
+    })
+  } catch (error) {
+    reject(error)
+  }
+})
+const reportErrorSafely = async (message, writeError, errorStream, streamErrors) => {
+  let writeFailure
+  try {
+    await writeError(message)
+  } catch (error) {
+    writeFailure = error
+  }
+
+  if (writeFailure === undefined && streamErrors.length === 0) return
+  const failures = [...streamErrors]
+  if (writeFailure !== undefined) failures.push(writeFailure)
+  const details = failures.map(describeError).join('; ')
+  try {
+    await writeStream(
+      errorStream,
+      `${message}[nonfatal error while reporting the failure: ${details}]\n`,
+    )
+  } catch {
+    // Reporting must never release or detach a peer that cleanup left live.
+  }
+}
 const waitForChildExit = (child, ms, signal) => new Promise((resolve, reject) => {
   if (childExited(child)) {
     resolve()
@@ -495,7 +538,8 @@ export const runEntrypoint = async ({
   execute = run,
   getLivePeer = () => peer,
   processState = process,
-  writeError = (message) => process.stderr.write(message),
+  errorStream = process.stderr,
+  writeError = (message) => writeStream(errorStream, message),
   releasePeerMonitor = () => peerLines?.dispose(),
 } = {}) => {
   try {
@@ -503,10 +547,17 @@ export const runEntrypoint = async ({
   } catch (error) {
     processState.exitCode = 1
     const message = error instanceof Error ? (error.stack ?? error.message) : String(error)
-    writeError(`${message}\n`)
+    // Install the child lease before reporting the cleanup failure: stderr can
+    // throw synchronously, reject asynchronously, or emit an error event.
+    const peerLease = retainLivePeerUntilExit(getLivePeer())
+    const streamErrors = []
+    const onStreamError = (streamError) => { streamErrors.push(streamError) }
+    errorStream?.on?.('error', onStreamError)
     try {
-      await retainLivePeerUntilExit(getLivePeer())
+      await reportErrorSafely(`${message}\n`, writeError, errorStream, streamErrors)
+      await peerLease
     } finally {
+      errorStream?.off?.('error', onStreamError)
       releasePeerMonitor()
     }
   }
