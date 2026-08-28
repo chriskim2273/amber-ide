@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import type { Node } from '../renderer/layout'
 import type { LayoutFile } from './layoutFile'
+import type { DaemonSessionKind } from './proto'
 
 import { assembleSave as _asm, planLoad as _pl, parseWorkspaceFile as _parse, serializeWorkspaceFile as _ser } from './workspaceFile'
 
@@ -24,7 +25,7 @@ describe('editor panes in .amberws', () => {
     expect(_parse(_ser(doc)).workspaces[0]!.tabs[0]!.panes[0]!.path).toBeNull()
   })
   it('load routes an editor pane to editors, not creates', () => {
-    const doc = { version: 1, scope: 'one' as const, workspaces: [{ tabs: [{ tab: 1, tree: { kind: 'leaf' as const, paneId: 'p0' },
+    const doc: WorkspaceDoc = { version: 1, scope: 'one', workspaces: [{ tabs: [{ tab: 1, tree: { kind: 'leaf', paneId: 'p0' },
       panes: [{ id: 'p0', kind: 'editor', cwd: '', ord: 0, scrollback: '', path: '/tmp/z.json' }] }] }] }
     let n = 0
     const plan = _pl(doc, { mode: 'new', currentWs: 1, liveWs: [1], mintId: () => `m${n++}` })
@@ -42,8 +43,8 @@ describe('editor panes in .amberws', () => {
     expect(Object.values(plan.editors)[0]!.path).toBeNull()
   })
   it('planLoad merges editors across replace + new workspaces', () => {
-    const wsWith = (path: string) => ({ tabs: [{ tab: 1, tree: null, panes: [{ id: 'p0', kind: 'editor', cwd: '', ord: 0, scrollback: '', path }] }] })
-    const doc = { version: 1, scope: 'all' as const, workspaces: [wsWith('/a'), wsWith('/b')] }
+    const wsWith = (path: string): WorkspaceDoc['workspaces'][number] => ({ tabs: [{ tab: 1, tree: null, panes: [{ id: 'p0', kind: 'editor', cwd: '', ord: 0, scrollback: '', path }] }] })
+    const doc: WorkspaceDoc = { version: 1, scope: 'all', workspaces: [wsWith('/a'), wsWith('/b')] }
     let n = 0
     const plan = _pl(doc, { mode: 'replace', currentWs: 1, liveWs: [1], mintId: () => `m${n++}` })
     expect(Object.values(plan.editors).map((e) => e.path).sort()).toEqual(['/a', '/b'])
@@ -62,7 +63,7 @@ describe('browser panes in .amberws', () => {
     expect(pane.scrollback).toBe('')
   })
   it('load routes a browser pane to browsers, not creates', () => {
-    const doc = { version: 1, scope: 'one' as const, workspaces: [{ tabs: [{ tab: 1, tree: { kind: 'leaf' as const, paneId: 'p0' },
+    const doc: WorkspaceDoc = { version: 1, scope: 'one', workspaces: [{ tabs: [{ tab: 1, tree: { kind: 'leaf', paneId: 'p0' },
       panes: [{ id: 'p0', kind: 'browser', cwd: '', ord: 0, scrollback: '', url: 'https://y.dev' }] }] }] }
     let n = 0
     const plan = _pl(doc, { mode: 'new', currentWs: 1, liveWs: [1], mintId: () => `m${n++}` })
@@ -70,6 +71,26 @@ describe('browser panes in .amberws', () => {
     const [name, entry] = Object.entries(plan.browsers)[0]!
     expect(name.startsWith('browser-2-1-0-')).toBe(true)
     expect(entry).toEqual({ ws: 2, tab: 1, ord: 0, url: 'https://y.dev' })
+  })
+})
+
+describe('Pi panes in .amberws', () => {
+  it('loads Pi as a daemon create and never as an app-local pane', () => {
+    const doc = _parse(JSON.stringify({ version: 1, scope: 'one', workspaces: [{ tabs: [{ tab: 1, tree: { kind: 'leaf', paneId: 'p0' },
+      panes: [{ id: 'p0', kind: 'pi', cwd: '/work', ord: 0, scrollback: '' }] }] }] }))
+    const plan = _pl(doc, { mode: 'new', currentWs: 1, liveWs: [1], mintId: () => 'pi-id' })
+
+    expect(plan.creates).toEqual([{ name: 'amber-2-1-0-pi-id', cwd: '/work', kind: 'pi' }])
+    const kind: DaemonSessionKind = plan.creates[0]!.kind
+    expect(kind).toBe('pi')
+    expect(plan.browsers).toEqual({})
+    expect(plan.editors).toEqual({})
+  })
+
+  it('rejects an unknown pane kind instead of creating a daemon session it cannot run', () => {
+    const doc = { version: 1, scope: 'one', workspaces: [{ tabs: [{ tab: 1, tree: null,
+      panes: [{ id: 'p0', kind: 'unknown-agent', cwd: '/work', ord: 0, scrollback: '' }] }] }] }
+    expect(() => _parse(JSON.stringify(doc))).toThrow(/pane\.kind/)
   })
 })
 import {

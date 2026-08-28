@@ -43,7 +43,7 @@ import { claudeNames } from './claudeNames'
 import { loadLayoutFile, saveLayoutFile } from './layoutIO'
 import { compatSignature, shouldUseCompat, compatWorthyReason, COMPAT_SWITCHES, DETECT_WINDOW_MS } from './renderCompat'
 import { installBinary } from './installBinary'
-import { spawnOkWithStderr } from './spawnOk'
+import { repairAgentExtensions } from './agentSetup'
 import {
   sshTunnelArgv, sshProbeArgv, isValidHost, localSocketPath, hostLabel,
   REMOTE_SOCKET_PROBE, REMOTE_LAYOUT_PROBE, parseAgentSock, explainSshFailure,
@@ -155,8 +155,10 @@ async function installDaemon(): Promise<void> {
     const stable = join(home, '.local', 'bin', 'amber')
     await mkdir(dirname(stable), { recursive: true })
     await installBinary(amberBinary(), stable)
-    await spawnOkWithStderr(stable, ['ctl', 'install-codex-skill'], (stderr) => {
-      process.stderr.write(stderr)
+    // These repairs are independent and strictly best-effort: neither changes
+    // daemon lifecycle, and a failed Codex repair must not skip Pi's hook.
+    await repairAgentExtensions((args) => runCapture(stable, args), (warning) => {
+      process.stderr.write(warning)
     })
 
     if (process.platform === 'linux') {

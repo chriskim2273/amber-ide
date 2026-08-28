@@ -2,16 +2,23 @@ import type { Node } from '../renderer/layout'
 import { formatName } from './names'
 import { formatBrowserName } from './browserName'
 import { formatEditorName } from './editorName'
+import { isDaemonSessionKind, type DaemonSessionKind } from './proto'
 import type { LayoutFile, WsLayout, TabLayout, FrozenEntry, BrowserEntry, EditorEntry } from './layoutFile'
 
 // The `.amberws` portable workspace file. Structure (grouping/tree/labels) +
 // per-pane scrollback, versioned. Tree leaves are file-local placeholders
 // (`p0`, `p1`…) — session names are minted fresh on load.
 export const WORKSPACE_VERSION = 1
+export type AppLocalPaneKind = 'browser' | 'editor'
+export type WorkspacePaneKind = DaemonSessionKind | AppLocalPaneKind
+
+function isWorkspacePaneKind(kind: string): kind is WorkspacePaneKind {
+  return isDaemonSessionKind(kind) || kind === 'browser' || kind === 'editor'
+}
 
 export interface WsPane {
   id: string // placeholder referenced by tree leaves (p0, p1…)
-  kind: string // 'shell' | 'claude' | 'grok' | 'codex' | 'opencode' | 'hermes' | 'browser' | 'editor' (app-local kinds stored verbatim)
+  kind: WorkspacePaneKind
   cwd: string
   ord: number
   frozenNote?: string // presence (incl. '') = frozen; the value is the note
@@ -74,13 +81,14 @@ function parsePane(v: unknown): WsPane {
   if (typeof v !== 'object' || v === null || Array.isArray(v)) fail('pane is not an object')
   const p = v as Record<string, unknown>
   if (typeof p['id'] !== 'string') fail('pane.id must be a string')
-  if (typeof p['kind'] !== 'string') fail('pane.kind must be a string')
+  const kind = p['kind']
+  if (typeof kind !== 'string' || !isWorkspacePaneKind(kind)) fail('pane.kind is unsupported')
   if (typeof p['cwd'] !== 'string') fail('pane.cwd must be a string')
   if (typeof p['ord'] !== 'number' || !Number.isFinite(p['ord'])) fail('pane.ord must be a number')
   if (typeof p['scrollback'] !== 'string') fail('pane.scrollback must be a string')
   return {
     id: p['id'],
-    kind: p['kind'],
+    kind,
     cwd: p['cwd'],
     ord: p['ord'],
     scrollback: p['scrollback'],
@@ -194,6 +202,7 @@ export function assembleSave(
       // Placeholder per pane, in ord order (live groupings already sort by ord).
       const nameToId: Record<string, string> = {}
       const panes: WsPane[] = tab.panes.map((p, i) => {
+        if (!isWorkspacePaneKind(p.kind)) throw new Error(`unsupported pane kind: ${p.kind}`)
         const id = `p${i}`
         nameToId[p.name] = id
         const dump = dumps[p.name]
@@ -235,7 +244,7 @@ export type LoadOptions =
   | { mode: 'new'; nextWs: number; mintId: () => string }
   | { mode: 'replace'; ws: number; mintId: () => string }
 
-export interface LoadCreate { name: string; cwd: string; kind: string }
+export interface LoadCreate { name: string; cwd: string; kind: DaemonSessionKind }
 export interface LoadPlan {
   creates: LoadCreate[]
   workspaces: Record<string, WsLayout> // sidecar mutations, keyed by ws-number string

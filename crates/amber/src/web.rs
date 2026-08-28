@@ -287,7 +287,7 @@ const RESIZE_MAX_ROWS: u16 = 300;
 
 /// Valid `Create` kinds. A pty runs a shell or `amber run <name> [--kind …]`
 /// and nothing else — `Create` carries no argv, so this is the entire surface.
-const CREATE_KINDS: [&str; 6] = ["shell", "claude", "grok", "codex", "opencode", "hermes"];
+const CREATE_KINDS: [&str; 7] = ["shell", "claude", "grok", "codex", "opencode", "hermes", "pi"];
 
 /// The ONLY mapping from a browser message to daemon control messages
 /// (spec §5, widened by the pane-parity pass). `open` is this connection's
@@ -312,7 +312,8 @@ pub fn map_browser_msg(
                     || s.kind == "grok"
                     || s.kind == "codex"
                     || s.kind == "opencode"
-                    || s.kind == "hermes")
+                    || s.kind == "hermes"
+                    || s.kind == "pi")
         })
     };
     // Exhaustive match: adding a browser message forces a decision here, so a

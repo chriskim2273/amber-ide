@@ -15,6 +15,7 @@ pub mod manager;
 pub mod memory_guardian;
 pub mod mosaic;
 pub mod opencode;
+pub mod pi;
 pub mod procinfo;
 pub mod pty;
 pub mod supervisor;

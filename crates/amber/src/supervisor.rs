@@ -13,7 +13,7 @@ use std::time::Duration;
 use amber_core::proto::{self, ControlMsg, Decoded, Decoder, Frame};
 use amber_core::state::{SessionKind, StateStore};
 
-use crate::{claude, codex, grok, hermes, opencode};
+use crate::{claude, codex, grok, hermes, opencode, pi};
 
 /// Upper bound on one run-state report attempt. The ordered reporter retries a
 /// timed-out attempt without blocking the child-monitoring loop.
@@ -68,7 +68,7 @@ pub enum SuperviseOutcome {
 /// Which coding agent a supervised session runs. All share this module's
 /// retry/suspend/fallback machinery; only the argv differs — see
 /// [`claude::claude_argv`], [`grok::grok_argv`], [`codex::codex_argv`], and
-/// [`opencode::opencode_argv`].
+/// [`opencode::opencode_argv`], [`hermes::hermes_argv`], and [`pi::pi_argv`].
 pub enum Agent {
     /// claude, whose rotating session id is recorded by its `SessionStart` hook
     /// into the generated per-session settings file at this path.
@@ -83,6 +83,8 @@ pub enum Agent {
     OpenCode,
     /// Hermes Agent, whose session id is recorded by Amber's global plugin.
     Hermes,
+    /// Pi, whose session id is recorded by Amber's global Pi extension.
+    Pi,
 }
 
 impl Agent {
@@ -93,6 +95,7 @@ impl Agent {
             Agent::Codex => "codex",
             Agent::OpenCode => "opencode",
             Agent::Hermes => "hermes",
+            Agent::Pi => "pi",
         }
     }
 }
@@ -127,7 +130,7 @@ pub fn supervise_agent(
     let store = StateStore::new(root);
     let mut attempts = 0u32;
     // Escalation within one unchanged recording: Resume (escalation 0) -> Fresh
-    // (every later attempt). Codex also resets when SessionStart refreshes the
+    // (every later attempt). Codex and Pi reset when SessionStart refreshes the
     // recording's timestamp with the same id; Claude/Grok retain their id-only
     // ladder.
     let mut escalation = 0u32;
@@ -148,7 +151,7 @@ pub fn supervise_agent(
         let recording_key = recording.as_ref().map(|meta| {
             (
                 meta.session_id.clone(),
-                if matches!(agent, Agent::Codex) {
+                if matches!(agent, Agent::Codex | Agent::Pi) {
                     meta.updated
                 } else {
                     0
@@ -177,6 +180,7 @@ pub fn supervise_agent(
                 opencode::opencode_argv(&select_opencode_start(session_id, escalation))
             }
             Agent::Hermes => hermes::hermes_argv(&select_hermes_start(session_id, escalation)),
+            Agent::Pi => pi::pi_argv(&select_pi_start(session_id, escalation)),
         };
 
         // Spawn (not `.status()`) so the run is interruptible: a SIGUSR1-set
@@ -436,6 +440,13 @@ fn select_hermes_start(session_id: Option<&str>, escalation: u32) -> hermes::Her
     match (session_id, escalation) {
         (Some(id), 0) if hermes::is_session_id(id) => hermes::HermesStart::Resume(id.to_string()),
         _ => hermes::HermesStart::Fresh,
+    }
+}
+
+fn select_pi_start(session_id: Option<&str>, escalation: u32) -> pi::PiStart {
+    match (session_id, escalation) {
+        (Some(id), 0) if pi::is_session_id(id) => pi::PiStart::Resume(id.to_string()),
+        _ => pi::PiStart::Fresh,
     }
 }
 
@@ -715,6 +726,7 @@ pub fn run_session(
         k if k == SessionKind::Codex.as_str() => "codex",
         k if k == SessionKind::OpenCode.as_str() => "opencode",
         k if k == SessionKind::Hermes.as_str() => "hermes",
+        k if k == SessionKind::Pi.as_str() => "pi",
         _ => "claude",
     };
 
@@ -727,6 +739,7 @@ pub fn run_session(
         "codex" => cfg.codex_path.clone(),
         "opencode" => cfg.opencode_path.clone(),
         "hermes" => cfg.hermes_path.clone(),
+        "pi" => cfg.pi_path.clone(),
         _ => cfg.claude_path.clone(),
     };
     let agent_path = match cached.filter(|p| p.exists()) {
@@ -737,6 +750,7 @@ pub fn run_session(
                 "codex" => codex::resolve_codex(),
                 "opencode" => opencode::resolve_opencode(),
                 "hermes" => hermes::resolve_hermes(),
+                "pi" => pi::resolve_pi(),
                 _ => claude::resolve_claude(),
             };
             if let Some(p) = resolved.clone() {
@@ -745,6 +759,7 @@ pub fn run_session(
                     "codex" => cfg.codex_path = Some(p),
                     "opencode" => cfg.opencode_path = Some(p),
                     "hermes" => cfg.hermes_path = Some(p),
+                    "pi" => cfg.pi_path = Some(p),
                     _ => cfg.claude_path = Some(p),
                 }
                 store.save_config(&cfg)?;
@@ -784,6 +799,10 @@ pub fn run_session(
             "hermes" => {
                 hermes::ensure_global_hermes_plugin(&agent_path);
                 Agent::Hermes
+            }
+            "pi" => {
+                pi::ensure_global_pi_extension();
+                Agent::Pi
             }
             _ => {
                 // A detached claude blocks forever on the interactive folder-trust
@@ -1326,6 +1345,14 @@ mod tests {
             select_hermes_start(Some("latest"), 0),
             hermes::HermesStart::Fresh
         );
+    }
+
+    #[test]
+    fn pi_resumes_only_a_valid_recording_on_its_first_attempt() {
+        let id = "0198f8ea-9c13-7000-a123-0123456789ab";
+        assert_eq!(select_pi_start(Some(id), 0), crate::pi::PiStart::Resume(id.into()));
+        assert_eq!(select_pi_start(Some(id), 1), crate::pi::PiStart::Fresh);
+        assert_eq!(select_pi_start(Some("--continue"), 0), crate::pi::PiStart::Fresh);
     }
 
     #[test]

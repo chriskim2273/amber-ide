@@ -2,10 +2,17 @@
 // tag 0 = Control (JSON of ControlMsg, serde externally-tagged).
 // tag 1 = Data ([u16 BE name_len][name utf8][raw bytes]).
 
+export type DaemonSessionKind = 'shell' | 'claude' | 'grok' | 'codex' | 'opencode' | 'hermes' | 'pi'
+
+export function isDaemonSessionKind(kind: unknown): kind is DaemonSessionKind {
+  return kind === 'shell' || kind === 'claude' || kind === 'grok' || kind === 'codex'
+    || kind === 'opencode' || kind === 'hermes' || kind === 'pi'
+}
+
 export interface SessionInfo {
   name: string
   cwd: string
-  kind: string
+  kind: DaemonSessionKind
   alive: boolean
   // Unix seconds of the session's last state-store write; the daemon's
   // ordering key for "most recent". Optional on the wire (serde default 0);
@@ -15,7 +22,7 @@ export interface SessionInfo {
   // 2026-07-19-stable-session-slots): what `amber ls` prints and what
   // `amber attach <n>` resolves. Absent/0 from an older daemon.
   slot?: number
-  // Supervision phase for an AGENT session (kind 'claude' | 'grok' | 'codex' | 'opencode' | 'hermes'): 'claude'
+  // Supervision phase for an AGENT session (all supervised kinds): 'claude'
   // (running), 'claude-retrying' (crashed, retrying), 'shell-fallback' (dropped
   // to a shell), 'suspended' (parked, RAM freed). The strings stay spelled
   // `claude*` for every agent — they name the phase, not the binary. Optional on
@@ -215,8 +222,8 @@ function jsonToMsg(v: unknown): ControlMsg | null {
           session_high_kb: (body['session_high_kb'] as number) ?? 0,
         }
       case 'SessionList': return { kind: 'SessionList', names: body['names'] as string[] }
-      case 'Sessions': return { kind: 'Sessions', sessions: body['sessions'] as SessionInfo[] }
-      case 'SessionsChanged': return { kind: 'SessionsChanged', added: body['added'] as SessionInfo[], removed: body['removed'] as string[] }
+      case 'Sessions': return { kind: 'Sessions', sessions: decodeSessionInfos(body['sessions']) }
+      case 'SessionsChanged': return { kind: 'SessionsChanged', added: decodeSessionInfos(body['added']), removed: body['removed'] as string[] }
       case 'Activity': return { kind: 'Activity', name: body['name'] as string }
       case 'MemoryStat': return { kind: 'MemoryStat', name: body['name'] as string, rss_kb: (body['rss_kb'] as number) ?? 0, growing: (body['growing'] as boolean) ?? false }
       case 'MemoryPressure': {
@@ -250,6 +257,16 @@ function jsonToMsg(v: unknown): ControlMsg | null {
     }
   }
   throw new Error('malformed control value')
+}
+
+function decodeSessionInfos(value: unknown): SessionInfo[] {
+  if (!Array.isArray(value)) throw new Error('invalid sessions payload')
+  return value.map((session) => {
+    if (!session || typeof session !== 'object' || !isDaemonSessionKind((session as Record<string, unknown>)['kind'])) {
+      throw new Error('invalid session kind')
+    }
+    return session as SessionInfo
+  })
 }
 
 export function encode(frame: Frame): Uint8Array {

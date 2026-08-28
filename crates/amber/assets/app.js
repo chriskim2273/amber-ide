@@ -195,7 +195,7 @@ function main() {
     });
 
     var add = pill('+ pane', false, function () {
-      var kind = window.prompt('kind: shell, claude, grok, codex, opencode or hermes', 'shell');
+      var kind = window.prompt('kind: shell, claude, grok, codex, opencode, hermes or pi', 'shell');
       if (!kind) return;
       var s = sessionByName(firstPaneOf(ws, cur)) || sessions[0];
       newPane(kind.trim(), (s && s.cwd) || '/');
@@ -294,7 +294,7 @@ function main() {
     menu.textContent = '⋯';
     menu.addEventListener('click', function (e) {
       e.stopPropagation();          // don't open the terminal
-      var agent = s.kind === 'claude' || s.kind === 'grok' || s.kind === 'codex' || s.kind === 'opencode' || s.kind === 'hermes';
+      var agent = s.kind === 'claude' || s.kind === 'grok' || s.kind === 'codex' || s.kind === 'opencode' || s.kind === 'hermes' || s.kind === 'pi';
       var choices = ['close'];
       if (agent) choices.push(s.run_state === 'suspended' ? 'unfreeze' : 'freeze');
       choices.push('move to tab…');
@@ -518,12 +518,12 @@ function main() {
   // a tap feels answered; it never touches `layout`.
   var pending = {};   // paneName -> expiry ms
 
-  var CREATE_KINDS = { shell: 1, claude: 1, grok: 1, codex: 1, opencode: 1, hermes: 1 };
+  var CREATE_KINDS = { shell: 1, claude: 1, grok: 1, codex: 1, opencode: 1, hermes: 1, pi: 1 };
 
   function newPane(kind, cwd) {
     // Mirrors the server's CREATE_KINDS check (web.rs) so a bad kind banners
     // instead of silently no-opping.
-    if (!CREATE_KINDS[kind]) { banner('kind must be shell, claude, grok, codex, opencode or hermes', 'warn'); return; }
+    if (!CREATE_KINDS[kind]) { banner('kind must be shell, claude, grok, codex, opencode, hermes or pi', 'warn'); return; }
     var name = paneName(curWs, curTab, freeOrd(curWs, curTab));
     pending[name] = Date.now() + 3000;
     control({ t: 'create', name: name, cwd: cwd, kind: kind });

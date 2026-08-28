@@ -333,6 +333,43 @@ fn socket_roundtrip_create_attach_write_read() {
 }
 
 #[test]
+fn socket_create_pi_reports_pi_session_kind() {
+    let (socket_path, _dir) = start_daemon();
+    let mut stream = connect_with_retry(&socket_path);
+    let mut decoder = Decoder::new();
+    send(&mut stream, &Frame::Control(ControlMsg::Create {
+        name: "pi-pane".into(), cwd: "/tmp".into(), kind: "pi".into(),
+    }));
+    read_frame_until(&mut stream, &mut decoder,
+        |f| matches!(f, Frame::Control(ControlMsg::Created { name }) if name == "pi-pane"),
+        Duration::from_secs(5));
+
+    send(&mut stream, &Frame::Control(ControlMsg::ListSessionsDetailed));
+    let frame = read_frame_until(&mut stream, &mut decoder,
+        |f| matches!(f, Frame::Control(ControlMsg::Sessions { .. })), Duration::from_secs(5));
+    let Frame::Control(ControlMsg::Sessions { sessions }) = frame else { unreachable!() };
+    assert_eq!(sessions.iter().find(|session| session.name == "pi-pane")
+        .map(|session| session.kind.as_str()), Some("pi"));
+}
+
+#[test]
+fn cli_pi_extension_repair_fails_when_the_destination_is_unusable() {
+    let dir = tempfile::tempdir().unwrap();
+    let blocked = dir.path().join("not-a-directory");
+    std::fs::write(&blocked, "file blocks extension directory").unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .args(["ctl", "install-pi-extension"])
+        .env("HOME", dir.path())
+        .env("PI_CODING_AGENT_DIR", &blocked)
+        .output()
+        .unwrap();
+
+    assert!(!out.status.success(), "repair falsely succeeded: {out:?}");
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("installed"));
+}
+
+#[test]
 fn snapshot_control_flushes_scrollback_and_acks() {
     let (socket_path, dir) = start_daemon();
     let mut stream = connect_with_retry(&socket_path);

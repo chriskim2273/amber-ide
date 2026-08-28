@@ -80,9 +80,12 @@ straight to a single xterm.js emulator.
 - Tab + workspace rename, tab close, drag-to-reorder tabs.
 
 **Coding agents**
-- Claude Code, OpenAI Codex, Grok, OpenCode, and Nous Research Hermes are supported supervised pane
+- Claude Code, OpenAI Codex, Grok, OpenCode, Nous Research Hermes, and Pi are supported supervised pane
   kinds. Their exact recorded conversations resume after agent crashes, unfreeze,
   daemon restart, and machine reboot.
+- Pi's global extension records each rotating session id. Pi resumes only an
+  exact recorded id with `pi --session <id>`; Amber never uses `-c` / `--continue`
+  because panes can share a working directory.
 - Codex remains its native terminal UI. Amber resolves the user-installed
   `codex` executable through the login shell; it does not bundle Codex or own
   authentication.
@@ -211,7 +214,7 @@ Debian/Ubuntu; Xcode Command Line Tools on macOS) for native build steps.
 > `AMBER_NO_SANDBOX=1 AMBER_SOFTWARE_GL=1` to render (documented in `CLAUDE.md`).
 
 **4. Agent CLIs (optional)** — install the provider binaries you plan to use.
-Amber discovers `claude`, `codex`, `grok`, `opencode`, and `hermes` through your login
+Amber discovers `claude`, `codex`, `grok`, `opencode`, `hermes`, and `pi` through your login
 shell. A missing provider only makes that pane fall back to a shell. `amber handoff`
 requires Claude Code because Claude itself summarizes the saved session without
 exposing its private transcript format.
@@ -263,7 +266,7 @@ amber ctl status            # daemon health
 ## Status
 
 Early — `v0.0.1`, single-developer project. The daemon spine, Claude Code,
-Codex, Grok, OpenCode, and Hermes supervision, reboot restore, and the full Electron IDE surface
+Codex, Grok, OpenCode, Hermes, and Pi supervision, reboot restore, and the full Electron IDE surface
 (tabs, workspaces, splits, drag-to-rearrange, browser panes, workspace
 save/load) work through automated coverage; live GUI verification remains
 feature-specific. See the build-status checklist at the bottom of

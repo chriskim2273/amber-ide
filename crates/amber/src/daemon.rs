@@ -169,6 +169,7 @@ fn parse_kind(kind: &str) -> anyhow::Result<SessionKind> {
         "codex" => Ok(SessionKind::Codex),
         "opencode" => Ok(SessionKind::OpenCode),
         "hermes" => Ok(SessionKind::Hermes),
+        "pi" => Ok(SessionKind::Pi),
         other => anyhow::bail!("unknown session kind: {other}"),
     }
 }
@@ -648,6 +649,8 @@ mod tests {
         assert!(!suppress_backlog(false, Some(SessionKind::OpenCode)));
         assert!(suppress_backlog(true, Some(SessionKind::Hermes)));
         assert!(!suppress_backlog(false, Some(SessionKind::Hermes)));
+        assert!(suppress_backlog(true, Some(SessionKind::Pi)));
+        assert!(!suppress_backlog(false, Some(SessionKind::Pi)));
         assert!(!suppress_backlog(true, Some(SessionKind::Shell)));
         assert!(!suppress_backlog(false, Some(SessionKind::Claude)));
         assert!(!suppress_backlog(false, Some(SessionKind::Shell)));

@@ -224,6 +224,7 @@ body {
 /* opencode: violet, distinct from the other three agents. */
 .tab .kind-dot.opencode { background: var(--opencode, #c084fc); }
 .tab .kind-dot.hermes { background: var(--hermes, #f472b6); }
+.tab .kind-dot.pi { background: var(--warn); }
 .tab .kind-dot.shell { background: var(--accent-2); }
 .tab .kind-dot.browser { background: var(--ok, #3fb950); }
 /* editor pane — app-local like a browser pane, distinct hue */
@@ -234,6 +235,7 @@ body {
 .tab .kind-dot.codex-retrying { background: var(--codex, #3dd68c); animation: pulse 1.2s ease-in-out infinite; }
 .tab .kind-dot.opencode-retrying { background: var(--opencode, #c084fc); animation: pulse 1.2s ease-in-out infinite; }
 .tab .kind-dot.hermes-retrying { background: var(--hermes, #f472b6); animation: pulse 1.2s ease-in-out infinite; }
+.tab .kind-dot.pi-retrying { background: var(--warn); animation: pulse 1.2s ease-in-out infinite; }
 /* claude gave up / user quit — pane is a plain shell now (gray) */
 .tab .kind-dot.shell-fallback { background: var(--text-faint); }
 /* parked by a freeze grace — claude killed to free RAM, resumable (cyan) */
@@ -337,6 +339,8 @@ body {
 .pane-header .kind-dot.codex { background: var(--codex, #3dd68c); }
 .pane-header .kind-dot.opencode { background: var(--opencode, #c084fc); }
 .pane-header .kind-dot.hermes { background: var(--hermes, #f472b6); }
+.pane-header .kind-dot.pi { background: var(--warn); }
+.pane-header .kind-dot.pi-retrying { background: var(--warn); animation: pulse 1.2s ease-in-out infinite; }
 .pane-header .kind-dot.shell { background: var(--accent-2); }
 /* app-local web viewer (green) */
 .pane-header .kind-dot.browser { background: var(--ok, #3fb950); }
@@ -927,6 +931,7 @@ body {
 .session-row .kind-dot.codex { background: var(--codex, #3dd68c); }
 .session-row .kind-dot.opencode { background: var(--opencode, #c084fc); }
 .session-row .kind-dot.hermes { background: var(--hermes, #f472b6); }
+.session-row .kind-dot.pi { background: var(--warn); }
 /* min-width:0 so the ellipsis below has something to clamp against. */
 .session-main { display: flex; flex-direction: column; min-width: 0; }
 .session-name, .session-sub { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

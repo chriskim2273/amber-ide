@@ -6,9 +6,9 @@ import { Browser } from './Browser'
 import type { EditorApi } from './Editor'
 import { paneRects, handles, nextPaneInDirection, focusCandidates, ratioAt, leaves, type Node, type Rect, type Zone, type FocusDir } from './layout'
 import { appChord, chordLabel } from './keys'
-import { paneDot, parkedOverlayText, shouldHintTerminalFocus, shouldResumeMemoryParked } from './store'
+import { isAgentKind, paneDot, parkedOverlayText, shouldHintTerminalFocus, shouldResumeMemoryParked } from './store'
 import { ParkedOverlay } from './PressureBanners'
-import { reloadAgentCommand } from './reloadAgent'
+import { reloadAgentCommand, reloadAgentVisibility } from './reloadAgent'
 // CodeMirror + marked (the editor's whole dependency graph) load LAZILY: they
 // are the largest single block in the bundle but matter only when an editor
 // pane actually mounts. A static import here made every app start pay for
@@ -24,12 +24,12 @@ export interface PaneMeta { kind: string; title: string; cwd: string; runState?:
 /** Which agent binary a pane's recorded conversation id belongs to. Explicit
  *  agent kinds map to themselves; a shell pane with a recorded id got it from a
  *  hand-started claude (the global SessionStart hook), so it stays claude. */
-export function agentOf(kind: string): 'claude' | 'grok' | 'codex' | 'opencode' | 'hermes' {
-  if (kind === 'grok' || kind === 'codex' || kind === 'opencode' || kind === 'hermes') return kind
+export function agentOf(kind: string): 'claude' | 'grok' | 'codex' | 'opencode' | 'hermes' | 'pi' {
+  if (kind === 'grok' || kind === 'codex' || kind === 'opencode' || kind === 'hermes' || kind === 'pi') return kind
   return 'claude'
 }
 
-export type PaneKind = 'shell' | 'claude' | 'grok' | 'codex' | 'opencode' | 'hermes' | 'browser' | 'editor'
+export type PaneKind = 'shell' | 'claude' | 'grok' | 'codex' | 'opencode' | 'hermes' | 'pi' | 'browser' | 'editor'
 
 // Compact memory label from resident KiB: "0" hidden by the caller; MB up to
 // ~1 GB, then GB with one decimal. Display-only.
@@ -764,9 +764,9 @@ export function SplitView(props: {
                 {!noTerm &&
                   <button className="icon-btn" aria-label="refresh pane" title="force refresh (rebuild the terminal from the daemon)"
                     onClick={() => setRebuild((r) => ({ ...r, [paneId]: (r[paneId] ?? 0) + 1 }))}>⟳</button>}
-                {!noTerm && meta?.claudeId &&
+                {!noTerm && meta && isAgentKind(meta.kind) && reloadAgentVisibility(agentOf(meta.kind), meta.claudeId ?? null).show &&
                   <button className="icon-btn" aria-label={`reload ${agentOf(meta.kind)} session`}
-                    title={`reload ${agentOf(meta.kind)} — resume this conversation`}
+                    title={`reload ${agentOf(meta.kind)} — ${meta.claudeId ? 'resume this conversation' : 'pick a session'}`}
                     onClick={() => setReloadPane(paneId)}>↺{agentOf(meta.kind)}</button>}
                 <button className="icon-btn" aria-label="split right" title="split right — choose kind"
                   onClick={(e) => openSplitPicker(paneId, 'h', e.currentTarget)}>⬌</button>
@@ -817,32 +817,37 @@ export function SplitView(props: {
                   onCommit={(note) => { freeze(paneId, note); setNotePane(null) }}
                   onCancel={() => setNotePane(null)} />}
               {/* Provider-specific resume confirmation. */}
-              {reloadPane === paneId && meta?.claudeId && !isFrozen &&
+              {reloadPane === paneId && meta && isAgentKind(meta.kind) && !isFrozen && (() => {
+                const visibility = reloadAgentVisibility(agentOf(meta.kind), meta.claudeId ?? null)
+                return (
                 <div className="reload-claude-prompt" role="dialog" aria-label={`reload ${agentOf(meta.kind)}`}>
                   <div className="reload-claude-title">Reload {agentOf(meta.kind)} in this pane?</div>
                   <div className="reload-claude-sub">Clears the current line, then runs <code>{
                     meta.kind === 'codex' ? 'codex resume'
                       : meta.kind === 'opencode' ? 'opencode -s'
                         : meta.kind === 'hermes' ? 'hermes --resume'
+                        : meta.kind === 'pi' ? 'pi --session'
                         : `${agentOf(meta.kind)} --resume`
                   }</code>.</div>
                   <div className="reload-claude-actions">
-                    <button className="btn btn-accent" onClick={() => reloadClaude(paneId, meta.claudeId ?? null, meta.kind)}>
-                      Resume saved <span className="reload-id">{meta.claudeId!.slice(0, 8)}…</span>
-                    </button>
-                    <button className="btn" onClick={() => reloadClaude(paneId, null, meta.kind)}
+                    {visibility.resumeSaved && meta.claudeId && <button className="btn btn-accent" onClick={() => reloadClaude(paneId, meta.claudeId ?? null, meta.kind)}>
+                      Resume saved <span className="reload-id">{meta.claudeId.slice(0, 8)}…</span>
+                    </button>}
+                    {visibility.pickSession && <button className="btn" onClick={() => reloadClaude(paneId, null, meta.kind)}
                       title={
                         meta.kind === 'grok' ? "resumes the most recent conversation in this folder"
                           : meta.kind === 'codex' ? "opens codex's session picker"
                             : meta.kind === 'opencode' ? "starts a fresh OpenCode session"
                               : meta.kind === 'hermes' ? "starts a fresh Hermes session"
+                              : meta.kind === 'pi' ? "opens Pi's session picker"
                               : "opens claude's own session list"
                       }>
                       Pick session…
-                    </button>
+                    </button>}
                     <button className="btn btn-ghost" onClick={() => setReloadPane(null)}>Cancel</button>
                   </div>
-                </div>}
+                </div>
+                )})()}
               {/* Frozen (parked) overlay — reuses the dead-overlay visual language.
                   Intercepts ALL pointer events, so the terminal underneath is
                   unclickable (it stays MOUNTED and streaming). Suppressed when the
@@ -891,7 +896,7 @@ export function SplitView(props: {
           return (
             <div className="ctx-menu" role="menu" aria-label={dir === 'h' ? 'split right as' : 'split down as'}
               style={{ left: x, top: y }} onMouseDown={(e) => e.stopPropagation()}>
-              {(['shell', 'claude', 'grok', 'codex', 'opencode', 'hermes', 'browser', 'editor'] as const).map((k) => (
+              {(['shell', 'claude', 'grok', 'codex', 'opencode', 'hermes', 'pi', 'browser', 'editor'] as const).map((k) => (
                 <button key={k} className="ctx-item" role="menuitem"
                   onClick={run(() => props.onSplit(paneId, dir, k))}>{k}</button>
               ))}

@@ -90,6 +90,19 @@ describe('proto', () => {
     expect(roundtrip(f)).toEqual(f)
   })
 
+  it('parses a Pi session fixture from the daemon wire', () => {
+    const frame = decodeControlJson('{"Sessions":{"sessions":[{"name":"amber-1-1-0-pi","cwd":"/tmp","kind":"pi","alive":true}]}}')
+    expect(frame).toEqual({
+      type: 'control',
+      msg: { kind: 'Sessions', sessions: [{ name: 'amber-1-1-0-pi', cwd: '/tmp', kind: 'pi', alive: true }] },
+    })
+  })
+
+  it('rejects a session with an unknown daemon kind from the wire', () => {
+    expect(() => decodeControlJson('{"Sessions":{"sessions":[{"name":"amber-1-1-0-x","cwd":"/tmp","kind":"unknown","alive":true}]}}'))
+      .toThrow(/session kind/)
+  })
+
   it('roundtrips an Activity control frame (daemon -> app)', () => {
     const f: Frame = { type: 'control', msg: { kind: 'Activity', name: 'amber-1-1-0-a' } }
     expect(roundtrip(f)).toEqual(f)

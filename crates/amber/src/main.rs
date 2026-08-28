@@ -129,7 +129,7 @@ enum Command {
     Run {
         name: String,
         /// Which agent to supervise: `claude` (default), `grok`, `codex`,
-        /// `opencode`, or `hermes`. Passed by the daemon rather than read from the store,
+        /// `opencode`, `hermes`, or `pi`. Passed by the daemon rather than read from the store,
         /// which the spawn races.
         #[arg(long, default_value = "claude")]
         kind: String,
@@ -145,7 +145,7 @@ enum Command {
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<OsString>,
     },
-    /// Session hook target invoked by claude/codex/opencode/hermes; records the
+    /// Session hook target invoked by claude/codex/opencode/hermes/pi; records the
     /// session id from stdin (`AMBER_SESSION`/`AMBER_STATE_DIR` env, spec §6.2).
     Hook,
     /// Print a read-only Claude-session handoff for the current Codex session.
@@ -185,7 +185,7 @@ fn parse_slot(value: &str) -> Result<u32, String> {
 
 #[derive(Subcommand)]
 enum CtlAction {
-    /// Resolve agent binaries (claude, grok, codex, opencode, hermes) via your
+    /// Resolve agent binaries (claude, grok, codex, opencode, hermes, pi) via your
     /// login shell and record them in config (the distribution-safe path —
     /// never the daemon's own PATH; spec §8).
     Doctor {
@@ -274,6 +274,8 @@ enum CtlAction {
     InstallCodexSkill,
     #[command(hide = true)]
     PurgeCodexSkill,
+    /// Install or repair Amber's global Pi session-id extension.
+    InstallPiExtension,
 }
 
 /// `$XDG_STATE_HOME/amber-ide`, falling back to `$HOME/.local/state/amber-ide`.
@@ -360,6 +362,7 @@ fn main() -> anyhow::Result<()> {
             CtlAction::Web { action, port, json, root } => run_ctl_web(action, port, json, root),
             CtlAction::InstallCodexSkill => run_install_codex_skill(),
             CtlAction::PurgeCodexSkill => run_purge_codex_skill(),
+            CtlAction::InstallPiExtension => run_install_pi_extension(),
         },
     }
 }
@@ -372,7 +375,7 @@ fn run_doctor(root: Option<PathBuf>) -> anyhow::Result<()> {
     std::fs::create_dir_all(&root)?;
     let store = StateStore::new(&root);
 
-    // grok/codex/opencode/hermes are optional: a machine with only claude installed is
+    // grok/codex/opencode/hermes/pi are optional: a machine with only claude installed is
     // a working amber, so a missing optional agent is reported but never fails
     // the doctor.
     if let Some(path) = amber::grok::resolve_grok() {
@@ -407,6 +410,14 @@ fn run_doctor(root: Option<PathBuf>) -> anyhow::Result<()> {
         println!("hermes: {} (recorded in config)", path.display());
     } else {
         println!("hermes: not found via your login shell (hermes panes will fall back to a shell)");
+    }
+    if let Some(path) = amber::pi::resolve_pi() {
+        let mut cfg = store.load_config()?;
+        cfg.pi_path = Some(path.clone());
+        store.save_config(&cfg)?;
+        println!("pi:     {} (recorded in config)", path.display());
+    } else {
+        println!("pi:     not found via your login shell (pi panes will fall back to a shell)");
     }
 
     match claude::resolve_claude() {
@@ -457,6 +468,12 @@ fn run_purge_codex_skill() -> anyhow::Result<()> {
         amber::codex_skill::RemoveOutcome::Missing => {}
         amber::codex_skill::RemoveOutcome::Conflict => codex_skill_conflict_warning(),
     }
+    Ok(())
+}
+
+fn run_install_pi_extension() -> anyhow::Result<()> {
+    let path = amber::pi::install_global_pi_extension()?;
+    println!("installed {}", path.display());
     Ok(())
 }
 
@@ -1174,6 +1191,12 @@ fn run_daemon(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Result<
     cgroups.set_session_high_kb(config.memory.session_high_kb(budget_kb));
     let memory_config = config.memory.clone();
     let pressure_config = config.pressure.clone();
+    let refresh_pi_extension = config.pi_path.as_ref().is_some_and(|path| path.exists())
+        || amber::pi::resolve_pi().is_some()
+        || StateStore::new(&root)
+            .list_sessions()?
+            .iter()
+            .any(|meta| meta.kind == amber_core::state::SessionKind::Pi);
     let manager = Arc::new(
         SessionManager::new_with_cgroups(&root, config, cgroups)?
             .with_socket(socket_path.clone())
@@ -1191,6 +1214,9 @@ fn run_daemon(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Result<
         amber::codex::ensure_global_codex_hook(&hook);
         amber::opencode::ensure_global_opencode_plugin();
         if let Some(path) = amber::hermes::resolve_hermes() { amber::hermes::ensure_global_hermes_plugin(&path); }
+    }
+    if refresh_pi_extension {
+        amber::pi::ensure_global_pi_extension();
     }
     manager.restore()?;
 
