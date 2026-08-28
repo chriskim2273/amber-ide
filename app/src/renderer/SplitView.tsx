@@ -31,6 +31,13 @@ export function agentOf(kind: string): 'claude' | 'grok' | 'codex' | 'opencode' 
 
 export type PaneKind = 'shell' | 'claude' | 'grok' | 'codex' | 'opencode' | 'hermes' | 'pi' | 'browser' | 'editor'
 
+// The window listener below dismisses an open context menu on an outside
+// pointer press. React delivers `click` only after `pointerdown`; treating a
+// press on a menu row as outside would unmount that row before its action ran.
+export function shouldDismissContextMenu(target: EventTarget | null): boolean {
+  return !(target instanceof Element && target.closest('.ctx-menu'))
+}
+
 // Compact memory label from resident KiB: "0" hidden by the caller; MB up to
 // ~1 GB, then GB with one decimal. Display-only.
 export function fmtMem(rssKb: number): string {
@@ -403,7 +410,9 @@ export function SplitView(props: {
   // stops mousedown propagation, so clicks inside it don't reach this listener.
   useEffect(() => {
     if (!menu) return
-    const onDown = (): void => setMenu(null)
+    const onDown = (e: PointerEvent): void => {
+      if (shouldDismissContextMenu(e.target)) setMenu(null)
+    }
     const onKey = (e: KeyboardEvent): void => { if (e.key === 'Escape') setMenu(null) }
     window.addEventListener('pointerdown', onDown)
     window.addEventListener('keydown', onKey)

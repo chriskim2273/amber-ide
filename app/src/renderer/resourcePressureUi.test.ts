@@ -53,7 +53,7 @@ vi.mock('./PressureBanners', async (importOriginal) => {
 })
 
 import { ParkedOverlay, ResourcePressureBanner } from './PressureBanners'
-import { SplitView } from './SplitView'
+import { shouldDismissContextMenu, SplitView } from './SplitView'
 import type { Node } from './layout'
 
 const PANE = 'amber-1-1-0-a'
@@ -445,6 +445,19 @@ async function withFakeDom<T>(body: (dom: { container: FakeElement }) => Promise
 }
 
 describe('resource-pressure renderer UI', () => {
+  it('keeps the context menu mounted through a pointer press on a menu action', async () => {
+    await withFakeDom(async (dom) => {
+      const menu = dom.container.ownerDocument.createElement('div')
+      menu.setAttribute('class', 'ctx-menu')
+      const action = dom.container.ownerDocument.createElement('button')
+      menu.appendChild(action)
+      dom.container.appendChild(menu)
+
+      expect(shouldDismissContextMenu(action as unknown as EventTarget)).toBe(false)
+      expect(shouldDismissContextMenu(dom.container as unknown as EventTarget)).toBe(true)
+    })
+  })
+
   it('renders every critical pressure cause in the banner', () => {
     const html = renderToStaticMarkup(createElement(ResourcePressureBanner, {
       pressure: { level: 'critical', causes: ['cpu', 'io'], blocked: false },
