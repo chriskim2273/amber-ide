@@ -1,51 +1,49 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { EventEmitter, once as onceEvent } from 'node:events'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { PassThrough } from 'node:stream'
 import test from 'node:test'
 
 import {
   monitorLines,
-  peerBuildInvocation,
-  peerExecutableFromCargo,
   peerRunInvocation,
   readExactly,
+  resolvePeerExecutable,
   runWithDeadline,
+  spawnPeer,
   stageWait,
+  startPeer,
+  stopPeer,
   terminateChild,
-  waitForSuccessfulChild,
 } from './windows-pipe.mjs'
 
-test('line monitor drains inherited stdout after the direct child exits', async () => {
-  const grandchild = [
-    "const child = require('node:child_process').spawn(",
-    '  process.execPath,',
-    `  ['-e', "setTimeout(() => process.stdout.write('RELEASED'), 100)"],`,
-    "  { stdio: ['ignore', 1, 2] },",
-    ')',
-    'child.unref()',
-  ].join('\n')
-  const child = spawn(process.execPath, ['-e', grandchild], {
+test('line monitor delivers peer records and removes listeners on dispose', async () => {
+  const child = spawn(process.execPath, ['-e', "console.log('READY')"], {
     stdio: ['ignore', 'pipe', 'pipe'],
   })
   const lines = monitorLines(child)
+  const awaitClose = stageWait(onceEvent(child, 'close'))
 
   try {
-    await lines.waitFor('RELEASED')
+    await lines.waitFor('READY')
+    await awaitClose()
     assert.equal(child.exitCode, 0)
   } finally {
     lines.dispose()
-    if (child.exitCode === null && child.signalCode === null) child.kill()
   }
+  assert.equal(child.listenerCount('error'), 0)
+  assert.equal(child.listenerCount('exit'), 0)
+  assert.equal(child.listenerCount('close'), 0)
 })
 
 test('deadline finishes cleanup before rejecting the operation', async () => {
   let cleaned = false
-  const pending = new Promise(() => {})
 
   await assert.rejects(
-    runWithDeadline(pending, 10, async () => {
+    runWithDeadline(new Promise(() => {}), 10, async () => {
       await new Promise((resolve) => setTimeout(resolve, 10))
       cleaned = true
     }),
@@ -55,7 +53,7 @@ test('deadline finishes cleanup before rejecting the operation', async () => {
 })
 
 test('deadline surfaces cleanup failure instead of hiding it', async () => {
-  const cleanupError = new Error('process tree could not be reaped')
+  const cleanupError = new Error('peer could not be reaped')
   await assert.rejects(
     runWithDeadline(new Promise(() => {}), 10, async () => { throw cleanupError }),
     cleanupError,
@@ -106,210 +104,164 @@ test('line monitor reports a failed spawn when child stdio is absent', async () 
   }
 })
 
-test('child completion wait reports failed spawn when stdio is absent', async () => {
+test('Windows peer path is required and must be absolute before stat or spawn', async () => {
+  let stats = 0
+  let spawns = 0
+  const statPath = async () => {
+    stats += 1
+    return { isFile: () => true }
+  }
+  const spawnChild = () => {
+    spawns += 1
+    throw new Error('must not spawn')
+  }
+
+  await assert.rejects(
+    startPeer({ env: {}, platform: 'win32', statPath, spawnChild }),
+    /AMBER_WINDOWS_PIPE_PEER is required on Windows/,
+  )
+  await assert.rejects(
+    startPeer({
+      env: { AMBER_WINDOWS_PIPE_PEER: 'windows_pipe_peer.exe' },
+      platform: 'win32',
+      statPath,
+      spawnChild,
+    }),
+    /AMBER_WINDOWS_PIPE_PEER must be an absolute path/,
+  )
+  assert.equal(stats, 0)
+  assert.equal(spawns, 0)
+})
+
+test('Windows peer path must identify a file', async () => {
+  const executable = String.raw`C:\amber-ci\windows_pipe_peer.exe`
+  await assert.rejects(
+    resolvePeerExecutable({
+      env: { AMBER_WINDOWS_PIPE_PEER: executable },
+      platform: 'win32',
+      statPath: async () => ({ isFile: () => false }),
+    }),
+    /AMBER_WINDOWS_PIPE_PEER is not a file/,
+  )
+  await assert.rejects(
+    resolvePeerExecutable({
+      env: { AMBER_WINDOWS_PIPE_PEER: executable },
+      platform: 'win32',
+      statPath: async () => { throw Object.assign(new Error('missing'), { code: 'ENOENT' }) },
+    }),
+    /AMBER_WINDOWS_PIPE_PEER does not name an existing file/,
+  )
+})
+
+test('validated peer path is spawned directly with only the endpoint argument', async () => {
+  const executable = String.raw`C:\amber-ci\windows_pipe_peer.exe`
+  let invocation
   const child = new EventEmitter()
-  child.stdout = undefined
-  child.stderr = undefined
-  const spawnError = Object.assign(new Error('build spawn failed'), { code: 'ENOENT' })
-  const completed = waitForSuccessfulChild(child, 'test build')
-
-  queueMicrotask(() => {
-    child.emit('error', spawnError)
-    child.emit('close', -1, null)
-  })
-
-  await assert.rejects(completed, spawnError)
-})
-
-test('peer build requests Cargo JSON and direct run uses its exact artifact', () => {
-  const repoRoot = path.resolve(path.sep, 'checkout')
-  const manifest = path.join(
-    repoRoot,
-    'crates', 'amber', 'tests', 'windows_pipe_peer', 'Cargo.toml',
-  )
-  const configuredExecutable = path.join(path.sep, 'custom-target', 'host', 'peer.exe')
-
-  assert.deepEqual(
-    peerBuildInvocation({ repoRoot, cargo: 'custom-cargo' }),
-    {
-      command: 'custom-cargo',
-      args: [
-        'build', '--message-format=json', '--manifest-path', manifest,
-        '--bin', 'windows_pipe_peer',
-      ],
+  child.stdout = new PassThrough()
+  child.stderr = new PassThrough()
+  child.stdio = [null, child.stdout, child.stderr]
+  const returned = await startPeer({
+    env: { AMBER_WINDOWS_PIPE_PEER: executable },
+    platform: 'win32',
+    statPath: async () => ({ isFile: () => true }),
+    endpoint: 'amber-proof-endpoint',
+    spawnChild: (...args) => {
+      invocation = args
+      return child
     },
-  )
-  assert.deepEqual(
-    peerRunInvocation({ executable: configuredExecutable, endpoint: 'test-pipe' }),
-    {
-      command: configuredExecutable,
-      args: ['test-pipe'],
-    },
-  )
-  assert.throws(
-    () => peerRunInvocation({ endpoint: 'test-pipe' }),
-    /peer executable path is required/,
-  )
+  })
+
+  assert.equal(returned, child)
+  assert.deepEqual(peerRunInvocation({ executable, endpoint: 'amber-proof-endpoint' }), {
+    command: executable,
+    args: ['amber-proof-endpoint'],
+  })
+  assert.equal(invocation[0], executable)
+  assert.deepEqual(invocation[1], ['amber-proof-endpoint'])
+  assert.deepEqual(invocation[2].stdio, ['ignore', 'pipe', 'pipe'])
+  assert.equal(invocation[2].shell, false)
+  assert.equal(invocation[2].windowsHide, true)
+  assert.equal(path.isAbsolute(invocation[2].cwd), true)
 })
 
-test('Cargo artifact parser selects only this manifest named binary', () => {
-  const repoRoot = path.resolve(path.sep, 'checkout')
-  const manifest = path.join(
-    repoRoot,
-    'crates', 'amber', 'tests', 'windows_pipe_peer', 'Cargo.toml',
-  )
-  const executable = path.resolve(path.sep, 'cargo-target', 'custom', 'windows_pipe_peer')
-  const output = [
-    'a build tool wrote a non-JSON status line',
-    '{malformed JSON from an arbitrary tool',
-    JSON.stringify({
-      reason: 'compiler-artifact',
-      manifest_path: path.join(repoRoot, 'dependency', 'Cargo.toml'),
-      target: { name: 'windows_pipe_peer', kind: ['bin'] },
-      executable: path.resolve(path.sep, 'wrong-package', 'windows_pipe_peer'),
-    }),
-    JSON.stringify({
-      reason: 'compiler-artifact',
-      manifest_path: manifest,
-      target: { name: 'amber_core', kind: ['lib'] },
-      executable: null,
-    }),
-    JSON.stringify({
-      reason: 'compiler-artifact',
-      manifest_path: manifest,
-      target: { name: 'windows_pipe_peer', kind: ['bin'] },
-      executable,
-    }),
-    JSON.stringify({ reason: 'build-finished', success: true }),
-  ].join('\n')
-
-  assert.equal(peerExecutableFromCargo(output, { repoRoot, platform: 'linux' }), executable)
-  assert.throws(
-    () => peerExecutableFromCargo('{"reason":"build-finished","success":true}', {
-      repoRoot,
-      platform: 'linux',
-    }),
-    /did not report the windows_pipe_peer executable artifact/,
-  )
-  const relativeArtifact = JSON.stringify({
-    reason: 'compiler-artifact',
-    manifest_path: manifest,
-    target: { name: 'windows_pipe_peer', kind: ['bin'] },
-    executable: 'target/debug/windows_pipe_peer',
-  })
-  assert.throws(
-    () => peerExecutableFromCargo(relativeArtifact, { repoRoot, platform: 'linux' }),
-    /non-absolute peer executable/,
-  )
+test('harness contains no build launcher, process-tree killer, or target guess', async () => {
+  const source = await readFile(new URL('./windows-pipe.mjs', import.meta.url), 'utf8')
+  assert.doesNotMatch(source, /\bcargo\b/i)
+  assert.doesNotMatch(source, /\btaskkill(?:\.exe)?\b/i)
+  assert.doesNotMatch(source, /target[\\/]debug/i)
 })
 
-test('child cleanup terminates a directly spawned process', async () => {
-  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1_000)'], {
-    stdio: ['ignore', 'pipe', 'pipe'],
-  })
+test('direct peer spawn is terminated and observed exiting before release', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'amber-peer-lifecycle-'))
+  const script = path.join(directory, 'peer-fixture.mjs')
+  await writeFile(script, 'setInterval(() => {}, 1_000)\n')
+  const child = spawnPeer({ executable: process.execPath, endpoint: script })
 
   try {
     await onceEvent(child, 'spawn')
+    assert.equal(child.spawnfile, process.execPath)
     await terminateChild(child, 1_000)
     assert.equal(child.exitCode !== null || child.signalCode !== null, true)
+    assert.equal(child.stdout.destroyed, true)
+    assert.equal(child.stderr.destroyed, true)
   } finally {
-    if (child.exitCode === null && child.signalCode === null) child.kill()
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill()
+      await onceEvent(child, 'exit')
+    }
+    await rm(directory, { recursive: true, force: true })
   }
 })
 
-test('child cleanup releases inherited stdio even after direct child exit', async () => {
-  const script = [
-    "const child = require('node:child_process').spawn(",
-    '  process.execPath,',
-    `  ['-e', 'setTimeout(() => {}, 200)'],`,
-    "  { stdio: ['ignore', 1, 2] },",
-    ')',
-    'child.unref()',
-  ].join('\n')
-  const child = spawn(process.execPath, ['-e', script], {
+test('protocol grace permits a directly owned peer to exit without signaling', async () => {
+  const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 20)'], {
     stdio: ['ignore', 'pipe', 'pipe'],
   })
+  let kills = 0
+  const originalKill = child.kill.bind(child)
+  child.kill = (...args) => {
+    kills += 1
+    return originalKill(...args)
+  }
 
-  await onceEvent(child, 'exit')
+  await onceEvent(child, 'spawn')
+  await stopPeer(child, 500, 250)
+  assert.equal(kills, 0)
+  assert.equal(child.exitCode, 0)
+})
+
+test('failed termination keeps a known-live peer and its streams referenced', async () => {
+  const child = new EventEmitter()
+  child.pid = 4242
+  child.exitCode = null
+  child.signalCode = null
+  child.stdout = new PassThrough()
+  child.stderr = new PassThrough()
+  child.stdio = [null, child.stdout, child.stderr]
+  child.kill = () => false
+  child.unref = () => { throw new Error('live child must not be unreferenced') }
+
+  await assert.rejects(terminateChild(child, 20), /failed to terminate peer 4242/)
   assert.equal(child.stdout.destroyed, false)
-  await terminateChild(child)
-  assert.equal(child.stdout.destroyed, true)
-  assert.equal(child.stderr.destroyed, true)
+  assert.equal(child.stderr.destroyed, false)
+  assert.equal(child.listenerCount('error'), 0)
+  assert.equal(child.listenerCount('exit'), 0)
 })
 
-test('Windows cleanup uses taskkill tree and surfaces failed killer spawn', async () => {
-  const target = new EventEmitter()
-  target.pid = 4242
-  target.exitCode = null
-  target.signalCode = null
-  target.stdio = [null, new PassThrough(), new PassThrough()]
-  target.unref = () => { target.unreferenced = true }
+test('thrown termination error also clears wait listeners without releasing peer', async () => {
+  const child = new EventEmitter()
+  child.pid = 4343
+  child.exitCode = null
+  child.signalCode = null
+  child.stdout = new PassThrough()
+  child.stderr = new PassThrough()
+  child.stdio = [null, child.stdout, child.stderr]
+  const killError = Object.assign(new Error('access denied'), { code: 'EPERM' })
+  child.kill = () => { throw killError }
 
-  const killer = new EventEmitter()
-  killer.exitCode = null
-  killer.signalCode = null
-  killer.stdout = undefined
-  killer.stderr = undefined
-  killer.stdio = [null, null, null]
-  killer.unref = () => { killer.unreferenced = true }
-  const spawnError = Object.assign(new Error('taskkill spawn failed'), { code: 'ENOENT' })
-  let invocation
-  const spawnChild = (...args) => {
-    invocation = args
-    queueMicrotask(() => {
-      killer.emit('error', spawnError)
-      killer.emit('close', -1, null)
-    })
-    return killer
-  }
-
-  await assert.rejects(
-    terminateChild(target, 20, { platform: 'win32', spawnChild }),
-    spawnError,
-  )
-  assert.deepEqual(invocation, [
-    'taskkill.exe',
-    ['/PID', '4242', '/T', '/F'],
-    { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true },
-  ])
-  assert.equal(target.stdio[1].destroyed, true)
-  assert.equal(target.stdio[2].destroyed, true)
-  assert.equal(target.unreferenced, true)
-  assert.equal(killer.unreferenced, true)
-})
-
-test('Windows cleanup requires the taskkill target to be reaped', async () => {
-  const target = new EventEmitter()
-  target.pid = 4343
-  target.exitCode = null
-  target.signalCode = null
-  target.stdio = [null, new PassThrough(), new PassThrough()]
-  target.unref = () => { target.unreferenced = true }
-
-  const killer = new EventEmitter()
-  killer.pid = 4444
-  killer.exitCode = null
-  killer.signalCode = null
-  killer.stdout = new PassThrough()
-  killer.stderr = new PassThrough()
-  killer.stdio = [null, killer.stdout, killer.stderr]
-  killer.unref = () => { killer.unreferenced = true }
-  const spawnChild = () => {
-    queueMicrotask(() => {
-      killer.exitCode = 0
-      killer.emit('close', 0, null)
-    })
-    return killer
-  }
-
-  await assert.rejects(
-    terminateChild(target, 20, { platform: 'win32', spawnChild }),
-    /child 4343 did not exit within 20ms/,
-  )
-  assert.equal(target.stdio[1].destroyed, true)
-  assert.equal(target.stdio[2].destroyed, true)
-  assert.equal(target.unreferenced, true)
-  assert.equal(killer.stdout.destroyed, true)
-  assert.equal(killer.stderr.destroyed, true)
-  assert.equal(killer.unreferenced, true)
+  await assert.rejects(terminateChild(child, 20), killError)
+  assert.equal(child.stdout.destroyed, false)
+  assert.equal(child.stderr.destroyed, false)
+  assert.equal(child.listenerCount('error'), 0)
+  assert.equal(child.listenerCount('exit'), 0)
 })

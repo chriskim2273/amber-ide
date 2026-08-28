@@ -19,67 +19,32 @@ const frame = Buffer.concat([Buffer.from([0, 0, 0, body.length + 1, 0]), body])
 const sockets = new Set()
 let peer
 let peerLines
-let build
+const peerPathVariable = 'AMBER_WINDOWS_PIPE_PEER'
 
-const peerDirectory = (repoRoot) => path.join(
-  repoRoot,
-  'crates', 'amber', 'tests', 'windows_pipe_peer',
-)
-const peerManifest = (repoRoot) => path.join(peerDirectory(repoRoot), 'Cargo.toml')
-export const peerBuildInvocation = ({
-  repoRoot = repo,
-  cargo = process.env.CARGO ?? 'cargo',
-} = {}) => ({
-  command: cargo,
-  args: [
-    'build', '--message-format=json', '--manifest-path', peerManifest(repoRoot),
-    '--bin', 'windows_pipe_peer',
-  ],
-})
-export const peerExecutableFromCargo = (output, {
-  repoRoot = repo,
+export const resolvePeerExecutable = async ({
+  env = process.env,
   platform = process.platform,
+  statPath = stat,
 } = {}) => {
-  const expectedManifest = path.resolve(peerManifest(repoRoot))
-  let executable
-
-  for (const line of output.split(/\r?\n/)) {
-    // Cargo documents one JSON object per line and warns that other build
-    // tools can still write arbitrary output. Only JSON-looking lines enter
-    // the parser, and only this manifest's named binary can become the peer.
-    if (!line.startsWith('{')) continue
-    let message
-    try {
-      message = JSON.parse(line)
-    } catch {
-      continue
-    }
-    if (
-      message?.reason !== 'compiler-artifact'
-      || message?.target?.name !== 'windows_pipe_peer'
-      || !Array.isArray(message.target.kind)
-      || !message.target.kind.includes('bin')
-      || typeof message.manifest_path !== 'string'
-      || typeof message.executable !== 'string'
-      || message.executable.length === 0
-    ) continue
-
-    const actualManifest = path.resolve(message.manifest_path)
-    const sameManifest = platform === 'win32'
-      ? actualManifest.toLowerCase() === expectedManifest.toLowerCase()
-      : actualManifest === expectedManifest
-    if (!sameManifest) continue
-    if (!path.isAbsolute(message.executable)) {
-      throw new Error(`Cargo reported a non-absolute peer executable: ${message.executable}`)
-    }
-    if (executable && executable !== message.executable) {
-      throw new Error('Cargo reported multiple peer executables')
-    }
-    executable = message.executable
+  const executable = env[peerPathVariable]
+  if (typeof executable !== 'string' || executable.length === 0) {
+    throw new Error(`${peerPathVariable} is required on Windows`)
+  }
+  const platformPath = platform === 'win32' ? path.win32 : path.posix
+  if (!platformPath.isAbsolute(executable)) {
+    throw new Error(`${peerPathVariable} must be an absolute path: ${executable}`)
   }
 
-  if (!executable) {
-    throw new Error('Cargo did not report the windows_pipe_peer executable artifact')
+  let executableStat
+  try {
+    executableStat = await statPath(executable)
+  } catch (error) {
+    throw new Error(`${peerPathVariable} does not name an existing file: ${executable}`, {
+      cause: error,
+    })
+  }
+  if (!executableStat.isFile()) {
+    throw new Error(`${peerPathVariable} is not a file: ${executable}`)
   }
   return executable
 }
@@ -91,6 +56,29 @@ export const peerRunInvocation = ({
     throw new Error('peer executable path is required')
   }
   return { command: executable, args: [targetEndpoint] }
+}
+export const spawnPeer = ({
+  executable,
+  endpoint: targetEndpoint = endpoint,
+  spawnChild = spawn,
+} = {}) => {
+  const spec = peerRunInvocation({ executable, endpoint: targetEndpoint })
+  return spawnChild(spec.command, spec.args, {
+    cwd: repo,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    shell: false,
+    windowsHide: true,
+  })
+}
+export const startPeer = async ({
+  env = process.env,
+  platform = process.platform,
+  statPath = stat,
+  endpoint: targetEndpoint = endpoint,
+  spawnChild = spawn,
+} = {}) => {
+  const executable = await resolvePeerExecutable({ env, platform, statPath })
+  return spawnPeer({ executable, endpoint: targetEndpoint, spawnChild })
 }
 
 const abortReason = (signal) => (
@@ -281,38 +269,6 @@ export const monitorLines = (child) => {
     }
   }
 }
-export const waitForSuccessfulChild = (child, label) => new Promise((resolve, reject) => {
-  let childError
-  let output = ''
-  let errors = ''
-  const onError = (error) => { childError = error }
-  const onStdout = (chunk) => { output += chunk }
-  const onStderr = (chunk) => { errors += chunk }
-  const cleanup = () => {
-    child.off('error', onError)
-    child.off('close', onClose)
-    child.stdout?.off('data', onStdout)
-    child.stderr?.off('data', onStderr)
-  }
-  const onClose = (code, signal) => {
-    cleanup()
-    if (childError) {
-      reject(childError)
-    } else if (code !== 0) {
-      reject(new Error(`${label} failed (code ${code}, signal ${signal}): ${errors}`))
-    } else {
-      resolve({ stdout: output, stderr: errors })
-    }
-  }
-
-  // A failed spawn may not provide stdio, so handle the process error first.
-  child.on('error', onError)
-  child.once('close', onClose)
-  child.stdout?.setEncoding('utf8')
-  child.stderr?.setEncoding('utf8')
-  child.stdout?.on('data', onStdout)
-  child.stderr?.on('data', onStderr)
-})
 export const runWithDeadline = (operation, ms, onTimeout) => new Promise((resolve, reject) => {
   let timedOut = false
   const timer = setTimeout(async () => {
@@ -340,93 +296,98 @@ export const runWithDeadline = (operation, ms, onTimeout) => new Promise((resolv
   )
 })
 const childExited = (child) => child.exitCode !== null || child.signalCode !== null
-export const releaseChild = (child) => {
-  if (!child) return
-  const streams = child.stdio ?? [child.stdin, child.stdout, child.stderr]
-  for (const stream of new Set(streams)) stream?.destroy?.()
-  child.unref?.()
+const peerExitTimeout = (child, ms) => Object.assign(
+  new Error(`peer ${child.pid ?? '<unknown>'} did not exit within ${ms}ms`),
+  { code: 'ERR_AMBER_PEER_EXIT_TIMEOUT' },
+)
+const releaseExitedChild = (child) => {
+  if (!child || childExited(child) || child.pid === undefined) {
+    const streams = child?.stdio ?? [child?.stdin, child?.stdout, child?.stderr]
+    for (const stream of new Set(streams)) stream?.destroy?.()
+    return
+  }
+  throw new Error(`refusing to release live peer ${child.pid}`)
 }
-const waitForChildExit = (child, ms) => new Promise((resolve, reject) => {
+const waitForChildExit = (child, ms, signal) => new Promise((resolve, reject) => {
   if (childExited(child)) {
     resolve()
     return
   }
-  const timer = setTimeout(() => {
-    cleanup()
-    reject(new Error(`child ${child.pid ?? '<unknown>'} did not exit within ${ms}ms`))
-  }, ms)
-  const onError = (error) => {
-    cleanup()
-    reject(error)
-  }
-  const onExit = () => {
-    cleanup()
-    resolve()
-  }
-  const cleanup = () => {
+  let settled = false
+  const finish = (callback, value) => {
+    if (settled) return
+    settled = true
     clearTimeout(timer)
     child.off('error', onError)
     child.off('exit', onExit)
+    signal?.removeEventListener('abort', onAbort)
+    callback(value)
   }
+  const timer = setTimeout(() => {
+    finish(reject, peerExitTimeout(child, ms))
+  }, ms)
+  const onError = (error) => finish(reject, error)
+  const onExit = () => finish(resolve)
+  const onAbort = () => finish(reject, abortReason(signal))
   child.once('error', onError)
   child.once('exit', onExit)
+  signal?.addEventListener('abort', onAbort, { once: true })
+  if (signal?.aborted) onAbort()
   if (childExited(child)) onExit()
 })
-export const terminateChild = async (child, ms = 2_000, {
-  platform = process.platform,
-  spawnChild = spawn,
-} = {}) => {
+export const terminateChild = async (child, ms = 2_000) => {
   if (!child) return
-  let killer
-  try {
-    if (childExited(child)) return
-    if (!Number.isInteger(child.pid) || child.pid <= 0) {
-      throw new Error('cannot terminate a live child without a process id')
-    }
+  if (childExited(child) || child.pid === undefined) {
+    releaseExitedChild(child)
+    return
+  }
 
-    const awaitExit = stageWait(waitForChildExit(child, ms))
-    if (platform === 'win32') {
-      // Microsoft documents /T as terminating the PID and its descendants;
-      // /F prevents Cargo or a compiler child from extending the harness
-      // deadline with user-mode signal handling.
-      killer = spawnChild(
-        'taskkill.exe',
-        ['/PID', String(child.pid), '/T', '/F'],
-        { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true },
-      )
-      try {
-        await runWithDeadline(
-          waitForSuccessfulChild(killer, `taskkill process tree ${child.pid}`),
-          ms,
-          async () => {
-            if (!childExited(killer)) {
-              const signaled = killer.kill()
-              if (!signaled && !childExited(killer)) {
-                throw new Error(`failed to stop taskkill for child ${child.pid}`)
-              }
-            }
-            releaseChild(killer)
-          },
-        )
-      } catch (error) {
-        // The target can finish naturally between the initial state check and
-        // taskkill's PID lookup. A taskkill error is cleanup failure only if
-        // the target still needs termination.
-        if (!childExited(child)) throw error
-      }
-    } else {
-      const signaled = child.kill()
-      if (!signaled && !childExited(child)) {
-        throw new Error(`failed to signal child ${child.pid}`)
-      }
-    }
+  const waitAbort = new AbortController()
+  const awaitExit = stageWait(waitForChildExit(child, ms, waitAbort.signal))
+  let signaled
+  try {
+    signaled = child.kill()
+  } catch (error) {
+    waitAbort.abort(error)
+    throw error
+  }
+  if (!signaled && !childExited(child)) {
+    waitAbort.abort(new Error(`failed to terminate peer ${child.pid}`))
+    // Keep the known-live child and its stdio referenced so this failure cannot
+    // be mistaken for successful cleanup or silently outlive the harness.
+    throw new Error(`failed to terminate peer ${child.pid}`)
+  }
+  try {
     await awaitExit()
   } finally {
-    // `exit` can precede inherited stdio closure. The harness owns these pipe
-    // ends, so release them and the event-loop reference on every outcome.
-    releaseChild(killer)
-    releaseChild(child)
+    waitAbort.abort()
   }
+  releaseExitedChild(child)
+}
+export const stopPeer = async (child, ms = 2_000, gracefulMs = 250) => {
+  if (!child) return
+  if (childExited(child) || child.pid === undefined) {
+    releaseExitedChild(child)
+    return
+  }
+
+  const grace = Math.min(gracefulMs, ms)
+  try {
+    // Socket cleanup closes the protocol channels first. The standalone peer
+    // treats that EOF as shutdown, so normal and timed-out proofs can exit
+    // without an out-of-band process signal.
+    await waitForChildExit(child, grace)
+    releaseExitedChild(child)
+    return
+  } catch (error) {
+    if (childExited(child)) {
+      releaseExitedChild(child)
+      return
+    }
+    if (error?.code !== 'ERR_AMBER_PEER_EXIT_TIMEOUT') throw error
+  }
+
+  await terminateChild(child, Math.max(1, ms - grace))
 }
 
 const run = async () => {
@@ -442,47 +403,18 @@ const run = async () => {
       }
       sockets.clear()
 
-      peerLines?.dispose()
-      const failures = []
-      for (const child of [build, peer]) {
-        try {
-          await terminateChild(child)
-        } catch (error) {
-          failures.push(error)
-        }
-      }
-      if (failures.length) {
-        throw failures.length === 1
-          ? failures[0]
-          : new AggregateError(failures, 'Windows pipe harness child cleanup failed')
+      try {
+        await stopPeer(peer)
+      } finally {
+        peerLines?.dispose()
       }
     })()
     return cleanupPromise
   }
 
   try {
-    const buildSpec = peerBuildInvocation()
-    build = spawn(buildSpec.command, buildSpec.args, {
-      cwd: repo,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    })
-    const buildResult = await runWithDeadline(
-      waitForSuccessfulChild(build, 'Rust peer build'),
-      60_000,
-      cleanup,
-    )
-    const executable = peerExecutableFromCargo(buildResult.stdout)
-    const executableStat = await stat(executable)
-    if (!executableStat.isFile()) {
-      throw new Error(`Cargo peer executable artifact is not a file: ${executable}`)
-    }
-
     const operation = (async () => {
-      const peerSpec = peerRunInvocation({ executable })
-      peer = spawn(peerSpec.command, peerSpec.args, {
-        cwd: repo,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      })
+      peer = await startPeer()
       peerLines = monitorLines(peer)
       await peerLines.waitFor('READY')
 
