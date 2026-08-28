@@ -906,6 +906,14 @@ impl SessionManager {
         // deterministically in name order.
         let mut ready = Vec::new();
         for mut meta in metas {
+            if let Err(error) = Self::validate_name(&meta.name) {
+                eprintln!(
+                    "amber daemon: restore skipped session {:?}: {error}",
+                    meta.name
+                );
+                lost.push(meta.name);
+                continue;
+            }
             if meta.slot < 1 || !used.insert(meta.slot) {
                 meta.slot = alloc_slot(&used);
                 used.insert(meta.slot);
@@ -3787,6 +3795,34 @@ mod tests {
                 .windows(9)
                 .any(|w| w == b"history-a"),
             "healthy session's scrollback preloaded"
+        );
+    }
+
+    #[test]
+    fn restore_skips_windows_unsafe_persisted_session_name_before_slot_repair() {
+        let dir = tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        store
+            .write_session(&SessionMeta {
+                name: "CON".to_string(),
+                cwd: PathBuf::from("/tmp"),
+                kind: SessionKind::Shell,
+                updated: 1,
+                resume_as_claude: false,
+                run_state: None,
+                slot: 0,
+            })
+            .unwrap();
+
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        mgr.restore()
+            .expect("invalid persisted name must be skipped, not abort restore");
+
+        assert!(mgr.names().is_empty());
+        assert_eq!(
+            store.read_session("CON").unwrap().unwrap().slot,
+            0,
+            "validation happens before slot repair writes the unsafe record"
         );
     }
 

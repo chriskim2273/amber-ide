@@ -100,7 +100,9 @@ mod tests {
 
     #[test]
     fn rejects_windows_device_and_trailing_names() {
-        for name in ["CON", "aux", "a:b", "name.", "name "] {
+        for name in [
+            "CON", "aux", "COM1", "LPT9", "CON.txt", "a:b", "name.", "name ",
+        ] {
             assert!(validate_session_name(name).is_err(), "{name}");
         }
         assert!(validate_session_name("amber-1-1-0-safe").is_ok());
