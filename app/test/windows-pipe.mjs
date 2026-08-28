@@ -18,10 +18,51 @@ const frame = Buffer.concat([Buffer.from([0, 0, 0, body.length + 1, 0]), body])
 const sockets = new Set()
 let peer
 let peerLines
+let build
+
+const peerDirectory = (repoRoot) => path.join(
+  repoRoot,
+  'crates', 'amber', 'tests', 'windows_pipe_peer',
+)
+export const peerBuildInvocation = ({
+  repoRoot = repo,
+  cargo = process.env.CARGO ?? 'cargo',
+} = {}) => ({
+  command: cargo,
+  args: [
+    'build', '-q', '--manifest-path', path.join(peerDirectory(repoRoot), 'Cargo.toml'),
+    '--target-dir', path.join(peerDirectory(repoRoot), 'target'),
+  ],
+})
+export const peerRunInvocation = ({
+  repoRoot = repo,
+  platform = process.platform,
+  endpoint: targetEndpoint = endpoint,
+} = {}) => ({
+  command: path.join(
+    peerDirectory(repoRoot),
+    'target', 'debug', `windows_pipe_peer${platform === 'win32' ? '.exe' : ''}`,
+  ),
+  args: [targetEndpoint],
+})
 
 const abortReason = (signal) => (
   signal.reason instanceof Error ? signal.reason : new Error('operation aborted')
 )
+export const stageWait = (promise) => {
+  // Attach both settlement handlers now. A later deadline may abort this wait
+  // before control reaches its await site; the staged promise itself therefore
+  // always fulfills and cannot become an unhandled rejection.
+  const settlement = Promise.resolve(promise).then(
+    (value) => ({ status: 'fulfilled', value }),
+    (reason) => ({ status: 'rejected', reason }),
+  )
+  return async () => {
+    const result = await settlement
+    if (result.status === 'rejected') throw result.reason
+    return result.value
+  }
+}
 const trackSocket = (socket) => {
   sockets.add(socket)
   const onError = () => {}
@@ -35,7 +76,7 @@ const trackSocket = (socket) => {
   socket.once('close', onClose)
   return socket
 }
-const readExactly = (socket, length, signal) => new Promise((resolve, reject) => {
+export const readExactly = (socket, length, signal) => new Promise((resolve, reject) => {
   let received = Buffer.alloc(0)
   let settled = false
   const stopWaiting = () => {
@@ -155,14 +196,18 @@ export const monitorLines = (child) => {
     rejectWaiters(ended)
   }
 
-  child.stdout.setEncoding('utf8')
-  child.stderr.setEncoding('utf8')
-  child.stdout.on('data', onStdout)
-  child.stdout.on('end', onStdoutEnd)
-  child.stderr.on('data', onStderr)
+  // Register process lifecycle handlers before touching stdio. Node permits
+  // stdout/stderr to be absent when spawn itself fails.
   child.on('error', onError)
   child.on('exit', onExit)
   child.on('close', onClose)
+  const stdout = child.stdout
+  const stderr = child.stderr
+  stdout?.setEncoding('utf8')
+  stderr?.setEncoding('utf8')
+  stdout?.on('data', onStdout)
+  stdout?.on('end', onStdoutEnd)
+  stderr?.on('data', onStderr)
 
   return {
     waitFor(line) {
@@ -179,9 +224,9 @@ export const monitorLines = (child) => {
       })
     },
     dispose() {
-      child.stdout.off('data', onStdout)
-      child.stdout.off('end', onStdoutEnd)
-      child.stderr.off('data', onStderr)
+      stdout?.off('data', onStdout)
+      stdout?.off('end', onStdoutEnd)
+      stderr?.off('data', onStderr)
       child.off('error', onError)
       child.off('exit', onExit)
       child.off('close', onClose)
@@ -189,6 +234,33 @@ export const monitorLines = (child) => {
     }
   }
 }
+const waitForSuccessfulChild = (child, label) => new Promise((resolve, reject) => {
+  let childError
+  let errors = ''
+  const onError = (error) => { childError = error }
+  const onStderr = (chunk) => { errors += chunk }
+  const cleanup = () => {
+    child.off('error', onError)
+    child.off('close', onClose)
+    child.stderr?.off('data', onStderr)
+  }
+  const onClose = (code, signal) => {
+    cleanup()
+    if (childError) {
+      reject(childError)
+    } else if (code !== 0) {
+      reject(new Error(`${label} failed (code ${code}, signal ${signal}): ${errors}`))
+    } else {
+      resolve()
+    }
+  }
+
+  // A failed spawn may not provide stdio, so handle the process error first.
+  child.on('error', onError)
+  child.once('close', onClose)
+  child.stderr?.setEncoding('utf8')
+  child.stderr?.on('data', onStderr)
+})
 export const runWithDeadline = (operation, ms, onTimeout) => new Promise((resolve, reject) => {
   let timedOut = false
   const timer = setTimeout(async () => {
@@ -215,6 +287,31 @@ export const runWithDeadline = (operation, ms, onTimeout) => new Promise((resolv
     },
   )
 })
+export const terminateChild = async (child, ms = 2_000) => {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return
+
+  const exitAbort = new AbortController()
+  const exitTimer = setTimeout(
+    () => exitAbort.abort(new Error(`child did not exit within ${ms}ms`)),
+    ms,
+  )
+  try {
+    const awaitExit = stageWait(onceEvent(child, 'exit', { signal: exitAbort.signal }))
+    child.kill()
+    await awaitExit()
+  } catch {
+    // The caller still releases the child's streams and event-loop reference.
+  } finally {
+    clearTimeout(exitTimer)
+    exitAbort.abort()
+  }
+
+  if (child.exitCode === null && child.signalCode === null) {
+    child.stdout?.destroy()
+    child.stderr?.destroy()
+    child.unref()
+  }
+}
 
 const run = async () => {
   const operationAbort = new AbortController()
@@ -223,42 +320,36 @@ const run = async () => {
     if (cleanupPromise) return cleanupPromise
     cleanupPromise = (async () => {
       operationAbort.abort(reason)
-      peerLines?.dispose()
       for (const socket of sockets) {
         socket.destroy()
         socket.unref()
       }
       sockets.clear()
 
-      if (peer && peer.exitCode === null && peer.signalCode === null) {
-        const exitAbort = new AbortController()
-        const exitTimer = setTimeout(() => exitAbort.abort(), 2_000)
-        try {
-          const peerExited = onceEvent(peer, 'exit', { signal: exitAbort.signal })
-          peer.kill()
-          await peerExited
-        } catch {
-          // Cleanup continues below; abort removes the temporary event listeners.
-        } finally {
-          clearTimeout(exitTimer)
-          exitAbort.abort()
-        }
-      }
-      if (peer && peer.exitCode === null && peer.signalCode === null) {
-        peer.stdout?.destroy()
-        peer.stderr?.destroy()
-        peer.unref()
-      }
+      for (const child of [build, peer]) await terminateChild(child)
+      peerLines?.dispose()
     })()
     return cleanupPromise
   }
 
   try {
+    const buildSpec = peerBuildInvocation()
+    build = spawn(buildSpec.command, buildSpec.args, {
+      cwd: repo,
+      stdio: ['ignore', 'ignore', 'pipe'],
+    })
+    await runWithDeadline(
+      waitForSuccessfulChild(build, 'Rust peer build'),
+      60_000,
+      cleanup,
+    )
+
     const operation = (async () => {
-      const cargo = process.env.CARGO ?? 'cargo'
-      peer = spawn(cargo, [
-        'run', '-q', '--manifest-path', 'crates/amber/tests/windows_pipe_peer/Cargo.toml', '--', endpoint,
-      ], { cwd: repo, stdio: ['ignore', 'pipe', 'pipe'] })
+      const peerSpec = peerRunInvocation()
+      peer = spawn(peerSpec.command, peerSpec.args, {
+        cwd: repo,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
       peerLines = monitorLines(peer)
       await peerLines.waitFor('READY')
 
@@ -268,23 +359,27 @@ const run = async () => {
       assert.deepEqual(echoed, frame, 'Rust transport must preserve Amber frame bytes for Node')
 
       const stalled = await connect(operationAbort.signal)
-      const stalledClosed = onceEvent(stalled, 'close', { signal: operationAbort.signal })
-      const peerExited = onceEvent(peer, 'exit', { signal: operationAbort.signal })
-      const queuedRead = readExactly(
+      const awaitStalledClosed = stageWait(
+        onceEvent(stalled, 'close', { signal: operationAbort.signal }),
+      )
+      const awaitPeerExit = stageWait(
+        onceEvent(peer, 'exit', { signal: operationAbort.signal }),
+      )
+      const awaitQueuedRead = stageWait(readExactly(
         stalled,
         Buffer.byteLength('queued-before-forced-close'),
         operationAbort.signal,
-      )
+      ))
       await peerLines.waitFor('QUEUED')
-      const queued = await queuedRead
+      const queued = await awaitQueuedRead()
       assert.deepEqual(queued, Buffer.from('queued-before-forced-close'))
       // Acknowledge that Node consumed the queued bytes while its persistent
       // data listener keeps the socket flowing. This does not claim a kernel
       // read is pending; Node exposes no such synchronization point.
       active.write(Buffer.from([1]))
       await peerLines.waitFor('RELEASED')
-      await stalledClosed
-      const [exitCode] = await peerExited
+      await awaitStalledClosed()
+      const [exitCode] = await awaitPeerExit()
       assert.equal(exitCode, 0, 'Rust peer must exit cleanly after forcing peer release')
     })()
     await runWithDeadline(operation, 15_000, cleanup)

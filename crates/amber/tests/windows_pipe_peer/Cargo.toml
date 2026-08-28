@@ -4,6 +4,10 @@ version = "0.0.0"
 edition = "2024"
 publish = false
 
+[[bin]]
+name = "windows_pipe_peer"
+path = "src/main.rs"
+
 # This deliberately keeps the probe outside Amber's Cargo workspace. It must
 # validate Task 2's transport before unrelated Unix-only application modules
 # become Windows-portable.
