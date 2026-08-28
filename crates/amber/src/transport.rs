@@ -162,6 +162,13 @@ mod imp {
 
     struct Pipe {
         handle: Mutex<Option<OwnedHandle>>,
+        role: PipeRole,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum PipeRole {
+        Server,
+        Client,
     }
 
     #[derive(Clone)]
@@ -172,15 +179,22 @@ mod imp {
 
     impl LocalListener {
         pub fn accept(&self) -> io::Result<LocalStream> {
+            let next = self.config.create_instance(false)?;
             let handle =
                 self.pending.lock().unwrap().take().ok_or_else(|| {
                     io::Error::new(io::ErrorKind::BrokenPipe, "listener is closed")
                 })?;
-            connect_instance(handle.as_raw_handle())?;
-            let next = self.config.create_instance(false)?;
+            if let Err(error) = connect_instance(handle.as_raw_handle()) {
+                // Do not strand the listener after a failed/stale accept. The
+                // replacement is a fresh listening instance; drop the failed
+                // one rather than handing a stale connection to the next call.
+                *self.pending.lock().unwrap() = Some(next);
+                return Err(error);
+            }
             *self.pending.lock().unwrap() = Some(next);
             Ok(LocalStream(Arc::new(Pipe {
                 handle: Mutex::new(Some(handle)),
+                role: PipeRole::Server,
             })))
         }
     }
@@ -215,6 +229,7 @@ mod imp {
         }
         Ok(LocalStream(Arc::new(Pipe {
             handle: Mutex::new(Some(unsafe { OwnedHandle::from_raw_handle(handle) })),
+            role: PipeRole::Client,
         })))
     }
 
@@ -257,8 +272,8 @@ mod imp {
     }
 
     impl LocalWriter {
-        /// Force a named-pipe disconnect and then close Amber's raw handle.
-        /// This deliberately bypasses the interprocess linger/flush drop path.
+        /// A server force-disconnects its peer; a client simply closes its own
+        /// handle. Both paths bypass the interprocess linger/flush drop path.
         pub fn shutdown(&mut self) -> io::Result<()> {
             self.0.shutdown()?;
             Ok(())
@@ -284,19 +299,21 @@ mod imp {
         }
 
         fn write(&self, buf: &[u8]) -> io::Result<usize> {
-            self.with_retry(|handle| unsafe {
-                let mut written = 0_u32;
-                if WriteFile(
-                    handle,
-                    buf.as_ptr(),
-                    buf.len().try_into().unwrap_or(u32::MAX),
-                    &mut written,
-                    std::ptr::null_mut(),
-                ) == 0
-                {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(written as usize)
+            retry_nonblocking_write(!buf.is_empty(), || {
+                self.with_retry(|handle| unsafe {
+                    let mut written = 0_u32;
+                    if WriteFile(
+                        handle,
+                        buf.as_ptr(),
+                        buf.len().try_into().unwrap_or(u32::MAX),
+                        &mut written,
+                        std::ptr::null_mut(),
+                    ) == 0
+                    {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(written as usize)
+                })
             })
         }
 
@@ -328,10 +345,12 @@ mod imp {
         fn shutdown(&self) -> io::Result<()> {
             let handle = self.handle.lock().unwrap().take();
             if let Some(handle) = handle {
-                let raw = handle.as_raw_handle();
-                let disconnected = unsafe { DisconnectNamedPipe(raw) } != 0;
-                if !disconnected && unsafe { GetLastError() } != ERROR_PIPE_NOT_CONNECTED {
-                    return Err(io::Error::last_os_error());
+                if self.role == PipeRole::Server {
+                    let raw = handle.as_raw_handle();
+                    let disconnected = unsafe { DisconnectNamedPipe(raw) } != 0;
+                    if !disconnected && unsafe { GetLastError() } != ERROR_PIPE_NOT_CONNECTED {
+                        return Err(io::Error::last_os_error());
+                    }
                 }
                 drop(handle); // OwnedHandle => direct CloseHandle; no linger/flush.
             }
@@ -405,10 +424,21 @@ mod imp {
     fn connect_instance(handle: windows_sys::Win32::Foundation::HANDLE) -> io::Result<()> {
         loop {
             if unsafe { ConnectNamedPipe(handle, std::ptr::null_mut()) } != 0 {
-                return Ok(());
+                // In PIPE_NOWAIT mode this resets a disconnected instance to
+                // listening; it is not an accepted client connection.
+                continue;
             }
             match unsafe { GetLastError() } {
                 ERROR_PIPE_CONNECTED => return Ok(()),
+                ERROR_NO_DATA => {
+                    // A client closed before accept. Microsoft requires the
+                    // server to disconnect before reconnecting this instance.
+                    if unsafe { DisconnectNamedPipe(handle) } == 0
+                        && unsafe { GetLastError() } != ERROR_PIPE_NOT_CONNECTED
+                    {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
                 error if error == windows_sys::Win32::Foundation::ERROR_PIPE_LISTENING => {
                     thread::sleep(Duration::from_millis(1));
                 }
@@ -460,7 +490,44 @@ mod imp {
     }
 }
 
+/// Retry the only successful-but-no-progress result possible for a nonblocking
+/// byte-mode named-pipe write. `WriteFile` may report `TRUE, 0` when no buffer
+/// space is available; a positive short write is intentionally returned so
+/// `Write::write_all` preserves the remaining bytes. Sleeping prevents a busy
+/// spin; higher-level client-write deadlines remain Task 3 policy.
+#[cfg(any(windows, test))]
+fn retry_nonblocking_write(
+    nonempty: bool,
+    mut write_once: impl FnMut() -> io::Result<usize>,
+) -> io::Result<usize> {
+    loop {
+        match write_once()? {
+            0 if nonempty => std::thread::sleep(std::time::Duration::from_millis(1)),
+            written => return Ok(written),
+        }
+    }
+}
+
 pub use imp::{bind, connect, LocalListener, LocalReader, LocalStream, LocalWriter};
 
 #[cfg(unix)]
 pub use imp::test_pair;
+
+#[cfg(test)]
+#[test]
+fn nonblocking_write_retries_zero_progress_without_losing_partial_progress() {
+    let mut results = [Ok(0), Ok(3)].into_iter();
+    assert!(matches!(
+        retry_nonblocking_write(true, || results.next().expect("retry called")),
+        Ok(3)
+    ));
+
+    let mut partial = [Ok(2)].into_iter();
+    assert!(
+        matches!(
+            retry_nonblocking_write(true, || partial.next().expect("one write")),
+            Ok(2)
+        ),
+        "a short successful write is returned for Write::write_all to continue"
+    );
+}

@@ -78,6 +78,7 @@ fn named_pipe_accepts_two_clients_and_releases_a_stalled_peer() {
     let endpoint = PathBuf::from(format!("amber-windows-pipe-{stamp}"));
     let listener = transport::bind(&endpoint).unwrap();
     let (write_queued, queued) = mpsc::channel();
+    let (reader_pending, reader_started) = mpsc::channel();
     let (permit_shutdown, wait_for_shutdown) = mpsc::channel();
     let server = thread::spawn(move || {
         let mut first = listener.accept().unwrap();
@@ -94,6 +95,7 @@ fn named_pipe_accepts_two_clients_and_releases_a_stalled_peer() {
         let (_reader, mut writer) = second.into_split().unwrap();
         writer.write_all(b"queued-before-forced-close").unwrap();
         write_queued.send(()).unwrap();
+        reader_started.recv().unwrap();
         wait_for_shutdown.recv().unwrap();
         writer.shutdown().unwrap();
     });
@@ -106,25 +108,64 @@ fn named_pipe_accepts_two_clients_and_releases_a_stalled_peer() {
         .unwrap();
     let stalled = transport::connect(&endpoint).unwrap();
     queued.recv().unwrap();
-    thread::sleep(Duration::from_millis(20));
-    permit_shutdown.send(()).unwrap();
-    server.join().unwrap();
 
     let (released, result) = mpsc::channel();
     thread::spawn(move || {
         let mut stalled = stalled;
-        let mut seen = Vec::new();
         let mut bytes = [0_u8; 64];
-        loop {
-            match stalled.read(&mut bytes) {
-                Ok(0) => break released.send(Ok(seen)),
-                Ok(count) => seen.extend_from_slice(&bytes[..count]),
-                Err(error) => break released.send(Err(error)),
-            }
-        }
+        let queued = stalled.read(&mut bytes).unwrap();
+        assert_eq!(&bytes[..queued], b"queued-before-forced-close");
+        // The first read consumed the earlier output. This signal precedes the
+        // second read, which must remain blocked until server shutdown.
+        reader_pending.send(()).unwrap();
+        released.send(stalled.read(&mut bytes)).unwrap();
     });
+    reader_pending.recv().unwrap();
+    thread::sleep(Duration::from_millis(20));
     assert!(
-        result.recv_timeout(Duration::from_secs(2)).is_ok(),
+        result.try_recv().is_err(),
+        "reader must be pending after it consumed queued output"
+    );
+    permit_shutdown.send(()).unwrap();
+    server.join().unwrap();
+    assert!(
+        matches!(
+            result.recv_timeout(Duration::from_secs(2)),
+            Ok(Ok(0) | Err(_))
+        ),
         "forced server close did not release the stalled peer"
     );
+}
+
+/// A client can connect and close before the server calls `accept`. Windows
+/// reports `ERROR_NO_DATA` for that stale pending instance; accept must
+/// disconnect/replenish and still accept the next client.
+#[cfg(windows)]
+#[test]
+fn named_pipe_recovers_from_client_close_before_accept() {
+    use std::path::PathBuf;
+    use std::thread;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use amber::transport;
+
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let endpoint = PathBuf::from(format!("amber-windows-stale-pipe-{stamp}"));
+    let listener = transport::bind(&endpoint).unwrap();
+    let stale = transport::connect(&endpoint).unwrap();
+    let (_reader, mut writer) = stale.into_split().unwrap();
+    writer.shutdown().unwrap(); // Client role closes only its own raw handle.
+
+    let server = thread::spawn(move || listener.accept());
+    thread::sleep(Duration::from_millis(20));
+    let fresh = transport::connect(&endpoint).unwrap();
+    let accepted = server.join().unwrap();
+    assert!(
+        accepted.is_ok(),
+        "accept must replenish after ERROR_NO_DATA"
+    );
+    drop(fresh);
 }

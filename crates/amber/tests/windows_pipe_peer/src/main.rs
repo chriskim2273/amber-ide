@@ -49,6 +49,13 @@ fn main() -> std::io::Result<()> {
     let second = listener.accept()?;
     let (_reader, mut writer) = second.into_split()?;
     writer.write_all(b"queued-before-forced-close")?;
+    println!("QUEUED");
+    std::io::stdout().flush()?;
+
+    // The Node probe drains the queued write, leaves its reader flowing, and
+    // sends this one-byte barrier over the first client before teardown.
+    let mut barrier = [0_u8; 1];
+    first.read_exact(&mut barrier)?;
     writer.shutdown()?;
     println!("RELEASED");
     std::io::stdout().flush()

@@ -1,6 +1,6 @@
 // Windows-only Node <-> Rust named-pipe proof. It starts an isolated Rust
 // transport peer, exchanges an Amber protocol frame, then verifies that a
-// queued write followed by Rust's forced close releases a stalled Node client.
+// queued write followed by Rust's forced close releases a live Node reader.
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
@@ -67,15 +67,20 @@ try {
     assert.deepEqual(echoed, frame, 'Rust transport must preserve Amber frame bytes for Node')
 
     const stalled = await connect()
-    stalled.pause()
     const stalledClosed = once(stalled, 'close')
     const peerExited = once(peer, 'exit')
+    await waitForLine(peer, 'QUEUED')
+    const queued = await once(stalled, 'data')
+    assert.deepEqual(queued, Buffer.from('queued-before-forced-close'))
+    // The second client has consumed the queued write and remains in flowing
+    // read mode. Let Rust cross its equivalent reader-pending barrier now.
+    active.write(Buffer.from([1]))
     await waitForLine(peer, 'RELEASED')
     await stalledClosed
     const [exitCode] = await peerExited
     assert.equal(exitCode, 0, 'Rust peer must exit cleanly after forcing peer release')
   })(), 15_000)
-  console.log('PASS Node<->Rust frame, multi-client acceptance, queued-write forced release')
+  console.log('PASS Node<->Rust frame, multi-client acceptance, queued-reader forced release')
 } finally {
   for (const socket of sockets) socket.destroy()
   if (peer && peer.exitCode === null) {
