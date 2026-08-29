@@ -63,11 +63,12 @@ jobs:
       - name: Test portable core and web daemon link
         run: |
           cargo test -p amber-core
+          cargo test -p amber --lib
           cargo test -p amber --test web
       - name: Test named-pipe transport and Windows attach/pty paths
         run: |
           cargo test -p amber --test windows_pipe
-          cargo test -p amber --test windows_attach
+          cargo test -p amber --features test-support --test windows_attach
           cargo test -p amber --features test-support --test windows_pty
       - name: Setup Node LTS
         uses: actions/setup-node@v4

@@ -670,6 +670,7 @@ mod tests {
         assert_eq!(cmd, "/usr/bin/amber hook");
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolve_finds_claude_on_path() {
         let dir = tempdir().unwrap();

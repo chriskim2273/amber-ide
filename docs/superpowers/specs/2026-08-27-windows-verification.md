@@ -17,12 +17,15 @@ remain executable, not a documentation-only checklist:
 2. `cargo build -p amber --bin amber --bin amberd`, which builds both shipped
    binaries. `amberd` is a binary target in the `amber` package, not a separate
    Cargo package.
-3. `cargo test -p amber-core`, the portable `web` daemon-link target, and the
-   Windows-native `windows_pipe`, `windows_attach`, and `windows_pty` targets.
-   The pty target uses its declared `test-support` feature. We deliberately do
-   not use broad `cargo test -p amber`: several unrelated integration targets
-   use Unix sockets, Unix signals, or shell scripts. No portable target is
-   cfg-hidden to make Windows green—the portable web daemon-link suite runs.
+3. `cargo test -p amber-core` and `cargo test -p amber --lib` run the core and
+   all portable `amber` unit tests, including the Task 7 Windows ACL negative
+   tests. The portable `web` daemon-link target and the Windows-native
+   `windows_pipe`, `windows_attach`, and `windows_pty` targets run separately.
+   The attach and pty targets use their declared `test-support` feature. We
+   deliberately do not use broad `cargo test -p amber`: several unrelated
+   integration targets use Unix sockets, Unix signals, or shell scripts. Only
+   genuinely Unix-only test bodies are cfg-gated; no portable target is hidden
+   to make Windows green.
 4. Build `crates/amber/tests/windows_pipe_peer` and set
    `AMBER_WINDOWS_PIPE_PEER` to the absolute generated
    `windows_pipe_peer.exe`, then run `node app/test/windows-pipe.mjs`. This is
@@ -35,6 +38,12 @@ acknowledgement. A persistent `set_read_timeout` is a Unix-socket operation and
 correctly returns `Unsupported` for a Windows named pipe; the deadline read
 retains the same protocol coverage on both transports.
 
+`windows_attach` opens a real current-user named pipe and drives the production
+Windows attach event loop through Focus → raw Attach → Resize → Input → Detach,
+then separately proves a peer close wakes that loop. Its console-mode test seam
+uses the same RAII teardown helper as the real guard and verifies output mode is
+restored before input mode without mutating the CI console.
+
 ## Native evidence at `fc12fc6`
 
 The following fresh Windows 10/MSVC evidence was supplied before this CI gate
@@ -45,6 +54,10 @@ was added:
 - [x] The real named-pipe `set_read_timeout` behavior was identified as the
   cause of eight web daemon-link failures, rather than being suppressed or
   skipped. The fixture now uses the platform-neutral deadline API.
+- [x] Windows cross-target checking validates the amended `amber-core` tests,
+  `amber --lib`, and the feature-enabled `windows_attach` target. The one
+  state-store test that requires Unix permission bits is cfg-gated; all other
+  portable tests remain in the native library gate.
 - [ ] Run the amended `web` suite natively.
 - [ ] Run the complete mandatory GitHub Actions `rust-windows` job at or after
   the commit containing this document.

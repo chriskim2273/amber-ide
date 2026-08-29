@@ -651,17 +651,47 @@ impl ConsoleModeGuard {
 #[cfg(windows)]
 impl Drop for ConsoleModeGuard {
     fn drop(&mut self) {
-        unsafe {
-            let _ = windows_sys::Win32::System::Console::SetConsoleMode(
-                self.output,
-                self.output_original,
-            );
-            let _ = windows_sys::Win32::System::Console::SetConsoleMode(
-                self.input,
-                self.input_original,
-            );
-        }
+        restore_console_modes(
+            self.input,
+            self.input_original,
+            self.output,
+            self.output_original,
+            |handle, mode| unsafe {
+                let _ = windows_sys::Win32::System::Console::SetConsoleMode(handle, mode);
+            },
+        );
     }
+}
+
+/// The shared RAII teardown path. Keep output first: restoring input first can
+/// let a pending key echo while the console still has altered VT output mode.
+#[cfg(windows)]
+fn restore_console_modes(
+    input: windows_sys::Win32::Foundation::HANDLE,
+    input_original: u32,
+    output: windows_sys::Win32::Foundation::HANDLE,
+    output_original: u32,
+    mut set_mode: impl FnMut(windows_sys::Win32::Foundation::HANDLE, u32),
+) {
+    set_mode(output, output_original);
+    set_mode(input, input_original);
+}
+
+#[cfg(all(windows, feature = "test-support"))]
+#[doc(hidden)]
+pub fn windows_console_restore_order_for_test(
+    input_original: u32,
+    output_original: u32,
+) -> Vec<u32> {
+    let mut restored = Vec::new();
+    restore_console_modes(
+        std::ptr::null_mut(),
+        input_original,
+        std::ptr::null_mut(),
+        output_original,
+        |_, mode| restored.push(mode),
+    );
+    restored
 }
 
 #[cfg(windows)]
@@ -789,6 +819,134 @@ fn send_windows_control(
     Ok(())
 }
 
+/// The production Windows attach loop after console setup. It owns every
+/// daemon write, including Focus, Attach, Resize, Input, and Detach.
+#[cfg(windows)]
+fn run_windows_client(
+    writer: &mut crate::transport::LocalWriter,
+    receiver: mpsc::Receiver<WindowsClientEvent>,
+    name: &str,
+    prefix: Option<u8>,
+    mut stdout: impl Write,
+    mut current_size: impl FnMut() -> (u16, u16),
+) -> anyhow::Result<ClientEnd> {
+    send_windows_control(
+        writer,
+        ControlMsg::Focus {
+            name: name.to_string(),
+        },
+    )?;
+    send_windows_control(
+        writer,
+        ControlMsg::Attach {
+            name: name.to_string(),
+            raw_client: true,
+            preview: false,
+            resume: None,
+        },
+    )?;
+    let (mut cols, mut rows) = current_size();
+    send_windows_control(
+        writer,
+        ControlMsg::Resize {
+            name: name.to_string(),
+            cols,
+            rows,
+        },
+    )?;
+    let mut prefix_armed = false;
+    loop {
+        match receiver.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(WindowsClientEvent::Stdin(Ok(bytes))) if bytes.is_empty() => {
+                return Ok(ClientEnd::StdinEof)
+            }
+            Ok(WindowsClientEvent::Stdin(Ok(bytes))) => {
+                let (to_send, detach) = match prefix {
+                    None => (bytes, false),
+                    Some(key) => {
+                        let scanned = scan_prefix(&bytes, key, prefix_armed);
+                        prefix_armed = scanned.armed;
+                        (scanned.forward, scanned.detach)
+                    }
+                };
+                if !to_send.is_empty() {
+                    writer.write_all(&proto::encode(&Frame::Data {
+                        session: name.to_string(),
+                        bytes: to_send,
+                    }))?;
+                    writer.flush()?;
+                }
+                if detach {
+                    send_windows_control(
+                        writer,
+                        ControlMsg::Detach {
+                            name: name.to_string(),
+                        },
+                    )?;
+                    return Ok(ClientEnd::Detached);
+                }
+            }
+            Ok(WindowsClientEvent::Stdin(Err(error))) => return Err(error.into()),
+            Ok(WindowsClientEvent::Frame(Frame::Data { bytes, .. })) => {
+                stdout.write_all(&bytes)?;
+                stdout.flush()?;
+            }
+            Ok(WindowsClientEvent::Frame(Frame::Control(ControlMsg::Exit {
+                name: ended,
+                code,
+            }))) if ended == name => return Ok(ClientEnd::SessionExit(code)),
+            Ok(WindowsClientEvent::Frame(Frame::Control(ControlMsg::Error { msg }))) => {
+                return Ok(ClientEnd::Rejected(msg))
+            }
+            Ok(WindowsClientEvent::Frame(_)) => {}
+            Ok(WindowsClientEvent::SocketClosed) => return Ok(ClientEnd::SocketClosed),
+            Ok(WindowsClientEvent::SocketError(error)) => return Err(anyhow::anyhow!(error)),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(ClientEnd::SocketClosed),
+        }
+        let size = current_size();
+        if size != (cols, rows) {
+            (cols, rows) = size;
+            send_windows_control(
+                writer,
+                ControlMsg::Resize {
+                    name: name.to_string(),
+                    cols,
+                    rows,
+                },
+            )?;
+        }
+    }
+}
+
+#[cfg(all(windows, feature = "test-support"))]
+#[doc(hidden)]
+pub fn run_windows_client_for_test(
+    socket: &Path,
+    name: &str,
+    prefix: Option<u8>,
+    input: mpsc::Receiver<Vec<u8>>,
+    stdout: impl Write,
+    size: (u16, u16),
+) -> anyhow::Result<ClientEnd> {
+    let stream = crate::transport::connect(socket)?;
+    let (reader, mut writer) = stream.into_split()?;
+    let (sender, receiver) = mpsc::channel();
+    let input_sender = sender.clone();
+    thread::spawn(move || {
+        while let Ok(bytes) = input.recv() {
+            if input_sender
+                .send(WindowsClientEvent::Stdin(Ok(bytes)))
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    spawn_windows_socket_reader(reader, sender);
+    run_windows_client(&mut writer, receiver, name, prefix, stdout, || size)
+}
+
 /// Windows command-line attach. Named pipes cannot be polled alongside a
 /// console handle, so independent stdin/socket readers forward events into one
 /// loop. That loop is the sole writer and the sole place that applies prefix
@@ -810,103 +968,17 @@ pub fn attach(
     let is_tty = io::stdin().is_terminal();
     let raw_guard = is_tty.then(ConsoleModeGuard::enable).transpose()?;
 
-    send_windows_control(
-        &mut writer,
-        ControlMsg::Focus {
-            name: name.to_string(),
-        },
-    )?;
-    send_windows_control(
-        &mut writer,
-        ControlMsg::Attach {
-            name: name.to_string(),
-            raw_client: true,
-            preview: false,
-            resume: None,
-        },
-    )?;
-
-    let (mut cols, mut rows) = windows_current_size();
-    send_windows_control(
-        &mut writer,
-        ControlMsg::Resize {
-            name: name.to_string(),
-            cols,
-            rows,
-        },
-    )?;
-
     let (sender, receiver) = mpsc::channel();
     spawn_windows_stdin_reader(sender.clone());
     spawn_windows_socket_reader(reader, sender);
-    let mut stdout = io::stdout();
-    let mut prefix_armed = false;
-
-    let end = loop {
-        match receiver.recv_timeout(std::time::Duration::from_millis(100)) {
-            Ok(WindowsClientEvent::Stdin(Ok(bytes))) if bytes.is_empty() => {
-                break ClientEnd::StdinEof
-            }
-            Ok(WindowsClientEvent::Stdin(Ok(bytes))) => {
-                let (to_send, detach) = match prefix {
-                    None => (bytes, false),
-                    Some(key) => {
-                        let scanned = scan_prefix(&bytes, key, prefix_armed);
-                        prefix_armed = scanned.armed;
-                        (scanned.forward, scanned.detach)
-                    }
-                };
-                if !to_send.is_empty() {
-                    writer.write_all(&proto::encode(&Frame::Data {
-                        session: name.to_string(),
-                        bytes: to_send,
-                    }))?;
-                    writer.flush()?;
-                }
-                if detach {
-                    send_windows_control(
-                        &mut writer,
-                        ControlMsg::Detach {
-                            name: name.to_string(),
-                        },
-                    )?;
-                    break ClientEnd::Detached;
-                }
-            }
-            Ok(WindowsClientEvent::Stdin(Err(error))) => return Err(error.into()),
-            Ok(WindowsClientEvent::Frame(Frame::Data { bytes, .. })) => {
-                stdout.write_all(&bytes)?;
-                stdout.flush()?;
-            }
-            Ok(WindowsClientEvent::Frame(Frame::Control(ControlMsg::Exit {
-                name: ended,
-                code,
-            }))) if ended == name => {
-                break ClientEnd::SessionExit(code);
-            }
-            Ok(WindowsClientEvent::Frame(Frame::Control(ControlMsg::Error { msg }))) => {
-                break ClientEnd::Rejected(msg);
-            }
-            Ok(WindowsClientEvent::Frame(_)) => {}
-            Ok(WindowsClientEvent::SocketClosed) => break ClientEnd::SocketClosed,
-            Ok(WindowsClientEvent::SocketError(error)) => return Err(anyhow::anyhow!(error)),
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => break ClientEnd::SocketClosed,
-        }
-
-        let size = windows_current_size();
-        if size != (cols, rows) {
-            (cols, rows) = size;
-            send_windows_control(
-                &mut writer,
-                ControlMsg::Resize {
-                    name: name.to_string(),
-                    cols,
-                    rows,
-                },
-            )?;
-        }
-    };
+    let end = run_windows_client(
+        &mut writer,
+        receiver,
+        name,
+        prefix,
+        io::stdout(),
+        windows_current_size,
+    )?;
 
     drop(raw_guard);
     match end {

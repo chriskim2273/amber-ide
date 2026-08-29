@@ -1088,6 +1088,7 @@ mod tests {
         assert!(resolve_cgroup_path(&mount, Path::new("/other/amber.service")).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn memory_high_writer_is_nonblocking() {
         use std::os::fd::AsRawFd;

@@ -1092,6 +1092,7 @@ mod tests {
         assert_eq!(args, ["--resume"]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn empty_workload_still_reclaims_a_child_that_missed_placement() {
         let mut child = Command::new("/bin/sh")
@@ -1113,12 +1114,14 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     fn reap_outside_child(child: &std::process::Child) {
         let pid = child.id() as i32;
         let mut status = 0;
         assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
     }
 
+    #[cfg(unix)]
     #[test]
     fn reclaim_try_wait_error_keeps_the_supervisor_recoverable() {
         let mut child = Command::new("/bin/true").spawn().unwrap();
@@ -1167,6 +1170,7 @@ mod tests {
         assert!(was_timely, "spawn waited on a stopped wrapper instead of the real exec boundary");
     }
 
+    #[cfg(unix)]
     #[test]
     fn reclaim_echild_without_cgroup_never_signals_the_stale_pid() {
         let mut child = Command::new("/bin/true").spawn().unwrap();
@@ -1184,6 +1188,7 @@ mod tests {
         assert!(!kill_called, "ECHILD must not signal a possibly recycled pid");
     }
 
+    #[cfg(unix)]
     #[test]
     fn cgroup_error_is_not_masked_by_an_exited_direct_child() {
         let mut child = Command::new("/bin/true").spawn().unwrap();
@@ -1207,6 +1212,7 @@ mod tests {
         assert!(!kill_called, "ECHILD must not signal a possibly recycled pid");
     }
 
+    #[cfg(unix)]
     #[test]
     fn final_wait_io_error_is_swallowed_after_reclaim() {
         let mut child = Command::new("/bin/sh")
@@ -1227,6 +1233,7 @@ mod tests {
         child.wait().unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn cgroup_cleanup_error_does_not_claim_a_safe_suspend() {
         let mut child = Command::new("/bin/sh")
@@ -1260,6 +1267,7 @@ mod tests {
         let _ = child.wait();
     }
 
+    #[cfg(unix)]
     #[test]
     fn both_suspend_signal_handlers_are_required_before_agent_launch() {
         let ctl = SuspendControl::new();
@@ -1300,6 +1308,7 @@ mod tests {
         assert_eq!(states.into_inner().unwrap(), vec!["claude-retrying"]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn initial_suspend_waits_for_resume_before_spawning_an_agent() {
         let dir = tempfile::tempdir().unwrap();
@@ -1343,6 +1352,7 @@ mod tests {
         assert!(marker.exists(), "agent did not launch after resume");
     }
 
+    #[cfg(unix)]
     #[test]
     fn dropped_run_state_ack_retries_the_same_sequence() {
         let dir = tempfile::tempdir().unwrap();
@@ -1384,6 +1394,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn legacy_daemon_without_run_state_ack_allows_shell_fallback() {
         let dir = tempfile::tempdir().unwrap();

@@ -113,7 +113,7 @@ pub fn parse_psi_avg10(row: &str) -> Option<f64> {
         .filter(|value| value.is_finite())
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(test, unix)))]
 fn parse_psi_kind(contents: &str, kind: &str) -> Option<f64> {
     contents
         .lines()

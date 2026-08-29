@@ -1694,6 +1694,7 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn committed_rename_survives_a_journal_unlink_failure() {
         use std::os::unix::fs::PermissionsExt;

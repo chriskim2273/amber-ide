@@ -2191,10 +2191,14 @@ mod tests {
     use super::*;
     use crate::cgroup::CgroupManager;
     use crate::pty::SuspendOrigin;
+    #[cfg(unix)]
     use portable_pty::CommandBuilder;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
-    use std::sync::{mpsc, Barrier, Condvar};
+    #[cfg(unix)]
+    use std::sync::mpsc;
+    use std::sync::{Barrier, Condvar};
     use tempfile::tempdir;
 
     fn with_fake_cgroups(state: &Path, cgroup_root: &Path) -> SessionManager {
@@ -2216,6 +2220,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn set_memory_budget_persists_and_moves_the_live_handle_and_leaves() {
         // The whole feature: a budget change survives (config write) AND takes
         // effect immediately (guardian handle + existing session leaves),
@@ -2266,6 +2271,7 @@ mod tests {
         assert_eq!(auto.configured_mb, None);
     }
 
+    #[cfg(unix)]
     fn wait_for_output(session: &PtySession, needle: &[u8]) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !session
@@ -2281,10 +2287,12 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn fake_agent(mgr: &SessionManager, name: &str) -> Arc<PtySession> {
         fake_agent_with_slot(mgr, name, 1)
     }
 
+    #[cfg(unix)]
     fn fake_agent_with_slot(mgr: &SessionManager, name: &str, slot: u32) -> Arc<PtySession> {
         let mut cmd = CommandBuilder::new("/bin/sh");
         cmd.arg("-c");
@@ -2373,6 +2381,7 @@ mod tests {
     /// Persist a shell session's metadata directly (no live spawn) with an
     /// unreadable scrollback file, so `restore_one` fails on the read step —
     /// a real, spawn-independent way to force a restore loss.
+    #[cfg(unix)]
     fn seed_unrestorable_session(root: &Path, name: &str) {
         let store = StateStore::new(root);
         store
@@ -2392,6 +2401,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn restore_writes_crash_report_after_unclean_shutdown_with_losses() {
         let dir = tempdir().unwrap();
         seed_unrestorable_session(dir.path(), "victim");
@@ -2406,6 +2416,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn restore_stays_silent_after_a_clean_shutdown() {
         let dir = tempdir().unwrap();
         seed_unrestorable_session(dir.path(), "victim");
@@ -2597,6 +2608,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn snapshot_skips_a_session_whose_scrollback_did_not_change() {
         // The snapshot ran every 10 s and unconditionally cloned + rewrote every
         // ring. Measured live: 18 sessions all at their 2 MiB cap = 36 MiB of
@@ -2986,6 +2998,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn create_allocates_slot_before_spawn_and_rolls_back_cgroup_on_persist_failure() {
         // If the state store is unwritable, create must error, track nothing,
         // and kill the just-spawned child rather than leaking it.
@@ -3295,6 +3308,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn deferred_metadata_does_not_follow_a_reused_name() {
         let dir = tempdir().unwrap();
         let mgr = SessionManager::new(dir.path()).unwrap();
@@ -3348,6 +3362,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn restore_does_not_spawn_when_kind_normalization_cannot_be_persisted() {
         let dir = tempdir().unwrap();
         let store = StateStore::new(dir.path());
@@ -3399,6 +3414,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn shell_fallback_and_retrying_sessions_refuse_suspend() {
         let dir = tempdir().unwrap();
         let mgr = SessionManager::new(dir.path()).unwrap();
@@ -3413,6 +3429,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn memory_suspend_tracks_pending_until_manual_override_and_resume() {
         let dir = tempdir().unwrap();
         let mgr = SessionManager::new(dir.path()).unwrap();
@@ -3434,6 +3451,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn memory_candidates_join_live_state_persisted_identity_and_charge() {
         let dir = tempdir().unwrap();
         let mgr = SessionManager::new(dir.path()).unwrap();
@@ -3465,6 +3483,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn host_pressure_candidates_ignore_output_but_protect_recent_user_input() {
         let dir = tempdir().unwrap();
         let mgr = SessionManager::new(dir.path()).unwrap();
@@ -3533,6 +3552,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn host_pressure_candidates_keep_existing_automatic_safety_exclusions() {
         let dir = tempdir().unwrap();
         let mgr = SessionManager::new(dir.path()).unwrap();
@@ -3576,6 +3596,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn automatic_pressure_suspend_rechecks_liveness_under_the_transition_lock() {
         let dir = tempdir().unwrap();
         let mgr = SessionManager::new(dir.path()).unwrap();
@@ -3596,6 +3617,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn output_waiting_on_a_saturated_subscriber_blocks_memory_suspend() {
         let dir = tempdir().unwrap();
         let mgr = SessionManager::new(dir.path()).unwrap();
@@ -3655,6 +3677,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn memory_pending_reports_the_earliest_unconfirmed_memory_suspend() {
         let dir = tempdir().unwrap();
         let mgr = SessionManager::new(dir.path()).unwrap();
@@ -3687,6 +3710,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn focus_resumes_memory_origin_but_not_manual_origin() {
         let dir = tempdir().unwrap();
         let mgr = SessionManager::new(dir.path()).unwrap();
@@ -3704,6 +3728,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn input_resumes_memory_but_is_rejected_while_manual() {
         let dir = tempdir().unwrap();
         let mgr = SessionManager::new(dir.path()).unwrap();
@@ -3725,6 +3750,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn failed_signal_restores_the_previous_origin_and_pending_clock() {
         let dir = tempdir().unwrap();
         let mgr = SessionManager::new(dir.path()).unwrap();
@@ -3752,6 +3778,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn focus_waits_for_an_in_progress_suspend_transition() {
         let dir = tempdir().unwrap();
         let mgr = Arc::new(SessionManager::new(dir.path()).unwrap());
@@ -3774,6 +3801,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn queued_focus_rechecks_identity_after_remove_finishes_teardown() {
         let dir = tempdir().unwrap();
         let mgr = Arc::new(SessionManager::new(dir.path()).unwrap());
@@ -3838,6 +3866,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn session_infos_distinguishes_memory_from_manual_suspension() {
         let dir = tempdir().unwrap();
         let mgr = SessionManager::new(dir.path()).unwrap();
@@ -4054,6 +4083,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn agent_rename_keeps_manual_suspension_parked() {
         let dir = tempdir().unwrap();
         let mgr = SessionManager::new(dir.path()).unwrap();
@@ -4075,6 +4105,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn agent_rename_keeps_memory_suspension_resumable_on_focus() {
         let dir = tempdir().unwrap();
         let mgr = SessionManager::new(dir.path()).unwrap();
@@ -4103,6 +4134,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn initial_parked_resume_waits_for_the_supervisor_ready_report() {
         let dir = tempdir().unwrap();
         let mgr = SessionManager::new(dir.path()).unwrap();
@@ -4122,6 +4154,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn focus_waits_for_the_supervisor_to_confirm_suspension() {
         let dir = tempdir().unwrap();
         let mgr = SessionManager::new(dir.path()).unwrap();
@@ -4147,6 +4180,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn terminal_reports_release_an_inherited_initial_suspension() {
         for (report, expected_state) in [
             ("shell-fallback", "shell-fallback"),
@@ -4185,6 +4219,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn ordinary_or_stale_reports_do_not_release_manual_suspension() {
         let dir = tempdir().unwrap();
         let mgr = SessionManager::new(dir.path()).unwrap();
@@ -4207,6 +4242,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn suspended_after_failed_reclaim_recovers_as_manual() {
         let dir = tempdir().unwrap();
         let mgr = SessionManager::new(dir.path()).unwrap();
@@ -4329,6 +4365,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn agent_rename_rollback_restores_the_original_suspension() {
         for (origin, started) in [(SuspendOrigin::Manual, 0), (SuspendOrigin::Pressure, 91)] {
             let dir = tempdir().unwrap();
@@ -4351,6 +4388,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn agent_rollback_recovers_committed_journal_before_reverse_rename() {
         let dir = tempdir().unwrap();
         let mgr = SessionManager::new(dir.path()).unwrap();

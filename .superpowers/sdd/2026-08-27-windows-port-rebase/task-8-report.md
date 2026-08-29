@@ -56,3 +56,39 @@ The manual checklist remains deliberately unchecked: fresh-user install, every
 agent resume, alternate-screen attach, real browser web access, logoff restore,
 and reboot restore. The verification document records these without claiming
 Linux or cross-target output as native proof.
+
+## Review follow-up: native library and attach coverage
+
+- The mandatory Windows job now executes `cargo test -p amber --lib` in
+  addition to `cargo test -p amber-core` and the explicit web integration
+  target. This makes the Task 7 Windows ACL-negative unit tests executable on
+  a real Windows runner rather than merely compilable.
+- Cross-target compilation exposed only genuinely Unix-specific library unit
+  tests: Unix permission-bit journal recovery, cgroup pipe behavior, and
+  Unix `waitpid`/signal supervision. Those exact tests are cfg-gated; portable
+  `amber` unit coverage remains in the new library gate.
+- `windows_attach` now uses a real named pipe and invokes the production
+  Windows attach event loop through Focus → Attach → Resize → Input → Detach;
+  a second case closes the accepted pipe and asserts the blocked loop returns
+  `SocketClosed`. Its test-only console boundary calls the shared RAII restore
+  helper, proving output mode restores before input mode without duplicating
+  attach logic or modifying the runner console.
+- Node setup remains before both the pipe-peer build and the Node harness, so
+  the harness cannot depend on the image's incidental Node installation.
+
+### Follow-up local evidence
+
+| Check | Result |
+| --- | --- |
+| `cargo test -p amber-core` | Pass, 116 tests |
+| `cargo test -p amber --lib` | Pass, 393 tests |
+| `cargo check -p amber-core --tests --target x86_64-pc-windows-msvc` | Pass |
+| `cargo check -p amber --lib --target x86_64-pc-windows-msvc` | Pass |
+| `cargo check -p amber --features test-support --test windows_attach --target x86_64-pc-windows-msvc` | Pass |
+
+This Linux host cannot link MSVC binaries (`link.exe` is unavailable), so
+cross-target checks do not replace native execution. The amended web suite
+must complete on the Windows runner with its normal Cargo test timeout; it is
+not skipped or given a short artificial timeout. `cargo fmt --check` remains
+blocked by unrelated repository-wide formatting drift, and the prior
+Windows-GNU DLL-tool issue remains outside this task.

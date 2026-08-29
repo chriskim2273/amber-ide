@@ -895,7 +895,9 @@ pub(crate) fn kill_process_tree(pid: u32) {
     let _ = pid;
 }
 
-#[cfg(test)]
+// These assertions drive `/bin/sh` and `cat`; `windows_pty` is the native
+// ConPTY counterpart selected explicitly by the Windows CI workflow.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use portable_pty::CommandBuilder;
