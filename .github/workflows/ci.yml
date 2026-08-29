@@ -40,6 +40,58 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  rust-windows:
+    # This must run natively: the daemon uses a current-user named pipe and
+    # ConPTY, neither of which can be exercised by Linux cross-compilation.
+    name: rust + app (windows / msvc)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+      - name: Clippy amber (deny warnings)
+        run: cargo clippy -p amber -- -D warnings
+      - name: Build daemon and CLI binaries
+        run: cargo build -p amber --bin amber --bin amberd
+      # Do not use broad `cargo test -p amber` here: it compiles integration
+      # targets that intentionally exercise Unix sockets and signals. These
+      # are the portable and Windows-native targets that the runner can prove.
+      - name: Test portable core and web daemon link
+        run: |
+          cargo test -p amber-core
+          cargo test -p amber --test web
+      - name: Test named-pipe transport and Windows attach/pty paths
+        run: |
+          cargo test -p amber --test windows_pipe
+          cargo test -p amber --test windows_attach
+          cargo test -p amber --features test-support --test windows_pty
+      - name: Setup Node LTS
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - name: Build Node pipe peer
+        run: cargo build --manifest-path crates/amber/tests/windows_pipe_peer/Cargo.toml
+      - name: Exercise Node to Rust named-pipe harness
+        shell: pwsh
+        run: |
+          $env:AMBER_WINDOWS_PIPE_PEER = (Resolve-Path 'crates/amber/tests/windows_pipe_peer/target/debug/windows_pipe_peer.exe').Path
+          node app/test/windows-pipe.mjs
+      - name: Install app dependencies
+        working-directory: app
+        run: npm ci
+      - name: Typecheck app
+        working-directory: app
+        run: npm run typecheck
+      - name: Test app with Vitest
+        working-directory: app
+        run: npx vitest run
+
   app:
     name: app (typecheck + test)
     runs-on: ubuntu-latest

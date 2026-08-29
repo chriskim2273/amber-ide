@@ -463,7 +463,7 @@ pub fn load_or_create_token(root: &Path, regenerate: bool) -> anyhow::Result<Str
         if token.is_empty() {
             anyhow::bail!("refusing an empty private web token at {}", path.display());
         }
-        return Ok(token);
+        Ok(token)
     }
 
     #[cfg(unix)]
@@ -499,7 +499,7 @@ pub fn load_token(root: &Path) -> Option<String> {
     {
         let raw = crate::platform::read_user_private(&root.join(TOKEN_FILE)).ok()??;
         let trimmed = std::str::from_utf8(&raw).ok()?.trim();
-        return (!trimmed.is_empty()).then(|| trimmed.to_string());
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
     }
 
     #[cfg(unix)]

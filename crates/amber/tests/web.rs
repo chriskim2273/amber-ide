@@ -130,12 +130,14 @@ impl Fixture {
         .unwrap();
         let mut dec = proto::Decoder::new();
         let mut buf = [0u8; 8192];
-        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             if let Some(Frame::Control(ControlMsg::Created { .. })) = dec.next_frame().unwrap() {
                 return name;
             }
-            let n = s.read(&mut buf).unwrap();
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "timed out waiting for Created");
+            let n = s.read_with_timeout(&mut buf, remaining).unwrap();
             assert!(n > 0);
             dec.feed(&buf[..n]);
         }

@@ -1692,11 +1692,6 @@ impl SessionManager {
         Ok(())
     }
 
-    #[cfg(not(unix))]
-    fn signal_supervisor(name: &str, _session: &PtySession, _signal: i32) -> anyhow::Result<()> {
-        anyhow::bail!("suspend/resume is not supported on this platform for session {name}")
-    }
-
     fn suspend_supervisor(&self, name: &str, session: &PtySession) -> anyhow::Result<()> {
         #[cfg(unix)] return Self::signal_supervisor(name, session, nix::libc::SIGUSR1);
         #[cfg(not(unix))]

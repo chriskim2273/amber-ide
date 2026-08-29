@@ -1,6 +1,6 @@
 # Project: Persistent Terminal Workspace
 
-An Electron terminal workspace app (Warp/iTerm2-style) for **macOS and Linux**
+An Electron terminal workspace app (Warp/iTerm2-style) for **macOS, Linux, and Windows**
 whose defining feature is total session persistence: every pane, tab,
 workspace, and running Claude Code conversation survives app crashes AND
 machine reboots, restored exactly as they were.
@@ -21,10 +21,11 @@ session.
 
 1. **The `amber` daemon is the single source of truth** for session existence,
    naming, cwd, scrollback, and process supervision. It owns the ptys directly
-   (`portable-pty`; ConPTY-ready for a future Windows port). One long-lived
+   (`portable-pty`, using ConPTY on Windows). One long-lived
    daemon; the app is a **disposable client** holding zero authoritative state.
    Any client (the app, or the `amber attach` CLI) connects over the daemon's
-   unix socket.
+   platform-local transport: a Unix socket on macOS/Linux and a current-user
+   named pipe on Windows.
 2. **Every app pane is its own daemon session** — one pty running exactly one
    process (`$SHELL`, or `amber run <name>` which supervises `claude`). Tabs and
    workspaces are app-level groupings encoded in the **session name**
@@ -66,14 +67,14 @@ session.
    the **login shell** and cached in config — never the daemon's own PATH (the
    original bug).
 8. **Languages:** **Rust** for the daemon and all infra binaries (one
-   dependency-free `amber` binary, static musl on Linux / universal on macOS);
+   dependency-free `amber` binary, static musl on Linux / universal on macOS /
+   native MSVC on Windows);
    **TypeScript strict** for the Electron app. No native Node addons.
 
 ## Out of scope — do not build
 
-Windows support (deferred, though `portable-pty` keeps the door open — do not
-add a Windows target without asking); floating/overlapping panes; multiplexing
-inside a session (every session stays one pty running one process); SSH
+Floating/overlapping panes; multiplexing inside a session (every session stays
+one pty running one process); SSH
 connection manager; AI chat UI; themes/settings beyond minimal.
 
 ## Stack
@@ -82,8 +83,9 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   `portable-pty`, `clap`, `nix`, `signal-hook`. No external runtime deps.
 - **App:** Electron (current stable) + electron-vite, TypeScript strict, React
   (chrome only), xterm.js + webgl addon, vitest.
-- **Protocol:** length-prefixed binary frames over a unix socket
-  (`amber-core::proto`) — control messages (serde) + raw `Data` frames.
+- **Protocol:** length-prefixed binary frames over platform-local IPC (Unix
+  sockets / Windows named pipes; `amber-core::proto`) — control messages
+  (serde) + raw `Data` frames.
 
 ## Repo layout
 
@@ -1415,6 +1417,15 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   disable, and legacy behavior. Live xvfb+CDP proof against Pi 0.84.4 covered
   both a supervised Pi pane and Pi launched manually inside a shell pane: text
   stayed as two editor lines and was not submitted.
+- [x] Windows native CI wiring (2026-08-29) — the `windows-latest` MSVC job
+  strictly clippies `amber`, builds both `amber` and `amberd`, runs the
+  portable web daemon-link test plus named-pipe/attach/ConPTY tests, builds the
+  isolated `windows_pipe_peer.exe` for the real Node ↔ Rust pipe harness, and
+  runs app typecheck + Vitest. The web fixture now uses its transport deadline
+  read instead of Unix-only persistent read timeouts. Native release proof is
+  deliberately still unchecked for fresh install, every agent resume,
+  alternate-screen attach, browser access, logoff, and reboot; see
+  `docs/superpowers/specs/2026-08-27-windows-verification.md`.
 
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**

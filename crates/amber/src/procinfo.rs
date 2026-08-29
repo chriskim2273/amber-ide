@@ -134,6 +134,7 @@ pub fn is_growing(samples: &[u64], min_growth_kb: u64, noise_kb: u64) -> bool {
     true
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn parse_memtotal_kb(meminfo: &str) -> Option<u64> {
     let fields = meminfo
         .lines()

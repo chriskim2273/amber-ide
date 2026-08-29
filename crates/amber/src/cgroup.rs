@@ -2,12 +2,14 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
+#[cfg(unix)]
 use std::process::Command;
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
+#[cfg(any(target_os = "linux", test))]
 const DAEMON_MEMORY_LOW_BYTES: u64 = 128 * 1024 * 1024;
 const DAEMON_CPU_WEIGHT: u64 = 10_000;
 const FOREGROUND_CPU_WEIGHT: u64 = 1_000;
@@ -63,6 +65,7 @@ impl Clone for CgroupManager {
 }
 
 #[derive(Debug)]
+#[cfg(any(target_os = "linux", test))]
 struct CgroupMount {
     root: PathBuf,
     mount_point: PathBuf,
@@ -159,6 +162,7 @@ impl CgroupManager {
     /// Activate the mandatory memory controller and, when delegated, the
     /// optional CPU controller. Kept path-based so fake cgroup layouts can
     /// exercise the exact activation behavior without touching `/sys`.
+    #[cfg(any(target_os = "linux", test))]
     fn activate_at(root: PathBuf, mount_point: PathBuf) -> io::Result<Self> {
         let controllers = fs::read_to_string(root.join("cgroup.controllers"))?;
         if !controllers.split_whitespace().any(|name| name == "memory") {
@@ -586,6 +590,7 @@ fn place_current(slot: u32, role: CgroupRole) -> io::Result<()> {
     write_control(&target.join("cgroup.procs"), "0")
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn placement_target(current: &Path, slot: u32, role: CgroupRole) -> Option<PathBuf> {
     let service_root = match current.file_name()?.to_str()? {
         "_daemon" => current.parent()?,
@@ -634,6 +639,7 @@ pub fn kill_workload_from_current(slot: u32) -> io::Result<Option<bool>> {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn workload_from_current(current: &Path, slot: u32) -> Option<PathBuf> {
     if current.file_name()?.to_str()? != "supervisor" {
         return None;
@@ -645,6 +651,7 @@ fn workload_from_current(current: &Path, slot: u32) -> Option<PathBuf> {
     Some(session.join("workload"))
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn parse_unified_path(body: &str) -> io::Result<PathBuf> {
     for line in body.lines() {
         let mut fields = line.splitn(3, ':');
@@ -660,6 +667,7 @@ fn parse_unified_path(body: &str) -> io::Result<PathBuf> {
     ))
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn parse_cgroup2_mount(body: &str, unified: &Path) -> io::Result<CgroupMount> {
     validate_absolute(unified)?;
     for line in body.lines() {
@@ -688,6 +696,7 @@ fn parse_cgroup2_mount(body: &str, unified: &Path) -> io::Result<CgroupMount> {
     ))
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn resolve_cgroup_path(mount: &CgroupMount, unified: &Path) -> io::Result<PathBuf> {
     validate_absolute(unified)?;
     let relative = unified.strip_prefix(&mount.root).map_err(|_| {
@@ -715,6 +724,7 @@ fn validate_absolute(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn validate_relative(path: &Path) -> io::Result<()> {
     if path
         .components()
@@ -728,6 +738,7 @@ fn validate_relative(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn decode_proc_path(value: &str) -> String {
     value
         .replace("\\040", " ")

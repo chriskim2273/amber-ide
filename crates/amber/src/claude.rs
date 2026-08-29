@@ -177,7 +177,7 @@ pub fn resolve_bin_windows(bin: &str) -> Option<PathBuf> {
     let probe = |dir: &Path| {
         extensions.iter().find_map(|extension| {
             let candidate = dir.join(format!("{bin}{extension}"));
-            candidate.is_file().then(|| candidate)
+            candidate.is_file().then_some(candidate)
         })
     };
     let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")

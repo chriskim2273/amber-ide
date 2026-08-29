@@ -648,6 +648,7 @@ fn parse_size_mb(text: &str) -> anyhow::Result<Option<u64>> {
 }
 
 /// Render MiB the way systemctl accepts MemoryHigh values (binary units).
+#[cfg(any(target_os = "linux", test))]
 fn format_mb_for_systemctl(mb: u64) -> String {
     if mb.is_multiple_of(1024 * 1024) && mb > 0 {
         format!("{}T", mb / (1024 * 1024))

@@ -6,7 +6,8 @@
 A terminal workspace (Warp/iTerm2-style) whose defining feature is **total
 session persistence**: every pane, tab, workspace, and running Claude Code
 conversation survives app crashes **and** machine reboots, restored exactly as
-they were. For **macOS and Linux**.
+they were. For **macOS, Linux, and Windows** (Windows native release
+verification is tracked explicitly below).
 
 ## Why
 
@@ -49,8 +50,9 @@ daemon (`amber`) that owns everything.
   exact recorded conversation id and falls back to a shell so a pane never
   silently dies.
 
-No tmux, no double terminal emulation. Raw pty bytes stream over a unix socket
-straight to a single xterm.js emulator.
+No tmux, no double terminal emulation. Raw pty bytes stream over a local Unix
+socket on macOS/Linux or a current-user named pipe on Windows, straight to a
+single xterm.js emulator.
 
 ## Features
 
@@ -150,6 +152,10 @@ straight to a single xterm.js emulator.
 **Platform & packaging**
 - Linux AppImage / macOS dmg via electron-builder, with the static `amber`
   binary bundled.
+- Windows is built and tested on native MSVC CI. Packaged first-run, agent
+  resume, attach full-screen behavior, browser access, logoff, and reboot
+  restore remain release-verification work; see
+  [`2026-08-27-windows-verification.md`](docs/superpowers/specs/2026-08-27-windows-verification.md).
 - First run does a **cargo-free install** — copies `amber` to `~/.local/bin`
   and writes a boot unit (systemd user unit on Linux, launchd agent on macOS).
 - Linux "Install desktop shortcut" — icon + `.desktop` entry with taskbar-pin
@@ -293,5 +299,5 @@ derivatives must stay open under the same license.
 
 ## Out of scope
 
-Windows support (deferred), floating panes, multiplexing inside a session, an
-SSH connection manager, an AI chat UI, heavy theming.
+Floating panes, multiplexing inside a session, an SSH connection manager, an
+AI chat UI, heavy theming.

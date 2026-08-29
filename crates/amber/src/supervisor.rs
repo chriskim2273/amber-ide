@@ -561,6 +561,7 @@ enum RunClass {
     /// Exited with a non-zero status code.
     Nonzero,
     /// Killed by some other signal (Unix).
+    #[cfg(unix)]
     Signaled,
     /// The child could not be launched at all (e.g. ENOENT / ETXTBSY).
     LaunchFailed,
@@ -1658,6 +1659,7 @@ mod tests {
         assert!(RunClass::Success.is_user_quit());
         assert!(RunClass::UserInterrupt.is_user_quit());
         assert!(!RunClass::Nonzero.is_user_quit());
+        #[cfg(unix)]
         assert!(!RunClass::Signaled.is_user_quit());
         assert!(!RunClass::LaunchFailed.is_user_quit());
     }
