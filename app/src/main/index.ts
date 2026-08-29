@@ -11,7 +11,12 @@ import { resolveSocketPath } from '../shared/socketPath'
 import { HANDOFF_FILE_MAX, parseHandoff } from '../shared/handoff'
 import { pathCandidates } from '../shared/pathSel'
 import { ensureDaemon, probeSocket } from './daemonBoot'
-import { resolveAmberBinary } from './amberBin'
+import {
+  resolveAmberBinary,
+  resolveAmberDaemonBinary,
+  windowsAmberPath,
+  windowsDaemonPath,
+} from './amberBin'
 import {
   renderDaemonPlist,
   launchAgentPlistPath,
@@ -24,6 +29,9 @@ import {
   restartDaemonCommand,
   AMBER_SYSTEMD_UNIT,
   linuxInstallServiceArgv,
+  windowsRunKeyCommand,
+  windowsTaskkillCommand,
+  shouldStopWindowsDaemon,
 } from './serviceManager'
 import { backoffDelay, nextAttempt } from './clientSupervisor'
 import {
@@ -52,6 +60,7 @@ import { repairAgentExtensions } from './agentSetup'
 import {
   sshTunnelArgv, sshProbeArgv, isValidHost, localSocketPath, hostLabel,
   REMOTE_SOCKET_PROBE, REMOTE_LAYOUT_PROBE, parseAgentSock, explainSshFailure,
+  isSupportedOnPlatform,
 } from './sshRemote'
 import { webCtlArgv, parseWebStatus, redactUrl, type WebStatus } from './webService'
 import { inspectLinuxInputMethod, repairLinuxInputMethod, resolveLinuxInputEnvironment } from './inputMethod'
@@ -64,6 +73,9 @@ const CLIENT_STABLE_MS = 5000
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
 function stateRoot(): string {
+  if (process.platform === 'win32') {
+    return join(process.env['LOCALAPPDATA'] ?? '.', 'amber-ide')
+  }
   const stateHome = process.env['XDG_STATE_HOME']
   return stateHome && stateHome.length > 0 ? join(stateHome, 'amber-ide')
     : join(process.env['HOME'] ?? '.', '.local', 'state', 'amber-ide')
@@ -240,7 +252,12 @@ function amberBinary(): string {
   return resolveAmberBinary(process.env, app.isPackaged, process.resourcesPath)
 }
 
+function amberDaemonBinary(): string {
+  return resolveAmberDaemonBinary(process.env, app.isPackaged, process.resourcesPath)
+}
+
 function layoutPath(): string {
+  if (process.platform === 'win32') return join(stateRoot(), 'ui-layout.json')
   const stateHome = process.env['XDG_STATE_HOME']
   const root = stateHome && stateHome.length > 0 ? stateHome + '/amber-ide'
     : (process.env['HOME'] ?? '.') + '/.local/state/amber-ide'
@@ -255,10 +272,56 @@ function spawnOk(cmd: string, args: string[]): Promise<void> {
   })
 }
 
+/** Spawn the windowless daemon without holding the app open as its parent. */
+function spawnDetached(cmd: string, args: string[]): Promise<void> {
+  return new Promise((resolveSpawn, reject) => {
+    const child = spawn(cmd, args, { detached: true, stdio: 'ignore', windowsHide: true })
+    child.once('error', reject)
+    child.once('spawn', () => {
+      child.unref()
+      resolveSpawn()
+    })
+  })
+}
+
+async function installWindowsDaemon(): Promise<void> {
+  const localAppData = process.env['LOCALAPPDATA']
+  if (!localAppData) throw new Error('LOCALAPPDATA is required to install amber on Windows')
+
+  const stableAmber = windowsAmberPath(localAppData)
+  const stableDaemon = windowsDaemonPath(localAppData)
+  // Do not kill a live daemon until it has acknowledged a snapshot. A missing
+  // endpoint is equally safe: there is no state-owning process to preserve.
+  const snapshot = await runCapture(amberBinary(), ['ctl', 'snapshot-now'])
+  if (!shouldStopWindowsDaemon(snapshot.code, snapshot.stderr)) {
+    throw new Error(`refusing to replace amberd before its snapshot succeeds: ${snapshot.stderr || `exit ${snapshot.code}`}`)
+  }
+  // `taskkill` is intentionally after the safety decision above. Its nonzero
+  // result is normal on a first install, where no daemon exists yet.
+  const stop = windowsTaskkillCommand()
+  await spawnOk(stop.cmd, stop.args).catch(() => {})
+
+  await mkdir(dirname(stableAmber), { recursive: true })
+  // installBinary writes beside the destination then renames, so each program
+  // is never half-written if the installer/app dies during an upgrade.
+  await installBinary(amberBinary(), stableAmber)
+  await installBinary(amberDaemonBinary(), stableDaemon)
+  await spawnOkWithStderr(stableAmber, ['ctl', 'install-codex-skill'], (stderr) => {
+    process.stderr.write(stderr)
+  })
+  const runKey = windowsRunKeyCommand(stableDaemon)
+  await spawnOk(runKey.cmd, runKey.args)
+  await spawnDetached(stableDaemon, ['daemon'])
+}
+
 async function installDaemon(): Promise<void> {
   const home = process.env['HOME'] ?? '.'
 
   if (app.isPackaged) {
+    if (process.platform === 'win32') {
+      await installWindowsDaemon()
+      return
+    }
     // A packaged app has no repo/toolchain, so `amber ctl install` (which runs
     // cargo from a source checkout) can't work. Do a cargo-free install: place
     // the bundled amber at a STABLE path and write the boot unit directly — the
@@ -485,6 +548,7 @@ function buildAppMenu(
   onConnectHost: () => void,
 ): Menu {
   const isMac = process.platform === 'darwin'
+  const sshSupport = isSupportedOnPlatform(process.platform)
   const template: MenuItemConstructorOptions[] = []
   // macOS appMenu already carries a plain "Quit amber-ide" (quits the app,
   // leaves the daemon running); on Linux we add that plain quit ourselves.
@@ -496,7 +560,13 @@ function buildAppMenu(
           { type: 'separator' } as MenuItemConstructorOptions,
         ]
       : []),
-    { label: 'Connect to host…', accelerator: 'CmdOrCtrl+Shift+O', click: () => onConnectHost() },
+    sshSupport.ok
+      ? { label: 'Connect to host…', accelerator: 'CmdOrCtrl+Shift+O', click: () => onConnectHost() }
+      : {
+          label: 'Connect to host… (unavailable: named-pipe transport)',
+          enabled: false,
+          toolTip: sshSupport.reason,
+        },
     { type: 'separator' } as MenuItemConstructorOptions,
     { label: 'Restart amber daemon', click: () => onRestartDaemon() },
     { label: 'Quit amber daemon', click: () => onQuitDaemon() },
@@ -596,6 +666,17 @@ function sshProbe(host: string, script: string): Promise<{ out: string; err: str
  * window.
  */
 async function openRemoteWindow(host: string): Promise<void> {
+  const support = isSupportedOnPlatform(process.platform)
+  if (!support.ok) {
+    await dialog.showMessageBox({
+      type: 'info',
+      buttons: ['OK'],
+      title: 'Remote SSH unavailable on Windows',
+      message: 'Remote SSH windows are not available on this platform.',
+      detail: support.reason,
+    })
+    return
+  }
   if (!isValidHost(host)) {
     await dialog.showMessageBox({
       type: 'error',
@@ -688,6 +769,17 @@ async function openRemoteWindow(host: string): Promise<void> {
  * without amber ever parsing ssh config or touching a credential.
  */
 function promptConnectHost(): void {
+  const support = isSupportedOnPlatform(process.platform)
+  if (!support.ok) {
+    void dialog.showMessageBox({
+      type: 'info',
+      buttons: ['OK'],
+      title: 'Remote SSH unavailable on Windows',
+      message: 'Remote SSH windows are not available on this platform.',
+      detail: support.reason,
+    })
+    return
+  }
   const win = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0]
   if (!win || win.isDestroyed()) return
   win.webContents.send('connect-host-prompt')
@@ -921,7 +1013,7 @@ async function openWindow(target: WindowTarget): Promise<WindowCtx> {
 async function main(): Promise<void> {
   if (!await preflightLinuxInputMethod()) return
 
-  const socket = resolveSocketPath(process.env)
+  const socket = resolveSocketPath(process.env, process.platform)
   await ensureDaemon(socket, {
     probe: probeSocket,
     install: installDaemon,

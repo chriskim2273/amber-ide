@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest'
 import {
   sshTunnelArgv, sshProbeArgv, isValidHost, localSocketPath, hostLabel,
   REMOTE_SOCKET_PROBE, parseAgentSock, explainSshFailure,
+  isSupportedOnPlatform,
 } from './sshRemote'
 
 describe('sshTunnelArgv', () => {
@@ -108,5 +109,19 @@ describe('explainSshFailure', () => {
   })
   it('stays out of the way for unrelated failures', () => {
     expect(explainSshFailure('ssh: Could not resolve hostname box', false)).toBeNull()
+  })
+})
+
+describe('isSupportedOnPlatform', () => {
+  it('declares remote SSH unsupported on Windows', () => {
+    expect(isSupportedOnPlatform('win32')).toEqual({
+      ok: false,
+      reason: expect.stringContaining('named pipe'),
+    })
+  })
+
+  it('keeps SSH remote windows available on Unix platforms', () => {
+    expect(isSupportedOnPlatform('linux')).toEqual({ ok: true })
+    expect(isSupportedOnPlatform('darwin')).toEqual({ ok: true })
   })
 })

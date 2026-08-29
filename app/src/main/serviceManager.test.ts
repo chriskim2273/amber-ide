@@ -12,6 +12,8 @@ import { restartDaemonCommand,
   stopDaemonCommand,
   stopDaemonFallbackCommand,
   bootUnitPath,
+  windowsRunKeyCommand,
+  shouldStopWindowsDaemon,
   LAUNCHD_LABEL,
   SYSTEMD_SERVICE,
 } from './serviceManager'
@@ -163,5 +165,28 @@ describe('restartDaemonCommand', () => {
   })
   it('is unsupported elsewhere', () => {
     expect(restartDaemonCommand('win32', 0)).toBeNull()
+  })
+})
+
+describe('Windows daemon install', () => {
+  it('writes a current-user login command for the windowless daemon', () => {
+    expect(windowsRunKeyCommand('C:\\Users\\alice\\AppData\\Local\\Programs\\amber-ide\\amberd.exe'))
+      .toEqual({
+        cmd: 'reg.exe',
+        args: [
+          'add',
+          'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run',
+          '/v', 'amber-daemon',
+          '/t', 'REG_SZ',
+          '/d', '"C:\\Users\\alice\\AppData\\Local\\Programs\\amber-ide\\amberd.exe" daemon',
+          '/f',
+        ],
+      })
+  })
+
+  it('only permits taskkill after snapshot success or a confirmed absent daemon', () => {
+    expect(shouldStopWindowsDaemon(0, '')).toBe(true)
+    expect(shouldStopWindowsDaemon(1, 'daemon unreachable at \\\\.\\pipe\\amber-ide')).toBe(true)
+    expect(shouldStopWindowsDaemon(1, 'snapshot failed: disk full')).toBe(false)
   })
 })

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { resolveAmberBinary } from './amberBin'
+import { resolveAmberBinary, resolveAmberDaemonBinary, windowsAmberPath, windowsDaemonPath } from './amberBin'
 
 describe('resolveAmberBinary', () => {
   it('honors AMBER_BIN override', () => {
@@ -10,5 +10,19 @@ describe('resolveAmberBinary', () => {
   })
   it('falls back to PATH lookup in dev', () => {
     expect(resolveAmberBinary({}, false, '/app/resources')).toBe('amber')
+  })
+
+  it('uses .exe resources on packaged Windows', () => {
+    expect(resolveAmberBinary({}, true, 'C:\\app\\resources', 'win32'))
+      .toBe('C:\\app\\resources\\bin\\amber.exe')
+    expect(resolveAmberDaemonBinary({}, true, 'C:\\app\\resources', 'win32'))
+      .toBe('C:\\app\\resources\\bin\\amberd.exe')
+  })
+
+  it('derives stable per-user Windows executable paths', () => {
+    expect(windowsAmberPath('C:\\Users\\alice\\AppData\\Local'))
+      .toBe('C:\\Users\\alice\\AppData\\Local\\Programs\\amber-ide\\amber.exe')
+    expect(windowsDaemonPath('C:\\Users\\alice\\AppData\\Local'))
+      .toBe('C:\\Users\\alice\\AppData\\Local\\Programs\\amber-ide\\amberd.exe')
   })
 })

@@ -71,6 +71,36 @@ export interface Argv {
   args: string[]
 }
 
+const WINDOWS_RUN_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run'
+
+/** Register the windowless daemon for the signed-in user only (never HKLM). */
+export function windowsRunKeyCommand(daemonPath: string): Argv {
+  return {
+    cmd: 'reg.exe',
+    args: [
+      'add', WINDOWS_RUN_KEY,
+      '/v', 'amber-daemon',
+      '/t', 'REG_SZ',
+      '/d', `"${daemonPath}" daemon`,
+      '/f',
+    ],
+  }
+}
+
+/** Terminate only Amber's dedicated windowless daemon after a safe snapshot. */
+export function windowsTaskkillCommand(): Argv {
+  return { cmd: 'taskkill.exe', args: ['/IM', 'amberd.exe', '/T', '/F'] }
+}
+
+/**
+ * A failed snapshot is safe to ignore only when its CLI reported no daemon.
+ * Any other failure may mean state has not been persisted, so replacing the
+ * running daemon would risk the user's sessions.
+ */
+export function shouldStopWindowsDaemon(snapshotExitCode: number, stderr: string): boolean {
+  return snapshotExitCode === 0 || /daemon unreachable at/i.test(stderr)
+}
+
 export function linuxInstallServiceArgv(): Argv[] {
   return [
     { cmd: 'systemctl', args: ['--user', 'daemon-reload'] },

@@ -24,4 +24,10 @@ describe('resolveSocketPath', () => {
     expect(resolveSocketPath({ HOME: '/home/u' }))
       .toBe('/home/u/.local/state/amber-ide/amberd.sock')
   })
+
+  it('uses the exact Windows pipe endpoint accepted by the daemon', () => {
+    // The DACL and first-instance ownership isolate this pipe; adding a
+    // username suffix would no longer byte-match Rust's endpoint.
+    expect(resolveSocketPath({ USERNAME: 'alice' }, 'win32')).toBe('\\\\.\\pipe\\amber-ide')
+  })
 })

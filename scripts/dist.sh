@@ -38,6 +38,16 @@ build_macos_intel() {
     echo "dist: $OUT/amber-x86_64-apple-darwin (intel)"
 }
 
+build_windows() {
+    local target=x86_64-pc-windows-msvc
+    rustup target add "$target"
+    cargo build --release --target "$target" --bin amber --bin amberd
+    cp "$ROOT/target/$target/release/amber.exe" "$OUT/amber-windows-x86_64.exe"
+    cp "$ROOT/target/$target/release/amberd.exe" "$OUT/amberd-windows-x86_64.exe"
+    echo "dist: $OUT/amber-windows-x86_64.exe (console CLI)"
+    echo "dist: $OUT/amberd-windows-x86_64.exe (windowless daemon)"
+}
+
 case "$(uname -s)" in
     Linux)  build_linux ;;
     Darwin)
@@ -47,5 +57,6 @@ case "$(uname -s)" in
             build_macos
         fi
         ;;
+    MINGW*|MSYS*|CYGWIN*) build_windows ;;
     *) echo "unsupported OS: $(uname -s)"; exit 1 ;;
 esac

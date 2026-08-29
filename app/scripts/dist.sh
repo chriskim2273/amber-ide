@@ -42,6 +42,11 @@ EOF
             SRC="$ROOT_DIR/dist/amber-macos-universal"
         fi
         ;;
+    MINGW*|MSYS*|CYGWIN*)
+        bash "$ROOT_DIR/scripts/dist.sh"
+        SRC="$ROOT_DIR/dist/amber-windows-x86_64.exe"
+        DAEMON_SRC="$ROOT_DIR/dist/amberd-windows-x86_64.exe"
+        ;;
     *)
         echo "error: unsupported OS: $os" >&2
         exit 1
@@ -50,6 +55,11 @@ esac
 
 if [ ! -f "$SRC" ]; then
     echo "error: expected distributable amber at $SRC but it was not produced" >&2
+    exit 1
+fi
+
+if [ "${DAEMON_SRC:-}" ] && [ ! -f "$DAEMON_SRC" ]; then
+    echo "error: expected windowless amber daemon at $DAEMON_SRC but it was not produced" >&2
     exit 1
 fi
 
@@ -70,6 +80,11 @@ echo "==> bundling amber into app resources"
 mkdir -p "$APP_DIR/resources/bin"
 cp "$SRC" "$APP_DIR/resources/bin/amber"
 chmod +x "$APP_DIR/resources/bin/amber"
+if [ "${DAEMON_SRC:-}" ]; then
+    cp "$SRC" "$APP_DIR/resources/bin/amber.exe"
+    cp "$DAEMON_SRC" "$APP_DIR/resources/bin/amberd.exe"
+    chmod +x "$APP_DIR/resources/bin/amber.exe" "$APP_DIR/resources/bin/amberd.exe"
+fi
 
 echo "==> building renderer/main/preload"
 ( cd "$APP_DIR" && npm run build )

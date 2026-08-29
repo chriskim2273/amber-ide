@@ -25,6 +25,25 @@ export interface Argv {
   args: string[]
 }
 
+export type SshRemoteSupport =
+  | { ok: true }
+  | { ok: false; reason: string }
+
+/**
+ * Windows OpenSSH cannot be assumed to forward Amber's named pipe. Keep the
+ * feature discoverable, but never start a tunnel that cannot carry the local
+ * transport.
+ */
+export function isSupportedOnPlatform(platform: NodeJS.Platform): SshRemoteSupport {
+  if (platform === 'win32') {
+    return {
+      ok: false,
+      reason: 'Remote SSH windows are unavailable on Windows because Amber uses a named pipe, not a Unix socket that OpenSSH can forward.',
+    }
+  }
+  return { ok: true }
+}
+
 /**
  * Argv for the tunnel itself.
  *

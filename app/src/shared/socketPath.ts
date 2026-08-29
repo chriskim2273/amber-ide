@@ -10,9 +10,17 @@ import { join } from 'node:path'
  * in this repo, where an `AMBER_SOCKET` that looked set was ignored and the GUI
  * attached to the user's production sessions.
  */
-export function resolveSocketPath(env: NodeJS.ProcessEnv): string {
+export function resolveSocketPath(
+  env: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform = process.platform,
+): string {
   const explicit = env['AMBER_SOCKET']
   if (explicit && explicit.length > 0) return explicit
+  // This must stay byte-for-byte aligned with Rust's
+  // `platform::socket_name_for_root`. The endpoint is already isolated by the
+  // daemon's current-user DACL and first-instance ownership; a username suffix
+  // would make Electron unable to reach it.
+  if (platform === 'win32') return '\\\\.\\pipe\\amber-ide'
   const runtime = env['XDG_RUNTIME_DIR']
   if (runtime && runtime.length > 0) {
     return join(runtime, 'amber-ide', 'amberd.sock')
