@@ -1402,7 +1402,7 @@ impl SessionManager {
             })?;
         let previous_started = session.memory_suspend_started_ms();
         session.set_memory_suspend_started_ms(pending_started_ms);
-        if let Err(error) = Self::signal_supervisor(name, &session, nix::libc::SIGUSR1) {
+        if let Err(error) = Self::suspend_supervisor(name, &session) {
             session.restore_suspend_origin(SuspendOrigin::Pressure, SuspendOrigin::None);
             session.set_memory_suspend_started_ms(previous_started);
             return Err(error);
@@ -1616,7 +1616,7 @@ impl SessionManager {
                 let _ = sess.claim_suspend(SuspendOrigin::Manual);
             }
             if sess.take_pending_resume() {
-                if let Err(error) = Self::signal_supervisor(name, &sess, nix::libc::SIGUSR2) {
+                if let Err(error) = Self::resume_supervisor(name, &sess) {
                     sess.restore_pending_resume();
                     return Err(error);
                 }
@@ -1632,6 +1632,7 @@ impl SessionManager {
         Ok(true)
     }
 
+    #[cfg(unix)]
     fn signal_supervisor(name: &str, session: &PtySession, signal: i32) -> anyhow::Result<()> {
         let pid = session
             .pid()
@@ -1646,6 +1647,21 @@ impl SessionManager {
             );
         }
         Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn signal_supervisor(name: &str, _session: &PtySession, _signal: i32) -> anyhow::Result<()> {
+        anyhow::bail!("suspend/resume is not supported on this platform for session {name}")
+    }
+
+    fn suspend_supervisor(name: &str, session: &PtySession) -> anyhow::Result<()> {
+        #[cfg(unix)] return Self::signal_supervisor(name, session, nix::libc::SIGUSR1);
+        #[cfg(not(unix))] Self::signal_supervisor(name, session, 0)
+    }
+
+    fn resume_supervisor(name: &str, session: &PtySession) -> anyhow::Result<()> {
+        #[cfg(unix)] return Self::signal_supervisor(name, session, nix::libc::SIGUSR2);
+        #[cfg(not(unix))] Self::signal_supervisor(name, session, 0)
     }
 
     pub fn suspend(&self, name: &str, origin: SuspendOrigin) -> anyhow::Result<()> {
@@ -1680,7 +1696,7 @@ impl SessionManager {
             if state.as_deref() == Some("suspended") {
                 return Ok(());
             }
-            return Self::signal_supervisor(name, &session, nix::libc::SIGUSR1);
+            return Self::suspend_supervisor(name, &session);
         }
         if current != SuspendOrigin::None
             && !(current == SuspendOrigin::Pressure && origin == SuspendOrigin::Manual)
@@ -1706,7 +1722,7 @@ impl SessionManager {
         if previous == SuspendOrigin::Pressure && state.as_deref() == Some("suspended") {
             return Ok(());
         }
-        if let Err(error) = Self::signal_supervisor(name, &session, nix::libc::SIGUSR1) {
+        if let Err(error) = Self::suspend_supervisor(name, &session) {
             session.restore_suspend_origin(origin, previous);
             session.set_memory_suspend_started_ms(previous_started);
             return Err(error);
@@ -1739,7 +1755,7 @@ impl SessionManager {
             session.queue_pending_resume();
             return Ok(true);
         }
-        Self::signal_supervisor(name, session, nix::libc::SIGUSR2)?;
+        Self::resume_supervisor(name, session)?;
         session.clear_suspend_origin();
         session.set_memory_suspend_started_ms(0);
         Ok(true)

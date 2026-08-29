@@ -18,21 +18,21 @@
 //! - a daemon `Exit` frame (the pane's child ended) exits the client.
 
 use std::io::{self, IsTerminal, Read, Write};
-use std::os::fd::AsFd;
-use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+#[cfg(unix)] use std::os::fd::AsFd;
+#[cfg(unix)] use std::os::unix::net::UnixStream;
+#[cfg(unix)] use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(unix)] use std::sync::Arc;
 
 use amber_core::proto::{self, ControlMsg, Decoder, Frame};
-use nix::errno::Errno;
-use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
-use nix::sys::termios::{self, SetArg, Termios};
+#[cfg(unix)] use nix::errno::Errno;
+#[cfg(unix)] use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+#[cfg(unix)] use nix::sys::termios::{self, SetArg, Termios};
 
 /// Poll timeout: the cadence at which the SIGWINCH flag is rechecked even if
 /// no fd is ready (a signal may interrupt poll on this thread, but flag-only
 /// delivery on another thread must still be noticed).
-const POLL_TICK_MS: u16 = 100;
+#[cfg(unix)] const POLL_TICK_MS: u16 = 100;
 
 /// Written to the local terminal once per attach, before any replayed bytes
 /// (spec §5) — a minimal reset so replay lands in a known-good terminal:
@@ -369,11 +369,11 @@ pub fn nest_refusal(amber_session: Option<&str>, force: bool) -> Option<String> 
 /// Restores the original terminal settings when dropped, even on error or
 /// panic unwind, so a crashing client never leaves the user's shell in raw
 /// mode.
-struct RawModeGuard {
+#[cfg(unix)] struct RawModeGuard {
     original: Termios,
 }
 
-impl RawModeGuard {
+#[cfg(unix)] impl RawModeGuard {
     fn enable() -> anyhow::Result<Self> {
         let stdin = io::stdin();
         let original = termios::tcgetattr(&stdin)?;
@@ -384,7 +384,7 @@ impl RawModeGuard {
     }
 }
 
-impl Drop for RawModeGuard {
+#[cfg(unix)] impl Drop for RawModeGuard {
     fn drop(&mut self) {
         let stdin = io::stdin();
         let _ = termios::tcsetattr(&stdin, SetArg::TCSANOW, &self.original);
@@ -400,7 +400,7 @@ fn current_size() -> (u16, u16) {
     }
 }
 
-fn send_control(stream: &UnixStream, msg: ControlMsg) -> anyhow::Result<()> {
+#[cfg(unix)] fn send_control(stream: &UnixStream, msg: ControlMsg) -> anyhow::Result<()> {
     let mut w = stream;
     w.write_all(&proto::encode(&Frame::Control(msg)))?;
     w.flush()?;
@@ -410,7 +410,7 @@ fn send_control(stream: &UnixStream, msg: ControlMsg) -> anyhow::Result<()> {
 /// Connect to `socket`, attach session `name`, and proxy the terminal until
 /// stdin hits EOF, the socket closes, or the daemon reports the session's
 /// child exited.
-pub fn attach(socket: &Path, name: &str, prefix: Option<u8>, want_bar: bool) -> anyhow::Result<()> {
+#[cfg(unix)] pub fn attach(socket: &Path, name: &str, prefix: Option<u8>, want_bar: bool) -> anyhow::Result<()> {
     let stream = UnixStream::connect(socket).map_err(|e| {
         anyhow::anyhow!(
             "cannot reach the amber daemon at {} ({e}) — is it running?",
@@ -475,9 +475,14 @@ pub fn attach(socket: &Path, name: &str, prefix: Option<u8>, want_bar: bool) -> 
     Ok(())
 }
 
+#[cfg(not(unix))]
+pub fn attach(_socket: &Path, _name: &str, _prefix: Option<u8>, _want_bar: bool) -> anyhow::Result<()> {
+    anyhow::bail!("amber attach is not yet supported on this platform")
+}
+
 /// The client event loop, separated from tty/signal setup so it can be
 /// driven in tests with socket pairs and pipes instead of a real terminal.
-pub fn run_client(
+#[cfg(unix)] pub fn run_client(
     stream: &UnixStream,
     name: &str,
     mut stdin: impl AsFd + Read,
@@ -688,7 +693,7 @@ fn teardown_decoration(ui: &StatusUi) {
     let _ = out.flush();
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::sync::mpsc;
@@ -1221,5 +1226,15 @@ mod tests {
             !out.windows(SCROLL_RESET.len()).any(|w| w == SCROLL_RESET.as_bytes()),
             "no-bar attach must not emit a scroll-region reset"
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    #[test]
+    fn attach_reports_the_native_console_fallback() {
+        let error = attach(Path::new("amber-test-pipe"), "s", None, false).unwrap_err();
+        assert!(error.to_string().contains("not yet supported"));
     }
 }

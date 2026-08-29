@@ -72,7 +72,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::os::unix::fs::OpenOptionsExt;
+#[cfg(unix)] use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
@@ -447,11 +447,18 @@ const AUTH_FAIL_DELAY: Duration = Duration::from_millis(300);
 /// 32 bytes from the kernel CSPRNG. std has no RNG and this is the only
 /// randomness the feature needs, so `/dev/urandom` (present on both supported
 /// OSes) beats pulling a crate.
-fn random_token() -> String {
+#[cfg(unix)] fn random_token() -> String {
     let mut buf = [0u8; 32];
     std::fs::File::open("/dev/urandom")
         .and_then(|mut f| f.read_exact(&mut buf))
         .expect("/dev/urandom is readable");
+    base64url(&buf)
+}
+
+#[cfg(windows)] fn random_token() -> String {
+    let mut buf = [0u8; 32];
+    let status = unsafe { windows_sys::Win32::Security::Cryptography::BCryptGenRandom(std::ptr::null_mut(), buf.as_mut_ptr(), buf.len() as u32, windows_sys::Win32::Security::Cryptography::BCRYPT_USE_SYSTEM_PREFERRED_RNG) };
+    assert_eq!(status, 0, "BCryptGenRandom failed: {status:#x}");
     base64url(&buf)
 }
 
@@ -469,16 +476,17 @@ pub fn load_or_create_token(root: &Path, regenerate: bool) -> anyhow::Result<Str
     }
     std::fs::create_dir_all(root)?;
     let token = random_token();
-    let mut f = std::fs::OpenOptions::new()
+    let mut options = std::fs::OpenOptions::new();
+    options
         .write(true)
         .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&path)?;
+        .truncate(true);
+    #[cfg(unix)] options.mode(0o600);
+    let mut f = options.open(&path)?;
     f.write_all(token.as_bytes())?;
     f.flush()?;
     // `.mode()` only applies at creation — re-assert it for an existing file.
-    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    #[cfg(unix)] std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     Ok(token)
 }
 

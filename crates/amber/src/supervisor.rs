@@ -883,13 +883,15 @@ pub fn run_session(
     shell_fallback(&cwd)
 }
 
-fn install_suspend_handlers(ctl: &SuspendControl) -> anyhow::Result<()> {
+#[cfg(unix)] fn install_suspend_handlers(ctl: &SuspendControl) -> anyhow::Result<()> {
     install_suspend_handlers_with(ctl, |signal, flag| {
         signal_hook::flag::register(signal, flag).map(|_| ())
     })
 }
 
-fn install_suspend_handlers_with(
+#[cfg(not(unix))] fn install_suspend_handlers(_ctl: &SuspendControl) -> anyhow::Result<()> { Ok(()) }
+
+#[cfg(unix)] fn install_suspend_handlers_with(
     ctl: &SuspendControl,
     mut register: impl FnMut(i32, Arc<AtomicBool>) -> std::io::Result<()>,
 ) -> anyhow::Result<()> {
@@ -898,7 +900,7 @@ fn install_suspend_handlers_with(
     Ok(())
 }
 
-fn ignore_suspend_signals() -> anyhow::Result<()> {
+#[cfg(unix)] fn ignore_suspend_signals() -> anyhow::Result<()> {
     use nix::sys::signal::{signal, SigHandler, Signal};
 
     // SAFETY: fixed valid signals and SIG_IGN, immediately before shell exec.
@@ -909,6 +911,8 @@ fn ignore_suspend_signals() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(not(unix))] fn ignore_suspend_signals() -> anyhow::Result<()> { Ok(()) }
+
 /// `exec $SHELL -l` in `cwd`, replacing this process so the pane never dies.
 /// Only returns on error (exec never returns on success).
 #[cfg(unix)]
@@ -918,6 +922,13 @@ fn shell_fallback(cwd: &Path) -> anyhow::Result<()> {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
     let err = Command::new(&shell).arg("-l").current_dir(cwd).exec();
     Err(anyhow::anyhow!("failed to exec shell fallback {shell}: {err}"))
+}
+
+#[cfg(not(unix))]
+fn shell_fallback(cwd: &Path) -> anyhow::Result<()> {
+    let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
+    let status = Command::new(&shell).current_dir(cwd).status()?;
+    if status.success() { Ok(()) } else { anyhow::bail!("shell fallback {shell} exited with {status}") }
 }
 
 #[cfg(test)]

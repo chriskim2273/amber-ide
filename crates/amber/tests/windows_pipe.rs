@@ -97,7 +97,6 @@ fn named_pipe_accepts_two_clients_and_forces_a_live_peer_closed() {
         let (_reader, mut writer) = second.into_split().unwrap();
         writer.write_all(b"queued-before-forced-close").unwrap();
         write_queued.send(()).unwrap();
-        reader_started.recv().unwrap();
         wait_for_shutdown.recv().unwrap();
         writer.shutdown().unwrap();
     });
@@ -123,7 +122,7 @@ fn named_pipe_accepts_two_clients_and_forces_a_live_peer_closed() {
         let mut byte = [0_u8; 1];
         released.send(stalled.read(&mut byte)).unwrap();
     });
-    reader_ready.recv().unwrap();
+    reader_started.recv().unwrap();
     thread::sleep(Duration::from_millis(20));
     assert!(
         result.try_recv().is_err(),

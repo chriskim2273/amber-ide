@@ -1,7 +1,6 @@
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -535,7 +534,14 @@ pub fn exec_current_into(slot: u32, role: CgroupRole, command: Vec<OsString>) ->
     if let Err(error) = place_current(slot, role) {
         eprintln!("amber: cgroup placement failed; continuing uncontained: {error}");
     }
-    Err(Command::new(program).args(args).exec())
+    #[cfg(unix)] {
+        use std::os::unix::process::CommandExt;
+        Err(Command::new(program).args(args).exec())
+    }
+    #[cfg(not(unix))] {
+        let _ = (slot, role, program, args);
+        Err(io::Error::new(io::ErrorKind::Unsupported, "cgroup process placement is only supported on Linux"))
+    }
 }
 
 /// Open the workload placement control while the parent may safely allocate
@@ -824,6 +830,7 @@ fn read_populated(path: &Path) -> io::Result<bool> {
         })
 }
 
+#[cfg(target_os = "linux")]
 fn kill_all_pids(root: &Path, deadline: Instant) -> io::Result<bool> {
     let mut pending = vec![root.to_path_buf()];
     while let Some(path) = pending.pop() {
@@ -862,6 +869,11 @@ fn kill_all_pids(root: &Path, deadline: Instant) -> io::Result<bool> {
         }
     }
     Ok(Instant::now() < deadline)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn kill_all_pids(_root: &Path, _deadline: Instant) -> io::Result<bool> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "cgroup process termination is only supported on Linux"))
 }
 
 #[cfg(test)]
