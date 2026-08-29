@@ -314,25 +314,32 @@ mod imp {
 
     impl LocalListener {
         pub fn accept(&self) -> io::Result<LocalStream> {
-            let next = self.config.create_instance(false)?;
-            let handle =
+            let mut handle =
                 self.pending.lock().unwrap().take().ok_or_else(|| {
                     io::Error::new(io::ErrorKind::BrokenPipe, "listener is closed")
                 })?;
-            if let Err(error) = connect_instance(handle.as_raw_handle()) {
-                // Do not strand the listener after a failed/stale accept. The
-                // replacement is a fresh listening instance; drop the failed
-                // one rather than handing a stale connection to the next call.
-                *self.pending.lock().unwrap() = Some(next);
-                return Err(error);
+            loop {
+                // Keep one separate instance available while this one waits.
+                // If `handle` was claimed then abandoned before accept, that
+                // replacement becomes the one we wait on below; otherwise a
+                // fresh client can attach to it and no caller will accept it.
+                let next = self.config.create_instance(false)?;
+                if connect_instance(handle.as_raw_handle())? {
+                    *self.pending.lock().unwrap() = Some(next);
+                    return Ok(LocalStream(Arc::new(Pipe {
+                        handle: Mutex::new(Some(handle)),
+                        role: PipeRole::Server,
+                        #[cfg(test)]
+                        read_retry_hook: Mutex::new(None),
+                    })));
+                }
+                // `ERROR_NO_DATA`: the peer disconnected before accept. The
+                // just-created replacement may already have a fresh client,
+                // so accept it in this same call instead of parking it for a
+                // future call that the daemon will never make.
+                drop(handle);
+                handle = next;
             }
-            *self.pending.lock().unwrap() = Some(next);
-            Ok(LocalStream(Arc::new(Pipe {
-                handle: Mutex::new(Some(handle)),
-                role: PipeRole::Server,
-                #[cfg(test)]
-                read_retry_hook: Mutex::new(None),
-            })))
         }
     }
 
@@ -703,7 +710,9 @@ mod imp {
         }
     }
 
-    fn connect_instance(handle: windows_sys::Win32::Foundation::HANDLE) -> io::Result<()> {
+    /// Wait for one named-pipe instance. `Ok(false)` means its client closed
+    /// before acceptance; the caller must move to a replacement instance.
+    fn connect_instance(handle: windows_sys::Win32::Foundation::HANDLE) -> io::Result<bool> {
         loop {
             if unsafe { ConnectNamedPipe(handle, std::ptr::null_mut()) } != 0 {
                 // In PIPE_NOWAIT mode this resets a disconnected instance to
@@ -711,7 +720,7 @@ mod imp {
                 continue;
             }
             match unsafe { GetLastError() } {
-                ERROR_PIPE_CONNECTED => return Ok(()),
+                ERROR_PIPE_CONNECTED => return Ok(true),
                 ERROR_NO_DATA => {
                     // A client closed before accept. Microsoft requires the
                     // server to disconnect before reconnecting this instance.
@@ -720,6 +729,7 @@ mod imp {
                     {
                         return Err(io::Error::last_os_error());
                     }
+                    return Ok(false);
                 }
                 error if error == windows_sys::Win32::Foundation::ERROR_PIPE_LISTENING => {
                     thread::sleep(Duration::from_millis(1));
