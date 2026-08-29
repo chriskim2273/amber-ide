@@ -809,11 +809,37 @@ impl PtySession {
                     return error.into_inner().is_some();
                 }
             }
+            // A failed `child.wait()` has no exit code, but after the waiter
+            // has closed subscriptions it is just as terminal as a normal
+            // status. Managers must reap it rather than waiting out their
+            // child-exit timeout and leaving stale metadata behind.
+            if self.exit_teardown_done.load(Ordering::SeqCst) {
+                match self.exit_error.try_lock() {
+                    Ok(error) if error.is_some() => return true,
+                    Ok(_) | Err(std::sync::TryLockError::WouldBlock) => {}
+                    Err(std::sync::TryLockError::Poisoned(error)) => {
+                        return error.into_inner().is_some();
+                    }
+                }
+            }
             if std::time::Instant::now() >= deadline {
                 return false;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// Mark the session as if its waiter exhausted a `child.wait()` error and
+    /// completed teardown. Kept out of production builds so tests can cover
+    /// the manager's error-terminal lifecycle without an OS-specific wait
+    /// ownership fault.
+    #[cfg(test)]
+    pub(crate) fn record_wait_error_after_teardown_for_test(&self, error: impl Into<String>) {
+        *self.exit_error.lock().unwrap() = Some(error.into());
+        let mut subs = self.subs.lock().unwrap();
+        self.reader_done.store(true, Ordering::SeqCst);
+        subs.clear();
+        self.exit_teardown_done.store(true, Ordering::SeqCst);
     }
 
     /// Terminate the child AND everything it started.

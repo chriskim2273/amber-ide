@@ -2733,6 +2733,36 @@ mod tests {
     }
 
     #[test]
+    fn reap_removes_session_after_terminal_wait_error() {
+        struct KillChildOnDrop(Arc<PtySession>);
+
+        impl Drop for KillChildOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        let session = mgr
+            .create("wait-error", "/tmp", SessionKind::Shell)
+            .unwrap();
+        // The injector models a `child.wait()` ownership error: no exit code
+        // exists, but the waiter has completed its authoritative teardown.
+        let _cleanup = KillChildOnDrop(Arc::clone(&session));
+        session.record_wait_error_after_teardown_for_test("child was already reaped");
+
+        let started = std::time::Instant::now();
+        assert_eq!(mgr.reap().unwrap(), vec!["wait-error".to_string()]);
+        assert!(
+            started.elapsed() < CHILD_EXIT_TIMEOUT,
+            "terminal wait error must not wait for the child-exit timeout"
+        );
+        assert!(mgr.session("wait-error").is_none());
+        assert!(mgr.store.read_session("wait-error").unwrap().is_none());
+    }
+
+    #[test]
     fn cpu_weight_failures_do_not_block_session_create_or_focus() {
         let dir = tempdir().unwrap();
         let cgroups = tempdir().unwrap();
