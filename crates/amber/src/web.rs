@@ -72,7 +72,6 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
-#[cfg(unix)] use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
@@ -444,22 +443,11 @@ pub const AUTH_MAX_FAILS: u32 = 8;
 const AUTH_WINDOW: Duration = Duration::from_secs(60);
 const AUTH_FAIL_DELAY: Duration = Duration::from_millis(300);
 
-/// 32 bytes from the kernel CSPRNG. std has no RNG and this is the only
-/// randomness the feature needs, so `/dev/urandom` (present on both supported
-/// OSes) beats pulling a crate.
-#[cfg(unix)] fn random_token() -> String {
+/// 32 bytes from the platform CSPRNG, encoded for URLs and cookies.
+fn random_token() -> std::io::Result<String> {
     let mut buf = [0u8; 32];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut buf))
-        .expect("/dev/urandom is readable");
-    base64url(&buf)
-}
-
-#[cfg(windows)] fn random_token() -> String {
-    let mut buf = [0u8; 32];
-    let status = unsafe { windows_sys::Win32::Security::Cryptography::BCryptGenRandom(std::ptr::null_mut(), buf.as_mut_ptr(), buf.len() as u32, windows_sys::Win32::Security::Cryptography::BCRYPT_USE_SYSTEM_PREFERRED_RNG) };
-    assert_eq!(status, 0, "BCryptGenRandom failed: {status:#x}");
-    base64url(&buf)
+    crate::platform::random_bytes(&mut buf)?;
+    Ok(base64url(&buf))
 }
 
 /// Load the web token from `<root>/web-token`, creating it (mode 0600) if it
@@ -470,23 +458,19 @@ pub fn load_or_create_token(root: &Path, regenerate: bool) -> anyhow::Result<Str
         if let Ok(existing) = std::fs::read_to_string(&path) {
             let existing = existing.trim().to_string();
             if !existing.is_empty() {
+                if !crate::platform::is_user_private(&path)? {
+                    anyhow::bail!(
+                        "refusing to use {}: it is not private to the current user",
+                        path.display()
+                    );
+                }
                 return Ok(existing);
             }
         }
     }
     std::fs::create_dir_all(root)?;
-    let token = random_token();
-    let mut options = std::fs::OpenOptions::new();
-    options
-        .write(true)
-        .create(true)
-        .truncate(true);
-    #[cfg(unix)] options.mode(0o600);
-    let mut f = options.open(&path)?;
-    f.write_all(token.as_bytes())?;
-    f.flush()?;
-    // `.mode()` only applies at creation — re-assert it for an existing file.
-    #[cfg(unix)] std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    let token = random_token()?;
+    crate::platform::write_user_private(&path, token.as_bytes())?;
     Ok(token)
 }
 
@@ -535,7 +519,7 @@ impl Auth {
     fn authenticate(&self, ip: std::net::IpAddr, body: &[u8]) -> Option<String> {
         let presented = std::str::from_utf8(body).unwrap_or_default().trim();
         if ct_eq(presented.as_bytes(), self.token.as_bytes()) {
-            let id = random_token();
+            let Ok(id) = random_token() else { return None };
             self.sessions.lock().unwrap().push(id.clone());
             self.fails.lock().unwrap().remove(&ip);
             return Some(id);
@@ -2266,6 +2250,15 @@ mod tests {
 
         let made = load_or_create_token(dir.path(), false).unwrap();
         assert_eq!(load_token(dir.path()).as_deref(), Some(made.as_str()));
+    }
+
+    #[test]
+    fn token_creation_uses_platform_private_file() {
+        let root = tempfile::tempdir().unwrap();
+        let token = load_or_create_token(root.path(), false).unwrap();
+
+        assert_eq!(token.len(), 43);
+        assert!(crate::platform::is_user_private(&root.path().join(TOKEN_FILE)).unwrap());
     }
 
     #[test]

@@ -354,15 +354,20 @@ fn websocket_focus_refreshes_a_live_session() {
 }
 
 #[test]
-fn token_file_is_0600_and_stable_until_regenerated() {
-    use std::os::unix::fs::PermissionsExt;
+fn token_file_is_private_and_stable_until_regenerated() {
     let dir = tempfile::tempdir().unwrap();
     let a = web::load_or_create_token(dir.path(), false).unwrap();
     let b = web::load_or_create_token(dir.path(), false).unwrap();
     assert_eq!(a, b, "token must persist across runs");
     assert!(a.len() >= 40, "token too short: {a}");
-    let meta = std::fs::metadata(dir.path().join("web-token")).unwrap();
-    assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    let path = dir.path().join("web-token");
+    assert!(amber::platform::is_user_private(&path).unwrap());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    }
     let c = web::load_or_create_token(dir.path(), true).unwrap();
     assert_ne!(a, c, "--new-token must rotate the token");
 }
