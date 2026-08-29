@@ -1,4 +1,4 @@
-import { join } from 'node:path'
+import { join, win32 } from 'node:path'
 
 // Service-manager glue for the boot units that give the daemon reboot survival.
 // Everything here is PURE (string/argv construction) so it is unit-testable; the
@@ -97,8 +97,8 @@ export function windowsTaskkillCommand(): Argv {
  * Any other failure may mean state has not been persisted, so replacing the
  * running daemon would risk the user's sessions.
  */
-export function shouldStopWindowsDaemon(snapshotExitCode: number, stderr: string): boolean {
-  return snapshotExitCode === 0 || /daemon unreachable at/i.test(stderr)
+export function shouldStopWindowsDaemon(snapshotExitCode: number, endpointIsAbsent: boolean): boolean {
+  return snapshotExitCode === 0 || endpointIsAbsent
 }
 
 export function linuxInstallServiceArgv(): Argv[] {
@@ -134,6 +134,7 @@ export function stopDaemonCommand(platform: NodeJS.Platform, uid: number): Argv 
   if (platform === 'darwin') {
     return { cmd: 'launchctl', args: ['bootout', `gui/${uid}/${LAUNCHD_LABEL}`] }
   }
+  if (platform === 'win32') return windowsTaskkillCommand()
   return null
 }
 
@@ -167,12 +168,19 @@ export function stopDaemonFallbackCommand(
 
 // Where the boot unit lives once installed. Absence => dev/unmanaged: don't
 // guess at pids, just report it.
-export function bootUnitPath(platform: NodeJS.Platform, home: string): string | null {
+export function bootUnitPath(
+  platform: NodeJS.Platform,
+  home: string,
+  localAppData?: string,
+): string | null {
   if (platform === 'linux') {
     return join(home, '.config', 'systemd', 'user', SYSTEMD_SERVICE)
   }
   if (platform === 'darwin') {
     return launchAgentPlistPath(home)
+  }
+  if (platform === 'win32' && localAppData) {
+    return win32.join(localAppData, 'Programs', 'amber-ide', 'amberd.exe')
   }
   return null
 }

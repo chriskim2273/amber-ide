@@ -10,7 +10,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node
 import { resolveSocketPath } from '../shared/socketPath'
 import { HANDOFF_FILE_MAX, parseHandoff } from '../shared/handoff'
 import { pathCandidates } from '../shared/pathSel'
-import { ensureDaemon, probeSocket } from './daemonBoot'
+import { ensureDaemon, isSocketAbsent, probeSocket, type EnsureDeps } from './daemonBoot'
 import {
   resolveAmberBinary,
   resolveAmberDaemonBinary,
@@ -284,22 +284,52 @@ function spawnDetached(cmd: string, args: string[]): Promise<void> {
   })
 }
 
-async function installWindowsDaemon(): Promise<void> {
+function windowsLocalAppData(): string {
   const localAppData = process.env['LOCALAPPDATA']
   if (!localAppData) throw new Error('LOCALAPPDATA is required to install amber on Windows')
+  return localAppData
+}
 
+async function windowsInstallNeedsRefresh(): Promise<boolean> {
+  const localAppData = windowsLocalAppData()
+  const pairs: Array<[string, string]> = [
+    [amberBinary(), windowsAmberPath(localAppData)],
+    [amberDaemonBinary(), windowsDaemonPath(localAppData)],
+  ]
+  for (const [bundled, installed] of pairs) {
+    try {
+      if (!(await readFile(bundled)).equals(await readFile(installed))) return true
+    } catch {
+      return true // first install or an interrupted/corrupt prior install
+    }
+  }
+  return false
+}
+
+async function snapshotAllowsWindowsDaemonStop(socket: string): Promise<void> {
+  const snapshot = await runCapture(amberBinary(), ['ctl', 'snapshot-now'])
+  // A nonzero CLI exit is not permission by itself. Only a fresh Node probe
+  // reporting ENOENT proves the named-pipe endpoint is actually absent.
+  const endpointIsAbsent = snapshot.code === 0 ? false : await isSocketAbsent(socket)
+  if (shouldStopWindowsDaemon(snapshot.code, endpointIsAbsent)) return
+  throw new Error(
+    `refusing to stop amberd before its snapshot succeeds: ${snapshot.stderr || `exit ${snapshot.code}`}`,
+  )
+}
+
+async function stopWindowsDaemon(socket: string): Promise<void> {
+  await snapshotAllowsWindowsDaemonStop(socket)
+  const stop = windowsTaskkillCommand()
+  // A concurrent clean exit can make taskkill report no matching process;
+  // that still meets the state-safety precondition above.
+  await spawnOk(stop.cmd, stop.args).catch(() => {})
+}
+
+async function installWindowsDaemon(socket: string): Promise<void> {
+  const localAppData = windowsLocalAppData()
   const stableAmber = windowsAmberPath(localAppData)
   const stableDaemon = windowsDaemonPath(localAppData)
-  // Do not kill a live daemon until it has acknowledged a snapshot. A missing
-  // endpoint is equally safe: there is no state-owning process to preserve.
-  const snapshot = await runCapture(amberBinary(), ['ctl', 'snapshot-now'])
-  if (!shouldStopWindowsDaemon(snapshot.code, snapshot.stderr)) {
-    throw new Error(`refusing to replace amberd before its snapshot succeeds: ${snapshot.stderr || `exit ${snapshot.code}`}`)
-  }
-  // `taskkill` is intentionally after the safety decision above. Its nonzero
-  // result is normal on a first install, where no daemon exists yet.
-  const stop = windowsTaskkillCommand()
-  await spawnOk(stop.cmd, stop.args).catch(() => {})
+  await stopWindowsDaemon(socket)
 
   await mkdir(dirname(stableAmber), { recursive: true })
   // installBinary writes beside the destination then renames, so each program
@@ -314,12 +344,25 @@ async function installWindowsDaemon(): Promise<void> {
   await spawnDetached(stableDaemon, ['daemon'])
 }
 
-async function installDaemon(): Promise<void> {
+async function preflightPackagedWindowsDaemon(socket: string): Promise<void> {
+  const localAppData = windowsLocalAppData()
+  const stableDaemon = windowsDaemonPath(localAppData)
+  if (await windowsInstallNeedsRefresh()) {
+    await installWindowsDaemon(socket)
+    return
+  }
+  // A healthy daemon normally causes ensureDaemon to return immediately; still
+  // repair the HKCU Run entry on every packaged launch without restarting it.
+  const runKey = windowsRunKeyCommand(stableDaemon)
+  await spawnOk(runKey.cmd, runKey.args)
+}
+
+async function installDaemon(socket?: string): Promise<void> {
   const home = process.env['HOME'] ?? '.'
 
   if (app.isPackaged) {
     if (process.platform === 'win32') {
-      await installWindowsDaemon()
+      await installWindowsDaemon(socket ?? resolveSocketPath(process.env, process.platform))
       return
     }
     // A packaged app has no repo/toolchain, so `amber ctl install` (which runs
@@ -400,7 +443,7 @@ async function quitDaemonAndApp(win: BrowserWindow): Promise<void> {
   if (confirm.response !== 1) return
 
   const home = process.env['HOME'] ?? '.'
-  const unit = bootUnitPath(process.platform, home)
+  const unit = bootUnitPath(process.platform, home, process.env['LOCALAPPDATA'])
   // No installed boot unit => dev / unmanaged daemon. Don't guess at pids;
   // report it and quit (the daemon keeps running, as when closing the window).
   if (unit === null || !existsSync(unit)) {
@@ -418,6 +461,22 @@ async function quitDaemonAndApp(win: BrowserWindow): Promise<void> {
   }
 
   const uid = process.getuid?.() ?? 0
+  if (process.platform === 'win32') {
+    try {
+      await stopWindowsDaemon(resolveSocketPath(process.env, process.platform))
+    } catch (err) {
+      await dialog.showMessageBox(win, {
+        type: 'error',
+        buttons: ['OK'],
+        title: 'Daemon stop blocked',
+        message: 'Could not safely stop the amber daemon.',
+        detail: String(err),
+      })
+      return
+    }
+    app.quit()
+    return
+  }
   const stop = stopDaemonCommand(process.platform, uid)
   if (stop !== null) {
     await spawnOk(stop.cmd, stop.args).catch(async () => {
@@ -451,7 +510,7 @@ async function restartDaemon(win: BrowserWindow): Promise<void> {
   if (confirm.response !== 1) return
 
   const home = process.env['HOME'] ?? '.'
-  const unit = bootUnitPath(process.platform, home)
+  const unit = bootUnitPath(process.platform, home, process.env['LOCALAPPDATA'])
   // No installed boot unit => dev / unmanaged daemon. Don't guess at pids.
   if (unit === null || !existsSync(unit)) {
     await dialog.showMessageBox(win, {
@@ -467,6 +526,21 @@ async function restartDaemon(win: BrowserWindow): Promise<void> {
   }
 
   const uid = process.getuid?.() ?? 0
+  if (process.platform === 'win32') {
+    try {
+      await stopWindowsDaemon(resolveSocketPath(process.env, process.platform))
+      await spawnDetached(unit, ['daemon'])
+    } catch (err) {
+      await dialog.showMessageBox(win, {
+        type: 'error',
+        buttons: ['OK'],
+        title: 'Restart failed',
+        message: 'Could not restart the amber daemon.',
+        detail: String(err),
+      })
+    }
+    return
+  }
   const restart = restartDaemonCommand(process.platform, uid)
   if (restart === null) return
   try {
@@ -1014,12 +1088,16 @@ async function main(): Promise<void> {
   if (!await preflightLinuxInputMethod()) return
 
   const socket = resolveSocketPath(process.env, process.platform)
-  await ensureDaemon(socket, {
+  const ensureDeps: EnsureDeps = {
     probe: probeSocket,
-    install: installDaemon,
+    install: () => installDaemon(socket),
     delayMs: (a) => Math.min(2000, 100 * 2 ** a),
     attempts: 8,
-  })
+  }
+  if (app.isPackaged && process.platform === 'win32') {
+    ensureDeps.preflight = () => preflightPackagedWindowsDaemon(socket)
+  }
+  await ensureDaemon(socket, ensureDeps)
 
   const ctx = await openWindow({ kind: 'local' })
   const win = ctx.win

@@ -13,6 +13,7 @@ import { restartDaemonCommand,
   stopDaemonFallbackCommand,
   bootUnitPath,
   windowsRunKeyCommand,
+  windowsTaskkillCommand,
   shouldStopWindowsDaemon,
   LAUNCHD_LABEL,
   SYSTEMD_SERVICE,
@@ -76,8 +77,8 @@ describe('stopDaemonCommand', () => {
       args: ['bootout', 'gui/501/com.amber-ide.daemon'],
     })
   })
-  it('returns null on unsupported platforms', () => {
-    expect(stopDaemonCommand('win32', 501)).toBeNull()
+  it('uses Amber\'s windowless daemon process on Windows', () => {
+    expect(stopDaemonCommand('win32', 501)).toEqual(windowsTaskkillCommand())
   })
 })
 
@@ -104,8 +105,10 @@ describe('bootUnitPath', () => {
       '/Users/u/Library/LaunchAgents/com.amber-ide.daemon.plist',
     )
   })
-  it('returns null elsewhere', () => {
-    expect(bootUnitPath('win32', '/home/u')).toBeNull()
+  it('treats the stable windowless executable as the Windows boot unit', () => {
+    expect(bootUnitPath('win32', '/home/u', 'C:\\Users\\u\\AppData\\Local')).toBe(
+      'C:\\Users\\u\\AppData\\Local\\Programs\\amber-ide\\amberd.exe',
+    )
   })
 })
 
@@ -185,8 +188,13 @@ describe('Windows daemon install', () => {
   })
 
   it('only permits taskkill after snapshot success or a confirmed absent daemon', () => {
-    expect(shouldStopWindowsDaemon(0, '')).toBe(true)
-    expect(shouldStopWindowsDaemon(1, 'daemon unreachable at \\\\.\\pipe\\amber-ide')).toBe(true)
-    expect(shouldStopWindowsDaemon(1, 'snapshot failed: disk full')).toBe(false)
+    expect(shouldStopWindowsDaemon(0, false)).toBe(true)
+    expect(shouldStopWindowsDaemon(1, true)).toBe(true)
+    expect(shouldStopWindowsDaemon(1, false)).toBe(false)
+  })
+
+  it('does not treat access denied or generic transport failures as absence', () => {
+    expect(shouldStopWindowsDaemon(1, false)).toBe(false)
+    expect(shouldStopWindowsDaemon(2, false)).toBe(false)
   })
 })
