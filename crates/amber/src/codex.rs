@@ -50,7 +50,7 @@ pub fn resolve_codex() -> Option<PathBuf> {
     #[cfg(unix)]
     {
         let shell = crate::platform::default_shell();
-        return crate::claude::resolve_bin_with(&shell.to_string_lossy(), true, "codex", &[]);
+        crate::claude::resolve_bin_with(&shell.to_string_lossy(), true, "codex", &[])
     }
     #[cfg(windows)]
     {

@@ -186,6 +186,10 @@ pub enum ControlMsg {
         #[serde(default, skip_serializing_if = "is_zero")]
         seq: u64,
     },
+    /// Supervisor-only registration for the daemon's private control link.
+    SupervisorHello { name: String },
+    /// Daemon -> registered supervisor only; ignored if a client sends it.
+    SupervisorCommand { name: String, command: String },
     /// Client -> daemon: park a claude session's child to free its RAM (Slice 3,
     /// freeze grace). The daemon signals the session's `amber run` supervisor
     /// (SIGUSR1) to kill claude and idle; the session record + pty + attachments

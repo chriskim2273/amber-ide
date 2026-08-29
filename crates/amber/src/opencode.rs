@@ -84,7 +84,7 @@ pub fn resolve_opencode() -> Option<PathBuf> {
     #[cfg(unix)]
     {
         let shell = crate::platform::default_shell();
-        return crate::claude::resolve_bin_with(&shell.to_string_lossy(), true, "opencode", &[]);
+        crate::claude::resolve_bin_with(&shell.to_string_lossy(), true, "opencode", &[])
     }
     #[cfg(windows)]
     {

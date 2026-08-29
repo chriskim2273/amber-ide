@@ -202,7 +202,7 @@ pub fn resolve_claude() -> Option<PathBuf> {
     #[cfg(unix)]
     {
         let shell = crate::platform::default_shell();
-        return resolve_claude_with(&shell.to_string_lossy(), true, &[]);
+        resolve_claude_with(&shell.to_string_lossy(), true, &[])
     }
     #[cfg(windows)]
     {

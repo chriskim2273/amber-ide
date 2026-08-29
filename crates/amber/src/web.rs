@@ -1892,7 +1892,13 @@ mod tests {
         // its own `live(name)` gate in `map_browser_msg`. `Resize` is
         // deliberately NOT here either, as of the 2026-08-01 resize reversal:
         // it is validated (live + bounds), not forbidden.
-        matches!(msg, ControlMsg::Snapshot | ControlMsg::ReportRunState { .. })
+        matches!(
+            msg,
+            ControlMsg::Snapshot
+                | ControlMsg::ReportRunState { .. }
+                | ControlMsg::SupervisorHello { .. }
+                | ControlMsg::SupervisorCommand { .. }
+        )
     }
 
     #[test]

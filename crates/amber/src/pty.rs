@@ -118,6 +118,7 @@ pub struct PtySession {
     next_sub_id: AtomicU64,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     exit: Arc<Mutex<Option<i32>>>,
+    exit_error: Arc<Mutex<Option<String>>>,
     /// The child's OS process id, captured at spawn (for reading its live cwd
     /// via `procinfo::cwd_of` so `cd` inside a shell survives restart).
     pid: Option<u32>,
@@ -215,6 +216,7 @@ impl PtySession {
     /// reader after its child has exited, so EOF cannot be the authority that
     /// releases subscribers. The reader stays alive after EOF while the
     /// waiter remains responsible for closing every subscription.
+    #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub fn session_with_non_eof_reader_for_test(cmd: CommandBuilder) -> Self {
         Self::spawn_with_reader_eof(cmd, 24, 80, 4096, false)
@@ -414,26 +416,30 @@ impl PtySession {
         // exited, so waiting for reader EOF would leave clients subscribed to
         // a pane that can no longer produce output.
         let exit = Arc::new(Mutex::new(None));
+        let exit_error = Arc::new(Mutex::new(None));
         {
             let exit = Arc::clone(&exit);
+            let exit_error = Arc::clone(&exit_error);
             let subs = Arc::clone(&subs);
             let reader_done = Arc::clone(&reader_done);
             let exit_teardown_done = Arc::clone(&exit_teardown_done);
             thread::spawn(move || {
-                if let Ok(status) = child.wait() {
-                    // Publish terminal status promptly for reaping, but let a
-                    // normal PTY's reader deliver bytes already buffered by
-                    // the kernel. ConPTY can hold that reader open forever;
-                    // its bounded fallback is still this waiter, not EOF.
-                    *exit.lock().unwrap() = Some(status.exit_code() as i32);
-                    if !reader_done.load(Ordering::SeqCst) {
-                        thread::sleep(EXIT_OUTPUT_DRAIN_GRACE);
-                        let mut subs = subs.lock().unwrap();
-                        reader_done.store(true, Ordering::SeqCst);
-                        subs.clear();
-                    }
-                    exit_teardown_done.store(true, Ordering::SeqCst);
+                let result = child.wait().map(|status| status.exit_code() as i32);
+                // Publish terminal status promptly for reaping, but let a
+                // normal PTY's reader deliver bytes already buffered by the
+                // kernel. ConPTY can hold that reader open forever; its
+                // bounded fallback is still this waiter, not EOF.
+                match result {
+                    Ok(code) => *exit.lock().unwrap() = Some(code),
+                    Err(error) => *exit_error.lock().unwrap() = Some(error.to_string()),
                 }
+                if !reader_done.load(Ordering::SeqCst) {
+                    thread::sleep(EXIT_OUTPUT_DRAIN_GRACE);
+                    let mut subs = subs.lock().unwrap();
+                    reader_done.store(true, Ordering::SeqCst);
+                    subs.clear();
+                }
+                exit_teardown_done.store(true, Ordering::SeqCst);
             });
         }
 
@@ -447,6 +453,7 @@ impl PtySession {
             next_sub_id: AtomicU64::new(0),
             killer: Mutex::new(killer),
             exit,
+            exit_error,
             pid,
             run_state: Mutex::new(None),
             run_state_seq: AtomicU64::new(0),
@@ -780,13 +787,16 @@ impl PtySession {
                 if let Some(code) = self.exit_code() {
                     return Ok(code);
                 }
+                if let Some(error) = self.exit_error.lock().unwrap().clone() {
+                    anyhow::bail!("pty child wait failed: {error}");
+                }
             }
             thread::sleep(Duration::from_millis(10));
         }
     }
 
     pub fn is_alive(&self) -> bool {
-        self.exit_code().is_none()
+        self.exit_code().is_none() && self.exit_error.lock().unwrap().is_none()
     }
 
     pub(crate) fn wait_for_exit(&self, timeout: Duration) -> bool {
@@ -1242,6 +1252,19 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn wait_exit_returns_a_recorded_wait_error_after_teardown() {
+        let sess = PtySession::spawn(CommandBuilder::new("cat"), 24, 80, 4096).unwrap();
+        let (_id, _backlog, receiver) = sess.subscribe();
+        *sess.exit_error.lock().unwrap() = Some("injected child wait failure".into());
+        sess.subs.lock().unwrap().clear();
+        sess.exit_teardown_done.store(true, Ordering::SeqCst);
+
+        assert!(sess.wait_exit().unwrap_err().to_string().contains("injected child wait failure"));
+        assert!(receiver.recv_timeout(Duration::from_secs(1)).is_err());
+        let _ = sess.kill();
     }
 
     #[test]

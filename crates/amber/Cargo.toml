@@ -34,3 +34,11 @@ libc = { workspace = true }
 [lib]
 name = "amber"
 path = "src/lib.rs"
+
+[features]
+test-support = []
+
+[[test]]
+name = "windows_pty"
+path = "tests/windows_pty.rs"
+required-features = ["test-support"]

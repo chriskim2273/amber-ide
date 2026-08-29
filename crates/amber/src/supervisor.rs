@@ -2,9 +2,7 @@
 //! with resume/continue argv selection, falling back to an interactive shell
 //! so a pane never silently dies.
 
-use std::io::Write;
-#[cfg(test)]
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -884,6 +882,8 @@ pub fn run_session(
         let ctl = SuspendControl::new();
         match install_suspend_handlers(&ctl) {
             Ok(()) => {
+                #[cfg(windows)]
+                start_windows_supervisor_control(socket, name, ctl.clone());
                 // Rename restoration may need the replacement supervisor to
                 // park before its first agent spawn, otherwise a SIGUSR1 can
                 // arrive before the handlers exist and kill this process.
@@ -961,6 +961,46 @@ pub fn run_session(
 }
 
 #[cfg(not(unix))] fn ignore_suspend_signals() -> anyhow::Result<()> { Ok(()) }
+
+/// Hold a private daemon connection for Windows park/thaw commands. This
+/// connection is distinct from run-state reporting, so no application, web,
+/// or attach client is ever sent a supervisor command.
+#[cfg(windows)]
+fn start_windows_supervisor_control(socket: &Path, name: &str, control: SupervisorControl) {
+    let socket = socket.to_path_buf();
+    let name = name.to_string();
+    std::thread::spawn(move || loop {
+        let Ok(mut stream) = transport::connect(&socket) else {
+            std::thread::sleep(REPORT_RETRY_DELAY);
+            continue;
+        };
+        let hello = Frame::Control(ControlMsg::SupervisorHello { name: name.clone() });
+        if stream.write_all(&proto::encode(&hello)).is_err() || stream.flush().is_err() {
+            std::thread::sleep(REPORT_RETRY_DELAY);
+            continue;
+        }
+        let mut decoder = Decoder::new();
+        let mut bytes = [0u8; 4096];
+        loop {
+            match stream.read(&mut bytes) {
+                Ok(0) | Err(_) => break,
+                Ok(count) => {
+                    decoder.feed(&bytes[..count]);
+                    while let Ok(Some(Decoded::Frame(Frame::Control(ControlMsg::SupervisorCommand { name: target, command })))) = decoder.next_decoded() {
+                        if target == name {
+                            match command.as_str() {
+                                "suspend" => control.apply(SupervisorCommand::Suspend),
+                                "resume" => control.apply(SupervisorCommand::Resume),
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        std::thread::sleep(REPORT_RETRY_DELAY);
+    });
+}
 
 /// `exec $SHELL -l` in `cwd`, replacing this process so the pane never dies.
 /// Only returns on error (exec never returns on success).

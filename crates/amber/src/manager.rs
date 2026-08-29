@@ -6,7 +6,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{mpsc::SyncSender, Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use amber_core::proto::{ControlMsg, RecoveryEvent, SearchResult, SessionInfo};
@@ -135,6 +135,7 @@ pub struct SessionManager {
     cfg: Config,
     root: PathBuf,
     sessions: Mutex<HashMap<String, Arc<PtySession>>>,
+    supervisors: Mutex<HashMap<String, SyncSender<bool>>>,
     /// Stable slot of the terminal most recently focused or written to. Zero
     /// means no foreground session yet; slots make rename unable to drop this
     /// protection by changing only the session name.
@@ -301,6 +302,7 @@ impl SessionManager {
             cfg,
             root,
             sessions: Mutex::new(HashMap::new()),
+            supervisors: Mutex::new(HashMap::new()),
             foreground_slot: AtomicU32::new(0),
             cpu_reconciliation: Mutex::new(()),
             #[cfg(test)]
@@ -1146,6 +1148,24 @@ impl SessionManager {
         self.sessions.lock().unwrap().get(name).cloned()
     }
 
+    pub(crate) fn register_supervisor(
+        &self,
+        name: &str,
+        sender: SyncSender<bool>,
+    ) -> anyhow::Result<()> {
+        let session = self
+            .session(name)
+            .ok_or_else(|| anyhow::anyhow!("no such session: {name}"))?;
+        if !self
+            .effective_meta_for(name, &session)?
+            .is_some_and(|meta| meta.kind.is_agent())
+        {
+            anyhow::bail!("supervisor control applies only to agent sessions: {name}");
+        }
+        self.supervisors.lock().unwrap().insert(name.to_string(), sender);
+        Ok(())
+    }
+
     fn ensure_current_session(&self, name: &str, session: &Arc<PtySession>) -> anyhow::Result<()> {
         let current = self.sessions.lock().unwrap().get(name).cloned();
         if !current
@@ -1420,7 +1440,7 @@ impl SessionManager {
             })?;
         let previous_started = session.memory_suspend_started_ms();
         session.set_memory_suspend_started_ms(pending_started_ms);
-        if let Err(error) = Self::suspend_supervisor(name, &session) {
+        if let Err(error) = self.suspend_supervisor(name, &session) {
             session.restore_suspend_origin(SuspendOrigin::Pressure, SuspendOrigin::None);
             session.set_memory_suspend_started_ms(previous_started);
             return Err(error);
@@ -1634,7 +1654,7 @@ impl SessionManager {
                 let _ = sess.claim_suspend(SuspendOrigin::Manual);
             }
             if sess.take_pending_resume() {
-                if let Err(error) = Self::resume_supervisor(name, &sess) {
+                if let Err(error) = self.resume_supervisor(name, &sess) {
                     sess.restore_pending_resume();
                     return Err(error);
                 }
@@ -1672,14 +1692,33 @@ impl SessionManager {
         anyhow::bail!("suspend/resume is not supported on this platform for session {name}")
     }
 
-    fn suspend_supervisor(name: &str, session: &PtySession) -> anyhow::Result<()> {
+    fn suspend_supervisor(&self, name: &str, session: &PtySession) -> anyhow::Result<()> {
         #[cfg(unix)] return Self::signal_supervisor(name, session, nix::libc::SIGUSR1);
-        #[cfg(not(unix))] Self::signal_supervisor(name, session, 0)
+        #[cfg(not(unix))]
+        {
+            let _ = session;
+            self.send_supervisor_command(name, true)
+        }
     }
 
-    fn resume_supervisor(name: &str, session: &PtySession) -> anyhow::Result<()> {
+    fn resume_supervisor(&self, name: &str, session: &PtySession) -> anyhow::Result<()> {
         #[cfg(unix)] return Self::signal_supervisor(name, session, nix::libc::SIGUSR2);
-        #[cfg(not(unix))] Self::signal_supervisor(name, session, 0)
+        #[cfg(not(unix))]
+        {
+            let _ = session;
+            self.send_supervisor_command(name, false)
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn send_supervisor_command(&self, name: &str, suspend: bool) -> anyhow::Result<()> {
+        self.supervisors
+            .lock()
+            .unwrap()
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("supervisor control is not connected for session {name}"))?
+            .send(suspend)
+            .map_err(|_| anyhow::anyhow!("supervisor control disconnected for session {name}"))
     }
 
     pub fn suspend(&self, name: &str, origin: SuspendOrigin) -> anyhow::Result<()> {
@@ -1714,7 +1753,7 @@ impl SessionManager {
             if state.as_deref() == Some("suspended") {
                 return Ok(());
             }
-            return Self::suspend_supervisor(name, &session);
+            return self.suspend_supervisor(name, &session);
         }
         if current != SuspendOrigin::None
             && !(current == SuspendOrigin::Pressure && origin == SuspendOrigin::Manual)
@@ -1740,7 +1779,7 @@ impl SessionManager {
         if previous == SuspendOrigin::Pressure && state.as_deref() == Some("suspended") {
             return Ok(());
         }
-        if let Err(error) = Self::suspend_supervisor(name, &session) {
+        if let Err(error) = self.suspend_supervisor(name, &session) {
             session.restore_suspend_origin(origin, previous);
             session.set_memory_suspend_started_ms(previous_started);
             return Err(error);
@@ -1773,7 +1812,7 @@ impl SessionManager {
             session.queue_pending_resume();
             return Ok(true);
         }
-        Self::resume_supervisor(name, session)?;
+        self.resume_supervisor(name, session)?;
         session.clear_suspend_origin();
         session.set_memory_suspend_started_ms(0);
         Ok(true)

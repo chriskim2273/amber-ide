@@ -489,6 +489,42 @@ fn handle_control(
                 }
             }
         }
+        ControlMsg::SupervisorHello { name } => {
+            // This connection is opened only by `amber run` on Windows. The
+            // bounded queue and its writer-forwarder keep supervisor commands
+            // off every GUI/web/attach connection.
+            let (tx, rx) = std::sync::mpsc::sync_channel(4);
+            match manager.register_supervisor(&name, tx) {
+                Ok(()) => {
+                    let writer = Arc::clone(writer);
+                    thread::spawn(move || {
+                        while let Ok(suspend) = rx.recv() {
+                            let command = if suspend { "suspend" } else { "resume" };
+                            if write_frame(
+                                &writer,
+                                &Frame::Control(ControlMsg::SupervisorCommand {
+                                    name: name.clone(),
+                                    command: command.to_string(),
+                                }),
+                            )
+                            .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    });
+                }
+                Err(error) => {
+                    let _ = write_frame(
+                        writer,
+                        &Frame::Control(ControlMsg::Error { msg: error.to_string() }),
+                    );
+                }
+            }
+        }
+        // A supervisor may only receive commands after it registered. A
+        // client-originated command is intentionally inert.
+        ControlMsg::SupervisorCommand { .. } => {}
         // Slice 3: park/un-park a claude session to free its RAM. Signal the
         // supervisor (SIGUSR1/SIGUSR2); the supervisor reports the resulting phase
         // ("suspended"/"claude") back via ReportRunState, which fans the change to
