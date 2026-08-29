@@ -493,34 +493,39 @@ fn handle_control(
             // This connection is opened only by `amber run` on Windows. The
             // bounded queue and its writer-forwarder keep supervisor commands
             // off every GUI/web/attach connection.
-            let (tx, rx) = std::sync::mpsc::sync_channel(4);
-            match manager.register_supervisor(&name, tx) {
-                Ok(()) => {
-                    let writer = Arc::clone(writer);
-                    thread::spawn(move || {
-                        while let Ok(suspend) = rx.recv() {
-                            let command = if suspend { "suspend" } else { "resume" };
-                            if write_frame(
-                                &writer,
-                                &Frame::Control(ControlMsg::SupervisorCommand {
-                                    name: name.clone(),
-                                    command: command.to_string(),
-                                }),
-                            )
-                            .is_err()
-                            {
-                                break;
+            #[cfg(windows)]
+            {
+                let (tx, rx) = std::sync::mpsc::sync_channel(4);
+                match manager.register_supervisor(&name, tx) {
+                    Ok(()) => {
+                        let writer = Arc::clone(writer);
+                        thread::spawn(move || {
+                            while let Ok(suspend) = rx.recv() {
+                                let command = if suspend { "suspend" } else { "resume" };
+                                if write_frame(
+                                    &writer,
+                                    &Frame::Control(ControlMsg::SupervisorCommand {
+                                        name: name.clone(),
+                                        command: command.to_string(),
+                                    }),
+                                )
+                                .is_err()
+                                {
+                                    break;
+                                }
                             }
-                        }
-                    });
-                }
-                Err(error) => {
-                    let _ = write_frame(
-                        writer,
-                        &Frame::Control(ControlMsg::Error { msg: error.to_string() }),
-                    );
+                        });
+                    }
+                    Err(error) => {
+                        let _ = write_frame(
+                            writer,
+                            &Frame::Control(ControlMsg::Error { msg: error.to_string() }),
+                        );
+                    }
                 }
             }
+            #[cfg(not(windows))]
+            let _ = name;
         }
         // A supervisor may only receive commands after it registered. A
         // client-originated command is intentionally inert.

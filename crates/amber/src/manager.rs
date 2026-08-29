@@ -6,7 +6,9 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{mpsc::SyncSender, Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, Weak};
+#[cfg(windows)]
+use std::sync::mpsc::SyncSender;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use amber_core::proto::{ControlMsg, RecoveryEvent, SearchResult, SessionInfo};
@@ -135,6 +137,7 @@ pub struct SessionManager {
     cfg: Config,
     root: PathBuf,
     sessions: Mutex<HashMap<String, Arc<PtySession>>>,
+    #[cfg(windows)]
     supervisors: Mutex<HashMap<String, SyncSender<bool>>>,
     /// Stable slot of the terminal most recently focused or written to. Zero
     /// means no foreground session yet; slots make rename unable to drop this
@@ -302,6 +305,7 @@ impl SessionManager {
             cfg,
             root,
             sessions: Mutex::new(HashMap::new()),
+            #[cfg(windows)]
             supervisors: Mutex::new(HashMap::new()),
             foreground_slot: AtomicU32::new(0),
             cpu_reconciliation: Mutex::new(()),
@@ -1148,6 +1152,7 @@ impl SessionManager {
         self.sessions.lock().unwrap().get(name).cloned()
     }
 
+    #[cfg(windows)]
     pub(crate) fn register_supervisor(
         &self,
         name: &str,

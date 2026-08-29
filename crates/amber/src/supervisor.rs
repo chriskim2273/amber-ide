@@ -2,7 +2,11 @@
 //! with resume/continue argv selection, falling back to an interactive shell
 //! so a pane never silently dies.
 
-use std::io::{Read, Write};
+use std::io::Write;
+#[cfg(windows)]
+use std::io::Read;
+#[cfg(all(test, not(windows)))]
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -986,13 +990,13 @@ fn start_windows_supervisor_control(socket: &Path, name: &str, control: Supervis
                 Ok(0) | Err(_) => break,
                 Ok(count) => {
                     decoder.feed(&bytes[..count]);
-                    while let Ok(Some(Decoded::Frame(Frame::Control(ControlMsg::SupervisorCommand { name: target, command })))) = decoder.next_decoded() {
-                        if target == name {
-                            match command.as_str() {
-                                "suspend" => control.apply(SupervisorCommand::Suspend),
-                                "resume" => control.apply(SupervisorCommand::Resume),
-                                _ => {}
+                    loop {
+                        match decoder.next_decoded() {
+                            Ok(Some(Decoded::Frame(frame))) => {
+                                apply_supervisor_control_frame(&control, &name, frame);
                             }
+                            Ok(Some(Decoded::UndecodableControl(_))) => {}
+                            Ok(None) | Err(_) => break,
                         }
                     }
                 }
@@ -1000,6 +1004,24 @@ fn start_windows_supervisor_control(socket: &Path, name: &str, control: Supervis
         }
         std::thread::sleep(REPORT_RETRY_DELAY);
     });
+}
+
+/// Apply a command received on the supervisor's private daemon connection.
+/// Keeping this conversion beside the connection loop makes the production
+/// pipe and its test exercise the same command-to-state-machine boundary.
+#[cfg(any(windows, test))]
+fn apply_supervisor_control_frame(control: &SupervisorControl, expected_name: &str, frame: Frame) {
+    let Frame::Control(ControlMsg::SupervisorCommand { name, command }) = frame else {
+        return;
+    };
+    if name != expected_name {
+        return;
+    }
+    match command.as_str() {
+        "suspend" => control.apply(SupervisorCommand::Suspend),
+        "resume" => control.apply(SupervisorCommand::Resume),
+        _ => {}
+    }
 }
 
 /// `exec $SHELL -l` in `cwd`, replacing this process so the pane never dies.
@@ -1024,6 +1046,40 @@ fn shell_fallback(cwd: &Path) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use std::process::ExitStatus;
+
+    #[test]
+    fn private_supervisor_frame_drives_shared_control_state_machine() {
+        let control = SupervisorControl::new();
+        apply_supervisor_control_frame(
+            &control,
+            "agent",
+            Frame::Control(ControlMsg::SupervisorCommand {
+                name: "agent".to_string(),
+                command: "suspend".to_string(),
+            }),
+        );
+        assert!(control.take_suspend());
+
+        apply_supervisor_control_frame(
+            &control,
+            "agent",
+            Frame::Control(ControlMsg::SupervisorCommand {
+                name: "agent".to_string(),
+                command: "resume".to_string(),
+            }),
+        );
+        assert!(control.take_resume());
+
+        apply_supervisor_control_frame(
+            &control,
+            "agent",
+            Frame::Control(ControlMsg::SupervisorCommand {
+                name: "another-session".to_string(),
+                command: "suspend".to_string(),
+            }),
+        );
+        assert!(!control.take_suspend());
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
