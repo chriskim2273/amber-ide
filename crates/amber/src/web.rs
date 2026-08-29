@@ -454,6 +454,20 @@ fn random_token() -> std::io::Result<String> {
 /// is missing/empty or `regenerate` is set (`amber web --new-token`).
 pub fn load_or_create_token(root: &Path, regenerate: bool) -> anyhow::Result<String> {
     let path = root.join(TOKEN_FILE);
+    #[cfg(windows)]
+    {
+        std::fs::create_dir_all(root)?;
+        let candidate = random_token()?;
+        let stored = crate::platform::load_or_create_user_private(&path, candidate.as_bytes(), regenerate)?;
+        let token = String::from_utf8(stored)?.trim().to_string();
+        if token.is_empty() {
+            anyhow::bail!("refusing an empty private web token at {}", path.display());
+        }
+        return Ok(token);
+    }
+
+    #[cfg(unix)]
+    {
     if !regenerate {
         if let Ok(existing) = std::fs::read_to_string(&path) {
             let existing = existing.trim().to_string();
@@ -472,6 +486,7 @@ pub fn load_or_create_token(root: &Path, regenerate: bool) -> anyhow::Result<Str
     let token = random_token()?;
     crate::platform::write_user_private(&path, token.as_bytes())?;
     Ok(token)
+    }
 }
 
 /// Read the token WITHOUT creating one.
@@ -480,9 +495,19 @@ pub fn load_or_create_token(root: &Path, regenerate: bool) -> anyhow::Result<Str
 /// for a read-only query: `amber ctl web status` must be able to report "no
 /// token yet" rather than manufacture one.
 pub fn load_token(root: &Path) -> Option<String> {
+    #[cfg(windows)]
+    {
+        let raw = crate::platform::read_user_private(&root.join(TOKEN_FILE)).ok()??;
+        let trimmed = std::str::from_utf8(&raw).ok()?.trim();
+        return (!trimmed.is_empty()).then(|| trimmed.to_string());
+    }
+
+    #[cfg(unix)]
+    {
     let raw = std::fs::read_to_string(root.join(TOKEN_FILE)).ok()?;
     let trimmed = raw.trim();
     if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+    }
 }
 
 struct Auth {

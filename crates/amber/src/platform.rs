@@ -2,7 +2,7 @@
 
 use std::ffi::OsString;
 use std::io::{self, Write};
-#[cfg(unix)] use std::io::Read;
+#[cfg(any(unix, windows))] use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// Fill `bytes` from the operating system's cryptographic random source.
@@ -51,24 +51,7 @@ pub fn write_user_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
 
     #[cfg(windows)]
     {
-        let mut file = match create_user_private_file(path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                if !is_user_private(path)? {
-                    anyhow::bail!(
-                        "refusing to replace {}: it is not private to the current user",
-                        path.display()
-                    );
-                }
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .truncate(true)
-                    .open(path)?
-            }
-            Err(error) => return Err(error.into()),
-        };
-        file.write_all(bytes)?;
-        file.flush()?;
+        write_user_private_windows(path, bytes)?;
     }
 
     if !is_user_private(path)? {
@@ -90,7 +73,81 @@ pub fn is_user_private(path: &Path) -> anyhow::Result<bool> {
 
     #[cfg(windows)]
     {
-        windows_is_user_private(path).map_err(Into::into)
+        match open_existing_user_private(path) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+/// Atomically establish or load a current-user-private file on Windows.
+///
+/// The candidate is written only through a new, exclusively-held handle whose
+/// no-reparse object and DACL have already been verified. A concurrent creator
+/// that loses `CREATE_NEW` retries the established winner and returns its
+/// bytes; it never truncates or rewrites the winner.
+#[cfg(windows)]
+pub fn load_or_create_user_private(
+    path: &Path,
+    candidate: &[u8],
+    regenerate: bool,
+) -> anyhow::Result<Vec<u8>> {
+    if regenerate {
+        match open_existing_user_private(path) {
+            Ok(mut file) => {
+                write_private_handle(&mut file, candidate)?;
+                return Ok(candidate.to_vec());
+            }
+            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error.into()),
+            Err(_) => {}
+        }
+    }
+
+    for _ in 0..50 {
+        match open_existing_user_private(path) {
+            Ok(mut file) => {
+                let mut existing = Vec::new();
+                file.read_to_end(&mut existing)?;
+                if !existing.is_empty() {
+                    return Ok(existing);
+                }
+                // A winner may have created the object but not reached its
+                // first write yet. It holds the handle exclusively, so never
+                // initialize this observed empty file from a losing caller.
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match create_user_private_file(path) {
+                    Ok(mut file) => {
+                        write_private_handle(&mut file, candidate)?;
+                        return Ok(candidate.to_vec());
+                    }
+                    Err(error) if is_creation_race(&error) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Err(error) if is_creation_race(&error) => {}
+            Err(error) => return Err(error.into()),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    anyhow::bail!(
+        "timed out waiting for the private token creator at {}",
+        path.display()
+    )
+}
+
+/// Read a Windows private file through a verified no-reparse handle.
+#[cfg(windows)]
+pub fn read_user_private(path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
+    match open_existing_user_private(path) {
+        Ok(mut file) => {
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            Ok(Some(bytes))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -182,50 +239,145 @@ fn create_user_private_file(path: &Path) -> io::Result<std::fs::File> {
         if handle == INVALID_HANDLE_VALUE {
             return Err(io::Error::last_os_error());
         }
-        Ok(std::fs::File::from_raw_handle(handle))
+        let file = std::fs::File::from_raw_handle(handle);
+        verify_user_private_handle(&file)?;
+        Ok(file)
     }
 }
 
 #[cfg(windows)]
-fn windows_is_user_private(path: &Path) -> io::Result<bool> {
-    use std::ffi::c_void;
-    use std::mem::size_of;
+fn open_existing_user_private(path: &Path) -> io::Result<std::fs::File> {
     use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT, OPEN_EXISTING,
+    };
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    unsafe {
+        let handle = CreateFileW(
+            wide.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            0,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        );
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        let file = std::fs::File::from_raw_handle(handle);
+        verify_user_private_handle(&file)?;
+        Ok(file)
+    }
+}
+
+#[cfg(windows)]
+fn write_user_private_windows(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    match open_existing_user_private(path) {
+        Ok(mut file) => write_private_handle(&mut file, bytes),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let mut file = create_user_private_file(path)?;
+            write_private_handle(&mut file, bytes)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(windows)]
+fn write_private_handle(file: &mut std::fs::File, bytes: &[u8]) -> io::Result<()> {
+    // This is intentionally after `verify_user_private_handle`: no candidate
+    // byte reaches an object before the exact opened handle is verified.
+    verify_user_private_handle(file)?;
+    file.set_len(0)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+#[cfg(windows)]
+fn is_creation_race(error: &io::Error) -> bool {
+    use windows_sys::Win32::Foundation::{ERROR_FILE_EXISTS, ERROR_SHARING_VIOLATION};
+
+    matches!(
+        error.raw_os_error(),
+        Some(code) if code == ERROR_FILE_EXISTS as i32 || code == ERROR_SHARING_VIOLATION as i32
+    )
+}
+
+#[cfg(windows)]
+fn verify_user_private_handle(file: &std::fs::File) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT,
+    };
+
+    unsafe {
+        let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        if GetFileInformationByHandle(handle, &mut info) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "refusing a reparse-point token file",
+            ));
+        }
+        if !handle_is_user_private(handle)? {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "token file is not private to the current user",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn handle_is_user_private(handle: windows_sys::Win32::Foundation::HANDLE) -> io::Result<bool> {
+    use std::ffi::c_void;
+    use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::{
-        EqualSid, GetAce, GetFileSecurityW, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
-        GetSecurityDescriptorOwner, ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION,
-        OWNER_SECURITY_INFORMATION, SE_DACL_PROTECTED, SECURITY_DESCRIPTOR,
+        DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+    };
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+
+    let mut descriptor = std::ptr::null_mut::<c_void>();
+    unsafe {
+        let status = GetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+        );
+        if status != 0 {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        let result = security_descriptor_is_user_private(descriptor, &current_user_sid()?);
+        let _ = LocalFree(descriptor);
+        result
+    }
+}
+
+#[cfg(windows)]
+fn security_descriptor_is_user_private(
+    descriptor: *mut std::ffi::c_void,
+    current_sid: &[u8],
+) -> io::Result<bool> {
+    use std::ffi::c_void;
+    use windows_sys::Win32::Security::{
+        EqualSid, GetAce, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
+        GetSecurityDescriptorOwner, ACCESS_ALLOWED_ACE, ACL, SE_DACL_PROTECTED,
     };
     use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
 
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    let mut required = 0;
     unsafe {
-        let _ = GetFileSecurityW(
-            wide.as_ptr(),
-            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
-            0,
-            &mut required,
-        );
-    }
-    if required == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let mut words = vec![0u32; (required as usize).div_ceil(size_of::<u32>())];
-    let descriptor = words.as_mut_ptr().cast::<SECURITY_DESCRIPTOR>();
-    let descriptor_ptr = descriptor.cast::<c_void>();
-    unsafe {
-        if GetFileSecurityW(
-            wide.as_ptr(),
-            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-            descriptor_ptr,
-            required,
-            &mut required,
-        ) == 0 {
-            return Err(io::Error::last_os_error());
-        }
-
         let mut owner = std::ptr::null_mut();
         let mut owner_defaulted = 0;
         let mut dacl = std::ptr::null_mut::<ACL>();
@@ -233,9 +385,9 @@ fn windows_is_user_private(path: &Path) -> io::Result<bool> {
         let mut dacl_defaulted = 0;
         let mut control = 0;
         let mut revision = 0;
-        if GetSecurityDescriptorOwner(descriptor_ptr, &mut owner, &mut owner_defaulted) == 0
-            || GetSecurityDescriptorDacl(descriptor_ptr, &mut dacl_present, &mut dacl, &mut dacl_defaulted) == 0
-            || GetSecurityDescriptorControl(descriptor_ptr, &mut control, &mut revision) == 0 {
+        if GetSecurityDescriptorOwner(descriptor, &mut owner, &mut owner_defaulted) == 0
+            || GetSecurityDescriptorDacl(descriptor, &mut dacl_present, &mut dacl, &mut dacl_defaulted) == 0
+            || GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) == 0 {
             return Err(io::Error::last_os_error());
         }
         if owner.is_null()
@@ -245,22 +397,17 @@ fn windows_is_user_private(path: &Path) -> io::Result<bool> {
             || (*dacl).AceCount != 1 {
             return Ok(false);
         }
-
         let mut ace = std::ptr::null_mut::<c_void>();
         if GetAce(dacl, 0, &mut ace) == 0 || ace.is_null() {
             return Err(io::Error::last_os_error());
         }
         let ace = &*ace.cast::<ACCESS_ALLOWED_ACE>();
-        // ACCESS_ALLOWED_ACE_TYPE is zero. Reject every other ACE kind,
-        // including inherited, deny, callback, and object-specific entries.
         if ace.Header.AceType != 0 || ace.Header.AceFlags != 0 || ace.Mask != FILE_ALL_ACCESS {
             return Ok(false);
         }
-
-        let sid = current_user_sid()?;
-        let current_sid = sid.as_ptr() as *mut c_void;
+        let sid = current_sid.as_ptr() as *mut c_void;
         let ace_sid = std::ptr::addr_of!(ace.SidStart).cast_mut().cast::<c_void>();
-        Ok(EqualSid(owner, current_sid) != 0 && EqualSid(ace_sid, current_sid) != 0)
+        Ok(EqualSid(owner, sid) != 0 && EqualSid(ace_sid, sid) != 0)
     }
 }
 
@@ -380,6 +527,134 @@ fn reserved_device_name(name: &str) -> bool {
 
 fn is_single_device_number(number: &str) -> bool {
     matches!(number.as_bytes(), [b'1'..=b'9'])
+}
+
+#[cfg(all(test, windows))]
+mod windows_private_file_tests {
+    use super::*;
+    use std::mem::size_of;
+    use windows_sys::Win32::Security::{
+        AddAccessAllowedAce, CreateWellKnownSid, InitializeAcl, InitializeSecurityDescriptor,
+        SetSecurityDescriptorControl, SetSecurityDescriptorDacl, SetSecurityDescriptorOwner,
+        ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, SECURITY_DESCRIPTOR, SE_DACL_PROTECTED, WinWorldSid,
+    };
+    use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+
+    struct Descriptor {
+        _acl: Vec<u32>,
+        descriptor: SECURITY_DESCRIPTOR,
+    }
+
+    fn world_sid() -> Vec<u8> {
+        unsafe {
+            let mut len = 0;
+            let _ = CreateWellKnownSid(WinWorldSid, std::ptr::null_mut(), std::ptr::null_mut(), &mut len);
+            assert!(len > 0);
+            let mut sid = vec![0u8; len as usize];
+            assert_ne!(
+                CreateWellKnownSid(
+                    WinWorldSid,
+                    std::ptr::null_mut(),
+                    sid.as_mut_ptr().cast(),
+                    &mut len,
+                ),
+                0
+            );
+            sid
+        }
+    }
+
+    fn descriptor(owner: *mut std::ffi::c_void, ace_sids: &[*mut std::ffi::c_void], dacl: bool) -> Descriptor {
+        let mut descriptor = SECURITY_DESCRIPTOR::default();
+        let acl_bytes = size_of::<ACL>()
+            + ace_sids.len() * (size_of::<ACCESS_ALLOWED_ACE>() - size_of::<u32>())
+            + ace_sids
+                .iter()
+                .map(|sid| unsafe { windows_sys::Win32::Security::GetLengthSid(*sid) as usize })
+                .sum::<usize>();
+        let mut acl = vec![0u32; acl_bytes.div_ceil(size_of::<u32>())];
+        unsafe {
+            let descriptor_ptr = (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast();
+            assert_ne!(InitializeSecurityDescriptor(descriptor_ptr, 1), 0);
+            assert_ne!(SetSecurityDescriptorOwner(descriptor_ptr, owner, 0), 0);
+            if dacl {
+                let dacl = acl.as_mut_ptr().cast::<ACL>();
+                assert_ne!(InitializeAcl(dacl, acl_bytes as u32, ACL_REVISION), 0);
+                for sid in ace_sids {
+                    assert_ne!(AddAccessAllowedAce(dacl, ACL_REVISION, FILE_ALL_ACCESS, *sid), 0);
+                }
+                assert_ne!(SetSecurityDescriptorDacl(descriptor_ptr, 1, dacl, 0), 0);
+                assert_ne!(
+                    SetSecurityDescriptorControl(descriptor_ptr, SE_DACL_PROTECTED, SE_DACL_PROTECTED),
+                    0
+                );
+            } else {
+                assert_ne!(SetSecurityDescriptorDacl(descriptor_ptr, 0, std::ptr::null(), 0), 0);
+            }
+        }
+        Descriptor { _acl: acl, descriptor }
+    }
+
+    #[test]
+    fn private_descriptor_rejects_owner_mismatch_and_extra_aces() {
+        let user = current_user_sid().unwrap();
+        let user_ptr = user.as_ptr() as *mut std::ffi::c_void;
+        let world = world_sid();
+        let world_ptr = world.as_ptr() as *mut std::ffi::c_void;
+
+        let wrong_owner = descriptor(world_ptr, &[user_ptr], true);
+        assert!(!security_descriptor_is_user_private(
+            (&wrong_owner.descriptor as *const SECURITY_DESCRIPTOR).cast_mut().cast(),
+            &user,
+        )
+        .unwrap());
+
+        let extra_ace = descriptor(user_ptr, &[user_ptr, world_ptr], true);
+        assert!(!security_descriptor_is_user_private(
+            (&extra_ace.descriptor as *const SECURITY_DESCRIPTOR).cast_mut().cast(),
+            &user,
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn private_descriptor_rejects_absent_and_null_dacls() {
+        let user = current_user_sid().unwrap();
+        let user_ptr = user.as_ptr() as *mut std::ffi::c_void;
+        let absent = descriptor(user_ptr, &[], false);
+        assert!(!security_descriptor_is_user_private(
+            (&absent.descriptor as *const SECURITY_DESCRIPTOR).cast_mut().cast(),
+            &user,
+        )
+        .unwrap());
+
+        let mut null_dacl = SECURITY_DESCRIPTOR::default();
+        unsafe {
+            let ptr = (&mut null_dacl as *mut SECURITY_DESCRIPTOR).cast();
+            assert_ne!(InitializeSecurityDescriptor(ptr, 1), 0);
+            assert_ne!(SetSecurityDescriptorOwner(ptr, user_ptr, 0), 0);
+            assert_ne!(SetSecurityDescriptorDacl(ptr, 1, std::ptr::null(), 0), 0);
+        }
+        assert!(!security_descriptor_is_user_private(
+            (&null_dacl as *const SECURITY_DESCRIPTOR).cast_mut().cast(),
+            &user,
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn private_open_rejects_a_reparse_point() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"not-a-token").unwrap();
+        let link = dir.path().join("web-token");
+        match std::os::windows::fs::symlink_file(&target, &link) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("could not create test reparse point: {error}"),
+        }
+        assert!(open_existing_user_private(&link).is_err());
+    }
 }
 
 #[cfg(test)]

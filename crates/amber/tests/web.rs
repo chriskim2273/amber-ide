@@ -372,6 +372,29 @@ fn token_file_is_private_and_stable_until_regenerated() {
     assert_ne!(a, c, "--new-token must rotate the token");
 }
 
+#[cfg(windows)]
+#[test]
+fn concurrent_token_creation_returns_the_single_established_token() {
+    use std::sync::{Arc, Barrier};
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = Arc::new(dir.path().to_path_buf());
+    let start = Arc::new(Barrier::new(2));
+    let mut workers = Vec::new();
+    for _ in 0..2 {
+        let root = Arc::clone(&root);
+        let start = Arc::clone(&start);
+        workers.push(std::thread::spawn(move || {
+            start.wait();
+            web::load_or_create_token(&root, false).unwrap()
+        }));
+    }
+    let first = workers.pop().unwrap().join().unwrap();
+    let second = workers.pop().unwrap().join().unwrap();
+    assert_eq!(first, second, "a loser must load, never overwrite, the winner token");
+    assert_eq!(web::load_or_create_token(&root, false).unwrap(), first);
+}
+
 #[test]
 fn sessions_response_carries_the_mosaic_and_the_slot() {
     let f = fixture();
