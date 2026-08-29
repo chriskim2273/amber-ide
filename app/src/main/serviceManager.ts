@@ -92,6 +92,11 @@ export function windowsTaskkillCommand(): Argv {
   return { cmd: 'taskkill.exe', args: ['/IM', 'amberd.exe', '/T', '/F'] }
 }
 
+/** Windows taskkill uses 128 when the requested image has no matching process. */
+export function isWindowsTaskkillNoMatch(exitCode: number): boolean {
+  return exitCode === 128
+}
+
 /**
  * A failed snapshot is safe to ignore only when its CLI reported no daemon.
  * Any other failure may mean state has not been persisted, so replacing the

@@ -14,6 +14,7 @@ import { restartDaemonCommand,
   bootUnitPath,
   windowsRunKeyCommand,
   windowsTaskkillCommand,
+  isWindowsTaskkillNoMatch,
   shouldStopWindowsDaemon,
   LAUNCHD_LABEL,
   SYSTEMD_SERVICE,
@@ -196,5 +197,12 @@ describe('Windows daemon install', () => {
   it('does not treat access denied or generic transport failures as absence', () => {
     expect(shouldStopWindowsDaemon(1, false)).toBe(false)
     expect(shouldStopWindowsDaemon(2, false)).toBe(false)
+  })
+
+  it('ignores only taskkill\'s no-matching-process result', () => {
+    expect(isWindowsTaskkillNoMatch(128)).toBe(true)
+    expect(isWindowsTaskkillNoMatch(5)).toBe(false) // access denied
+    expect(isWindowsTaskkillNoMatch(1)).toBe(false)
+    expect(isWindowsTaskkillNoMatch(-1)).toBe(false) // spawn failure
   })
 })

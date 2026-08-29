@@ -31,6 +31,7 @@ import {
   linuxInstallServiceArgv,
   windowsRunKeyCommand,
   windowsTaskkillCommand,
+  isWindowsTaskkillNoMatch,
   shouldStopWindowsDaemon,
 } from './serviceManager'
 import { backoffDelay, nextAttempt } from './clientSupervisor'
@@ -320,9 +321,12 @@ async function snapshotAllowsWindowsDaemonStop(socket: string): Promise<void> {
 async function stopWindowsDaemon(socket: string): Promise<void> {
   await snapshotAllowsWindowsDaemonStop(socket)
   const stop = windowsTaskkillCommand()
-  // A concurrent clean exit can make taskkill report no matching process;
-  // that still meets the state-safety precondition above.
-  await spawnOk(stop.cmd, stop.args).catch(() => {})
+  const result = await runCapture(stop.cmd, stop.args)
+  // A concurrent clean exit can leave taskkill with no matching amberd.exe.
+  // Every other failure (notably access denied) blocks the caller: Quit must
+  // not report success, and Restart must not spawn a duplicate daemon.
+  if (result.code === 0 || isWindowsTaskkillNoMatch(result.code)) return
+  throw new Error(`taskkill failed: ${result.stderr.trim() || `exit ${result.code}`}`)
 }
 
 async function installWindowsDaemon(socket: string): Promise<void> {
