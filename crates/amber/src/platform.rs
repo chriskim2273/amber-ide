@@ -13,7 +13,7 @@ pub fn state_root() -> anyhow::Result<PathBuf> {
             return Ok(PathBuf::from(state_home).join("amber-ide"));
         }
         let home = std::env::var_os("HOME").unwrap_or_else(|| ".".into());
-        return Ok(PathBuf::from(home).join(".local/state/amber-ide"));
+        Ok(PathBuf::from(home).join(".local/state/amber-ide"))
     }
 
     #[cfg(windows)]
@@ -49,7 +49,7 @@ pub fn socket_name_for_root(root: &Path) -> anyhow::Result<PathBuf> {
                 .join("amber-ide")
                 .join("amberd.sock"));
         }
-        return Ok(root.join("amberd.sock"));
+        Ok(root.join("amberd.sock"))
     }
 
     #[cfg(windows)]
