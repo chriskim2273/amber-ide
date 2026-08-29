@@ -15,10 +15,10 @@ use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
 pub mod attach;
+pub mod cgroup;
 pub mod claude;
 pub mod codex;
 pub mod codex_skill;
-pub mod cgroup;
 pub mod daemon;
 pub mod grok;
 pub mod host_pressure;
@@ -29,16 +29,18 @@ pub mod memory_guardian;
 pub mod mosaic;
 pub mod opencode;
 pub mod pi;
+pub mod platform;
 pub mod procinfo;
 pub mod pty;
 pub mod search;
-pub mod platform;
 pub mod supervisor;
-pub mod web;
 pub mod tailscale;
 pub mod transport;
-pub mod webctl;
 pub mod watchers;
+pub mod web;
+pub mod webctl;
+#[cfg(windows)]
+pub mod winlifecycle;
 
 /// Start the long-lived Amber session daemon.
 ///
@@ -68,7 +70,9 @@ pub fn daemon_main(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Re
             None
         }
     };
-    let budget_kb = config.memory.budget_kb(procinfo::total_memory_kb(), cgroup_limit_kb);
+    let budget_kb = config
+        .memory
+        .budget_kb(procinfo::total_memory_kb(), cgroup_limit_kb);
     cgroups.set_session_high_kb(config.memory.session_high_kb(budget_kb));
     let memory_config = config.memory.clone();
     let pressure_config = config.pressure.clone();
@@ -97,6 +101,9 @@ pub fn daemon_main(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Re
         pi::ensure_global_pi_extension();
     }
     manager.restore()?;
+
+    #[cfg(windows)]
+    winlifecycle::install_shutdown_handler(Arc::clone(&manager))?;
 
     let listener = daemon::prepare_socket(&socket_path)?;
     {

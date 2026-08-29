@@ -17,22 +17,38 @@
 //!   forwarded as a `Resize`;
 //! - a daemon `Exit` frame (the pane's child ended) exits the client.
 
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, Write};
+#[cfg(any(unix, windows))]
+use std::io::{IsTerminal, Read};
+#[cfg(unix)]
+use std::os::fd::AsFd;
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 use std::path::Path;
-#[cfg(unix)] use std::os::fd::AsFd;
-#[cfg(unix)] use std::os::unix::net::UnixStream;
-#[cfg(unix)] use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(unix)] use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(windows)]
+use std::sync::mpsc;
+#[cfg(unix)]
+use std::sync::Arc;
+#[cfg(windows)]
+use std::thread;
 
-use amber_core::proto::{self, ControlMsg, Decoder, Frame};
-#[cfg(unix)] use nix::errno::Errno;
-#[cfg(unix)] use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
-#[cfg(unix)] use nix::sys::termios::{self, SetArg, Termios};
+use amber_core::proto;
+#[cfg(any(unix, windows))]
+use amber_core::proto::{ControlMsg, Decoder, Frame};
+#[cfg(unix)]
+use nix::errno::Errno;
+#[cfg(unix)]
+use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+#[cfg(unix)]
+use nix::sys::termios::{self, SetArg, Termios};
 
 /// Poll timeout: the cadence at which the SIGWINCH flag is rechecked even if
 /// no fd is ready (a signal may interrupt poll on this thread, but flag-only
 /// delivery on another thread must still be noticed).
-#[cfg(unix)] const POLL_TICK_MS: u16 = 100;
+#[cfg(unix)]
+const POLL_TICK_MS: u16 = 100;
 
 /// Written to the local terminal once per attach, before any replayed bytes
 /// (spec §5) — a minimal reset so replay lands in a known-good terminal:
@@ -41,6 +57,7 @@ use amber_core::proto::{self, ControlMsg, Decoder, Frame};
 /// - `ESC [?1049l`: leave the alternate screen, in case a previous attach
 ///   died while a TUI held it;
 /// - `ESC [?25h`: show the cursor (TUIs hide it and may not have restored it).
+#[cfg(unix)]
 const TERM_RESET: &[u8] = b"\x1b[!p\x1b[?1049l\x1b[?25h";
 
 /// Written to the local terminal on detach/exit (the mirror of [`TERM_RESET`]).
@@ -56,6 +73,7 @@ const TERM_RESET: &[u8] = b"\x1b[!p\x1b[?1049l\x1b[?25h";
 /// Mirrors tmux/screen detach restore. Order: disable mouse (all encodings) +
 /// bracketed paste, DECSTR soft reset (autowrap/origin/cursor-keys/margins),
 /// leave the alt screen, show the cursor.
+#[cfg(unix)]
 const TERM_RESTORE: &[u8] =
     b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[!p\x1b[?1049l\x1b[?25h";
 
@@ -97,15 +115,26 @@ pub struct PrefixResolution {
 /// An unparseable env value falls back to the default and reports a warning.
 pub fn resolve_prefix(no_prefix: bool, env: Option<&str>) -> PrefixResolution {
     if no_prefix {
-        return PrefixResolution { prefix: None, warning: None };
+        return PrefixResolution {
+            prefix: None,
+            warning: None,
+        };
     }
     match env {
-        None => PrefixResolution { prefix: Some(DEFAULT_PREFIX), warning: None },
+        None => PrefixResolution {
+            prefix: Some(DEFAULT_PREFIX),
+            warning: None,
+        },
         Some(raw) => match parse_prefix_env(raw) {
-            Ok(prefix) => PrefixResolution { prefix, warning: None },
+            Ok(prefix) => PrefixResolution {
+                prefix,
+                warning: None,
+            },
             Err(()) => PrefixResolution {
                 prefix: Some(DEFAULT_PREFIX),
-                warning: Some(format!("ignoring invalid AMBER_PREFIX {raw:?}; using Ctrl-b")),
+                warning: Some(format!(
+                    "ignoring invalid AMBER_PREFIX {raw:?}; using Ctrl-b"
+                )),
             },
         },
     }
@@ -131,6 +160,7 @@ fn parse_prefix_env(raw: &str) -> Result<Option<u8>, ()> {
 
 /// Human name for a prefix byte in the `C-<letter>` control range, for the
 /// attach banner (e.g. `0x02` -> `"Ctrl-b"`). Falls back to a hex form.
+#[cfg(unix)]
 fn prefix_key_name(prefix: u8) -> String {
     if (0x01..=0x1a).contains(&prefix) {
         format!("Ctrl-{}", (prefix - 1 + b'a') as char)
@@ -209,7 +239,11 @@ struct ScanResult {
 /// prefix + any other byte = drop both (tmux "unbound key"). Every other byte
 /// is forwarded verbatim — no normal keystroke is ever silently lost.
 fn scan_prefix(chunk: &[u8], prefix: u8, armed: bool) -> ScanResult {
-    let mut out = ScanResult { forward: Vec::with_capacity(chunk.len()), armed, detach: false };
+    let mut out = ScanResult {
+        forward: Vec::with_capacity(chunk.len()),
+        armed,
+        detach: false,
+    };
     for &b in chunk {
         if out.armed {
             out.armed = false;
@@ -233,6 +267,7 @@ fn scan_prefix(chunk: &[u8], prefix: u8, armed: bool) -> ScanResult {
 
 /// Terminal decoration for an interactive attach. Both fields are inert off a
 /// tty; the headless tests use [`StatusUi::none`].
+#[cfg(unix)]
 #[derive(Debug, Clone)]
 pub struct StatusUi {
     /// Set the terminal title (`amber: <name>`) via OSC 2 (push/pop).
@@ -243,32 +278,43 @@ pub struct StatusUi {
     pub hint: Option<String>,
 }
 
+#[cfg(unix)]
 impl StatusUi {
     /// No decoration — raw passthrough, used off a tty and in tests.
     pub fn none() -> Self {
-        StatusUi { title: false, bar: false, hint: None }
+        StatusUi {
+            title: false,
+            bar: false,
+            hint: None,
+        }
     }
 }
 
 /// OSC 2 set-title, preceded by XTPUSHTITLE so [`TITLE_POP`] can restore it.
+#[cfg(unix)]
 fn title_set(name: &str) -> String {
     format!("\x1b[22;2t\x1b]2;amber: {name}\x07")
 }
 /// XTPOPTITLE — restore the title saved by [`title_set`] (ignored if unsupported).
+#[cfg(unix)]
 const TITLE_POP: &str = "\x1b[23;2t";
 
 /// DECSTBM: confine scrolling to rows `1..=bottom`, keeping the bar row clear.
+#[cfg(unix)]
 fn set_scroll_region(bottom: u16) -> String {
     format!("\x1b[1;{bottom}r")
 }
 /// DECSTBM reset to the full screen.
+#[cfg(unix)]
 const SCROLL_RESET: &str = "\x1b[r";
 
 /// Draw `line` on physical row `row`, preserving the child's cursor (DECSC/DECRC).
+#[cfg(unix)]
 fn draw_bar(row: u16, line: &str) -> String {
     format!("\x1b7\x1b[{row};1H\x1b[7m{line}\x1b[0m\x1b8")
 }
 /// Erase physical row `row` (used on cleanup), preserving the cursor.
+#[cfg(unix)]
 fn clear_row(row: u16) -> String {
     format!("\x1b7\x1b[{row};1H\x1b[2K\x1b8")
 }
@@ -277,6 +323,7 @@ fn clear_row(row: u16) -> String {
 /// truncated to `cols` and padded with spaces to exactly `cols` columns (no
 /// escape sequences — the caller wraps it in positioning + SGR). Assumes
 /// single-width ASCII, which the fixed content is.
+#[cfg(unix)]
 fn render_status_line(name: &str, cols: u16, hint: Option<&str>) -> String {
     let cols = cols as usize;
     let mut s = format!("amber: {name}");
@@ -297,23 +344,29 @@ fn render_status_line(name: &str, cols: u16, hint: Option<&str>) -> String {
 /// 47 / 1047 / 1049 toggle the alt screen. This is a bounded state machine
 /// (split-safe across `feed` calls), NOT a general terminal emulator — it only
 /// gates whether the bar may draw, so it never paints over a full-screen TUI.
+#[cfg(unix)]
 #[derive(Debug)]
 struct AltScreenTracker {
     alt: bool,
     state: AltState,
 }
 
+#[cfg(unix)]
 #[derive(Debug, PartialEq, Eq)]
 enum AltState {
     Normal,
-    Esc,           // saw ESC
-    Csi,           // saw ESC [
-    Priv(String),  // saw ESC [ ? … , collecting parameter bytes
+    Esc,          // saw ESC
+    Csi,          // saw ESC [
+    Priv(String), // saw ESC [ ? … , collecting parameter bytes
 }
 
+#[cfg(unix)]
 impl AltScreenTracker {
     fn new() -> Self {
-        AltScreenTracker { alt: false, state: AltState::Normal }
+        AltScreenTracker {
+            alt: false,
+            state: AltState::Normal,
+        }
     }
 
     fn is_alt(&self) -> bool {
@@ -334,7 +387,10 @@ impl AltScreenTracker {
                 AltState::Csi => AltState::Normal,
                 AltState::Priv(mut params) => {
                     if b == b'h' || b == b'l' {
-                        if params.split(';').any(|p| matches!(p, "47" | "1047" | "1049")) {
+                        if params
+                            .split(';')
+                            .any(|p| matches!(p, "47" | "1047" | "1049"))
+                        {
                             self.alt = b == b'h';
                         }
                         AltState::Normal
@@ -369,11 +425,13 @@ pub fn nest_refusal(amber_session: Option<&str>, force: bool) -> Option<String> 
 /// Restores the original terminal settings when dropped, even on error or
 /// panic unwind, so a crashing client never leaves the user's shell in raw
 /// mode.
-#[cfg(unix)] struct RawModeGuard {
+#[cfg(unix)]
+struct RawModeGuard {
     original: Termios,
 }
 
-#[cfg(unix)] impl RawModeGuard {
+#[cfg(unix)]
+impl RawModeGuard {
     fn enable() -> anyhow::Result<Self> {
         let stdin = io::stdin();
         let original = termios::tcgetattr(&stdin)?;
@@ -384,7 +442,8 @@ pub fn nest_refusal(amber_session: Option<&str>, force: bool) -> Option<String> 
     }
 }
 
-#[cfg(unix)] impl Drop for RawModeGuard {
+#[cfg(unix)]
+impl Drop for RawModeGuard {
     fn drop(&mut self) {
         let stdin = io::stdin();
         let _ = termios::tcsetattr(&stdin, SetArg::TCSANOW, &self.original);
@@ -393,6 +452,7 @@ pub fn nest_refusal(amber_session: Option<&str>, force: bool) -> Option<String> 
 
 /// Current terminal size, falling back to 80x24 if it cannot be determined
 /// (e.g. stdout is not a tty).
+#[cfg(unix)]
 fn current_size() -> (u16, u16) {
     match terminal_size::terminal_size() {
         Some((terminal_size::Width(w), terminal_size::Height(h))) => (w, h),
@@ -400,7 +460,8 @@ fn current_size() -> (u16, u16) {
     }
 }
 
-#[cfg(unix)] fn send_control(stream: &UnixStream, msg: ControlMsg) -> anyhow::Result<()> {
+#[cfg(unix)]
+fn send_control(stream: &UnixStream, msg: ControlMsg) -> anyhow::Result<()> {
     let mut w = stream;
     w.write_all(&proto::encode(&Frame::Control(msg)))?;
     w.flush()?;
@@ -410,7 +471,8 @@ fn current_size() -> (u16, u16) {
 /// Connect to `socket`, attach session `name`, and proxy the terminal until
 /// stdin hits EOF, the socket closes, or the daemon reports the session's
 /// child exited.
-#[cfg(unix)] pub fn attach(socket: &Path, name: &str, prefix: Option<u8>, want_bar: bool) -> anyhow::Result<()> {
+#[cfg(unix)]
+pub fn attach(socket: &Path, name: &str, prefix: Option<u8>, want_bar: bool) -> anyhow::Result<()> {
     let stream = UnixStream::connect(socket).map_err(|e| {
         anyhow::anyhow!(
             "cannot reach the amber daemon at {} ({e}) — is it running?",
@@ -429,7 +491,11 @@ fn current_size() -> (u16, u16) {
     // shell-only gate — the bar is never drawn over a full-screen TUI session
     // such as claude, whose alt-screen state the raw client can't observe).
     let ui = if is_tty {
-        StatusUi { title: true, bar: want_bar, hint: prefix.map(prefix_key_name) }
+        StatusUi {
+            title: true,
+            bar: want_bar,
+            hint: prefix.map(prefix_key_name),
+        }
     } else {
         StatusUi::none()
     };
@@ -440,7 +506,10 @@ fn current_size() -> (u16, u16) {
     if is_tty {
         match prefix {
             Some(p) => {
-                eprintln!("[amber] attached to {name} — {} d to detach", prefix_key_name(p));
+                eprintln!(
+                    "[amber] attached to {name} — {} d to detach",
+                    prefix_key_name(p)
+                );
             }
             None => eprintln!("[amber] attached to {name} — close the terminal to detach"),
         }
@@ -448,9 +517,21 @@ fn current_size() -> (u16, u16) {
 
     // Enter raw mode only when stdin really is a terminal (and restore it
     // via RAII regardless of how this function returns).
-    let raw_guard = if is_tty { Some(RawModeGuard::enable()?) } else { None };
+    let raw_guard = if is_tty {
+        Some(RawModeGuard::enable()?)
+    } else {
+        None
+    };
 
-    let end = run_client(&stream, name, io::stdin(), io::stdout(), &winch, prefix, &ui);
+    let end = run_client(
+        &stream,
+        name,
+        io::stdin(),
+        io::stdout(),
+        &winch,
+        prefix,
+        &ui,
+    );
 
     // Unwind title/bar on EVERY exit — Ok or Err — before leaving raw mode, so
     // a mid-loop error never strands a scroll region on the user's shell.
@@ -476,13 +557,374 @@ fn current_size() -> (u16, u16) {
 }
 
 #[cfg(not(unix))]
-pub fn attach(_socket: &Path, _name: &str, _prefix: Option<u8>, _want_bar: bool) -> anyhow::Result<()> {
+#[cfg(not(windows))]
+pub fn attach(
+    _socket: &Path,
+    _name: &str,
+    _prefix: Option<u8>,
+    _want_bar: bool,
+) -> anyhow::Result<()> {
     anyhow::bail!("amber attach is not yet supported on this platform")
+}
+
+/// The visible dimensions extracted from Windows' console-buffer information.
+/// This intentionally describes `srWindow`, not the backing scroll buffer:
+/// resizing a session to the latter would make the attached process larger
+/// than the user can see.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConsoleBufferInfo {
+    pub width: u16,
+    pub height: u16,
+}
+
+/// Keep the conversion from Win32's signed coordinates pure and testable.
+#[cfg(windows)]
+pub fn windows_console_size_from_info(info: ConsoleBufferInfo) -> (u16, u16) {
+    (info.width, info.height)
+}
+
+/// Restore both console modes even when the attach loop returns an error.
+///
+/// The input mode gives the attach client byte-at-a-time keystrokes. The
+/// output mode is equally necessary: xterm's raw ANSI/VT frames are otherwise
+/// printed literally by a classic conhost rather than interpreted.
+#[cfg(windows)]
+struct ConsoleModeGuard {
+    input: windows_sys::Win32::Foundation::HANDLE,
+    input_original: u32,
+    output: windows_sys::Win32::Foundation::HANDLE,
+    output_original: u32,
+}
+
+#[cfg(windows)]
+impl ConsoleModeGuard {
+    fn enable() -> anyhow::Result<Self> {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Console::{
+            GetConsoleMode, GetStdHandle, SetConsoleMode, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+        };
+
+        let input = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+        if input.is_null() || input == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let mut input_original = 0;
+        if unsafe { GetConsoleMode(input, &mut input_original) } == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let raw_input = windows_raw_input_mode(input_original);
+        if unsafe { SetConsoleMode(input, raw_input) } == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+
+        let output = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+        if output.is_null() || output == INVALID_HANDLE_VALUE {
+            unsafe {
+                let _ = SetConsoleMode(input, input_original);
+            }
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let mut output_original = 0;
+        if unsafe { GetConsoleMode(output, &mut output_original) } == 0 {
+            unsafe {
+                let _ = SetConsoleMode(input, input_original);
+            }
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let vt_output = windows_vt_output_mode(output_original);
+        if unsafe { SetConsoleMode(output, vt_output) } == 0 {
+            unsafe {
+                let _ = SetConsoleMode(input, input_original);
+            }
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(Self {
+            input,
+            input_original,
+            output,
+            output_original,
+        })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ConsoleModeGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows_sys::Win32::System::Console::SetConsoleMode(
+                self.output,
+                self.output_original,
+            );
+            let _ = windows_sys::Win32::System::Console::SetConsoleMode(
+                self.input,
+                self.input_original,
+            );
+        }
+    }
+}
+
+#[cfg(windows)]
+fn windows_raw_input_mode(original: u32) -> u32 {
+    use windows_sys::Win32::System::Console::{
+        ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_VIRTUAL_TERMINAL_INPUT,
+    };
+
+    (original & !(ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT))
+        | ENABLE_VIRTUAL_TERMINAL_INPUT
+}
+
+#[cfg(windows)]
+fn windows_vt_output_mode(original: u32) -> u32 {
+    original | windows_sys::Win32::System::Console::ENABLE_VIRTUAL_TERMINAL_PROCESSING
+}
+
+#[cfg(windows)]
+fn windows_console_size() -> Option<(u16, u16)> {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Console::{
+        GetConsoleScreenBufferInfo, GetStdHandle, CONSOLE_SCREEN_BUFFER_INFO, STD_OUTPUT_HANDLE,
+    };
+
+    let output = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+    if output.is_null() || output == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let mut native = CONSOLE_SCREEN_BUFFER_INFO::default();
+    if unsafe { GetConsoleScreenBufferInfo(output, &mut native) } == 0 {
+        return None;
+    }
+    let width = i32::from(native.srWindow.Right) - i32::from(native.srWindow.Left) + 1;
+    let height = i32::from(native.srWindow.Bottom) - i32::from(native.srWindow.Top) + 1;
+    Some(windows_console_size_from_info(ConsoleBufferInfo {
+        width: width.try_into().ok()?,
+        height: height.try_into().ok()?,
+    }))
+}
+
+#[cfg(windows)]
+fn windows_current_size() -> (u16, u16) {
+    windows_console_size().unwrap_or((80, 24))
+}
+
+#[cfg(windows)]
+enum WindowsClientEvent {
+    Stdin(io::Result<Vec<u8>>),
+    Frame(Frame),
+    SocketClosed,
+    SocketError(String),
+}
+
+#[cfg(windows)]
+fn spawn_windows_stdin_reader(sender: mpsc::Sender<WindowsClientEvent>) {
+    thread::spawn(move || {
+        let mut stdin = io::stdin();
+        loop {
+            let mut bytes = vec![0; 4096];
+            match stdin.read(&mut bytes) {
+                Ok(count) => {
+                    bytes.truncate(count);
+                    let eof = count == 0;
+                    if sender.send(WindowsClientEvent::Stdin(Ok(bytes))).is_err() || eof {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    let _ = sender.send(WindowsClientEvent::Stdin(Err(error)));
+                    return;
+                }
+            }
+        }
+    });
+}
+
+#[cfg(windows)]
+fn spawn_windows_socket_reader(
+    mut reader: crate::transport::LocalReader,
+    sender: mpsc::Sender<WindowsClientEvent>,
+) {
+    thread::spawn(move || {
+        let mut decoder = Decoder::new();
+        let mut bytes = [0; 8192];
+        loop {
+            match reader.read(&mut bytes) {
+                Ok(0) => {
+                    let _ = sender.send(WindowsClientEvent::SocketClosed);
+                    return;
+                }
+                Ok(count) => {
+                    decoder.feed(&bytes[..count]);
+                    loop {
+                        match decoder.next_frame() {
+                            Ok(Some(frame)) => {
+                                if sender.send(WindowsClientEvent::Frame(frame)).is_err() {
+                                    return;
+                                }
+                            }
+                            Ok(None) => break,
+                            Err(error) => {
+                                let _ =
+                                    sender.send(WindowsClientEvent::SocketError(error.to_string()));
+                                return;
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    let _ = sender.send(WindowsClientEvent::SocketError(error.to_string()));
+                    return;
+                }
+            }
+        }
+    });
+}
+
+#[cfg(windows)]
+fn send_windows_control(
+    writer: &mut crate::transport::LocalWriter,
+    msg: ControlMsg,
+) -> anyhow::Result<()> {
+    writer.write_all(&proto::encode(&Frame::Control(msg)))?;
+    writer.flush()?;
+    Ok(())
+}
+
+/// Windows command-line attach. Named pipes cannot be polled alongside a
+/// console handle, so independent stdin/socket readers forward events into one
+/// loop. That loop is the sole writer and the sole place that applies prefix
+/// handling and console-size changes, preserving the raw daemon protocol.
+#[cfg(windows)]
+pub fn attach(
+    socket: &Path,
+    name: &str,
+    prefix: Option<u8>,
+    _want_bar: bool,
+) -> anyhow::Result<()> {
+    let stream = crate::transport::connect(socket).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot reach the amber daemon at {} ({error}) — is it running?",
+            socket.display()
+        )
+    })?;
+    let (reader, mut writer) = stream.into_split()?;
+    let is_tty = io::stdin().is_terminal();
+    let raw_guard = is_tty.then(ConsoleModeGuard::enable).transpose()?;
+
+    send_windows_control(
+        &mut writer,
+        ControlMsg::Focus {
+            name: name.to_string(),
+        },
+    )?;
+    send_windows_control(
+        &mut writer,
+        ControlMsg::Attach {
+            name: name.to_string(),
+            raw_client: true,
+            preview: false,
+            resume: None,
+        },
+    )?;
+
+    let (mut cols, mut rows) = windows_current_size();
+    send_windows_control(
+        &mut writer,
+        ControlMsg::Resize {
+            name: name.to_string(),
+            cols,
+            rows,
+        },
+    )?;
+
+    let (sender, receiver) = mpsc::channel();
+    spawn_windows_stdin_reader(sender.clone());
+    spawn_windows_socket_reader(reader, sender);
+    let mut stdout = io::stdout();
+    let mut prefix_armed = false;
+
+    let end = loop {
+        match receiver.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(WindowsClientEvent::Stdin(Ok(bytes))) if bytes.is_empty() => {
+                break ClientEnd::StdinEof
+            }
+            Ok(WindowsClientEvent::Stdin(Ok(bytes))) => {
+                let (to_send, detach) = match prefix {
+                    None => (bytes, false),
+                    Some(key) => {
+                        let scanned = scan_prefix(&bytes, key, prefix_armed);
+                        prefix_armed = scanned.armed;
+                        (scanned.forward, scanned.detach)
+                    }
+                };
+                if !to_send.is_empty() {
+                    writer.write_all(&proto::encode(&Frame::Data {
+                        session: name.to_string(),
+                        bytes: to_send,
+                    }))?;
+                    writer.flush()?;
+                }
+                if detach {
+                    send_windows_control(
+                        &mut writer,
+                        ControlMsg::Detach {
+                            name: name.to_string(),
+                        },
+                    )?;
+                    break ClientEnd::Detached;
+                }
+            }
+            Ok(WindowsClientEvent::Stdin(Err(error))) => return Err(error.into()),
+            Ok(WindowsClientEvent::Frame(Frame::Data { bytes, .. })) => {
+                stdout.write_all(&bytes)?;
+                stdout.flush()?;
+            }
+            Ok(WindowsClientEvent::Frame(Frame::Control(ControlMsg::Exit {
+                name: ended,
+                code,
+            }))) if ended == name => {
+                break ClientEnd::SessionExit(code);
+            }
+            Ok(WindowsClientEvent::Frame(Frame::Control(ControlMsg::Error { msg }))) => {
+                break ClientEnd::Rejected(msg);
+            }
+            Ok(WindowsClientEvent::Frame(_)) => {}
+            Ok(WindowsClientEvent::SocketClosed) => break ClientEnd::SocketClosed,
+            Ok(WindowsClientEvent::SocketError(error)) => return Err(anyhow::anyhow!(error)),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break ClientEnd::SocketClosed,
+        }
+
+        let size = windows_current_size();
+        if size != (cols, rows) {
+            (cols, rows) = size;
+            send_windows_control(
+                &mut writer,
+                ControlMsg::Resize {
+                    name: name.to_string(),
+                    cols,
+                    rows,
+                },
+            )?;
+        }
+    };
+
+    drop(raw_guard);
+    match end {
+        ClientEnd::StdinEof => {}
+        ClientEnd::Detached => eprintln!("[amber] detached from {name}"),
+        ClientEnd::SocketClosed => eprintln!("[amber] daemon closed the connection"),
+        ClientEnd::SessionExit(code) => {
+            eprintln!("[amber] session {name} ended (exit code {code})")
+        }
+        ClientEnd::Rejected(message) => anyhow::bail!("[amber] {message}"),
+    }
+    Ok(())
 }
 
 /// The client event loop, separated from tty/signal setup so it can be
 /// driven in tests with socket pairs and pipes instead of a real terminal.
-#[cfg(unix)] pub fn run_client(
+#[cfg(unix)]
+pub fn run_client(
     stream: &UnixStream,
     name: &str,
     mut stdin: impl AsFd + Read,
@@ -491,8 +933,21 @@ pub fn attach(_socket: &Path, _name: &str, _prefix: Option<u8>, _want_bar: bool)
     prefix: Option<u8>,
     ui: &StatusUi,
 ) -> anyhow::Result<ClientEnd> {
-    send_control(stream, ControlMsg::Focus { name: name.to_string() })?;
-    send_control(stream, ControlMsg::Attach { name: name.to_string(), raw_client: true, preview: false, resume: None })?;
+    send_control(
+        stream,
+        ControlMsg::Focus {
+            name: name.to_string(),
+        },
+    )?;
+    send_control(
+        stream,
+        ControlMsg::Attach {
+            name: name.to_string(),
+            raw_client: true,
+            preview: false,
+            resume: None,
+        },
+    )?;
 
     // Whether the bar can be shown at a given height: it needs the physical
     // last row plus at least one row for the child.
@@ -503,7 +958,11 @@ pub fn attach(_socket: &Path, _name: &str, _prefix: Option<u8>, _want_bar: bool)
     let (mut cols, mut rows) = current_size();
     send_control(
         stream,
-        ControlMsg::Resize { name: name.to_string(), cols, rows: child_rows(rows) },
+        ControlMsg::Resize {
+            name: name.to_string(),
+            cols,
+            rows: child_rows(rows),
+        },
     )?;
 
     // Prefix armed across reads: a prefix byte can be the last byte of one
@@ -535,7 +994,11 @@ pub fn attach(_socket: &Path, _name: &str, _prefix: Option<u8>, _want_bar: bool)
             rows = r;
             send_control(
                 stream,
-                ControlMsg::Resize { name: name.to_string(), cols, rows: child_rows(rows) },
+                ControlMsg::Resize {
+                    name: name.to_string(),
+                    cols,
+                    rows: child_rows(rows),
+                },
             )?;
             if bar_at(rows) && !alt.is_alt() {
                 stdout.write_all(set_scroll_region(rows - 1).as_bytes())?;
@@ -634,14 +1097,22 @@ pub fn attach(_socket: &Path, _name: &str, _prefix: Option<u8>, _want_bar: bool)
             };
 
             if !to_send.is_empty() {
-                let frame = Frame::Data { session: name.to_string(), bytes: to_send };
+                let frame = Frame::Data {
+                    session: name.to_string(),
+                    bytes: to_send,
+                };
                 let mut w = stream;
                 w.write_all(&proto::encode(&frame))?;
                 w.flush()?;
             }
 
             if detach {
-                send_control(stream, ControlMsg::Detach { name: name.to_string() })?;
+                send_control(
+                    stream,
+                    ControlMsg::Detach {
+                        name: name.to_string(),
+                    },
+                )?;
                 break 'ev ClientEnd::Detached;
             }
         }
@@ -662,6 +1133,7 @@ pub fn attach(_socket: &Path, _name: &str, _prefix: Option<u8>, _want_bar: bool)
 /// bar/title were drawn — because the mode leak is independent of decoration
 /// (e.g. a claude session runs with the bar OFF but still leaves the alt screen
 /// and mouse tracking on).
+#[cfg(unix)]
 fn restore_bytes(ui: &StatusUi, rows: u16) -> Vec<u8> {
     let mut b = Vec::new();
     if !(ui.title || ui.bar) {
@@ -682,6 +1154,7 @@ fn restore_bytes(ui: &StatusUi, rows: u16) -> Vec<u8> {
 /// (detach, socket close, session exit, stdin EOF). Best-effort (ignores write
 /// errors); written through a fresh stdout handle so it runs regardless of how
 /// `run_client` returned.
+#[cfg(unix)]
 fn teardown_decoration(ui: &StatusUi) {
     let (_, rows) = current_size();
     let bytes = restore_bytes(ui, rows);
@@ -732,7 +1205,13 @@ mod tests {
                 let _ = tx.send((end, out));
             });
         }
-        Harness { server, decoder: Decoder::new(), stdin_feeder, winch, done }
+        Harness {
+            server,
+            decoder: Decoder::new(),
+            stdin_feeder,
+            winch,
+            done,
+        }
     }
 
     impl Harness {
@@ -786,9 +1265,7 @@ mod tests {
         h.expect_attach_and_initial_resize();
         h.winch.store(true, Ordering::Relaxed);
         // A second Resize must arrive without any other traffic.
-        h.server_read_until(|f| {
-            matches!(f, Frame::Control(ControlMsg::Resize { .. }))
-        });
+        h.server_read_until(|f| matches!(f, Frame::Control(ControlMsg::Resize { .. })));
         drop(h.server);
         let _ = h.done.recv_timeout(Duration::from_secs(5)).unwrap();
     }
@@ -800,17 +1277,25 @@ mod tests {
         // silently emit the terminal reset and sit on a dead terminal.
         let mut h = start_client();
         h.expect_attach_and_initial_resize();
-        let err = Frame::Control(ControlMsg::Error { msg: "no such session: s".into() });
+        let err = Frame::Control(ControlMsg::Error {
+            msg: "no such session: s".into(),
+        });
         h.server.write_all(&proto::encode(&err)).unwrap();
         let (end, _) = h.done.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert_eq!(end.unwrap(), ClientEnd::Rejected("no such session: s".into()));
+        assert_eq!(
+            end.unwrap(),
+            ClientEnd::Rejected("no such session: s".into())
+        );
     }
 
     #[test]
     fn client_exits_on_session_exit_frame() {
         let mut h = start_client();
         h.expect_attach_and_initial_resize();
-        let exit = Frame::Control(ControlMsg::Exit { name: "s".into(), code: 7 });
+        let exit = Frame::Control(ControlMsg::Exit {
+            name: "s".into(),
+            code: 7,
+        });
         h.server.write_all(&proto::encode(&exit)).unwrap();
         let (end, _) = h.done.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(end.unwrap(), ClientEnd::SessionExit(7));
@@ -825,7 +1310,10 @@ mod tests {
         let frame = h.server_read_until(|f| matches!(f, Frame::Data { .. }));
         assert_eq!(
             frame,
-            Frame::Data { session: "s".into(), bytes: b"typed".to_vec() }
+            Frame::Data {
+                session: "s".into(),
+                bytes: b"typed".to_vec()
+            }
         );
 
         drop(h.stdin_feeder); // stdin EOF
@@ -837,9 +1325,15 @@ mod tests {
     fn client_writes_session_output_to_stdout() {
         let mut h = start_client();
         h.expect_attach_and_initial_resize();
-        let data = Frame::Data { session: "s".into(), bytes: b"OUTPUT".to_vec() };
+        let data = Frame::Data {
+            session: "s".into(),
+            bytes: b"OUTPUT".to_vec(),
+        };
         h.server.write_all(&proto::encode(&data)).unwrap();
-        let exit = Frame::Control(ControlMsg::Exit { name: "s".into(), code: 0 });
+        let exit = Frame::Control(ControlMsg::Exit {
+            name: "s".into(),
+            code: 0,
+        });
         h.server.write_all(&proto::encode(&exit)).unwrap();
         let (end, out) = h.done.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(end.unwrap(), ClientEnd::SessionExit(0));
@@ -852,11 +1346,15 @@ mod tests {
         // itself so the daemon can suppress alt-screen backlog replay
         // (spec §5). The Electron app attaches without the flag.
         let mut h = start_client();
-        let frame =
-            h.server_read_until(|f| matches!(f, Frame::Control(ControlMsg::Attach { .. })));
+        let frame = h.server_read_until(|f| matches!(f, Frame::Control(ControlMsg::Attach { .. })));
         assert_eq!(
             frame,
-            Frame::Control(ControlMsg::Attach { name: "s".into(), raw_client: true, preview: false, resume: None })
+            Frame::Control(ControlMsg::Attach {
+                name: "s".into(),
+                raw_client: true,
+                preview: false,
+                resume: None
+            })
         );
         drop(h.server);
         let _ = h.done.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -889,16 +1387,25 @@ mod tests {
         // in (alt screen, hidden cursor).
         let mut h = start_client();
         h.expect_attach_and_initial_resize();
-        let data = Frame::Data { session: "s".into(), bytes: b"BACKLOG".to_vec() };
+        let data = Frame::Data {
+            session: "s".into(),
+            bytes: b"BACKLOG".to_vec(),
+        };
         h.server.write_all(&proto::encode(&data)).unwrap();
-        let exit = Frame::Control(ControlMsg::Exit { name: "s".into(), code: 0 });
+        let exit = Frame::Control(ControlMsg::Exit {
+            name: "s".into(),
+            code: 0,
+        });
         h.server.write_all(&proto::encode(&exit)).unwrap();
         let (_, out) = h.done.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(
             out.starts_with(TERM_RESET),
             "terminal reset must precede replayed bytes, got {out:?}"
         );
-        assert!(out.ends_with(b"BACKLOG"), "replayed bytes lost, got {out:?}");
+        assert!(
+            out.ends_with(b"BACKLOG"),
+            "replayed bytes lost, got {out:?}"
+        );
     }
 
     // ---- detach prefix: pure helpers ------------------------------------
@@ -952,7 +1459,11 @@ mod tests {
         let only_dead = [info("a", false, 99)];
         assert!(pick_newest(&only_dead).is_none());
         // greatest `updated` among live wins.
-        let mixed = [info("a", true, 10), info("b", true, 30), info("c", false, 40)];
+        let mixed = [
+            info("a", true, 10),
+            info("b", true, 30),
+            info("c", false, 40),
+        ];
         assert_eq!(pick_newest(&mixed).unwrap().name, "b");
         // tie on `updated` breaks toward the greater name, deterministically.
         let tie = [info("a", true, 5), info("z", true, 5)];
@@ -969,9 +1480,16 @@ mod tests {
         // claude-style attach (title on, bar off): no scroll-region reset, but
         // the mode restore (mouse-off + leave alt screen) MUST run — this is the
         // exact detach-glitch case.
-        let claude = StatusUi { title: true, bar: false, hint: None };
+        let claude = StatusUi {
+            title: true,
+            bar: false,
+            hint: None,
+        };
         let out = restore_bytes(&claude, 24);
-        assert!(!has(&out, SCROLL_RESET.as_bytes()), "no bar => no scroll reset");
+        assert!(
+            !has(&out, SCROLL_RESET.as_bytes()),
+            "no bar => no scroll reset"
+        );
         assert!(has(&out, TITLE_POP.as_bytes()));
         assert!(has(&out, b"\x1b[?1000l"), "must disable mouse tracking");
         assert!(has(&out, b"\x1b[?1006l"), "must disable SGR mouse encoding");
@@ -980,7 +1498,11 @@ mod tests {
         assert!(has(&out, b"\x1b[?25h"), "must show the cursor");
 
         // Shell attach with the bar: scroll region + reserved row cleared too.
-        let bar = StatusUi { title: true, bar: true, hint: None };
+        let bar = StatusUi {
+            title: true,
+            bar: true,
+            hint: None,
+        };
         let out = restore_bytes(&bar, 24);
         assert!(has(&out, SCROLL_RESET.as_bytes()));
         assert!(has(&out, b"\x1b[?1000l"));
@@ -992,8 +1514,11 @@ mod tests {
         // Slots are the session's OWN number, not its position: list order is
         // irrelevant, and a gap (a killed session) stays a gap rather than
         // renumbering everything after it.
-        let mut s =
-            [info("amber-c", true, 1), info("amber-a", false, 9), info("amber-b", true, 5)];
+        let mut s = [
+            info("amber-c", true, 1),
+            info("amber-a", false, 9),
+            info("amber-b", true, 5),
+        ];
         s[0].slot = 4;
         s[1].slot = 1;
         s[2].slot = 2;
@@ -1040,22 +1565,50 @@ mod tests {
     #[test]
     fn scan_prefix_bindings() {
         let p = DEFAULT_PREFIX; // 0x02
-        // plain bytes pass through, prefix disarmed.
+                                // plain bytes pass through, prefix disarmed.
         let r = scan_prefix(b"abc", p, false);
-        assert_eq!(r, ScanResult { forward: b"abc".to_vec(), armed: false, detach: false });
+        assert_eq!(
+            r,
+            ScanResult {
+                forward: b"abc".to_vec(),
+                armed: false,
+                detach: false
+            }
+        );
         // prefix + d = detach, forwarding the bytes seen before it.
         let r = scan_prefix(b"ab\x02d", p, false);
         assert!(r.detach);
         assert_eq!(r.forward, b"ab".to_vec());
         // prefix + prefix = one literal prefix byte.
         let r = scan_prefix(b"\x02\x02", p, false);
-        assert_eq!(r, ScanResult { forward: vec![p], armed: false, detach: false });
+        assert_eq!(
+            r,
+            ScanResult {
+                forward: vec![p],
+                armed: false,
+                detach: false
+            }
+        );
         // prefix + unbound key = drop both.
         let r = scan_prefix(b"\x02x", p, false);
-        assert_eq!(r, ScanResult { forward: vec![], armed: false, detach: false });
+        assert_eq!(
+            r,
+            ScanResult {
+                forward: vec![],
+                armed: false,
+                detach: false
+            }
+        );
         // trailing prefix leaves the scanner armed for the next chunk.
         let r = scan_prefix(b"x\x02", p, false);
-        assert_eq!(r, ScanResult { forward: b"x".to_vec(), armed: true, detach: false });
+        assert_eq!(
+            r,
+            ScanResult {
+                forward: b"x".to_vec(),
+                armed: true,
+                detach: false
+            }
+        );
         // an armed scanner completes the command from the next chunk.
         let r = scan_prefix(b"d", p, true);
         assert!(r.detach);
@@ -1071,7 +1624,10 @@ mod tests {
         h.stdin_feeder.write_all(&[DEFAULT_PREFIX, b'd']).unwrap();
         // The daemon side must observe a Detach control frame...
         let frame = h.server_read_until(|f| matches!(f, Frame::Control(ControlMsg::Detach { .. })));
-        assert_eq!(frame, Frame::Control(ControlMsg::Detach { name: "s".into() }));
+        assert_eq!(
+            frame,
+            Frame::Control(ControlMsg::Detach { name: "s".into() })
+        );
         // ...and the client exits with Detached.
         let (end, _) = h.done.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(end.unwrap(), ClientEnd::Detached);
@@ -1085,12 +1641,17 @@ mod tests {
         h.expect_attach_and_initial_resize();
         h.stdin_feeder.write_all(&[DEFAULT_PREFIX]).unwrap();
         // Give the client a beat to consume the lone prefix and arm.
-        h.server.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        h.server
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
         let mut scratch = [0u8; 64];
         let _ = h.server.read(&mut scratch); // drain nothing / timeout, just yield
         h.stdin_feeder.write_all(b"d").unwrap();
         let frame = h.server_read_until(|f| matches!(f, Frame::Control(ControlMsg::Detach { .. })));
-        assert_eq!(frame, Frame::Control(ControlMsg::Detach { name: "s".into() }));
+        assert_eq!(
+            frame,
+            Frame::Control(ControlMsg::Detach { name: "s".into() })
+        );
         let (end, _) = h.done.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(end.unwrap(), ClientEnd::Detached);
     }
@@ -1099,11 +1660,16 @@ mod tests {
     fn client_sends_literal_prefix_on_double_prefix() {
         let mut h = start_client();
         h.expect_attach_and_initial_resize();
-        h.stdin_feeder.write_all(&[DEFAULT_PREFIX, DEFAULT_PREFIX]).unwrap();
+        h.stdin_feeder
+            .write_all(&[DEFAULT_PREFIX, DEFAULT_PREFIX])
+            .unwrap();
         let frame = h.server_read_until(|f| matches!(f, Frame::Data { .. }));
         assert_eq!(
             frame,
-            Frame::Data { session: "s".into(), bytes: vec![DEFAULT_PREFIX] }
+            Frame::Data {
+                session: "s".into(),
+                bytes: vec![DEFAULT_PREFIX]
+            }
         );
         drop(h.stdin_feeder);
         let (end, _) = h.done.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -1119,7 +1685,10 @@ mod tests {
         let frame = h.server_read_until(|f| matches!(f, Frame::Data { .. }));
         assert_eq!(
             frame,
-            Frame::Data { session: "s".into(), bytes: vec![DEFAULT_PREFIX, b'd'] }
+            Frame::Data {
+                session: "s".into(),
+                bytes: vec![DEFAULT_PREFIX, b'd']
+            }
         );
         drop(h.stdin_feeder);
         let (end, _) = h.done.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -1182,10 +1751,17 @@ mod tests {
     #[test]
     fn next_session_name_takes_the_lowest_free_number() {
         assert_eq!(next_session_name(&[]), "s1");
-        assert_eq!(next_session_name(&["s1".to_string(), "s2".to_string()]), "s3");
+        assert_eq!(
+            next_session_name(&["s1".to_string(), "s2".to_string()]),
+            "s3"
+        );
         // A hole left by a killed session is reused, and names outside the
         // `s<n>` family (app panes, hand-named sessions) never block one.
-        let taken = ["s1".to_string(), "s3".to_string(), "amber-1-1-0-x".to_string()];
+        let taken = [
+            "s1".to_string(),
+            "s3".to_string(),
+            "amber-1-1-0-x".to_string(),
+        ];
         assert_eq!(next_session_name(&taken), "s2");
     }
 
@@ -1196,9 +1772,14 @@ mod tests {
         // With the bar enabled the child must be sized one row short so the
         // physical last row is free for the bar. current_size() falls back to
         // 80x24 off a tty, so the reserved Resize carries rows = 23.
-        let ui = StatusUi { title: true, bar: true, hint: Some("Ctrl-b".into()) };
+        let ui = StatusUi {
+            title: true,
+            bar: true,
+            hint: Some("Ctrl-b".into()),
+        };
         let mut h = start_client_full(Some(DEFAULT_PREFIX), ui);
-        let resize = h.server_read_until(|f| matches!(f, Frame::Control(ControlMsg::Resize { .. })));
+        let resize =
+            h.server_read_until(|f| matches!(f, Frame::Control(ControlMsg::Resize { .. })));
         match resize {
             Frame::Control(ControlMsg::Resize { rows, .. }) => assert_eq!(rows, 23),
             other => panic!("expected Resize, got {other:?}"),
@@ -1213,17 +1794,22 @@ mod tests {
         // run_client emits no scroll-region control at all (the bar is what
         // sets it; teardown lives in `attach`, not the loop).
         let mut h = start_client_full(Some(DEFAULT_PREFIX), StatusUi::none());
-        let resize = h.server_read_until(|f| matches!(f, Frame::Control(ControlMsg::Resize { .. })));
+        let resize =
+            h.server_read_until(|f| matches!(f, Frame::Control(ControlMsg::Resize { .. })));
         match resize {
             Frame::Control(ControlMsg::Resize { rows, .. }) => assert_eq!(rows, 24),
             other => panic!("expected Resize, got {other:?}"),
         }
-        let exit = Frame::Control(ControlMsg::Exit { name: "s".into(), code: 0 });
+        let exit = Frame::Control(ControlMsg::Exit {
+            name: "s".into(),
+            code: 0,
+        });
         h.server.write_all(&proto::encode(&exit)).unwrap();
         let (end, out) = h.done.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(end.unwrap(), ClientEnd::SessionExit(0));
         assert!(
-            !out.windows(SCROLL_RESET.len()).any(|w| w == SCROLL_RESET.as_bytes()),
+            !out.windows(SCROLL_RESET.len())
+                .any(|w| w == SCROLL_RESET.as_bytes()),
             "no-bar attach must not emit a scroll-region reset"
         );
     }
@@ -1232,9 +1818,33 @@ mod tests {
 #[cfg(all(test, windows))]
 mod windows_tests {
     use super::*;
+
     #[test]
-    fn attach_reports_the_native_console_fallback() {
-        let error = attach(Path::new("amber-test-pipe"), "s", None, false).unwrap_err();
-        assert!(error.to_string().contains("not yet supported"));
+    fn windows_console_size_reads_visible_window() {
+        let info = ConsoleBufferInfo {
+            width: 132,
+            height: 43,
+        };
+        assert_eq!(windows_console_size_from_info(info), (132, 43));
+    }
+
+    #[test]
+    fn windows_console_modes_enable_vt_and_keep_restorable_bits() {
+        use windows_sys::Win32::System::Console::{
+            ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
+            ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+        };
+
+        let input_original = ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT | 0x20;
+        assert_eq!(
+            windows_raw_input_mode(input_original),
+            ENABLE_VIRTUAL_TERMINAL_INPUT | 0x20
+        );
+
+        let output_original = 0x3;
+        assert_eq!(
+            windows_vt_output_mode(output_original),
+            output_original | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        );
     }
 }
