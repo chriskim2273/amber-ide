@@ -47,8 +47,15 @@ pub fn is_session_id(id: &str) -> bool {
 /// Resolve the codex binary via the user's login shell — never the daemon's
 /// own PATH (same distribution-safe path claude/grok take).
 pub fn resolve_codex() -> Option<PathBuf> {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-    crate::claude::resolve_bin_with(&shell, true, "codex", &[])
+    #[cfg(unix)]
+    {
+        let shell = crate::platform::default_shell();
+        return crate::claude::resolve_bin_with(&shell.to_string_lossy(), true, "codex", &[]);
+    }
+    #[cfg(windows)]
+    {
+        crate::claude::resolve_bin_windows("codex")
+    }
 }
 
 /// Codex home directory: `$CODEX_HOME` when set to an existing directory,

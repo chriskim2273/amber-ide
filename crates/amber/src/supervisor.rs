@@ -40,21 +40,47 @@ const WORKLOAD_KILL_LOG_INTERVAL: u32 = 20;
 /// fine, so a single failure must not cost the conversation.
 const GROK_RESUME_ATTEMPTS: u32 = 2;
 
-/// Suspend/resume signalling for a claude session (Slice 3, freeze grace). The
-/// daemon sets `suspend` (SIGUSR1) to park claude — the supervisor kills it,
-/// freeing its RAM, and idles holding the pty — and `resume` (SIGUSR2) to
-/// relaunch it. Two one-shot flags, drained with `swap(false)`.
+/// A request delivered only to a supervised agent. Unix signal handlers and
+/// the Windows supervisor-control link apply the same two-state command.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SupervisorCommand {
+    Suspend,
+    Resume,
+}
+
+/// Suspend/resume state for a supervised agent. Unix signal handlers and the
+/// Windows daemon-control transport both write these one-shot flags; the
+/// supervisor drains them with `take_*`.
 #[derive(Clone, Default)]
-pub struct SuspendControl {
+pub struct SupervisorControl {
     pub suspend: Arc<AtomicBool>,
     pub resume: Arc<AtomicBool>,
 }
 
-impl SuspendControl {
+impl SupervisorControl {
     pub fn new() -> Self {
         Self::default()
     }
+
+    pub fn apply(&self, command: SupervisorCommand) {
+        match command {
+            SupervisorCommand::Suspend => self.suspend.store(true, Ordering::SeqCst),
+            SupervisorCommand::Resume => self.resume.store(true, Ordering::SeqCst),
+        }
+    }
+
+    pub fn take_suspend(&self) -> bool {
+        self.suspend.swap(false, Ordering::SeqCst)
+    }
+
+    pub fn take_resume(&self) -> bool {
+        self.resume.swap(false, Ordering::SeqCst)
+    }
 }
+
+/// Compatibility name for existing callers; new platform control paths use
+/// [`SupervisorControl`].
+pub type SuspendControl = SupervisorControl;
 
 /// Outcome of [`supervise_claude`]'s bounded retry loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,9 +163,9 @@ pub fn supervise_agent(
     let mut escalation = 0u32;
     let mut prev_recording = None;
     'sup: loop {
-        if ctl.suspend.swap(false, Ordering::SeqCst) {
+        if ctl.take_suspend() {
             report("suspended");
-            while !ctl.resume.swap(false, Ordering::SeqCst) {
+            while !ctl.take_resume() {
                 ctl.suspend.store(false, Ordering::SeqCst);
                 std::thread::sleep(IDLE_POLL);
             }
@@ -212,7 +238,7 @@ pub fn supervise_agent(
                         Ok(None) => {}
                         Err(e) => break 'wait Err(e),
                     }
-                    if ctl.suspend.swap(false, Ordering::SeqCst) {
+                    if ctl.take_suspend() {
                         // Park: kill claude (frees its RAM), idle holding the pty
                         // until a resume, then relaunch via the resume ladder. NOT
                         // counted as a crash — escalation/prev_id reset so the
@@ -236,7 +262,7 @@ pub fn supervise_agent(
                         // It belongs to this parked transition, not the next child.
                         ctl.suspend.store(false, Ordering::SeqCst);
                         report("suspended");
-                        while !ctl.resume.swap(false, Ordering::SeqCst) {
+                        while !ctl.take_resume() {
                             ctl.suspend.store(false, Ordering::SeqCst);
                             std::thread::sleep(IDLE_POLL);
                         }
@@ -276,6 +302,23 @@ fn agent_command(
     argv: &[String],
     _slot: Option<u32>,
 ) -> anyhow::Result<Command> {
+    #[cfg(windows)]
+    if matches!(
+        agent_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("cmd" | "bat")
+    ) {
+        // npm shims are batch files. CreateProcess cannot run them directly;
+        // let cmd.exe interpret the shim while preserving the agent argv.
+        let mut command = Command::new(
+            std::env::var_os("ComSpec").unwrap_or_else(crate::platform::default_shell),
+        );
+        command.arg("/D").arg("/C").arg(agent_path).args(argv);
+        return Ok(command);
+    }
     let mut command = Command::new(agent_path);
     command.args(argv);
     Ok(command)
@@ -542,6 +585,12 @@ fn classify_run(outcome: &std::io::Result<std::process::ExitStatus>) -> RunClass
                     Some(_) => return RunClass::Signaled,
                     None => {}
                 }
+            }
+            #[cfg(windows)]
+            if status.code() == Some(0xC000_013A_u32 as i32) {
+                // `STATUS_CONTROL_C_EXIT`: Windows reports Ctrl-C as an exit
+                // status, not a Unix signal. It is a deliberate user quit.
+                return RunClass::UserInterrupt;
             }
             // Not signal-terminated, so a real exit code is present. 130 is the
             // shell convention for "terminated by ^C" — claude's own quit path.
@@ -926,9 +975,9 @@ fn shell_fallback(cwd: &Path) -> anyhow::Result<()> {
 
 #[cfg(not(unix))]
 fn shell_fallback(cwd: &Path) -> anyhow::Result<()> {
-    let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
+    let shell = crate::platform::default_shell();
     let status = Command::new(&shell).current_dir(cwd).status()?;
-    if status.success() { Ok(()) } else { anyhow::bail!("shell fallback {shell} exited with {status}") }
+    if status.success() { Ok(()) } else { anyhow::bail!("shell fallback {} exited with {status}", shell.to_string_lossy()) }
 }
 
 #[cfg(test)]

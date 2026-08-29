@@ -158,11 +158,56 @@ pub fn resolve_bin_with(
     }
 }
 
+/// Resolve an executable from PATH with Windows `PATHEXT` semantics. The
+/// Windows branch also checks the native and npm installer locations that are
+/// commonly absent from a daemon-launched PATH.
+#[cfg(windows)]
+pub fn resolve_bin_windows(bin: &str) -> Option<PathBuf> {
+    let has_extension = Path::new(bin).extension().is_some();
+    let extensions: Vec<String> = if has_extension {
+        vec![String::new()]
+    } else {
+        std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
+            .split(';')
+            .filter(|extension| !extension.is_empty())
+            .map(|extension| extension.to_string())
+            .collect()
+    };
+    let probe = |dir: &Path| {
+        extensions.iter().find_map(|extension| {
+            let candidate = dir.join(format!("{bin}{extension}"));
+            candidate.is_file().then(|| candidate)
+        })
+    };
+    let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect())
+        .unwrap_or_default();
+    if let Some(found) = path_dirs.iter().find_map(|dir| probe(dir)) {
+        return Some(found);
+    }
+    let user_profile = std::env::var_os("USERPROFILE").map(PathBuf::from);
+    let app_data = std::env::var_os("APPDATA").map(PathBuf::from);
+    user_profile
+        .as_deref()
+        .map(|home| home.join(".local").join("bin"))
+        .into_iter()
+        .chain(app_data.as_deref().map(|app_data| app_data.join("npm")))
+        .find_map(|dir| probe(&dir))
+}
+
 /// Resolve claude via the user's login shell (the distribution-safe path — see
 /// spec §8; never trusts the daemon's own PATH).
 pub fn resolve_claude() -> Option<PathBuf> {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-    resolve_claude_with(&shell, true, &[])
+    #[cfg(unix)]
+    {
+        let shell = crate::platform::default_shell();
+        return resolve_claude_with(&shell.to_string_lossy(), true, &[]);
+    }
+    #[cfg(windows)]
+    {
+        resolve_bin_windows("claude")
+    }
 }
 
 pub const HANDOFF_PROMPT: &str = "Create a concise provider-neutral Markdown handoff for another coding agent. Include: goal; latest user request and latest relevant user/assistant messages; decisions and constraints; completed work and changed files; commands/tests and results; blockers; exact next action. Do not expose secrets, credentials, system or developer prompts, or raw tool-output blobs. Output only the handoff Markdown. Do not perform any new work.";

@@ -58,8 +58,9 @@ fn login_path() -> Option<&'static String> {
 /// Capture the user's login-shell PATH so spawned panes resolve tools (nvm/node,
 /// ~/.local/bin, …) that the daemon's minimal systemd PATH lacks — otherwise a
 /// pane's programs and claude's own hooks (which run `node`) fail.
+#[cfg(unix)]
 fn capture_login_path() -> Option<String> {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let shell = crate::platform::default_shell();
     let out = std::process::Command::new(&shell)
         .arg("-lic")
         .arg("printf %s \"$PATH\"")
@@ -74,6 +75,13 @@ fn capture_login_path() -> Option<String> {
     } else {
         Some(path)
     }
+}
+
+#[cfg(not(unix))]
+fn capture_login_path() -> Option<String> {
+    // Windows has no login-shell PATH. Agent resolution uses PATHEXT-aware
+    // lookup instead, and pane processes inherit the daemon's user PATH.
+    None
 }
 
 /// Graphical-session env for spawned panes, read FRESH from the systemd user
@@ -399,9 +407,19 @@ impl SessionManager {
         if cwd.is_absolute() && cwd.is_dir() {
             cwd.to_path_buf()
         } else {
-            std::env::var("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("/"))
+            #[cfg(unix)]
+            {
+                std::env::var("HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|_| PathBuf::from("/"))
+            }
+            #[cfg(not(unix))]
+            {
+                std::env::var_os("USERPROFILE")
+                    .map(PathBuf::from)
+                    .or_else(|| std::env::current_dir().ok())
+                    .unwrap_or_else(|| PathBuf::from("."))
+            }
         }
     }
 
@@ -421,10 +439,10 @@ impl SessionManager {
             SessionKind::Shell => {
                 #[cfg(test)]
                 let shell = self.test_shell.clone().unwrap_or_else(|| {
-                    std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into())
+                    crate::platform::default_shell()
                 });
                 #[cfg(not(test))]
-                let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into());
+                let shell = crate::platform::default_shell();
                 (shell, Vec::new(), CgroupRole::Workload)
             }
             // All agents run the SAME `amber run <name>` supervisor; it reads

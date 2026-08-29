@@ -36,6 +36,11 @@ const READER_CHANNEL_DEPTH: usize = 32;
 /// Retry cadence while at least one subscriber's queue is full.
 const STALL_POLL: std::time::Duration = std::time::Duration::from_millis(2);
 
+/// Give an ordinary PTY reader a brief chance to deliver its final buffered
+/// output after the child exits. A ConPTY reader that remains open still gets
+/// waiter-authoritative teardown after this bounded grace.
+const EXIT_OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(100);
+
 /// Minimum gap between activity notifications for one session (ms). A chatty
 /// pty (e.g. `cat` of a huge file) must not flood watchers — at most one
 /// `Activity` per session per this window (spec: background-activity dots).
@@ -107,6 +112,9 @@ pub struct PtySession {
     /// a newly-registered sender, so `subscribe` must hand out an
     /// already-closed channel instead.
     reader_done: Arc<std::sync::atomic::AtomicBool>,
+    /// Set by the waiter after reader EOF or the bounded non-EOF grace has
+    /// closed subscriptions. `wait_exit` waits for this before returning.
+    exit_teardown_done: Arc<AtomicBool>,
     next_sub_id: AtomicU64,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     exit: Arc<Mutex<Option<i32>>>,
@@ -200,6 +208,26 @@ impl PtySession {
     /// Spawn `cmd` in a fresh pty of `rows`x`cols`, retaining at most `cap`
     /// bytes of scrollback.
     pub fn spawn(cmd: CommandBuilder, rows: u16, cols: u16, cap: usize) -> anyhow::Result<Self> {
+        Self::spawn_with_reader_eof(cmd, rows, cols, cap, true)
+    }
+
+    /// Test fixture for the ConPTY lifecycle: Windows may retain an output
+    /// reader after its child has exited, so EOF cannot be the authority that
+    /// releases subscribers. The reader stays alive after EOF while the
+    /// waiter remains responsible for closing every subscription.
+    #[doc(hidden)]
+    pub fn session_with_non_eof_reader_for_test(cmd: CommandBuilder) -> Self {
+        Self::spawn_with_reader_eof(cmd, 24, 80, 4096, false)
+            .expect("test pty session must spawn")
+    }
+
+    fn spawn_with_reader_eof(
+        cmd: CommandBuilder,
+        rows: u16,
+        cols: u16,
+        cap: usize,
+        reader_eof_ends_stream: bool,
+    ) -> anyhow::Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
             rows,
@@ -233,6 +261,7 @@ impl PtySession {
         let ring = Arc::new(Mutex::new(Ring::new(cap)));
         let subs: Arc<Mutex<Subscribers>> = Arc::new(Mutex::new(Vec::new()));
         let reader_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let exit_teardown_done = Arc::new(AtomicBool::new(false));
         let activity = Arc::new(ActivityState {
             last_output_ms: AtomicU64::new(0),
             last_hook_ms: AtomicU64::new(0),
@@ -261,7 +290,14 @@ impl PtySession {
             let mut buf = [0u8; 8192];
             loop {
                 match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) | Err(_) if reader_eof_ends_stream => break,
+                    Ok(0) | Err(_) => {
+                        // Keep this test reader open to simulate a ConPTY
+                        // output pipe retained past the child exit.
+                        loop {
+                            thread::sleep(Duration::from_secs(60));
+                        }
+                    }
                     Ok(n) => {
                         // Publish output truth at the earliest userspace
                         // boundary, before the bounded batch channel or a
@@ -373,13 +409,30 @@ impl PtySession {
             });
         }
 
-        // Waiter thread: record the exit code once the child dies.
+        // Waiter thread: terminal child status is authoritative. In
+        // particular, ConPTY can retain its output reader after the child has
+        // exited, so waiting for reader EOF would leave clients subscribed to
+        // a pane that can no longer produce output.
         let exit = Arc::new(Mutex::new(None));
         {
             let exit = Arc::clone(&exit);
+            let subs = Arc::clone(&subs);
+            let reader_done = Arc::clone(&reader_done);
+            let exit_teardown_done = Arc::clone(&exit_teardown_done);
             thread::spawn(move || {
                 if let Ok(status) = child.wait() {
+                    // Publish terminal status promptly for reaping, but let a
+                    // normal PTY's reader deliver bytes already buffered by
+                    // the kernel. ConPTY can hold that reader open forever;
+                    // its bounded fallback is still this waiter, not EOF.
                     *exit.lock().unwrap() = Some(status.exit_code() as i32);
+                    if !reader_done.load(Ordering::SeqCst) {
+                        thread::sleep(EXIT_OUTPUT_DRAIN_GRACE);
+                        let mut subs = subs.lock().unwrap();
+                        reader_done.store(true, Ordering::SeqCst);
+                        subs.clear();
+                    }
+                    exit_teardown_done.store(true, Ordering::SeqCst);
                 }
             });
         }
@@ -390,6 +443,7 @@ impl PtySession {
             ring,
             subs,
             reader_done,
+            exit_teardown_done,
             next_sub_id: AtomicU64::new(0),
             killer: Mutex::new(killer),
             exit,
@@ -718,6 +772,19 @@ impl PtySession {
         *self.exit.lock().unwrap()
     }
 
+    /// Block until the pty child has a terminal status, returning its exit
+    /// code. Subscription teardown is complete before this returns.
+    pub fn wait_exit(&self) -> anyhow::Result<i32> {
+        loop {
+            if self.exit_teardown_done.load(Ordering::SeqCst) {
+                if let Some(code) = self.exit_code() {
+                    return Ok(code);
+                }
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     pub fn is_alive(&self) -> bool {
         self.exit_code().is_none()
     }
@@ -788,6 +855,8 @@ pub(crate) fn kill_process_tree(pid: u32) {
             let _ = kill(Pid::from_raw(stray as i32), Signal::SIGKILL);
         }
     }
+    #[cfg(not(unix))]
+    let _ = pid;
 }
 
 #[cfg(test)]

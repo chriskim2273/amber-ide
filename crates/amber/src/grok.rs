@@ -89,8 +89,15 @@ pub fn new_session_id() -> String {
 /// Resolve the grok binary via the user's login shell — the same
 /// distribution-safe path claude takes (spec §8); never the daemon's own PATH.
 pub fn resolve_grok() -> Option<PathBuf> {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-    crate::claude::resolve_bin_with(&shell, true, "grok", &[])
+    #[cfg(unix)]
+    {
+        let shell = crate::platform::default_shell();
+        return crate::claude::resolve_bin_with(&shell.to_string_lossy(), true, "grok", &[]);
+    }
+    #[cfg(windows)]
+    {
+        crate::claude::resolve_bin_windows("grok")
+    }
 }
 
 #[cfg(test)]

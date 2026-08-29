@@ -81,8 +81,15 @@ pub fn is_session_id(id: &str) -> bool {
 /// Resolve the opencode binary via the user's login shell — never the daemon's
 /// own PATH (same distribution-safe path claude/grok/codex take).
 pub fn resolve_opencode() -> Option<PathBuf> {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-    crate::claude::resolve_bin_with(&shell, true, "opencode", &[])
+    #[cfg(unix)]
+    {
+        let shell = crate::platform::default_shell();
+        return crate::claude::resolve_bin_with(&shell.to_string_lossy(), true, "opencode", &[]);
+    }
+    #[cfg(windows)]
+    {
+        crate::claude::resolve_bin_windows("opencode")
+    }
 }
 
 /// OpenCode config directory: `$OPENCODE_CONFIG_DIR` when set, else
