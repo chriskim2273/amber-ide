@@ -1417,4 +1417,9 @@ input:focus-visible {
 .activity-summary strong { color: var(--text); }
 .notification-prefs { font-size: 12px; border-bottom: 1px solid var(--border); }
 .notification-prefs label { display: flex; gap: 5px; align-items: center; }
+.preset-slot-list { max-height: min(300px, 38vh); border-bottom: 1px solid var(--border); }
+.preset-slot-list code { overflow: hidden; overflow-wrap: anywhere; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-clamp: 3; }
+.preset-slot-editor { padding-bottom: 12px; }
+.productivity-textarea { box-sizing: border-box; width: calc(100% - 32px); min-height: 88px; max-height: 180px; resize: vertical; margin: 0 16px 8px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg); color: var(--text); padding: 9px 11px; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.productivity-textarea:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
 @media (max-width: 700px) { .productivity-controls, .productivity-row.static { align-items: stretch; flex-direction: column; } }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { emptyProductivity, parseProductivity, replayProductivity, serializeProductivity } from './productivity'
+import { emptyProductivity, nextPresetInputSlot, parseProductivity, replayProductivity, serializeProductivity } from './productivity'
 import { parseProjectProfile } from './projectProfile'
 import { parseCheckpoint, serializeCheckpoint } from './checkpoint'
 import { parseHandoff, serializeHandoff } from './handoff'
@@ -24,13 +24,31 @@ describe('productivity schemas', () => {
   it('replays queued local operations over a fresh CAS-conflict remote', () => {
     const remote = emptyProductivity()
     remote.templates.push({ id: 'template-remote', name: 'remote', createdAt: 1, doc })
+    remote.inputSlots.push({ slot: 1, label: 'remote', text: 'remote text', updatedAt: 1 })
     const rebased = replayProductivity(remote, [
       (file) => ({ ...file, notifications: { ...file.notifications, activity: true } }),
       (file) => ({ ...file, bookmarks: { ...file.bookmarks, session: [{ id: 'bookmark-local', createdAt: 2, label: 'local', excerpt: 'needle' }] } }),
+      (file) => ({ ...file, inputSlots: [...file.inputSlots, { slot: 2, label: 'local', text: 'local text', updatedAt: 2 }] }),
     ])
     expect(rebased.templates[0]?.name).toBe('remote')
     expect(rebased.notifications.activity).toBe(true)
     expect(rebased.bookmarks['session']?.[0]?.label).toBe('local')
+    expect(rebased.inputSlots.map((entry) => entry.label)).toEqual(['remote', 'local'])
+  })
+
+  it('shape-guards stable preset input slots and never retains submit/control bytes', () => {
+    const value = emptyProductivity() as unknown as Record<string, unknown>
+    value['inputSlots'] = [
+      { slot: 2, label: 'Deploy', text: 'npm run deploy', updatedAt: 10 },
+      { slot: 2, label: 'duplicate', text: 'ignored', updatedAt: 11 },
+      { slot: 3, label: 'newline', text: 'echo unsafe\n', updatedAt: 12 },
+      { slot: 4, label: 'escape', text: 'echo\u001b[31m', updatedAt: 13 },
+      { slot: 21, label: 'too high', text: 'ignored', updatedAt: 14 },
+    ]
+    const parsed = parseProductivity(JSON.stringify(value))
+    expect(parsed.inputSlots).toEqual([{ slot: 2, label: 'Deploy', text: 'npm run deploy', updatedAt: 10 }])
+    expect(nextPresetInputSlot(parsed.inputSlots)).toBe(1)
+    expect(nextPresetInputSlot(Array.from({ length: 20 }, (_, index) => ({ slot: index + 1, label: 'x', text: 'x', updatedAt: 1 })))).toBeNull()
   })
 
   it('parses the strict non-executable project profile', () => {

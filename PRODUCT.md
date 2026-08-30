@@ -27,7 +27,7 @@ Success means a developer can close or lose the interface, restart the computer,
 - The `amber` CLI can create, inspect, and attach to the same daemon-owned sessions from another terminal.
 - Browser access can expose the live workspace over a user-controlled Tailscale connection without making the daemon itself a network service.
 - Workspace structure and scrollback can be saved to and loaded from portable `.amberws` files, reusable templates, and named restore points.
-- Large persistent installations are navigable through a command palette, daemon-side global scrollback search, terminal bookmarks, and a session activity overview.
+- Large persistent installations are navigable through a command palette, daemon-side global scrollback search, terminal bookmarks, reusable preset-input slots, and a session activity overview.
 - Recovery history makes daemon restores, exits, fallbacks, and failures inspectable; single-session handoff exports make continuity portable without claiming process-memory restoration.
 - Project-local `.amber.toml` profiles can declare reviewed pane kinds, folders, and splits, but cannot execute commands.
 - Coding-agent processes may be long-running and memory-intensive, so Amber supervises their lifecycle and can suspend and precisely resume supported conversations.

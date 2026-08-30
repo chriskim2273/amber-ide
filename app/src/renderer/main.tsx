@@ -16,7 +16,7 @@ import type { WebStatus } from '../shared/webStatus'
 import {
   emptyProductivity, parseProductivity, serializeProductivity, mutateProductivity, replayProductivity,
   type LoadProductivityResult, type SaveProductivityResult, type ProductivityFile,
-  type WorkspaceTemplate, type SessionBookmark,
+  type WorkspaceTemplate, type SessionBookmark, type PresetInputSlot,
 } from '../shared/productivity'
 import { serializeCheckpoint, parseCheckpoint, type CheckpointSummary } from '../shared/checkpoint'
 import type { ProjectProfile } from '../shared/projectProfile'
@@ -41,7 +41,7 @@ import { type PaletteEntry } from './commandPalette'
 import { activitySummary, bookmarkNeedle, makeBookmark, searchScopeNames, shouldNotify, type SearchScope } from './productivityModels'
 import {
   CommandPalette, GlobalSearchDialog, RecoveryCenter, TemplatesDialog,
-  BookmarksDialog, CheckpointsDialog, ProjectProfileDialog,
+  BookmarksDialog, PresetInputsDialog, CheckpointsDialog, ProjectProfileDialog,
 } from './ProductivityDialogs'
 import './theme.css'
 
@@ -235,7 +235,7 @@ function App(): JSX.Element {
   const [saveScopeOpen, setSaveScopeOpen] = useState(false)
   const [loadDoc, setLoadDoc] = useState<WorkspaceDoc | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
-  type ProductivityOverlay = 'palette' | 'search' | 'recovery' | 'templates' | 'bookmarks' | 'checkpoints' | 'project'
+  type ProductivityOverlay = 'palette' | 'search' | 'recovery' | 'templates' | 'bookmarks' | 'presets' | 'checkpoints' | 'project'
   const [productivityOverlay, setProductivityOverlay] = useState<ProductivityOverlay | null>(null)
   const [productivity, setProductivity] = useState<ProductivityFile>(emptyProductivity)
   const productivityRef = useRef(productivity)
@@ -259,6 +259,8 @@ function App(): JSX.Element {
   const [findRequest, setFindRequest] = useState<{ paneId: string; query: string; seq: number } | undefined>(undefined)
   const [focusRequest, setFocusRequest] = useState<{ paneId: string; seq: number } | undefined>(undefined)
   const [paneActionRequest, setPaneActionRequest] = useState<{ action: 'bookmark' | 'handoff'; seq: number } | undefined>(undefined)
+  const [presetTarget, setPresetTarget] = useState<string | null>(null)
+  const [insertPresetRequest, setInsertPresetRequest] = useState<{ paneId: string; text: string; seq: number } | undefined>(undefined)
   const navigationSeq = useRef(0)
   const notificationDedup = useRef(new Map<string, number>())
   const navigateRef = useRef<(session: string, query?: string) => void>(() => {})
@@ -1302,6 +1304,10 @@ function App(): JSX.Element {
     if (overlay === 'recovery') refreshRecovery()
     if (overlay === 'checkpoints') void window.amber.listCheckpoints?.().then(setCheckpoints)
     if (overlay === 'project') { setProjectProfile(null); setProjectError(null) }
+    if (overlay === 'presets') setPresetTarget(null)
+  }
+  const choosePresetForPane = (paneId: string): void => {
+    setToolbarMenu(null); setPresetTarget(paneId); setProductivityOverlay('presets')
   }
   const captureTemplate = (name: string): void => {
     void captureWorkspace('one', false).then(({ doc }) => updateProductivity((file) => ({ ...file, templates: [
@@ -1359,6 +1365,7 @@ function App(): JSX.Element {
       { id: 'action:checkpoints', label: 'Restore points', detail: 'Named structure and scrollback snapshots', keywords: 'checkpoint rollback', run: () => openProductivity('checkpoints') },
       { id: 'action:bookmark-current', label: 'Bookmark active pane position', detail: 'Capture selected text or nearby cursor lines', keywords: 'terminal anchor', run: () => setPaneActionRequest({ action: 'bookmark', seq: ++navigationSeq.current }) },
       { id: 'action:bookmarks', label: 'Browse bookmarks', detail: 'Terminal text anchors', keywords: 'saved positions', run: () => openProductivity('bookmarks') },
+      { id: 'action:presets', label: 'Preset input slots', detail: 'Save reusable text for one-click pane input', keywords: 'snippet command prompt paste', run: () => openProductivity('presets') },
       { id: 'action:handoff', label: 'Export active pane handoff', detail: 'Metadata, scrollback, and bookmarks', keywords: 'transfer archive', run: () => setPaneActionRequest({ action: 'handoff', seq: ++navigationSeq.current }) },
       { id: 'action:project', label: 'Load project profile', detail: `${cwd}/.amber.toml`, keywords: 'local config', run: () => openProductivity('project') },
     ] : []),
@@ -1644,6 +1651,9 @@ function App(): JSX.Element {
                 <button className="popover-item" role="menuitem" onClick={() => openProductivity('bookmarks')}>
                   <Icon name="preserve" /><span><strong>Bookmarks</strong><small>Saved terminal text anchors</small></span>
                 </button>
+                <button className="popover-item" role="menuitem" onClick={() => openProductivity('presets')}>
+                  <Icon name="preset" /><span><strong>Preset inputs</strong><small>Reusable text slots for terminal panes</small></span>
+                </button>
                 <button className="popover-item" role="menuitem" onClick={() => openProductivity('project')}>
                   <Icon name="folder" /><span><strong>Project profile</strong><small>Review {cwd}/.amber.toml</small></span>
                 </button>
@@ -1744,7 +1754,11 @@ function App(): JSX.Element {
                           frozen={frozen}
                           onFreeze={freezePane}
                           onUnfreeze={unfreezePane}
-                          {...(productivityAvailable ? { onBookmark: addBookmark, onExportHandoff: exportHandoff, paneActionRequest } : {})}
+                          {...(productivityAvailable ? {
+                            onBookmark: addBookmark, onExportHandoff: exportHandoff, paneActionRequest,
+                            onPresetInputs: choosePresetForPane, hasPresetInputs: productivity.inputSlots.length > 0, insertPresetRequest,
+                            onPresetInserted: (seq: number) => setInsertPresetRequest((request) => request?.seq === seq ? undefined : request),
+                          } : {})}
                           findRequest={findRequest}
                           focusRequest={focusRequest}
                           onToggleZoom={toggleZoom}
@@ -2162,6 +2176,21 @@ function App(): JSX.Element {
         onClose={() => setProductivityOverlay(null)} onPick={(session, bookmark: SessionBookmark) => navigateTo(session, bookmarkNeedle(bookmark))}
         onRename={(session, id, label) => updateProductivity((file) => ({ ...file, bookmarks: { ...file.bookmarks, [session]: (file.bookmarks[session] ?? []).map((bookmark) => bookmark.id === id ? { ...bookmark, label } : bookmark) } }))}
         onDelete={(session, id) => updateProductivity((file) => ({ ...file, bookmarks: { ...file.bookmarks, [session]: (file.bookmarks[session] ?? []).filter((bookmark) => bookmark.id !== id) } }))} />}
+      {productivityOverlay === 'presets' && <PresetInputsDialog slots={productivity.inputSlots} targetPane={presetTarget}
+        onClose={() => { setProductivityOverlay(null); setPresetTarget(null) }}
+        onInsert={(entry: PresetInputSlot) => {
+          const target = presetTarget
+          if (!target || sessions.find((session) => session.name === target)?.alive !== true) {
+            setNotice('That pane is no longer available.'); return
+          }
+          setProductivityOverlay(null); setPresetTarget(null)
+          setInsertPresetRequest({ paneId: target, text: entry.text, seq: ++navigationSeq.current })
+          setNotice(`Inserted preset #${entry.slot} without sending Enter.`)
+        }}
+        onSave={(slot, label, text) => updateProductivity((file) => ({ ...file, inputSlots: [
+          ...file.inputSlots.filter((entry) => entry.slot !== slot), { slot, label, text, updatedAt: Date.now() },
+        ].sort((a, b) => a.slot - b.slot) }))}
+        onDelete={(slot) => updateProductivity((file) => ({ ...file, inputSlots: file.inputSlots.filter((entry) => entry.slot !== slot) }))} />}
       {productivityOverlay === 'checkpoints' && <CheckpointsDialog checkpoints={checkpoints}
         onClose={() => setProductivityOverlay(null)} onCreate={(name, scope) => { void createCheckpoint(name, false, scope) }}
         onDelete={(id) => { if (window.confirm('Delete this restore point?')) void window.amber.deleteCheckpoint?.(id).then(async () => setCheckpoints(await window.amber.listCheckpoints?.() ?? [])) }}

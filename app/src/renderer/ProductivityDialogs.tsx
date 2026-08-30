@@ -4,7 +4,10 @@ import { filterPalette } from './commandPalette'
 import type { RecoveryEvent, SearchResult, SessionInfo } from '../shared/proto'
 import type { CheckpointSummary } from '../shared/checkpoint'
 import type { ProjectProfile } from '../shared/projectProfile'
-import type { SessionBookmark, WorkspaceTemplate } from '../shared/productivity'
+import {
+  nextPresetInputSlot, validPresetInputText,
+  type PresetInputSlot, type SessionBookmark, type WorkspaceTemplate,
+} from '../shared/productivity'
 import { filterRecovery, type RecoveryFilter, type SearchScope } from './productivityModels'
 import { Icon } from './Icon'
 
@@ -129,6 +132,57 @@ export function BookmarksDialog(props: { bookmarks: Array<{ session: string; boo
     {props.bookmarks.length === 0 && <div className="productivity-empty">No terminal bookmarks</div>}
     {props.bookmarks.map(({ session, bookmark }) => <div className="productivity-row static" key={`${session}:${bookmark.id}`}><button onClick={() => props.onPick(session, bookmark)}><strong>{bookmark.label}</strong><small>{session} · {new Date(bookmark.createdAt).toLocaleString()}</small><code>{bookmark.excerpt}</code></button><span><button className="btn btn-ghost" onClick={() => { const label = window.prompt('Bookmark label', bookmark.label)?.trim(); if (label) props.onRename(session, bookmark.id, label) }}>Rename</button><button className="btn btn-ghost" onClick={() => props.onDelete(session, bookmark.id)}>Delete</button></span></div>)}
   </div></Shell>
+}
+
+export function PresetInputsDialog(props: {
+  slots: PresetInputSlot[]; targetPane: string | null; onClose: () => void
+  onInsert: (entry: PresetInputSlot) => void
+  onSave: (slot: number, label: string, text: string) => void
+  onDelete: (slot: number) => void
+}): JSX.Element {
+  const [editing, setEditing] = useState<number | null>(null)
+  const [label, setLabel] = useState('')
+  const [text, setText] = useState('')
+  const [error, setError] = useState<string | null>(null)
+  const next = nextPresetInputSlot(props.slots)
+  const begin = (entry?: PresetInputSlot): void => {
+    setEditing(entry?.slot ?? null); setLabel(entry?.label ?? ''); setText(entry?.text ?? ''); setError(null)
+  }
+  const save = (): void => {
+    const targetSlot = editing ?? next
+    if (targetSlot === null) { setError('All 20 preset slots are in use.'); return }
+    if (!label.trim()) { setError('Give this preset a label.'); return }
+    if (!validPresetInputText(text)) {
+      setError('Input must be 1–16,384 printable characters with no line breaks, tabs, or control keys.')
+      return
+    }
+    props.onSave(targetSlot, label.trim(), text); begin()
+  }
+  return <Shell title={props.targetPane ? 'Insert preset input' : 'Preset input slots'} label="Preset input slots" onClose={props.onClose}>
+    <p className="dialog-text">Select a slot to type it into the pane. Amber never sends Enter. Presets are stored locally in plaintext—do not save passwords or tokens.</p>
+    <div className="productivity-list preset-slot-list">
+      {props.slots.length === 0 && <div className="productivity-empty">No preset inputs yet</div>}
+      {props.slots.map((entry) => <div className="productivity-row static" key={entry.slot}>
+        {props.targetPane
+          ? <button onClick={() => props.onInsert(entry)}><strong>#{entry.slot} · {entry.label}</strong><code>{entry.text}</code></button>
+          : <span><strong>#{entry.slot} · {entry.label}</strong><code>{entry.text}</code></span>}
+        <span><button className="btn btn-ghost" onClick={() => begin(entry)}>Edit</button>
+          <button className="btn btn-ghost" onClick={() => props.onDelete(entry.slot)}>Delete</button></span>
+      </div>)}
+    </div>
+    <div className="preset-slot-editor">
+      <div className="productivity-controls">
+        <input className="productivity-search" aria-label="preset label" placeholder="Label, e.g. Run tests" value={label} maxLength={80}
+          onChange={(event) => { setLabel(event.target.value); setError(null) }} />
+        {editing !== null && <button className="btn btn-ghost" onClick={() => begin()}>New slot</button>}
+      </div>
+      <textarea className="productivity-textarea" aria-label="preset input" placeholder="Text to type into the pane (Enter is never included)"
+        value={text} spellCheck={false} onChange={(event) => { setText(event.target.value); setError(null) }} />
+      {error && <div className="productivity-error" role="alert">{error}</div>}
+      <div className="dialog-actions"><button className="btn btn-accent" disabled={editing === null && next === null}
+        onClick={save}>Save slot #{editing ?? next ?? '—'}</button></div>
+    </div>
+  </Shell>
 }
 
 export function CheckpointsDialog(props: { checkpoints: CheckpointSummary[]; onCreate: (name: string, scope: 'one' | 'all') => void; onRestore: (id: string, replace: boolean) => void; onDelete: (id: string) => void; onClose: () => void }): JSX.Element {

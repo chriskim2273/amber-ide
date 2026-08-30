@@ -210,6 +210,10 @@ export function SplitView(props: {
   findRequest?: { paneId: string; query: string; seq: number } | undefined
   focusRequest?: { paneId: string; seq: number } | undefined
   paneActionRequest?: { action: 'bookmark' | 'handoff'; seq: number } | undefined
+  onPresetInputs?: (paneId: string) => void
+  hasPresetInputs?: boolean
+  insertPresetRequest?: { paneId: string; text: string; seq: number } | undefined
+  onPresetInserted?: (seq: number) => void
 }): JSX.Element {
   const ref = useRef<HTMLDivElement>(null)
   const [size, setSize] = useState<Rect>({ x: 0, y: 0, w: 0, h: 0 })
@@ -409,6 +413,16 @@ export function SplitView(props: {
   }
   const searchApis = useRef<Map<string, SearchApi>>(new Map())
   const searchReadyCbs = useRef<Map<string, (api: SearchApi) => void>>(new Map())
+  const pendingPreset = useRef<{ paneId: string; text: string; seq: number } | null>(null)
+  const appliedPresetSeq = useRef<number | null>(null)
+  const applyPreset = (request: { paneId: string; text: string; seq: number }, api: SearchApi): void => {
+    if (appliedPresetSeq.current === request.seq) return
+    appliedPresetSeq.current = request.seq; pendingPreset.current = null
+    api.insert(request.text)
+    props.onPresetInserted?.(request.seq)
+    setFocused(request.paneId)
+    requestAnimationFrame(() => focusPane(request.paneId, false))
+  }
   useEffect(() => {
     const request = props.paneActionRequest
     if (!props.active || !request) return
@@ -419,9 +433,26 @@ export function SplitView(props: {
     // The request sequence is the command; callbacks intentionally read this render.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [props.paneActionRequest?.seq, props.active, props.tree])
+  useEffect(() => {
+    const request = props.insertPresetRequest
+    if (!props.active || !request || frozenRef.current.has(request.paneId)
+      || !leaves(props.tree).includes(request.paneId)) return
+    const api = searchApis.current.get(request.paneId)
+    if (api) applyPreset(request, api)
+    else pendingPreset.current = request
+    // The request sequence is the command; terminal refs are intentionally live.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [props.insertPresetRequest?.seq, props.active, props.tree])
   const searchReadyFor = (paneId: string): ((api: SearchApi) => void) => {
     let cb = searchReadyCbs.current.get(paneId)
-    if (!cb) { cb = (api) => { searchApis.current.set(paneId, api) }; searchReadyCbs.current.set(paneId, cb) }
+    if (!cb) {
+      cb = (api) => {
+        searchApis.current.set(paneId, api)
+        const pending = pendingPreset.current
+        if (pending?.paneId === paneId) applyPreset(pending, api)
+      }
+      searchReadyCbs.current.set(paneId, cb)
+    }
     return cb
   }
   // Sweep cached callbacks/apis for panes no longer in the tree — the caches are
@@ -445,6 +476,7 @@ export function SplitView(props: {
       for (const id of stale) delete next[id]
       return next
     })
+    if (pendingPreset.current && !live.has(pendingPreset.current.paneId)) pendingPreset.current = null
     setFindPane((p) => (p && !live.has(p) ? null : p))
     setMenu((m) => (m && !live.has(m.paneId) ? null : m))
     setNotePane((p) => (p && !live.has(p) ? null : p))
@@ -814,6 +846,9 @@ export function SplitView(props: {
               {isZoomedPane &&
                 <span className="zoom-badge">zoomed — {chordLabel('zoom')} to restore</span>}
               <div className="pane-actions">
+                {!noTerm && dead === undefined && !isFrozen && props.hasPresetInputs && props.onPresetInputs &&
+                  <button className="icon-btn pane-presets" aria-label="insert preset input" title="Insert preset input"
+                    onClick={() => props.onPresetInputs?.(paneId)}><Icon name="preset" /></button>}
                 <button className="icon-btn pane-move" aria-label="move pane" title="Drag to move pane"
                   onPointerDown={startPaneDrag(paneId)} style={{ cursor: 'grab', touchAction: 'none' }}><Icon name="move" /></button>
                 <button className="icon-btn pane-more" aria-label="pane actions" title="Pane actions"
@@ -1004,6 +1039,8 @@ export function SplitView(props: {
             })()}
             {menuHasTerm && <>
               <div className="ctx-sep" />
+              {props.onPresetInputs && props.deadCodes[paneId] === undefined && !isFrozen && <button className="ctx-item" role="menuitem"
+                onClick={run(() => props.onPresetInputs?.(paneId))}><span>Insert preset input…</span></button>}
               {props.onBookmark && <button className="ctx-item" role="menuitem" onClick={run(() => {
                 const excerpt = searchApis.current.get(paneId)?.captureBookmark() ?? ''
                 props.onBookmark?.(paneId, excerpt)

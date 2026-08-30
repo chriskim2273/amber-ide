@@ -112,8 +112,10 @@ straight to a single xterm.js emulator.
   into the renderer; selecting a result opens that pane's local find bar.
 - Recovery history records restores, exits, supervision transitions, snapshots,
   and failures in a bounded daemon journal.
-- Terminal bookmarks, activity/memory overview, desktop notifications, and
-  bounded single-session handoff exports support long-running work.
+- Terminal bookmarks, reusable preset-input slots, activity/memory overview,
+  desktop notifications, and bounded single-session handoff exports support
+  long-running work. Preset slots type saved text into a chosen terminal but
+  never send Enter.
 - Explicitly reviewed `.amber.toml` files may declare pane kinds, folders, and
   split direction. They cannot run commands or escape their project root.
 - Restore points recreate session structure and replay scrollback; they are not

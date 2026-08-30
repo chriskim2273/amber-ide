@@ -1,7 +1,7 @@
 export type IconName =
   | 'add' | 'folder' | 'more' | 'move' | 'close' | 'split-right' | 'split-down'
   | 'refresh' | 'reload' | 'snowflake' | 'play' | 'save' | 'load' | 'sessions'
-  | 'memory' | 'help' | 'preserve' | 'up' | 'down' | 'maximize' | 'restore'
+  | 'memory' | 'help' | 'preserve' | 'preset' | 'up' | 'down' | 'maximize' | 'restore'
 
 export function Icon({ name, size = 16 }: { name: IconName; size?: number }): JSX.Element {
   const common = {
@@ -36,6 +36,7 @@ export function Icon({ name, size = 16 }: { name: IconName; size?: number }): JS
     case 'memory': return <svg {...common}><rect x="6" y="6" width="12" height="12" rx="2" /><path d="M9 2.5v3M15 2.5v3M9 18.5v3M15 18.5v3M2.5 9h3M2.5 15h3M18.5 9h3M18.5 15h3M10 10h4v4h-4z" /></svg>
     case 'help': return <svg {...common}><circle cx="12" cy="12" r="9" /><path d="M9.8 9a2.3 2.3 0 1 1 3.1 2.2c-.9.4-.9 1.1-.9 1.8M12 17h.01" /></svg>
     case 'preserve': return <svg {...common}><path d="M12 3 5 6v5c0 4.6 2.8 8 7 10 4.2-2 7-5.4 7-10V6z" /><path d="m9 12 2 2 4-4" /></svg>
+    case 'preset': return <svg {...common}><rect x="3.5" y="5" width="17" height="14" rx="2" /><path d="M7 9h3M7 13h3M14 9v7m-2-2 2 2 2-2" /></svg>
     case 'up': return <svg {...common}><path d="m6 14 6-6 6 6" /></svg>
     case 'down': return <svg {...common}><path d="m6 10 6 6 6-6" /></svg>
     case 'maximize': return <svg {...common}><path d="M8 4H4v4M16 4h4v4M4 16v4h4M20 16v4h-4" /></svg>

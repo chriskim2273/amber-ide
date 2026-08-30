@@ -1261,6 +1261,17 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   and the native handoff save modal remain manual environment gestures; full
   rustfmt still has the repository-wide pre-existing drift.
 
+- [x] Preset input slots (2026-08-30) — the desktop productivity store now
+  carries 20 stable numbered slots for reusable terminal text. Slots are
+  managed from Tools/command palette and, once any exist, every live terminal
+  header exposes a direct preset button; selecting a slot types its contents
+  into exactly that pane without sending Enter. The pane menu offers the same
+  picker. Stored values are shape/size bounded, reject all Unicode control
+  characters (including newline, tab, escape, and carriage return), survive
+  CAS replay/app restart, and are explicitly labeled as local plaintext so
+  secrets are not implied safe. Browser/editor panes and web/remote bridges do
+  not receive this desktop-only input authority.
+
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**
   `std::io::Read` (dedicated thread); `take_writer()` is one-shot;

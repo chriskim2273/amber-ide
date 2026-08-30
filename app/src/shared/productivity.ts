@@ -4,6 +4,8 @@ export const PRODUCTIVITY_VERSION = 1
 export const TEMPLATE_MAX = 50
 export const BOOKMARKS_PER_SESSION_MAX = 100
 export const BOOKMARKS_TOTAL_MAX = 2_000
+export const PRESET_INPUT_SLOT_MAX = 20
+export const PRESET_INPUT_TEXT_MAX = 16_384
 
 export interface WorkspaceTemplate {
   id: string
@@ -19,6 +21,13 @@ export interface SessionBookmark {
   excerpt: string
 }
 
+export interface PresetInputSlot {
+  slot: number
+  label: string
+  text: string
+  updatedAt: number
+}
+
 export interface NotificationPreferences {
   activity: boolean
   exit: boolean
@@ -32,6 +41,7 @@ export interface ProductivityFile {
   version: 1
   templates: WorkspaceTemplate[]
   bookmarks: Record<string, SessionBookmark[]>
+  inputSlots: PresetInputSlot[]
   notifications: NotificationPreferences
 }
 
@@ -52,7 +62,7 @@ const DEFAULT_NOTIFICATIONS: NotificationPreferences = {
 }
 
 export function emptyProductivity(): ProductivityFile {
-  return { version: PRODUCTIVITY_VERSION, templates: [], bookmarks: {}, notifications: { ...DEFAULT_NOTIFICATIONS } }
+  return { version: PRODUCTIVITY_VERSION, templates: [], bookmarks: {}, inputSlots: [], notifications: { ...DEFAULT_NOTIFICATIONS } }
 }
 
 function bounded(value: unknown, max: number): string | null {
@@ -79,6 +89,28 @@ function parseBookmark(value: unknown): SessionBookmark | null {
   const excerpt = bounded(raw['excerpt'], 500)
   if (label === null || excerpt === null || typeof raw['createdAt'] !== 'number' || !Number.isFinite(raw['createdAt'])) return null
   return { id: raw['id'], createdAt: raw['createdAt'], label, excerpt }
+}
+
+export function validPresetInputText(text: string): boolean {
+  return text.length > 0 && [...text].length <= PRESET_INPUT_TEXT_MAX && !/\p{C}/u.test(text)
+}
+
+function parsePresetInput(value: unknown): PresetInputSlot | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const raw = value as Record<string, unknown>
+  const label = bounded(raw['label'], 80)
+  if (typeof raw['slot'] !== 'number' || !Number.isInteger(raw['slot'])
+    || raw['slot'] < 1 || raw['slot'] > PRESET_INPUT_SLOT_MAX
+    || label === null || label.trim().length === 0 || /\p{C}/u.test(label)
+    || typeof raw['text'] !== 'string' || !validPresetInputText(raw['text'])
+    || typeof raw['updatedAt'] !== 'number' || !Number.isFinite(raw['updatedAt']) || raw['updatedAt'] < 0) return null
+  return { slot: raw['slot'], label: label.trim(), text: raw['text'], updatedAt: raw['updatedAt'] }
+}
+
+export function nextPresetInputSlot(slots: PresetInputSlot[]): number | null {
+  const used = new Set(slots.map((entry) => entry.slot))
+  for (let slot = 1; slot <= PRESET_INPUT_SLOT_MAX; slot += 1) if (!used.has(slot)) return slot
+  return null
 }
 
 function parseNotifications(value: unknown): NotificationPreferences {
@@ -115,7 +147,18 @@ export function parseProductivity(text: string): ProductivityFile {
         remaining -= parsed.length
       }
     }
-    return { version: PRODUCTIVITY_VERSION, templates, bookmarks, notifications: parseNotifications(value['notifications']) }
+    const inputSlots: PresetInputSlot[] = []
+    const usedSlots = new Set<number>()
+    if (Array.isArray(value['inputSlots'])) {
+      for (const candidate of value['inputSlots']) {
+        const parsed = parsePresetInput(candidate)
+        if (!parsed || usedSlots.has(parsed.slot)) continue
+        usedSlots.add(parsed.slot); inputSlots.push(parsed)
+        if (inputSlots.length >= PRESET_INPUT_SLOT_MAX) break
+      }
+    }
+    inputSlots.sort((a, b) => a.slot - b.slot)
+    return { version: PRODUCTIVITY_VERSION, templates, bookmarks, inputSlots, notifications: parseNotifications(value['notifications']) }
   } catch { return emptyProductivity() }
 }
 
