@@ -1207,6 +1207,33 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   tunnel relaunch after a mid-session ssh death, macOS (`sshEnv` no-ops off
   Linux), and protocol skew against an older remote daemon.
 
+- [x] Coordinated UI/UX pass (2026-08-30) — preserved the incumbent
+  “Preservation Console” identity while addressing the five critique themes as
+  one system. Desktop chrome: `+ Pane` now owns a labeled nine-kind picker; the
+  permanent kind select is gone; save/load/sessions/memory moved into one
+  workspace-tools menu. Pane chrome: every header keeps only normalized SVG
+  move + overflow controls; refresh/reload/split/zoom/freeze/cwd/close remain in
+  one labeled capability-aware menu and all shortcuts remain intact. Continuity:
+  a calm daemon pill shows connection + live-session truth and opens a detail
+  surface; “snapshot saved” appears only after the existing daemon `SnapshotOk`
+  reply (no fabricated automatic timestamp). Accessibility/polish: separate
+  5.3:1 filled-violet token while retaining the focus violet, 26 px desktop
+  icon/tab-close targets, 11.5 px functional metadata, 44 px mobile controls,
+  reduced-motion/browser-surface treatment, intent-only exact memory labels,
+  and one local 16 px SVG grammar replacing high-frequency emoji/Unicode.
+  Product/design truth plus reviewed design and implementation plans live in
+  `PRODUCT.md`, `DESIGN.md`, and the 2026-08-30 spec/plan. Gates run from an
+  NVMe mirror (not the media worktree): app 595 tests passed with the existing
+  real-daemon skip, typecheck and production bundle green; ESLint remains
+  blocked by the repository-wide pre-existing ESLint-v9 flat-config gap.
+  Impeccable source detector returned zero findings. Live xvfb+CDP proof against
+  the real daemon confirmed 13 live sessions, no toolbar overflow at 1100 px,
+  26×26 pane/tab actions, `#6553e6` primary fill, labeled creation/tools/pane
+  menus, and a real `Snapshot`→`SnapshotOk` “saved just now” transition with no
+  daemon error. Coarse-pointer structure was forced for inspection and retained
+  44×44 mobile top-bar controls; a true physical coarse-pointer device remains
+  manual.
+
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**
   `std::io::Read` (dedicated thread); `take_writer()` is one-shot;

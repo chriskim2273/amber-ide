@@ -1,0 +1,560 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-08-30T02:49:27Z",
+  "title": "Design System: Amber",
+  "extensions": {
+    "colorMeta": {
+      "background": {
+        "role": "neutral",
+        "displayName": "Obsidian",
+        "canonical": "#0c0c0f",
+        "tonalRamp": [
+          "color-mix(in oklch, #0c0c0f 35%, black)",
+          "color-mix(in oklch, #0c0c0f 50%, black)",
+          "color-mix(in oklch, #0c0c0f 68%, black)",
+          "color-mix(in oklch, #0c0c0f 84%, black)",
+          "#0c0c0f",
+          "color-mix(in oklch, #0c0c0f 84%, white)",
+          "color-mix(in oklch, #0c0c0f 60%, white)",
+          "color-mix(in oklch, #0c0c0f 30%, white)"
+        ]
+      },
+      "surface": {
+        "role": "neutral",
+        "displayName": "Carbon I",
+        "canonical": "#141419",
+        "tonalRamp": [
+          "color-mix(in oklch, #141419 35%, black)",
+          "color-mix(in oklch, #141419 50%, black)",
+          "color-mix(in oklch, #141419 68%, black)",
+          "color-mix(in oklch, #141419 84%, black)",
+          "#141419",
+          "color-mix(in oklch, #141419 84%, white)",
+          "color-mix(in oklch, #141419 60%, white)",
+          "color-mix(in oklch, #141419 30%, white)"
+        ]
+      },
+      "surface-raised": {
+        "role": "neutral",
+        "displayName": "Carbon II",
+        "canonical": "#1b1b22",
+        "tonalRamp": [
+          "color-mix(in oklch, #1b1b22 35%, black)",
+          "color-mix(in oklch, #1b1b22 50%, black)",
+          "color-mix(in oklch, #1b1b22 68%, black)",
+          "color-mix(in oklch, #1b1b22 84%, black)",
+          "#1b1b22",
+          "color-mix(in oklch, #1b1b22 84%, white)",
+          "color-mix(in oklch, #1b1b22 60%, white)",
+          "color-mix(in oklch, #1b1b22 30%, white)"
+        ]
+      },
+      "surface-high": {
+        "role": "neutral",
+        "displayName": "Carbon III",
+        "canonical": "#23232c",
+        "tonalRamp": [
+          "color-mix(in oklch, #23232c 35%, black)",
+          "color-mix(in oklch, #23232c 50%, black)",
+          "color-mix(in oklch, #23232c 68%, black)",
+          "color-mix(in oklch, #23232c 84%, black)",
+          "#23232c",
+          "color-mix(in oklch, #23232c 84%, white)",
+          "color-mix(in oklch, #23232c 60%, white)",
+          "color-mix(in oklch, #23232c 30%, white)"
+        ]
+      },
+      "border": {
+        "role": "neutral",
+        "displayName": "Structural Graphite",
+        "canonical": "#2a2a34",
+        "tonalRamp": [
+          "color-mix(in oklch, #2a2a34 35%, black)",
+          "color-mix(in oklch, #2a2a34 50%, black)",
+          "color-mix(in oklch, #2a2a34 68%, black)",
+          "color-mix(in oklch, #2a2a34 84%, black)",
+          "#2a2a34",
+          "color-mix(in oklch, #2a2a34 84%, white)",
+          "color-mix(in oklch, #2a2a34 60%, white)",
+          "color-mix(in oklch, #2a2a34 30%, white)"
+        ]
+      },
+      "border-strong": {
+        "role": "neutral",
+        "displayName": "Strong Graphite",
+        "canonical": "#3a3a48",
+        "tonalRamp": [
+          "color-mix(in oklch, #3a3a48 35%, black)",
+          "color-mix(in oklch, #3a3a48 50%, black)",
+          "color-mix(in oklch, #3a3a48 68%, black)",
+          "color-mix(in oklch, #3a3a48 84%, black)",
+          "#3a3a48",
+          "color-mix(in oklch, #3a3a48 84%, white)",
+          "color-mix(in oklch, #3a3a48 60%, white)",
+          "color-mix(in oklch, #3a3a48 30%, white)"
+        ]
+      },
+      "text": {
+        "role": "neutral",
+        "displayName": "Primary Text",
+        "canonical": "#e6e6ec",
+        "tonalRamp": [
+          "color-mix(in oklch, #e6e6ec 35%, black)",
+          "color-mix(in oklch, #e6e6ec 50%, black)",
+          "color-mix(in oklch, #e6e6ec 68%, black)",
+          "color-mix(in oklch, #e6e6ec 84%, black)",
+          "#e6e6ec",
+          "color-mix(in oklch, #e6e6ec 84%, white)",
+          "color-mix(in oklch, #e6e6ec 60%, white)",
+          "color-mix(in oklch, #e6e6ec 30%, white)"
+        ]
+      },
+      "text-muted": {
+        "role": "neutral",
+        "displayName": "Muted Text",
+        "canonical": "#9a9aa8",
+        "tonalRamp": [
+          "color-mix(in oklch, #9a9aa8 35%, black)",
+          "color-mix(in oklch, #9a9aa8 50%, black)",
+          "color-mix(in oklch, #9a9aa8 68%, black)",
+          "color-mix(in oklch, #9a9aa8 84%, black)",
+          "#9a9aa8",
+          "color-mix(in oklch, #9a9aa8 84%, white)",
+          "color-mix(in oklch, #9a9aa8 60%, white)",
+          "color-mix(in oklch, #9a9aa8 30%, white)"
+        ]
+      },
+      "text-faint": {
+        "role": "neutral",
+        "displayName": "Faint Text",
+        "canonical": "#64646f",
+        "tonalRamp": [
+          "color-mix(in oklch, #64646f 35%, black)",
+          "color-mix(in oklch, #64646f 50%, black)",
+          "color-mix(in oklch, #64646f 68%, black)",
+          "color-mix(in oklch, #64646f 84%, black)",
+          "#64646f",
+          "color-mix(in oklch, #64646f 84%, white)",
+          "color-mix(in oklch, #64646f 60%, white)",
+          "color-mix(in oklch, #64646f 30%, white)"
+        ]
+      },
+      "primary": {
+        "role": "primary",
+        "displayName": "Preservation Violet",
+        "canonical": "#7c6cff",
+        "tonalRamp": [
+          "color-mix(in oklch, #7c6cff 35%, black)",
+          "color-mix(in oklch, #7c6cff 50%, black)",
+          "color-mix(in oklch, #7c6cff 68%, black)",
+          "color-mix(in oklch, #7c6cff 84%, black)",
+          "#7c6cff",
+          "color-mix(in oklch, #7c6cff 84%, white)",
+          "color-mix(in oklch, #7c6cff 60%, white)",
+          "color-mix(in oklch, #7c6cff 30%, white)"
+        ]
+      },
+      "primary-soft": {
+        "role": "primary",
+        "displayName": "Preservation Violet Veil",
+        "canonical": "rgba(124, 108, 255, 0.16)",
+        "tonalRamp": [
+          "color-mix(in oklch, #7c6cff 35%, black)",
+          "color-mix(in oklch, #7c6cff 50%, black)",
+          "color-mix(in oklch, #7c6cff 68%, black)",
+          "color-mix(in oklch, #7c6cff 84%, black)",
+          "#7c6cff",
+          "color-mix(in oklch, #7c6cff 84%, white)",
+          "color-mix(in oklch, #7c6cff 60%, white)",
+          "color-mix(in oklch, #7c6cff 30%, white)"
+        ]
+      },
+      "secondary": {
+        "role": "secondary",
+        "displayName": "Signal Blue",
+        "canonical": "#4d9fff",
+        "tonalRamp": [
+          "color-mix(in oklch, #4d9fff 35%, black)",
+          "color-mix(in oklch, #4d9fff 50%, black)",
+          "color-mix(in oklch, #4d9fff 68%, black)",
+          "color-mix(in oklch, #4d9fff 84%, black)",
+          "#4d9fff",
+          "color-mix(in oklch, #4d9fff 84%, white)",
+          "color-mix(in oklch, #4d9fff 60%, white)",
+          "color-mix(in oklch, #4d9fff 30%, white)"
+        ]
+      },
+      "danger": {
+        "role": "tertiary",
+        "displayName": "Failure Red",
+        "canonical": "#ff5c5c",
+        "tonalRamp": [
+          "color-mix(in oklch, #ff5c5c 35%, black)",
+          "color-mix(in oklch, #ff5c5c 50%, black)",
+          "color-mix(in oklch, #ff5c5c 68%, black)",
+          "color-mix(in oklch, #ff5c5c 84%, black)",
+          "#ff5c5c",
+          "color-mix(in oklch, #ff5c5c 84%, white)",
+          "color-mix(in oklch, #ff5c5c 60%, white)",
+          "color-mix(in oklch, #ff5c5c 30%, white)"
+        ]
+      },
+      "danger-soft": {
+        "role": "tertiary",
+        "displayName": "Failure Red Veil",
+        "canonical": "rgba(255, 92, 92, 0.14)",
+        "tonalRamp": [
+          "color-mix(in oklch, #ff5c5c 35%, black)",
+          "color-mix(in oklch, #ff5c5c 50%, black)",
+          "color-mix(in oklch, #ff5c5c 68%, black)",
+          "color-mix(in oklch, #ff5c5c 84%, black)",
+          "#ff5c5c",
+          "color-mix(in oklch, #ff5c5c 84%, white)",
+          "color-mix(in oklch, #ff5c5c 60%, white)",
+          "color-mix(in oklch, #ff5c5c 30%, white)"
+        ]
+      },
+      "warning": {
+        "role": "tertiary",
+        "displayName": "Warning Amber",
+        "canonical": "#ffb454",
+        "tonalRamp": [
+          "color-mix(in oklch, #ffb454 35%, black)",
+          "color-mix(in oklch, #ffb454 50%, black)",
+          "color-mix(in oklch, #ffb454 68%, black)",
+          "color-mix(in oklch, #ffb454 84%, black)",
+          "#ffb454",
+          "color-mix(in oklch, #ffb454 84%, white)",
+          "color-mix(in oklch, #ffb454 60%, white)",
+          "color-mix(in oklch, #ffb454 30%, white)"
+        ]
+      },
+      "success": {
+        "role": "tertiary",
+        "displayName": "Success Green",
+        "canonical": "#52d273",
+        "tonalRamp": [
+          "color-mix(in oklch, #52d273 35%, black)",
+          "color-mix(in oklch, #52d273 50%, black)",
+          "color-mix(in oklch, #52d273 68%, black)",
+          "color-mix(in oklch, #52d273 84%, black)",
+          "#52d273",
+          "color-mix(in oklch, #52d273 84%, white)",
+          "color-mix(in oklch, #52d273 60%, white)",
+          "color-mix(in oklch, #52d273 30%, white)"
+        ]
+      },
+      "suspended": {
+        "role": "secondary",
+        "displayName": "Suspended Cyan",
+        "canonical": "#4dd6c8",
+        "tonalRamp": [
+          "color-mix(in oklch, #4dd6c8 35%, black)",
+          "color-mix(in oklch, #4dd6c8 50%, black)",
+          "color-mix(in oklch, #4dd6c8 68%, black)",
+          "color-mix(in oklch, #4dd6c8 84%, black)",
+          "#4dd6c8",
+          "color-mix(in oklch, #4dd6c8 84%, white)",
+          "color-mix(in oklch, #4dd6c8 60%, white)",
+          "color-mix(in oklch, #4dd6c8 30%, white)"
+        ]
+      },
+      "agent-grok": {
+        "role": "tertiary",
+        "displayName": "Grok Signal",
+        "canonical": "#8ab4f8",
+        "tonalRamp": [
+          "color-mix(in oklch, #8ab4f8 35%, black)",
+          "color-mix(in oklch, #8ab4f8 50%, black)",
+          "color-mix(in oklch, #8ab4f8 68%, black)",
+          "color-mix(in oklch, #8ab4f8 84%, black)",
+          "#8ab4f8",
+          "color-mix(in oklch, #8ab4f8 84%, white)",
+          "color-mix(in oklch, #8ab4f8 60%, white)",
+          "color-mix(in oklch, #8ab4f8 30%, white)"
+        ]
+      },
+      "agent-codex": {
+        "role": "tertiary",
+        "displayName": "Codex Signal",
+        "canonical": "#3dd68c",
+        "tonalRamp": [
+          "color-mix(in oklch, #3dd68c 35%, black)",
+          "color-mix(in oklch, #3dd68c 50%, black)",
+          "color-mix(in oklch, #3dd68c 68%, black)",
+          "color-mix(in oklch, #3dd68c 84%, black)",
+          "#3dd68c",
+          "color-mix(in oklch, #3dd68c 84%, white)",
+          "color-mix(in oklch, #3dd68c 60%, white)",
+          "color-mix(in oklch, #3dd68c 30%, white)"
+        ]
+      },
+      "agent-opencode": {
+        "role": "tertiary",
+        "displayName": "OpenCode Signal",
+        "canonical": "#c084fc",
+        "tonalRamp": [
+          "color-mix(in oklch, #c084fc 35%, black)",
+          "color-mix(in oklch, #c084fc 50%, black)",
+          "color-mix(in oklch, #c084fc 68%, black)",
+          "color-mix(in oklch, #c084fc 84%, black)",
+          "#c084fc",
+          "color-mix(in oklch, #c084fc 84%, white)",
+          "color-mix(in oklch, #c084fc 60%, white)",
+          "color-mix(in oklch, #c084fc 30%, white)"
+        ]
+      },
+      "agent-hermes": {
+        "role": "tertiary",
+        "displayName": "Hermes Signal",
+        "canonical": "#f472b6",
+        "tonalRamp": [
+          "color-mix(in oklch, #f472b6 35%, black)",
+          "color-mix(in oklch, #f472b6 50%, black)",
+          "color-mix(in oklch, #f472b6 68%, black)",
+          "color-mix(in oklch, #f472b6 84%, black)",
+          "#f472b6",
+          "color-mix(in oklch, #f472b6 84%, white)",
+          "color-mix(in oklch, #f472b6 60%, white)",
+          "color-mix(in oklch, #f472b6 30%, white)"
+        ]
+      },
+      "drop-zone-fill": {
+        "role": "secondary",
+        "displayName": "Drop Signal Fill",
+        "canonical": "rgba(80, 140, 255, 0.35)",
+        "tonalRamp": [
+          "color-mix(in oklch, #508cff 35%, black)",
+          "color-mix(in oklch, #508cff 50%, black)",
+          "color-mix(in oklch, #508cff 68%, black)",
+          "color-mix(in oklch, #508cff 84%, black)",
+          "#508cff",
+          "color-mix(in oklch, #508cff 84%, white)",
+          "color-mix(in oklch, #508cff 60%, white)",
+          "color-mix(in oklch, #508cff 30%, white)"
+        ]
+      },
+      "drop-zone-border": {
+        "role": "secondary",
+        "displayName": "Drop Signal Border",
+        "canonical": "rgba(120, 170, 255, 0.9)",
+        "tonalRamp": [
+          "color-mix(in oklch, #78aaff 35%, black)",
+          "color-mix(in oklch, #78aaff 50%, black)",
+          "color-mix(in oklch, #78aaff 68%, black)",
+          "color-mix(in oklch, #78aaff 84%, black)",
+          "#78aaff",
+          "color-mix(in oklch, #78aaff 84%, white)",
+          "color-mix(in oklch, #78aaff 60%, white)",
+          "color-mix(in oklch, #78aaff 30%, white)"
+        ]
+      }
+    },
+    "typographyMeta": {
+      "title": {
+        "displayName": "Title",
+        "purpose": "Small hierarchy peaks in dialogs, prompts, and empty states."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "Default application chrome and explanatory copy."
+      },
+      "label": {
+        "displayName": "Label",
+        "purpose": "Compact navigation and control labels, optionally tracked uppercase."
+      },
+      "mono": {
+        "displayName": "Machine Truth",
+        "purpose": "Terminal content, paths, identifiers, shortcuts, values, and code."
+      }
+    },
+    "shadows": [
+      {
+        "name": "structural-low",
+        "value": "0 1px 2px rgba(0, 0, 0, 0.4)",
+        "purpose": "Subtle separation for a resting call-to-action or light lift."
+      },
+      {
+        "name": "floating-high",
+        "value": "0 4px 14px rgba(0, 0, 0, 0.5)",
+        "purpose": "Menus, dialogs, search controls, and transient overlays."
+      },
+      {
+        "name": "sheet-lift",
+        "value": "0 -8px 32px rgba(0, 0, 0, 0.5)",
+        "purpose": "Mobile bottom sheets rising above the workspace."
+      }
+    ],
+    "motion": [
+      {
+        "name": "state-fast",
+        "value": "120ms ease",
+        "purpose": "Hover, text, border, opacity, and surface-state transitions."
+      },
+      {
+        "name": "status-pulse",
+        "value": "1.2s ease-in-out infinite",
+        "purpose": "Retrying, disconnected, and urgent process-state dots only."
+      },
+      {
+        "name": "activity-pulse",
+        "value": "1.6s ease-in-out infinite",
+        "purpose": "Softer background-tab activity acknowledgment."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "coarse-phone",
+        "value": "820px",
+        "purpose": "Combined with pointer: coarse to replace desktop chrome with touch navigation."
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Default Button",
+      "kind": "button",
+      "refersTo": "button-default",
+      "description": "Compact neutral action used throughout toolbar, dialogs, and pane controls.",
+      "html": "<button class=\"ds-btn-default\">Open workspace</button>",
+      "css": ".ds-btn-default { font: 12px/1 system-ui, -apple-system, 'Segoe UI', sans-serif; color: var(--text-dim, #9a9aa8); background: var(--surface-2, #1b1b22); border: 1px solid var(--border, #2a2a34); border-radius: var(--radius, 6px); padding: 5px 10px; cursor: pointer; transition: background .12s, color .12s, border-color .12s; } .ds-btn-default:hover { color: var(--text, #e6e6ec); background: var(--surface-3, #23232c); border-color: var(--border-strong, #3a3a48); } .ds-btn-default:focus-visible { outline: 2px solid var(--accent, #7c6cff); outline-offset: 1px; } .ds-btn-default:active { transform: translateY(.5px); }"
+    },
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "The clearest forward action in a local decision.",
+      "html": "<button class=\"ds-btn-primary\">+ Pane</button>",
+      "css": ".ds-btn-primary { font: 12px/1 system-ui, -apple-system, 'Segoe UI', sans-serif; color: #fff; background: var(--accent, #7c6cff); border: 1px solid transparent; border-radius: var(--radius, 6px); padding: 5px 10px; cursor: pointer; transition: background .12s, transform .12s; } .ds-btn-primary:hover { background: #8b7cff; } .ds-btn-primary:focus-visible { outline: 2px solid var(--accent, #7c6cff); outline-offset: 2px; } .ds-btn-primary:active { transform: translateY(.5px); }"
+    },
+    {
+      "name": "Ghost Button",
+      "kind": "button",
+      "refersTo": "button-ghost",
+      "description": "Quiet cancellation or secondary toolbar action.",
+      "html": "<button class=\"ds-btn-ghost\">Cancel</button>",
+      "css": ".ds-btn-ghost { font: 12px/1 system-ui, -apple-system, 'Segoe UI', sans-serif; color: var(--text-dim, #9a9aa8); background: transparent; border: 1px solid transparent; border-radius: var(--radius, 6px); padding: 5px 10px; cursor: pointer; transition: background .12s, color .12s; } .ds-btn-ghost:hover { color: var(--text, #e6e6ec); background: var(--surface-2, #1b1b22); } .ds-btn-ghost:focus-visible { outline: 2px solid var(--accent, #7c6cff); outline-offset: 1px; }"
+    },
+    {
+      "name": "Technical Input",
+      "kind": "input",
+      "refersTo": "input",
+      "description": "Compact field for search, paths, identifiers, and other machine-facing values.",
+      "html": "<input class=\"ds-input\" value=\"amber-1-2-0-a7f3\" aria-label=\"Session name\">",
+      "css": ".ds-input { width: 220px; font: 12px/1.35 'JetBrains Mono', 'SF Mono', Menlo, monospace; color: var(--text, #e6e6ec); background: var(--surface-3, #23232c); border: 1px solid var(--border, #2a2a34); border-radius: var(--radius, 6px); padding: 4px 8px; outline: none; transition: border-color .12s, box-shadow .12s; } .ds-input:hover { border-color: var(--border-strong, #3a3a48); } .ds-input:focus { border-color: var(--accent, #7c6cff); box-shadow: 0 0 0 3px var(--accent-soft, rgba(124,108,255,.16)); }"
+    },
+    {
+      "name": "Active Workspace Chip",
+      "kind": "chip",
+      "refersTo": "workspace-chip-active",
+      "description": "Contained active-workspace selector with a restrained focus halo.",
+      "html": "<button class=\"ds-workspace-chip\">1</button>",
+      "css": ".ds-workspace-chip { min-width: 26px; height: 26px; padding: 0 8px; font: 12px/1 system-ui, sans-serif; font-variant-numeric: tabular-nums; color: #fff; background: var(--accent, #7c6cff); border: 1px solid transparent; border-radius: 13px; box-shadow: 0 0 0 3px var(--accent-soft, rgba(124,108,255,.16)); cursor: pointer; } .ds-workspace-chip:hover { filter: brightness(1.08); } .ds-workspace-chip:focus-visible { outline: 2px solid var(--accent, #7c6cff); outline-offset: 2px; }"
+    },
+    {
+      "name": "Tab Navigation",
+      "kind": "nav",
+      "description": "Dense active tab with a violet top rule, state dot, and pane count.",
+      "html": "<nav class=\"ds-tabbar\"><button class=\"ds-tab ds-tab-active\"><span class=\"ds-kind-dot\"></span><span>terminal</span><span class=\"ds-count\">3</span></button><button class=\"ds-tab\">+ Tab</button></nav>",
+      "css": ".ds-tabbar { display: flex; align-items: stretch; min-height: 36px; gap: 2px; padding: 0 8px; background: var(--bg, #0c0c0f); border-bottom: 1px solid var(--border, #2a2a34); } .ds-tab { display: flex; align-items: center; gap: 8px; padding: 0 12px; font: 12px/1 system-ui, sans-serif; color: var(--text-faint, #64646f); background: transparent; border: 0; border-top: 2px solid transparent; cursor: pointer; } .ds-tab:hover { color: var(--text-dim, #9a9aa8); background: var(--surface, #141419); } .ds-tab:focus-visible { outline: 2px solid var(--accent, #7c6cff); outline-offset: -2px; } .ds-tab-active { color: var(--text, #e6e6ec); background: var(--surface, #141419); border-top-color: var(--accent, #7c6cff); } .ds-kind-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent-2, #4d9fff); } .ds-count { color: var(--text-faint, #64646f); font-size: 11px; font-variant-numeric: tabular-nums; }"
+    },
+    {
+      "name": "Focused Pane Frame",
+      "kind": "card",
+      "description": "Signature terminal leaf: compact machine header above an Obsidian canvas with explicit focus.",
+      "html": "<section class=\"ds-pane\"><header class=\"ds-pane-head\"><span class=\"ds-pane-dot\"></span><span class=\"ds-pane-title\">#2 ~/project · codex</span><span class=\"ds-pane-state\">15 MB</span></header><div class=\"ds-terminal\"><span class=\"ds-prompt\">user@host</span>:~/project$ <span class=\"ds-cursor\"> </span></div></section>",
+      "css": ".ds-pane { width: 420px; overflow: hidden; color: var(--text, #e6e6ec); background: var(--bg, #0c0c0f); border: 1px solid var(--accent, #7c6cff); border-radius: var(--radius, 6px); box-shadow: 0 0 0 1px var(--accent, #7c6cff), 0 0 0 4px var(--accent-soft, rgba(124,108,255,.16)); } .ds-pane-head { display: flex; align-items: center; gap: 8px; height: 26px; padding: 0 8px; color: var(--text, #e6e6ec); background: var(--surface-2, #1b1b22); border-bottom: 1px solid var(--border, #2a2a34); } .ds-pane-dot { width: 6px; height: 6px; border-radius: 50%; background: #3dd68c; } .ds-pane-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 11px/1 'JetBrains Mono', 'SF Mono', Menlo, monospace; } .ds-pane-state { padding: 1px 7px; border-radius: 10px; color: var(--text-dim, #9a9aa8); background: rgba(255,255,255,.06); font: 10.5px/1 system-ui, sans-serif; } .ds-terminal { min-height: 112px; padding: 8px; font: 13px/1.15 'JetBrains Mono', 'SF Mono', Menlo, monospace; } .ds-prompt { color: var(--success, #52d273); font-weight: 600; } .ds-cursor { display: inline-block; width: 7px; height: 14px; vertical-align: -2px; background: var(--accent, #7c6cff); }"
+    },
+    {
+      "name": "Dialog",
+      "kind": "card",
+      "refersTo": "dialog",
+      "description": "Floating operational decision with separated title bar and compact actions.",
+      "html": "<section class=\"ds-dialog\"><header class=\"ds-dialog-head\"><strong>Save workspace</strong><button aria-label=\"Close\">×</button></header><div class=\"ds-dialog-body\"><p>Save structure and scrollback to a portable file.</p><div class=\"ds-dialog-actions\"><button>This workspace</button><button>All workspaces</button></div></div></section>",
+      "css": ".ds-dialog { width: 380px; overflow: hidden; color: var(--text, #e6e6ec); background: var(--surface, #141419); border: 1px solid var(--border-strong, #3a3a48); border-radius: var(--radius-lg, 9px); box-shadow: 0 4px 14px rgba(0,0,0,.5); font: 13px/1.4 system-ui, sans-serif; } .ds-dialog-head { display: flex; align-items: center; justify-content: space-between; padding: 12px 16px; border-bottom: 1px solid var(--border, #2a2a34); } .ds-dialog-head strong { font-size: 14px; font-weight: 600; } .ds-dialog-head button { width: 20px; height: 20px; color: var(--text-faint, #64646f); background: transparent; border: 0; border-radius: 4px; cursor: pointer; } .ds-dialog-head button:hover { color: var(--text, #e6e6ec); background: var(--surface-3, #23232c); } .ds-dialog-head button:focus-visible { outline: 2px solid var(--accent, #7c6cff); } .ds-dialog-body { padding: 12px 16px 16px; } .ds-dialog-body p { margin: 0 0 12px; color: var(--text-dim, #9a9aa8); font-size: 12.5px; } .ds-dialog-actions { display: flex; gap: 8px; } .ds-dialog-actions button { flex: 1; padding: 5px 10px; color: var(--text-dim, #9a9aa8); background: var(--surface-2, #1b1b22); border: 1px solid var(--border, #2a2a34); border-radius: var(--radius, 6px); cursor: pointer; } .ds-dialog-actions button:hover { color: var(--text, #e6e6ec); background: var(--surface-3, #23232c); } .ds-dialog-actions button:focus-visible { outline: 2px solid var(--accent, #7c6cff); outline-offset: 1px; }"
+    },
+    {
+      "name": "Critical Status Banner",
+      "kind": "custom",
+      "description": "Full-width operational failure or disconnection signal with a pulsing state dot.",
+      "html": "<div class=\"ds-banner\" role=\"alert\"><span class=\"ds-banner-dot\"></span><span>daemon disconnected — reconnecting…</span></div>",
+      "css": "@keyframes ds-pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } } .ds-banner { display: flex; align-items: center; gap: 8px; padding: 6px 12px; color: var(--danger, #ff5c5c); background: var(--danger-soft, rgba(255,92,92,.14)); border-bottom: 1px solid rgba(255,92,92,.3); font: 12px/1.3 system-ui, sans-serif; } .ds-banner-dot { width: 8px; height: 8px; flex: none; border-radius: 50%; background: var(--danger, #ff5c5c); animation: ds-pulse 1.2s ease-in-out infinite; }"
+    },
+    {
+      "name": "Mobile Terminal Key",
+      "kind": "button",
+      "description": "Thumb-sized on-screen terminal key used when hardware keyboards lack TUI controls.",
+      "html": "<button class=\"ds-key\" aria-pressed=\"true\">Ctrl</button>",
+      "css": ".ds-key { min-width: 44px; min-height: 44px; padding: 0 10px; color: #fff; background: var(--accent, #7c6cff); border: 1px solid var(--accent, #7c6cff); border-radius: var(--radius, 6px); font: 13px/1 system-ui, sans-serif; cursor: pointer; } .ds-key:hover { filter: brightness(1.1); } .ds-key:focus-visible { outline: 2px solid var(--accent, #7c6cff); outline-offset: 2px; } .ds-key:active { filter: brightness(.94); }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Preservation Console",
+    "overview": "Amber is a quiet technical instrument for work that must remain intact. Its near-black workspace recedes behind terminal content, while thin structural borders, compact controls, and precise state signals make many concurrent sessions legible without turning the interface into a spectacle.\n\nThe system is precise, resilient, focused, and deliberately low-light. It behaves like infrastructure rather than decoration: hierarchy comes from tonal layers, typography, focus, and operational color. It rejects flashy gamer-terminal styling, decorative glassmorphism, and attention-seeking gradients.",
+    "keyCharacteristics": [
+      "Dense, full-viewport workspace that gives terminal content priority.",
+      "Near-black tonal layers separated by fine borders rather than large effects.",
+      "Preservation Violet for interaction and focus; Signal Blue for secondary state.",
+      "Compact system typography paired with machine-facing monospace.",
+      "Strong color and elevation appear only when state or manipulation requires them."
+    ],
+    "rules": [
+      {
+        "name": "The Concentrated Accent Rule",
+        "body": "Preservation Violet is rare enough to mean active, focused, or actionable; never wash a large resting surface in it.",
+        "section": "colors"
+      },
+      {
+        "name": "The Operational Color Rule",
+        "body": "Amber, blue, green, red, cyan, and agent hues communicate state or identity. They are not interchangeable decoration.",
+        "section": "colors"
+      },
+      {
+        "name": "The Human Controls, Machine Truth Rule",
+        "body": "Use sans-serif for actions and explanations; switch to monospace whenever the interface is showing what a process, path, protocol, or shortcut actually is.",
+        "section": "typography"
+      },
+      {
+        "name": "The Compact Hierarchy Rule",
+        "body": "Amber creates hierarchy inside a narrow 10–15px UI range through weight, color, spacing, and type family—not oversized display text.",
+        "section": "typography"
+      },
+      {
+        "name": "The Terminal Owns the Room Rule",
+        "body": "Chrome stays compact and peripheral; the pane body receives the overwhelming majority of every viewport.",
+        "section": "layout"
+      },
+      {
+        "name": "The No-Reflow Overlay Rule",
+        "body": "Search, freeze prompts, path actions, and transient controls overlay the pane instead of entering terminal layout and changing the PTY geometry.",
+        "section": "layout"
+      },
+      {
+        "name": "The Flat-at-Rest Rule",
+        "body": "Ordinary chrome is separated by tone and a one-pixel border. A shadow must explain that a surface is floating, temporary, or moving.",
+        "section": "elevation"
+      },
+      {
+        "name": "The Radius Has a Job Rule",
+        "body": "Use standard rounding for controls, medium rounding for floating containers, and full pills only for compact identity or state—not as a universal softness treatment.",
+        "section": "shapes"
+      }
+    ],
+    "dos": [
+      "**Do** keep the terminal or editor canvas visually dominant and the chrome compact.",
+      "**Do** use tonal Carbon layers and one-pixel graphite borders before reaching for shadow.",
+      "**Do** reserve Preservation Violet for focus, active state, selection, and primary action.",
+      "**Do** preserve the three-level text hierarchy and use monospace for machine truth.",
+      "**Do** maintain visible keyboard focus and 44px touch targets in the coarse-pointer mobile layout.",
+      "**Do** communicate process and agent state with the established semantic dots and badges."
+    ],
+    "donts": [
+      "**Don't** introduce gamer-neon spectacle, decorative glassmorphism, gradients, or ornamental glow.",
+      "**Don't** use Warning Amber as a broad application accent; keep it tied to brand and operational meaning.",
+      "**Don't** turn every container into a rounded card or every action into a pill.",
+      "**Don't** add large headings that compete with live terminal content.",
+      "**Don't** animate layout, terminal output, or controls continuously; motion should acknowledge state, hover, or activity.",
+      "**Don't** allow transient pane controls to reflow the PTY or hide critical terminal content without an explicit modal state."
+    ]
+  }
+}
