@@ -2,13 +2,14 @@ import { useCallback, useEffect, useReducer, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { SplitView, fmtMem, type PaneMeta, type PaneKind } from './SplitView'
 import { Icon } from './Icon'
-import { PANE_KIND_OPTIONS, continuityView, type SnapshotState } from './uiModel'
+import { PANE_KIND_OPTIONS, continuityView, machineWindowTitle, type SnapshotState } from './uiModel'
 import type { EditorApi } from './Editor'
 import { initialState, reduce, groupSessions, mergeBrowsers, mergeEditors, tabDot, hasActivity, isAgentKind, type DaemonEvent } from './store'
 import { ResourcePressureBanner } from './PressureBanners'
 import type { ControlMsg } from '../shared/proto'
 import { sessionRows } from './sessionRows'
 import { commandCenterModel, type CommandCenterItem } from './commandCenter'
+import { DesktopAttention, attentionNames } from './DesktopAttention'
 import { PocketCommandCenter, PocketFocusHeader, PocketNav, pocketSessionTitle } from './PocketCommandCenter'
 import { PocketNewSessionSheet, PocketSessionSheet, type PocketSessionKind } from './PocketSheets'
 import { deriveTab, shortCwd } from './tabView'
@@ -177,7 +178,7 @@ function App(): JSX.Element {
   const [kind, setKind] = useState<PaneKind>('shell')
   // Desktop command surfaces. Only one may be open at a time; each is a small
   // popover rather than another permanent toolbar cluster.
-  const [toolbarMenu, setToolbarMenu] = useState<'pane-kind' | 'tools' | 'continuity' | null>(null)
+  const [toolbarMenu, setToolbarMenu] = useState<'pane-kind' | 'tools' | 'continuity' | 'attention' | null>(null)
   // Presentation state for the existing daemon Snapshot/SnapshotOk exchange.
   // A timestamp is shown only after the daemon explicitly confirms the write.
   const [snapshotState, setSnapshotState] = useState<SnapshotState>({ kind: 'idle' })
@@ -204,6 +205,9 @@ function App(): JSX.Element {
   // arrangement and never writes its sidecar. Read once — a window is local or
   // remote for its whole life.
   const [remoteHost] = useState<string>(() => window.amber?.remoteHost ?? '')
+  useEffect(() => {
+    document.title = machineWindowTitle(window.amber?.machineName ?? '', remoteHost)
+  }, [remoteHost])
   // "Connect to host…" (menu) asks the RENDERER for the destination: Electron
   // has no window.prompt, so main sends this and we show a real dialog.
   const [connectOpen, setConnectOpen] = useState(false)
@@ -229,6 +233,7 @@ function App(): JSX.Element {
   // Session-cleanup dialog: open flag + the claude conversation labels fetched
   // for it (main reads the transcripts; see claudeNames.ts).
   const [sessionsOpen, setSessionsOpen] = useState(false)
+  const [sessionView, setSessionView] = useState<'all' | 'attention'>('all')
   const [claudeNames, setClaudeNames] = useState<Record<string, string>>({})
   const [picked, setPicked] = useState<Set<string>>(new Set())
   // Memory-budget dialog: the daemon's last BudgetApplied truth, the raw text
@@ -282,6 +287,8 @@ function App(): JSX.Element {
   // written to the layout sidecar. Cleared when the tab's pane set changes
   // structurally (split/close/move), so it can't outlive its pane.
   const [zoom, setZoom] = useState<Record<string, string>>({})
+  const [focusRequest, setFocusRequest] = useState<{ paneId: string; seq: number } | null>(null)
+  const focusRequestSeq = useRef(0)
   const layoutRef = useRef(layout)
   layoutRef.current = layout
   // CAS state (spec 2026-08-01 §6) — see the persist effect below for how
@@ -539,6 +546,7 @@ function App(): JSX.Element {
 
   const workspaces = mergeEditors(mergeBrowsers(groupSessions(state), layout.browsers ?? {}), layout.editors ?? {})
   const pocketAll = commandCenterModel({ workspaces, state, frozen: frozenSet })
+  const needsAttention = pocketAll.groups.find((group) => group.id === 'needs-you')?.items ?? []
   const pocketModel = commandCenterModel({
     workspaces,
     state,
@@ -572,6 +580,38 @@ function App(): JSX.Element {
     setActiveTab(item.tab)
     setZoom((current) => ({ ...current, [`${item.ws}:${item.tab}`]: item.pane.name }))
   }
+  const showDesktopItem = (item: CommandCenterItem): void => {
+    const destination = `${item.ws}:${item.tab}`
+    setToolbarMenu(null)
+    setSessionsOpen(false)
+    setActiveWs(item.ws)
+    setActiveTab(item.tab)
+    // Desktop reveal preserves the mosaic. An old per-tab zoom must not hide the
+    // requested pane; the explicit focus request runs once its tab is active.
+    setZoom((current) => {
+      if (!(destination in current)) return current
+      const next = { ...current }
+      delete next[destination]
+      return next
+    })
+    setFocusRequest({ paneId: item.pane.name, seq: ++focusRequestSeq.current })
+  }
+  const openSessionList = (view: 'all' | 'attention'): void => {
+    setToolbarMenu(null)
+    setPicked(new Set())
+    setSessionView(view)
+    setSessionsOpen(true)
+  }
+  // A focus request is an edge, not remembered navigation state. Clear it only
+  // after child effects had one frame to focus the newly active SplitView.
+  useEffect(() => {
+    if (!focusRequest) return
+    const seq = focusRequest.seq
+    const frame = requestAnimationFrame(() => {
+      setFocusRequest((current) => current?.seq === seq ? null : current)
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [focusRequest])
   const toggleZoom = (paneId: string): void => setZoom((z) => {
     if (z[zoomKey] === paneId) { const c = { ...z }; delete c[zoomKey]; return c }
     return { ...z, [zoomKey]: paneId }
@@ -1448,6 +1488,22 @@ function App(): JSX.Element {
             {remoteHost} · read-only
           </span>
         )}
+        {!mobile && needsAttention.length > 0 && (
+          <div className="toolbar-popover-wrap">
+            <button className="btn attention-pill" aria-haspopup="dialog"
+              aria-expanded={toolbarMenu === 'attention'}
+              aria-label={`${needsAttention.length} session${needsAttention.length === 1 ? '' : 's'} ${needsAttention.length === 1 ? 'needs' : 'need'} attention`}
+              onClick={() => setToolbarMenu((open) => open === 'attention' ? null : 'attention')}>
+              <span className="attention-pulse" aria-hidden="true" />
+              <span className="attention-label">{needsAttention.length} need{needsAttention.length === 1 ? 's' : ''} you</span>
+            </button>
+            {toolbarMenu === 'attention' && (
+              <DesktopAttention model={pocketAll} titles={titles}
+                workspaceLabels={pocketWorkspaceLabels} tabLabels={pocketTabLabels} home={home}
+                onOpen={showDesktopItem} onViewAll={() => openSessionList('all')} />
+            )}
+          </div>
+        )}
         <div className="toolbar-popover-wrap">
           <button className={`btn continuity-pill ${continuity.tone}`} aria-haspopup="dialog"
             aria-expanded={toolbarMenu === 'continuity'}
@@ -1464,6 +1520,10 @@ function App(): JSX.Element {
                 <span><strong>{continuity.heading}</strong><small>{continuity.detail}</small></span>
               </div>
               <p>Your terminal sessions are owned by the daemon and continue independently of this window.</p>
+              <div className="continuity-machine">
+                <span>{remoteHost ? 'Remote machine' : 'Machine'}</span>
+                <code>{remoteHost || window.amber.machineName}</code>
+              </div>
               <div className={`snapshot-row snapshot-${snapshotState.kind}`} role="status" aria-live="polite">
                 <span>{continuity.snapshot}</span>
                 <button className="btn btn-ghost" disabled={!continuity.canSnapshot || !window.amber.snapshotNow}
@@ -1494,7 +1554,7 @@ function App(): JSX.Element {
                 <Icon name="load" /><span><strong>Load workspace…</strong><small>Open a portable .amberws file</small></span>
               </button>
               <div className="ctx-sep" />
-              <button className="popover-item" role="menuitem" onClick={() => { setToolbarMenu(null); setSessionsOpen(true) }}>
+              <button className="popover-item" role="menuitem" onClick={() => openSessionList('all')}>
                 <Icon name="sessions" /><span><strong>Sessions</strong><small>Inspect every daemon session</small></span>
               </button>
               <button className="popover-item" role="menuitem" onClick={() => { setToolbarMenu(null); setBudgetError(null); setBudgetOpen(true) }}>
@@ -1583,6 +1643,7 @@ function App(): JSX.Element {
                       ? <SplitView tree={layerTree} active={isActive} deadCodes={d.deadCodes} meta={d.paneMeta}
                           epoch={reconnectEpoch} portEpoch={childEpoch}
                           fontSize={fontSize} onPaneTitle={onPaneTitle} onPaneFocus={onPaneFocus}
+                          focusRequest={isActive ? focusRequest : null}
                           zoomedPane={isActive ? zoomedPane : null}
                           frozen={frozen}
                           onFreeze={freezePane}
@@ -1770,7 +1831,12 @@ function App(): JSX.Element {
         // show. The daemon outlives the app by design (core rule #6), so
         // sessions accumulate across quits with nothing in the UI that admits
         // they exist; this is that place, and the only bulk way to end them.
-        const rows = sessionRows(sessions, claudeNames)
+        const allRows = sessionRows(sessions, claudeNames)
+        const attention = attentionNames(pocketAll)
+        const rows = sessionView === 'attention'
+          ? allRows.filter((row) => attention.has(row.name))
+          : allRows
+        const itemsByName = new Map(pocketAll.groups.flatMap((group) => group.items).map((item) => [item.pane.name, item]))
         const toggle = (n: string): void =>
           setPicked((p) => { const c = new Set(p); if (!c.delete(n)) c.add(n); return c })
         // Adopt a session no pane can show (`amber create foo`, or a name from
@@ -1789,15 +1855,24 @@ function App(): JSX.Element {
             <div className="help-card dialog-card sessions-card" role="dialog" aria-modal="true" aria-label="Sessions"
               onClick={(e) => e.stopPropagation()}>
               <div className="help-head">
-                <span className="help-title">Sessions ({rows.length})</span>
+                <span className="help-title">Sessions ({allRows.length})</span>
                 <button className="icon-btn" aria-label="close" title="close" onClick={() => setSessionsOpen(false)}><Icon name="close" /></button>
               </div>
               <div className="dialog-body">
+                <div className="session-view-tabs" role="tablist" aria-label="Session view">
+                  <button role="tab" aria-selected={sessionView === 'all'}
+                    className={sessionView === 'all' ? 'active' : ''}
+                    onClick={() => { setPicked(new Set()); setSessionView('all') }}>All <span>{allRows.length}</span></button>
+                  <button role="tab" aria-selected={sessionView === 'attention'}
+                    className={sessionView === 'attention' ? 'active' : ''}
+                    onClick={() => { setPicked(new Set()); setSessionView('attention') }}>Needs you <span>{attention.size}</span></button>
+                </div>
                 <p className="dialog-text">
-                  Every live amber session. These outlive the app on purpose — quitting never
-                  kills them. Killing one ends its pty and everything running in it.
-                  One tagged <em>no pane</em> can be adopted into the current tab.
+                  {sessionView === 'attention'
+                    ? 'Sessions that exited, are retrying, or need recovery. Show reveals the existing pane without changing its layout.'
+                    : <>Every retained Amber session. They outlive the app on purpose. Killing one ends its pty and everything running in it. A tagged <em>no pane</em> session can be adopted into the current tab.</>}
                 </p>
+                {rows.length === 0 && <div className="session-empty">Nothing needs you.</div>}
                 <ul className="session-list">
                   {rows.map((r) => (
                     <li key={r.name} className={'session-row' + (picked.has(r.name) ? ' picked' : '')}>
@@ -1817,6 +1892,11 @@ function App(): JSX.Element {
                           {r.claudeName ? ` · ${r.cwd}` : ''}
                         </span>
                       </span>
+                      {r.inPane && itemsByName.has(r.name) && (
+                        <button className="btn btn-ghost session-show"
+                          aria-label={`show ${r.name}`}
+                          onClick={() => showDesktopItem(itemsByName.get(r.name)!)}>Show</button>
+                      )}
                       {!r.inPane && r.alive && (
                         <button className="btn btn-ghost session-adopt"
                           aria-label={`adopt ${r.name}`}

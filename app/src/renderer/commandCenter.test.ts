@@ -66,6 +66,7 @@ describe('commandCenterModel', () => {
 
     expect(names(model, 'needs-you')).toEqual(['dead-frozen'])
     expect(names(model, 'parked')).toEqual(['frozen-active'])
+    expect(model.groups.find((group) => group.id === 'parked')?.items[0]?.stateLabel).toBe('Frozen by you')
     expect(names(model, 'working')).toEqual([])
   })
 

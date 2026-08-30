@@ -18,6 +18,59 @@ export const PANE_KIND_OPTIONS: readonly PaneKindOption[] = [
   { kind: 'editor', label: 'Editor', detail: 'App-local file editor' },
 ] as const
 
+export type DaemonPaneKind = Exclude<PaneKind, 'browser' | 'editor'>
+export type DaemonPaneKindOption = PaneKindOption & { kind: DaemonPaneKind }
+
+/** One metadata source for every client; capability filters choose the surface. */
+export const DAEMON_PANE_KIND_OPTIONS: readonly DaemonPaneKindOption[] = PANE_KIND_OPTIONS.filter(
+  (option): option is DaemonPaneKindOption => option.kind !== 'browser' && option.kind !== 'editor',
+)
+
+export function machineWindowTitle(localMachine: string, remoteHost: string): string {
+  return `Amber · ${remoteHost.trim() || localMachine.trim() || 'local'}`
+}
+
+export interface PaneHeaderPresentation {
+  state: { kind: 'attention' | 'frozen' | 'parked' | 'zoomed'; label: string; title: string } | null
+  showMemory: boolean
+}
+
+/** Collapse competing pane metadata to one operational state, then telemetry. */
+export function paneHeaderPresentation(input: {
+  frozen: boolean
+  runState: string | null | undefined
+  zoomed: boolean
+  rssKb: number | undefined
+  growing: boolean | undefined
+  width: number
+}): PaneHeaderPresentation {
+  let state: PaneHeaderPresentation['state'] = null
+  if (input.frozen) {
+    state = { kind: 'frozen', label: 'Frozen by you', title: 'Manually frozen in Amber' }
+  } else if (input.runState === 'claude-retrying') {
+    state = { kind: 'attention', label: 'Retrying', title: 'The supervised agent is retrying' }
+  } else if (input.runState === 'shell-fallback') {
+    state = { kind: 'attention', label: 'Exited to shell', title: 'The supervised agent exited to a shell' }
+  } else if (input.runState === 'suspend-failed') {
+    state = { kind: 'attention', label: 'Suspend failed', title: 'Amber could not suspend this session' }
+  } else if (input.runState === 'memory-suspended') {
+    state = { kind: 'parked', label: 'Parked for memory', title: 'Parked by the memory guardian' }
+  } else if (input.runState === 'resource-suspended') {
+    state = { kind: 'parked', label: 'Parked for resources', title: 'Parked by the resource guardian' }
+  } else if (input.runState === 'suspended') {
+    state = { kind: 'parked', label: 'Suspended', title: 'Suspended to free agent memory' }
+  } else if (input.zoomed) {
+    state = { kind: 'zoomed', label: 'Zoomed', title: 'Restore the workspace layout with the zoom shortcut' }
+  }
+
+  return {
+    state,
+    showMemory: state === null
+      && (input.rssKb ?? 0) > 0
+      && (input.growing === true || input.width >= 480),
+  }
+}
+
 export type SnapshotState =
   | { kind: 'idle' }
   | { kind: 'pending' }

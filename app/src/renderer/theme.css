@@ -264,6 +264,18 @@ input:focus-visible {
 .continuity-mark { width: 32px; height: 32px; display: grid; place-items: center; border-radius: 50%; color: var(--ok); background: rgba(82, 210, 115, 0.12); }
 .continuity-mark.offline { color: var(--danger); background: var(--danger-soft); }
 .continuity-popover p { margin: 0; color: var(--text-dim); font-size: 12px; line-height: 1.45; }
+.continuity-machine {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 9px;
+  border-radius: 5px;
+  color: var(--text-faint);
+  background: var(--surface-3);
+  font-size: 11.5px;
+}
+.continuity-machine code { overflow: hidden; color: var(--text); font: 11.5px var(--font-mono); text-overflow: ellipsis; white-space: nowrap; }
 .snapshot-row { display: flex; align-items: center; gap: 8px; padding-top: 10px; border-top: 1px solid var(--border); }
 .snapshot-row > span { min-width: 0; flex: 1; color: var(--text-faint); font-size: 11.5px; }
 .snapshot-confirmed > span { color: var(--ok); }
@@ -505,18 +517,28 @@ input:focus-visible {
 .icon-btn:hover { background: var(--surface-3); color: var(--text); }
 .icon-btn.danger:hover { background: var(--danger-soft); color: var(--danger); }
 
-/* Zoom badge: legibility cue in the zoomed pane's header (accent pill). */
-.zoom-badge {
+/* One primary operational state per pane; avoids frozen/parked/zoomed/memory
+   badges competing with the title in narrow splits. */
+.pane-state-badge {
   flex: none;
-  font-size: 11.5px;
-  color: var(--accent);
-  background: var(--accent-soft);
-  border: 1px solid transparent;
-  border-radius: 10px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 190px;
   padding: 1px 8px;
+  border-radius: 10px;
+  overflow: hidden;
+  color: var(--text-dim);
+  background: var(--surface-3);
+  font-size: 11px;
+  letter-spacing: 0.01em;
+  text-overflow: ellipsis;
   white-space: nowrap;
-  letter-spacing: 0.02em;
 }
+.pane-state-badge.frozen,
+.pane-state-badge.parked { color: var(--accent-2); background: rgba(77, 159, 255, 0.14); }
+.pane-state-badge.attention { color: var(--warn); background: rgba(255, 180, 84, 0.14); }
+.pane-state-badge.zoomed { color: var(--accent); background: var(--accent-soft); }
 
 .pane-body { position: absolute; inset: 28px 0 0 0; }
 
@@ -644,20 +666,6 @@ input:focus-visible {
 .dead-close:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 /* ---------- frozen (parked) pane ---------- */
-/* Header badge: small frozen chip (mirrors the zoom-badge treatment, cool hue). */
-.frozen-badge {
-  flex: none;
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  font-size: 11.5px;
-  color: var(--accent-2);
-  background: rgba(77, 159, 255, 0.14);
-  border-radius: 10px;
-  padding: 1px 8px;
-  white-space: nowrap;
-  letter-spacing: 0.02em;
-}
 /* Per-pane child-process memory (daemon monitor). Muted by default; turns amber
    with a ▲ when the reading is a sustained climb (possible leak). */
 .mem-tag {
@@ -1021,7 +1029,40 @@ input:focus-visible {
    cleanup dialog is wider (it shows the session name AND its claude
    conversation) and scrolls: a daemon that has been up for days can list a few
    dozen sessions, which is the whole reason the view exists. */
-.sessions-card { width: min(620px, calc(100vw - 2 * var(--sp-4))); }
+.sessions-card { width: min(660px, calc(100vw - 2 * var(--sp-4))); }
+.session-view-tabs {
+  display: inline-flex;
+  gap: 3px;
+  padding: 3px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+}
+.session-view-tabs button {
+  min-height: 28px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 4px;
+  color: var(--text-faint);
+  background: transparent;
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.session-view-tabs button:hover { color: var(--text); background: var(--surface-2); }
+.session-view-tabs button.active { color: var(--text); background: var(--surface-3); }
+.session-view-tabs button span { color: var(--text-faint); font: 10.5px var(--font-mono); }
+.session-view-tabs button:focus-visible { outline: var(--focus-ring); outline-offset: 1px; }
+.session-empty {
+  padding: 24px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-faint);
+  text-align: center;
+}
 .session-list {
   list-style: none; margin: 0 0 var(--sp-3); padding: 0;
   max-height: min(46vh, 420px); overflow-y: auto;
@@ -1057,7 +1098,8 @@ input:focus-visible {
   color: var(--text-faint);
 }
 .session-tag.dead { color: var(--danger); }
-/* Pushed to the row's right edge; only rendered for a session no pane shows. */
+/* Pushed to the row's right edge; reveal existing panes or adopt orphans. */
+.session-show,
 .session-adopt { margin-left: auto; flex: none; padding: 2px 8px; font-size: 11px; }
 
 /* Floating "Open" button — appears at a pane text selection that resolves to a

@@ -38,7 +38,21 @@ describe('PocketSessionSheet', () => {
     expect(html).toContain('/home/u/api')
   })
 
-  it('does not offer freeze when the agent has already fallen back to a shell', () => {
+  it('does not offer freeze to a shell or an agent that already fell back to one', () => {
+    const shell = { ...item, pane: { ...item.pane, kind: 'shell', runState: 'claude' } }
+    const shellHtml = renderToStaticMarkup(createElement(PocketSessionSheet, {
+      item: shell,
+      title: 'shell',
+      parked: false,
+      onOpen: () => {},
+      onTogglePark: () => {},
+      onCopyCwd: () => {},
+      onShowMosaic: () => {},
+      onCloseSession: () => {},
+      onDismiss: () => {},
+    }))
+    expect(shellHtml).not.toContain('Freeze session')
+
     const fallback = { ...item, pane: { ...item.pane, runState: 'shell-fallback' } }
     const html = renderToStaticMarkup(createElement(PocketSessionSheet, {
       item: fallback,
@@ -53,6 +67,23 @@ describe('PocketSessionSheet', () => {
     }))
     expect(html).not.toContain('Freeze session')
     expect(html).not.toContain('Resume session')
+  })
+
+  it('offers freeze from agent capability even before run-state telemetry arrives', () => {
+    const starting = { ...item, pane: { ...item.pane } }
+    delete starting.pane.runState
+    const html = renderToStaticMarkup(createElement(PocketSessionSheet, {
+      item: starting,
+      title: 'api-refactor',
+      parked: false,
+      onOpen: () => {},
+      onTogglePark: () => {},
+      onCopyCwd: () => {},
+      onShowMosaic: () => {},
+      onCloseSession: () => {},
+      onDismiss: () => {},
+    }))
+    expect(html).toContain('Freeze session')
   })
 
   it('offers resume for a parked agent', () => {
@@ -87,7 +118,8 @@ describe('PocketNewSessionSheet', () => {
     }
     expect(html).not.toContain('Browser')
     expect(html).not.toContain('Editor')
-    expect(html).toContain('Create shell')
+    expect(html).toContain('A persistent terminal session')
+    expect(html).toContain('Create Shell')
     expect(html).toContain('platform / release')
     expect(html).toContain('/home/u/api')
   })
