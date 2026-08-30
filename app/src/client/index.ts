@@ -44,6 +44,8 @@ process.parentPort.on('message', (event) => {
         | { cmd: 'rename'; from: string; to: string }
         | { cmd: 'dumpBacklog'; name: string }
         | { cmd: 'searchScrollback'; requestId: number; query: string; names: string[]; limit: number }
+        | { cmd: 'listRecoveryEvents'; limit: number }
+        | { cmd: 'clearRecoveryEvents' }
         | { cmd: 'suspend'; name: string }
         | { cmd: 'resume'; name: string }
         | { cmd: 'focus'; name: string }
@@ -66,6 +68,10 @@ process.parentPort.on('message', (event) => {
             query: cmd.query, names: cmd.names, limit: cmd.limit,
           },
         })
+      } else if (cmd.cmd === 'listRecoveryEvents') {
+        conn.send({ type: 'control', msg: { kind: 'ListRecoveryEvents', limit: cmd.limit } })
+      } else if (cmd.cmd === 'clearRecoveryEvents') {
+        conn.send({ type: 'control', msg: { kind: 'ClearRecoveryEvents' } })
       } else if (cmd.cmd === 'suspend') {
         conn.send({ type: 'control', msg: { kind: 'Suspend', name: cmd.name } })
       } else if (cmd.cmd === 'resume') {

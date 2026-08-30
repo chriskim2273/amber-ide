@@ -47,6 +47,8 @@ declare global {
       dumpBacklog: (name: string) => void
       // Desktop-only; amber-web intentionally does not widen its control whitelist.
       searchScrollback?: (requestId: number, query: string, names: string[], limit: number) => void
+      listRecoveryEvents?: (limit: number) => void
+      clearRecoveryEvents?: () => void
       // Memory budget view/change; the BudgetApplied reply arrives via
       // onDaemonEvent. mb is MiB, 0 = auto.
       getMemoryBudget: () => void

@@ -69,6 +69,21 @@ pub struct SearchResult {
     pub preview: String,
 }
 
+/// One bounded daemon lifecycle/recovery record persisted across restarts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryEvent {
+    pub at: u64,
+    #[serde(default)]
+    pub sequence: u32,
+    pub level: String,
+    pub event: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    pub detail: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<i32>,
+}
+
 /// Epochs ride the JSON wire as STRINGS: they are nanos-derived u64s whose
 /// magnitude exceeds JavaScript's 2^53 integer precision. `JSON.parse` would
 /// silently round one, and a rounded epoch fails its equality check on every
@@ -207,6 +222,10 @@ pub enum ControlMsg {
         query: String,
         results: Vec<SearchResult>,
     },
+    ListRecoveryEvents { #[serde(default)] limit: u16 },
+    ClearRecoveryEvents,
+    RecoveryEvents { events: Vec<RecoveryEvent> },
+    RecoveryEventsCleared,
     /// Daemon -> client: the requested session's full scrollback bytes.
     ///
     /// **Superseded by [`Frame::Backlog`] (wire tag 2) and no longer emitted.**
@@ -379,6 +398,10 @@ fn known_control_variant(name: &str) -> bool {
             | "DumpBacklog"
             | "SearchScrollback"
             | "SearchResults"
+            | "ListRecoveryEvents"
+            | "ClearRecoveryEvents"
+            | "RecoveryEvents"
+            | "RecoveryEventsCleared"
             | "Backlog"
             | "WatchSessions"
             | "WatchMemoryPressure"
@@ -1046,6 +1069,33 @@ mod tests {
         })
         .unwrap()
         .contains("SearchScrollback"));
+    }
+
+    #[test]
+    fn recovery_controls_roundtrip() {
+        let event = RecoveryEvent {
+            at: 1_700_000_000,
+            sequence: 4,
+            level: "error".into(),
+            event: "session.restore_failed".into(),
+            session: Some("s".into()),
+            detail: "spawn failed".into(),
+            code: Some(127),
+        };
+        for message in [
+            ControlMsg::ListRecoveryEvents { limit: 200 },
+            ControlMsg::ClearRecoveryEvents,
+            ControlMsg::RecoveryEvents { events: vec![event] },
+            ControlMsg::RecoveryEventsCleared,
+        ] {
+            let frame = Frame::Control(message);
+            assert_eq!(roundtrip(&frame), frame);
+        }
+        let request: ControlMsg = serde_json::from_str(
+            r#"{"ListRecoveryEvents":{}}"#,
+        )
+        .unwrap();
+        assert_eq!(request, ControlMsg::ListRecoveryEvents { limit: 0 });
     }
 
     #[test]

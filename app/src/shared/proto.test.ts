@@ -58,6 +58,23 @@ describe('proto', () => {
     )).toThrow(/line/)
   })
 
+  it('roundtrips recovery history controls and validates event fields', () => {
+    const request: Frame = { type: 'control', msg: { kind: 'ListRecoveryEvents', limit: 200 } }
+    expect(roundtrip(request)).toEqual(request)
+    expect(roundtrip({ type: 'control', msg: { kind: 'ClearRecoveryEvents' } }))
+      .toEqual({ type: 'control', msg: { kind: 'ClearRecoveryEvents' } })
+    const reply = decodeControlJson(
+      '{"RecoveryEvents":{"events":[{"at":10,"sequence":2,"level":"error","event":"session.exited","session":"s","detail":"exit","code":1}]}}',
+    )
+    expect(reply).toEqual({
+      type: 'control',
+      msg: { kind: 'RecoveryEvents', events: [{ at: 10, sequence: 2, level: 'error', event: 'session.exited', session: 's', detail: 'exit', code: 1 }] },
+    })
+    expect(() => decodeControlJson(
+      '{"RecoveryEvents":{"events":[{"at":"now","level":"info","event":"x","detail":"x"}]}}',
+    )).toThrow(/at/)
+  })
+
   it('decodes additive defaults on a search request', () => {
     expect(decodeControlJson('{"SearchScrollback":{"request_id":1,"query":"x"}}')).toEqual({
       type: 'control',

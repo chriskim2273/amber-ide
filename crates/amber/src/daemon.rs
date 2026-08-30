@@ -271,13 +271,17 @@ fn handle_control(
 ) {
     match msg {
         ControlMsg::Create { name, cwd, kind } => {
-            let result = parse_kind(&kind).and_then(|k| manager.create(&name, cwd, k));
+            let result = parse_kind(&kind).and_then(|k| manager.create(&name, cwd.clone(), k));
             let reply = match &result {
                 Ok(_) => ControlMsg::Created { name: name.clone() },
                 Err(e) => ControlMsg::Error { msg: e.to_string() },
             };
             let _ = write_frame(writer, &Frame::Control(reply));
             if result.is_ok() {
+                manager.record_recovery_event(
+                    "info", "session.created", Some(&name),
+                    format!("created {kind} session in {cwd}"), None,
+                );
                 if let Ok(infos) = manager.session_infos() {
                     if let Some(info) = infos.into_iter().find(|i| i.name == name) {
                         watchers.broadcast(&ControlMsg::SessionsChanged {
@@ -455,19 +459,32 @@ fn handle_control(
         // watchers. On success, no reply (fire-and-forget, like ReportRunState);
         // only a failure gets a small Error frame.
         ControlMsg::Suspend { name } => {
-            if let Err(e) = manager.suspend(&name, SuspendOrigin::Manual) {
-                let _ = write_frame(
-                    writer,
-                    &Frame::Control(ControlMsg::Error { msg: e.to_string() }),
-                );
+            match manager.suspend(&name, SuspendOrigin::Manual) {
+                Ok(()) => manager.record_recovery_event(
+                    "info", "session.suspended", Some(&name),
+                    "manually suspended", None,
+                ),
+                Err(e) => {
+                    let _ = write_frame(
+                        writer,
+                        &Frame::Control(ControlMsg::Error { msg: e.to_string() }),
+                    );
+                }
             }
         }
         ControlMsg::Resume { name } => {
-            if let Err(e) = manager.resume(&name, ResumeCause::Manual) {
-                let _ = write_frame(
-                    writer,
-                    &Frame::Control(ControlMsg::Error { msg: e.to_string() }),
-                );
+            match manager.resume(&name, ResumeCause::Manual) {
+                Ok(true) => manager.record_recovery_event(
+                    "info", "session.resumed", Some(&name),
+                    "manually resumed", None,
+                ),
+                Ok(false) => {}
+                Err(e) => {
+                    let _ = write_frame(
+                        writer,
+                        &Frame::Control(ControlMsg::Error { msg: e.to_string() }),
+                    );
+                }
             }
         }
         ControlMsg::SetMemoryBudget { mb } => {
@@ -559,8 +576,33 @@ fn handle_control(
         }
         ControlMsg::Snapshot => {
             let reply = match manager.snapshot() {
-                Ok(()) => ControlMsg::SnapshotOk,
-                Err(e) => ControlMsg::Error { msg: e.to_string() },
+                Ok(()) => {
+                    manager.record_recovery_event(
+                        "info", "snapshot.completed", None,
+                        "explicit snapshot completed", None,
+                    );
+                    ControlMsg::SnapshotOk
+                }
+                Err(e) => {
+                    manager.record_recovery_event(
+                        "error", "snapshot.failed", None, e.to_string(), None,
+                    );
+                    ControlMsg::Error { msg: e.to_string() }
+                }
+            };
+            let _ = write_frame(writer, &Frame::Control(reply));
+        }
+        ControlMsg::ListRecoveryEvents { limit } => {
+            let reply = match manager.recovery_events(limit) {
+                Ok(events) => ControlMsg::RecoveryEvents { events },
+                Err(error) => ControlMsg::Error { msg: error.to_string() },
+            };
+            let _ = write_frame(writer, &Frame::Control(reply));
+        }
+        ControlMsg::ClearRecoveryEvents => {
+            let reply = match manager.clear_recovery_events() {
+                Ok(()) => ControlMsg::RecoveryEventsCleared,
+                Err(error) => ControlMsg::Error { msg: error.to_string() },
             };
             let _ = write_frame(writer, &Frame::Control(reply));
         }
@@ -575,6 +617,10 @@ fn handle_control(
             let existed = manager.session(&name).is_some();
             match manager.remove(&name) {
                 Ok(()) if existed => {
+                    manager.record_recovery_event(
+                        "info", "session.killed", Some(&name),
+                        "session killed by client request", None,
+                    );
                     watchers.broadcast(&ControlMsg::SessionsChanged {
                         added: vec![],
                         removed: vec![name],
@@ -650,8 +696,12 @@ fn handle_control(
             // surface (and the app's decoder) is unchanged.
             watchers.broadcast(&ControlMsg::SessionsChanged {
                 added: vec![info],
-                removed: vec![from],
+                removed: vec![from.clone()],
             });
+            manager.record_recovery_event(
+                "info", "session.renamed", Some(&to),
+                format!("renamed from {from}"), None,
+            );
             let _ = write_frame(writer, &Frame::Control(ControlMsg::Created { name: to }));
         }
         // Hello and daemon->client-only variants: no-op. Well-formed but

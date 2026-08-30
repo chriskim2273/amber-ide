@@ -33,6 +33,8 @@ contextBridge.exposeInMainWorld('amber', {
   dumpBacklog: (name: string) => ipcRenderer.send('daemon-command', { cmd: 'dumpBacklog', name }),
   searchScrollback: (requestId: number, query: string, names: string[], limit: number) =>
     ipcRenderer.send('daemon-command', { cmd: 'searchScrollback', requestId, query, names, limit }),
+  listRecoveryEvents: (limit: number) => ipcRenderer.send('daemon-command', { cmd: 'listRecoveryEvents', limit }),
+  clearRecoveryEvents: () => ipcRenderer.send('daemon-command', { cmd: 'clearRecoveryEvents' }),
   // Memory budget: view (`getMemoryBudget`) / change (`setMemoryBudget`, MiB;
   // 0 = auto). The `BudgetApplied` reply arrives via onDaemonEvent.
   getMemoryBudget: () => ipcRenderer.send('daemon-command', { cmd: 'getMemoryBudget' }),

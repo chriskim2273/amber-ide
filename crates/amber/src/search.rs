@@ -54,9 +54,7 @@ pub fn sanitize_scrollback(bytes: &[u8]) -> String {
                 }
             }
             StripState::ControlString { escape } => {
-                if byte == 0x07 {
-                    StripState::Text
-                } else if escape && byte == b'\\' {
+                if byte == 0x07 || (escape && byte == b'\\') {
                     StripState::Text
                 } else {
                     StripState::ControlString { escape: byte == 0x1b }

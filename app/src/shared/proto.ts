@@ -15,6 +15,16 @@ export interface SearchResult {
   preview: string
 }
 
+export interface RecoveryEvent {
+  at: number
+  sequence: number
+  level: string
+  event: string
+  session?: string
+  detail: string
+  code?: number
+}
+
 export interface SessionInfo {
   name: string
   cwd: string
@@ -70,6 +80,10 @@ export type ControlMsg =
   | { kind: 'DumpBacklog'; name: string }
   | { kind: 'SearchScrollback'; request_id: number; query: string; names: string[]; limit: number }
   | { kind: 'SearchResults'; request_id: number; query: string; results: SearchResult[] }
+  | { kind: 'ListRecoveryEvents'; limit: number }
+  | { kind: 'ClearRecoveryEvents' }
+  | { kind: 'RecoveryEvents'; events: RecoveryEvent[] }
+  | { kind: 'RecoveryEventsCleared' }
   | { kind: 'Backlog'; name: string; data: Uint8Array }
   | { kind: 'Kill'; name: string }
   | { kind: 'Rename'; from: string; to: string }
@@ -118,6 +132,8 @@ function msgToJson(m: ControlMsg): unknown {
     case 'ListSessionsDetailed':
     case 'Snapshot':
     case 'SnapshotOk':
+    case 'ClearRecoveryEvents':
+    case 'RecoveryEventsCleared':
       return m.kind // unit variant -> bare string
     case 'WatchMemoryPressure':
       return { WatchMemoryPressure: { version: m.version } }
@@ -147,6 +163,10 @@ function msgToJson(m: ControlMsg): unknown {
       return { SearchScrollback: { request_id: m.request_id, query: m.query, names: m.names, limit: m.limit } }
     case 'SearchResults':
       return { SearchResults: { request_id: m.request_id, query: m.query, results: m.results } }
+    case 'ListRecoveryEvents':
+      return { ListRecoveryEvents: { limit: m.limit } }
+    case 'RecoveryEvents':
+      return { RecoveryEvents: { events: m.events } }
     case 'Backlog':
       // serde encodes Vec<u8> as a JSON numeric array (not base64); mirror it.
       return { Backlog: { name: m.name, data: Array.from(m.data) } }
@@ -188,7 +208,8 @@ function msgToJson(m: ControlMsg): unknown {
 function jsonToMsg(v: unknown): ControlMsg | null {
   if (typeof v === 'string') {
     if (v === 'Hello' || v === 'ListSessions' || v === 'WatchSessions' ||
-        v === 'ListSessionsDetailed' || v === 'Snapshot' || v === 'SnapshotOk') {
+        v === 'ListSessionsDetailed' || v === 'Snapshot' || v === 'SnapshotOk' ||
+        v === 'ClearRecoveryEvents' || v === 'RecoveryEventsCleared') {
       return { kind: v }
     }
     return null
@@ -233,6 +254,10 @@ function jsonToMsg(v: unknown): ControlMsg | null {
           query: stringField(body, 'query'),
           results: decodeSearchResults(body['results']),
         }
+      case 'ListRecoveryEvents':
+        return { kind: 'ListRecoveryEvents', limit: optionalNumberField(body, 'limit', 0) }
+      case 'RecoveryEvents':
+        return { kind: 'RecoveryEvents', events: decodeRecoveryEvents(body['events']) }
       // serde encodes Vec<u8> as a JSON numeric array; rebuild the Uint8Array.
       case 'Backlog': return { kind: 'Backlog', name: body['name'] as string, data: Uint8Array.from(body['data'] as number[]) }
       case 'Kill': return { kind: 'Kill', name: body['name'] as string }
@@ -318,6 +343,27 @@ function decodeSearchResults(value: unknown): SearchResult[] {
       name: stringField(body, 'name'),
       line: numberField(body, 'line'),
       preview: stringField(body, 'preview'),
+    }
+  })
+}
+
+function decodeRecoveryEvents(value: unknown): RecoveryEvent[] {
+  if (!Array.isArray(value)) throw new Error('invalid recovery events')
+  return value.map((entry) => {
+    if (!entry || typeof entry !== 'object') throw new Error('invalid recovery event')
+    const body = entry as Record<string, unknown>
+    const session = body['session']
+    const code = body['code']
+    if (session !== undefined && typeof session !== 'string') throw new Error('invalid recovery session')
+    if (code !== undefined && (typeof code !== 'number' || !Number.isFinite(code))) throw new Error('invalid recovery code')
+    return {
+      at: numberField(body, 'at'),
+      sequence: optionalNumberField(body, 'sequence', 0),
+      level: stringField(body, 'level'),
+      event: stringField(body, 'event'),
+      ...(session === undefined ? {} : { session }),
+      detail: stringField(body, 'detail'),
+      ...(code === undefined ? {} : { code }),
     }
   })
 }
