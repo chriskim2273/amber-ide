@@ -1418,18 +1418,19 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   both a supervised Pi pane and Pi launched manually inside a shell pane: text
   stayed as two editor lines and was not submitted.
 - [x] Windows native implementation + release gate (2026-08-30) — full native
-  workspace tests and strict all-target clippy passed on MSVC before final
-  `main` sync; the committed
+  workspace tests and strict all-target clippy pass on current head (494 native
+  tests, Windows 10/MSVC); the committed
   `windows-latest` job repeats them, exercises the real Node/Rust named-pipe
   harness, runs app tests/typecheck/build, packages NSIS, and asserts both
   shipped Rust binaries. Native `app/scripts/dist.sh` produced and installed
   the per-user package; packaged daemon/CLI startup, named-pipe RPC, session
-  creation/listing, and snapshotting pass. Release-only fixes include stable
+  creation/listing, snapshotting, adjacent `amber.exe` agent supervision, and
+  no-stdio Run-key startup pass. Release-only fixes include stable
   `%LOCALAPPDATA%\\Programs\\amber-ide` package identity and an explicit valid
   `file:///C:/...` renderer URL for Electron 43. Interactive GUI, fresh-user
   install, every agent resume, alternate-screen attach, browser access, logoff,
-  and post-reboot restore remain manual gates. Current-main Linux, app, Pocket
-  web, and Windows cross-target gates pass; native Windows rerun remains open; see
+  remain manual gates; one pre-final-package reboot restore passed. Current-main
+  Linux, app, Pocket web, Windows cross-target, and native Windows gates pass; see
   `docs/superpowers/specs/2026-08-27-windows-verification.md`.
 
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees

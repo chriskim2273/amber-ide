@@ -1,9 +1,9 @@
 # Windows native CI and release verification
 
-**Status:** native implementation, full CI gate, NSIS packaging, and packaged
-daemon/CLI smoke proof complete before the final `main` sync. Current head passes
-Linux and Windows cross-target gates; its native Windows rerun plus interactive-
-desktop, agent-resume, logoff, and reboot restore proof remain open.
+**Status:** native implementation, full CI gate, current-head native MSVC rerun,
+NSIS packaging, packaged daemon/CLI/agent-supervisor smoke, and one reboot restore
+proof are complete. Interactive desktop use, real-agent resume coverage, logoff,
+and a second reboot on the final rebuilt package remain open.
 
 Amber's Windows daemon uses current-user named pipes and ConPTY, so the
 mandatory proof runs on `windows-latest` x64 with the MSVC toolchain. Linux
@@ -34,6 +34,11 @@ remain executable, not a documentation-only checklist:
 6. The job stages the release Rust binaries, builds the per-user x64 NSIS
    installer, and asserts that the installer plus bundled `amber.exe` and
    `amberd.exe` exist.
+7. The job launches the packaged daemon and CLI, creates shell and Pi panes,
+   verifies that the Pi pane is supervised by adjacent `amber.exe` rather than
+   recursively launching `amberd.exe`, snapshots, and cleans up. The native
+   `windows_daemon` integration test separately clears every standard handle and
+   proves the windowless Run-key entrypoint still binds its isolated named pipe.
 
 The web fixture uses `LocalStream::read_with_timeout` for its Create → Created
 acknowledgement. A persistent `set_read_timeout` is a Unix-socket operation and
@@ -81,8 +86,24 @@ kind test, and made NSIS/package scripts build the new Pocket web bundle.
 - [x] Linux full workspace tests and strict all-target clippy pass.
 - [x] App typecheck, 645 passed tests plus 1 existing skip, Electron production
   build, and Pocket web build pass.
-- [ ] Repeat the full native Windows workspace, app, package, and runtime gates
-  on current head.
+- [x] On Windows 10 Pro 10.0.19045 with Rust 1.98.0, strict native all-target
+  clippy passed and the serial native workspace passed 494 tests with zero
+  failures.
+- [x] The current Node/Rust named-pipe peer passed exact frame exchange,
+  multi-client acceptance, and forced blocked-reader release.
+- [x] Native app typecheck passed; Vitest passed 641 tests with 5 platform skips;
+  Electron and Pocket production bundles both built.
+- [x] Current release `amber.exe` and `amberd.exe` built, electron-builder
+  produced the x64 per-user NSIS installer, and the rebuilt installer completed
+  a silent reinstall.
+- [x] Exact `win-unpacked` binaries created a Pi pane whose live process command
+  was `amber.exe run windows-proof-agent`; the pane reached `shell-fallback`,
+  snapshotting passed, and cleanup passed.
+- [x] The rebuilt windowless release started through `Win32_Process.Create`
+  with no standard handles and accepted CLI connections. This caught and fixed
+  a release blocker where early diagnostics could stall before `serve`.
+- [ ] Run the committed `rust-windows` job on GitHub Actions. Equivalent commands
+  pass manually, but this branch has not been pushed.
 
 ## Native packaged-runtime evidence
 
@@ -93,17 +114,28 @@ reinstall on the existing `dev` account placed the app under
 CLI/daemon binaries, and wrote the `amber-daemon` HKCU Run value.
 
 The packaged app started the named-pipe daemon. The installed CLI then created
-`win-smoke`, listed it, and forced a snapshot. This run also found and fixed two
-release-only defects: npm package identity selected the wrong install directory,
-and Electron 43 generated an invalid Windows `file:` URL through `loadFile`.
-Production now uses the intended package identity and an explicit
-`pathToFileURL(...).href` renderer URL.
+`win-smoke`, listed it, and forced a snapshot. This run found and fixed four
+release-only defects: npm package identity selected the wrong install directory;
+Electron 43 generated an invalid Windows `file:` URL through `loadFile`;
+`amberd.exe` recursively received `run`/`hook` commands instead of dispatching
+them through adjacent `amber.exe`; and a Run-key launch without standard handles
+could stall on diagnostics before accepting its named pipe. Tests and the native
+CI runtime smoke now cover the latter two paths.
 
-The launch occurred through SSH in the Windows Services session. It proves
-packaged process startup, renderer URL loading, daemon RPC, session creation,
-and snapshotting, but not interactive GUI gestures. The host was rebooted after
-the snapshot; it has not returned to Tailscale yet, so post-reboot restore is
-not checked.
+The launch occurred through SSH in the Windows Services session. With
+`--disable-gpu` (required only for that non-interactive session), Electron 43
+kept its main, renderer, utility, and daemon processes alive from installed
+paths. The installed CLI created/listed/snapshotted a session, and app startup
+installed both the Codex handoff skill and Pi extension under `%USERPROFILE%`.
+This proves packaged process startup, renderer loading, daemon RPC, agent setup,
+session creation, and snapshotting, but not interactive GUI gestures.
+
+The host rebooted after snapshotting `win-smoke`. After sign-in, Tailscale and
+SSH returned; `amberd.exe` was running from the installed path, the HKCU Run
+value was intact, and `amber ls` showed `win-smoke` alive. That proves one full
+reboot restore using the pre-final-sync package. The final rebuilt package has
+instead been proved through the stricter no-stdio WMI launch; a second physical
+reboot on that exact artifact remains manual.
 
 ## Manual Windows release checklist
 
