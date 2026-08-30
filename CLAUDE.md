@@ -1417,14 +1417,17 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   disable, and legacy behavior. Live xvfb+CDP proof against Pi 0.84.4 covered
   both a supervised Pi pane and Pi launched manually inside a shell pane: text
   stayed as two editor lines and was not submitted.
-- [x] Windows native CI wiring (2026-08-29) — the `windows-latest` MSVC job
-  strictly clippies `amber`, builds both `amber` and `amberd`, runs the
-  portable web daemon-link test plus named-pipe/attach/ConPTY tests, builds the
-  isolated `windows_pipe_peer.exe` for the real Node ↔ Rust pipe harness, and
-  runs app typecheck + Vitest. The web fixture now uses its transport deadline
-  read instead of Unix-only persistent read timeouts. Native release proof is
-  deliberately still unchecked for fresh install, every agent resume,
-  alternate-screen attach, browser access, logoff, and reboot; see
+- [x] Windows native implementation + release gate (2026-08-30) — full native
+  workspace tests and strict all-target clippy pass on MSVC; the committed
+  `windows-latest` job repeats them, exercises the real Node/Rust named-pipe
+  harness, runs app tests/typecheck/build, packages NSIS, and asserts both
+  shipped Rust binaries. Native `app/scripts/dist.sh` produced and installed
+  the per-user package; packaged daemon/CLI startup, named-pipe RPC, session
+  creation/listing, and snapshotting pass. Release-only fixes include stable
+  `%LOCALAPPDATA%\\Programs\\amber-ide` package identity and an explicit valid
+  `file:///C:/...` renderer URL for Electron 43. Interactive GUI, fresh-user
+  install, every agent resume, alternate-screen attach, browser access, logoff,
+  and post-reboot restore remain manual gates; see
   `docs/superpowers/specs/2026-08-27-windows-verification.md`.
 
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees

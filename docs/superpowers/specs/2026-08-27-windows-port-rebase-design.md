@@ -1,7 +1,9 @@
 # Windows Port Rebase Design
 
-**Date:** 2026-08-27  
-**Status:** approved for implementation; this document awaits final review before plan execution.  
+**Date:** 2026-08-27
+**Status:** implemented; automated native Windows gates and packaged daemon/CLI
+smoke proof pass. Remaining manual release gates are tracked in
+`2026-08-27-windows-verification.md`.
 **Supersedes:** the unmerged `feat/windows-port` design for implementation planning. Its code is reference material, not a merge candidate.
 
 ## Goal
@@ -85,11 +87,15 @@ Each phase starts with a failing test and ends with focused tests plus the full 
 | Persistence | snapshot/unit tests | logoff and reboot restore with scrollback |
 | Web | token/permission and local-link tests | browser access, reconnect, resize boundary |
 
-## Explicit Non-Claims Until Verified
+## Remaining Non-Claims
 
-- Named-pipe interoperability, DACL enforcement, ConPTY behavior, and shutdown messages are unproven until Windows execution.
-- Reboot survival is not lossless until torture-tested.
-- Code signing and bundled ConPTY compatibility DLLs remain release decisions after test evidence.
+- Interactive desktop behavior and shutdown-message delivery remain unproven;
+  SSH-launched processes run outside the signed-in user's desktop.
+- Reboot survival is not lossless until the post-reboot session restore check
+  and later torture testing pass.
+- Conversation resume for every supported agent, full-screen attach, and live
+  browser access still need manual Windows runs.
+- Code signing remains a release decision after the remaining manual evidence.
 
 ## Alternatives Rejected
 

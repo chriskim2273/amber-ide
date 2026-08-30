@@ -152,9 +152,11 @@ single xterm.js emulator.
 **Platform & packaging**
 - Linux AppImage / macOS dmg via electron-builder, with the static `amber`
   binary bundled.
-- Windows is built and tested on native MSVC CI. Packaged first-run, agent
-  resume, attach full-screen behavior, browser access, logoff, and reboot
-  restore remain release-verification work; see
+- Windows has a native MSVC gate plus a verified per-user NSIS build. Packaged
+  daemon/CLI startup, named-pipe RPC, session creation, and snapshotting pass on
+  a native host. Interactive GUI, fresh-user install, agent resume, attach
+  full-screen behavior, browser access, logoff, and reboot restore remain
+  release-verification work; see
   [`2026-08-27-windows-verification.md`](docs/superpowers/specs/2026-08-27-windows-verification.md).
 - First run does a **cargo-free install** — copies `amber` to `~/.local/bin`
   and writes a boot unit (systemd user unit on Linux, launchd agent on macOS).
@@ -163,12 +165,14 @@ single xterm.js emulator.
 
 ## Stack
 
-- **Daemon/CLI:** Rust — one dependency-free `amber` binary (static musl on
-  Linux, universal on macOS). `portable-pty`, `clap`, `nix`, `signal-hook`.
+- **Daemon/CLI:** Rust — static musl `amber` on Linux, universal `amber` on
+  macOS, and native MSVC `amber.exe` plus windowless `amberd.exe` on Windows.
+  `portable-pty`, `clap`, `nix`, `signal-hook`.
 - **App:** Electron + electron-vite, TypeScript strict, React (chrome only),
   xterm.js + WebGL addon.
-- **Protocol:** length-prefixed binary frames over a unix socket — serde control
-  messages + raw data frames.
+- **Protocol:** length-prefixed binary frames over platform-local IPC (Unix
+  socket or current-user Windows named pipe) — serde control messages + raw
+  data frames.
 
 ## Repo layout
 
@@ -177,7 +181,7 @@ single xterm.js emulator.
   client, Claude supervision, CLI.
 - `app/` — the Electron client.
 - `infra/daemon/` — systemd user unit, launchd agent, `install.sh`.
-- `scripts/dist.sh` — static/universal release builds.
+- `scripts/dist.sh` — static, universal, or native MSVC release builds.
 - `docs/superpowers/specs/` — design specs.
 
 ## Download
