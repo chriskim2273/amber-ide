@@ -1418,8 +1418,8 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   both a supervised Pi pane and Pi launched manually inside a shell pane: text
   stayed as two editor lines and was not submitted.
 - [x] Windows native implementation + release gate (2026-08-30) — full native
-  workspace tests and strict all-target clippy pass on current head (494 native
-  tests, Windows 10/MSVC); the committed
+  workspace tests and strict all-target clippy pass on current head (Windows
+  10/MSVC); the committed
   `windows-latest` job repeats them, exercises the real Node/Rust named-pipe
   harness, runs app tests/typecheck/build, packages NSIS, and asserts both
   shipped Rust binaries. Native `app/scripts/dist.sh` produced and installed
@@ -1430,7 +1430,9 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   `file:///C:/...` renderer URL for Electron 43. Interactive GUI, fresh-user
   install, every agent resume, alternate-screen attach, browser access, logoff,
   remain manual gates; one pre-final-package reboot restore passed. Current-main
-  Linux, app, Pocket web, Windows cross-target, and native Windows gates pass; see
+  Linux, app, Pocket web, Windows cross-target, native Windows, NSIS, and packaged
+  shell/Pi-supervisor smoke gates pass; desktop window close now tears down its
+  utility client and suppresses reconnect. See
   `docs/superpowers/specs/2026-08-27-windows-verification.md`.
 
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees

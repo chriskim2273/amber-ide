@@ -76,26 +76,32 @@ implementation pass:
 
 ## Current-main integration evidence
 
-The branch was rebased onto `main` at `d07186f` after that native run. Integration
-work preserved Hermes and Pi supervision/setup, added `%USERPROFILE%` fallback
-for every agent's Windows home, removed an accidental Unix gate from the Hermes
-kind test, and made NSIS/package scripts build the new Pocket web bundle.
+The branch was rebased onto `main` at `b80c138`, including the productivity,
+scrollback-search, preset-input, Pi keyboard-mode, and Linux input-health work.
+Integration preserved Hermes and Pi supervision/setup, `%USERPROFILE%` fallback
+for every agent's Windows home, Pocket web packaging, platform transports, and
+the packaged `amberd.exe`/`amber.exe` command split. Closing a desktop window now
+also closes its MessagePort, kills its utility client, unregisters its quit
+listener, and suppresses queued relaunches.
 
 - [x] Windows MSVC cross-target check passes for the full workspace and all
   targets with `test-support`.
-- [x] Linux full workspace tests and strict all-target clippy pass.
-- [x] App typecheck, 645 passed tests plus 1 existing skip, Electron production
-  build, and Pocket web build pass.
+- [x] Linux full workspace passed 650 tests with 1 intentional ignore; strict
+  all-target clippy passes.
+- [x] App typecheck, 685 tests, Electron production build, and Pocket web build
+  pass on Linux.
 - [x] On Windows 10 Pro 10.0.19045 with Rust 1.98.0, strict native all-target
-  clippy passed and the serial native workspace passed 494 tests with zero
-  failures.
+  clippy and the complete serial native workspace pass with zero failures.
+  This rerun found and fixed a test-only portability defect: the new search
+  integration had sent Unix `printf` plus LF into Windows `cmd.exe`; it now uses
+  a valid temp cwd and native CRLF shell input.
 - [x] The current Node/Rust named-pipe peer passed exact frame exchange,
   multi-client acceptance, and forced blocked-reader release.
-- [x] Native app typecheck passed; Vitest passed 641 tests with 5 platform skips;
+- [x] Native app typecheck passed; Vitest passed 684 tests with 5 platform skips;
   Electron and Pocket production bundles both built.
 - [x] Current release `amber.exe` and `amberd.exe` built, electron-builder
-  produced the x64 per-user NSIS installer, and the rebuilt installer completed
-  a silent reinstall.
+  produced the x64 per-user NSIS installer, and exact `win-unpacked` binaries
+  passed an isolated daemon/CLI/shell/Pi-supervisor/snapshot smoke.
 - [x] Exact `win-unpacked` binaries created a Pi pane whose live process command
   was `amber.exe run windows-proof-agent`; the pane reached `shell-fallback`,
   snapshotting passed, and cleanup passed.
