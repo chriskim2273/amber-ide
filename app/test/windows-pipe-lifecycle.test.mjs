@@ -19,6 +19,7 @@ import {
   startPeer,
   stopPeer,
   terminateChild,
+  waitForClose,
 } from './windows-pipe.mjs'
 
 const hostileThrownValue = () => Object.create(Error.prototype, {
@@ -90,6 +91,21 @@ test('pre-created event and read waits handle abort until their awaited point', 
     process.off('unhandledRejection', onUnhandled)
     stream.destroy()
   }
+})
+
+test('close wait tolerates an expected EPIPE but still requires close', async () => {
+  const socket = new EventEmitter()
+  const controller = new AbortController()
+  const awaitingClose = waitForClose(socket, controller.signal)
+
+  socket.emit('error', Object.assign(new Error('broken pipe'), { code: 'EPIPE' }))
+  let settled = false
+  void awaitingClose.then(() => { settled = true })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(settled, false)
+
+  socket.emit('close')
+  await awaitingClose
 })
 
 test('line monitor reports a failed spawn when child stdio is absent', async () => {

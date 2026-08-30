@@ -1,4 +1,4 @@
-import { join, win32 } from 'node:path'
+import { posix, win32 } from 'node:path'
 
 // Service-manager glue for the boot units that give the daemon reboot survival.
 // Everything here is PURE (string/argv construction) so it is unit-testable; the
@@ -63,7 +63,7 @@ export function renderDaemonPlist(amberBin: string): string {
 
 // Installed location of the launchd agent plist (~/Library/LaunchAgents).
 export function launchAgentPlistPath(home: string): string {
-  return join(home, 'Library', 'LaunchAgents', `${LAUNCHD_LABEL}.plist`)
+  return posix.join(home, 'Library', 'LaunchAgents', `${LAUNCHD_LABEL}.plist`)
 }
 
 export interface Argv {
@@ -179,7 +179,7 @@ export function bootUnitPath(
   localAppData?: string,
 ): string | null {
   if (platform === 'linux') {
-    return join(home, '.config', 'systemd', 'user', SYSTEMD_SERVICE)
+    return posix.join(home, '.config', 'systemd', 'user', SYSTEMD_SERVICE)
   }
   if (platform === 'darwin') {
     return launchAgentPlistPath(home)

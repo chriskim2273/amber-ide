@@ -118,6 +118,33 @@ const trackSocket = (socket) => {
   socket.once('close', onClose)
   return socket
 }
+// Windows can report EPIPE while releasing the peer that received queued
+// bytes. The harness still requires the socket's close event; EPIPE is only
+// the platform-specific companion to that forced close.
+export const waitForClose = (socket, signal) => new Promise((resolve, reject) => {
+  let settled = false
+  const finish = (callback, value) => {
+    if (settled) return
+    settled = true
+    socket.off('error', onError)
+    socket.off('close', onClose)
+    signal.removeEventListener('abort', onAbort)
+    callback(value)
+  }
+  const onError = (error) => {
+    if (error?.code === 'EPIPE') return
+    finish(reject, error)
+  }
+  const onClose = () => finish(resolve)
+  const onAbort = () => {
+    socket.destroy()
+    finish(reject, abortReason(signal))
+  }
+  socket.on('error', onError)
+  socket.once('close', onClose)
+  signal.addEventListener('abort', onAbort, { once: true })
+  if (signal.aborted) onAbort()
+})
 export const readExactly = (socket, length, signal) => new Promise((resolve, reject) => {
   let received = Buffer.alloc(0)
   let settled = false
@@ -527,7 +554,7 @@ const run = async () => {
 
       const stalled = await connect(operationAbort.signal)
       const awaitStalledClosed = stageWait(
-        onceEvent(stalled, 'close', { signal: operationAbort.signal }),
+        waitForClose(stalled, operationAbort.signal),
       )
       const awaitPeerExit = stageWait(
         onceEvent(peer, 'exit', { signal: operationAbort.signal }),

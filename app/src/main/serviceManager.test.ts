@@ -42,6 +42,12 @@ describe('launchAgentPlistPath', () => {
       '/Users/u/Library/LaunchAgents/com.amber-ide.daemon.plist',
     )
   })
+
+  it('uses macOS separators independently of the host running the app', () => {
+    expect(launchAgentPlistPath('/Users/u')).toBe(
+      '/Users/u/Library/LaunchAgents/com.amber-ide.daemon.plist',
+    )
+  })
 })
 
 describe('launchctl install argv', () => {
@@ -101,6 +107,11 @@ describe('bootUnitPath', () => {
       '/home/u/.config/systemd/user/amber.service',
     )
   })
+  it('uses Linux separators independently of the host running the app', () => {
+    expect(bootUnitPath('linux', '/home/u')).toBe(
+      '/home/u/.config/systemd/user/amber.service',
+    )
+  })
   it('darwin points at the launchd agent plist', () => {
     expect(bootUnitPath('darwin', '/Users/u')).toBe(
       '/Users/u/Library/LaunchAgents/com.amber-ide.daemon.plist',
@@ -133,7 +144,7 @@ describe('constants', () => {
       'utf8',
     )
     const resourceDirectives = (unit: string) => unit
-      .split('\n')
+      .split(/\r?\n/)
       .filter((line) => /^(Delegate|Memory(?:Accounting|High|Max)|OOMPolicy|CPU)/.test(line))
 
     const expected = [

@@ -1,7 +1,7 @@
 import { app, BrowserWindow, utilityProcess, MessageChannelMain, Menu, shell, Notification } from 'electron'
 import type { MenuItemConstructorOptions } from 'electron'
 import { ipcMain, dialog, clipboard } from 'electron'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { basename, dirname, join, resolve as resolvePathJoin, isAbsolute } from 'node:path'
 import { homedir, hostname, release as osRelease, tmpdir } from 'node:os'
 import { spawn, execFileSync } from 'node:child_process'
@@ -986,7 +986,12 @@ async function openWindow(target: WindowTarget): Promise<WindowCtx> {
   })
 
   if (process.env['ELECTRON_RENDERER_URL']) await win.loadURL(process.env['ELECTRON_RENDERER_URL'])
-  else await win.loadFile(join(__dirname, '../renderer/index.html'))
+  else {
+    // Electron 43's loadFile produced `file:///C:\...` for an asar path on
+    // Windows, which Chromium rejects. Build the file URL explicitly so drive
+    // separators are encoded correctly (`file:///C:/...`).
+    await win.loadURL(pathToFileURL(join(__dirname, '../renderer/index.html')).href)
+  }
 
   // Supervise the client utilityProcess. It owns the daemon socket (rule #4:
   // terminal bytes never touch the main process), and the renderer's

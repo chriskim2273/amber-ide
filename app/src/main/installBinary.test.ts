@@ -23,7 +23,7 @@ function tmp(): string {
 const script = (body: string): string => `#!/bin/sh\n${body}\n`
 
 describe('installBinary', () => {
-  it('replaces a binary that is CURRENTLY EXECUTING', async () => {
+  it.skipIf(process.platform === 'win32')('replaces a binary that is CURRENTLY EXECUTING', async () => {
     // The regression: copyFile() into a running executable fails with ETXTBSY,
     // and ~/.local/bin/amber is the live daemon's image — a packaged launch
     // died at startup on exactly this.
@@ -67,5 +67,18 @@ describe('installBinary', () => {
     await installBinary(src, join(d, 'amber'))
 
     expect(readFileSync(join(d, 'amber'), 'utf8')).toContain('echo fresh')
+  })
+
+  it('replaces an existing destination when it is not running', async () => {
+    const d = tmp()
+    const src = join(d, 'src')
+    const dest = join(d, 'amber')
+    writeFileSync(src, script('echo replacement'))
+    writeFileSync(dest, script('echo old'))
+
+    await installBinary(src, dest)
+
+    expect(readFileSync(dest, 'utf8')).toContain('echo replacement')
+    expect(readdirSync(d).filter((f) => f.startsWith('.'))).toEqual([])
   })
 })

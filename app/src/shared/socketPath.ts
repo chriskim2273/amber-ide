@@ -1,4 +1,4 @@
-import { join } from 'node:path'
+import { posix } from 'node:path'
 
 /**
  * Where the daemon's unix socket is.
@@ -23,11 +23,11 @@ export function resolveSocketPath(
   if (platform === 'win32') return '\\\\.\\pipe\\amber-ide'
   const runtime = env['XDG_RUNTIME_DIR']
   if (runtime && runtime.length > 0) {
-    return join(runtime, 'amber-ide', 'amberd.sock')
+    return posix.join(runtime, 'amber-ide', 'amberd.sock')
   }
   const stateHome = env['XDG_STATE_HOME']
   const root = stateHome && stateHome.length > 0
-    ? join(stateHome, 'amber-ide')
-    : join(env['HOME'] ?? '.', '.local/state/amber-ide')
-  return join(root, 'amberd.sock')
+    ? posix.join(stateHome, 'amber-ide')
+    : posix.join(env['HOME'] ?? '.', '.local/state/amber-ide')
+  return posix.join(root, 'amberd.sock')
 }

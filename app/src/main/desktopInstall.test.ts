@@ -25,7 +25,7 @@ describe('renderDesktopEntry', () => {
   })
 })
 
-describe('path builders', () => {
+describe.skipIf(process.platform === 'win32')('Linux path builders', () => {
   it('stableAppImagePath', () => {
     expect(stableAppImagePath('/home/u')).toBe('/home/u/Applications/amber-ide.AppImage')
   })

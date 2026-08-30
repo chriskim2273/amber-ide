@@ -145,11 +145,15 @@ export async function inlineImages(mdDir: string, html: string): Promise<{ html:
 }
 
 async function imageDataUri(mdDir: string, src: string): Promise<string | null> {
-  if (src === '' || /^[a-z][a-z0-9+.-]*:/i.test(src) || src.startsWith('//')) return null
+  if (src === '' || src.startsWith('//')) return null
+  const absolute = isAbsolute(src)
+  // A Windows absolute path begins with `C:`; do not mistake its drive letter
+  // for a URI scheme. Non-file schemes remain deliberately unfetched.
+  if (!absolute && /^[a-z][a-z0-9+.-]*:/i.test(src)) return null
   const ext = src.split('?')[0]!.split('#')[0]!.split('.').pop()?.toLowerCase() ?? ''
   const mime = MIME[ext]
   if (!mime) return null
-  const abs = isAbsolute(src) ? src : resolve(mdDir, src)
+  const abs = absolute ? src : resolve(mdDir, src)
   try {
     const st = await stat(abs)
     if (!st.isFile() || st.size > MAX_IMG_BYTES) return null

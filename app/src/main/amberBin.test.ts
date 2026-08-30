@@ -3,13 +3,13 @@ import { resolveAmberBinary, resolveAmberDaemonBinary, windowsAmberPath, windows
 
 describe('resolveAmberBinary', () => {
   it('honors AMBER_BIN override', () => {
-    expect(resolveAmberBinary({ AMBER_BIN: '/x/amber' }, true, '/res')).toBe('/x/amber')
+    expect(resolveAmberBinary({ AMBER_BIN: '/x/amber' }, true, '/res', 'linux')).toBe('/x/amber')
   })
   it('uses the bundled resources path when packaged', () => {
-    expect(resolveAmberBinary({}, true, '/app/resources')).toBe('/app/resources/bin/amber')
+    expect(resolveAmberBinary({}, true, '/app/resources', 'linux')).toBe('/app/resources/bin/amber')
   })
   it('falls back to PATH lookup in dev', () => {
-    expect(resolveAmberBinary({}, false, '/app/resources')).toBe('amber')
+    expect(resolveAmberBinary({}, false, '/app/resources', 'linux')).toBe('amber')
   })
 
   it('uses .exe resources on packaged Windows', () => {

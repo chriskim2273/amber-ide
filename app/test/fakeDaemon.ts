@@ -19,7 +19,12 @@ export class FakeDaemon {
 
   listen(fixedPath?: string): Promise<string> {
     counter += 1
-    const path = fixedPath ?? join(tmpdir(), `amber-fake-${process.pid}-${counter}.sock`)
+    // Windows does not support Unix-domain socket paths. Use a distinct named
+    // pipe for each fixture so these connection tests exercise the same Node
+    // transport API as production does there.
+    const path = fixedPath ?? (process.platform === 'win32'
+      ? `\\\\.\\pipe\\amber-fake-${process.pid}-${counter}`
+      : join(tmpdir(), `amber-fake-${process.pid}-${counter}.sock`))
     this.server.on('connection', (sock) => {
       this.clients.add(sock)
       const dec = new Decoder()

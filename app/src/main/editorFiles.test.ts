@@ -162,7 +162,9 @@ describe('drafts', () => {
   })
 
   it('draftPath stays inside the drafts dir for a valid id', () => {
-    expect(draftPath('/s/drafts', 'editor-0-0-0-a')).toBe('/s/drafts/editor-0-0-0-a.txt')
+    expect(draftPath('/s/drafts', 'editor-0-0-0-a')).toBe(
+      join('/s/drafts', 'editor-0-0-0-a.txt'),
+    )
   })
 })
 

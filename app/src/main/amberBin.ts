@@ -1,4 +1,4 @@
-import { join, win32 } from 'node:path'
+import { posix, win32 } from 'node:path'
 
 // Where to find the `amber` binary. In a packaged app it's bundled under the
 // app's resources (electron-builder `extraResources`); in dev it's on PATH.
@@ -13,7 +13,7 @@ export function resolveAmberBinary(
   if (override && override.length > 0) return override
   if (isPackaged) return platform === 'win32'
     ? win32.join(resourcesPath, 'bin', 'amber.exe')
-    : join(resourcesPath, 'bin', 'amber')
+    : posix.join(resourcesPath, 'bin', 'amber')
   return platform === 'win32' ? 'amber.exe' : 'amber'
 }
 
@@ -28,7 +28,7 @@ export function resolveAmberDaemonBinary(
   if (override && override.length > 0) return override
   if (isPackaged) return platform === 'win32'
     ? win32.join(resourcesPath, 'bin', 'amberd.exe')
-    : join(resourcesPath, 'bin', 'amberd')
+    : posix.join(resourcesPath, 'bin', 'amberd')
   return platform === 'win32' ? 'amberd.exe' : 'amberd'
 }
 

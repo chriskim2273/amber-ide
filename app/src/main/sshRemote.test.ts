@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest'
+import { join } from 'node:path'
 import {
   sshTunnelArgv, sshProbeArgv, isValidHost, localSocketPath, hostLabel,
   REMOTE_SOCKET_PROBE, parseAgentSock, explainSshFailure,
@@ -75,7 +76,7 @@ describe('isValidHost', () => {
 
 describe('localSocketPath / hostLabel', () => {
   it('puts the socket inside the window private dir', () => {
-    expect(localSocketPath('/tmp/w')).toBe('/tmp/w/remote.sock')
+    expect(localSocketPath('/tmp/w')).toBe(join('/tmp/w', 'remote.sock'))
   })
   it('labels a window by host, dropping the user', () => {
     expect(hostLabel('me@box.local')).toBe('box.local')
