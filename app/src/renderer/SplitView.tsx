@@ -10,7 +10,7 @@ import { isAgentKind, paneDot, parkedOverlayText, shouldHintTerminalFocus, shoul
 import { ParkedOverlay } from './PressureBanners'
 import { reloadAgentCommand, reloadAgentVisibility } from './reloadAgent'
 import { Icon } from './Icon'
-import { PANE_KIND_OPTIONS } from './uiModel'
+import { PANE_KIND_OPTIONS, paneHeaderPresentation } from './uiModel'
 // CodeMirror + marked (the editor's whole dependency graph) load LAZILY: they
 // are the largest single block in the bundle but matter only when an editor
 // pane actually mounts. A static import here made every app start pay for
@@ -120,12 +120,12 @@ function FindBar({ api, focusSeq, onClose }: { api: SearchApi; focusSeq: number;
 // so an accidental click-away never silently parks the pane — an accidental
 // freeze is a worse surprise than a dropped note. stopPropagation keeps typing
 // away from the global chords.
-function FreezeNoteInput({ onCommit, onCancel }:
-  { onCommit: (note: string) => void; onCancel: () => void }): JSX.Element {
+function FreezeNoteInput({ noun, onCommit, onCancel }:
+  { noun: 'pane' | 'session'; onCommit: (note: string) => void; onCancel: () => void }): JSX.Element {
   const committed = useRef(false)
   return (
     <div className="freeze-note" onMouseDown={(e) => e.stopPropagation()}>
-      <span className="freeze-note-label"><Icon name="snowflake" size={14} /> Freeze pane — add a note</span>
+      <span className="freeze-note-label"><Icon name="snowflake" size={14} /> Freeze {noun} — add a note</span>
       <input className="freeze-note-input" autoFocus aria-label="freeze note"
         placeholder="note (optional), Enter to freeze" spellCheck={false}
         onKeyDown={(e) => {
@@ -173,6 +173,8 @@ export function SplitView(props: {
   fontSize: number
   onPaneTitle: (session: string, title: string) => void
   onPaneFocus: (session: string) => void
+  /** One-shot cross-workspace reveal request from desktop overview surfaces. */
+  focusRequest?: { paneId: string; seq: number } | null
   onSetRatio: (path: Array<'a' | 'b'>, ratio: number) => void
   onSplit: (paneId: string, dir: 'h' | 'v', kind?: PaneKind) => void
   onMove: (sourceId: string, targetId: string, zone: Zone) => void
@@ -303,6 +305,20 @@ export function SplitView(props: {
     if (target) focusPane(target, false)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [props.active])
+
+  // Desktop attention/session rows can reveal a pane in another workspace. The
+  // request arrives in the same render that activates this SplitView, so focus
+  // only after it is visible. Manual freezes retain the header highlight but do
+  // not receive terminal input; guardian-parked panes take the normal focus hint
+  // path, which tells the daemon to resume them.
+  useEffect(() => {
+    const request = props.focusRequest
+    if (!props.active || !request || !leaves(props.tree).includes(request.paneId)) return
+    setFocused(request.paneId)
+    focusPane(request.paneId)
+    // `seq` is the event identity; paneId may repeat across consecutive reveals.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [props.active, props.focusRequest?.seq])
 
   // Freeze a pane. The overlay + focusPane guard only block FUTURE focus; if this
   // pane's xterm textarea already holds DOM focus, keystrokes keep flowing into
@@ -695,6 +711,7 @@ export function SplitView(props: {
         // Terminal-only affordances (refresh, scrollback search, claude reload,
         // freeze) are meaningless for a pane that owns no pty.
         const noTerm = isBrowser || isEditor
+        const surfaceNoun = noTerm ? 'pane' : 'session'
         const dot = paneDot(meta?.kind ?? 'shell', meta?.runState)
         const parkedText = parkedOverlayText(meta?.runState)
         const frozenEntry = props.frozen[paneId]
@@ -704,6 +721,14 @@ export function SplitView(props: {
         // display:none (Pane's ResizeObserver early-returns at 0×0, so this fires
         // NO spurious pty resize — verified in Pane.sendResize).
         const box = isZoomedPane ? size : rect
+        const header = paneHeaderPresentation({
+          frozen: isFrozen,
+          runState: meta?.runState,
+          zoomed: isZoomedPane,
+          rssKb: meta?.rssKb,
+          growing: meta?.growing,
+          width: box.w,
+        })
         const hidden = zoomActive && !isZoomedPane
         return (
           <div key={paneId}
@@ -766,14 +791,17 @@ export function SplitView(props: {
               }}>
               <span className={'kind-dot ' + dot.cls} role="img" aria-label={dot.label} title={dot.label} />
               <span className="pane-title">{meta?.title ?? paneId}</span>
-              {meta?.rssKb !== undefined && meta.rssKb > 0 &&
+              {header.showMemory && meta?.rssKb !== undefined &&
                 <span className={'mem-tag' + (meta.growing ? ' growing' : '')}
                   title={meta.growing ? 'memory climbing (possible leak)' : 'child process memory'}>
                   {meta.growing ? '▲ ' : ''}{fmtMem(meta.rssKb)}
                 </span>}
-              {isFrozen && <span className="frozen-badge" title="pane frozen"><Icon name="snowflake" size={12} /> frozen</span>}
-              {isZoomedPane &&
-                <span className="zoom-badge">zoomed — {chordLabel('zoom')} to restore</span>}
+              {header.state && (
+                <span className={`pane-state-badge ${header.state.kind}`} title={header.state.title}>
+                  <Icon name={header.state.kind === 'zoomed' ? 'restore' : header.state.kind === 'attention' ? 'reload' : 'snowflake'} size={12} />
+                  {header.state.label}{header.state.kind === 'zoomed' ? ` · ${chordLabel('zoom')}` : ''}
+                </span>
+              )}
               <div className="pane-actions">
                 <button className="icon-btn pane-move" aria-label="move pane" title="Drag to move pane"
                   onPointerDown={startPaneDrag(paneId)} style={{ cursor: 'grab', touchAction: 'none' }}><Icon name="move" /></button>
@@ -815,12 +843,12 @@ export function SplitView(props: {
                   <div className={'dead-badge ' + (dead === 0 ? 'ok' : 'err')}>
                     exited · code {dead}
                   </div>
-                  <button className="dead-close" onClick={() => props.onClose(paneId)}>close pane</button>
+                  <button className="dead-close" onClick={() => props.onClose(paneId)}>close session</button>
                 </div>}
               {/* Inline freeze-note prompt (context-menu path). Above the terminal;
                   commits/cancels back into App's sidecar state. */}
               {notePane === paneId && !isFrozen &&
-                <FreezeNoteInput
+                <FreezeNoteInput noun={surfaceNoun}
                   onCommit={(note) => { freeze(paneId, note); setNotePane(null) }}
                   onCancel={() => setNotePane(null)} />}
               {/* Provider-specific resume confirmation. */}
@@ -863,10 +891,10 @@ export function SplitView(props: {
                   header frozen badge still marks the pane as parked. */}
               {isFrozen && dead === undefined &&
                 <div className="frozen-overlay">
-                  <div className="frozen-badge-lg" role="img" aria-label="frozen pane"><Icon name="snowflake" size={30} /></div>
-                  <div className="frozen-note-text">{frozenEntry.note?.trim() || 'frozen'}</div>
-                  <button className="frozen-unfreeze btn-with-icon" aria-label="unfreeze pane"
-                    onClick={() => props.onUnfreeze(paneId)}><Icon name="play" size={14} /> Unfreeze</button>
+                  <div className="frozen-badge-lg" role="img" aria-label={`frozen ${surfaceNoun}`}><Icon name="snowflake" size={30} /></div>
+                  <div className="frozen-note-text">{frozenEntry.note?.trim() || 'Frozen by you'}</div>
+                  <button className="frozen-unfreeze btn-with-icon" aria-label={`unfreeze ${surfaceNoun}`}
+                    onClick={() => props.onUnfreeze(paneId)}><Icon name="play" size={14} /> Unfreeze {surfaceNoun}</button>
                 </div>}
               {parkedText && !isFrozen && dead === undefined &&
                 <ParkedOverlay text={parkedText} active={props.active}
@@ -898,6 +926,7 @@ export function SplitView(props: {
         const menuMeta = props.meta[paneId]
         const menuKind = menuMeta?.kind
         const menuHasTerm = menuKind !== 'browser' && menuKind !== 'editor'
+        const menuNoun = menuHasTerm ? 'session' : 'pane'
         const reload = menuMeta && isAgentKind(menuMeta.kind)
           ? reloadAgentVisibility(agentOf(menuMeta.kind), menuMeta.claudeId ?? null)
           : null
@@ -965,10 +994,10 @@ export function SplitView(props: {
             })()}
             {isFrozen
               ? <button className="ctx-item" role="menuitem" onClick={run(() => props.onUnfreeze(paneId))}>
-                  <Icon name="play" /><span>Unfreeze pane</span>
+                  <Icon name="play" /><span>Unfreeze {menuNoun}</span>
                 </button>
               : <button className="ctx-item" role="menuitem" onClick={run(() => setNotePane(paneId))}>
-                  <Icon name="snowflake" /><span>Freeze pane…</span>
+                  <Icon name="snowflake" /><span>Freeze {menuNoun}…</span>
                 </button>}
             <button className="ctx-item" role="menuitem"
               onClick={run(() => {
@@ -977,7 +1006,7 @@ export function SplitView(props: {
               })}><Icon name="folder" /><span>Copy working directory</span></button>
             <div className="ctx-sep" />
             <button className="ctx-item danger" role="menuitem" onClick={run(() => props.onClose(paneId))}>
-              <Icon name="close" /><span>Close pane</span>
+              <Icon name="close" /><span>Close {menuNoun}</span>
             </button>
           </div>
         )

@@ -1,18 +1,10 @@
 import { useState } from 'react'
 import type { CommandCenterItem } from './commandCenter'
+import { isAgentKind } from './store'
+import { DAEMON_PANE_KIND_OPTIONS, type DaemonPaneKind } from './uiModel'
 import './PocketSheets.css'
 
-export type PocketSessionKind = 'shell' | 'claude' | 'grok' | 'codex' | 'opencode' | 'hermes' | 'pi'
-
-const KINDS: ReadonlyArray<{ id: PocketSessionKind; label: string }> = [
-  { id: 'shell', label: 'Shell' },
-  { id: 'claude', label: 'Claude' },
-  { id: 'grok', label: 'Grok' },
-  { id: 'codex', label: 'Codex' },
-  { id: 'opencode', label: 'OpenCode' },
-  { id: 'hermes', label: 'Hermes' },
-  { id: 'pi', label: 'Pi' },
-]
+export type PocketSessionKind = DaemonPaneKind
 
 function SheetFrame({ label, onDismiss, children }: {
   label: string
@@ -51,6 +43,8 @@ export function PocketSessionSheet({
   onCloseSession: () => void
   onDismiss: () => void
 }): JSX.Element {
+  const canTogglePark = isAgentKind(item.pane.kind)
+    && (parked || (item.pane.runState !== 'shell-fallback' && item.pane.runState !== 'suspend-failed'))
   return (
     <SheetFrame label={`Actions for ${title}`} onDismiss={onDismiss}>
       <header className="pocket-sheet-head">
@@ -65,7 +59,7 @@ export function PocketSessionSheet({
           <strong>Open terminal</strong>
           <span>{item.stateLabel}</span>
         </button>
-        {item.pane.kind !== 'shell' && (parked || item.pane.runState === 'claude') && (
+        {canTogglePark && (
           <button type="button" onClick={onTogglePark}>
             <strong>{parked ? 'Resume session' : 'Freeze session'}</strong>
             <span>{parked ? 'Continue the same conversation' : 'Free agent memory now'}</span>
@@ -104,6 +98,7 @@ export function PocketNewSessionSheet({
   onDismiss: () => void
 }): JSX.Element {
   const [selected, setSelected] = useState<PocketSessionKind>(defaultKind)
+  const selectedOption = DAEMON_PANE_KIND_OPTIONS.find((option) => option.kind === selected)!
   return (
     <SheetFrame label="Create session" onDismiss={onDismiss}>
       <header className="pocket-sheet-head">
@@ -115,20 +110,21 @@ export function PocketNewSessionSheet({
       </header>
       <fieldset className="pocket-kind-grid">
         <legend>Session kind</legend>
-        {KINDS.map((kind) => (
-          <label key={kind.id}>
-            <input type="radio" name="pocket-kind" value={kind.id}
-              checked={selected === kind.id} onChange={() => setSelected(kind.id)} />
+        {DAEMON_PANE_KIND_OPTIONS.map((kind) => (
+          <label key={kind.kind}>
+            <input type="radio" name="pocket-kind" value={kind.kind}
+              checked={selected === kind.kind} onChange={() => setSelected(kind.kind)} />
             <span>{kind.label}</span>
           </label>
         ))}
       </fieldset>
+      <p className="pocket-kind-detail">{selectedOption.detail}</p>
       <button type="button" className="pocket-cwd-choice" onClick={onChooseCwd}>
         <span>Working directory</span>
         <code>{cwd}</code>
       </button>
       <button type="button" className="pocket-create" onClick={() => onCreate(selected)}>
-        Create {selected}
+        Create {selectedOption.label}
       </button>
     </SheetFrame>
   )

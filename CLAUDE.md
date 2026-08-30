@@ -1237,11 +1237,29 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   daemon's 13 sessions: Sessions is the initial surface, stage is hidden, first
   row is above the fold, all controls are ≥44 px, row→Focus keeps the existing
   xterm/MessagePort, old pane chrome is absent, session/new sheets work, and
-  sheet-back leaves Focus intact. Impeccable's full detector returned zero
-  findings. Gates: app **612 tests** + one intentional skip, typecheck,
-  Electron bundle, `build:web`, and `git diff --check` green. **Still open:**
-  physical iOS/Android proof, header collapse after input, customizable quick
-  commands, and the sheet's lower-frequency move/rename/split actions.
+  sheet-back leaves Focus intact. **The connected desktop companion landed in
+  the same 2026-08-30 pass, still with zero daemon/protocol change:** a
+  conditional `N needs you` affordance appears only with proven attention state
+  and opens the same model grouped across workspaces; its row reveal and the
+  Sessions dialog's new `Show` action switch workspace/tab and focus the existing
+  pane WITHOUT zooming or altering geometry. Sessions now has All/Needs-you
+  views. Creation kind labels/order/details come from one shared metadata table;
+  mobile derives its daemon-only subset instead of duplicating it. State copy is
+  explicit (`Frozen by you` vs guardian `Parked for memory/resources`), and pane
+  headers show one precedence-ranked state before secondary memory telemetry.
+  Electron's title plus the continuity detail name the local/remote machine,
+  while the local toolbar remains unchanged. Live desktop CDP against 12 real
+  sessions proved window/machine identity, zero toolbar overflow at 1024 px,
+  Sessions filter counts, all 12 `Show` actions, and Show→existing-pane focus;
+  a 390×844 production web build proved the shared seven-kind picker, selected
+  description, 44 px floor, and unchanged hidden-stage contract. The live daemon
+  had zero Needs-you rows, correctly hiding the conditional trigger; its exact
+  three-group markup received a separate CSS fixture review while component and
+  pure-model tests pin behavior. Impeccable's detector returned zero findings.
+  Gates: app **628 tests** + one intentional skip, typecheck, Electron bundle,
+  `build:web`, and `git diff --check` green. **Still open:** physical iOS/Android
+  proof, header collapse after input, customizable quick commands, and the
+  sheet's lower-frequency move/rename/split actions.
 
 - [x] SSH remote windows (2026-08-23) — open another machine's amber in its own
   window. Spec:

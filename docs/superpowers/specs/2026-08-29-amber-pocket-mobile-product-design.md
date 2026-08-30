@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-29
 
-**Status:** visual prototype complete; production command-center model, mobile shell, focus chrome, sheets, and keyboard hardening implemented; physical-device hardening remains
+**Status:** visual prototype complete; production command-center model, mobile shell, focus chrome, sheets, keyboard hardening, and desktop continuity companion implemented; physical-device hardening remains
 
 **Prototype:** `docs/prototypes/amber-pocket/index.html`
 
@@ -489,6 +489,26 @@ Activity is output, not completion.
   keyboard timing is measured; the current fixed header never changes PTY
   geometry.
 
+### Desktop continuity companion — implemented 2026-08-30
+
+Pocket's useful intelligence now reaches desktop without importing its mobile
+composition or changing daemon/protocol truth:
+
+- a conditional `Needs you` toolbar affordance appears only when proven
+  attention states exist, then opens a compact cross-workspace overview;
+- selecting a row switches workspace/tab and focuses the existing pane without
+  zooming or changing geometry;
+- the Sessions dialog gains All/Needs-you views and can reveal any represented
+  pane instead of acting only as a cleanup tool;
+- shared pane-kind metadata prevents desktop/mobile creation copy from drifting;
+- manual `Frozen by you`, guardian `Parked`, retry/fallback, and zoom now use one
+  precedence-ranked pane-header state instead of competing badges;
+- local/remote machine identity is reflected in the window title and continuity
+  details, while the permanent toolbar stays unchanged for local windows.
+
+The desktop still launches into its split workspace and receives no sidebar,
+bottom navigation, command-center landing screen, or protocol branch.
+
 ### Slice 4: key-bar hierarchy and quick commands
 
 - Preserve all existing keys and byte-generation tests.
@@ -529,7 +549,8 @@ terminal implementation.
   are visible before the arrow cluster.
 - Every sheet and navigation transition works with platform back.
 - No production renderer code branches on host.
-- Desktop layout and interaction remain unchanged.
+- Desktop remains split-workspace-first; Pocket intelligence may appear only as
+  compact, conditional companion controls that do not reflow terminal geometry.
 - Real-device evidence exists before the design is called shipped.
 
 ## 14. Explicit cuts

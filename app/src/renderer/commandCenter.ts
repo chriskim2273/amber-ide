@@ -76,7 +76,7 @@ function classify(
       return { group: 'needs-you', stateLabel: 'Could not suspend session', urgency: 3 }
   }
 
-  if (frozen) return { group: 'parked', stateLabel: 'Frozen', urgency: 0 }
+  if (frozen) return { group: 'parked', stateLabel: 'Frozen by you', urgency: 0 }
   if (PARKED_STATES.has(pane.runState ?? '')) {
     const stateLabel = pane.runState === 'memory-suspended'
       ? 'Parked to protect system memory'
@@ -116,7 +116,7 @@ function resourceCauseText(causes: ResourcePressureCause[]): string {
 }
 
 /**
- * Pure mobile command-center projection. It only groups daemon-backed panes
+ * Pure cross-client command-center projection. It only groups daemon-backed panes
  * whose state Amber can prove; it never infers TUI completion or waiting from
  * terminal output. Global pressure remains a global alert instead of assigning
  * blame to an arbitrary session.
