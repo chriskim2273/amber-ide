@@ -184,6 +184,65 @@ fn read_frame_until<F: Fn(&Frame) -> bool>(
 }
 
 #[test]
+fn scrollback_search_returns_sanitized_hits_and_keeps_control_flowing() {
+    let (socket_path, manager, _guard) = start_daemon_with_manager();
+    manager
+        .create("searchable", "/tmp", amber_core::state::SessionKind::Shell)
+        .unwrap();
+    manager.write("searchable", b"printf '\\033[31mUNIQUE_NEEDLE\\033[0m\\n'\n").unwrap();
+    let session = manager.session("searchable").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !session
+        .scrollback()
+        .windows(b"\x1b[31mUNIQUE_NEEDLE".len())
+        .any(|w| w == b"\x1b[31mUNIQUE_NEEDLE")
+    {
+        assert!(Instant::now() < deadline, "shell never produced searchable output");
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let mut stream = connect_with_retry(&socket_path);
+    send(&mut stream, &Frame::Control(ControlMsg::SearchScrollback {
+        request_id: 41,
+        query: "unique_needle".into(),
+        names: vec!["searchable".into()],
+        limit: 10,
+    }));
+    // This request shares the same socket and is sent immediately behind the
+    // search. Both must complete; search work itself runs on a worker thread.
+    send(&mut stream, &Frame::Control(ControlMsg::ListSessionsDetailed));
+
+    let mut decoder = Decoder::new();
+    let search = read_frame_until(
+        &mut stream,
+        &mut decoder,
+        |frame| matches!(frame, Frame::Control(ControlMsg::SearchResults { request_id: 41, .. })),
+        Duration::from_secs(5),
+    );
+    let Frame::Control(ControlMsg::SearchResults { results, .. }) = search else {
+        unreachable!()
+    };
+    assert!(
+        results.iter().any(|hit| hit.name == "searchable"
+            && hit.preview.contains("UNIQUE_NEEDLE")
+            && !hit.preview.contains("[31m")),
+        "unexpected search results: {results:?}"
+    );
+
+    // The helper above may have consumed the first listing while waiting for
+    // the worker's result (arrival order is intentionally unconstrained). A
+    // fresh request proves the same connection remained responsive.
+    send(&mut stream, &Frame::Control(ControlMsg::ListSessionsDetailed));
+    let sessions = read_frame_until(
+        &mut stream,
+        &mut decoder,
+        |frame| matches!(frame, Frame::Control(ControlMsg::Sessions { .. })),
+        Duration::from_secs(5),
+    );
+    assert!(matches!(sessions, Frame::Control(ControlMsg::Sessions { .. })));
+}
+
+#[test]
 fn disconnecting_client_releases_its_subscription() {
     // A client that attaches and then drops its connection must not leave a
     // subscriber (and its blocked forwarder) behind on an idle session.

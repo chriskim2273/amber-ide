@@ -2,14 +2,14 @@
 //! between them and the [`StateStore`]. This is the piece that replaces
 //! tmux-resurrect (restore) and tmux-continuum (snapshot).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use amber_core::proto::{ControlMsg, SessionInfo};
+use amber_core::proto::{ControlMsg, RecoveryEvent, SearchResult, SessionInfo};
 use amber_core::state::{Config, SessionKind, SessionMeta, StateStore};
 use portable_pty::CommandBuilder;
 
@@ -365,6 +365,39 @@ impl SessionManager {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0)
+    }
+
+    /// Best-effort lifecycle journal append. Once an authoritative session
+    /// mutation has succeeded, a diagnostic-file failure must never turn that
+    /// success into an API failure or trigger a destructive rollback.
+    pub fn record_recovery_event(
+        &self,
+        level: &str,
+        event: &str,
+        session: Option<&str>,
+        detail: impl Into<String>,
+        code: Option<i32>,
+    ) {
+        let record = RecoveryEvent {
+            at: Self::now(),
+            sequence: 0,
+            level: level.to_string(),
+            event: event.to_string(),
+            session: session.map(str::to_string),
+            detail: detail.into(),
+            code,
+        };
+        if let Err(error) = self.store.append_recovery_event(record) {
+            eprintln!("amber daemon: could not append recovery event: {error}");
+        }
+    }
+
+    pub fn recovery_events(&self, limit: u16) -> anyhow::Result<Vec<RecoveryEvent>> {
+        self.store.list_recovery_events(limit)
+    }
+
+    pub fn clear_recovery_events(&self) -> anyhow::Result<()> {
+        self.store.clear_recovery_events()
     }
 
     /// Resolve a session cwd to a STABLE absolute directory. A relative cwd
@@ -875,6 +908,7 @@ impl SessionManager {
 
         let mut metas = self.store.list_sessions()?;
         metas.sort_by(|a, b| a.name.cmp(&b.name));
+        let restore_total = metas.len();
         let mut used: BTreeSet<u32> = BTreeSet::new();
         let mut lost = Vec::new();
 
@@ -905,6 +939,10 @@ impl SessionManager {
                 Ok(meta) => meta,
                 Err(error) => {
                     eprintln!("amber daemon: restore skipped session {restore_name}: {error}");
+                    self.record_recovery_event(
+                        "error", "session.restore_failed", Some(&restore_name),
+                        error.to_string(), None,
+                    );
                     lost.push(restore_name);
                     continue;
                 }
@@ -913,6 +951,10 @@ impl SessionManager {
                 eprintln!(
                     "amber daemon: restore skipped session {}: {error}",
                     meta.name
+                );
+                self.record_recovery_event(
+                    "error", "session.restore_failed", Some(&meta.name),
+                    error.to_string(), None,
                 );
                 lost.push(meta.name.clone());
                 continue;
@@ -959,6 +1001,7 @@ impl SessionManager {
 
         // Phase C — SERIAL commit: register under the live-table lock, apply
         // deferred overrides, clean up failures — in the original name order.
+        let mut restored_count = 0usize;
         for (meta, result) in outcomes {
             match result {
                 Ok(sess) => {
@@ -973,9 +1016,14 @@ impl SessionManager {
                         );
                     }
                     sessions.insert(meta.name.clone(), sess);
+                    restored_count += 1;
                 }
                 Err(e) => {
                     eprintln!("amber daemon: restore skipped session {}: {e}", meta.name);
+                    self.record_recovery_event(
+                        "error", "session.restore_failed", Some(&meta.name),
+                        e.to_string(), None,
+                    );
                     if let Err(cleanup) = self.stop_session(meta.slot, None) {
                         eprintln!(
                             "amber daemon: restore cleanup failed for {}: {cleanup}",
@@ -989,12 +1037,22 @@ impl SessionManager {
         if !clean_shutdown && !lost.is_empty() {
             let report = serde_json::json!({
                 "timestamp": Self::now(),
-                "lost_sessions": lost,
+                "lost_sessions": &lost,
             });
             if let Ok(body) = serde_json::to_string_pretty(&report) {
                 let _ = std::fs::write(self.root.join("last-crash-report.json"), body);
             }
         }
+        self.record_recovery_event(
+            if lost.is_empty() { "info" } else { "warning" },
+            "daemon.restore",
+            None,
+            format!(
+                "restored {restored_count} of {restore_total} sessions; skipped {}",
+                lost.len()
+            ),
+            None,
+        );
         self.reconcile_cpu_weights();
         Ok(())
     }
@@ -1733,6 +1791,44 @@ impl SessionManager {
         v
     }
 
+    /// Search point-in-time copies of retained rings. The session-table lock is
+    /// held only while cloning Arcs; each ring is copied with that lock released,
+    /// and text processing occurs after every daemon-wide lock is gone.
+    pub fn search_scrollback(
+        &self,
+        query: &str,
+        names: &[String],
+        limit: u16,
+    ) -> anyhow::Result<Vec<SearchResult>> {
+        Ok(self.search_scrollback_cancellable(query, names, limit, &|| false)?.unwrap_or_default())
+    }
+
+    pub fn search_scrollback_cancellable(
+        &self,
+        query: &str,
+        names: &[String],
+        limit: u16,
+        cancelled: &dyn Fn() -> bool,
+    ) -> anyhow::Result<Option<Vec<SearchResult>>> {
+        // Reject bad requests before copying a single retained ring.
+        crate::search::validate_query(query)?;
+        let wanted: HashSet<&str> = names.iter().map(String::as_str).collect();
+        let handles: Vec<(String, Arc<PtySession>)> = self
+            .sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(name, _)| wanted.is_empty() || wanted.contains(name.as_str()))
+            .map(|(name, session)| (name.clone(), Arc::clone(session)))
+            .collect();
+        let mut snapshots = Vec::with_capacity(handles.len());
+        for (name, session) in handles {
+            if cancelled() { return Ok(None) }
+            snapshots.push((name, session.scrollback()));
+        }
+        crate::search::search_snapshots_cancellable(query, &snapshots, names, limit, cancelled)
+    }
+
     /// One [`SessionInfo`] per live session, joining the live table (existence
     /// + liveness) with the persisted metadata (cwd/kind). Sorted by name.
     pub fn session_infos(&self) -> anyhow::Result<Vec<SessionInfo>> {
@@ -1828,6 +1924,7 @@ impl SessionManager {
             .collect();
         let mut reaped = Vec::new();
         for (name, session) in dead {
+            let exit_code = session.exit_code();
             let result = (|| -> anyhow::Result<()> {
                 let _transition = session.lock_suspend_transition();
                 let meta = self
@@ -1840,7 +1937,13 @@ impl SessionManager {
                 Ok(())
             })();
             match result {
-                Ok(()) => reaped.push(name),
+                Ok(()) => {
+                    self.record_recovery_event(
+                        "warning", "session.exited", Some(&name),
+                        "session child exited and was reaped", exit_code,
+                    );
+                    reaped.push(name);
+                }
                 Err(error) => {
                     eprintln!("amber daemon: could not reap session {name}: {error}");
                 }

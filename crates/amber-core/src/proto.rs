@@ -60,6 +60,30 @@ pub struct SessionInfo {
     pub slot: u32,
 }
 
+/// One bounded, printable hit from a daemon-side retained-scrollback search.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchResult {
+    pub name: String,
+    /// One-based logical line within the sanitized retained ring.
+    pub line: u32,
+    pub preview: String,
+}
+
+/// One bounded daemon lifecycle/recovery record persisted across restarts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryEvent {
+    pub at: u64,
+    #[serde(default)]
+    pub sequence: u32,
+    pub level: String,
+    pub event: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    pub detail: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<i32>,
+}
+
 /// Epochs ride the JSON wire as STRINGS: they are nanos-derived u64s whose
 /// magnitude exceeds JavaScript's 2^53 integer precision. `JSON.parse` would
 /// silently round one, and a rounded epoch fails its equality check on every
@@ -182,6 +206,26 @@ pub enum ControlMsg {
     /// (forwarder path) — a multi-MiB `data` must never block control frames
     /// multiplexed on the same socket (backlog head-of-line lesson).
     DumpBacklog { name: String },
+    /// Search the current retained rings. Scanning and the reply write run off
+    /// the connection read thread; `names=[]` means all listed sessions.
+    SearchScrollback {
+        request_id: u32,
+        query: String,
+        #[serde(default)]
+        names: Vec<String>,
+        #[serde(default)]
+        limit: u16,
+    },
+    /// Bounded printable search results. Daemon -> client only.
+    SearchResults {
+        request_id: u32,
+        query: String,
+        results: Vec<SearchResult>,
+    },
+    ListRecoveryEvents { #[serde(default)] limit: u16 },
+    ClearRecoveryEvents,
+    RecoveryEvents { events: Vec<RecoveryEvent> },
+    RecoveryEventsCleared,
     /// Daemon -> client: the requested session's full scrollback bytes.
     ///
     /// **Superseded by [`Frame::Backlog`] (wire tag 2) and no longer emitted.**
@@ -352,6 +396,12 @@ fn known_control_variant(name: &str) -> bool {
             | "Snapshot"
             | "SnapshotOk"
             | "DumpBacklog"
+            | "SearchScrollback"
+            | "SearchResults"
+            | "ListRecoveryEvents"
+            | "ClearRecoveryEvents"
+            | "RecoveryEvents"
+            | "RecoveryEventsCleared"
             | "Backlog"
             | "WatchSessions"
             | "WatchMemoryPressure"
@@ -990,6 +1040,79 @@ mod tests {
         // Lock the externally-tagged JSON shape the TS client decodes.
         let json = serde_json::to_string(&ControlMsg::Activity { name: "s".into() }).unwrap();
         assert_eq!(json, r#"{"Activity":{"name":"s"}}"#);
+    }
+
+    #[test]
+    fn search_controls_roundtrip() {
+        let request = Frame::Control(ControlMsg::SearchScrollback {
+            request_id: 7,
+            query: "needle".into(),
+            names: vec!["a".into(), "b".into()],
+            limit: 25,
+        });
+        assert_eq!(roundtrip(&request), request);
+        let reply = Frame::Control(ControlMsg::SearchResults {
+            request_id: 7,
+            query: "needle".into(),
+            results: vec![SearchResult {
+                name: "a".into(),
+                line: 3,
+                preview: "a needle here".into(),
+            }],
+        });
+        assert_eq!(roundtrip(&reply), reply);
+        assert!(serde_json::to_string(&ControlMsg::SearchScrollback {
+            request_id: 7,
+            query: "needle".into(),
+            names: vec![],
+            limit: 0,
+        })
+        .unwrap()
+        .contains("SearchScrollback"));
+    }
+
+    #[test]
+    fn recovery_controls_roundtrip() {
+        let event = RecoveryEvent {
+            at: 1_700_000_000,
+            sequence: 4,
+            level: "error".into(),
+            event: "session.restore_failed".into(),
+            session: Some("s".into()),
+            detail: "spawn failed".into(),
+            code: Some(127),
+        };
+        for message in [
+            ControlMsg::ListRecoveryEvents { limit: 200 },
+            ControlMsg::ClearRecoveryEvents,
+            ControlMsg::RecoveryEvents { events: vec![event] },
+            ControlMsg::RecoveryEventsCleared,
+        ] {
+            let frame = Frame::Control(message);
+            assert_eq!(roundtrip(&frame), frame);
+        }
+        let request: ControlMsg = serde_json::from_str(
+            r#"{"ListRecoveryEvents":{}}"#,
+        )
+        .unwrap();
+        assert_eq!(request, ControlMsg::ListRecoveryEvents { limit: 0 });
+    }
+
+    #[test]
+    fn search_request_additive_fields_default() {
+        let msg: ControlMsg = serde_json::from_str(
+            r#"{"SearchScrollback":{"request_id":1,"query":"x"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            msg,
+            ControlMsg::SearchScrollback {
+                request_id: 1,
+                query: "x".into(),
+                names: vec![],
+                limit: 0,
+            }
+        );
     }
 
     #[test]

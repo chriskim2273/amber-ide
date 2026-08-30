@@ -19,6 +19,11 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
+use crate::proto::RecoveryEvent;
+
+const RECOVERY_EVENT_CAP: usize = 500;
+const RECOVERY_DETAIL_CAP: usize = 512;
+
 /// Kind of a persisted session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -295,6 +300,9 @@ pub struct StateStore {
     /// replaces an open+read+parse per file per call. See [`FileCache`].
     session_cache: FileCache<SessionMeta>,
     claude_cache: FileCache<ClaudeMeta>,
+    /// Serializes the recovery journal's complete read-modify-atomic-write
+    /// transaction so concurrent connection/reap threads cannot lose appends.
+    recovery_lock: Mutex<()>,
 }
 
 /// Stat-keyed parse cache for small metadata files that are read far more
@@ -360,6 +368,7 @@ impl StateStore {
             root: root.into(),
             session_cache: FileCache::new(),
             claude_cache: FileCache::new(),
+            recovery_lock: Mutex::new(()),
         }
     }
 
@@ -393,6 +402,10 @@ impl StateStore {
 
     fn config_path(&self) -> PathBuf {
         self.root.join("config.toml")
+    }
+
+    fn recovery_events_path(&self) -> PathBuf {
+        self.root.join("recovery-events.json")
     }
 
     /// Atomically write `bytes` to `path`: create parent dirs, write a
@@ -771,6 +784,42 @@ impl StateStore {
         Err(error)
     }
 
+    /// Append one lifecycle record as a bounded atomic transaction.
+    pub fn append_recovery_event(&self, mut event: RecoveryEvent) -> anyhow::Result<RecoveryEvent> {
+        let _guard = self.recovery_lock.lock().unwrap();
+        let path = self.recovery_events_path();
+        let mut events = Self::read_json::<Vec<RecoveryEvent>>(&path)?.unwrap_or_default();
+        event.sequence = events.last().map_or(1, |previous| previous.sequence.wrapping_add(1).max(1));
+        event.level = match event.level.as_str() {
+            "warning" | "error" => event.level,
+            _ => "info".to_string(),
+        };
+        event.event = event.event.chars().take(80).collect();
+        event.session = event.session.map(|value| value.chars().take(200).collect());
+        event.detail = event.detail.chars().take(RECOVERY_DETAIL_CAP).collect();
+        events.push(event.clone());
+        if events.len() > RECOVERY_EVENT_CAP {
+            let overflow = events.len() - RECOVERY_EVENT_CAP;
+            events.drain(..overflow);
+        }
+        Self::write_json(&path, &events)?;
+        Ok(event)
+    }
+
+    /// Return the newest bounded suffix in chronological order.
+    pub fn list_recovery_events(&self, limit: u16) -> anyhow::Result<Vec<RecoveryEvent>> {
+        let _guard = self.recovery_lock.lock().unwrap();
+        let events = Self::read_json::<Vec<RecoveryEvent>>(&self.recovery_events_path())?
+            .unwrap_or_default();
+        let limit = if limit == 0 { 200 } else { usize::from(limit).min(RECOVERY_EVENT_CAP) };
+        Ok(events[events.len().saturating_sub(limit)..].to_vec())
+    }
+
+    pub fn clear_recovery_events(&self) -> anyhow::Result<()> {
+        let _guard = self.recovery_lock.lock().unwrap();
+        Self::write_json(&self.recovery_events_path(), &Vec::<RecoveryEvent>::new())
+    }
+
     pub fn write_scrollback(&self, name: &str, bytes: &[u8]) -> anyhow::Result<()> {
         Self::atomic_write(&self.scrollback_path(name), bytes)
     }
@@ -1130,7 +1179,7 @@ mod tests {
         const LEN: usize = 64 * 1024;
 
         let mut handles = Vec::new();
-        for byte in [b'a', b'b'] {
+        for byte in *b"ab" {
             let target = target.clone();
             handles.push(std::thread::spawn(move || {
                 let payload = vec![byte; LEN];
@@ -1841,5 +1890,65 @@ mod tests {
         let result = store.remove_session("never-existed");
 
         assert!(result.is_ok());
+    }
+
+    fn recovery(detail: &str) -> RecoveryEvent {
+        RecoveryEvent {
+            at: 10,
+            sequence: 0,
+            level: "info".into(),
+            event: "session.created".into(),
+            session: Some("s".into()),
+            detail: detail.into(),
+            code: None,
+        }
+    }
+
+    #[test]
+    fn recovery_journal_is_missing_safe_bounded_and_clearable() {
+        let dir = tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        assert!(store.list_recovery_events(0).unwrap().is_empty());
+        // Seed in one atomic write: 510 fsync-heavy appends would make this
+        // cap test dominate the suite without exercising anything extra.
+        let seeded: Vec<_> = (0..500).map(|index| {
+            let mut event = recovery(&format!("event-{index}"));
+            event.sequence = index + 1;
+            event
+        }).collect();
+        StateStore::write_json(&store.recovery_events_path(), &seeded).unwrap();
+        for index in 500..510 {
+            store.append_recovery_event(recovery(&format!("event-{index}"))).unwrap();
+        }
+        let events = store.list_recovery_events(500).unwrap();
+        assert_eq!(events.len(), 500);
+        assert_eq!(events.first().unwrap().detail, "event-10");
+        assert!(events.windows(2).all(|pair| pair[0].sequence < pair[1].sequence));
+        store.clear_recovery_events().unwrap();
+        assert!(store.list_recovery_events(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn recovery_journal_bounds_and_normalizes_fields() {
+        let dir = tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        let mut event = recovery(&"x".repeat(700));
+        event.level = "made-up".into();
+        event.event = "e".repeat(100);
+        let saved = store.append_recovery_event(event).unwrap();
+        assert_eq!(saved.level, "info");
+        assert_eq!(saved.detail.chars().count(), RECOVERY_DETAIL_CAP);
+        assert_eq!(saved.event.chars().count(), 80);
+        assert_eq!(saved.sequence, 1);
+    }
+
+    #[test]
+    fn malformed_recovery_journal_does_not_break_other_state() {
+        let dir = tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        store.write_session(&sample_session("healthy")).unwrap();
+        fs::write(dir.path().join("recovery-events.json"), b"not-json").unwrap();
+        assert!(store.list_recovery_events(10).is_err());
+        assert_eq!(store.read_session("healthy").unwrap().unwrap().name, "healthy");
     }
 }

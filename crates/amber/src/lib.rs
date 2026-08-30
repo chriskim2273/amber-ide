@@ -18,6 +18,7 @@ pub mod opencode;
 pub mod pi;
 pub mod procinfo;
 pub mod pty;
+pub mod search;
 pub mod supervisor;
 pub mod web;
 pub mod tailscale;

@@ -3,6 +3,7 @@
 
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -197,7 +198,9 @@ fn handle_connection(
     stream.set_write_timeout(Some(CLIENT_WRITE_TIMEOUT))?;
     let writer: SharedWriter = Arc::new(Mutex::new(stream.try_clone()?));
     let mut subscriptions: Subscriptions = Vec::new();
-    let result = connection_loop(&manager, &watchers, &writer, stream, &mut subscriptions);
+    let search_epoch = Arc::new(AtomicU64::new(0));
+    let result = connection_loop(&manager, &watchers, &writer, stream, &mut subscriptions, &search_epoch);
+    search_epoch.fetch_add(1, Ordering::Relaxed);
     // However the connection ended, release every subscription it held.
     for (_, sess, id) in subscriptions {
         sess.unsubscribe(id);
@@ -211,6 +214,7 @@ fn connection_loop(
     writer: &SharedWriter,
     mut read_half: UnixStream,
     subscriptions: &mut Subscriptions,
+    search_epoch: &Arc<AtomicU64>,
 ) -> anyhow::Result<()> {
     let mut decoder = Decoder::new();
     let mut buf = [0u8; 8192];
@@ -219,7 +223,7 @@ fn connection_loop(
         while let Some(decoded) = decoder.next_decoded()? {
             match decoded {
                 Decoded::Frame(frame) => {
-                    handle_frame(manager, watchers, writer, frame, subscriptions)
+                    handle_frame(manager, watchers, writer, frame, subscriptions, search_epoch)
                 }
                 // Forward-compat: a control body this build can't decode (e.g. a
                 // newer client's new message). Framing is length-prefixed and the
@@ -245,9 +249,10 @@ fn handle_frame(
     writer: &SharedWriter,
     frame: Frame,
     subscriptions: &mut Subscriptions,
+    search_epoch: &Arc<AtomicU64>,
 ) {
     match frame {
-        Frame::Control(msg) => handle_control(manager, watchers, writer, msg, subscriptions),
+        Frame::Control(msg) => handle_control(manager, watchers, writer, msg, subscriptions, search_epoch),
         Frame::Data { session, bytes } => {
             // Input from the client: forward to the child's stdin. A stale
             // session name is not fatal to the connection — log and carry on.
@@ -268,16 +273,20 @@ fn handle_control(
     writer: &SharedWriter,
     msg: ControlMsg,
     subscriptions: &mut Subscriptions,
+    search_epoch: &Arc<AtomicU64>,
 ) {
     match msg {
         ControlMsg::Create { name, cwd, kind } => {
-            let result = parse_kind(&kind).and_then(|k| manager.create(&name, cwd, k));
+            let result = parse_kind(&kind).and_then(|k| manager.create(&name, cwd.clone(), k));
             let reply = match &result {
                 Ok(_) => ControlMsg::Created { name: name.clone() },
                 Err(e) => ControlMsg::Error { msg: e.to_string() },
             };
             let _ = write_frame(writer, &Frame::Control(reply));
             if result.is_ok() {
+                // Publish daemon truth before the fsync-backed journal append.
+                // Otherwise a watcher that subscribes after the Created ack can
+                // receive a duplicate added-only delta after its full snapshot.
                 if let Ok(infos) = manager.session_infos() {
                     if let Some(info) = infos.into_iter().find(|i| i.name == name) {
                         watchers.broadcast(&ControlMsg::SessionsChanged {
@@ -286,6 +295,10 @@ fn handle_control(
                         });
                     }
                 }
+                manager.record_recovery_event(
+                    "info", "session.created", Some(&name),
+                    format!("created {kind} session in {cwd}"), None,
+                );
             }
         }
         ControlMsg::ListSessions => {
@@ -455,19 +468,32 @@ fn handle_control(
         // watchers. On success, no reply (fire-and-forget, like ReportRunState);
         // only a failure gets a small Error frame.
         ControlMsg::Suspend { name } => {
-            if let Err(e) = manager.suspend(&name, SuspendOrigin::Manual) {
-                let _ = write_frame(
-                    writer,
-                    &Frame::Control(ControlMsg::Error { msg: e.to_string() }),
-                );
+            match manager.suspend(&name, SuspendOrigin::Manual) {
+                Ok(()) => manager.record_recovery_event(
+                    "info", "session.suspended", Some(&name),
+                    "manually suspended", None,
+                ),
+                Err(e) => {
+                    let _ = write_frame(
+                        writer,
+                        &Frame::Control(ControlMsg::Error { msg: e.to_string() }),
+                    );
+                }
             }
         }
         ControlMsg::Resume { name } => {
-            if let Err(e) = manager.resume(&name, ResumeCause::Manual) {
-                let _ = write_frame(
-                    writer,
-                    &Frame::Control(ControlMsg::Error { msg: e.to_string() }),
-                );
+            match manager.resume(&name, ResumeCause::Manual) {
+                Ok(true) => manager.record_recovery_event(
+                    "info", "session.resumed", Some(&name),
+                    "manually resumed", None,
+                ),
+                Ok(false) => {}
+                Err(e) => {
+                    let _ = write_frame(
+                        writer,
+                        &Frame::Control(ControlMsg::Error { msg: e.to_string() }),
+                    );
+                }
             }
         }
         ControlMsg::SetMemoryBudget { mb } => {
@@ -529,10 +555,67 @@ fn handle_control(
                 let _ = write_frame(&writer, &Frame::Backlog { session: name, bytes });
             });
         }
+        ControlMsg::SearchScrollback { request_id, query, names, limit } => {
+            // Validate tiny request bounds inline, then move scoped ring copies,
+            // scan, and response write off the multiplexed connection's read
+            // thread. A newer request on this connection cancels stale work.
+            if crate::search::validate_query(&query).is_err()
+                || names.len() > 1_000
+                || names.iter().any(|name| name.len() > 512)
+            {
+                let _ = write_frame(
+                    writer,
+                    &Frame::Control(ControlMsg::Error {
+                        msg: "invalid scrollback search request".to_string(),
+                    }),
+                );
+                return;
+            }
+            let manager = Arc::clone(manager);
+            let writer = Arc::clone(writer);
+            let search_epoch = Arc::clone(search_epoch);
+            let token = search_epoch.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+            thread::spawn(move || {
+                let cancelled = || search_epoch.load(Ordering::Relaxed) != token;
+                let reply = match manager.search_scrollback_cancellable(&query, &names, limit, &cancelled) {
+                    Ok(Some(results)) => Some(ControlMsg::SearchResults { request_id, query, results }),
+                    Ok(None) => None,
+                    Err(error) => Some(ControlMsg::Error { msg: error.to_string() }),
+                };
+                if let Some(reply) = reply {
+                    let _ = write_frame(&writer, &Frame::Control(reply));
+                }
+            });
+        }
         ControlMsg::Snapshot => {
             let reply = match manager.snapshot() {
-                Ok(()) => ControlMsg::SnapshotOk,
-                Err(e) => ControlMsg::Error { msg: e.to_string() },
+                Ok(()) => {
+                    manager.record_recovery_event(
+                        "info", "snapshot.completed", None,
+                        "explicit snapshot completed", None,
+                    );
+                    ControlMsg::SnapshotOk
+                }
+                Err(e) => {
+                    manager.record_recovery_event(
+                        "error", "snapshot.failed", None, e.to_string(), None,
+                    );
+                    ControlMsg::Error { msg: e.to_string() }
+                }
+            };
+            let _ = write_frame(writer, &Frame::Control(reply));
+        }
+        ControlMsg::ListRecoveryEvents { limit } => {
+            let reply = match manager.recovery_events(limit) {
+                Ok(events) => ControlMsg::RecoveryEvents { events },
+                Err(error) => ControlMsg::Error { msg: error.to_string() },
+            };
+            let _ = write_frame(writer, &Frame::Control(reply));
+        }
+        ControlMsg::ClearRecoveryEvents => {
+            let reply = match manager.clear_recovery_events() {
+                Ok(()) => ControlMsg::RecoveryEventsCleared,
+                Err(error) => ControlMsg::Error { msg: error.to_string() },
             };
             let _ = write_frame(writer, &Frame::Control(reply));
         }
@@ -549,8 +632,12 @@ fn handle_control(
                 Ok(()) if existed => {
                     watchers.broadcast(&ControlMsg::SessionsChanged {
                         added: vec![],
-                        removed: vec![name],
+                        removed: vec![name.clone()],
                     });
+                    manager.record_recovery_event(
+                        "info", "session.killed", Some(&name),
+                        "session killed by client request", None,
+                    );
                 }
                 Ok(()) => {}
                 Err(error) => {
@@ -622,8 +709,12 @@ fn handle_control(
             // surface (and the app's decoder) is unchanged.
             watchers.broadcast(&ControlMsg::SessionsChanged {
                 added: vec![info],
-                removed: vec![from],
+                removed: vec![from.clone()],
             });
+            manager.record_recovery_event(
+                "info", "session.renamed", Some(&to),
+                format!("renamed from {from}"), None,
+            );
             let _ = write_frame(writer, &Frame::Control(ControlMsg::Created { name: to }));
         }
         // Hello and daemon->client-only variants: no-op. Well-formed but

@@ -1359,6 +1359,58 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   into the app after clicking Restart; the exact packaged artifact passed the
   real-X physical-key smoke against a private daemon.
 
+- [x] Productivity & continuity suite (2026-08-30) — ten persistence-aligned
+  capabilities shipped together: universal command palette; cancellable
+  daemon-side global scrollback search over scoped point-in-time ring copies;
+  a bounded atomic recovery-event journal and filtered recovery center;
+  reusable workspace templates; actionable desktop notifications with
+  preference/mute/dedup policy; durable semantic terminal bookmarks; an
+  activity overview with daemon-derived state/memory; strict non-executable
+  project-local `.amber.toml` profiles; named `.amberws` restore points with
+  automatic preflight before destructive multi-session actions; and bounded
+  single-session `.amberhandoff` export. Daemon authority and one-way lifecycle
+  flow remain intact; search/dump work stays off connection read threads; web
+  and SSH-remote bridges gain no privileged productivity operations. Final
+  review:
+  `docs/superpowers/reviews/2026-08-30-productivity-continuity-suite-implementation-review.md`.
+  Review fixes closed a watcher/journal ordering race, full-file checkpoint
+  index parsing, stale/unscoped search work, queued-productivity CAS clobber,
+  stale project review state, and symlink/size/schema file-boundary gaps.
+  Gates ran only from the NVMe mirror: Rust 622 passed twice serially with one
+  intentional ignore; warnings-as-errors clippy clean; app 616 passed with one
+  intentional skip; strict typecheck plus Electron/web production builds
+  green. Isolated xvfb+CDP/private-daemon proof covered real PTY search→FindBar,
+  bookmark capture/delete, template instantiate, daemon-restart and poison-
+  restore history, restore-point create/restore, accepted/rejected project
+  profiles, palette, and five-session activity. Native OS-notification clicking
+  and the native handoff save modal remain manual environment gestures; full
+  rustfmt still has the repository-wide pre-existing drift.
+
+- [x] Preset input slots (2026-08-30) — the desktop productivity store now
+  carries 20 stable numbered slots for reusable terminal text. Slots are
+  managed from Tools/command palette and, once any exist, every live terminal
+  header exposes a direct preset button; selecting a slot types its contents
+  into exactly that pane without sending Enter. The pane menu offers the same
+  picker. Stored values are shape/size bounded, reject all Unicode control
+  characters (including newline, tab, escape, and carriage return), survive
+  CAS replay/app restart, and are explicitly labeled as local plaintext so
+  secrets are not implied safe. Browser/editor panes and web/remote bridges do
+  not receive this desktop-only input authority.
+
+- [x] Shift+Enter for Pi launched from shell panes (2026-08-30) — the earlier
+  fix selected CSI-u from the daemon's static session kind, so a supervised
+  `kind:"pi"` pane worked while typing `pi` inside an ordinary shell pane still
+  sent Amber's Claude-compatible Meta+Enter fallback; current Pi interpreted
+  that as follow-up/submit instead of newline. `Pane` now tracks only the live
+  Kitty keyboard / xterm modifyOtherKeys mode-control sequences in pty output
+  (bounded streaming recognizer, including split Data frames) and encodes
+  Shift+Enter for the negotiated mode. It resets before re-attach backlog
+  replay, while programs that negotiate neither keep the shell-safe Meta+Enter
+  fallback. TDD covers Kitty, realistic Pi fallback negotiation, chunk splits,
+  disable, and legacy behavior. Live xvfb+CDP proof against Pi 0.84.4 covered
+  both a supervised Pi pane and Pi launched manually inside a shell pane: text
+  stayed as two editor lines and was not submitted.
+
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**
   `std::io::Read` (dedicated thread); `take_writer()` is one-shot;
