@@ -31,6 +31,8 @@ contextBridge.exposeInMainWorld('amber', {
   // Request the daemon dump a session's scrollback ring; the reply arrives as a
   // `Backlog` control frame via onDaemonEvent (correlated by name renderer-side).
   dumpBacklog: (name: string) => ipcRenderer.send('daemon-command', { cmd: 'dumpBacklog', name }),
+  searchScrollback: (requestId: number, query: string, names: string[], limit: number) =>
+    ipcRenderer.send('daemon-command', { cmd: 'searchScrollback', requestId, query, names, limit }),
   // Memory budget: view (`getMemoryBudget`) / change (`setMemoryBudget`, MiB;
   // 0 = auto). The `BudgetApplied` reply arrives via onDaemonEvent.
   getMemoryBudget: () => ipcRenderer.send('daemon-command', { cmd: 'getMemoryBudget' }),

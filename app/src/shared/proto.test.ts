@@ -37,6 +37,34 @@ describe('proto', () => {
     expect(new TextDecoder().decode(encode(confirmation).slice(5))).toBe('"SnapshotOk"')
   })
 
+  it('roundtrips scrollback search requests and strict result replies', () => {
+    const request: Frame = {
+      type: 'control',
+      msg: { kind: 'SearchScrollback', request_id: 9, query: 'needle', names: ['a'], limit: 25 },
+    }
+    expect(roundtrip(request)).toEqual(request)
+    expect(new TextDecoder().decode(encode(request).slice(5)))
+      .toBe('{"SearchScrollback":{"request_id":9,"query":"needle","names":["a"],"limit":25}}')
+
+    const reply = decodeControlJson(
+      '{"SearchResults":{"request_id":9,"query":"needle","results":[{"name":"a","line":2,"preview":"a needle"}]}}',
+    )
+    expect(reply).toEqual({
+      type: 'control',
+      msg: { kind: 'SearchResults', request_id: 9, query: 'needle', results: [{ name: 'a', line: 2, preview: 'a needle' }] },
+    })
+    expect(() => decodeControlJson(
+      '{"SearchResults":{"request_id":9,"query":"needle","results":[{"name":"a","line":"2","preview":"x"}]}}',
+    )).toThrow(/line/)
+  })
+
+  it('decodes additive defaults on a search request', () => {
+    expect(decodeControlJson('{"SearchScrollback":{"request_id":1,"query":"x"}}')).toEqual({
+      type: 'control',
+      msg: { kind: 'SearchScrollback', request_id: 1, query: 'x', names: [], limit: 0 },
+    })
+  })
+
   it('roundtrips a data frame preserving raw bytes', () => {
     const bytes = new Uint8Array([0, 1, 255, 0, 27, 91, 50, 74])
     const f: Frame = { type: 'data', session: 's', bytes }

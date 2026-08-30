@@ -9,6 +9,12 @@ export function isDaemonSessionKind(kind: unknown): kind is DaemonSessionKind {
     || kind === 'opencode' || kind === 'hermes' || kind === 'pi'
 }
 
+export interface SearchResult {
+  name: string
+  line: number
+  preview: string
+}
+
 export interface SessionInfo {
   name: string
   cwd: string
@@ -62,6 +68,8 @@ export type ControlMsg =
   | { kind: 'Detach'; name: string }
   | { kind: 'Focus'; name: string }
   | { kind: 'DumpBacklog'; name: string }
+  | { kind: 'SearchScrollback'; request_id: number; query: string; names: string[]; limit: number }
+  | { kind: 'SearchResults'; request_id: number; query: string; results: SearchResult[] }
   | { kind: 'Backlog'; name: string; data: Uint8Array }
   | { kind: 'Kill'; name: string }
   | { kind: 'Rename'; from: string; to: string }
@@ -135,6 +143,10 @@ function msgToJson(m: ControlMsg): unknown {
       return { Focus: { name: m.name } }
     case 'DumpBacklog':
       return { DumpBacklog: { name: m.name } }
+    case 'SearchScrollback':
+      return { SearchScrollback: { request_id: m.request_id, query: m.query, names: m.names, limit: m.limit } }
+    case 'SearchResults':
+      return { SearchResults: { request_id: m.request_id, query: m.query, results: m.results } }
     case 'Backlog':
       // serde encodes Vec<u8> as a JSON numeric array (not base64); mirror it.
       return { Backlog: { name: m.name, data: Array.from(m.data) } }
@@ -206,6 +218,21 @@ function jsonToMsg(v: unknown): ControlMsg | null {
       case 'Detach': return { kind: 'Detach', name: body['name'] as string }
       case 'Focus': return { kind: 'Focus', name: body['name'] as string }
       case 'DumpBacklog': return { kind: 'DumpBacklog', name: body['name'] as string }
+      case 'SearchScrollback':
+        return {
+          kind: 'SearchScrollback',
+          request_id: numberField(body, 'request_id'),
+          query: stringField(body, 'query'),
+          names: stringArrayField(body, 'names', []),
+          limit: optionalNumberField(body, 'limit', 0),
+        }
+      case 'SearchResults':
+        return {
+          kind: 'SearchResults',
+          request_id: numberField(body, 'request_id'),
+          query: stringField(body, 'query'),
+          results: decodeSearchResults(body['results']),
+        }
       // serde encodes Vec<u8> as a JSON numeric array; rebuild the Uint8Array.
       case 'Backlog': return { kind: 'Backlog', name: body['name'] as string, data: Uint8Array.from(body['data'] as number[]) }
       case 'Kill': return { kind: 'Kill', name: body['name'] as string }
@@ -257,6 +284,42 @@ function jsonToMsg(v: unknown): ControlMsg | null {
     }
   }
   throw new Error('malformed control value')
+}
+
+function stringField(body: Record<string, unknown>, key: string): string {
+  const value = body[key]
+  if (typeof value !== 'string') throw new Error(`invalid ${key}`)
+  return value
+}
+
+function numberField(body: Record<string, unknown>, key: string): number {
+  const value = body[key]
+  if (typeof value !== 'number' || !Number.isFinite(value)) throw new Error(`invalid ${key}`)
+  return value
+}
+
+function optionalNumberField(body: Record<string, unknown>, key: string, fallback: number): number {
+  return body[key] === undefined ? fallback : numberField(body, key)
+}
+
+function stringArrayField(body: Record<string, unknown>, key: string, fallback: string[]): string[] {
+  const value = body[key]
+  if (value === undefined) return fallback
+  if (!Array.isArray(value) || !value.every((entry) => typeof entry === 'string')) throw new Error(`invalid ${key}`)
+  return [...value]
+}
+
+function decodeSearchResults(value: unknown): SearchResult[] {
+  if (!Array.isArray(value)) throw new Error('invalid search results')
+  return value.map((result) => {
+    if (!result || typeof result !== 'object') throw new Error('invalid search result')
+    const body = result as Record<string, unknown>
+    return {
+      name: stringField(body, 'name'),
+      line: numberField(body, 'line'),
+      preview: stringField(body, 'preview'),
+    }
+  })
 }
 
 function decodeSessionInfos(value: unknown): SessionInfo[] {

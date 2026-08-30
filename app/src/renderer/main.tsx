@@ -45,6 +45,8 @@ declare global {
       resumeSession: (name: string) => void
       focusSession: (name: string) => void
       dumpBacklog: (name: string) => void
+      // Desktop-only; amber-web intentionally does not widen its control whitelist.
+      searchScrollback?: (requestId: number, query: string, names: string[], limit: number) => void
       // Memory budget view/change; the BudgetApplied reply arrives via
       // onDaemonEvent. mb is MiB, 0 = auto.
       getMemoryBudget: () => void

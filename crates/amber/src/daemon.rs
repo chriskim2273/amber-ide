@@ -529,6 +529,34 @@ fn handle_control(
                 let _ = write_frame(&writer, &Frame::Backlog { session: name, bytes });
             });
         }
+        ControlMsg::SearchScrollback { request_id, query, names, limit } => {
+            // Validate tiny request bounds inline, then move every ring copy,
+            // scan, and response write off the multiplexed connection's read
+            // thread. A search must never queue Create/Kill/Resize behind it.
+            let chars = query.trim().chars().count();
+            if chars == 0 || chars > 256 || names.len() > 1_000 {
+                let _ = write_frame(
+                    writer,
+                    &Frame::Control(ControlMsg::Error {
+                        msg: "invalid scrollback search request".to_string(),
+                    }),
+                );
+                return;
+            }
+            let manager = Arc::clone(manager);
+            let writer = Arc::clone(writer);
+            thread::spawn(move || {
+                let reply = match manager.search_scrollback(&query, &names, limit) {
+                    Ok(results) => ControlMsg::SearchResults {
+                        request_id,
+                        query,
+                        results,
+                    },
+                    Err(error) => ControlMsg::Error { msg: error.to_string() },
+                };
+                let _ = write_frame(&writer, &Frame::Control(reply));
+            });
+        }
         ControlMsg::Snapshot => {
             let reply = match manager.snapshot() {
                 Ok(()) => ControlMsg::SnapshotOk,

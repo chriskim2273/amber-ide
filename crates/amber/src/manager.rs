@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use amber_core::proto::{ControlMsg, SessionInfo};
+use amber_core::proto::{ControlMsg, SearchResult, SessionInfo};
 use amber_core::state::{Config, SessionKind, SessionMeta, StateStore};
 use portable_pty::CommandBuilder;
 
@@ -1731,6 +1731,29 @@ impl SessionManager {
         let mut v: Vec<String> = self.sessions.lock().unwrap().keys().cloned().collect();
         v.sort();
         v
+    }
+
+    /// Search point-in-time copies of retained rings. The session-table lock is
+    /// held only while cloning Arcs; each ring is copied with that lock released,
+    /// and text processing occurs after every daemon-wide lock is gone.
+    pub fn search_scrollback(
+        &self,
+        query: &str,
+        names: &[String],
+        limit: u16,
+    ) -> anyhow::Result<Vec<SearchResult>> {
+        let handles: Vec<(String, Arc<PtySession>)> = self
+            .sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, session)| (name.clone(), Arc::clone(session)))
+            .collect();
+        let snapshots: Vec<(String, Vec<u8>)> = handles
+            .into_iter()
+            .map(|(name, session)| (name, session.scrollback()))
+            .collect();
+        crate::search::search_snapshots(query, &snapshots, names, limit)
     }
 
     /// One [`SessionInfo`] per live session, joining the live table (existence
