@@ -115,3 +115,30 @@ overwrite failure before the bounded retry. Native strict
 `cargo test -q -p amber-core` passed **116 tests**, and local strict clippy
 passed. Codebase-memory MCP was unavailable in this session, so the durability
 path was traced by direct source search instead.
+
+## Review follow-up: durable Windows removal
+
+Windows `sync_dir` cannot establish deletion durability, so `remove_durable`
+now moves a regular authoritative file to a unique same-directory
+`.tombstone` name with `MoveFileExW(MOVEFILE_WRITE_THROUGH)` before attempting
+to delete that tombstone. A crash can therefore leave only an ignored
+tombstone—never the original session metadata or rename journal name. Missing
+sources remain successful; non-files fail rather than moving an obstruction and
+prematurely clearing the durable journal. Unix removal remains `remove_file`
+plus parent-directory fsync.
+
+The Windows replace path now removes its unique temporary file best-effort when
+the replacement itself fails. Its bounded retry for native `ERROR_ACCESS_DENIED`
+and sharing/lock violations backs off from 1 ms to 25 ms rather than yielding in
+a CPU spin; persistent errors still propagate. The existing thread-contention
+test covers the observed native collision. Cross-process contention remains a
+residual risk not independently injected here, but it uses the same
+replace-existing write-through primitive and bounded retry.
+
+Added a Windows-only state test proving the real tombstone move removes the
+authoritative `.json` name, is ignored by session listing, and is cleaned in
+the ordinary success path. On `potato-server` Windows/MSVC,
+`cargo test -q -p amber-core` passed **116 passed, 0 failed** and strict
+`RUSTFLAGS='-Dwarnings' cargo clippy -q -p amber-core` passed. Local Linux
+`cargo test -q -p amber-core` passed **116 tests**, strict clippy passed, and
+the Windows test target cross-checked successfully.

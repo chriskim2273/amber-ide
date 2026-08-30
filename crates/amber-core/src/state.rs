@@ -23,6 +23,9 @@ use crate::proto::RecoveryEvent;
 
 const RECOVERY_EVENT_CAP: usize = 500;
 const RECOVERY_DETAIL_CAP: usize = 512;
+/// Unique across concurrent state writes and Windows removal tombstones in
+/// this process. The pid disambiguates processes.
+static STATE_FILE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Kind of a persisted session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -414,7 +417,6 @@ impl StateStore {
     /// counter (unique across threads) — a pid-only name let two threads of
     /// the same process share a tmp path and interleave write/rename.
     fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let parent = path
             .parent()
             .ok_or_else(|| anyhow::anyhow!("path has no parent: {}", path.display()))?;
@@ -423,13 +425,19 @@ impl StateStore {
             .file_name()
             .ok_or_else(|| anyhow::anyhow!("path has no file name: {}", path.display()))?
             .to_string_lossy();
-        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let seq = STATE_FILE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp_path = parent.join(format!("{file_name}.{}.{seq}.tmp", std::process::id()));
         let mut tmp = fs::File::create(&tmp_path)?;
         tmp.write_all(bytes)?;
         tmp.sync_all()?;
         drop(tmp);
-        Self::replace_atomic(&tmp_path, path)?;
+        if let Err(error) = Self::replace_atomic(&tmp_path, path) {
+            // A failed replacement leaves the old authoritative file intact;
+            // clean our unique temporary file if possible without obscuring
+            // the real replacement error.
+            let _ = fs::remove_file(&tmp_path);
+            return Err(error);
+        }
         Self::sync_dir(parent)?;
         Ok(())
     }
@@ -446,51 +454,60 @@ impl StateStore {
 
     #[cfg(windows)]
     fn replace_atomic(tmp_path: &Path, path: &Path) -> anyhow::Result<()> {
-        use std::os::windows::ffi::OsStrExt;
         use std::time::{Duration, Instant};
         use windows_sys::Win32::Foundation::{
             ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION,
         };
+        let mut retry_delay = Duration::from_millis(1);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match Self::move_file_write_through(tmp_path, path, true) {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if matches!(
+                        error.raw_os_error().map(|code| code as u32),
+                        Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)
+                    ) && Instant::now() < deadline =>
+                {
+                    // A competing atomic replacement temporarily holds the
+                    // name. Keep both files intact and retry the documented
+                    // primitive; never create a delete-then-rename exposure
+                    // window or spin.
+                    std::thread::sleep(retry_delay);
+                    retry_delay = (retry_delay * 2).min(Duration::from_millis(25));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn move_file_write_through(from: &Path, to: &Path, replace: bool) -> std::io::Result<()> {
+        use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Storage::FileSystem::{
             MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
         };
 
-        let from: Vec<u16> = tmp_path
+        let from: Vec<u16> = from
             .as_os_str()
             .encode_wide()
             .chain(std::iter::once(0))
             .collect();
-        let to: Vec<u16> = path
+        let to: Vec<u16> = to
             .as_os_str()
             .encode_wide()
             .chain(std::iter::once(0))
             .collect();
-        let deadline = Instant::now() + Duration::from_secs(1);
-        loop {
-            if unsafe {
-                MoveFileExW(
-                    from.as_ptr(),
-                    to.as_ptr(),
-                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-                )
-            } != 0
-            {
-                return Ok(());
-            }
-            let error = std::io::Error::last_os_error();
-            if matches!(
-                error.raw_os_error().map(|code| code as u32),
-                Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)
-            ) && Instant::now() < deadline
-            {
-                // A competing atomic replacement temporarily holds the name.
-                // Keep both files intact and retry the documented primitive;
-                // never create a delete-then-rename exposure window.
-                std::thread::yield_now();
-                continue;
-            }
-            return Err(error.into());
+        let flags = MOVEFILE_WRITE_THROUGH
+            | if replace {
+                MOVEFILE_REPLACE_EXISTING
+            } else {
+                0
+            };
+        if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), flags) } == 0 {
+            return Err(std::io::Error::last_os_error());
         }
+        Ok(())
     }
 
     #[cfg(not(windows))]
@@ -506,12 +523,68 @@ impl StateStore {
         Ok(())
     }
 
+    #[cfg(not(windows))]
     fn remove_durable(path: &Path) -> anyhow::Result<()> {
         match fs::remove_file(path) {
             Ok(()) => {
                 if let Some(parent) = path.parent() {
                     Self::sync_dir(parent)?;
                 }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    }
+
+    /// A Windows directory cannot be fsynced through `std::fs::File`. Move an
+    /// authoritative file to a same-directory ignored name with write-through
+    /// semantics first, so a crash can leave only a harmless tombstone rather
+    /// than resurrecting the original session or rename journal.
+    #[cfg(windows)]
+    fn move_to_tombstone(path: &Path) -> std::io::Result<PathBuf> {
+        if !fs::symlink_metadata(path)?.file_type().is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("refusing to tombstone a non-file: {}", path.display()),
+            ));
+        }
+        let parent = path
+            .parent()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("path has no parent: {}", path.display()),
+                )
+            })?;
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("path has no file name: {}", path.display()),
+                )
+            })?
+            .to_string_lossy();
+        let seq = STATE_FILE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // `.tombstone` is deliberately not `.json`/`.bin`, so normal session
+        // listing can never treat it as a live artifact after a crash.
+        let tombstone = parent.join(format!(
+            ".{file_name}.{}.{}.tombstone",
+            std::process::id(),
+            seq
+        ));
+        Self::move_file_write_through(path, &tombstone, false)?;
+        Ok(tombstone)
+    }
+
+    #[cfg(windows)]
+    fn remove_durable(path: &Path) -> anyhow::Result<()> {
+        match Self::move_to_tombstone(path) {
+            Ok(tombstone) => {
+                // The durable commit is the write-through move. A failed
+                // deletion only leaves an ignored tombstone for later hygiene.
+                let _ = fs::remove_file(tombstone);
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
@@ -1231,6 +1304,35 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
             .collect();
         assert_eq!(entries, vec!["alpha.json".to_string()]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn durable_removal_hides_authoritative_name_before_tombstone_cleanup() {
+        let dir = tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        store.write_session(&sample_session("vanished")).unwrap();
+        let source = store.session_path("vanished");
+
+        // This is the durable half of Windows removal: a crash after this
+        // point can expose only the ignored tombstone, never `vanished.json`.
+        let tombstone = StateStore::move_to_tombstone(&source).unwrap();
+        assert!(!source.exists(), "authoritative session name survived move");
+        assert!(tombstone.exists());
+        assert_eq!(tombstone.extension().and_then(|ext| ext.to_str()), Some("tombstone"));
+        assert!(store.list_sessions().unwrap().is_empty());
+
+        fs::remove_file(&tombstone).unwrap();
+        store.write_session(&sample_session("removed")).unwrap();
+        let source = store.session_path("removed");
+        StateStore::remove_durable(&source).unwrap();
+        assert!(!source.exists());
+        assert!(
+            fs::read_dir(store.sessions_dir())
+                .unwrap()
+                .all(|entry| !entry.unwrap().file_name().to_string_lossy().ends_with(".tombstone")),
+            "best-effort cleanup left a tombstone in the ordinary success path"
+        );
     }
 
     #[test]
