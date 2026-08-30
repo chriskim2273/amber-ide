@@ -566,18 +566,34 @@ impl StateStore {
                 )
             })?
             .to_string_lossy();
-        let seq = STATE_FILE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // `.tombstone` is deliberately not `.json`/`.bin`, so normal session
-        // listing can never treat it as a live artifact after a crash.
-        let tombstone = parent.join(format!(
-            ".{file_name}.{}.{}.tombstone",
-            std::process::id(),
-            seq
-        ));
-        Self::move_file_write_through(path, &tombstone, false)?;
-        #[cfg(test)]
-        durable_remove_probe::record(path, &tombstone);
-        Ok(tombstone)
+        let mut collision = None;
+        for _ in 0..64 {
+            let seq = STATE_FILE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // `.tombstone` is deliberately not `.json`/`.bin`, so normal session
+            // listing can never treat it as a live artifact after a crash.
+            let tombstone = parent.join(format!(
+                ".{file_name}.{}.{}.tombstone",
+                std::process::id(),
+                seq
+            ));
+            match Self::move_file_write_through(path, &tombstone, false) {
+                Ok(()) => {
+                    #[cfg(test)]
+                    durable_remove_probe::record(path, &tombstone);
+                    return Ok(tombstone);
+                }
+                Err(error) if Self::is_tombstone_collision(&error) => {
+                    collision = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(collision.unwrap_or_else(|| {
+            std::io::Error::other(format!(
+                "could not allocate a tombstone name for {}",
+                path.display()
+            ))
+        }))
     }
 
     #[cfg(windows)]
@@ -592,6 +608,16 @@ impl StateStore {
             Err(error) => return Err(error.into()),
         }
         Ok(())
+    }
+
+    #[cfg(windows)]
+    fn is_tombstone_collision(error: &std::io::Error) -> bool {
+        use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS};
+
+        matches!(
+            error.raw_os_error().map(|code| code as u32),
+            Some(ERROR_ALREADY_EXISTS | ERROR_FILE_EXISTS)
+        )
     }
 
     /// Read and deserialize a JSON file, returning `Ok(None)` if it doesn't
@@ -1347,6 +1373,39 @@ mod tests {
                 .all(|entry| !entry.unwrap().file_name().to_string_lossy().ends_with(".tombstone")),
             "best-effort cleanup left a tombstone in the ordinary success path"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn durable_removal_retries_when_tombstone_name_already_exists() {
+        // Catches a stale-crash tombstone blocking the no-replace Windows
+        // move. A correct removal must keep the stale ignored file intact and
+        // commit the authoritative source to a different tombstone name.
+        let dir = tempdir().unwrap();
+        let _ = durable_remove_probe::take();
+        let store = StateStore::new(dir.path());
+        store.write_session(&sample_session("collides")).unwrap();
+        let source = store.session_path("collides");
+        let parent = source.parent().unwrap();
+        let file_name = source.file_name().unwrap().to_string_lossy();
+        let seq = 9_000_000_000u64;
+        STATE_FILE_SEQ.store(seq, std::sync::atomic::Ordering::SeqCst);
+        let colliding_tombstone = parent.join(format!(
+            ".{file_name}.{}.{}.tombstone",
+            std::process::id(),
+            seq
+        ));
+        fs::write(&colliding_tombstone, b"stale crash tombstone").unwrap();
+
+        StateStore::remove_durable(&source).unwrap();
+
+        assert!(!source.exists(), "authoritative session name survived removal");
+        assert_eq!(fs::read(&colliding_tombstone).unwrap(), b"stale crash tombstone");
+        let moves = durable_remove_probe::take();
+        let (_, tombstone) = moves.last().expect("move was not recorded");
+        assert_ne!(tombstone, &colliding_tombstone);
+        assert_eq!(tombstone.extension().and_then(|ext| ext.to_str()), Some("tombstone"));
+        assert!(store.list_sessions().unwrap().is_empty());
     }
 
     #[test]
