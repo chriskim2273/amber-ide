@@ -492,7 +492,7 @@ pub fn default_shell() -> OsString {
     }
 }
 
-pub(crate) fn user_home() -> Option<PathBuf> {
+pub fn user_home() -> Option<PathBuf> {
     user_home_from(std::env::var_os("HOME"), std::env::var_os("USERPROFILE"))
 }
 

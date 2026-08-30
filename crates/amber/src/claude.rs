@@ -294,15 +294,24 @@ pub fn ensure_global_claude_hook(hook_command: &str) {
 /// True for `"<path> hook"` where `<path>` is an amber binary that is NOT on
 /// disk any more — i.e. a hook left behind by an amber that has been deleted
 /// (typically a dev build in a removed git worktree). Deliberately narrow: the
-/// command must be exactly two whitespace-separated words, the second `hook`,
-/// and the first must end in `amber`, so a user's unrelated SessionStart hook
-/// can never match. Shared with the codex global-hook installer.
+/// command must end in exactly ` hook`; its path is either one unquoted word or
+/// one double-quoted path, and its filename must be `amber` or `amber.exe`.
+/// Shared with the codex global-hook installer.
 pub(crate) fn is_dangling_amber_hook(command: &str) -> bool {
-    let mut parts = command.split_whitespace();
-    let (Some(path), Some("hook"), None) = (parts.next(), parts.next(), parts.next()) else {
+    let Some(raw_path) = command.strip_suffix(" hook") else {
         return false;
     };
-    Path::new(path).file_name().is_some_and(|f| f == "amber") && !Path::new(path).exists()
+    let path = match raw_path.strip_prefix('"').and_then(|path| path.strip_suffix('"')) {
+        Some(path) if !path.is_empty() && !path.contains('"') => path,
+        Some(_) => return false,
+        None if !raw_path.chars().any(char::is_whitespace) => raw_path,
+        None => return false,
+    };
+    let is_amber = Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("amber") || name.eq_ignore_ascii_case("amber.exe"));
+    is_amber && !Path::new(path).exists()
 }
 
 fn add_global_hook_in(config: &Path, hook_command: &str) {
@@ -748,6 +757,14 @@ mod tests {
             cmds.iter().any(|c| c == "~/.claude/hooks/unrelated"),
             "a hook that is not ours is never touched, got {cmds:?}"
         );
+    }
+
+    #[test]
+    fn dangling_hook_recognizes_quoted_windows_cli_path() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("Ada Lovelace").join("amber.exe");
+        let command = format!(r#""{}" hook"#, missing.display());
+        assert!(is_dangling_amber_hook(&command));
     }
 
     #[test]

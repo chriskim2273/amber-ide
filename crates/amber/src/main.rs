@@ -411,11 +411,8 @@ fn run_doctor(root: Option<PathBuf>) -> anyhow::Result<()> {
 }
 
 fn codex_skill_home() -> anyhow::Result<PathBuf> {
-    std::env::var("HOME")
-        .ok()
-        .filter(|home| !home.is_empty())
-        .map(PathBuf::from)
-        .ok_or_else(|| anyhow::anyhow!("amber ctl: HOME must be set and non-empty"))
+    amber::platform::user_home()
+        .ok_or_else(|| anyhow::anyhow!("amber ctl: HOME or USERPROFILE must be set and non-empty"))
 }
 
 fn codex_skill_conflict_warning() {
@@ -917,7 +914,7 @@ fn run_ctl_web(
     }
     let root = amber::platform::resolve_state_root(root)?;
     std::fs::create_dir_all(&root)?;
-    let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".into()));
+    let home = amber::platform::user_home().unwrap_or_else(|| PathBuf::from("."));
     let unit = amber::webctl::unit_path(&home);
 
     match action {
@@ -1187,7 +1184,7 @@ fn shorten_home(path: &str, home: &str) -> String {
         return "~".to_string();
     }
     match path.strip_prefix(home) {
-        Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+        Some(rest) if rest.starts_with(['/', '\\']) => format!("~{rest}"),
         _ => path.to_string(),
     }
 }
@@ -1220,7 +1217,9 @@ fn run_ls(socket: &Path) -> anyhow::Result<()> {
             // dies. Listing ORDER stays by name — stable and readable — and the
             // slot column is width-padded to the widest slot.
             sessions.sort_by(|a, b| a.name.cmp(&b.name));
-            let home = std::env::var("HOME").unwrap_or_default();
+            let home = amber::platform::user_home()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default();
             let w = sessions.iter().map(|s| s.slot).max().unwrap_or(0).to_string().len();
             let nw = sessions.iter().map(|s| s.name.len()).max().unwrap_or(0);
             let cwds: Vec<String> = sessions.iter().map(|s| shorten_home(&s.cwd, &home)).collect();
@@ -1736,6 +1735,10 @@ mod tests {
         assert_eq!(shorten_home("/home/meta/x", "/home/me"), "/home/meta/x");
         assert_eq!(shorten_home("/tmp", "/home/me"), "/tmp");
         assert_eq!(shorten_home("/home/me/proj", ""), "/home/me/proj");
+        assert_eq!(
+            shorten_home(r"C:\Users\dev\project", r"C:\Users\dev"),
+            r"~\project"
+        );
     }
 
     #[test]

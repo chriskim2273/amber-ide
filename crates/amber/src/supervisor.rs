@@ -222,7 +222,7 @@ pub fn supervise_agent(
             .current_dir(cwd)
             .env("AMBER_SESSION", name)
             .env("AMBER_STATE_DIR", root);
-        if let Ok(exe) = crate::manager::resolve_current_exe() {
+        if let Ok(exe) = crate::manager::resolve_command_exe() {
             command.env("AMBER_BIN", exe);
         }
         let outcome = match spawn_agent(&mut command, slot) {
@@ -842,8 +842,8 @@ pub fn run_session(
                 // (SessionStart never fires). Pre-accept like claude's folder
                 // trust. Global SessionStart hook + AMBER_SESSION records the id.
                 codex::ensure_cwd_trusted(&cwd);
-                if let Ok(exe) = crate::manager::resolve_current_exe() {
-                    codex::ensure_global_codex_hook(&format!("{} hook", exe.display()));
+                if let Ok(exe) = crate::manager::resolve_command_exe() {
+                    codex::ensure_global_codex_hook(&crate::manager::hook_command(&exe));
                 }
                 Agent::Codex
             }
@@ -866,8 +866,8 @@ pub fn run_session(
                 // prompt for an untrusted cwd (never starting the session /
                 // recording the resume id). Pre-accept trust for this cwd.
                 claude::ensure_cwd_trusted(&cwd);
-                let current_exe = crate::manager::resolve_current_exe()?;
-                let hook_command = format!("{} hook", current_exe.display());
+                let current_exe = crate::manager::resolve_command_exe()?;
+                let hook_command = crate::manager::hook_command(&current_exe);
                 Agent::Claude {
                     settings: claude::write_settings(root, name, &hook_command)?,
                 }

@@ -88,8 +88,8 @@ pub fn daemon_main(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Re
             .with_watchers(Arc::clone(&watchers)),
     );
     manager.store_effective_budget_kb(budget_kb);
-    if let Ok(exe) = manager::resolve_current_exe() {
-        let hook = format!("{} hook", exe.display());
+    if let Ok(exe) = manager::resolve_command_exe() {
+        let hook = manager::hook_command(&exe);
         claude::ensure_global_claude_hook(&hook);
         codex::ensure_global_codex_hook(&hook);
         opencode::ensure_global_opencode_plugin();

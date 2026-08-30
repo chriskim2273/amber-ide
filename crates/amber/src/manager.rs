@@ -41,6 +41,50 @@ pub fn resolve_current_exe() -> anyhow::Result<PathBuf> {
     Ok(repair_deleted_exe(&exe).unwrap_or(exe))
 }
 
+/// Resolve the console-capable Amber executable used for supervisors, hooks,
+/// and internal CLI commands. Windows packages launch the long-lived daemon
+/// through the adjacent windowless `amberd.exe`; that binary deliberately has
+/// no CLI dispatcher and must never receive `run`, `hook`, or internal args.
+pub fn resolve_command_exe() -> anyhow::Result<PathBuf> {
+    let current = resolve_current_exe()?;
+    let command = command_executable_for(&current);
+    if command != current && !command.is_file() {
+        anyhow::bail!(
+            "windowless daemon {} has no adjacent console companion {}",
+            current.display(),
+            command.display()
+        );
+    }
+    Ok(command)
+}
+
+fn command_executable_for(current: &Path) -> PathBuf {
+    if current
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("amberd.exe"))
+    {
+        current.with_file_name("amber.exe")
+    } else {
+        current.to_path_buf()
+    }
+}
+
+/// Render a hook command with a quoted executable whenever a shell could split
+/// or reinterpret its path. This is common for Windows user-profile installs.
+pub fn hook_command(executable: &Path) -> String {
+    let executable = executable.to_string_lossy();
+    let needs_quotes = cfg!(windows)
+        || executable
+            .chars()
+            .any(|ch| ch.is_whitespace() || "&()[]{}^=;!'+,`~".contains(ch));
+    if needs_quotes {
+        format!("\"{}\" hook", executable.replace('"', "\\\""))
+    } else {
+        format!("{executable} hook")
+    }
+}
+
 /// If `path` carries the kernel's `" (deleted)"` suffix and the underlying
 /// path (suffix stripped) exists on disk, return it. Pure/testable half of
 /// [`resolve_current_exe`].
@@ -459,7 +503,7 @@ impl SessionManager {
             | SessionKind::OpenCode
             | SessionKind::Hermes
             | SessionKind::Pi => {
-                let exe = resolve_current_exe()?;
+                let exe = resolve_command_exe()?;
                 // The kind is passed EXPLICITLY, not looked up from the store:
                 // `create` spawns the pty before it persists the metadata (the
                 // slot is allocated under the sessions lock, which the spawn
@@ -2473,6 +2517,32 @@ mod tests {
         let dir = tempdir().unwrap();
         let missing = dir.path().join("amber");
         assert_eq!(repair_deleted_exe(&missing), None);
+    }
+
+    #[test]
+    fn daemon_executable_uses_adjacent_cli_for_commands() {
+        let dir = tempdir().unwrap();
+        assert_eq!(
+            command_executable_for(&dir.path().join("amberd.exe")),
+            dir.path().join("amber.exe")
+        );
+        assert_eq!(
+            command_executable_for(&dir.path().join("AMBERD.EXE")),
+            dir.path().join("amber.exe")
+        );
+        assert_eq!(
+            command_executable_for(&dir.path().join("amber.exe")),
+            dir.path().join("amber.exe")
+        );
+    }
+
+    #[test]
+    fn hook_command_quotes_executable_paths_with_spaces() {
+        assert_eq!(
+            hook_command(Path::new(r"C:\Users\Ada Lovelace\amber.exe")),
+            r#""C:\Users\Ada Lovelace\amber.exe" hook"#
+        );
+        assert_eq!(hook_command(Path::new("/usr/local/bin/amber")), "/usr/local/bin/amber hook");
     }
 
     #[test]
