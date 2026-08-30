@@ -83,7 +83,7 @@ jobs:
         run: npx vitest run
       - name: Build app bundles
         working-directory: app
-        run: npm run build
+        run: npm run build && npm run build:web
       - name: Stage release Amber binaries
         shell: pwsh
         run: |
@@ -104,6 +104,9 @@ jobs:
           }
           if (-not (Test-Path 'app/release/win-unpacked/resources/bin/amberd.exe')) {
             throw 'amberd.exe was not bundled'
+          }
+          if (-not (Test-Path 'app/out/web/index.html')) {
+            throw 'Pocket web bundle was not built before packaging'
           }
 
   app:

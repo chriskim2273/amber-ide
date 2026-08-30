@@ -11,7 +11,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json",
     "lint": "eslint . --ext .ts,.tsx",
     "test": "vitest run",
-    "package": "electron-vite build && electron-builder",
+    "package": "electron-vite build && npm run build:web && electron-builder",
     "dist": "bash scripts/dist.sh"
   },
   "build": {

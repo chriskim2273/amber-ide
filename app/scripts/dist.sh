@@ -87,7 +87,7 @@ if [ "${DAEMON_SRC:-}" ]; then
 fi
 
 echo "==> building renderer/main/preload"
-( cd "$APP_DIR" && npm run build )
+( cd "$APP_DIR" && npm run build && npm run build:web )
 
 echo "==> packaging with electron-builder"
 ( cd "$APP_DIR" && npx electron-builder )
