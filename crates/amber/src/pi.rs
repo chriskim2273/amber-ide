@@ -141,7 +141,7 @@ fn atomic_write_extension(path: &Path, contents: &[u8]) -> io::Result<()> {
             let _ = fs::remove_file(&temporary);
             return Err(e);
         }
-        if let Err(e) = fs::rename(&temporary, path) {
+        if let Err(e) = crate::platform::replace_file(&temporary, path) {
             let _ = fs::remove_file(&temporary);
             return Err(e);
         }

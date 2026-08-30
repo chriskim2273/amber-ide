@@ -502,6 +502,42 @@ fn user_home_from(home: Option<OsString>, user_profile: Option<OsString>) -> Opt
         .map(PathBuf::from)
 }
 
+pub(crate) fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::rename(from, to)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        };
+
+        let from: Vec<u16> = from
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let to: Vec<u16> = to
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        if unsafe {
+            MoveFileExW(
+                from.as_ptr(),
+                to.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
 /// Validate a name before it becomes a persisted session filename.
 ///
 /// The grammar is deliberately portable: state created on Unix must be safe
@@ -703,6 +739,21 @@ mod tests {
             socket_name_for_root(Path::new(r"C:\ignored")).unwrap(),
             PathBuf::from(r"\\.\pipe\amber-ide")
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_replace_file_overwrites_an_existing_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("new");
+        let to = dir.path().join("current");
+        std::fs::write(&from, b"new").unwrap();
+        std::fs::write(&to, b"old").unwrap();
+
+        super::replace_file(&from, &to).unwrap();
+
+        assert!(!from.exists());
+        assert_eq!(std::fs::read(to).unwrap(), b"new");
     }
 
     #[test]
