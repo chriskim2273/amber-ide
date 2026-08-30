@@ -1329,6 +1329,36 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   44×44 mobile top-bar controls; a true physical coarse-pointer device remains
   manual.
 
+- [x] Linux desktop input health hardening (2026-08-30) — prevents the
+  post-deploy “renders but cannot type” failure without touching the daemon,
+  protocol, PTYs, or renderer. Root cause was a live GNOME `ibus-daemon` whose
+  registry pointed at an unlinked `~/.cache/ibus/dbus-*` socket: systemd's
+  `Restart=on-abnormal` saw a healthy process, new Electron clients logged an
+  overflowing IBus event queue and dropped physical keys, while CDP synthetic
+  input bypassed IBus and produced a false green. Before the first window,
+  Electron main now checks `ibus address`; filesystem addresses must be live
+  unix sockets, while abstract addresses are accepted. A stale address opens a
+  native Restart/Continue/Quit prompt. Restart uses IBus's documented
+  `--type=systemd` path, polls for a proven replacement, removes only a proven
+  stale `IBUS_ADDRESS` override, and continues before Chromium creates its input
+  context; repair failure remains user-controlled and explicit. The check is
+  bounded to 8 s and is a no-op off Linux or when IBus is not selected.
+  `scripts/relaunch-app-linux.sh` is now the supported deploy relaunch: it
+  imports a narrow GUI-environment allowlist without `eval`, preflights IBus,
+  refuses to race a client that did not exit, and never restarts the daemon.
+  `scripts/smoke-desktop-input-x11.sh` launches an isolated private daemon,
+  session, state store, and AppImage window on the REAL X display, injects a
+  physical XTest key, uses CDP only to observe xterm, clears the private shell,
+  and cleans every artifact. Spec:
+  `docs/superpowers/specs/2026-08-30-linux-input-health-design.md`. TDD proved
+  address parsing, stale/live/abstract classification, documented repair,
+  polling, failure reporting, stale-env removal, and relaunch preflight. Gates:
+  app **642 tests** + one intentional skip, typecheck, production bundle,
+  packaged AppImage, shell syntax/regression, and diff checks green. Live proof
+  covered both sides: a fake stale IBus produced the native prompt and recovered
+  into the app after clicking Restart; the exact packaged artifact passed the
+  real-X physical-key smoke against a private daemon.
+
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**
   `std::io::Read` (dedicated thread); `take_writer()` is one-shot;

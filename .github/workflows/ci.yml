@@ -60,6 +60,8 @@ jobs:
         run: npm run typecheck
       - name: Test
         run: npx vitest run
+      - name: Linux desktop relaunch regression
+        run: bash ../scripts/relaunch-app-linux.test.sh
       # `npm run lint` is intentionally omitted: the repo's eslint config predates
       # ESLint v9's required flat config (eslint.config.js), so `eslint .` errors
       # out on a pre-existing config issue unrelated to this workflow. Re-add the
