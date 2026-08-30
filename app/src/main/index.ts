@@ -340,8 +340,8 @@ async function installWindowsDaemon(socket: string): Promise<void> {
   // is never half-written if the installer/app dies during an upgrade.
   await installBinary(amberBinary(), stableAmber)
   await installBinary(amberDaemonBinary(), stableDaemon)
-  await spawnOkWithStderr(stableAmber, ['ctl', 'install-codex-skill'], (stderr) => {
-    process.stderr.write(stderr)
+  await repairAgentExtensions((args) => runCapture(stableAmber, args), (warning) => {
+    process.stderr.write(warning)
   })
   const runKey = windowsRunKeyCommand(stableDaemon)
   await spawnOk(runKey.cmd, runKey.args)
