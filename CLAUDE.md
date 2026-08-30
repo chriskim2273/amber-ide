@@ -1157,14 +1157,91 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   paths were resizing regardless (the font-size effect, which fires on the
   phone's 13→14 px flip, and the reconnect nudge) and now respect it. §3's soft-keyboard rule is implemented
   (`keyboardViewport.ts` + `Pane.tsx`): a `visualViewport` shrink that
-  `innerHeight` does not match is the keyboard, and the pane pins its rows and
-  scrolls the cursor above it instead of re-fitting — an orientation change,
-  which moves BOTH heights, still re-fits. Unit-tested both ways. Browser
-  pinch-zoom is left ENABLED: an earlier draft set `user-scalable=no` to make
-  room for app-owned pinch that was never built, which would have left a phone
-  unable to zoom at all. **Not verified:** any real device on either platform —
-  so the soft-keyboard path has never actually run — plus long-press arming,
-  real-finger touch scrolling, clipboard gestures, and PWA install.
+  `innerHeight` does not match is the keyboard, and the pane pins its rows
+  instead of re-fitting — an orientation change, which moves BOTH heights,
+  still re-fits. **Hardened 2026-08-29:** the first implementation mutated
+  `host.style.paddingBottom`; the key bar itself still stayed under an
+  overlaying keyboard, and padding changed ResizeObserver's content box, so
+  keyboard close could look like a real pane resize and reflow the shared PTY.
+  `KeyboardDock` now translates above the exact bottom inset (including
+  `visualViewport.offsetTop`), while `Pane` translates the already-rendered
+  xterm host only far enough to keep its real cursor above the keyboard AND key
+  bar. Both are transform-only, listen to visual-viewport resize + scroll, and
+  opening/closing the keyboard changes no observed layout dimension. Pure
+  keyboard-inset/cursor-lift geometry is unit-tested. **Live-verified through
+  the production web bundle against an isolated daemon:** at 390×844, an
+  explicit visual-viewport move to 508 px docked the bar by 336 px, lifted a
+  bottom-row shell cursor by 388 px, kept the hidden textarea focused, and left
+  daemon geometry exactly **44×42 → 44×42**. Hardening gates: app **594 tests**
+  + one intentional skip, typecheck and `build:web` green. Browser pinch-zoom
+  is left ENABLED: an earlier draft set `user-scalable=no` to make room for
+  app-owned pinch that was never built, which would have left a phone unable to
+  zoom at all. **Not verified:** any real device on either platform — the
+  explicit viewport override proves our reaction, not Safari/Chrome's real
+  keyboard timing or safe-area behavior — plus long-press arming, real-finger
+  touch scrolling, clipboard gestures, and PWA install.
+
+- [x] Amber Pocket product design + production foundation (2026-08-29/30) — a reference-locked mobile
+  product direction and interactive code-led prototype, plus the production
+  soft-keyboard hardening above (**no protocol change**). Spec:
+  `docs/superpowers/specs/2026-08-29-amber-pocket-mobile-product-design.md`;
+  prototype: `docs/prototypes/amber-pocket/`. The phone now has a designed
+  product model rather than “desktop chrome made larger”: it lands in a
+  daemon-derived **command center** grouped by honest urgency (`Needs you`,
+  `Working`, `Parked`, `Quiet`), opens one edge-to-edge focus terminal, and
+  keeps the real split tree as a separate Mosaic destination. Research covered
+  the existing Amber renderer and live mobile report, Apple HIG, Material 3
+  sheets, Blink Shell, Prompt 3, Termius, and Working Copy. The reference lock
+  keeps Amber's Preservation Console intact: Obsidian/Carbon layers,
+  Preservation Violet for focus/action, Warning Amber only for brand and real
+  state, system sans for human controls, mono for machine truth, fine borders,
+  and terminal dominance. The prototype exercises command-center filters,
+  machine/session sheets, focus/back history, a reordered critical terminal
+  key deck, quick text macros, Mosaic, and new-session kind state; Phosphor
+  supplies the one icon family. The prototype shell now binds to
+  `visualViewport`: keyboard open shrinks the visible terminal, removes the
+  duplicate machine bar and optional macro row, and leaves the critical key
+  deck immediately above the keyboard. Production `KEY_BAR` likewise moved
+  ^C and Enter ahead of the scrollable arrow cluster. Six validated captures are checked in under
+  `docs/prototypes/amber-pocket/screenshots/` with embedded provenance
+  (`390×844` command center/focus/**keyboard-open focus**/mosaic/sheet and
+  `1440×900` presentation). The keyboard capture overrides the visual viewport
+  from 844 to 508 px; measured shell height and key-deck bottom both become
+  exactly 508 px while the optional quick row is absent.
+  Prototype CDP checks pass; every visible control has an accessible name and a
+  measured ≥44 px target, with JS/HTML/diff/raster-provenance checks green.
+  **Production landed 2026-08-30, still with no daemon or protocol change:**
+  `commandCenterModel` is a pure, tested projection over daemon panes, unseen
+  activity, run-state, frozen/exit state, memory, and pressure. Its precedence
+  is exit → retry/fallback → parked → active agent/unseen shell → quiet; global
+  pressure stays a global alert instead of blaming one pane, app-local browser/
+  editor panes are filtered without touching their sidecar, and “waiting” is
+  NEVER inferred from TUI bytes. The capability-gated phone now launches into
+  Sessions with machine identity, workspace filters, honest urgency groups,
+  memory only when known, and a bottom Sessions/Mosaic/New navigation surface.
+  Opening a row drives the EXISTING per-tab zoom and grid borrow; the desktop
+  pane header disappears in Focus and its 26 px returns to xterm, while a fixed
+  machine/session/run-state header and session sheet remain reachable. New
+  session creation lists daemon-backed kinds only and remains one-way (no row
+  until daemon confirmation). Tagged history states make platform back dismiss
+  a sheet before Focus. Crucially, command-center scanning no longer dispatches
+  `MarkSeen`; recent output is consumed only when Mosaic/Focus actually reveals
+  terminal pixels. The hidden pane stage is **absolute + `visibility:hidden`,
+  never `display:none`**: Pane's unconditional initial `fit.fit()` would fit a
+  zero-size host to xterm's 2×1 floor, and Mosaic scale mode deliberately never
+  re-fits it. Live proof: hidden stage remained 390×844 with 45 terminal rows,
+  then Mosaic revealed the same rows and applied only its CSS scale. The host
+  bridge supplies `machineName` (`teapot-dev` from
+  the web origin, OS hostname in Electron) without renderer host checks.
+  **Live-verified through the production bundle** at 390×844 against the real
+  daemon's 13 sessions: Sessions is the initial surface, stage is hidden, first
+  row is above the fold, all controls are ≥44 px, row→Focus keeps the existing
+  xterm/MessagePort, old pane chrome is absent, session/new sheets work, and
+  sheet-back leaves Focus intact. Impeccable's full detector returned zero
+  findings. Gates: app **612 tests** + one intentional skip, typecheck,
+  Electron bundle, `build:web`, and `git diff --check` green. **Still open:**
+  physical iOS/Android proof, header collapse after input, customizable quick
+  commands, and the sheet's lower-frequency move/rename/split actions.
 
 - [x] SSH remote windows (2026-08-23) — open another machine's amber in its own
   window. Spec:

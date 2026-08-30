@@ -3,7 +3,7 @@ import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { WebglAddon } from '@xterm/addon-webgl'
 import { altScrollKeys, takeWholeLines, AXIS_LOCK_PX, FLICK_DECAY, FLICK_MIN_LINES } from './touchInput'
-import { keyboardOpen, KEYBOARD_MIN_PX } from './keyboardViewport'
+import { keyboardInset, keyboardOpen, terminalLift } from './keyboardViewport'
 import { SearchAddon } from '@xterm/addon-search'
 import '@xterm/xterm/css/xterm.css'
 import { appChord } from './keys'
@@ -282,8 +282,14 @@ export const Pane = memo(function Pane(
      * `innerHeight` does not, so the difference is the discriminator. A real
      * orientation change moves BOTH, which is why it still re-fits.
      */
-    const isKeyboardOpen = (): boolean =>
-      keyboardOpen(window.innerHeight, window.visualViewport?.height ?? null)
+    const isKeyboardOpen = (): boolean => {
+      const viewport = window.visualViewport
+      return keyboardOpen(
+        window.innerHeight,
+        viewport?.height ?? null,
+        viewport?.offsetTop ?? 0,
+      )
+    }
 
     const sendResize = (): void => {
       // A collapsed host (window crushed below the chrome's own height) makes
@@ -309,19 +315,40 @@ export const Pane = memo(function Pane(
     const ro = new ResizeObserver(() => sendResize())
     ro.observe(host)
 
-    // With rows pinned (above), the keyboard would simply cover the bottom of
-    // the terminal — including the prompt. Scroll the cursor row back into the
-    // visible strip instead, which is what a native app does. Bounded to the
-    // keyboard-open case; on a desktop `visualViewport` never shrinks.
+    // With rows pinned (above), the keyboard would otherwise cover the prompt.
+    // Move the already-rendered terminal pixels just far enough to keep xterm's
+    // cursor above BOTH the keyboard and the key bar. A transform is
+    // load-bearing here: unlike the old paddingBottom implementation it changes
+    // no observed box size, so keyboard close cannot trigger FitAddon and send
+    // a fake PTY Resize.
     const onViewport = (): void => {
       if (fitModeRef.current === 'scale') return
-      const vv = window.visualViewport
-      if (!vv) return
-      const covered = window.innerHeight - vv.height
-      host.style.paddingBottom = covered > KEYBOARD_MIN_PX ? `${covered}px` : ''
-      if (covered > KEYBOARD_MIN_PX) term.scrollToBottom()
+      const viewport = window.visualViewport
+      if (!viewport) return
+      const inset = keyboardInset(window.innerHeight, viewport.height, viewport.offsetTop)
+      if (inset === 0) {
+        host.style.transform = ''
+        host.classList.remove('keyboard-lifted')
+        return
+      }
+      term.scrollToBottom()
+      const screen = term.element?.querySelector('.xterm-screen') as HTMLElement | null
+      const cellHeight = (screen?.offsetHeight ?? 0) / Math.max(1, term.rows)
+      const dockHeight = document.querySelector<HTMLElement>('.key-bar-dock')?.offsetHeight ?? 0
+      const hostTop = containerRef.current?.getBoundingClientRect().top ?? host.getBoundingClientRect().top
+      const lift = terminalLift({
+        hostTop,
+        cursorRow: term.buffer.active.cursorY,
+        cellHeight,
+        visibleBottom: viewport.offsetTop + viewport.height,
+        dockHeight,
+      })
+      host.style.transform = lift > 0 ? `translate3d(0, -${lift}px, 0)` : ''
+      host.classList.toggle('keyboard-lifted', lift > 0)
     }
     window.visualViewport?.addEventListener('resize', onViewport)
+    window.visualViewport?.addEventListener('scroll', onViewport)
+    onViewport()
     const focus = (): void => term.focus()
 
     // Input goes to whatever the CURRENT port is. Registered ONCE — re-running it
@@ -525,6 +552,7 @@ export const Pane = memo(function Pane(
       host.removeEventListener('click', focus)
       host.removeEventListener('mouseup', onMouseUp)
       window.visualViewport?.removeEventListener('resize', onViewport)
+      window.visualViewport?.removeEventListener('scroll', onViewport)
       if (coarse) {
         stopFlick()
         host.removeEventListener('touchstart', onTouchStart)
@@ -671,7 +699,7 @@ export const Pane = memo(function Pane(
     : undefined
   return (
     <div ref={containerRef} style={{ position: 'relative', width: '100%', height: '100%', background: 'var(--bg)' }}>
-      <div ref={hostRef} style={{ width: '100%', height: '100%' }} />
+      <div ref={hostRef} className="terminal-host" style={{ width: '100%', height: '100%' }} />
       {openBtn &&
         <button
           className="open-path-btn"

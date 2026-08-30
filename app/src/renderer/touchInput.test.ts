@@ -51,6 +51,12 @@ describe('KEY_BAR', () => {
       expect(keys).toContain(need)
     }
   })
+
+  it('keeps interrupt and enter ahead of the scrollable arrow cluster', () => {
+    const keys = KEY_BAR.map((k) => k.key)
+    expect(keys.indexOf('ctrl-c')).toBeLessThan(keys.indexOf('left'))
+    expect(keys.indexOf('enter')).toBeLessThan(keys.indexOf('left'))
+  })
 })
 
 describe('takeWholeLines', () => {

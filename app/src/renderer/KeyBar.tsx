@@ -7,7 +7,8 @@
 // Mobile-only by mount: `SplitView` renders it when `useMobile()` is true, so
 // nothing here branches on the host.
 
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import { keyboardInset } from './keyboardViewport'
 import { KEY_BAR, keyBytes } from './touchInput'
 
 export interface KeyBarTarget {
@@ -17,6 +18,45 @@ export interface KeyBarTarget {
   appMode: () => boolean
   /** Return focus to the terminal so the soft keyboard stays up. */
   focus: () => void
+}
+
+/**
+ * Pins the key bar to the visual viewport rather than the layout viewport.
+ * Mobile browsers commonly leave the layout viewport full-height and overlay
+ * the software keyboard; `bottom: 0` alone therefore puts the bar underneath
+ * it. This moves pixels only, never layout, so it cannot trigger a PTY resize.
+ */
+export function KeyboardDock({ target }: { target: KeyBarTarget | null }): JSX.Element {
+  const ref = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    const viewport = window.visualViewport
+    const update = (): void => {
+      const el = ref.current
+      if (!el) return
+      const inset = keyboardInset(
+        window.innerHeight,
+        viewport?.height ?? null,
+        viewport?.offsetTop ?? 0,
+      )
+      el.style.transform = inset > 0 ? `translate3d(0, -${inset}px, 0)` : ''
+      el.classList.toggle('keyboard-open', inset > 0)
+      el.dataset['keyboardInset'] = String(inset)
+    }
+    update()
+    viewport?.addEventListener('resize', update)
+    viewport?.addEventListener('scroll', update)
+    return () => {
+      viewport?.removeEventListener('resize', update)
+      viewport?.removeEventListener('scroll', update)
+    }
+  }, [])
+
+  return (
+    <div ref={ref} className="key-bar-dock">
+      <KeyBar target={target} />
+    </div>
+  )
 }
 
 export function KeyBar({ target }: { target: KeyBarTarget | null }): JSX.Element {

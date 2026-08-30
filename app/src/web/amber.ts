@@ -396,6 +396,7 @@ export interface AmberDeps {
   postPanePort: (session: string, port2: unknown) => void
   clipboard: { writeText: (text: string) => Promise<void>; readText: () => Promise<string> }
   home: string
+  machineName: string
   softwareGl: boolean
   // Layout CAS (spec 2026-08-01 §6), injected so this file stays fetch-free
   // and testable with fakes (the rest of the file's discipline). The real
@@ -446,6 +447,7 @@ export function createAmber(deps: AmberDeps): WebAmber {
   const api: Window['amber'] = {
     softwareGl: deps.softwareGl,
     homeDir: deps.home,
+    machineName: deps.machineName,
     // The browser build is never an ssh mirror; it IS the remote surface.
     remoteHost: '',
     connectHost: notImplemented('connectHost'),

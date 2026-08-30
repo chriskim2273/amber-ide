@@ -1,0 +1,492 @@
+
+/* ---------- Amber Pocket command center ---------- */
+/* Mobile-only by component mount. This is a task-specific composition over the
+   same session model, not a second responsive skin for desktop chrome. */
+/* Keep hidden terminals laid out while Sessions is in front. `display:none`
+   would make Pane's initial FitAddon fit a 0x0 host to its 2x1 floor; Mosaic's
+   scale mode deliberately never re-fits, so those terminals would stay broken.
+   Absolute + hidden preserves a real box without painting or taking flex space. */
+.app.mobile .pane-stage.pocket-stage-hidden {
+  position: absolute;
+  inset: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+.pocket-command {
+  min-height: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  padding-top: env(safe-area-inset-top, 0px);
+  background: var(--bg);
+}
+.pocket-machine {
+  min-height: 62px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+.pocket-machine-mark {
+  width: 36px;
+  height: 36px;
+  flex: 0 0 36px;
+  display: grid;
+  place-items: center;
+  border: 1px solid rgba(255, 180, 84, 0.42);
+  border-radius: 9px;
+  background: rgba(255, 180, 84, 0.1);
+  color: var(--warn);
+  font-family: var(--font-mono);
+  font-size: 14px;
+  font-weight: 700;
+}
+.pocket-machine-copy {
+  min-width: 0;
+  flex: 1;
+  display: grid;
+  gap: 2px;
+}
+.pocket-machine-copy strong {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 15px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pocket-machine-copy > span {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+.pocket-state-dot {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 7px;
+  border-radius: 50%;
+  background: var(--danger);
+}
+.pocket-machine-copy .connected .pocket-state-dot { background: var(--ok); }
+.pocket-session-count {
+  flex: 0 0 auto;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.pocket-workspaces {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  padding: 10px 14px 8px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+  scrollbar-width: none;
+}
+.pocket-workspaces::-webkit-scrollbar { display: none; }
+.pocket-workspaces button {
+  min-height: 44px;
+  flex: 0 0 auto;
+  padding: 0 14px;
+  border: 1px solid var(--border);
+  border-radius: 22px;
+  background: var(--surface);
+  color: var(--text-dim);
+  font: 600 13px var(--font-ui);
+  cursor: pointer;
+  transition: color 120ms, background-color 120ms, border-color 120ms, transform 90ms;
+}
+.pocket-workspaces button.active {
+  border-color: rgba(124, 108, 255, 0.52);
+  background: var(--accent-soft);
+  color: #dedaff;
+}
+.pocket-workspaces button:active,
+.pocket-session-open:active,
+.pocket-session-actions:active,
+.pocket-nav button:active { transform: scale(0.98); }
+.pocket-command-scroll {
+  min-height: 0;
+  flex: 1;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 14px 14px 22px;
+}
+.pocket-alert {
+  display: flex;
+  align-items: start;
+  gap: 10px;
+  margin-bottom: 14px;
+  padding: 11px 12px;
+  border: 1px solid rgba(255, 92, 92, 0.34);
+  border-radius: 10px;
+  background: var(--danger-soft);
+  color: #ffd3d3;
+  font-size: 12.5px;
+  line-height: 1.4;
+}
+.pocket-alert-mark {
+  width: 20px;
+  height: 20px;
+  flex: 0 0 20px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--danger);
+  color: var(--bg);
+  font: 800 12px var(--font-mono);
+}
+.pocket-group { margin-bottom: 20px; }
+.pocket-group-head {
+  min-height: 30px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 2px 7px;
+}
+.pocket-group-head h2 {
+  margin: 0;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 650;
+}
+.pocket-group-head > span {
+  min-width: 20px;
+  height: 20px;
+  display: grid;
+  place-items: center;
+  border-radius: 10px;
+  background: var(--surface-2);
+  color: var(--text-dim);
+  font: 11px var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+.pocket-clear {
+  margin: 0;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: var(--text-faint);
+  font-size: 12.5px;
+}
+.pocket-session-list {
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+}
+.pocket-group-needs-you .pocket-session-list {
+  border-color: rgba(255, 180, 84, 0.32);
+  background: rgba(255, 180, 84, 0.035);
+}
+.pocket-session {
+  min-height: 86px;
+  display: flex;
+  align-items: stretch;
+}
+.pocket-session + .pocket-session { border-top: 1px solid var(--border); }
+.pocket-session-open {
+  min-width: 0;
+  min-height: 86px;
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 11px 8px 11px 11px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 120ms, transform 90ms;
+}
+.pocket-session-open:hover { background: rgba(255, 255, 255, 0.025); }
+.pocket-kind {
+  width: 38px;
+  height: 38px;
+  flex: 0 0 38px;
+  border: 1px solid currentColor;
+  border-radius: 10px;
+  background: color-mix(in srgb, currentColor 10%, transparent);
+  color: var(--accent-2);
+}
+.pocket-kind::after {
+  content: '';
+  display: block;
+  width: 8px;
+  height: 8px;
+  margin: 14px auto;
+  border-radius: 50%;
+  background: currentColor;
+}
+.pocket-kind-claude,
+.pocket-kind-pi { color: var(--warn); }
+.pocket-kind-grok { color: var(--grok, #8ab4f8); }
+.pocket-kind-codex { color: var(--codex, #3dd68c); }
+.pocket-kind-opencode { color: var(--opencode, #c084fc); }
+.pocket-kind-hermes { color: var(--hermes, #f472b6); }
+.pocket-session-copy {
+  min-width: 0;
+  flex: 1;
+  display: grid;
+  gap: 3px;
+}
+.pocket-session-title {
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+}
+.pocket-session-title code {
+  color: var(--text-faint);
+  font: 11px var(--font-mono);
+}
+.pocket-session-title strong {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 14.5px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pocket-session-state {
+  overflow: hidden;
+  color: var(--text-dim);
+  font-size: 12.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pocket-session-needs-you .pocket-session-state { color: #e8c695; }
+.pocket-session-meta {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  overflow: hidden;
+  color: var(--text-faint);
+  font: 11px var(--font-mono);
+  white-space: nowrap;
+}
+.pocket-session-meta > * {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.pocket-session-meta > * + *::before {
+  content: '/';
+  margin-right: 8px;
+  color: var(--border-strong);
+}
+.pocket-session-meta code.growing { color: var(--warn); }
+.pocket-open-arrow {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 8px;
+  border-top: 1.5px solid var(--text-faint);
+  border-right: 1.5px solid var(--text-faint);
+  transform: rotate(45deg);
+}
+.pocket-session-actions {
+  width: 52px;
+  min-height: 86px;
+  flex: 0 0 52px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-left: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: background-color 120ms, transform 90ms;
+}
+.pocket-session-actions:hover { background: var(--surface-2); }
+.pocket-more-mark,
+.pocket-more-mark::before,
+.pocket-more-mark::after {
+  width: 3px;
+  height: 3px;
+  display: block;
+  border-radius: 50%;
+  background: currentColor;
+}
+.pocket-more-mark { position: relative; }
+.pocket-more-mark::before,
+.pocket-more-mark::after { content: ''; position: absolute; top: 0; }
+.pocket-more-mark::before { left: -6px; }
+.pocket-more-mark::after { left: 6px; }
+.pocket-loading {
+  min-height: 220px;
+  display: grid;
+  align-content: center;
+  gap: 10px;
+  padding: 24px;
+}
+.pocket-loading-line {
+  width: 64%;
+  height: 70px;
+  display: block;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+  opacity: 0.68;
+}
+.pocket-loading-line.wide { width: 100%; }
+.pocket-loading p { margin: 4px 0 0; color: var(--text-dim); font-size: 13px; }
+.pocket-empty {
+  min-height: 240px;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  padding: 24px;
+  text-align: center;
+}
+.pocket-empty h1 { margin: 0; color: var(--text); font-size: 19px; }
+.pocket-empty p { max-width: 30ch; margin: 8px 0 18px; color: var(--text-dim); line-height: 1.45; }
+.pocket-empty button {
+  min-height: 44px;
+  padding: 0 16px;
+  border: 0;
+  border-radius: 8px;
+  background: #6751df;
+  color: #fff;
+  font: 650 13px var(--font-ui);
+}
+.pocket-nav {
+  min-height: calc(64px + env(safe-area-inset-bottom, 0px));
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  padding: 6px 8px calc(6px + env(safe-area-inset-bottom, 0px));
+  border-top: 1px solid var(--border);
+  background: rgba(20, 20, 25, 0.98);
+}
+.pocket-nav button {
+  min-height: 52px;
+  display: grid;
+  place-items: center;
+  align-content: center;
+  gap: 4px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-faint);
+  font: 600 11px var(--font-ui);
+  cursor: pointer;
+  transition: color 120ms, background-color 120ms, transform 90ms;
+}
+.pocket-nav button.active { color: #dcd8ff; background: var(--accent-soft); }
+.pocket-nav-mark { position: relative; width: 18px; height: 15px; color: currentColor; }
+.pocket-nav-mark.sessions::before,
+.pocket-nav-mark.sessions::after {
+  content: '';
+  position: absolute;
+  left: 1px;
+  right: 1px;
+  height: 4px;
+  border: 1.5px solid currentColor;
+  border-radius: 2px;
+}
+.pocket-nav-mark.sessions::before { top: 0; }
+.pocket-nav-mark.sessions::after { bottom: 0; }
+.pocket-nav-mark.mosaic {
+  border: 1.5px solid currentColor;
+  border-radius: 2px;
+}
+.pocket-nav-mark.mosaic::before,
+.pocket-nav-mark.mosaic::after {
+  content: '';
+  position: absolute;
+  background: currentColor;
+}
+.pocket-nav-mark.mosaic::before { top: 0; bottom: 0; left: 7px; width: 1.5px; }
+.pocket-nav-mark.mosaic::after { top: 6px; right: 0; left: 7px; height: 1.5px; }
+.pocket-nav-mark.new::before,
+.pocket-nav-mark.new::after {
+  content: '';
+  position: absolute;
+  top: 7px;
+  left: 2px;
+  width: 14px;
+  height: 1.5px;
+  border-radius: 1px;
+  background: currentColor;
+}
+.pocket-nav-mark.new::after { transform: rotate(90deg); }
+.pocket-command button:focus-visible,
+.pocket-nav button:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: -2px;
+}
+
+@media (orientation: landscape) and (pointer: coarse) and (max-height: 540px) {
+  .pocket-command-scroll { display: grid; grid-template-columns: repeat(2, minmax(280px, 1fr)); gap: 14px; }
+  .pocket-alert, .pocket-empty { grid-column: 1 / -1; }
+  .pocket-group { margin-bottom: 0; }
+}
+
+/* Focus chrome replaces the pane's desktop header while keeping identity and
+   context reachable. Its fixed height is stable; keyboard motion transforms
+   terminal pixels and never changes this box or PTY geometry. */
+.pocket-focus-head {
+  min-height: calc(54px + env(safe-area-inset-top, 0px));
+  display: grid;
+  grid-template-columns: minmax(72px, auto) minmax(0, 1fr) 48px;
+  align-items: end;
+  gap: 8px;
+  padding: env(safe-area-inset-top, 0px) 6px 4px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+.pocket-focus-head button {
+  min-height: 44px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-dim);
+  font: 600 12px var(--font-ui);
+}
+.pocket-focus-back {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 8px;
+}
+.pocket-back-mark {
+  width: 9px;
+  height: 9px;
+  border-bottom: 1.5px solid currentColor;
+  border-left: 1.5px solid currentColor;
+  transform: rotate(45deg);
+}
+.pocket-focus-copy {
+  min-width: 0;
+  align-self: center;
+  display: grid;
+  gap: 2px;
+  text-align: center;
+}
+.pocket-focus-copy strong,
+.pocket-focus-copy span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pocket-focus-copy strong { color: var(--text); font-size: 14px; font-weight: 650; }
+.pocket-focus-copy span { color: var(--text-dim); font: 10.5px var(--font-mono); }
+.pocket-focus-actions { display: grid; place-items: center; }
+.pocket-focus-head button:focus-visible { outline: var(--focus-ring); outline-offset: -2px; }
+
+/* SplitView still owns the pane and xterm. Focus mode only replaces its chrome;
+   removing the old 26px header returns those pixels to the terminal. */
+.app.mobile.pocket-focus .pane-header { display: none; }
+.app.mobile.pocket-focus .pane-body { inset: 0; }
+
+@media (prefers-reduced-motion: reduce) {
+  .pocket-workspaces button,
+  .pocket-session-open,
+  .pocket-session-actions,
+  .pocket-nav button { transition-duration: 0.01ms; }
+}

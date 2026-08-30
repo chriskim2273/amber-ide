@@ -8,6 +8,9 @@ import { initialState, reduce, groupSessions, mergeBrowsers, mergeEditors, tabDo
 import { ResourcePressureBanner } from './PressureBanners'
 import type { ControlMsg } from '../shared/proto'
 import { sessionRows } from './sessionRows'
+import { commandCenterModel, type CommandCenterItem } from './commandCenter'
+import { PocketCommandCenter, PocketFocusHeader, PocketNav, pocketSessionTitle } from './PocketCommandCenter'
+import { PocketNewSessionSheet, PocketSessionSheet, type PocketSessionKind } from './PocketSheets'
 import { deriveTab, shortCwd } from './tabView'
 import { RemoteAccess } from './RemoteAccess'
 import { Drawer } from './Drawer'
@@ -61,6 +64,8 @@ declare global {
       saveWorkspaceFile: (json: string, suggestedName: string) => Promise<boolean>
       openWorkspaceFile: () => Promise<string | null>
       homeDir: string
+      /** Human-readable machine identity supplied by the host bridge. */
+      machineName: string
       /** `user@host` when this window mirrors a remote machine's amber. */
       remoteHost?: string
       connectHost?: (host: string) => Promise<void>
@@ -188,6 +193,13 @@ function App(): JSX.Element {
   // 390px, so they collapse into one bar plus this drawer.
   const mobile = useMobile()
   const [drawerOpen, setDrawerOpen] = useState(false)
+  // Amber Pocket is a mobile composition over the same daemon truth and pane
+  // lifecycle. The phone lands in Sessions; Mosaic exposes the existing split
+  // tree. Focus remains the existing per-tab zoom state, never a second pane.
+  const [pocketView, setPocketView] = useState<'sessions' | 'mosaic'>('sessions')
+  const [pocketWorkspace, setPocketWorkspace] = useState<number | null>(null)
+  const [pocketAction, setPocketAction] = useState<CommandCenterItem | null>(null)
+  const [pocketNewOpen, setPocketNewOpen] = useState(false)
   // SSH remote window (spec 2026-08-23): this window mirrors another machine's
   // arrangement and never writes its sidecar. Read once — a window is local or
   // remote for its whole life.
@@ -526,6 +538,13 @@ function App(): JSX.Element {
   }, [layout, bridgeReady, loaded, persistLayout])
 
   const workspaces = mergeEditors(mergeBrowsers(groupSessions(state), layout.browsers ?? {}), layout.editors ?? {})
+  const pocketAll = commandCenterModel({ workspaces, state, frozen: frozenSet })
+  const pocketModel = commandCenterModel({
+    workspaces,
+    state,
+    frozen: frozenSet,
+    ...(pocketWorkspace === null ? {} : { workspace: pocketWorkspace }),
+  })
   const ws = workspaces.find((w) => w.ws === activeWs) ?? workspaces[0]
   const tabs = ws?.tabs ?? []
   const tab = tabs.find((t) => t.tab === activeTab) ?? tabs[0]
@@ -545,6 +564,14 @@ function App(): JSX.Element {
   // and a plain workspace switch would trip the safety-net clear.
   const zoomKey = `${wsKey}:${tabKey}`
   const zoomedPane = zoom[zoomKey] && liveIds.includes(zoom[zoomKey]!) ? zoom[zoomKey]! : null
+  const pocketFocused = mobile && zoomedPane !== null
+  const pocketCommandActive = mobile && pocketView === 'sessions' && !pocketFocused
+  const pocketMosaicActive = mobile && pocketView === 'mosaic' && !pocketFocused
+  const openPocketItem = (item: CommandCenterItem): void => {
+    setActiveWs(item.ws)
+    setActiveTab(item.tab)
+    setZoom((current) => ({ ...current, [`${item.ws}:${item.tab}`]: item.pane.name }))
+  }
   const toggleZoom = (paneId: string): void => setZoom((z) => {
     if (z[zoomKey] === paneId) { const c = { ...z }; delete c[zoomKey]; return c }
     return { ...z, [zoomKey]: paneId }
@@ -575,8 +602,10 @@ function App(): JSX.Element {
     }
   }, [zoomedPane])
   useEffect(() => {
-    const onPop = (): void => {
-      if (zoomHistoryRef.current) {
+    const onPop = (event: PopStateEvent): void => {
+      // A sheet can sit above a focused pane in history. Popping only that sheet
+      // lands on a state that still carries amberZoom and must NOT also unzoom.
+      if (zoomHistoryRef.current && !(event.state as { amberZoom?: boolean } | null)?.amberZoom) {
         zoomHistoryRef.current = false
         clearZoom()
       }
@@ -586,6 +615,42 @@ function App(): JSX.Element {
     // `clearZoom` closes over the current zoomKey; re-binding per key keeps the
     // handler clearing the tab the user is actually looking at.
   }, [zoomKey])
+
+  // Pocket sheets get their own history layer. Platform back dismisses the
+  // sheet first; when a sheet sits over Focus, the tagged zoom entry remains.
+  const pocketSheetHistoryRef = useRef(false)
+  const pocketSheetAfterRef = useRef<(() => void) | null>(null)
+  const pocketSheetOpen = pocketAction !== null || pocketNewOpen
+  useEffect(() => {
+    if (pocketSheetOpen && !pocketSheetHistoryRef.current) {
+      pocketSheetHistoryRef.current = true
+      history.pushState({ ...(history.state as object | null), amberPocketSheet: true }, '')
+    }
+  }, [pocketSheetOpen])
+  useEffect(() => {
+    const onPop = (event: PopStateEvent): void => {
+      if (!pocketSheetHistoryRef.current
+        || (event.state as { amberPocketSheet?: boolean } | null)?.amberPocketSheet) return
+      pocketSheetHistoryRef.current = false
+      setPocketAction(null)
+      setPocketNewOpen(false)
+      const after = pocketSheetAfterRef.current
+      pocketSheetAfterRef.current = null
+      after?.()
+    }
+    window.addEventListener('popstate', onPop)
+    return () => window.removeEventListener('popstate', onPop)
+  }, [])
+  const closePocketSheet = (after?: () => void): void => {
+    if (pocketSheetHistoryRef.current) {
+      pocketSheetAfterRef.current = after ?? null
+      history.back()
+      return
+    }
+    setPocketAction(null)
+    setPocketNewOpen(false)
+    after?.()
+  }
   // Structural-change guard: when the visible tab's live pane set changes (a
   // split lands, a pane is closed/reaped — via our gesture OR the daemon), drop
   // that tab's zoom. Moves don't change the set, so those gestures clear zoom
@@ -720,9 +785,13 @@ function App(): JSX.Element {
   const visibleNames = tab?.panes.map((p) => p.name) ?? []
   const visibleKey = visibleNames.join(',')
   useEffect(() => {
+    // The command center is a scan surface, not the terminal itself. Merely
+    // listing a row must not consume its unseen-output signal; opening Focus or
+    // viewing Mosaic does, because the terminal pixels are then actually shown.
+    if (pocketCommandActive) return
     if (visibleNames.length > 0) dispatch({ kind: 'MarkSeen', names: visibleNames })
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [visibleKey, state.seq])
+  }, [visibleKey, state.seq, pocketCommandActive])
 
   // Place pending splits once their session exists, preserving H/V direction.
   const liveKey = allLive.join(',')
@@ -820,17 +889,19 @@ function App(): JSX.Element {
     return () => window.removeEventListener('keydown', h)
   }, [showHelp])
 
-  // Esc dismisses the save-scope / load-mode / budget dialogs.
+  // Esc dismisses the save-scope / load-mode / budget and Pocket sheets.
   useEffect(() => {
-    if (!saveScopeOpen && !loadDoc && !closeAsk && !killAsk && !sessionsOpen && !budgetOpen) return
+    if (!saveScopeOpen && !loadDoc && !closeAsk && !killAsk && !sessionsOpen && !budgetOpen
+      && !pocketAction && !pocketNewOpen) return
     const h = (e: KeyboardEvent): void => {
       if (e.key !== 'Escape') return
       setSaveScopeOpen(false); setLoadDoc(null); setCloseAsk(null)
       setKillAsk(null); setSessionsOpen(false); setBudgetOpen(false)
+      if (pocketAction || pocketNewOpen) closePocketSheet()
     }
     window.addEventListener('keydown', h)
     return () => window.removeEventListener('keydown', h)
-  }, [saveScopeOpen, loadDoc, closeAsk, killAsk, sessionsOpen, budgetOpen])
+  }, [saveScopeOpen, loadDoc, closeAsk, killAsk, sessionsOpen, budgetOpen, pocketAction, pocketNewOpen])
 
   // Opening the budget dialog fetches the daemon's live truth; the reply (and
   // every later one) lands here and refreshes the dialog in place.
@@ -1014,6 +1085,15 @@ function App(): JSX.Element {
     if (tab) newPane(tab.tab, nextOrd, paneKind)
     else { newPane(1, 0, paneKind); setActiveTab(1) }
   }
+  const createPocketPane = (selected: PocketSessionKind): void => {
+    const tabId = tab?.tab ?? 1
+    const ord = tab ? nextOrd : 0
+    setKind(selected)
+    window.amber.createSession(formatName({ ws: currentWs, tab: tabId, ord, id: makeId() }), cwd, selected)
+    setActiveTab(tabId)
+    setPocketNewOpen(false)
+    setPocketView('sessions')
+  }
   // Keyboard nav follows the VISUAL order (orderedTabs), so prev/next and the
   // 1–9 jump match what the user sees after a reorder.
   const stepTab = (d: number): void => {
@@ -1179,9 +1259,44 @@ function App(): JSX.Element {
     window.amber.snapshotNow?.()
   }
 
+  const pocketWorkspaceOptions = workspaces.map((workspace) => ({
+    ws: workspace.ws,
+    label: layout.workspaces[String(workspace.ws)]?.label ?? `Workspace ${workspace.ws}`,
+  }))
+  const pocketWorkspaceLabels = Object.fromEntries(
+    pocketWorkspaceOptions.map((workspace) => [workspace.ws, workspace.label]),
+  ) as Record<number, string>
+  const pocketTabLabels: Record<string, string> = {}
+  for (const workspace of workspaces) for (const workspaceTab of workspace.tabs) {
+    pocketTabLabels[`${workspace.ws}:${workspaceTab.tab}`] =
+      layout.workspaces[String(workspace.ws)]?.tabs[String(workspaceTab.tab)]?.label ?? `Tab ${workspaceTab.tab}`
+  }
+  const focusedPocketItem = zoomedPane === null
+    ? null
+    : pocketAll.groups.flatMap((group) => group.items).find((item) => item.pane.name === zoomedPane) ?? null
+  const choosePocketWorkspace = (next: number | null): void => {
+    setPocketWorkspace(next)
+    if (next === null) return
+    setActiveWs(next)
+    const workspace = workspaces.find((candidate) => candidate.ws === next)
+    setActiveTab(layout.workspaces[String(next)]?.activeTab ?? workspace?.tabs[0]?.tab ?? 1)
+  }
+
   return (
-    <div className={mobile ? 'app mobile' : 'app'}>
-      {mobile && (
+    <div className={mobile
+      ? `app mobile ${pocketFocused ? 'pocket-focus' : pocketView === 'sessions' ? 'pocket-sessions' : 'pocket-mosaic'}`
+      : 'app'}>
+      {mobile && pocketFocused && focusedPocketItem && (() => {
+        const focusTitle = pocketSessionTitle(focusedPocketItem, titles, home)
+        return <PocketFocusHeader
+          title={focusTitle}
+          machineName={window.amber.machineName}
+          stateLabel={focusedPocketItem.stateLabel}
+          onBack={clearZoom}
+          onActions={() => setPocketAction(focusedPocketItem)}
+        />
+      })()}
+      {mobile && !pocketCommandActive && (!pocketFocused || !focusedPocketItem) && (
         <div className="mobile-bar">
           <span className="crumb">
             {layout.workspaces[wsKey]?.label ?? `ws ${ws?.ws ?? 1}`}
@@ -1189,7 +1304,7 @@ function App(): JSX.Element {
             {layout.workspaces[wsKey]?.tabs[tabKey]?.label ?? `tab ${tab?.tab ?? 1}`}
           </span>
           <span className="spacer" />
-          <button aria-label="new pane" title="new pane" onClick={() => startPane()}><Icon name="add" /></button>
+          <button aria-label="new pane" title="new pane" onClick={() => setPocketNewOpen(true)}><Icon name="add" /></button>
           <button aria-label="workspaces and tabs" title="workspaces and tabs"
             onClick={() => setDrawerOpen(true)}><Icon name="more" /></button>
         </div>
@@ -1214,7 +1329,7 @@ function App(): JSX.Element {
           onClose={() => setDrawerOpen(false)}
         />
       )}
-      {!connected && <div className="banner" role="status" aria-live="polite"><span className="dot" />daemon disconnected — reconnecting…</div>}
+      {!connected && !pocketCommandActive && <div className="banner" role="status" aria-live="polite"><span className="dot" />daemon disconnected — reconnecting…</div>}
       {state.error && (
         <div className="banner error-banner" role="alert">
           <span className="dot" />
@@ -1222,7 +1337,7 @@ function App(): JSX.Element {
           <button className="banner-close" aria-label="dismiss error" title="dismiss" onClick={() => dispatch({ kind: 'ClearError' })}><Icon name="close" /></button>
         </div>
       )}
-      {state.pressure && state.pressure.level !== 'normal' && (() => {
+      {!pocketCommandActive && state.pressure && state.pressure.level !== 'normal' && (() => {
         const { level, currentKb, budgetKb, blocked } = state.pressure
         const message = level === 'warning'
           ? `Amber memory usage is high: ${fmtMem(currentKb)} of ${fmtMem(budgetKb)}. Idle agent panes may be parked.`
@@ -1234,7 +1349,7 @@ function App(): JSX.Element {
           <span className="banner-msg">{message}</span>
         </div>
       })()}
-      {state.resourcePressure?.level === 'critical' && (
+      {!pocketCommandActive && state.resourcePressure?.level === 'critical' && (
         <ResourcePressureBanner pressure={state.resourcePressure} />
       )}
       {notice && (
@@ -1243,6 +1358,25 @@ function App(): JSX.Element {
           <span className="banner-msg">{notice}</span>
           <button className="banner-close" aria-label="dismiss notice" title="dismiss" onClick={() => setNotice(null)}><Icon name="close" /></button>
         </div>
+      )}
+      {pocketCommandActive && (
+        <PocketCommandCenter
+          model={pocketModel}
+          loading={!(loaded && sawSessions)}
+          machineName={window.amber.machineName}
+          connected={connected}
+          workspaceOptions={pocketWorkspaceOptions}
+          activeWorkspace={pocketWorkspace}
+          workspaceLabels={pocketWorkspaceLabels}
+          tabLabels={pocketTabLabels}
+          titles={titles}
+          home={home}
+          onWorkspace={choosePocketWorkspace}
+          onOpen={openPocketItem}
+          onActions={setPocketAction}
+          onMosaic={() => setPocketView('mosaic')}
+          onNew={() => setPocketNewOpen(true)}
+        />
       )}
       <div className="toolbar">
         <span className="label">workspace</span>
@@ -1415,7 +1549,7 @@ function App(): JSX.Element {
         <button className="btn btn-ghost tab-add" data-drop-tab={nextTab}
           title="new tab · drop a pane here to move it to a new tab" onClick={openTab}>+ Tab</button>
       </div>
-      <div className="pane-stage">
+      <div className={`pane-stage${pocketCommandActive ? ' pocket-stage-hidden' : ''}`}>
         {/* Keep-alive: render ONE SplitView per tab in the workspace, hiding the
             inactive ones with display:none instead of unmounting them. Switching
             tabs no longer disposes/rebuilds terminals or replays backlog — the
@@ -1491,6 +1625,53 @@ function App(): JSX.Element {
                 )
               })}
       </div>
+      {pocketMosaicActive && (
+        <PocketNav
+          active="mosaic"
+          onSessions={() => setPocketView('sessions')}
+          onMosaic={() => {}}
+          onNew={() => setPocketNewOpen(true)}
+        />
+      )}
+      {mobile && pocketAction && (() => {
+        const item = pocketAction
+        const title = pocketSessionTitle(item, titles, home)
+        const parked = frozenSet.has(item.pane.name)
+          || item.pane.runState === 'suspended'
+          || item.pane.runState === 'memory-suspended'
+          || item.pane.runState === 'resource-suspended'
+        return <PocketSessionSheet
+          item={item}
+          title={title}
+          parked={parked}
+          onDismiss={() => closePocketSheet()}
+          onOpen={() => closePocketSheet(() => openPocketItem(item))}
+          onTogglePark={() => closePocketSheet(() => {
+            if (parked) {
+              unfreezePane(item.pane.name)
+              if (item.pane.runState === 'memory-suspended' || item.pane.runState === 'resource-suspended') {
+                window.amber.focusSession(item.pane.name)
+              }
+            } else freezePane(item.pane.name, '')
+          })}
+          onCopyCwd={() => closePocketSheet(() => window.amber.clipboardWrite(item.pane.cwd))}
+          onShowMosaic={() => closePocketSheet(() => {
+            setActiveWs(item.ws); setActiveTab(item.tab); setPocketView('mosaic')
+            setZoom((current) => { const next = { ...current }; delete next[`${item.ws}:${item.tab}`]; return next })
+          })}
+          onCloseSession={() => closePocketSheet(() => setKillAsk([item.pane.name]))}
+        />
+      })()}
+      {mobile && pocketNewOpen && (
+        <PocketNewSessionSheet
+          defaultKind={isAgentKind(kind) ? kind as PocketSessionKind : 'shell'}
+          cwd={cwd}
+          destination={`${pocketWorkspaceLabels[currentWs] ?? `Workspace ${currentWs}`} / ${pocketTabLabels[`${currentWs}:${currentTab}`] ?? `Tab ${currentTab}`}`}
+          onChooseCwd={() => void window.amber.pickFolder().then((path) => { if (path) setCwd(path) })}
+          onCreate={(selected) => closePocketSheet(() => createPocketPane(selected))}
+          onDismiss={() => closePocketSheet()}
+        />
+      )}
       {closeAsk && (() => {
         // Spec §3.3: closing a pane with unsaved work asks first, and Cancel
         // ABORTS the close. Save routes through the pane's own save path, so a

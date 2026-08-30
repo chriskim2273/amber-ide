@@ -6,6 +6,7 @@ import type { LoadLayoutResult, SaveLayoutResult } from '../shared/layoutFile'
 // (set in main's webPreferences), read here off `process.argv`.
 const argv = process.argv
 const homeArg = argv.find((a) => a.startsWith('--amber-home='))?.slice('--amber-home='.length)
+const machineArg = argv.find((a) => a.startsWith('--amber-machine='))?.slice('--amber-machine='.length)
 // Non-empty only in an SSH remote window (spec 2026-08-23): the renderer shows
 // a read-only marker and suppresses layout persistence chatter. The ENFORCEMENT
 // of read-only lives in main, which owns the disk — this is presentation.
@@ -41,6 +42,7 @@ contextBridge.exposeInMainWorld('amber', {
   // Absolute home dir (default cwd for new panes) + a native folder picker so
   // panes carry a real absolute cwd, not a relative '.' that drifts on restore.
   homeDir: homeArg || '/',
+  machineName: machineArg || 'amber',
   pickFolder: (): Promise<string | null> => ipcRenderer.invoke('pick-folder'),
   // CAS (spec 2026-08-01 §6): `layout-load`/`layout-save` return a version
   // token alongside the text; `saveLayout` must supply it back so main can

@@ -13,9 +13,11 @@ port 7921. The user's real daemon, sessions and tailnet config were untouched.
 go `display: none`, and the mobile bar + key bar mount — with **no reload**,
 purely from the pointer/width media query flipping.
 
-**Key bar.** All eleven keys render (`esc tab shift-tab ctrl ← ↓ ↑ → enter /
-^C`), each a **44px** tap target, `shift-tab` included — claude's mode cycle,
-the one key the bar could not ship without.
+**Key bar.** All eleven keys render (`esc tab shift-tab ctrl ^C enter / ← ↓ ↑
+→`), each a **44px** tap target, `shift-tab` included — claude's mode cycle,
+the one key the bar could not ship without. The interrupt and submit keys now
+precede the scrollable arrow cluster so the two urgent actions stay in the first
+thumb-width.
 
 **Font default.** The terminal is configured at 14px, giving a 44-column grid at
 this viewport (see `.reports/mobile-agent-cols.md` for why 14px, measured
@@ -31,6 +33,25 @@ tile:     80x24     <- unzoomed, pty untouched
 zoomed:   44x41     <- phone reflows it, readable
 unzoomed: 80x24     <- handed straight back
 ```
+
+**Software keyboard hardening (2026-08-29).** The earlier implementation added
+`paddingBottom` to the xterm host while the viewport was covered. That neither
+moved the key bar above an overlaying keyboard nor guaranteed stable PTY
+geometry: padding changes the host's observed content box. It is now
+transform-only. An emulated 390×844 mobile browser with
+`visualViewport.height` moved to 508 produced:
+
+```
+key-bar inset:       336px  (matrix translateY(-336))
+terminal lift:       388px  (matrix translateY(-388))
+pty before keyboard: 44x42
+pty after keyboard:  44x42
+```
+
+The key bar ended exactly at y=508, the active shell cursor remained visible
+above it, the hidden xterm textarea retained focus, and the daemon-reported PTY
+grid did not move. This ran against a real isolated daemon and the production
+web bundle, not the visual prototype.
 
 ## Two real bugs this pass caught
 
@@ -66,16 +87,42 @@ gating; the conflicts were additive on both sides (SplitView imports, the web
 shim's method table, two CLAUDE.md entries) and the borrow code was untouched
 by the protocol change.
 
+## Amber Pocket production foundation (2026-08-30)
+
+The real `/app` renderer now opens to a capability-gated command center instead
+of the desktop split tree. The selector is deterministic and honest: exited,
+retrying and fallback sessions need attention; daemon/app parked states are
+parked; live agents and shells with unseen output are working; the remainder
+are quiet. It never scrapes a TUI or claims an agent is waiting. Critical host
+pressure is a global alert, not assigned to an arbitrary pane.
+
+Production CDP at 390×844 against the live daemon's 13 sessions verified:
+
+- Sessions is the initial surface and the hidden pane stage remains mounted and
+  laid out (`visibility:hidden`, not `display:none`): measured 390×844 with 45
+  xterm rows, then Mosaic revealed those same rows instead of a broken 2×1 fit.
+- The first row appears above the fold; every interactive target is at least
+  44 px.
+- Opening a row reuses the existing zoomed pane and MessagePort/xterm path.
+- Focus removes the old pane header and returns its 26 px to xterm.
+- Session and new-session bottom sheets render above Focus.
+- A platform-history pop dismisses the sheet while Focus remains intact.
+- Browser/editor panes stay out of the terminal command center and remain
+  available in Mosaic.
+
+The command center also stops `MarkSeen` while it is only listing sessions, so
+an unseen-output signal survives scanning and is consumed only when Mosaic or
+Focus actually displays that terminal.
+
 ## Not verified
 
 - **A real device, either platform.** Emulation gives touch events and a coarse
   pointer, not a real soft keyboard, real momentum, or Safari's behaviour.
-  The soft-keyboard rule (§3: opening the keyboard must not re-fit the pty) is
-  **implemented and unit-tested** (`keyboardViewport.test.ts` pins the
-  discriminator, including that an orientation change — which moves BOTH
-  heights — must still re-fit), but it is **not verified on a device**:
-  `visualViewport` does not move under emulation, so the code path that keeps
-  the cursor row above the keyboard has never run for real.
+  The soft-keyboard path has now run end-to-end through an explicit
+  `visualViewport.height` override (measurements above) and its pure geometry is
+  unit-tested, including that an orientation change — which moves BOTH heights
+  — still re-fits. It remains unverified against the timing, panning and safe
+  area behaviour of a physical iOS or Android keyboard.
 - Long-press drag arming (§6) and long-press sheets: synthetic pointer events
   were not driven through the 400ms arming path.
 - Touch scrolling and its alt-screen arrow translation: the ported logic is

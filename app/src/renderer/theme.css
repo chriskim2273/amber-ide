@@ -520,6 +520,14 @@ input:focus-visible {
 
 .pane-body { position: absolute; inset: 28px 0 0 0; }
 
+/* A soft keyboard must move rendered pixels, never change the xterm host's
+   layout box: ResizeObserver watches that box and a size change would re-fit
+   the shared PTY. The class is present only while a cursor lift is active. */
+.terminal-host {
+  transition: transform 160ms cubic-bezier(0, 0, 0.2, 1);
+}
+.terminal-host.keyboard-lifted { will-change: transform; }
+
 /* ---------- header context menu ---------- */
 /* Custom menu opened by right-click on a pane HEADER (xterm owns body events).
    Positioned inline (stage-relative, clamped in JS); above every pane layer. */
@@ -1250,6 +1258,16 @@ input:focus-visible {
   right: 0;
   bottom: 0;
   z-index: 6;
+  transition: transform 160ms cubic-bezier(0, 0, 0.2, 1);
+}
+.key-bar-dock.keyboard-open { will-change: transform; }
+/* The keyboard already occupies the home-indicator area. Keeping the safe-area
+   pad here would spend scarce visible terminal height twice. */
+.key-bar-dock.keyboard-open .key-bar { padding-bottom: 6px; }
+
+@media (prefers-reduced-motion: reduce) {
+  .terminal-host,
+  .key-bar-dock { transition-duration: 0.01ms; }
 }
 
 /* An armed divider drag must not fight the browser's own pan/zoom on the same
