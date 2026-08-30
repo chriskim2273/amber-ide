@@ -60,13 +60,20 @@ pub fn is_session_id(id: &str) -> bool {
 
 /// Resolve Hermes through user's login shell, never daemon's own PATH.
 pub fn resolve_hermes() -> Option<PathBuf> {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-    crate::claude::resolve_bin_with(&shell, true, "hermes", &[])
+    #[cfg(unix)]
+    {
+        let shell = crate::platform::default_shell();
+        crate::claude::resolve_bin_with(&shell.to_string_lossy(), true, "hermes", &[])
+    }
+    #[cfg(windows)]
+    {
+        crate::claude::resolve_bin_windows("hermes")
+    }
 }
 
 fn hermes_home() -> Option<PathBuf> {
     std::env::var("HERMES_HOME").ok().filter(|p| !p.is_empty()).map(PathBuf::from)
-        .or_else(|| std::env::var("HOME").ok().filter(|p| !p.is_empty()).map(|p| PathBuf::from(p).join(".hermes")))
+        .or_else(|| crate::platform::user_home().map(|home| home.join(".hermes")))
 }
 
 /// Install recorder then enable it through Hermes CLI, never hand-merge user YAML.

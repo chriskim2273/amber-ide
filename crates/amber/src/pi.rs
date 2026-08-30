@@ -56,8 +56,15 @@ pub fn is_session_id(id: &str) -> bool {
 
 /// Resolve the Pi binary via the user's login shell, never the daemon PATH.
 pub fn resolve_pi() -> Option<PathBuf> {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-    crate::claude::resolve_bin_with(&shell, true, "pi", &[])
+    #[cfg(unix)]
+    {
+        let shell = crate::platform::default_shell();
+        crate::claude::resolve_bin_with(&shell.to_string_lossy(), true, "pi", &[])
+    }
+    #[cfg(windows)]
+    {
+        crate::claude::resolve_bin_windows("pi")
+    }
 }
 
 /// Pi's agent directory, respecting its non-empty override before `$HOME`.
@@ -67,10 +74,7 @@ fn pi_agent_dir() -> Option<PathBuf> {
         .filter(|dir| !dir.is_empty())
         .map(PathBuf::from)
         .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .filter(|home| !home.is_empty())
-                .map(|home| PathBuf::from(home).join(".pi").join("agent"))
+            crate::platform::user_home().map(|home| home.join(".pi").join("agent"))
         })
 }
 

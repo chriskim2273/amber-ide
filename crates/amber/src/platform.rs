@@ -492,6 +492,16 @@ pub fn default_shell() -> OsString {
     }
 }
 
+pub(crate) fn user_home() -> Option<PathBuf> {
+    user_home_from(std::env::var_os("HOME"), std::env::var_os("USERPROFILE"))
+}
+
+fn user_home_from(home: Option<OsString>, user_profile: Option<OsString>) -> Option<PathBuf> {
+    home.filter(|path| !path.is_empty())
+        .or_else(|| user_profile.filter(|path| !path.is_empty()))
+        .map(PathBuf::from)
+}
+
 /// Validate a name before it becomes a persisted session filename.
 ///
 /// The grammar is deliberately portable: state created on Unix must be safe
@@ -659,7 +669,7 @@ mod windows_private_file_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_paths, socket_name_for_root, validate_session_name};
+    use super::{resolve_paths, socket_name_for_root, user_home_from, validate_session_name};
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -703,5 +713,18 @@ mod tests {
             assert!(validate_session_name(name).is_err(), "{name}");
         }
         assert!(validate_session_name("amber-1-1-0-safe").is_ok());
+    }
+
+    #[test]
+    fn user_home_falls_back_to_windows_profile() {
+        assert_eq!(
+            user_home_from(Some("/home/alice".into()), Some(r"C:\Users\alice".into())),
+            Some(PathBuf::from("/home/alice")),
+        );
+        assert_eq!(
+            user_home_from(None, Some(r"C:\Users\alice".into())),
+            Some(PathBuf::from(r"C:\Users\alice")),
+        );
+        assert_eq!(user_home_from(Some("".into()), Some("".into())), None);
     }
 }

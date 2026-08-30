@@ -67,9 +67,7 @@ pub fn codex_home() -> Option<PathBuf> {
             return Some(p);
         }
     }
-    std::env::var("HOME")
-        .ok()
-        .map(|h| PathBuf::from(h).join(".codex"))
+    crate::platform::user_home().map(|home| home.join(".codex"))
 }
 
 /// Path of the Codex hooks file amber merges into.

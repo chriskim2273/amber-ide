@@ -107,10 +107,7 @@ pub fn config_dir() -> Option<PathBuf> {
             return Some(p.join("opencode"));
         }
     }
-    std::env::var("HOME")
-        .ok()
-        .filter(|h| !h.is_empty())
-        .map(|h| PathBuf::from(h).join(".config").join("opencode"))
+    crate::platform::user_home().map(|home| home.join(".config").join("opencode"))
 }
 
 /// Path of the plugins directory amber writes `amber-hook.js` into.

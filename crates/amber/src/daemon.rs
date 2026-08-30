@@ -859,7 +859,6 @@ mod tests {
         assert!(!suppress_backlog(true, None));
     }
 
-    #[cfg(unix)]
     #[test]
     fn parse_kind_accepts_hermes_as_an_agent() {
         let kind = parse_kind("hermes").expect("hermes must be a create kind");
@@ -867,6 +866,7 @@ mod tests {
         assert_eq!(kind.as_str(), "hermes");
     }
 
+    #[cfg(unix)]
     #[test]
     fn write_bounded_gives_up_after_one_timeout_on_a_non_reading_peer() {
         // The bound must be ONE timeout even for a buffer far larger than the

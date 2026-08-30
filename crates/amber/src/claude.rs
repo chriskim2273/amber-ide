@@ -276,8 +276,8 @@ pub fn create_handoff(id: &str) -> anyhow::Result<String> {
 /// in `~/.claude.json` is exactly what accepting the dialog does. Best-effort:
 /// any failure leaves claude to prompt as usual.
 pub fn ensure_cwd_trusted(cwd: &Path) {
-    if let Ok(home) = std::env::var("HOME") {
-        trust_cwd_in(&PathBuf::from(home).join(".claude.json"), cwd);
+    if let Some(home) = crate::platform::user_home() {
+        trust_cwd_in(&home.join(".claude.json"), cwd);
     }
 }
 
@@ -286,8 +286,8 @@ pub fn ensure_cwd_trusted(cwd: &Path) {
 /// amber shell also records its resume id (the per-session `--settings` hook
 /// only covers amber-launched claude). Idempotent and merge-preserving.
 pub fn ensure_global_claude_hook(hook_command: &str) {
-    if let Ok(home) = std::env::var("HOME") {
-        add_global_hook_in(&PathBuf::from(home).join(".claude").join("settings.json"), hook_command);
+    if let Some(home) = crate::platform::user_home() {
+        add_global_hook_in(&home.join(".claude").join("settings.json"), hook_command);
     }
 }
 
