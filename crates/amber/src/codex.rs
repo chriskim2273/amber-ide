@@ -302,6 +302,12 @@ mod tests {
     use super::*;
     use std::fs;
 
+    fn toml_project_header(path: &Path) -> String {
+        let raw = path.to_string_lossy();
+        let escaped = raw.replace('\\', "\\\\").replace('"', "\\\"");
+        format!("[projects.\"{escaped}\"]")
+    }
+
     #[test]
     fn argv_fresh_is_unattended_without_resume() {
         let argv = codex_argv(&CodexStart::Fresh);
@@ -476,7 +482,7 @@ mod tests {
         let text = fs::read_to_string(&config).unwrap();
         let abs = cwd.canonicalize().unwrap();
         assert!(text.contains("model = \"gpt-5\""));
-        assert!(text.contains(&format!("[projects.\"{}\"]", abs.display())));
+        assert!(text.contains(&toml_project_header(&abs)));
         assert!(text.contains("trust_level = \"trusted\""));
     }
 
@@ -488,8 +494,8 @@ mod tests {
         fs::create_dir(&cwd).unwrap();
         let abs = cwd.canonicalize().unwrap();
         let original = format!(
-            "model = \"x\"\n\n[projects.\"{}\"]\ntrust_level = \"trusted\"\nother = 1\n",
-            abs.display()
+            "model = \"x\"\n\n{}\ntrust_level = \"trusted\"\nother = 1\n",
+            toml_project_header(&abs)
         );
         fs::write(&config, &original).unwrap();
 
@@ -508,8 +514,8 @@ mod tests {
         fs::write(
             &config,
             format!(
-                "[projects.\"{}\"]\ntrust_level = \"untrusted\"\nnote = \"keep\"\n",
-                abs.display()
+                "{}\ntrust_level = \"untrusted\"\nnote = \"keep\"\n",
+                toml_project_header(&abs)
             ),
         )
         .unwrap();

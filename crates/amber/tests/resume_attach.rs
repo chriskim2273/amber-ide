@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! Delta re-attach: a client presenting a valid `(epoch, offset)` watermark
 //! gets ONLY the scrollback bytes it has not seen (plus an `AttachBacklog`
 //! announcement), instead of today's always-full replay that grew every pane's

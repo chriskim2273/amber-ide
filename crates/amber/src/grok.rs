@@ -13,7 +13,6 @@
 //! start ALWAYS mints a new uuid; re-passing the recorded one would fail
 //! instantly and burn the supervisor's whole retry budget.
 
-use std::io::Read;
 use std::path::PathBuf;
 
 /// How to start `grok`: reopen a recorded conversation, or begin a new one
@@ -66,13 +65,10 @@ pub fn is_session_id(id: &str) -> bool {
     parts.next().is_none()
 }
 
-/// Mint a random UUIDv4 for a new grok conversation. `/dev/urandom` is the only
-/// randomness amber needs (same source as the web token) — no dependency.
+/// Mint a random UUIDv4 for a new grok conversation.
 pub fn new_session_id() -> String {
     let mut b = [0u8; 16];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut b))
-        .expect("/dev/urandom is readable");
+    crate::platform::random_bytes(&mut b).expect("OS random source is readable");
     b[6] = (b[6] & 0x0f) | 0x40; // version 4
     b[8] = (b[8] & 0x3f) | 0x80; // variant 1
     let h: String = b.iter().map(|x| format!("{x:02x}")).collect();

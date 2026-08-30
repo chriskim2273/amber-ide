@@ -61,6 +61,16 @@ fn detached_session_has_a_real_pty_size() {
     let dir = tempfile::tempdir().unwrap();
     let mgr = SessionManager::new(dir.path()).unwrap();
     let sess = mgr.create("t", "/tmp", SessionKind::Shell).unwrap();
+    #[cfg(unix)]
     mgr.write("t", b"stty size\n").unwrap();
+    #[cfg(unix)]
     wait_contains(&sess, b"24 80"); // rows cols, as configured at spawn
+    #[cfg(windows)]
+    mgr.write(
+        "t",
+        b"powershell.exe -NoProfile -NonInteractive -Command \"$s=$Host.UI.RawUI.WindowSize; Write-Output ('AMBER_SIZE_{0}_{1}' -f $s.Height,$s.Width)\"\r\n",
+    )
+    .unwrap();
+    #[cfg(windows)]
+    wait_contains(&sess, b"AMBER_SIZE_24_80");
 }

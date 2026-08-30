@@ -311,7 +311,7 @@ pub struct StateStore {
 /// Stat-keyed parse cache for small metadata files that are read far more
 /// often than they are written.
 ///
-/// A hit is one `stat` (mtime + len match) returning the previously parsed
+/// A hit is one `stat` (file identity + mtime + len match) returning the previously parsed
 /// value; anything else — created, rewritten, deleted, recreated — falls
 /// through to `load`, whose result is cached under the stat observed BEFORE
 /// the load. That ordering is deliberately conservative: if the file changes
@@ -319,10 +319,63 @@ pub struct StateStore {
 /// re-reads (one wasted read, never a wrong value served twice).
 ///
 /// Correctness does not depend on writers cooperating: every write path here
-/// is an atomic tmp+rename, so a changed file always has a new inode/mtime,
+/// is an atomic tmp+rename, so a changed file always has a new file identity,
 /// and an externally deleted file fails its stat and is evicted.
-/// (mtime, len) stamp paired with the parsed value — the cache key + payload.
-type CacheEntry<T> = (Option<std::time::SystemTime>, u64, T);
+/// Filesystem stamp paired with the parsed value — the cache key + payload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileStamp {
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(windows)]
+    volume: u32,
+    #[cfg(windows)]
+    index: u64,
+}
+
+impl FileStamp {
+    fn read(path: &Path) -> Option<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = fs::metadata(path).ok()?;
+            Some(Self {
+                modified: metadata.modified().ok(),
+                len: metadata.len(),
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            })
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Storage::FileSystem::{
+                GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+            };
+
+            let file = fs::File::open(path).ok()?;
+            let metadata = file.metadata().ok()?;
+            let mut info = BY_HANDLE_FILE_INFORMATION::default();
+            // SAFETY: `file` owns a valid handle for this call and `info`
+            // points to writable storage of the required structure.
+            if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+                // Correctness beats caching when file identity is unavailable.
+                return None;
+            }
+            Some(Self {
+                modified: metadata.modified().ok(),
+                len: metadata.len(),
+                volume: info.dwVolumeSerialNumber,
+                index: u64::from(info.nFileIndexHigh) << 32 | u64::from(info.nFileIndexLow),
+            })
+        }
+    }
+}
+
+type CacheEntry<T> = (FileStamp, T);
 
 struct FileCache<T> {
     entries: Mutex<HashMap<PathBuf, CacheEntry<T>>>,
@@ -330,21 +383,21 @@ struct FileCache<T> {
 
 impl<T: Clone> FileCache<T> {
     fn new() -> Self {
-        FileCache { entries: Mutex::new(HashMap::new()) }
+        FileCache {
+            entries: Mutex::new(HashMap::new()),
+        }
     }
     /// Return the parsed contents of `path`, re-running `load` only when the
-    /// file's (mtime, len) no longer matches the cached entry. `load` mirrors
+    /// file stamp no longer matches the cached entry. `load` mirrors
     /// [`StateStore::read_json`]: `Ok(None)` for a missing file.
     fn get<F>(&self, path: &Path, load: F) -> anyhow::Result<Option<T>>
     where
         F: FnOnce(&Path) -> anyhow::Result<Option<T>>,
     {
-        let stamp = fs::metadata(path).ok().map(|m| (m.modified().ok(), m.len()));
-        if let Some((Some(mtime), len)) = &stamp {
-            if let Some((cached_mtime, cached_len, value)) =
-                self.entries.lock().unwrap().get(path)
-            {
-                if *cached_mtime == Some(*mtime) && *cached_len == *len {
+        let stamp = FileStamp::read(path);
+        if let Some(stamp) = stamp {
+            if let Some((cached_stamp, value)) = self.entries.lock().unwrap().get(path) {
+                if *cached_stamp == stamp {
                     return Ok(Some(value.clone()));
                 }
             }
@@ -352,8 +405,8 @@ impl<T: Clone> FileCache<T> {
         let loaded = load(path)?;
         let mut entries = self.entries.lock().unwrap();
         match (&stamp, &loaded) {
-            (Some((Some(mtime), len)), Some(value)) => {
-                entries.insert(path.to_path_buf(), (Some(*mtime), *len, value.clone()));
+            (Some(stamp), Some(value)) => {
+                entries.insert(path.to_path_buf(), (*stamp, value.clone()));
             }
             _ => {
                 // Deleted/unstattable, or nothing to remember: drop any stale

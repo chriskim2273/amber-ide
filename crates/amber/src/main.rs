@@ -477,6 +477,28 @@ fn print_crash_report() {
     }
 }
 
+const DAEMON_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn read_daemon_reply_chunk(
+    stream: &mut LocalStream,
+    buf: &mut [u8],
+    deadline: std::time::Instant,
+) -> anyhow::Result<usize> {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        anyhow::bail!("timed out waiting for the daemon's reply");
+    }
+    match stream.read_with_timeout(buf, remaining) {
+        Err(error)
+            if error.kind() == std::io::ErrorKind::WouldBlock
+                || error.kind() == std::io::ErrorKind::TimedOut =>
+        {
+            anyhow::bail!("timed out waiting for the daemon's reply")
+        }
+        result => Ok(result?),
+    }
+}
+
 /// Connect to the daemon and report liveness + session count.
 fn run_status(socket: &Path) -> anyhow::Result<()> {
     match transport::connect(socket) {
@@ -484,6 +506,7 @@ fn run_status(socket: &Path) -> anyhow::Result<()> {
             stream.write_all(&proto::encode(&Frame::Control(ControlMsg::ListSessions)))?;
             let mut decoder = Decoder::new();
             let mut buf = [0u8; 8192];
+            let deadline = std::time::Instant::now() + DAEMON_REPLY_TIMEOUT;
             loop {
                 if let Some(Frame::Control(ControlMsg::SessionList { names })) =
                     decoder.next_frame()?
@@ -492,7 +515,7 @@ fn run_status(socket: &Path) -> anyhow::Result<()> {
                     print_crash_report();
                     return Ok(());
                 }
-                let n = stream.read(&mut buf)?;
+                let n = read_daemon_reply_chunk(&mut stream, &mut buf, deadline)?;
                 if n == 0 {
                     anyhow::bail!("daemon closed the connection before replying");
                 }
@@ -604,6 +627,7 @@ fn run_snapshot_now(socket: &Path) -> anyhow::Result<()> {
 
     let mut decoder = Decoder::new();
     let mut buf = [0u8; 8192];
+    let deadline = std::time::Instant::now() + DAEMON_REPLY_TIMEOUT;
     loop {
         match decoder.next_frame()? {
             Some(Frame::Control(ControlMsg::SnapshotOk)) => {
@@ -615,7 +639,7 @@ fn run_snapshot_now(socket: &Path) -> anyhow::Result<()> {
             }
             _ => {}
         }
-        let n = stream.read(&mut buf)?;
+        let n = read_daemon_reply_chunk(&mut stream, &mut buf, deadline)?;
         if n == 0 {
             anyhow::bail!("daemon closed the connection before replying");
         }
@@ -885,6 +909,12 @@ fn run_ctl_web(
     json: bool,
     root: Option<PathBuf>,
 ) -> anyhow::Result<()> {
+    #[cfg(windows)]
+    if !matches!(&action, WebAction::Status | WebAction::Url) {
+        anyhow::bail!(
+            "managed amber web lifecycle is not supported on Windows; run `amber web` manually"
+        );
+    }
     let root = amber::platform::resolve_state_root(root)?;
     std::fs::create_dir_all(&root)?;
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".into()));
@@ -973,6 +1003,9 @@ fn run_ctl_web(
             }
         }
         WebAction::Status => {
+            #[cfg(windows)]
+            let unit_state = "unsupported";
+            #[cfg(not(windows))]
             let unit_state = match run_web_argv(&amber::webctl::is_active_argv(), &unit) {
                 Ok(o) if o.status.success() => "active",
                 Ok(_) => "inactive",
@@ -1179,6 +1212,7 @@ fn run_ls(socket: &Path) -> anyhow::Result<()> {
 
     let mut decoder = Decoder::new();
     let mut buf = [0u8; 8192];
+    let deadline = std::time::Instant::now() + DAEMON_REPLY_TIMEOUT;
     loop {
         if let Some(Frame::Control(ControlMsg::Sessions { mut sessions })) = decoder.next_frame()? {
             // The printed number is the session's STABLE slot (`attach <n>`
@@ -1207,7 +1241,7 @@ fn run_ls(socket: &Path) -> anyhow::Result<()> {
             }
             return Ok(());
         }
-        let n = stream.read(&mut buf)?;
+        let n = read_daemon_reply_chunk(&mut stream, &mut buf, deadline)?;
         if n == 0 {
             anyhow::bail!("daemon closed the connection before replying");
         }
@@ -1304,11 +1338,12 @@ fn list_session_names(socket: &Path) -> anyhow::Result<Vec<String>> {
 
     let mut decoder = Decoder::new();
     let mut buf = [0u8; 8192];
+    let deadline = std::time::Instant::now() + DAEMON_REPLY_TIMEOUT;
     loop {
         if let Some(Frame::Control(ControlMsg::SessionList { names })) = decoder.next_frame()? {
             return Ok(names);
         }
-        let n = stream.read(&mut buf)?;
+        let n = read_daemon_reply_chunk(&mut stream, &mut buf, deadline)?;
         if n == 0 {
             anyhow::bail!("daemon closed the connection before replying");
         }
@@ -1325,6 +1360,7 @@ fn resolve_target(socket: &Path, name: Option<String>) -> anyhow::Result<(String
 
     let mut decoder = Decoder::new();
     let mut buf = [0u8; 8192];
+    let deadline = std::time::Instant::now() + DAEMON_REPLY_TIMEOUT;
     loop {
         if let Some(Frame::Control(ControlMsg::Sessions { sessions })) = decoder.next_frame()? {
             return match name {
@@ -1350,7 +1386,7 @@ fn resolve_target(socket: &Path, name: Option<String>) -> anyhow::Result<(String
                 },
             };
         }
-        let n = stream.read(&mut buf)?;
+        let n = read_daemon_reply_chunk(&mut stream, &mut buf, deadline)?;
         if n == 0 {
             anyhow::bail!("daemon closed the connection before replying");
         }
@@ -1365,11 +1401,12 @@ fn list_detailed(socket: &Path) -> anyhow::Result<Vec<amber_core::proto::Session
 
     let mut decoder = Decoder::new();
     let mut buf = [0u8; 8192];
+    let deadline = std::time::Instant::now() + DAEMON_REPLY_TIMEOUT;
     loop {
         if let Some(Frame::Control(ControlMsg::Sessions { sessions })) = decoder.next_frame()? {
             return Ok(sessions);
         }
-        let n = stream.read(&mut buf)?;
+        let n = read_daemon_reply_chunk(&mut stream, &mut buf, deadline)?;
         if n == 0 {
             anyhow::bail!("daemon closed the connection before replying");
         }
@@ -1399,6 +1436,7 @@ fn run_kill(socket: &Path, arg: &str) -> anyhow::Result<()> {
 
     let mut decoder = Decoder::new();
     let mut buf = [0u8; 8192];
+    let deadline = std::time::Instant::now() + DAEMON_REPLY_TIMEOUT;
     loop {
         if let Some(Frame::Control(ControlMsg::SessionList { names })) = decoder.next_frame()? {
             if names.iter().any(|n| n == &name) {
@@ -1407,7 +1445,7 @@ fn run_kill(socket: &Path, arg: &str) -> anyhow::Result<()> {
             println!("killed {name}");
             return Ok(());
         }
-        let n = stream.read(&mut buf)?;
+        let n = read_daemon_reply_chunk(&mut stream, &mut buf, deadline)?;
         if n == 0 {
             anyhow::bail!("daemon closed the connection before replying");
         }
@@ -1434,25 +1472,28 @@ fn run_suspend(socket: &Path, arg: &str, freeze: bool) -> anyhow::Result<()> {
     let mut decoder = Decoder::new();
     let mut buf = [0u8; 8192];
     let mut err = None;
+    let deadline = std::time::Instant::now() + DAEMON_REPLY_TIMEOUT;
     loop {
-        match decoder.next_frame()? {
-            Some(Frame::Control(ControlMsg::Error { msg })) => {
-                err = Some(msg);
-            }
-            Some(Frame::Control(ControlMsg::Sessions { sessions })) => {
-                if let Some(msg) = err {
-                    anyhow::bail!("{verb} failed: {msg}");
+        while let Some(frame) = decoder.next_frame()? {
+            match frame {
+                Frame::Control(ControlMsg::Error { msg }) => {
+                    err = Some(msg);
                 }
-                if !sessions.iter().any(|s| s.name == name) {
-                    anyhow::bail!("no such session: {name}");
+                Frame::Control(ControlMsg::Sessions { sessions }) => {
+                    if let Some(msg) = err {
+                        anyhow::bail!("{verb} failed: {msg}");
+                    }
+                    if !sessions.iter().any(|s| s.name == name) {
+                        anyhow::bail!("no such session: {name}");
+                    }
+                    println!("{ok} {name}");
+                    return Ok(());
                 }
-                println!("{ok} {name}");
-                return Ok(());
+                Frame::Control(_) => {}
+                _ => {}
             }
-            Some(Frame::Control(_)) => {}
-            _ => {}
         }
-        let n = stream.read(&mut buf)?;
+        let n = read_daemon_reply_chunk(&mut stream, &mut buf, deadline)?;
         if n == 0 {
             if let Some(msg) = err {
                 anyhow::bail!("{verb} failed: {msg}");
@@ -1476,6 +1517,7 @@ fn run_rename(socket: &Path, from: &str, to: &str) -> anyhow::Result<()> {
 
     let mut decoder = Decoder::new();
     let mut buf = [0u8; 8192];
+    let deadline = std::time::Instant::now() + DAEMON_REPLY_TIMEOUT;
     loop {
         match decoder.next_frame()? {
             Some(Frame::Control(ControlMsg::Error { msg })) => {
@@ -1488,7 +1530,7 @@ fn run_rename(socket: &Path, from: &str, to: &str) -> anyhow::Result<()> {
             }
             _ => {}
         }
-        let n = stream.read(&mut buf)?;
+        let n = read_daemon_reply_chunk(&mut stream, &mut buf, deadline)?;
         if n == 0 {
             anyhow::bail!("daemon closed the connection before replying");
         }
@@ -1515,6 +1557,7 @@ fn create_session(socket: &Path, name: &str, cwd: &Path, kind: &str) -> anyhow::
 
     let mut decoder = Decoder::new();
     let mut buf = [0u8; 8192];
+    let deadline = std::time::Instant::now() + DAEMON_REPLY_TIMEOUT;
     loop {
         match decoder.next_frame()? {
             Some(Frame::Control(ControlMsg::Created { name })) => return Ok(name),
@@ -1523,7 +1566,7 @@ fn create_session(socket: &Path, name: &str, cwd: &Path, kind: &str) -> anyhow::
             }
             _ => {}
         }
-        let n = stream.read(&mut buf)?;
+        let n = read_daemon_reply_chunk(&mut stream, &mut buf, deadline)?;
         if n == 0 {
             anyhow::bail!("daemon closed the connection before replying");
         }
@@ -1534,6 +1577,31 @@ fn create_session(socket: &Path, name: &str, cwd: &Path, kind: &str) -> anyhow::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daemon_reply_read_waits_for_delayed_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = dir.path().join("delayed-reply");
+        let listener = transport::bind(&endpoint).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut stream = listener.accept().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(75));
+            stream.write_all(b"x").unwrap();
+        });
+        let mut stream = transport::connect(&endpoint).unwrap();
+        let mut byte = [0_u8; 1];
+
+        let read = read_daemon_reply_chunk(
+            &mut stream,
+            &mut byte,
+            std::time::Instant::now() + DAEMON_REPLY_TIMEOUT,
+        )
+        .unwrap();
+
+        assert_eq!(read, 1);
+        assert_eq!(byte, *b"x");
+        server.join().unwrap();
+    }
 
     #[test]
     fn parses_budget_sizes_in_binary_units() {

@@ -713,9 +713,13 @@ fn resolve_cgroup_path(mount: &CgroupMount, unified: &Path) -> io::Result<PathBu
 
 fn validate_absolute(path: &Path) -> io::Result<()> {
     let mut components = path.components();
-    if components.next() != Some(Component::RootDir)
-        || !components.all(|component| matches!(component, Component::Normal(_)))
-    {
+    let rooted = match components.next() {
+        Some(Component::RootDir) => true,
+        #[cfg(windows)]
+        Some(Component::Prefix(_)) => components.next() == Some(Component::RootDir),
+        _ => false,
+    };
+    if !rooted || !components.all(|component| matches!(component, Component::Normal(_))) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unsafe cgroup path: {}", path.display()),
@@ -1145,6 +1149,7 @@ mod tests {
         assert_eq!(manager.lowest_finite_limit_kb().unwrap(), Some(4096));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn fallback_pid_traversal_honors_an_expired_deadline() {
         let temp = tempfile::tempdir().unwrap();

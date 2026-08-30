@@ -596,6 +596,7 @@ impl PtySession {
     }
 
     #[cfg(test)]
+    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) fn pending_resume_for_test(&self) -> bool {
         self.pending_resume.load(Ordering::SeqCst)
     }
@@ -605,6 +606,7 @@ impl PtySession {
     }
 
     #[cfg(test)]
+    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) fn lock_killer_for_test(
         &self,
     ) -> MutexGuard<'_, Box<dyn ChildKiller + Send + Sync>> {
@@ -612,6 +614,7 @@ impl PtySession {
     }
 
     #[cfg(test)]
+    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) fn lock_exit_for_test(&self) -> MutexGuard<'_, Option<i32>> {
         self.exit.lock().unwrap()
     }

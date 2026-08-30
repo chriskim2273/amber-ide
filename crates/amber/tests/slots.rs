@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! Stable session slots (spec `2026-07-19-stable-session-slots-design.md`):
 //! the number `amber ls` prints and `amber attach <n>` resolves belongs to the
 //! session, not to its position in the list. It survives a daemon restart and

@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! Killing a session must kill what the session STARTED, not just its direct
 //! child.
 //!

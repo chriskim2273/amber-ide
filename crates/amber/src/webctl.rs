@@ -164,8 +164,16 @@ mod tests {
 
     #[test]
     fn systemd_unit_carries_bin_and_port() {
-        let u = render_systemd_unit(Path::new("/home/u/.local/bin/amber"), 7717);
-        assert!(u.contains("ExecStart=/home/u/.local/bin/amber web --port 7717"), "{u}");
+        let bin = if cfg!(windows) {
+            Path::new(r"C:\Users\u\.local\bin\amber.exe")
+        } else {
+            Path::new("/home/u/.local/bin/amber")
+        };
+        let u = render_systemd_unit(bin, 7717);
+        assert!(
+            u.contains(&format!("ExecStart={} web --port 7717", bin.display())),
+            "{u}"
+        );
         assert!(u.contains("WantedBy=default.target"));
         assert!(u.contains("Wants=amber.service"));
         // %h expansion must be GONE — we write an absolute path, because the
@@ -208,13 +216,26 @@ mod tests {
 
     #[test]
     fn unit_path_is_under_the_users_home() {
-        let p = unit_path(Path::new("/home/u"));
+        let home = if cfg!(windows) {
+            Path::new(r"C:\Users\u")
+        } else {
+            Path::new("/home/u")
+        };
+        let p = unit_path(home);
         let s = p.to_string_lossy();
-        assert!(s.starts_with("/home/u/"), "{s}");
+        assert!(p.starts_with(home), "{s}");
         if cfg!(target_os = "macos") {
             assert!(s.ends_with("Library/LaunchAgents/com.amber-ide.web.plist"), "{s}");
         } else {
-            assert!(s.ends_with(".config/systemd/user/amber-web.service"), "{s}");
+            assert!(
+                p.ends_with(
+                    Path::new(".config")
+                        .join("systemd")
+                        .join("user")
+                        .join("amber-web.service")
+                ),
+                "{s}"
+            );
         }
     }
 

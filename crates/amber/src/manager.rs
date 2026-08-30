@@ -698,13 +698,7 @@ impl SessionManager {
         if let Some(session) = session {
             if session.is_alive() {
                 if let Err(error) = session.kill() {
-                    let gone = error.chain().any(|cause| {
-                        cause
-                            .downcast_ref::<std::io::Error>()
-                            .and_then(std::io::Error::raw_os_error)
-                            == Some(libc::ESRCH)
-                    });
-                    if !gone {
+                    if !Self::ignorable_child_kill_error(&error) {
                         return Err(error);
                     }
                 }
@@ -721,6 +715,23 @@ impl SessionManager {
         }
         self.cgroups.remove_session(slot)?;
         Ok(())
+    }
+
+    fn ignorable_child_kill_error(error: &anyhow::Error) -> bool {
+        #[cfg(unix)]
+        {
+            error.chain().any(|cause| {
+                let Some(error) = cause.downcast_ref::<std::io::Error>() else {
+                    return false;
+                };
+                error.raw_os_error() == Some(libc::ESRCH)
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = error;
+            false
+        }
     }
 
     fn rollback_agent_rename(
@@ -2489,7 +2500,9 @@ mod tests {
     fn session_infos_projects_metadata_for_live_sessions() {
         let dir = tempdir().unwrap();
         let mgr = SessionManager::new(dir.path()).unwrap();
-        mgr.create("amber-1-1-0-a", "/tmp", SessionKind::Shell)
+        let shell_cwd = dir.path().join("shell-cwd");
+        std::fs::create_dir(&shell_cwd).unwrap();
+        mgr.create("amber-1-1-0-a", &shell_cwd, SessionKind::Shell)
             .unwrap();
         mgr.create("amber-1-1-1-b", dir.path(), SessionKind::Claude)
             .unwrap();
@@ -2499,7 +2512,7 @@ mod tests {
         assert_eq!(infos.len(), 2);
         assert_eq!(infos[0].name, "amber-1-1-0-a");
         assert_eq!(infos[0].kind, "shell");
-        assert_eq!(infos[0].cwd, "/tmp");
+        assert_eq!(Path::new(&infos[0].cwd), shell_cwd);
         assert!(infos[0].alive);
         assert_eq!(infos[1].kind, "claude");
     }
@@ -2543,6 +2556,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn snapshot_persists_a_shells_live_cwd_after_cd() {
         // A `cd` inside a shell must survive restart: snapshot reads the child's
         // live /proc/<pid>/cwd and updates the stored cwd.
@@ -2567,6 +2581,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn periodic_snapshot_does_not_mutate_metadata_while_rename_cleanup_is_pending() {
         let dir = tempdir().unwrap();
         let mgr = SessionManager::new(dir.path()).unwrap();
@@ -2723,7 +2738,11 @@ mod tests {
         mgr.create("lives", "/tmp", SessionKind::Shell).unwrap();
         let dead_slot = mgr.store.read_session("dies").unwrap().unwrap().slot;
 
-        mgr.write("dies", b"exit\n").unwrap();
+        #[cfg(windows)]
+        let exit_command = b"exit\r\n";
+        #[cfg(not(windows))]
+        let exit_command = b"exit\n";
+        mgr.write("dies", exit_command).unwrap();
         let sess = mgr.session("dies").unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while sess.is_alive() {
@@ -2798,6 +2817,8 @@ mod tests {
             "a missing optional cpu.weight must not break focus",
         );
         assert_eq!(mgr.foreground_slot(), 1);
+        mgr.remove("background").unwrap();
+        mgr.remove("foreground").unwrap();
     }
 
     #[test]
@@ -2837,11 +2858,10 @@ mod tests {
                     // kernel control-file semantics rather than regular-file
                     // overwrite semantics.
                     for slot in [1, 2] {
-                        std::fs::write(
-                            cgroup_root.join(format!("session-{slot}/cpu.weight")),
-                            "",
-                        )
-                        .unwrap();
+                        let path = cgroup_root.join(format!("session-{slot}/cpu.weight"));
+                        if path.exists() {
+                            std::fs::write(path, "").unwrap();
+                        }
                     }
                 }
                 let (state, changed) = &*coordination;
@@ -2924,6 +2944,8 @@ mod tests {
             !transition_was_held.load(Ordering::SeqCst),
             "the O(session-count) scan must run after releasing the per-session transition lock",
         );
+        mgr.remove("first").unwrap();
+        mgr.remove("second").unwrap();
     }
 
     #[test]
@@ -2962,15 +2984,11 @@ mod tests {
         let mgr = with_fake_cgroups(dir.path(), cgroups.path());
         for name in ["blocked", "clean"] {
             mgr.create(name, "/tmp", SessionKind::Shell).unwrap();
-            mgr.write(name, b"exit\n").unwrap();
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while ["blocked", "clean"]
-            .iter()
-            .any(|name| mgr.session(name).unwrap().is_alive())
-        {
-            assert!(std::time::Instant::now() < deadline, "shells never exited");
-            std::thread::sleep(std::time::Duration::from_millis(20));
+        for name in ["blocked", "clean"] {
+            let session = mgr.session(name).unwrap();
+            session.kill().unwrap();
+            session.wait_exit().unwrap();
         }
         let blocked_slot = mgr.store.read_session("blocked").unwrap().unwrap().slot;
         let clean_slot = mgr.store.read_session("clean").unwrap().unwrap().slot;
@@ -3061,7 +3079,6 @@ mod tests {
         for thread in threads {
             thread.join().unwrap();
         }
-
         let slots: BTreeSet<u32> = mgr
             .session_infos()
             .unwrap()
@@ -3074,6 +3091,9 @@ mod tests {
             StateStore::new(dir.path()).list_sessions().unwrap().len(),
             2
         );
+        for name in ["one", "two"] {
+            mgr.remove(name).unwrap();
+        }
     }
 
     #[test]
@@ -3931,6 +3951,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn restore_skips_windows_unsafe_persisted_session_name_before_slot_repair() {
         let dir = tempdir().unwrap();
         let store = StateStore::new(dir.path());
@@ -4077,9 +4098,10 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .cwd,
-            std::fs::canonicalize(dir.path()).unwrap_or_else(|_| dir.path().to_path_buf()),
+            dir.path(),
             "cwd preserved"
         );
+        mgr.remove("amber-1-2-0-c").unwrap();
     }
 
     #[test]
@@ -4296,6 +4318,7 @@ mod tests {
         assert!(old_settings.is_file());
         assert!(mgr.store.read_session(to).unwrap().is_none());
         assert!(cgroups.path().join(format!("session-{slot}")).is_dir());
+        mgr.remove(from).unwrap();
     }
 
     #[test]
@@ -4329,6 +4352,7 @@ mod tests {
         );
         assert!(mgr.store.read_session(to).unwrap().is_none());
         assert!(cgroups.path().join(format!("session-{slot}")).is_dir());
+        mgr.remove(from).unwrap();
     }
 
     #[test]
@@ -4362,6 +4386,7 @@ mod tests {
         );
         assert!(mgr.store.read_session(to).unwrap().is_none());
         assert!(cgroups.path().join(format!("session-{slot}")).is_dir());
+        mgr.remove(from).unwrap();
     }
 
     #[test]
@@ -4458,6 +4483,8 @@ mod tests {
         mgr.create(from, "/tmp", SessionKind::Shell).unwrap();
         assert_eq!(mgr.store.read_claude(from).unwrap(), None);
         assert!(!dir.path().join("rename.json").exists());
+        mgr.remove(from).unwrap();
+        mgr.remove(to).unwrap();
     }
 
     #[test]
@@ -4547,14 +4574,10 @@ mod tests {
         let mgr = SessionManager::new(dir.path()).unwrap();
         mgr.create("dies", "/tmp", SessionKind::Shell).unwrap();
         mgr.create("lives", "/tmp", SessionKind::Shell).unwrap();
+        let dies = mgr.session("dies").unwrap();
 
-        mgr.write("dies", b"exit\n").unwrap();
-        let sess = mgr.session("dies").unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while sess.is_alive() {
-            assert!(std::time::Instant::now() < deadline, "shell never exited");
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
+        dies.kill().unwrap();
+        dies.wait_exit().unwrap();
 
         // Dead, but still in the table and still listed.
         mgr.create("fresh", "/tmp", SessionKind::Shell).unwrap();
@@ -4575,6 +4598,12 @@ mod tests {
                 ("lives".into(), 2)
             ]
         );
+
+        // Explicitly terminate the sessions this test leaves live. On Windows,
+        // dropping an active ConPTY is a blocking shutdown operation.
+        for name in ["lives", "fresh", "after"] {
+            mgr.remove(name).unwrap();
+        }
     }
 
     #[test]

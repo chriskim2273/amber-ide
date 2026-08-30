@@ -174,6 +174,17 @@ mod imp {
         }
     }
 
+    impl LocalReader {
+        pub fn read_with_timeout(
+            &mut self,
+            buf: &mut [u8],
+            timeout: std::time::Duration,
+        ) -> io::Result<usize> {
+            self.0.set_read_timeout(Some(timeout))?;
+            self.0.read(buf)
+        }
+    }
+
     impl Write for LocalWriter {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             self.0
@@ -251,9 +262,9 @@ mod imp {
     use widestring::U16CString;
     use windows_sys::Win32::{
         Foundation::{
-            ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, ERROR_PIPE_NOT_CONNECTED,
-            ERROR_SEM_TIMEOUT, GENERIC_READ, GENERIC_WRITE, GetLastError, INVALID_HANDLE_VALUE,
-            LocalFree,
+            ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
+            ERROR_PIPE_NOT_CONNECTED, ERROR_SEM_TIMEOUT, GENERIC_READ, GENERIC_WRITE,
+            GetLastError, INVALID_HANDLE_VALUE, LocalFree,
         },
         Security::{
             Authorization::{
@@ -473,6 +484,12 @@ mod imp {
         }
     }
 
+    impl LocalReader {
+        pub fn read_with_timeout(&mut self, buf: &mut [u8], timeout: Duration) -> io::Result<usize> {
+            self.0.read_with_timeout(buf, timeout)
+        }
+    }
+
     impl Write for LocalWriter {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             self.0.write(buf)
@@ -530,6 +547,14 @@ mod imp {
                 ) == 0
                 {
                     let error = io::Error::last_os_error();
+                    if matches!(
+                        error.raw_os_error(),
+                        Some(code)
+                            if code == ERROR_BROKEN_PIPE as i32
+                                || code == ERROR_PIPE_NOT_CONNECTED as i32
+                    ) {
+                        return Ok(0);
+                    }
                     if error.raw_os_error() == Some(ERROR_NO_DATA as i32) {
                         #[cfg(test)]
                         self.signal_read_retry();
@@ -885,6 +910,28 @@ mod imp {
             let _server = listener.accept().unwrap();
 
             assert!(client.0.is_nonblocking().unwrap());
+        }
+
+        #[test]
+        fn peer_close_reads_as_eof() {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let endpoint = std::path::PathBuf::from(format!("amber-windows-eof-pipe-{stamp}"));
+            let listener = bind(&endpoint).unwrap();
+            let mut client = connect(&endpoint).unwrap();
+            let server = listener.accept().unwrap();
+
+            drop(server);
+
+            let mut byte = [0_u8; 1];
+            assert_eq!(
+                client
+                    .read_with_timeout(&mut byte, Duration::from_secs(1))
+                    .unwrap(),
+                0
+            );
         }
     }
 }

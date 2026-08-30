@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! Regression: a client that STOPS READING must be dropped, not allowed to
 //! wedge the daemon.
 //!

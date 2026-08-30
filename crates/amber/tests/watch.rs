@@ -1,6 +1,6 @@
 //! A watcher connection sees session create/kill deltas; a non-watcher does not.
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -34,7 +34,9 @@ fn read_control_until<F: Fn(&ControlMsg) -> bool>(stream: &mut LocalReader, pred
                 return msg;
             }
         }
-        let n = stream.read(&mut buf).expect("timed out waiting for control frame");
+        let n = stream
+            .read_with_timeout(&mut buf, Duration::from_secs(5))
+            .expect("timed out waiting for control frame");
         assert!(n > 0, "connection closed unexpectedly");
         dec.feed(&buf[..n]);
     }
@@ -53,7 +55,6 @@ fn watcher_sees_create_and_kill_deltas() {
     });
 
     let watcher = transport::connect(&sock).unwrap();
-    watcher.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let (mut w, mut watcher_write) = watcher.into_split().unwrap();
     let bystander = transport::connect(&sock).unwrap();
     let (_bystander_read, mut bystander_write) = bystander.into_split().unwrap();
@@ -109,7 +110,6 @@ fn watcher_snapshot_arrives_before_later_deltas() {
     });
 
     let watcher = transport::connect(&sock).unwrap();
-    watcher.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let (mut reader, mut watcher_write) = watcher.into_split().unwrap();
     send(&mut watcher_write, ControlMsg::WatchSessions);
     let creator = transport::connect(&sock).unwrap();
@@ -129,7 +129,9 @@ fn watcher_snapshot_arrives_before_later_deltas() {
         if let Some(frame) = decoder.next_frame().unwrap() {
             break frame;
         }
-        let n = reader.read(&mut buf).expect("timed out waiting for initial snapshot");
+        let n = reader
+            .read_with_timeout(&mut buf, Duration::from_secs(5))
+            .expect("timed out waiting for initial snapshot");
         assert!(n > 0, "watcher closed before its initial snapshot");
         decoder.feed(&buf[..n]);
     };
@@ -138,7 +140,9 @@ fn watcher_snapshot_arrives_before_later_deltas() {
         if let Some(Frame::Control(msg)) = decoder.next_frame().unwrap() {
             break msg;
         }
-        let n = reader.read(&mut buf).expect("timed out waiting for create delta");
+        let n = reader
+            .read_with_timeout(&mut buf, Duration::from_secs(5))
+            .expect("timed out waiting for create delta");
         assert!(n > 0, "watcher closed before create delta");
         decoder.feed(&buf[..n]);
     };
@@ -164,7 +168,6 @@ fn memory_pressure_reaches_only_versioned_opt_in_watchers() {
     // This connection models an older strict client: it knows WatchSessions
     // but has never advertised support for the newer pressure control.
     let old = transport::connect(&sock).unwrap();
-    old.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
     let (mut old_read, mut old_write) = old.into_split().unwrap();
     send(&mut old_write, ControlMsg::WatchSessions);
     read_control_until(&mut old_read, |m| matches!(m, ControlMsg::Sessions { .. }));
@@ -172,7 +175,6 @@ fn memory_pressure_reaches_only_versioned_opt_in_watchers() {
     // Send the new capability in raw serde shape so this test is RED before
     // the protocol enum learns the variant.
     let current = transport::connect(&sock).unwrap();
-    current.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let (mut current_read, mut current_write) = current.into_split().unwrap();
     send(&mut current_write, ControlMsg::WatchSessions);
     read_control_until(&mut current_read, |m| matches!(m, ControlMsg::Sessions { .. }));
@@ -204,7 +206,9 @@ fn memory_pressure_reaches_only_versioned_opt_in_watchers() {
         if let Some(frame) = decoder.next_frame().unwrap() {
             break frame;
         }
-        let n = old_read.read(&mut buf).expect("old watcher disconnected");
+        let n = old_read
+            .read_with_timeout(&mut buf, Duration::from_secs(2))
+            .expect("old watcher disconnected");
         assert!(n > 0, "old watcher disconnected");
         decoder.feed(&buf[..n]);
     };

@@ -7,7 +7,7 @@ use amber::pty::SuspendOrigin;
 use amber::transport::{self, LocalStream};
 use amber::watchers::Watchers;
 use amber_core::proto::{self, ControlMsg, Decoder, Frame};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -77,7 +77,6 @@ fn read_data_until<F: Fn(&[u8]) -> bool>(
     pred: F,
     timeout: Duration,
 ) -> Vec<u8> {
-    stream.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
     let deadline = Instant::now() + timeout;
     let mut acc = Vec::new();
     let mut buf = [0u8; 8192];
@@ -96,7 +95,7 @@ fn read_data_until<F: Fn(&[u8]) -> bool>(
                 String::from_utf8_lossy(&acc)
             );
         }
-        match stream.read(&mut buf) {
+        match stream.read_with_timeout(&mut buf, Duration::from_millis(100)) {
             Ok(0) => panic!("daemon closed the connection unexpectedly"),
             Ok(n) => decoder.feed(&buf[..n]),
             Err(e)
@@ -122,6 +121,7 @@ fn send(stream: &mut LocalStream, frame: &Frame) {
     stream.write_all(&proto::encode(frame)).unwrap();
 }
 
+#[cfg(unix)]
 fn prepare_trapped_agent(manager: &SessionManager, state_root: &Path, name: &str) {
     manager
         .create(name, "/tmp", amber_core::state::SessionKind::Shell)
@@ -152,6 +152,39 @@ fn prepare_trapped_agent(manager: &SessionManager, state_root: &Path, name: &str
     session.set_run_state(Some("suspended".into()));
 }
 
+#[cfg(windows)]
+fn prepare_trapped_agent(
+    manager: &SessionManager,
+    state_root: &Path,
+    socket_path: &Path,
+    name: &str,
+) -> (LocalStream, Decoder) {
+    manager
+        .create(name, state_root, amber_core::state::SessionKind::Shell)
+        .unwrap();
+    flip_kind_to_claude(state_root, name);
+    manager
+        .session(name)
+        .unwrap()
+        .set_run_state(Some("suspended".into()));
+    let mut supervisor = connect_with_retry(socket_path);
+    let mut decoder = Decoder::new();
+    send(
+        &mut supervisor,
+        &Frame::Control(ControlMsg::SupervisorHello { name: name.into() }),
+    );
+    // A following request is processed only after SupervisorHello registered
+    // this connection, so its reply is the registration barrier.
+    send(&mut supervisor, &Frame::Control(ControlMsg::ListSessions));
+    read_frame_until(
+        &mut supervisor,
+        &mut decoder,
+        |frame| matches!(frame, Frame::Control(ControlMsg::SessionList { .. })),
+        Duration::from_secs(5),
+    );
+    (supervisor, decoder)
+}
+
 /// Pull frames from `stream` (via `decoder`) until `pred` matches one, or
 /// panic after `timeout`.
 fn read_frame_until<F: Fn(&Frame) -> bool>(
@@ -160,7 +193,6 @@ fn read_frame_until<F: Fn(&Frame) -> bool>(
     pred: F,
     timeout: Duration,
 ) -> Frame {
-    stream.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
     let deadline = Instant::now() + timeout;
     let mut buf = [0u8; 8192];
     loop {
@@ -172,7 +204,7 @@ fn read_frame_until<F: Fn(&Frame) -> bool>(
         if Instant::now() > deadline {
             panic!("timed out waiting for expected frame");
         }
-        match stream.read(&mut buf) {
+        match stream.read_with_timeout(&mut buf, Duration::from_millis(100)) {
             Ok(0) => panic!("daemon closed the connection unexpectedly"),
             Ok(n) => decoder.feed(&buf[..n]),
             Err(e)
@@ -361,34 +393,12 @@ fn socket_roundtrip_create_attach_write_read() {
         },
     );
 
-    stream.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut acc = Vec::new();
-    let mut buf = [0u8; 8192];
-    loop {
-        while let Some(frame) = decoder.next_frame().unwrap() {
-            if let Frame::Data { bytes, .. } = frame {
-                acc.extend_from_slice(&bytes);
-            }
-        }
-        if acc.windows(12).any(|w| w == b"SOCKET_RT_OK") {
-            return;
-        }
-        if Instant::now() > deadline {
-            panic!(
-                "timed out waiting for SOCKET_RT_OK; got {:?}",
-                String::from_utf8_lossy(&acc)
-            );
-        }
-        match stream.read(&mut buf) {
-            Ok(0) => panic!("daemon closed the connection unexpectedly"),
-            Ok(n) => decoder.feed(&buf[..n]),
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(e) => panic!("read error: {e}"),
-        }
-    }
+    read_data_until(
+        &mut stream,
+        &mut decoder,
+        |bytes| bytes.windows(12).any(|window| window == b"SOCKET_RT_OK"),
+        Duration::from_secs(5),
+    );
 }
 
 #[test]
@@ -484,9 +494,13 @@ fn attached_client_receives_exit_when_child_dies() {
     );
 
     send(&mut stream, &Frame::Control(ControlMsg::Attach { name: "mortal".into(), raw_client: false, preview: false, resume: None }));
+    #[cfg(unix)]
+    let exit_command = b"exit\n".to_vec();
+    #[cfg(windows)]
+    let exit_command = b"exit\r\n".to_vec();
     send(
         &mut stream,
-        &Frame::Data { session: "mortal".into(), bytes: b"exit\n".to_vec() },
+        &Frame::Data { session: "mortal".into(), bytes: exit_command },
     );
 
     read_frame_until(
@@ -549,7 +563,14 @@ fn rename_moves_a_live_shell_session_and_broadcasts_the_delta() {
     let frame = read_frame_until(
         &mut watcher,
         &mut wdec,
-        |f| matches!(f, Frame::Control(ControlMsg::SessionsChanged { .. })),
+        |frame| {
+            matches!(
+                frame,
+                Frame::Control(ControlMsg::SessionsChanged { added, removed })
+                    if removed.iter().any(|name| name == "amber-1-1-0-mv")
+                        && added.iter().any(|info| info.name == "amber-1-2-0-mv")
+            )
+        },
         Duration::from_secs(5),
     );
     match frame {
@@ -945,11 +966,10 @@ fn malformed_frame_kills_only_that_connection_not_the_daemon() {
     // prefix. Its connection is torn down...
     let mut bad = connect_with_retry(&socket_path);
     bad.write_all(&[0, 0, 0, 1, 99]).unwrap(); // len=1, tag=99
-    bad.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let mut buf = [0u8; 64];
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        match bad.read(&mut buf) {
+        match bad.read_with_timeout(&mut buf, Duration::from_millis(100)) {
             Ok(0) => break, // daemon dropped the bad connection
             Ok(_) => {}
             Err(e)
@@ -1154,7 +1174,11 @@ fn stale_session_write_and_resize_do_not_kill_the_connection() {
 #[test]
 fn focus_refreshes_use_and_resumes_only_memory_suspension() {
     let (socket_path, manager, dir) = start_daemon_with_manager();
+    #[cfg(unix)]
     prepare_trapped_agent(&manager, &dir.path().join("state"), "agent");
+    #[cfg(windows)]
+    let (mut supervisor, mut supervisor_decoder) =
+        prepare_trapped_agent(&manager, &dir.path().join("state"), &socket_path, "agent");
     let session = manager.session("agent").unwrap();
     session.claim_suspend(SuspendOrigin::Memory).unwrap();
     let before = session.last_used_ms();
@@ -1168,21 +1192,38 @@ fn focus_refreshes_use_and_resumes_only_memory_suspension() {
         thread::sleep(Duration::from_millis(10));
     }
     assert!(session.last_used_ms() > before);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !session
-        .scrollback()
-        .windows(b"SOCKET_RESUME_SIGNAL".len())
-        .any(|w| w == b"SOCKET_RESUME_SIGNAL")
+    #[cfg(windows)]
+    assert!(matches!(
+        read_frame_until(
+            &mut supervisor,
+            &mut supervisor_decoder,
+            |frame| matches!(frame, Frame::Control(ControlMsg::SupervisorCommand { command, .. }) if command == "resume"),
+            Duration::from_secs(5),
+        ),
+        Frame::Control(ControlMsg::SupervisorCommand { command, .. }) if command == "resume"
+    ));
+    #[cfg(unix)]
     {
-        assert!(Instant::now() < deadline, "focus cleared origin without signalling resume");
-        thread::sleep(Duration::from_millis(10));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !session
+            .scrollback()
+            .windows(b"SOCKET_RESUME_SIGNAL".len())
+            .any(|w| w == b"SOCKET_RESUME_SIGNAL")
+        {
+            assert!(Instant::now() < deadline, "focus cleared origin without signalling resume");
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 }
 
 #[test]
 fn focus_never_resumes_manual_suspension() {
     let (socket_path, manager, dir) = start_daemon_with_manager();
+    #[cfg(unix)]
     prepare_trapped_agent(&manager, &dir.path().join("state"), "agent");
+    #[cfg(windows)]
+    let _supervisor =
+        prepare_trapped_agent(&manager, &dir.path().join("state"), &socket_path, "agent");
     let session = manager.session("agent").unwrap();
     session.set_run_state(Some("suspended".into()));
     session.claim_suspend(SuspendOrigin::Manual).unwrap();
@@ -1197,15 +1238,33 @@ fn focus_never_resumes_manual_suspension() {
 #[test]
 fn input_uses_the_same_focus_boundary_before_write() {
     let (socket_path, manager, dir) = start_daemon_with_manager();
+    #[cfg(unix)]
     prepare_trapped_agent(&manager, &dir.path().join("state"), "agent");
+    #[cfg(windows)]
+    let (mut supervisor, mut supervisor_decoder) =
+        prepare_trapped_agent(&manager, &dir.path().join("state"), &socket_path, "agent");
     let session = manager.session("agent").unwrap();
     session.claim_suspend(SuspendOrigin::Memory).unwrap();
 
     let mut stream = connect_with_retry(&socket_path);
+    #[cfg(unix)]
+    let input = b"echo INPUT_AFTER_FOCUS\n".to_vec();
+    #[cfg(windows)]
+    let input = b"echo INPUT_AFTER_FOCUS\r\n".to_vec();
     send(
         &mut stream,
-        &Frame::Data { session: "agent".into(), bytes: b"echo INPUT_AFTER_FOCUS\n".to_vec() },
+        &Frame::Data { session: "agent".into(), bytes: input },
     );
+    #[cfg(windows)]
+    assert!(matches!(
+        read_frame_until(
+            &mut supervisor,
+            &mut supervisor_decoder,
+            |frame| matches!(frame, Frame::Control(ControlMsg::SupervisorCommand { command, .. }) if command == "resume"),
+            Duration::from_secs(5),
+        ),
+        Frame::Control(ControlMsg::SupervisorCommand { command, .. }) if command == "resume"
+    ));
     let deadline = Instant::now() + Duration::from_secs(5);
     while !session
         .scrollback()

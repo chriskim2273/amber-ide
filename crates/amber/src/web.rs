@@ -2494,6 +2494,7 @@ mod tests {
 
     /// `serde_json::json!` does not guarantee key order, so assert on parsed
     /// structure rather than the literal string.
+    #[cfg(unix)]
     fn is_backlog_marker(text: &str, name: &str) -> bool {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else { return false };
         v["t"] == "backlog" && v["name"] == name
@@ -2503,6 +2504,7 @@ mod tests {
     /// else the hub also broadcasts in between (e.g. the `sessions`/`error`
     /// pair a daemon disconnect fires) — this test cares only that the marker
     /// itself is present and correctly paired with the payload that follows.
+    #[cfg(unix)]
     fn expect_backlog(rx: &Receiver<Out>, name: &str) -> Vec<u8> {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {

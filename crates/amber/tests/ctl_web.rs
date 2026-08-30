@@ -76,3 +76,21 @@ fn status_never_contains_the_token_in_any_field() {
     assert!(reported.ends_with("/app"), "{status}");
     assert!(!reported.contains('#'), "{status}");
 }
+
+#[cfg(windows)]
+#[test]
+fn managed_lifecycle_is_explicitly_unsupported_on_windows() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let out = amber()
+        .args(["ctl", "web", "start", "--root"])
+        .arg(dir.path())
+        .output()
+        .expect("runs");
+
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("managed amber web lifecycle is not supported on Windows"),
+        "{stderr}"
+    );
+}

@@ -948,6 +948,12 @@ mod tests {
                 },
             )
             .unwrap();
+        #[cfg(windows)]
+        let supervisor_rx = {
+            let (tx, rx) = std::sync::mpsc::sync_channel(4);
+            manager.register_supervisor(name, tx).unwrap();
+            rx
+        };
 
         let base_ms = session.last_user_ms();
         let clock_ms = Cell::new(base_ms);
@@ -1009,6 +1015,8 @@ mod tests {
         .expect("the successful signal must return its fresh timestamp");
         assert_eq!(session.memory_suspend_started_ms(), base_ms + 210_000);
         assert_eq!(signaled_at, base_ms + 215_000);
+        #[cfg(windows)]
+        assert!(supervisor_rx.try_recv().unwrap());
         policy.record_parked(signaled_at);
 
         let critical = || HostPressureDecision::Critical {

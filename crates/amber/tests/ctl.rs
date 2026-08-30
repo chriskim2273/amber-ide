@@ -73,6 +73,7 @@ fn ctl_install_web_flag_reaches_the_install_script() {
     assert!(stdout.contains("uninstall") && stdout.contains("--web"), "{stdout}");
 }
 
+#[cfg(unix)]
 #[test]
 fn install_script_passes_bash_syntax_check() {
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../infra/daemon/install.sh");

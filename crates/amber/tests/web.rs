@@ -300,9 +300,11 @@ fn websocket_open_and_input_reach_the_pty_and_output_comes_back() {
         format!(r#"{{"t":"open","name":"{name}"}}"#).into(),
     ))
     .unwrap();
-    ws.send(tungstenite::Message::Binary(
-        b"echo amber-web-marker\n".to_vec().into(),
-    ))
+    #[cfg(windows)]
+    let command = b"echo amber-web-marker\r\n";
+    #[cfg(not(windows))]
+    let command = b"echo amber-web-marker\n";
+    ws.send(tungstenite::Message::Binary(command.to_vec().into()))
     .unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -708,7 +710,14 @@ fn create_and_kill_from_the_browser_reach_the_daemon() {
     let made = "amber-1-1-9-webmade";
     let cwd = f.dir.path().to_string_lossy().into_owned();
     ws.send(tungstenite::Message::Text(
-        format!(r#"{{"t":"create","name":"{made}","cwd":"{cwd}","kind":"shell"}}"#).into(),
+        serde_json::json!({
+            "t": "create",
+            "name": made,
+            "cwd": cwd,
+            "kind": "shell",
+        })
+        .to_string()
+        .into(),
     ))
     .unwrap();
     assert!(

@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+#[cfg(unix)]
 fn write_fake_codex(dir: &Path, session_id: &str) -> PathBuf {
     let bin = dir.join("bin");
     fs::create_dir_all(&bin).unwrap();
@@ -27,12 +28,77 @@ exit 0
 "#
     );
     fs::write(&path, script).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
     path
+}
+
+#[cfg(windows)]
+fn write_fake_codex(dir: &Path, session_id: &str) -> PathBuf {
+    let bin = dir.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let source_path = bin.join("fake_codex.rs");
+    let executable_path = bin.join("codex.exe");
+    let payload = serde_json::json!({
+        "session_id": session_id,
+        "cwd": dir,
+        "hook_event_name": "SessionStart"
+    })
+    .to_string();
+    let source = r#"
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+
+const AMBER: &str = __AMBER__;
+const PAYLOAD: &str = __PAYLOAD__;
+
+fn main() {
+    let root = PathBuf::from(std::env::var_os("AMBER_STATE_DIR").unwrap());
+    let mut log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(root.join("codex_argv.log"))
+        .unwrap();
+    let args = std::env::args_os()
+        .skip(1)
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(" ");
+    writeln!(log, "{}", args).unwrap();
+
+    let crash_marker = root.join("codex_crashed_once");
+    if !crash_marker.exists() {
+        File::create(crash_marker).unwrap();
+        let mut hook = Command::new(AMBER)
+            .arg("hook")
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        hook.stdin.as_mut().unwrap().write_all(PAYLOAD.as_bytes()).unwrap();
+        assert!(hook.wait().unwrap().success());
+        std::process::exit(1);
+    }
+}
+"#
+    .replace("__AMBER__", &format!("{:?}", env!("CARGO_BIN_EXE_amber")))
+    .replace("__PAYLOAD__", &format!("{payload:?}"));
+    fs::write(&source_path, source).unwrap();
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let output = std::process::Command::new(rustc)
+        .args(["--edition=2021"])
+        .arg(&source_path)
+        .arg("-o")
+        .arg(&executable_path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "fake Codex compile failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    executable_path
 }
 
 #[test]
