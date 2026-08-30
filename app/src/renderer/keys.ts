@@ -15,6 +15,8 @@ export type Chord =
   | { type: 'focus-up' }
   | { type: 'focus-down' }
   | { type: 'help' }
+  | { type: 'command-palette' }
+  | { type: 'global-search' }
   | { type: 'find' }
   | { type: 'font-bigger' }
   | { type: 'font-smaller' }
@@ -63,6 +65,8 @@ export const CHORD_TABLE: ChordEntry[] = [
   { action: 'focus-up', label: '↑', keys: ['arrowup'], desc: 'Focus pane up' },
   { action: 'focus-down', label: '↓', keys: ['arrowdown'], desc: 'Focus pane down' },
   { action: 'find', label: 'F', keys: ['f'], desc: 'Find in pane' },
+  { action: 'command-palette', label: 'K', keys: ['k'], desc: 'Command palette' },
+  { action: 'global-search', label: 'G', keys: ['g'], desc: 'Search all scrollback', macShift: true },
   { action: 'help', label: '/', keys: ['/', '?'], desc: 'Keyboard shortcuts' },
   // Font size. Linux holds Shift for the modifier, so the key arrives renamed
   // ('=' -> '+', '-' -> '_', '0' -> ')') — accept both forms (mirrors help).
