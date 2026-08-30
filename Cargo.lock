@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "amber"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "amber-core",
  "anyhow",
@@ -25,7 +25,7 @@ dependencies = [
 
 [[package]]
 name = "amber-core"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "serde",
