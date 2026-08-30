@@ -1166,6 +1166,38 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   so the soft-keyboard path has never actually run — plus long-press arming,
   real-finger touch scrolling, clipboard gestures, and PWA install.
 
+- [x] Amber Pocket product design (2026-08-29) — a reference-locked mobile
+  product direction and interactive code-led prototype, with **no production
+  renderer or protocol change yet**. Spec:
+  `docs/superpowers/specs/2026-08-29-amber-pocket-mobile-product-design.md`;
+  prototype: `docs/prototypes/amber-pocket/`. The phone now has a designed
+  product model rather than “desktop chrome made larger”: it lands in a
+  daemon-derived **command center** grouped by honest urgency (`Needs you`,
+  `Working`, `Parked`, `Quiet`), opens one edge-to-edge focus terminal, and
+  keeps the real split tree as a separate Mosaic destination. Research covered
+  the existing Amber renderer and live mobile report, Apple HIG, Material 3
+  sheets, Blink Shell, Prompt 3, Termius, and Working Copy. The reference lock
+  keeps Amber's Preservation Console intact: Obsidian/Carbon layers,
+  Preservation Violet for focus/action, Warning Amber only for brand and real
+  state, system sans for human controls, mono for machine truth, fine borders,
+  and terminal dominance. The prototype exercises command-center filters,
+  machine/session sheets, focus/back history, a reordered critical terminal
+  key deck, quick text macros, Mosaic, and new-session kind state; Phosphor
+  supplies the one icon family. Five validated captures are checked in under
+  `docs/prototypes/amber-pocket/screenshots/` with embedded provenance
+  (`390×844` command center/focus/mosaic/sheet and `1440×900` presentation).
+  Raw CDP interaction checks pass; every visible control in sessions/focus/
+  sheet states has an accessible name and a measured ≥44 px target (terminal
+  keys deliberately use 45 px to avoid fractional layout rounding below the
+  floor); JS syntax, HTML parse, `git diff --check`, and raster provenance
+  checks pass. Impeccable's detector ran once in degraded regex mode because
+  its HTML parser modules are unavailable and returned no findings; the
+  required finish review/documentation roles were performed inline because
+  this harness exposes no subagent tool. **Next work is production Slice 1,
+  not more prototype polish:** the pure urgency selector, then capability-gated
+  command-center navigation, focus chrome, and real-device iOS/Android proof as
+  ordered in the spec.
+
 - [x] SSH remote windows (2026-08-23) — open another machine's amber in its own
   window. Spec:
   `docs/superpowers/specs/2026-08-23-ssh-remote-windows-design.md`; report

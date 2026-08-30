@@ -1,0 +1,359 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0c0c0f" />
+  <meta name="color-scheme" content="dark" />
+  <title>Amber Pocket prototype</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <!--
+  THESIS: Amber Pocket separates finding work from operating it, refusing the compressed desktop toolbar.
+  OWN-WORLD: Obsidian and Carbon layers, Preservation Violet focus, semantic agent color, system sans, machine mono.
+  STORY: The developer identifies the machine and urgent session, opens it, and operates a terminal with touch-native controls.
+  FIRST VIEWPORT: Machine context, Sessions title, workspace filter, Needs you, then Working, with bottom navigation in thumb reach.
+  FORM: Established-surface extension, inherited-preservation-console.
+  FINISH: unreviewed and undocumented is unfinished; this build ends with the finish review, the verdict, DESIGN.md, and every shipping raster carrying its provenance
+  -->
+  <div class="prototype-frame">
+    <div class="app-shell" id="appShell">
+      <div class="safe-top" aria-hidden="true"></div>
+
+      <header class="machine-bar">
+        <button class="machine-identity" id="machineButton" type="button" aria-haspopup="dialog">
+          <span class="machine-mark" aria-hidden="true">A</span>
+          <span class="machine-copy">
+            <strong>teapot-dev</strong>
+            <span><span class="status-mark online" aria-hidden="true"></span>Connected on tailnet</span>
+          </span>
+        </button>
+        <button class="text-button compact" id="machineAction" type="button">Machines</button>
+      </header>
+
+      <main class="screen-stack" id="mainContent">
+        <section class="screen is-active" id="sessionsScreen" data-screen="sessions" aria-labelledby="sessionsTitle">
+          <header class="screen-heading">
+            <div>
+              <h1 id="sessionsTitle">Sessions</h1>
+              <p>Continue work without returning to your desk.</p>
+            </div>
+            <button class="primary-button compact" type="button" data-open-sheet="createSheet">New</button>
+          </header>
+
+          <div class="workspace-filter" role="group" aria-label="Filter sessions by workspace">
+            <button class="filter-button is-active" type="button" data-workspace="all" aria-pressed="true">All</button>
+            <button class="filter-button" type="button" data-workspace="amber">amber-ide</button>
+            <button class="filter-button" type="button" data-workspace="inyeon">inyeon</button>
+          </div>
+
+          <section class="session-group" aria-labelledby="needsTitle">
+            <div class="group-heading">
+              <h2 id="needsTitle">Needs you</h2>
+              <span class="group-count">1</span>
+            </div>
+            <div class="session-list priority-list">
+              <article class="session-row" data-workspace-row="amber">
+                <button class="session-open" type="button" data-open-session="api-refactor">
+                  <span class="agent-mark pi" aria-hidden="true">π</span>
+                  <span class="session-main">
+                    <span class="session-title">api-refactor</span>
+                    <span class="session-state waiting"><span class="status-mark waiting" aria-hidden="true"></span>Waiting for input</span>
+                    <span class="session-meta"><span>Pi</span><span>amber-ide / core</span><span>now</span></span>
+                  </span>
+                </button>
+                <button class="row-action" type="button" data-session-actions="api-refactor" aria-label="Actions for api-refactor">Actions</button>
+              </article>
+            </div>
+          </section>
+
+          <section class="session-group" aria-labelledby="workingTitle">
+            <div class="group-heading">
+              <h2 id="workingTitle">Working</h2>
+              <span class="group-count">2</span>
+            </div>
+            <div class="session-list">
+              <article class="session-row" data-workspace-row="amber">
+                <button class="session-open" type="button" data-open-session="release-0.4">
+                  <span class="agent-mark codex" aria-hidden="true">C</span>
+                  <span class="session-main">
+                    <span class="session-title">release-0.4</span>
+                    <span class="session-state"><span class="status-mark working" aria-hidden="true"></span>Codex is working</span>
+                    <span class="session-meta"><span>Codex</span><span>amber-ide / release</span><span>18s</span></span>
+                  </span>
+                </button>
+                <button class="row-action" type="button" data-session-actions="release-0.4" aria-label="Actions for release-0.4">Actions</button>
+              </article>
+              <article class="session-row" data-workspace-row="inyeon">
+                <button class="session-open" type="button" data-open-session="tenant-rollout">
+                  <span class="agent-mark grok" aria-hidden="true">G</span>
+                  <span class="session-main">
+                    <span class="session-title">tenant-rollout</span>
+                    <span class="session-state"><span class="status-mark working" aria-hidden="true"></span>Grok is working</span>
+                    <span class="session-meta"><span>Grok</span><span>inyeon / deploy</span><span>1m</span></span>
+                  </span>
+                </button>
+                <button class="row-action" type="button" data-session-actions="tenant-rollout" aria-label="Actions for tenant-rollout">Actions</button>
+              </article>
+            </div>
+          </section>
+
+          <section class="session-group" aria-labelledby="parkedTitle">
+            <div class="group-heading">
+              <h2 id="parkedTitle">Parked</h2>
+              <span class="group-count">1</span>
+            </div>
+            <div class="session-list">
+              <article class="session-row" data-workspace-row="amber">
+                <button class="session-open" type="button" data-open-session="memory-audit">
+                  <span class="agent-mark claude" aria-hidden="true">Cl</span>
+                  <span class="session-main">
+                    <span class="session-title">memory-audit</span>
+                    <span class="session-state"><span class="status-mark suspended" aria-hidden="true"></span>Suspended to free memory</span>
+                    <span class="session-meta"><span>Claude</span><span>amber-ide / daemon</span><span>12m</span></span>
+                  </span>
+                </button>
+                <button class="row-action" type="button" data-session-actions="memory-audit" aria-label="Actions for memory-audit">Actions</button>
+              </article>
+            </div>
+          </section>
+
+          <p class="quiet-summary">2 quiet shell sessions are still preserved.</p>
+        </section>
+
+        <section class="screen" id="mosaicScreen" data-screen="mosaic" aria-labelledby="mosaicTitle" hidden>
+          <header class="screen-heading mosaic-heading">
+            <div>
+              <h1 id="mosaicTitle">Mosaic</h1>
+              <p>amber-ide / core</p>
+            </div>
+            <button class="text-button compact" type="button" data-open-sheet="workspaceSheet">Change</button>
+          </header>
+
+          <div class="mosaic-stage" aria-label="Workspace pane overview">
+            <button class="mosaic-pane pane-primary" type="button" data-open-session="api-refactor">
+              <span class="pane-label"><span class="status-mark waiting" aria-hidden="true"></span>api-refactor</span>
+              <span class="pane-preview mono">Review the proposed API change?</span>
+              <span class="pane-kind">Pi</span>
+            </button>
+            <div class="mosaic-column">
+              <button class="mosaic-pane" type="button" data-open-session="release-0.4">
+                <span class="pane-label"><span class="status-mark working" aria-hidden="true"></span>release-0.4</span>
+                <span class="pane-preview mono">running app gates...</span>
+                <span class="pane-kind">Codex</span>
+              </button>
+              <button class="mosaic-pane" type="button" data-open-session="deploy-logs">
+                <span class="pane-label"><span class="status-mark quiet" aria-hidden="true"></span>deploy-logs</span>
+                <span class="pane-preview mono">$ journalctl -f</span>
+                <span class="pane-kind">Shell</span>
+              </button>
+            </div>
+          </div>
+
+          <div class="mosaic-note">
+            <strong>Tap a pane to focus.</strong>
+            <span>Tiles preserve desktop geometry until you open them.</span>
+          </div>
+        </section>
+
+        <section class="screen focus-screen" id="focusScreen" data-screen="focus" aria-labelledby="focusTitle" hidden>
+          <header class="focus-header" id="focusHeader">
+            <button class="text-button compact" type="button" id="focusBack">Back</button>
+            <div class="focus-identity">
+              <strong id="focusTitle">api-refactor</strong>
+              <span id="focusState"><span class="status-mark waiting" aria-hidden="true"></span>Pi waiting for input</span>
+            </div>
+            <button class="text-button compact" type="button" data-open-sheet="actionsSheet">Actions</button>
+          </header>
+
+          <div class="terminal-wrap" id="terminalWrap" tabindex="0" aria-label="Interactive terminal prototype">
+            <pre class="terminal" id="terminalOutput"><span class="term-dim">╭──────────────────────────────────────────╮</span>
+<span class="term-dim">│</span> <span class="term-strong">Pi</span>  api-refactor                     <span class="term-dim">│</span>
+<span class="term-dim">╰──────────────────────────────────────────╯</span>
+
+I traced the protocol change through the daemon,
+web gateway, and TypeScript decoder.
+
+<span class="term-accent">Ready for your review.</span>
+
+Should I keep the compatibility decoder for one
+release, or remove it with the old frame path?
+
+<span class="term-prompt">›</span> <span class="term-cursor" aria-hidden="true"></span></pre>
+            <label class="sr-only" for="terminalInput">Type terminal input</label>
+            <textarea id="terminalInput" class="terminal-input" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
+          </div>
+
+          <div class="terminal-notice" id="terminalNotice" role="status" aria-live="polite">Phone grid borrowed at 44 columns</div>
+
+          <div class="key-deck" aria-label="Terminal controls">
+            <div class="quick-row" aria-label="Quick input">
+              <button type="button" class="quick-key" data-send-text="Keep compatibility for one release.">Keep compatibility</button>
+              <button type="button" class="quick-key" data-send-text="Show me the affected tests first.">Show tests</button>
+              <button type="button" class="quick-key" data-open-sheet="quickSheet">Edit quick keys</button>
+            </div>
+            <div class="key-row" role="toolbar" aria-label="Terminal keys">
+              <button type="button" class="term-key" data-key="esc">Esc</button>
+              <button type="button" class="term-key" data-key="tab">Tab</button>
+              <button type="button" class="term-key wide" data-key="shift-tab">Shift Tab</button>
+              <button type="button" class="term-key" data-key="ctrl" aria-pressed="false">Ctrl</button>
+              <button type="button" class="term-key wide critical-key" data-key="interrupt">Ctrl C</button>
+              <button type="button" class="term-key wide" data-key="enter">Enter</button>
+              <button type="button" class="term-key" data-key="slash">/</button>
+              <button type="button" class="term-key" data-key="left" aria-label="Left arrow">Left</button>
+              <button type="button" class="term-key" data-key="down" aria-label="Down arrow">Down</button>
+              <button type="button" class="term-key" data-key="up" aria-label="Up arrow">Up</button>
+              <button type="button" class="term-key" data-key="right" aria-label="Right arrow">Right</button>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      <nav class="bottom-nav" id="bottomNav" aria-label="Primary navigation">
+        <button class="nav-button is-active" type="button" data-nav="sessions" aria-current="page">
+          <svg class="nav-symbol" viewBox="0 0 256 256" aria-hidden="true"><path d="M80,64a8,8,0,0,1,8-8H216a8,8,0,0,1,0,16H88A8,8,0,0,1,80,64Zm136,56H88a8,8,0,0,0,0,16H216a8,8,0,0,0,0-16Zm0,64H88a8,8,0,0,0,0,16H216a8,8,0,0,0,0-16ZM44,52A12,12,0,1,0,56,64,12,12,0,0,0,44,52Zm0,64a12,12,0,1,0,12,12A12,12,0,0,0,44,116Zm0,64a12,12,0,1,0,12,12A12,12,0,0,0,44,180Z" /></svg>
+          <span>Sessions</span>
+        </button>
+        <button class="nav-button" type="button" data-nav="mosaic">
+          <svg class="nav-symbol" viewBox="0 0 256 256" aria-hidden="true"><path d="M104,40H56A16,16,0,0,0,40,56v48a16,16,0,0,0,16,16h48a16,16,0,0,0,16-16V56A16,16,0,0,0,104,40Zm0,64H56V56h48v48Zm96-64H152a16,16,0,0,0-16,16v48a16,16,0,0,0,16,16h48a16,16,0,0,0,16-16V56A16,16,0,0,0,200,40Zm0,64H152V56h48v48Zm-96,32H56a16,16,0,0,0-16,16v48a16,16,0,0,0,16,16h48a16,16,0,0,0,16-16V152A16,16,0,0,0,104,136Zm0,64H56V152h48v48Zm96-64H152a16,16,0,0,0-16,16v48a16,16,0,0,0,16,16h48a16,16,0,0,0,16-16V152A16,16,0,0,0,200,136Zm0,64H152V152h48v48Z" /></svg>
+          <span>Mosaic</span>
+        </button>
+        <button class="nav-button" type="button" data-open-sheet="createSheet">
+          <svg class="nav-symbol" viewBox="0 0 256 256" aria-hidden="true"><path d="M128,24A104,104,0,1,0,232,128,104.11,104.11,0,0,0,128,24Zm0,192a88,88,0,1,1,88-88A88.1,88.1,0,0,1,128,216Zm48-88a8,8,0,0,1-8,8H136v32a8,8,0,0,1-16,0V136H88a8,8,0,0,1,0-16h32V88a8,8,0,0,1,16,0v32h32A8,8,0,0,1,176,128Z" /></svg>
+          <span>New</span>
+        </button>
+      </nav>
+
+      <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
+      <div class="sheet-layer" id="actionsSheet" hidden>
+        <button class="sheet-backdrop" type="button" data-close-sheet aria-label="Close session actions"></button>
+        <section class="bottom-sheet" role="dialog" aria-modal="true" aria-labelledby="actionsTitle">
+          <div class="sheet-handle" aria-hidden="true"></div>
+          <header class="sheet-header">
+            <div>
+              <h2 id="actionsTitle">api-refactor</h2>
+              <p>Pi / amber-ide / core</p>
+            </div>
+            <button class="text-button compact" type="button" data-close-sheet>Done</button>
+          </header>
+          <div class="action-list">
+            <button type="button" data-action="resume"><span>Resume session</span><small>Return to the recorded conversation</small></button>
+            <button type="button" data-action="move"><span>Move</span><small>Choose another workspace or tab</small></button>
+            <button type="button" data-action="rename"><span>Rename</span><small>Keep the process and scrollback</small></button>
+            <button type="button" data-action="copy"><span>Copy working directory</span><small class="mono">~/Projects/amber-ide</small></button>
+            <button type="button" class="danger-action" data-action="close"><span>Close session</span><small>Stops the process after confirmation</small></button>
+          </div>
+        </section>
+      </div>
+
+      <div class="sheet-layer" id="createSheet" hidden>
+        <button class="sheet-backdrop" type="button" data-close-sheet aria-label="Close new session sheet"></button>
+        <section class="bottom-sheet" role="dialog" aria-modal="true" aria-labelledby="createTitle">
+          <div class="sheet-handle" aria-hidden="true"></div>
+          <header class="sheet-header">
+            <div>
+              <h2 id="createTitle">New session</h2>
+              <p>amber-ide / core</p>
+            </div>
+            <button class="text-button compact" type="button" data-close-sheet>Cancel</button>
+          </header>
+          <form id="createForm">
+            <fieldset>
+              <legend>Kind</legend>
+              <div class="kind-grid">
+                <label><input type="radio" name="kind" value="Pi" checked /><span>Pi</span></label>
+                <label><input type="radio" name="kind" value="Claude" /><span>Claude</span></label>
+                <label><input type="radio" name="kind" value="Codex" /><span>Codex</span></label>
+                <label><input type="radio" name="kind" value="Shell" /><span>Shell</span></label>
+              </div>
+            </fieldset>
+            <label class="field-label" for="sessionName">Session name</label>
+            <input class="text-field" id="sessionName" name="sessionName" value="review-followup" autocomplete="off" spellcheck="false" />
+            <label class="field-label" for="sessionCwd">Working directory</label>
+            <input class="text-field mono" id="sessionCwd" name="sessionCwd" value="~/Projects/amber-ide" autocomplete="off" spellcheck="false" />
+            <button class="primary-button sheet-primary" type="submit">Create Pi session</button>
+          </form>
+        </section>
+      </div>
+
+      <div class="sheet-layer" id="machineSheet" hidden>
+        <button class="sheet-backdrop" type="button" data-close-sheet aria-label="Close machines sheet"></button>
+        <section class="bottom-sheet" role="dialog" aria-modal="true" aria-labelledby="machineTitle">
+          <div class="sheet-handle" aria-hidden="true"></div>
+          <header class="sheet-header">
+            <div>
+              <h2 id="machineTitle">Machines</h2>
+              <p>Your authenticated Amber hosts</p>
+            </div>
+            <button class="text-button compact" type="button" data-close-sheet>Done</button>
+          </header>
+          <div class="machine-list">
+            <button type="button" class="machine-row selected">
+              <span class="machine-mark" aria-hidden="true">A</span>
+              <span><strong>teapot-dev</strong><small><span class="status-mark online" aria-hidden="true"></span>Connected on tailnet</small></span>
+              <span class="selected-label">Current</span>
+            </button>
+            <button type="button" class="machine-row">
+              <span class="machine-mark secondary" aria-hidden="true">A</span>
+              <span><strong>macbook-pro</strong><small><span class="status-mark quiet" aria-hidden="true"></span>Last seen 2h ago</small></span>
+              <span class="selected-label">Open</span>
+            </button>
+          </div>
+        </section>
+      </div>
+
+      <div class="sheet-layer" id="workspaceSheet" hidden>
+        <button class="sheet-backdrop" type="button" data-close-sheet aria-label="Close workspace sheet"></button>
+        <section class="bottom-sheet compact-sheet" role="dialog" aria-modal="true" aria-labelledby="workspaceTitle">
+          <div class="sheet-handle" aria-hidden="true"></div>
+          <header class="sheet-header">
+            <div>
+              <h2 id="workspaceTitle">Workspace</h2>
+              <p>Choose what the mosaic shows</p>
+            </div>
+            <button class="text-button compact" type="button" data-close-sheet>Done</button>
+          </header>
+          <div class="action-list">
+            <button type="button" data-action="workspace"><span>amber-ide / core</span><small>3 panes</small></button>
+            <button type="button" data-action="workspace"><span>amber-ide / release</span><small>2 panes</small></button>
+            <button type="button" data-action="workspace"><span>inyeon / deploy</span><small>2 panes</small></button>
+          </div>
+        </section>
+      </div>
+
+      <div class="sheet-layer" id="quickSheet" hidden>
+        <button class="sheet-backdrop" type="button" data-close-sheet aria-label="Close quick keys sheet"></button>
+        <section class="bottom-sheet compact-sheet" role="dialog" aria-modal="true" aria-labelledby="quickTitle">
+          <div class="sheet-handle" aria-hidden="true"></div>
+          <header class="sheet-header">
+            <div>
+              <h2 id="quickTitle">Quick keys</h2>
+              <p>Text macros use ordinary terminal input</p>
+            </div>
+            <button class="text-button compact" type="button" data-close-sheet>Done</button>
+          </header>
+          <div class="action-list">
+            <button type="button" data-action="quick"><span>Keep compatibility</span><small>Keep compatibility for one release.</small></button>
+            <button type="button" data-action="quick"><span>Show tests</span><small>Show me the affected tests first.</small></button>
+            <button type="button" data-action="quick"><span>Add quick key</span><small>Stored as app-owned display settings</small></button>
+          </div>
+        </section>
+      </div>
+    </div>
+
+    <aside class="prototype-notes" aria-label="Interactive prototype notes">
+      <h2>Amber Pocket</h2>
+      <p>Use the session rows, bottom navigation, terminal keys, and action sheets.</p>
+      <dl>
+        <div><dt>Mode</dt><dd>Operate</dd></div>
+        <div><dt>Viewport</dt><dd>390 × 844</dd></div>
+        <div><dt>Direction</dt><dd>Preservation Console, mobile first</dd></div>
+      </dl>
+    </aside>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
