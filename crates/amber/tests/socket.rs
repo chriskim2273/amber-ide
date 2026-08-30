@@ -219,15 +219,22 @@ fn read_frame_until<F: Fn(&Frame) -> bool>(
 fn scrollback_search_returns_sanitized_hits_and_keeps_control_flowing() {
     let (socket_path, manager, _guard) = start_daemon_with_manager();
     manager
-        .create("searchable", "/tmp", amber_core::state::SessionKind::Shell)
+        .create("searchable", std::env::temp_dir(), amber_core::state::SessionKind::Shell)
         .unwrap();
-    manager.write("searchable", b"printf '\\033[31mUNIQUE_NEEDLE\\033[0m\\n'\n").unwrap();
+    #[cfg(unix)]
+    let (input, emitted): (&[u8], &[u8]) = (
+        b"printf '\\033[31mUNIQUE_NEEDLE\\033[0m\\n'\n",
+        b"\x1b[31mUNIQUE_NEEDLE",
+    );
+    #[cfg(windows)]
+    let (input, emitted): (&[u8], &[u8]) = (b"echo UNIQUE_NEEDLE\r\n", b"UNIQUE_NEEDLE");
+    manager.write("searchable", input).unwrap();
     let session = manager.session("searchable").unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     while !session
         .scrollback()
-        .windows(b"\x1b[31mUNIQUE_NEEDLE".len())
-        .any(|w| w == b"\x1b[31mUNIQUE_NEEDLE")
+        .windows(emitted.len())
+        .any(|window| window == emitted)
     {
         assert!(Instant::now() < deadline, "shell never produced searchable output");
         thread::sleep(Duration::from_millis(10));
