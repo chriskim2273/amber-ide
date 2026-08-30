@@ -49,6 +49,7 @@ import {
   REMOTE_SOCKET_PROBE, REMOTE_LAYOUT_PROBE, parseAgentSock, explainSshFailure,
 } from './sshRemote'
 import { webCtlArgv, parseWebStatus, redactUrl, type WebStatus } from './webService'
+import { inspectLinuxInputMethod, repairLinuxInputMethod } from './inputMethod'
 import clientPath from '../client/index?modulePath'
 
 // A client child that stays up this long counts as a genuine run; a shorter
@@ -105,24 +106,115 @@ const WEB_PORT = 7717
 function runCapture(
   cmd: string,
   args: string[],
+  timeoutMs?: number,
 ): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolveRun) => {
     const p = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] })
     let stdout = ''
     let stderr = ''
+    let settled = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const finish = (result: { code: number; stdout: string; stderr: string }): void => {
+      if (settled) return
+      settled = true
+      if (timer) clearTimeout(timer)
+      resolveRun(result)
+    }
     p.stdout?.on('data', (d: Buffer) => {
       stdout += d.toString()
     })
     p.stderr?.on('data', (d: Buffer) => {
       stderr += d.toString()
     })
-    p.on('close', (code) => resolveRun({ code: code ?? -1, stdout, stderr }))
-    p.on('error', (e) => resolveRun({ code: -1, stdout: '', stderr: String(e) }))
+    p.on('close', (code) => finish({ code: code ?? -1, stdout, stderr }))
+    p.on('error', (e) => finish({ code: -1, stdout: '', stderr: String(e) }))
+    if (timeoutMs !== undefined) {
+      timer = setTimeout(() => {
+        try { p.kill('SIGKILL') } catch { /* already gone */ }
+        finish({ code: -1, stdout, stderr: `${stderr}${stderr ? '\n' : ''}timed out after ${timeoutMs} ms` })
+      }, timeoutMs)
+    }
   })
 }
 
 function runAmberCapture(args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
   return runCapture(amberBinary(), args)
+}
+
+async function isSocket(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isSocket()
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Chromium uses IBus for physical keyboard events on Linux/X11. A live
+ * ibus-daemon can retain a registry entry for a socket that has been unlinked;
+ * systemd's Restart=on-abnormal does not notice because the process itself is
+ * still healthy. New Electron clients then log a growing IBus event queue and
+ * eventually drop every physical key, while synthetic DevTools input continues
+ * to work. Detect that exact condition before a terminal window can open.
+ */
+async function preflightLinuxInputMethod(): Promise<boolean> {
+  const options = {
+    platform: process.platform,
+    env: process.env,
+    run: (cmd: string, args: string[]) => runCapture(cmd, args, 8000),
+    isSocket,
+  }
+  const health = await inspectLinuxInputMethod(options)
+  if (health.status !== 'stale') return true
+
+  process.stderr.write(`amber: desktop input preflight failed: ${health.reason}\n`)
+  const choice = await dialog.showMessageBox({
+    type: 'warning',
+    title: 'Keyboard input needs repair',
+    message: 'Amber cannot connect to the Linux input service.',
+    detail: `${health.reason}\n\nPhysical keyboard input may not work until IBus is restarted. Running sessions and the amber daemon will not be affected.`,
+    buttons: ['Restart input service', 'Continue anyway', 'Quit Amber'],
+    defaultId: 0,
+    cancelId: 2,
+    noLink: true,
+  })
+
+  if (choice.response === 1) return true
+  if (choice.response !== 0) {
+    app.quit()
+    return false
+  }
+
+  // A stale explicit override wins over IBus's newly generated registry file.
+  // Drop it only after proving it is broken, so repair and the first Chromium
+  // input context both discover the replacement address.
+  delete process.env['IBUS_ADDRESS']
+  const repaired = await repairLinuxInputMethod({
+    ...options,
+    delay: (ms) => new Promise((resolveDelay) => setTimeout(resolveDelay, ms)),
+  })
+  if (repaired.status === 'healthy') {
+    // This runs before the first BrowserWindow exists. Continuing now creates
+    // Chromium's input context against the replacement socket; no AppImage
+    // relaunch cycle (and no ephemeral-mount race) is necessary.
+    return true
+  }
+
+  const reason = repaired.status === 'stale' ? repaired.reason : 'IBus did not recover'
+  process.stderr.write(`amber: desktop input repair failed: ${reason}\n`)
+  const failure = await dialog.showMessageBox({
+    type: 'error',
+    title: 'Keyboard input repair failed',
+    message: 'Amber could not restore the Linux input service.',
+    detail: `${reason}\n\nYou can continue with limited input or quit and repair IBus manually.`,
+    buttons: ['Continue anyway', 'Quit Amber'],
+    defaultId: 1,
+    cancelId: 1,
+    noLink: true,
+  })
+  if (failure.response === 0) return true
+  app.quit()
+  return false
 }
 
 function amberBinary(): string {
@@ -808,6 +900,8 @@ async function openWindow(target: WindowTarget): Promise<WindowCtx> {
 }
 
 async function main(): Promise<void> {
+  if (!await preflightLinuxInputMethod()) return
+
   const socket = resolveSocketPath(process.env)
   await ensureDaemon(socket, {
     probe: probeSocket,
