@@ -3,6 +3,7 @@
 
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -197,7 +198,9 @@ fn handle_connection(
     stream.set_write_timeout(Some(CLIENT_WRITE_TIMEOUT))?;
     let writer: SharedWriter = Arc::new(Mutex::new(stream.try_clone()?));
     let mut subscriptions: Subscriptions = Vec::new();
-    let result = connection_loop(&manager, &watchers, &writer, stream, &mut subscriptions);
+    let search_epoch = Arc::new(AtomicU64::new(0));
+    let result = connection_loop(&manager, &watchers, &writer, stream, &mut subscriptions, &search_epoch);
+    search_epoch.fetch_add(1, Ordering::Relaxed);
     // However the connection ended, release every subscription it held.
     for (_, sess, id) in subscriptions {
         sess.unsubscribe(id);
@@ -211,6 +214,7 @@ fn connection_loop(
     writer: &SharedWriter,
     mut read_half: UnixStream,
     subscriptions: &mut Subscriptions,
+    search_epoch: &Arc<AtomicU64>,
 ) -> anyhow::Result<()> {
     let mut decoder = Decoder::new();
     let mut buf = [0u8; 8192];
@@ -219,7 +223,7 @@ fn connection_loop(
         while let Some(decoded) = decoder.next_decoded()? {
             match decoded {
                 Decoded::Frame(frame) => {
-                    handle_frame(manager, watchers, writer, frame, subscriptions)
+                    handle_frame(manager, watchers, writer, frame, subscriptions, search_epoch)
                 }
                 // Forward-compat: a control body this build can't decode (e.g. a
                 // newer client's new message). Framing is length-prefixed and the
@@ -245,9 +249,10 @@ fn handle_frame(
     writer: &SharedWriter,
     frame: Frame,
     subscriptions: &mut Subscriptions,
+    search_epoch: &Arc<AtomicU64>,
 ) {
     match frame {
-        Frame::Control(msg) => handle_control(manager, watchers, writer, msg, subscriptions),
+        Frame::Control(msg) => handle_control(manager, watchers, writer, msg, subscriptions, search_epoch),
         Frame::Data { session, bytes } => {
             // Input from the client: forward to the child's stdin. A stale
             // session name is not fatal to the connection — log and carry on.
@@ -268,6 +273,7 @@ fn handle_control(
     writer: &SharedWriter,
     msg: ControlMsg,
     subscriptions: &mut Subscriptions,
+    search_epoch: &Arc<AtomicU64>,
 ) {
     match msg {
         ControlMsg::Create { name, cwd, kind } => {
@@ -550,11 +556,13 @@ fn handle_control(
             });
         }
         ControlMsg::SearchScrollback { request_id, query, names, limit } => {
-            // Validate tiny request bounds inline, then move every ring copy,
+            // Validate tiny request bounds inline, then move scoped ring copies,
             // scan, and response write off the multiplexed connection's read
-            // thread. A search must never queue Create/Kill/Resize behind it.
-            let chars = query.trim().chars().count();
-            if chars == 0 || chars > 256 || names.len() > 1_000 {
+            // thread. A newer request on this connection cancels stale work.
+            if crate::search::validate_query(&query).is_err()
+                || names.len() > 1_000
+                || names.iter().any(|name| name.len() > 512)
+            {
                 let _ = write_frame(
                     writer,
                     &Frame::Control(ControlMsg::Error {
@@ -565,16 +573,18 @@ fn handle_control(
             }
             let manager = Arc::clone(manager);
             let writer = Arc::clone(writer);
+            let search_epoch = Arc::clone(search_epoch);
+            let token = search_epoch.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
             thread::spawn(move || {
-                let reply = match manager.search_scrollback(&query, &names, limit) {
-                    Ok(results) => ControlMsg::SearchResults {
-                        request_id,
-                        query,
-                        results,
-                    },
-                    Err(error) => ControlMsg::Error { msg: error.to_string() },
+                let cancelled = || search_epoch.load(Ordering::Relaxed) != token;
+                let reply = match manager.search_scrollback_cancellable(&query, &names, limit, &cancelled) {
+                    Ok(Some(results)) => Some(ControlMsg::SearchResults { request_id, query, results }),
+                    Ok(None) => None,
+                    Err(error) => Some(ControlMsg::Error { msg: error.to_string() }),
                 };
-                let _ = write_frame(&writer, &Frame::Control(reply));
+                if let Some(reply) = reply {
+                    let _ = write_frame(&writer, &Frame::Control(reply));
+                }
             });
         }
         ControlMsg::Snapshot => {

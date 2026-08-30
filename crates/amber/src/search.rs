@@ -74,14 +74,7 @@ fn preview(line: &str) -> String {
         .collect()
 }
 
-/// Search sanitized point-in-time ring snapshots. The caller owns snapshotting
-/// and threading; this pure body only performs bounded matching and formatting.
-pub fn search_snapshots(
-    query: &str,
-    sessions: &[(String, Vec<u8>)],
-    names: &[String],
-    limit: u16,
-) -> anyhow::Result<Vec<SearchResult>> {
+pub fn validate_query(query: &str) -> anyhow::Result<&str> {
     let query = query.trim();
     let query_chars = query.chars().count();
     if query_chars == 0 {
@@ -90,6 +83,20 @@ pub fn search_snapshots(
     if query_chars > MAX_QUERY_CHARS {
         anyhow::bail!("search query exceeds {MAX_QUERY_CHARS} characters");
     }
+    Ok(query)
+}
+
+/// Cancellable search over point-in-time ring snapshots. `None` means a newer
+/// request on the same connection superseded this work; stale workers then send
+/// no reply and release their bounded copies promptly.
+pub fn search_snapshots_cancellable(
+    query: &str,
+    sessions: &[(String, Vec<u8>)],
+    names: &[String],
+    limit: u16,
+    cancelled: &dyn Fn() -> bool,
+) -> anyhow::Result<Option<Vec<SearchResult>>> {
+    let query = validate_query(query)?;
     let needle = query.to_lowercase();
     let wanted: HashSet<&str> = names.iter().map(String::as_str).collect();
     let limit = if limit == 0 {
@@ -101,11 +108,13 @@ pub fn search_snapshots(
     ordered.sort_by(|a, b| a.0.cmp(&b.0));
     let mut results = Vec::new();
     'sessions: for (name, bytes) in ordered {
+        if cancelled() { return Ok(None) }
         if !wanted.is_empty() && !wanted.contains(name.as_str()) {
             continue;
         }
         let text = sanitize_scrollback(bytes);
         for (index, line) in text.lines().enumerate() {
+            if cancelled() { return Ok(None) }
             if line.to_lowercase().contains(&needle) {
                 results.push(SearchResult {
                     name: name.clone(),
@@ -118,7 +127,17 @@ pub fn search_snapshots(
             }
         }
     }
-    Ok(results)
+    Ok(Some(results))
+}
+
+/// Non-cancellable wrapper used by pure/unit callers.
+pub fn search_snapshots(
+    query: &str,
+    sessions: &[(String, Vec<u8>)],
+    names: &[String],
+    limit: u16,
+) -> anyhow::Result<Vec<SearchResult>> {
+    Ok(search_snapshots_cancellable(query, sessions, names, limit, &|| false)?.unwrap_or_default())
 }
 
 #[cfg(test)]
@@ -164,5 +183,15 @@ mod tests {
     fn rejects_empty_and_oversized_queries() {
         assert!(search_snapshots("   ", &[], &[], 10).is_err());
         assert!(search_snapshots(&"x".repeat(257), &[], &[], 10).is_err());
+    }
+
+    #[test]
+    fn cancellable_search_abandons_a_superseded_scan() {
+        let checks = std::cell::Cell::new(0);
+        let cancelled = || { checks.set(checks.get() + 1); checks.get() >= 3 };
+        let result = search_snapshots_cancellable(
+            "needle", &[('s'.to_string(), b"one\ntwo\nneedle\n".to_vec())], &[], 10, &cancelled,
+        ).unwrap();
+        assert_eq!(result, None);
     }
 }

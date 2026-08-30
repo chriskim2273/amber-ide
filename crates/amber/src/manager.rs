@@ -2,7 +2,7 @@
 //! between them and the [`StateStore`]. This is the piece that replaces
 //! tmux-resurrect (restore) and tmux-continuum (snapshot).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -1800,18 +1800,33 @@ impl SessionManager {
         names: &[String],
         limit: u16,
     ) -> anyhow::Result<Vec<SearchResult>> {
+        Ok(self.search_scrollback_cancellable(query, names, limit, &|| false)?.unwrap_or_default())
+    }
+
+    pub fn search_scrollback_cancellable(
+        &self,
+        query: &str,
+        names: &[String],
+        limit: u16,
+        cancelled: &dyn Fn() -> bool,
+    ) -> anyhow::Result<Option<Vec<SearchResult>>> {
+        // Reject bad requests before copying a single retained ring.
+        crate::search::validate_query(query)?;
+        let wanted: HashSet<&str> = names.iter().map(String::as_str).collect();
         let handles: Vec<(String, Arc<PtySession>)> = self
             .sessions
             .lock()
             .unwrap()
             .iter()
+            .filter(|(name, _)| wanted.is_empty() || wanted.contains(name.as_str()))
             .map(|(name, session)| (name.clone(), Arc::clone(session)))
             .collect();
-        let snapshots: Vec<(String, Vec<u8>)> = handles
-            .into_iter()
-            .map(|(name, session)| (name, session.scrollback()))
-            .collect();
-        crate::search::search_snapshots(query, &snapshots, names, limit)
+        let mut snapshots = Vec::with_capacity(handles.len());
+        for (name, session) in handles {
+            if cancelled() { return Ok(None) }
+            snapshots.push((name, session.scrollback()));
+        }
+        crate::search::search_snapshots_cancellable(query, &snapshots, names, limit, cancelled)
     }
 
     /// One [`SessionInfo`] per live session, joining the live table (existence
