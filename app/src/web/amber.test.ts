@@ -216,6 +216,7 @@ describe('PaneLink', () => {
       postPanePort: (session, port2) => posted.push({ session, port2 }),
       clipboard: { writeText: () => Promise.resolve(), readText: () => Promise.resolve('') },
       home: '/home/x',
+      machineName: 'teapot-dev',
       softwareGl: false,
       layoutGet: () => Promise.resolve({ text: null, version: null }),
       layoutSave: () => Promise.resolve({ ok: true, version: null }),
@@ -307,6 +308,7 @@ describe('createAmber', () => {
       postPanePort: () => {},
       clipboard: { writeText: () => Promise.resolve(), readText: () => Promise.resolve('clip') },
       home: '/home/x',
+      machineName: 'teapot-dev',
       softwareGl: false,
       layoutGet: () => Promise.resolve({ text: null, version: null }),
       layoutSave: () => Promise.resolve({ ok: true, version: null }),
@@ -314,9 +316,10 @@ describe('createAmber', () => {
     }
   }
 
-  it('exposes homeDir/softwareGl straight from deps', () => {
-    const amber = createAmber(deps({ home: '/home/y', softwareGl: true }))
+  it('exposes homeDir, machineName and softwareGl straight from deps', () => {
+    const amber = createAmber(deps({ home: '/home/y', machineName: 'amber-host', softwareGl: true }))
     expect(amber.homeDir).toBe('/home/y')
+    expect(amber.machineName).toBe('amber-host')
     expect(amber.softwareGl).toBe(true)
   })
 

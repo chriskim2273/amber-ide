@@ -87,6 +87,33 @@ gating; the conflicts were additive on both sides (SplitView imports, the web
 shim's method table, two CLAUDE.md entries) and the borrow code was untouched
 by the protocol change.
 
+## Amber Pocket production foundation (2026-08-30)
+
+The real `/app` renderer now opens to a capability-gated command center instead
+of the desktop split tree. The selector is deterministic and honest: exited,
+retrying and fallback sessions need attention; daemon/app parked states are
+parked; live agents and shells with unseen output are working; the remainder
+are quiet. It never scrapes a TUI or claims an agent is waiting. Critical host
+pressure is a global alert, not assigned to an arbitrary pane.
+
+Production CDP at 390×844 against the live daemon's 13 sessions verified:
+
+- Sessions is the initial surface and the hidden pane stage remains mounted and
+  laid out (`visibility:hidden`, not `display:none`): measured 390×844 with 45
+  xterm rows, then Mosaic revealed those same rows instead of a broken 2×1 fit.
+- The first row appears above the fold; every interactive target is at least
+  44 px.
+- Opening a row reuses the existing zoomed pane and MessagePort/xterm path.
+- Focus removes the old pane header and returns its 26 px to xterm.
+- Session and new-session bottom sheets render above Focus.
+- A platform-history pop dismisses the sheet while Focus remains intact.
+- Browser/editor panes stay out of the terminal command center and remain
+  available in Mosaic.
+
+The command center also stops `MarkSeen` while it is only listing sessions, so
+an unseen-output signal survives scanning and is consumed only when Mosaic or
+Focus actually displays that terminal.
+
 ## Not verified
 
 - **A real device, either platform.** Emulation gives touch events and a coarse

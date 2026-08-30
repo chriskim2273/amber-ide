@@ -87,6 +87,9 @@ export function installAmber(home: string): void {
       readText: () => navigator.clipboard.readText(),
     },
     home,
+    // The web renderer is already on the remote machine's HTTPS origin. Keep
+    // only the first DNS label so command-center identity stays compact.
+    machineName: location.hostname.split('.')[0] || 'amber',
     softwareGl: probeSoftwareGl(),
     layoutGet,
     layoutSave,

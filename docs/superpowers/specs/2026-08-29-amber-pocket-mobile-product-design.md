@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-29
 
-**Status:** visual prototype complete; production keyboard-viewport hardening implemented; command center not started
+**Status:** visual prototype complete; production command-center model, mobile shell, focus chrome, sheets, and keyboard hardening implemented; physical-device hardening remains
 
 **Prototype:** `docs/prototypes/amber-pocket/index.html`
 
@@ -459,24 +459,35 @@ Activity is output, not completion.
 
 ## 12. Production implementation order
 
-### Slice 1: command-center model
+### Slice 1: command-center model — implemented 2026-08-30
 
-- Pure selector that derives urgency groups from `PaneModel`, activity,
-  run-state, frozen state, exit state, and resource pressure.
-- Unit tests for every grouping and ordering rule.
-- No renderer change until selectors are deterministic.
+- `commandCenterModel` derives urgency groups from `PaneModel`, unseen activity,
+  run-state, frozen state, exit state, memory telemetry, and resource pressure.
+- Deterministic precedence and ordering are unit-tested. Global pressure remains
+  a global alert instead of blaming an arbitrary session.
+- Browser and editor panes are explicitly filtered without changing sidecar or
+  daemon truth.
+- The renderer landed only after the selector tests were green.
 
-### Slice 2: mobile navigation shell
+### Slice 2: mobile navigation shell — implemented 2026-08-30
 
-- Add command center and bottom navigation only when `useMobile()` is true.
-- Preserve the current drawer as the detailed workspace/tab browser.
-- Use history state for command center, mosaic, focus, and sheet dismissal.
+- Command center and bottom navigation mount only when `useMobile()` is true;
+  desktop composition remains unchanged.
+- The phone now lands in Sessions, while Mosaic keeps the existing split tree.
+  Workspace filters change display scope without mutating daemon grouping.
+- Session and new-session bottom sheets use tagged history entries. Platform
+  back dismisses a sheet before it leaves Focus.
 
-### Slice 3: focus terminal chrome
+### Slice 3: focus terminal chrome — baseline implemented 2026-08-30
 
-- Recompose the existing zoom state into the focus screen.
-- Keep `Pane` transport and terminal lifecycle unchanged.
-- Add header collapse without triggering `FitAddon` or PTY resize.
+- A command-center row opens the existing per-tab zoom state; no second pane or
+  terminal transport exists.
+- Focus replaces the desktop pane header with machine/session/run-state chrome,
+  returns the recovered 26 px to xterm, and exposes the session sheet.
+- `Pane`, MessagePort transport, grid borrowing, and terminal lifecycle remain
+  unchanged. Header collapse after input is still deferred until real-device
+  keyboard timing is measured; the current fixed header never changes PTY
+  geometry.
 
 ### Slice 4: key-bar hierarchy and quick commands
 

@@ -91,6 +91,21 @@ describe('commandCenterModel', () => {
     expect(names(model, 'working')).toEqual(['working-new', 'working-old'])
   })
 
+  it('filters by workspace without changing authoritative grouping', () => {
+    const model = commandCenterModel({
+      workspaces: [
+        { ws: 1, tabs: [{ tab: 1, panes: [pane('ws-one')] }] },
+        { ws: 2, tabs: [{ tab: 1, panes: [pane('ws-two', { slot: 2 })] }] },
+      ],
+      state: state(),
+      frozen: new Set(),
+      workspace: 2,
+    })
+
+    expect(model.count).toBe(1)
+    expect(model.groups.flatMap((group) => group.items).map((item) => item.pane.name)).toEqual(['ws-two'])
+  })
+
   it('keeps app-local browser and editor panes out of the mobile terminal command center', () => {
     const model = commandCenterModel({
       workspaces: workspaces(

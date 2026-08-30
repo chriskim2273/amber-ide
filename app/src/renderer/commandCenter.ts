@@ -38,6 +38,8 @@ export interface CommandCenterInput {
   workspaces: WorkspaceModel[]
   state: Pick<AppState, 'lastActivity' | 'lastSeen' | 'mem' | 'pressure' | 'resourcePressure'>
   frozen: ReadonlySet<string>
+  /** Optional display-only filter. Grouping and daemon state remain untouched. */
+  workspace?: number | undefined
 }
 
 const GROUPS: ReadonlyArray<{ id: CommandCenterGroupId; label: string }> = [
@@ -106,10 +108,11 @@ function compareItems(a: CommandCenterItem, b: CommandCenterItem): number {
 
 function resourceCauseText(causes: ResourcePressureCause[]): string {
   const labels = causes.map((cause) => ({ cpu: 'CPU', io: 'I/O', memory: 'memory' })[cause] ?? cause)
-  if (labels.length === 0) return 'System resource'
-  if (labels.length === 1) return labels[0]!
-  if (labels.length === 2) return `${labels[0]} and ${labels[1]}`
-  return `${labels.slice(0, -1).join(', ')}, and ${labels.at(-1)}`
+  const text = labels.length === 0 ? 'System resource'
+    : labels.length === 1 ? labels[0]!
+      : labels.length === 2 ? `${labels[0]} and ${labels[1]}`
+        : `${labels.slice(0, -1).join(', ')}, and ${labels.at(-1)}`
+  return text[0]!.toUpperCase() + text.slice(1)
 }
 
 /**
@@ -118,11 +121,12 @@ function resourceCauseText(causes: ResourcePressureCause[]): string {
  * terminal output. Global pressure remains a global alert instead of assigning
  * blame to an arbitrary session.
  */
-export function commandCenterModel({ workspaces, state, frozen }: CommandCenterInput): CommandCenterModel {
+export function commandCenterModel({ workspaces, state, frozen, workspace }: CommandCenterInput): CommandCenterModel {
   const buckets = new Map<CommandCenterGroupId, CommandCenterItem[]>(GROUPS.map((group) => [group.id, []]))
 
-  for (const workspace of workspaces) {
-    for (const tab of workspace.tabs) {
+  for (const workspaceModel of workspaces) {
+    if (workspace !== undefined && workspaceModel.ws !== workspace) continue
+    for (const tab of workspaceModel.tabs) {
       for (const pane of tab.panes) {
         // Browser/editor panes have no daemon terminal transport in the mobile
         // web surface. Hiding by kind here is the explicit product cut; these
@@ -134,7 +138,7 @@ export function commandCenterModel({ workspaces, state, frozen }: CommandCenterI
         const memory = state.mem[pane.name]
         buckets.get(classification.group)!.push({
           pane,
-          ws: workspace.ws,
+          ws: workspaceModel.ws,
           tab: tab.tab,
           unseenActivity,
           activitySeq,

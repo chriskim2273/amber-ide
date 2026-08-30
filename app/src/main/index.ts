@@ -3,7 +3,7 @@ import type { MenuItemConstructorOptions } from 'electron'
 import { ipcMain, dialog, clipboard } from 'electron'
 import { fileURLToPath } from 'node:url'
 import { basename, dirname, join, resolve as resolvePathJoin, isAbsolute } from 'node:path'
-import { homedir, release as osRelease, tmpdir } from 'node:os'
+import { homedir, hostname, release as osRelease, tmpdir } from 'node:os'
 import { spawn, execFileSync } from 'node:child_process'
 import { readFile, writeFile, rename, mkdir, copyFile, chmod, realpath, rm, stat, mkdtemp } from 'node:fs/promises'
 import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
@@ -617,6 +617,7 @@ async function openWindow(target: WindowTarget): Promise<WindowCtx> {
       // before exposeInMainWorld and the whole bridge silently vanishes.
       additionalArguments: [
         `--amber-home=${process.env['HOME'] ?? ''}`,
+        `--amber-machine=${target.kind === 'remote' ? (target.host ?? 'amber') : hostname()}`,
         ...(target.kind === 'remote' ? [`--amber-remote=${target.host ?? ''}`] : []),
         ...(process.env['AMBER_SOFTWARE_GL'] ? ['--amber-software-gl'] : []),
       ],

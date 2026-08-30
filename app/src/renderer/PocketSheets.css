@@ -1,0 +1,174 @@
+/* Amber Pocket bottom sheets. Floating depth is reserved for this overlay; the
+   command center itself stays flat and tonal. */
+.pocket-sheet-overlay {
+  position: fixed;
+  z-index: 40;
+  inset: 0;
+  display: flex;
+  align-items: end;
+  background: rgba(0, 0, 0, 0.58);
+}
+.pocket-sheet {
+  width: 100%;
+  max-height: 82dvh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 8px 14px calc(16px + env(safe-area-inset-bottom, 0px));
+  border-top: 1px solid var(--border-strong);
+  border-radius: 16px 16px 0 0;
+  background: var(--surface);
+  box-shadow: 0 -12px 36px rgba(0, 0, 0, 0.52);
+  animation: pocket-sheet-in 200ms cubic-bezier(0, 0, 0.2, 1) both;
+}
+@keyframes pocket-sheet-in {
+  from { opacity: 0; transform: translateY(18px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.pocket-sheet-grip {
+  width: 36px;
+  height: 4px;
+  margin: 2px auto 10px;
+  border-radius: 2px;
+  background: var(--border-strong);
+}
+.pocket-sheet-head {
+  min-height: 54px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--border);
+}
+.pocket-sheet-head > span {
+  min-width: 0;
+  flex: 1;
+  display: grid;
+  gap: 3px;
+}
+.pocket-sheet-head strong {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 17px;
+  font-weight: 680;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pocket-sheet-head code,
+.pocket-sheet-head small {
+  overflow: hidden;
+  color: var(--text-dim);
+  font: 11.5px var(--font-mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pocket-sheet-head button {
+  min-width: 54px;
+  min-height: 44px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-dim);
+  font: 600 13px var(--font-ui);
+}
+.pocket-sheet-actions { display: grid; padding-top: 8px; }
+.pocket-sheet-actions > button {
+  min-height: 58px;
+  display: grid;
+  align-content: center;
+  gap: 3px;
+  padding: 9px 10px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+.pocket-sheet-actions > button:hover { background: var(--surface-2); }
+.pocket-sheet-actions > button strong { font-size: 14px; font-weight: 620; }
+.pocket-sheet-actions > button span {
+  overflow: hidden;
+  color: var(--text-dim);
+  font: 11.5px var(--font-mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pocket-sheet-actions > button.danger {
+  margin-top: 8px;
+  border-top: 1px solid rgba(255, 92, 92, 0.2);
+  color: var(--danger);
+}
+.pocket-kind-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin: 14px 0;
+  padding: 0;
+  border: 0;
+}
+.pocket-kind-grid legend {
+  grid-column: 1 / -1;
+  margin-bottom: 2px;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+.pocket-kind-grid label { position: relative; }
+.pocket-kind-grid input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+}
+.pocket-kind-grid label span {
+  min-height: 46px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text-dim);
+  font-size: 13px;
+  font-weight: 600;
+}
+.pocket-kind-grid input:checked + span {
+  border-color: rgba(124, 108, 255, 0.62);
+  background: var(--accent-soft);
+  color: #dedaff;
+}
+.pocket-kind-grid input:focus-visible + span { outline: var(--focus-ring); outline-offset: 2px; }
+.pocket-cwd-choice {
+  width: 100%;
+  min-height: 58px;
+  display: grid;
+  gap: 4px;
+  padding: 9px 11px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text-dim);
+  text-align: left;
+}
+.pocket-cwd-choice span { font-size: 12px; }
+.pocket-cwd-choice code {
+  overflow: hidden;
+  color: var(--text);
+  font: 12px var(--font-mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pocket-create {
+  width: 100%;
+  min-height: 48px;
+  margin-top: 12px;
+  border: 0;
+  border-radius: 8px;
+  background: #6751df;
+  color: #fff;
+  font: 650 14px var(--font-ui);
+}
+.pocket-sheet button { cursor: pointer; }
+.pocket-sheet button:focus-visible { outline: var(--focus-ring); outline-offset: 2px; }
+
+@media (prefers-reduced-motion: reduce) {
+  .pocket-sheet { animation: none; }
+}
