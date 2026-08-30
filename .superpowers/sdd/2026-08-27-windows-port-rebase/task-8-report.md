@@ -142,3 +142,24 @@ the ordinary success path. On `potato-server` Windows/MSVC,
 `RUSTFLAGS='-Dwarnings' cargo clippy -q -p amber-core` passed. Local Linux
 `cargo test -q -p amber-core` passed **116 tests**, strict clippy passed, and
 the Windows test target cross-checked successfully.
+
+## Review follow-up: rename commit durable source removal
+
+The rename commit point now removes `sessions/<from>.json` through
+`remove_durable` instead of `remove_if_exists` plus `sync_dir`. That keeps the
+Unix behavior (`remove_file` plus parent directory fsync) while making Windows
+use the already-established same-directory write-through tombstone move for
+the authoritative source metadata. If removal fails while the source name is
+still visible, the destination metadata is rolled back as a pre-commit failure;
+if the source name is already gone, the rename remains committed and the
+durability warning is logged without deleting the new authoritative record.
+
+Added a Windows-only regression on the actual `rename_session` commit path.
+The RED run on `potato-server` failed exactly at
+`rename_commit_removes_source_metadata_through_durable_removal` because the
+commit path did not enter durable removal. After the production fix, the same
+targeted test passed, then full native `cargo test -q -p amber-core` passed
+**117 passed, 0 failed** and native strict
+`RUSTFLAGS='-Dwarnings' cargo clippy -q -p amber-core` passed. Local Linux
+`cargo test -q -p amber-core` passed **116 tests**, and local strict clippy
+passed.

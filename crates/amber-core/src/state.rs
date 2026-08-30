@@ -575,6 +575,8 @@ impl StateStore {
             seq
         ));
         Self::move_file_write_through(path, &tombstone, false)?;
+        #[cfg(test)]
+        durable_remove_probe::record(path, &tombstone);
         Ok(tombstone)
     }
 
@@ -866,22 +868,18 @@ impl StateStore {
 
         // COMMIT POINT: remove and durably record disappearance of the source
         // metadata. If this normal operation fails, destination publication is
-        // rolled back while the source is still authoritative.
+        // rolled back while the source is still authoritative. Once the source
+        // name is gone, the rename is committed in the live filesystem; any
+        // late durability warning must not delete the new authoritative record.
         let from_meta = self.session_path(from);
-        if let Err(error) = Self::remove_if_exists(&from_meta) {
-            let mut rollback = created.clone();
-            rollback.push(to_meta);
-            return self.rename_precommit_error(error, &rollback);
-        }
-        // Once remove_file succeeds the transaction is committed in the live
-        // filesystem. A directory-fsync error makes crash durability uncertain
-        // but must NOT trigger pre-commit rollback: deleting destination then
-        // could leave no metadata at all. Keep the new authoritative record and
-        // surface the durability warning in logs.
-        if let Some(parent) = from_meta.parent() {
-            if let Err(error) = Self::sync_dir(parent) {
+        if let Err(error) = Self::remove_durable(&from_meta) {
+            if from_meta.exists() {
+                let mut rollback = created.clone();
+                rollback.push(to_meta);
+                return self.rename_precommit_error(error, &rollback);
+            } else {
                 eprintln!(
-                    "amber state: renamed session but could not sync metadata directory: {error}"
+                    "amber state: renamed session but could not confirm durable metadata removal: {error}"
                 );
             }
         }
@@ -1018,6 +1016,22 @@ impl StateStore {
     pub fn save_config(&self, c: &Config) -> anyhow::Result<()> {
         let s = toml::to_string_pretty(c)?;
         Self::atomic_write(&self.config_path(), s.as_bytes())
+    }
+}
+
+#[cfg(all(test, windows))]
+mod durable_remove_probe {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    static MOVES: Mutex<Vec<(PathBuf, PathBuf)>> = Mutex::new(Vec::new());
+
+    pub(super) fn record(source: &Path, tombstone: &Path) {
+        MOVES.lock().unwrap().push((source.to_path_buf(), tombstone.to_path_buf()));
+    }
+
+    pub(super) fn take() -> Vec<(PathBuf, PathBuf)> {
+        std::mem::take(&mut *MOVES.lock().unwrap())
     }
 }
 
@@ -1823,6 +1837,34 @@ mod tests {
         assert_eq!(store.read_scrollback("amber-1-1-0-a").unwrap(), None);
         assert!(dir.path().join("claude/amber-1-2-0-a.settings.json").exists());
         assert!(!settings.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rename_commit_removes_source_metadata_through_durable_removal() {
+        let dir = tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        let from = "amber-1-1-0-durable";
+        let to = "amber-1-2-0-durable";
+        store.write_session(&sample_session(from)).unwrap();
+
+        durable_remove_probe::take();
+        store.rename_session(from, to).unwrap();
+
+        let from_meta = store.session_path(from);
+        let moves = durable_remove_probe::take();
+        assert!(
+            moves.iter().any(|(source, tombstone)| {
+                source == &from_meta
+                    && tombstone
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        == Some("tombstone")
+            }),
+            "rename commit did not route source metadata removal through remove_durable"
+        );
+        assert_eq!(store.read_session(from).unwrap(), None);
+        assert_eq!(store.read_session(to).unwrap().unwrap().name, to);
     }
 
     #[test]
