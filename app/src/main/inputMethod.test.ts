@@ -3,6 +3,7 @@ import {
   inspectLinuxInputMethod,
   parseIbusAddress,
   repairLinuxInputMethod,
+  resolveLinuxInputEnvironment,
   type CaptureResult,
 } from './inputMethod'
 
@@ -30,6 +31,53 @@ describe('parseIbusAddress', () => {
 
   it.each(['', '(null)', 'tcp:host=localhost'])('rejects unusable address %j', (address) => {
     expect(parseIbusAddress(address)).toBeNull()
+  })
+})
+
+describe('resolveLinuxInputEnvironment', () => {
+  it('recovers missing IBus markers from the systemd user manager', async () => {
+    const run = vi.fn().mockResolvedValue(ok([
+      'DISPLAY=:1',
+      'XMODIFIERS=@im=ibus',
+      'QT_IM_MODULE=ibus',
+      'UNRELATED=do-not-import',
+      '',
+    ].join('\n')))
+
+    const resolved = await resolveLinuxInputEnvironment({
+      platform: 'linux', env: { DISPLAY: ':1' }, run,
+    })
+
+    expect(run).toHaveBeenCalledWith('systemctl', ['--user', 'show-environment'])
+    expect(resolved).toMatchObject({
+      DISPLAY: ':1', XMODIFIERS: '@im=ibus', QT_IM_MODULE: 'ibus',
+    })
+    expect(resolved['UNRELATED']).toBeUndefined()
+  })
+
+  it('does not override an explicit input-method choice', async () => {
+    const run = vi.fn()
+    const env = { DISPLAY: ':1', XMODIFIERS: '@im=none' }
+    expect(await resolveLinuxInputEnvironment({ platform: 'linux', env, run }))
+      .toEqual(env)
+    expect(run).not.toHaveBeenCalled()
+  })
+
+  it('does not query systemd outside a graphical Linux process', async () => {
+    const run = vi.fn()
+    expect(await resolveLinuxInputEnvironment({ platform: 'darwin', env: { DISPLAY: ':1' }, run }))
+      .toEqual({ DISPLAY: ':1' })
+    expect(await resolveLinuxInputEnvironment({ platform: 'linux', env: {}, run }))
+      .toEqual({})
+    expect(run).not.toHaveBeenCalled()
+  })
+
+  it('degrades to the launch environment when manager discovery fails', async () => {
+    const env = { DISPLAY: ':1' }
+    expect(await resolveLinuxInputEnvironment({
+      platform: 'linux', env,
+      run: vi.fn().mockResolvedValue({ code: 1, stdout: '', stderr: 'no manager' }),
+    })).toEqual(env)
   })
 })
 

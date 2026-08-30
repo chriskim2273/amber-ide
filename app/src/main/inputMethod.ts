@@ -13,10 +13,13 @@ export type IbusAddress =
   | { kind: 'path'; path: string }
   | { kind: 'abstract' }
 
-interface InspectOptions {
+interface RunOptions {
   platform: NodeJS.Platform
   env: NodeJS.ProcessEnv
   run: (cmd: string, args: string[]) => Promise<CaptureResult>
+}
+
+interface InspectOptions extends RunOptions {
   isSocket: (path: string) => Promise<boolean>
 }
 
@@ -50,6 +53,30 @@ function ibusSelected(platform: NodeJS.Platform, env: NodeJS.ProcessEnv): boolea
   if (platform !== 'linux' || !env['DISPLAY']) return false
   return [env['XMODIFIERS'], env['GTK_IM_MODULE'], env['QT_IM_MODULE']]
     .some((value) => value?.toLowerCase().includes('ibus'))
+}
+
+const INPUT_ENV_KEYS = ['XMODIFIERS', 'GTK_IM_MODULE', 'QT_IM_MODULE'] as const
+
+/**
+ * A repository-driven/raw AppImage launch may inherit DISPLAY but omit GNOME's
+ * input-method markers. Recover only those missing markers from the systemd
+ * user manager; never eval its output and never override an explicit choice.
+ */
+export async function resolveLinuxInputEnvironment(options: RunOptions): Promise<NodeJS.ProcessEnv> {
+  const launchEnv = { ...options.env }
+  if (options.platform !== 'linux' || !launchEnv['DISPLAY']) return launchEnv
+  if (INPUT_ENV_KEYS.some((key) => launchEnv[key] !== undefined)) return launchEnv
+
+  const result = await options.run('systemctl', ['--user', 'show-environment'])
+  if (result.code !== 0) return launchEnv
+  for (const line of result.stdout.split('\n')) {
+    const separator = line.indexOf('=')
+    if (separator <= 0) continue
+    const key = line.slice(0, separator)
+    if (!INPUT_ENV_KEYS.includes(key as typeof INPUT_ENV_KEYS[number])) continue
+    launchEnv[key] = line.slice(separator + 1)
+  }
+  return launchEnv
 }
 
 /**

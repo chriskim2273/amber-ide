@@ -1336,9 +1336,13 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   `Restart=on-abnormal` saw a healthy process, new Electron clients logged an
   overflowing IBus event queue and dropped physical keys, while CDP synthetic
   input bypassed IBus and produced a false green. Before the first window,
-  Electron main now checks `ibus address`; filesystem addresses must be live
-  unix sockets, while abstract addresses are accepted. A stale address opens a
-  native Restart/Continue/Quit prompt. Restart uses IBus's documented
+  Electron main now recovers missing IBus markers from the systemd user manager
+  through a strict three-key allowlist (never `eval`, never overriding an
+  explicit input-method choice), then checks `ibus address`; filesystem
+  addresses must be live unix sockets, while abstract addresses are accepted.
+  This closes the raw-AppImage restart gap that caused the incident to recur
+  once after the initial guard shipped. A stale address opens a native
+  Restart/Continue/Quit prompt. Restart uses IBus's documented
   `--type=systemd` path, polls for a proven replacement, removes only a proven
   stale `IBUS_ADDRESS` override, and continues before Chromium creates its input
   context; repair failure remains user-controlled and explicit. The check is
@@ -1351,9 +1355,10 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   physical XTest key, uses CDP only to observe xterm, clears the private shell,
   and cleans every artifact. Spec:
   `docs/superpowers/specs/2026-08-30-linux-input-health-design.md`. TDD proved
-  address parsing, stale/live/abstract classification, documented repair,
-  polling, failure reporting, stale-env removal, and relaunch preflight. Gates:
-  app **642 tests** + one intentional skip, typecheck, production bundle,
+  address parsing, missing-manager-env recovery, explicit-choice preservation,
+  stale/live/abstract classification, documented repair, polling, failure
+  reporting, stale-env removal, and relaunch preflight. Gates:
+  app **667 tests** + one intentional skip, typecheck, production bundle,
   packaged AppImage, shell syntax/regression, and diff checks green. Live proof
   covered both sides: a fake stale IBus produced the native prompt and recovered
   into the app after clicking Restart; the exact packaged artifact passed the

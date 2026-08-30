@@ -54,7 +54,7 @@ import {
   REMOTE_SOCKET_PROBE, REMOTE_LAYOUT_PROBE, parseAgentSock, explainSshFailure,
 } from './sshRemote'
 import { webCtlArgv, parseWebStatus, redactUrl, type WebStatus } from './webService'
-import { inspectLinuxInputMethod, repairLinuxInputMethod } from './inputMethod'
+import { inspectLinuxInputMethod, repairLinuxInputMethod, resolveLinuxInputEnvironment } from './inputMethod'
 import clientPath from '../client/index?modulePath'
 
 // A client child that stays up this long counts as a genuine run; a shorter
@@ -163,10 +163,24 @@ async function isSocket(path: string): Promise<boolean> {
  * to work. Detect that exact condition before a terminal window can open.
  */
 async function preflightLinuxInputMethod(): Promise<boolean> {
-  const options = {
+  const run = (cmd: string, args: string[]) => runCapture(cmd, args, 8000)
+  const effectiveEnv = await resolveLinuxInputEnvironment({
     platform: process.platform,
     env: process.env,
-    run: (cmd: string, args: string[]) => runCapture(cmd, args, 8000),
+    run,
+  })
+  // Chromium reads these while constructing its first input context. A raw
+  // AppImage relaunch can omit them even though GNOME's user manager has the
+  // authoritative values, which was the gap in the first startup guard.
+  for (const key of ['XMODIFIERS', 'GTK_IM_MODULE', 'QT_IM_MODULE'] as const) {
+    if (process.env[key] === undefined && effectiveEnv[key] !== undefined) {
+      process.env[key] = effectiveEnv[key]
+    }
+  }
+  const options = {
+    platform: process.platform,
+    env: effectiveEnv,
+    run,
     isSocket,
   }
   const health = await inspectLinuxInputMethod(options)

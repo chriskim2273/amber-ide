@@ -29,9 +29,17 @@ D-Bus address, and `ibus restart --type=systemd` is the documented GNOME repair.
 
 ### App startup guard
 
-On Linux with an X display and an environment selecting IBus, Electron main
-checks `ibus address` before creating a window. Filesystem addresses must resolve
-to a live unix socket; abstract unix addresses need no filesystem check.
+On Linux with an X display, Electron main first repairs a common launch-context
+gap: if all input-method markers are absent, it reads the systemd user manager's
+`XMODIFIERS`/`GTK_IM_MODULE`/`QT_IM_MODULE` values through a strict allowlist,
+without `eval`, and applies them before Chromium creates its first input context.
+An explicit process-level input-method choice is never overridden. This covers
+raw AppImage restarts from non-graphical automation while keeping non-IBus
+sessions a no-op.
+
+When the effective environment selects IBus, Electron checks `ibus address`
+before creating a window. Filesystem addresses must resolve to a live unix
+socket; abstract unix addresses need no filesystem check.
 
 A stale address opens a native dialog with three explicit choices:
 
@@ -66,7 +74,7 @@ This specifically prevents a CDP false green from recurring.
 
 ## Boundaries
 
-- Linux/X11-focused; macOS and non-IBus environments are no-ops.
+- Linux/X11-focused; macOS and explicit non-IBus environments are no-ops.
 - No daemon, protocol, PTY, or renderer changes.
 - Amber does not silently restart a desktop-wide input service; repair requires
   the native-dialog choice, except in the explicit deploy helper.
