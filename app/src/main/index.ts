@@ -1,4 +1,4 @@
-import { app, BrowserWindow, utilityProcess, MessageChannelMain, Menu, shell } from 'electron'
+import { app, BrowserWindow, utilityProcess, MessageChannelMain, Menu, shell, Notification } from 'electron'
 import type { MenuItemConstructorOptions } from 'electron'
 import { ipcMain, dialog, clipboard } from 'electron'
 import { fileURLToPath } from 'node:url'
@@ -41,6 +41,10 @@ import {
 } from './editorFiles'
 import { claudeNames } from './claudeNames'
 import { loadLayoutFile, saveLayoutFile } from './layoutIO'
+import {
+  loadProductivityFile, saveProductivityFile, readProjectProfile,
+  listCheckpoints, writeCheckpoint, readCheckpoint, deleteCheckpoint,
+} from './productivityIO'
 import { compatSignature, shouldUseCompat, compatWorthyReason, COMPAT_SWITCHES, DETECT_WINDOW_MS } from './renderCompat'
 import { installBinary } from './installBinary'
 import { repairAgentExtensions } from './agentSetup'
@@ -972,6 +976,64 @@ async function main(): Promise<void> {
   ipcMain.handle('layout-save', async (e, text: string, version: string | null) => {
     if (ctxFor(e)?.target.kind === 'remote') return { ok: true, version: null }
     return saveLayoutFile(layoutPath(), text, version)
+  })
+
+  const productivityPath = () => join(stateRoot(), 'productivity.json')
+  ipcMain.handle('productivity-load', async (e) => {
+    if (ctxFor(e)?.target.kind === 'remote') return { text: null, version: null }
+    return loadProductivityFile(productivityPath())
+  })
+  ipcMain.handle('productivity-save', async (e, text: unknown, version: unknown) => {
+    if (ctxFor(e)?.target.kind === 'remote') return { error: 'remote windows are read-only' }
+    if (typeof text !== 'string' || (typeof version !== 'string' && version !== null)) return { error: 'invalid productivity save' }
+    return saveProductivityFile(productivityPath(), text, version)
+  })
+  ipcMain.handle('project-profile-read', async (e, root: unknown) => {
+    if (ctxFor(e)?.target.kind === 'remote') return { error: 'remote windows are read-only' }
+    if (typeof root !== 'string' || !isAbsolute(root)) return { error: 'project root must be absolute' }
+    return readProjectProfile(root)
+  })
+  ipcMain.handle('checkpoint-list', async (e) =>
+    ctxFor(e)?.target.kind === 'remote' ? [] : listCheckpoints(stateRoot()))
+  ipcMain.handle('checkpoint-write', async (e, id: unknown, text: unknown) => {
+    if (ctxFor(e)?.target.kind === 'remote') throw new Error('remote windows are read-only')
+    if (typeof id !== 'string' || typeof text !== 'string') throw new Error('invalid checkpoint write')
+    await writeCheckpoint(stateRoot(), id, text)
+  })
+  ipcMain.handle('checkpoint-read', async (e, id: unknown) => {
+    if (ctxFor(e)?.target.kind === 'remote' || typeof id !== 'string') throw new Error('invalid checkpoint read')
+    return readCheckpoint(stateRoot(), id)
+  })
+  ipcMain.handle('checkpoint-delete', async (e, id: unknown) => {
+    if (ctxFor(e)?.target.kind === 'remote' || typeof id !== 'string') throw new Error('invalid checkpoint delete')
+    await deleteCheckpoint(stateRoot(), id)
+  })
+  ipcMain.handle('handoff-save-file', async (e, text: unknown, suggested: unknown) => {
+    const ctx = ctxFor(e)
+    if (ctx?.target.kind === 'remote' || typeof text !== 'string' || typeof suggested !== 'string') return false
+    const r = await dialog.showSaveDialog(ctx?.win ?? win, {
+      defaultPath: suggested,
+      filters: [{ name: 'amber session handoff', extensions: ['amberhandoff'] }],
+    })
+    if (r.canceled || !r.filePath) return false
+    const path = r.filePath.endsWith('.amberhandoff') ? r.filePath : `${r.filePath}.amberhandoff`
+    await writeFile(`${path}.tmp`, text, { mode: 0o600 })
+    await rename(`${path}.tmp`, path)
+    return true
+  })
+  ipcMain.on('desktop-notify', (e, payload: unknown) => {
+    const ctx = ctxFor(e)
+    if (!ctx || ctx.target.kind === 'remote' || !Notification.isSupported() || !payload || typeof payload !== 'object') return
+    const raw = payload as Record<string, unknown>
+    if (typeof raw['title'] !== 'string' || typeof raw['body'] !== 'string') return
+    const session = typeof raw['session'] === 'string' && raw['session'].length <= 200 ? raw['session'] : undefined
+    const notification = new Notification({ title: raw['title'].slice(0, 80), body: raw['body'].slice(0, 240) })
+    notification.on('click', () => {
+      if (ctx.win.isDestroyed()) return
+      ctx.win.show(); ctx.win.focus()
+      if (session) ctx.win.webContents.send('notification-activate', session)
+    })
+    notification.show()
   })
 
   // Portable workspace file: native save dialog + atomic write (layout-save

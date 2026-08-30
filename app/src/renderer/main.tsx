@@ -13,6 +13,9 @@ import { RemoteAccess } from './RemoteAccess'
 import { Drawer } from './Drawer'
 import { useMobile } from './mobile'
 import type { WebStatus } from '../shared/webStatus'
+import type { LoadProductivityResult, SaveProductivityResult } from '../shared/productivity'
+import type { CheckpointSummary } from '../shared/checkpoint'
+import type { ProjectProfile } from '../shared/projectProfile'
 import { formatName, makeId, retargetPane } from '../shared/names'
 import { formatBrowserName, isBrowserName } from '../shared/browserName'
 import { formatEditorName, isEditorName } from '../shared/editorName'
@@ -62,6 +65,16 @@ declare global {
       // than silently overwritten. See the persist effect below.
       loadLayout: () => Promise<LoadLayoutResult>
       saveLayout: (text: string, version: string | null) => Promise<SaveLayoutResult>
+      loadProductivity?: () => Promise<LoadProductivityResult>
+      saveProductivity?: (text: string, version: string | null) => Promise<SaveProductivityResult>
+      readProjectProfile?: (root: string) => Promise<{ profile: ProjectProfile; root: string; resolvedCwds: string[] } | { error: string }>
+      listCheckpoints?: () => Promise<CheckpointSummary[]>
+      writeCheckpoint?: (id: string, text: string) => Promise<void>
+      readCheckpoint?: (id: string) => Promise<string>
+      deleteCheckpoint?: (id: string) => Promise<void>
+      saveHandoffFile?: (text: string, suggested: string) => Promise<boolean>
+      notify?: (payload: { title: string; body: string; session?: string }) => void
+      onNotificationActivate?: (cb: (session: string) => void) => void
       saveWorkspaceFile: (json: string, suggestedName: string) => Promise<boolean>
       openWorkspaceFile: () => Promise<string | null>
       homeDir: string

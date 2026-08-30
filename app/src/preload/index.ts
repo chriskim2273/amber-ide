@@ -1,5 +1,7 @@
 import { ipcRenderer, contextBridge } from 'electron'
 import type { LoadLayoutResult, SaveLayoutResult } from '../shared/layoutFile'
+import type { LoadProductivityResult, SaveProductivityResult } from '../shared/productivity'
+import type { CheckpointSummary } from '../shared/checkpoint'
 
 // This preload runs SANDBOXED — no node builtins, no `process.env`. Both would
 // throw/return-empty and kill the bridge. Values come from `additionalArguments`
@@ -52,6 +54,22 @@ contextBridge.exposeInMainWorld('amber', {
   loadLayout: (): Promise<LoadLayoutResult> => ipcRenderer.invoke('layout-load'),
   saveLayout: (text: string, version: string | null): Promise<SaveLayoutResult> =>
     ipcRenderer.invoke('layout-save', text, version),
+  loadProductivity: (): Promise<LoadProductivityResult> => ipcRenderer.invoke('productivity-load'),
+  saveProductivity: (text: string, version: string | null): Promise<SaveProductivityResult> =>
+    ipcRenderer.invoke('productivity-save', text, version),
+  readProjectProfile: (root: string): Promise<unknown> => ipcRenderer.invoke('project-profile-read', root),
+  listCheckpoints: (): Promise<CheckpointSummary[]> => ipcRenderer.invoke('checkpoint-list'),
+  writeCheckpoint: (id: string, text: string): Promise<void> => ipcRenderer.invoke('checkpoint-write', id, text),
+  readCheckpoint: (id: string): Promise<string> => ipcRenderer.invoke('checkpoint-read', id),
+  deleteCheckpoint: (id: string): Promise<void> => ipcRenderer.invoke('checkpoint-delete', id),
+  saveHandoffFile: (text: string, suggested: string): Promise<boolean> =>
+    ipcRenderer.invoke('handoff-save-file', text, suggested),
+  notify: (payload: { title: string; body: string; session?: string }): void => ipcRenderer.send('desktop-notify', payload),
+  onNotificationActivate: (cb: (session: string) => void): void => {
+    ipcRenderer.on('notification-activate', (_event, session: unknown) => {
+      if (typeof session === 'string') cb(session)
+    })
+  },
   // Portable `.amberws` workspace files via native OS dialogs. Save returns true
   // on write, false on cancel; open returns the file text or null on cancel.
   saveWorkspaceFile: (json: string, suggestedName: string): Promise<boolean> =>
