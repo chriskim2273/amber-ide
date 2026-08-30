@@ -51,13 +51,14 @@ export function fmtMem(rssKb: number): string {
 // debounced incremental findNext on type, Enter/Shift+Enter step, Escape closes.
 // Rendered as an absolute overlay so it never enters the terminal's layout box
 // (which would SIGWINCH the pty on open/close).
-function FindBar({ api, focusSeq, onClose }: { api: SearchApi; focusSeq: number; onClose: () => void }): JSX.Element {
-  const [query, setQuery] = useState('')
+function FindBar({ api, focusSeq, initialQuery, onClose }: { api: SearchApi; focusSeq: number; initialQuery?: string | undefined; onClose: () => void }): JSX.Element {
+  const [query, setQuery] = useState(initialQuery ?? '')
   const [res, setRes] = useState<{ index: number; count: number }>({ index: -1, count: 0 })
   const inputRef = useRef<HTMLInputElement>(null)
   // Focus on mount AND whenever the find chord re-fires on this pane (focusSeq
   // bumps) — reopening an already-open bar must put the caret back in the input.
   useEffect(() => { inputRef.current?.focus() }, [focusSeq])
+  useEffect(() => { if (initialQuery !== undefined) setQuery(initialQuery) }, [initialQuery, focusSeq])
   useEffect(() => {
     api.onResults((r) => setRes({ index: r.resultIndex, count: r.resultCount }))
     return () => {
@@ -204,6 +205,11 @@ export function SplitView(props: {
   frozen: Record<string, { note?: string }>
   onFreeze: (paneId: string, note: string) => void
   onUnfreeze: (paneId: string) => void
+  onBookmark?: (paneId: string, excerpt: string) => void
+  onExportHandoff?: (paneId: string) => void
+  findRequest?: { paneId: string; query: string; seq: number } | undefined
+  focusRequest?: { paneId: string; seq: number } | undefined
+  paneActionRequest?: { action: 'bookmark' | 'handoff'; seq: number } | undefined
 }): JSX.Element {
   const ref = useRef<HTMLDivElement>(null)
   const [size, setSize] = useState<Rect>({ x: 0, y: 0, w: 0, h: 0 })
@@ -225,6 +231,16 @@ export function SplitView(props: {
   // fire so re-invoking find on an already-open bar refocuses its input.
   const [findPane, setFindPane] = useState<string | null>(null)
   const [findSeq, setFindSeq] = useState(0)
+  const [findInitial, setFindInitial] = useState<string | undefined>(undefined)
+  useEffect(() => {
+    const request = props.findRequest
+    if (!props.active || !request || !leaves(props.tree).includes(request.paneId)) return
+    setFocused(request.paneId)
+    setFindPane(request.paneId)
+    setFindInitial(request.query)
+    setFindSeq(request.seq)
+  }, [props.findRequest?.seq, props.active, props.tree])
+
   // Custom header context menu, if open: which pane and where (stage-relative,
   // clamped on render). Bound to the pane HEADER only — xterm owns body events.
   // With `split` set it renders the kind picker instead (shell/claude/browser for
@@ -287,6 +303,15 @@ export function SplitView(props: {
     }
     input.focus()
   }
+
+  useEffect(() => {
+    const request = props.focusRequest
+    if (!props.active || !request || !leaves(props.tree).includes(request.paneId)) return
+    setFocused(request.paneId)
+    requestAnimationFrame(() => focusPane(request.paneId, false))
+    // focusPane reads live element refs; the request sequence is the trigger.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [props.focusRequest?.seq, props.active, props.tree])
 
   // Keep-alive activation: when this tab goes hidden -> visible (parent flips
   // `active`), nothing remounts, so no Pane calls term.focus() and the outgoing
@@ -384,6 +409,16 @@ export function SplitView(props: {
   }
   const searchApis = useRef<Map<string, SearchApi>>(new Map())
   const searchReadyCbs = useRef<Map<string, (api: SearchApi) => void>>(new Map())
+  useEffect(() => {
+    const request = props.paneActionRequest
+    if (!props.active || !request) return
+    const paneId = focusedRef.current ?? leaves(props.tree)[0]
+    if (!paneId || !searchApis.current.has(paneId)) return
+    if (request.action === 'bookmark') props.onBookmark?.(paneId, searchApis.current.get(paneId)?.captureBookmark() ?? '')
+    else props.onExportHandoff?.(paneId)
+    // The request sequence is the command; callbacks intentionally read this render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [props.paneActionRequest?.seq, props.active, props.tree])
   const searchReadyFor = (paneId: string): ((api: SearchApi) => void) => {
     let cb = searchReadyCbs.current.get(paneId)
     if (!cb) { cb = (api) => { searchApis.current.set(paneId, api) }; searchReadyCbs.current.set(paneId, cb) }
@@ -812,8 +847,8 @@ export function SplitView(props: {
                     // shared pty (spec §2.4). Desktop always fits.
                     fitMode={mobile && props.zoomedPane !== paneId ? 'scale' : 'fit'} />}
               {!noTerm && findPane === paneId && !isFrozen && searchApis.current.get(paneId) &&
-                <FindBar api={searchApis.current.get(paneId)!} focusSeq={findSeq}
-                  onClose={() => { setFindPane(null); focusPane(paneId) }} />}
+                <FindBar api={searchApis.current.get(paneId)!} focusSeq={findSeq} initialQuery={findInitial}
+                  onClose={() => { setFindPane(null); setFindInitial(undefined); focusPane(paneId) }} />}
               {dead !== undefined &&
                 <div className="dead-overlay">
                   <div className={'dead-badge ' + (dead === 0 ? 'ok' : 'err')}>
@@ -967,6 +1002,16 @@ export function SplitView(props: {
                 </>
               )
             })()}
+            {menuHasTerm && <>
+              <div className="ctx-sep" />
+              {props.onBookmark && <button className="ctx-item" role="menuitem" onClick={run(() => {
+                const excerpt = searchApis.current.get(paneId)?.captureBookmark() ?? ''
+                props.onBookmark?.(paneId, excerpt)
+              })}><span>Bookmark position</span></button>}
+              {props.onExportHandoff && <button className="ctx-item" role="menuitem" onClick={run(() => props.onExportHandoff?.(paneId))}>
+                <span>Export handoff…</span>
+              </button>}
+            </>}
             {isFrozen
               ? <button className="ctx-item" role="menuitem" onClick={run(() => props.onUnfreeze(paneId))}>
                   <Icon name="play" /><span>Unfreeze pane</span>

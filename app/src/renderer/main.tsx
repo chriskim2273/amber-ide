@@ -13,12 +13,17 @@ import { RemoteAccess } from './RemoteAccess'
 import { Drawer } from './Drawer'
 import { useMobile } from './mobile'
 import type { WebStatus } from '../shared/webStatus'
-import type { LoadProductivityResult, SaveProductivityResult } from '../shared/productivity'
-import type { CheckpointSummary } from '../shared/checkpoint'
+import {
+  emptyProductivity, parseProductivity, serializeProductivity, mutateProductivity,
+  type LoadProductivityResult, type SaveProductivityResult, type ProductivityFile,
+  type WorkspaceTemplate, type SessionBookmark,
+} from '../shared/productivity'
+import { serializeCheckpoint, parseCheckpoint, type CheckpointSummary } from '../shared/checkpoint'
 import type { ProjectProfile } from '../shared/projectProfile'
-import { formatName, makeId, retargetPane } from '../shared/names'
-import { formatBrowserName, isBrowserName } from '../shared/browserName'
-import { formatEditorName, isEditorName } from '../shared/editorName'
+import { serializeHandoff } from '../shared/handoff'
+import { formatName, makeId, parseName, retargetPane } from '../shared/names'
+import { formatBrowserName, isBrowserName, parseBrowserName } from '../shared/browserName'
+import { formatEditorName, isEditorName, parseEditorName } from '../shared/editorName'
 import { splitLeaf, setRatio, reconcile, leaves, moveLeaf, type Node } from './layout'
 import {
   emptyLayout, parseLayout, serializeLayout, orderTabs, moveTab, mergeLayout,
@@ -32,6 +37,12 @@ import { collectDumps, matchDumpError } from './dumps'
 import { stageReplay } from './replay'
 import { formatKb, parseBudgetInput, type BudgetView } from '../shared/budget'
 import { appChord, chordLabel, modLabel, CHORD_TABLE } from './keys'
+import { type PaletteEntry } from './commandPalette'
+import { activitySummary, bookmarkNeedle, makeBookmark, searchScopeNames, shouldNotify, type SearchScope } from './productivityModels'
+import {
+  CommandPalette, GlobalSearchDialog, RecoveryCenter, TemplatesDialog,
+  BookmarksDialog, CheckpointsDialog, ProjectProfileDialog,
+} from './ProductivityDialogs'
 import './theme.css'
 
 declare global {
@@ -224,6 +235,32 @@ function App(): JSX.Element {
   const [saveScopeOpen, setSaveScopeOpen] = useState(false)
   const [loadDoc, setLoadDoc] = useState<WorkspaceDoc | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
+  type ProductivityOverlay = 'palette' | 'search' | 'recovery' | 'templates' | 'bookmarks' | 'checkpoints' | 'project'
+  const [productivityOverlay, setProductivityOverlay] = useState<ProductivityOverlay | null>(null)
+  const [productivity, setProductivity] = useState<ProductivityFile>(emptyProductivity)
+  const productivityRef = useRef(productivity)
+  productivityRef.current = productivity
+  const productivityVersion = useRef<string | null>(null)
+  const productivitySaveChain = useRef<Promise<void>>(Promise.resolve())
+  const [searchResults, setSearchResults] = useState<import('../shared/proto').SearchResult[]>([])
+  const [searchLoading, setSearchLoading] = useState(false)
+  const [searchError, setSearchError] = useState<string | null>(null)
+  const searchRequest = useRef(0)
+  const searchTimeout = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const [recoveryEvents, setRecoveryEvents] = useState<import('../shared/proto').RecoveryEvent[]>([])
+  const [recoveryLoading, setRecoveryLoading] = useState(false)
+  const [recoveryError, setRecoveryError] = useState<string | null>(null)
+  const recoveryTimeout = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const [checkpoints, setCheckpoints] = useState<CheckpointSummary[]>([])
+  const [projectProfile, setProjectProfile] = useState<{ profile: ProjectProfile; root: string; resolvedCwds: string[] } | null>(null)
+  const [projectError, setProjectError] = useState<string | null>(null)
+  const [findRequest, setFindRequest] = useState<{ paneId: string; query: string; seq: number } | undefined>(undefined)
+  const [focusRequest, setFocusRequest] = useState<{ paneId: string; seq: number } | undefined>(undefined)
+  const [paneActionRequest, setPaneActionRequest] = useState<{ action: 'bookmark' | 'handoff'; seq: number } | undefined>(undefined)
+  const navigationSeq = useRef(0)
+  const notificationDedup = useRef(new Map<string, number>())
+  const navigateRef = useRef<(session: string, query?: string) => void>(() => {})
+  useEffect(() => window.amber.onNotificationActivate?.((session) => navigateRef.current(session)), [])
   // A close blocked on unsaved work (spec §3.3): the pane stays until the user
   // picks save / discard / cancel. Cancel ABORTS the close.
   const [closeAsk, setCloseAsk] = useState<string | null>(null)
@@ -234,6 +271,9 @@ function App(): JSX.Element {
   // Session-cleanup dialog: open flag + the claude conversation labels fetched
   // for it (main reads the transcripts; see claudeNames.ts).
   const [sessionsOpen, setSessionsOpen] = useState(false)
+  const [activityQuery, setActivityQuery] = useState('')
+  const [activityState, setActivityState] = useState<'all' | 'live' | 'exited' | 'agents' | 'retrying' | 'fallback' | 'suspended'>('all')
+  const [activitySort, setActivitySort] = useState<'slot' | 'name' | 'memory' | 'activity'>('slot')
   const [claudeNames, setClaudeNames] = useState<Record<string, string>>({})
   const [picked, setPicked] = useState<Set<string>>(new Set())
   // Memory-budget dialog: the daemon's last BudgetApplied truth, the raw text
@@ -326,6 +366,17 @@ function App(): JSX.Element {
   // authoritative live set) — without this the map grows without bound in a
   // long-lived renderer as sessions come and go.
   const sessions = state.sessions
+  const sessionsRef = useRef(sessions)
+  sessionsRef.current = sessions
+  const locationRef = useRef({ ws: activeWs, tab: activeTab })
+  locationRef.current = { ws: activeWs, tab: activeTab }
+  const deliverNotification = (kind: 'activity' | 'exit' | 'retry' | 'fallback' | 'pressure', session: string | undefined, title: string, body: string): void => {
+    const parsed = session ? parseName(session) : null
+    const candidate = { kind, ...(session ? { session } : {}), ...(parsed ? { ws: parsed.ws } : {}), title, body }
+    if (shouldNotify(candidate, productivityRef.current.notifications, {
+      focused: document.hasFocus(), ws: locationRef.current.ws, tab: locationRef.current.tab,
+    }, Date.now(), notificationDedup.current)) window.amber.notify?.({ title, body, ...(session ? { session } : {}) })
+  }
   useEffect(() => {
     setTitles((prev) => {
       const live = new Set(sessions.map((s) => s.name))
@@ -384,6 +435,45 @@ function App(): JSX.Element {
         if (cb) { dumpResolvers.current.delete(bf.msg.name); cb(bf.msg.data ?? new Uint8Array()) }
         return
       }
+      if (bf?.type === 'control' && bf.msg?.kind === 'SearchResults') {
+        const m = bf.msg as ControlMsg & { kind: 'SearchResults' }
+        if (m.request_id === searchRequest.current) {
+          if (searchTimeout.current) clearTimeout(searchTimeout.current)
+          setSearchLoading(false); setSearchError(null); setSearchResults(m.results)
+        }
+        return
+      }
+      if (bf?.type === 'control' && bf.msg?.kind === 'RecoveryEvents') {
+        if (recoveryTimeout.current) clearTimeout(recoveryTimeout.current)
+        const m = bf.msg as ControlMsg & { kind: 'RecoveryEvents' }
+        setRecoveryLoading(false); setRecoveryError(null); setRecoveryEvents(m.events)
+        return
+      }
+      if (bf?.type === 'control' && bf.msg?.kind === 'RecoveryEventsCleared') {
+        if (recoveryTimeout.current) clearTimeout(recoveryTimeout.current)
+        setRecoveryLoading(false); setRecoveryEvents([])
+        return
+      }
+      if (bf?.type === 'control' && bf.msg?.kind === 'Activity' && typeof bf.msg.name === 'string') {
+        deliverNotification('activity', bf.msg.name, 'Background terminal activity', 'A background Amber pane produced output.')
+      }
+      if (bf?.type === 'control' && bf.msg?.kind === 'Exit' && typeof bf.msg.name === 'string') {
+        deliverNotification('exit', bf.msg.name, 'Amber session exited', 'A persistent terminal session ended. Open Amber to inspect it.')
+      }
+      if (bf?.type === 'control' && bf.msg?.kind === 'SessionsChanged') {
+        const previous = new Map(sessionsRef.current.map((session) => [session.name, session]))
+        for (const next of (bf.msg as ControlMsg & { kind: 'SessionsChanged' }).added) {
+          const before = previous.get(next.name)?.run_state
+          if (next.run_state === 'claude-retrying' && before !== next.run_state) {
+            deliverNotification('retry', next.name, `${next.kind} is retrying`, 'The supervised agent exited and Amber is attempting an exact resume.')
+          } else if (next.run_state === 'shell-fallback' && before !== next.run_state) {
+            deliverNotification('fallback', next.name, `${next.kind} needs attention`, 'The agent stopped and this pane fell back to a shell.')
+          }
+        }
+      }
+      if (bf?.type === 'control' && (bf.msg?.kind === 'MemoryPressure' || bf.msg?.kind === 'ResourcePressure') && (bf.msg as { level?: string }).level === 'critical') {
+        deliverNotification('pressure', undefined, 'Amber resource pressure', 'Amber may park idle agent panes to protect the system.')
+      }
       // Snapshot success is explicit daemon truth. Never infer it from a timer,
       // layout save, connection health, or the periodic-snapshot guarantee.
       if (bf?.type === 'control' && bf.msg?.kind === 'SnapshotOk') {
@@ -441,6 +531,11 @@ function App(): JSX.Element {
       baseRef.current = l
       versionRef.current = version
       setLoaded(true)
+    })
+    void window.amber.loadProductivity?.().then(({ text, version }) => {
+      const next = text ? parseProductivity(text) : emptyProductivity()
+      productivityVersion.current = version
+      setProductivity(next)
     })
   }, [bridgeReady])
 
@@ -541,6 +636,28 @@ function App(): JSX.Element {
     }, 300)
     return () => clearTimeout(id)
   }, [layout, bridgeReady, loaded, persistLayout])
+
+  const updateProductivity = (mutation: (file: ProductivityFile) => ProductivityFile): void => {
+    if (!window.amber.saveProductivity || remoteHost) return
+    setProductivity((previous) => {
+      const next = mutateProductivity(previous, mutation)
+      productivitySaveChain.current = productivitySaveChain.current.then(async () => {
+        const save = window.amber.saveProductivity
+        if (!save) return
+        let result = await save(serializeProductivity(next), productivityVersion.current)
+        if ('conflict' in result) {
+          const remote = result.text ? parseProductivity(result.text) : emptyProductivity()
+          const merged = mutateProductivity(remote, mutation)
+          result = await save(serializeProductivity(merged), result.version)
+          if ('ok' in result) setProductivity(merged)
+        }
+        if ('ok' in result) productivityVersion.current = result.version
+        else if ('error' in result) setNotice(`Productivity data could not be saved — ${result.error}`)
+        else setNotice('Productivity data changed in another window; try again.')
+      })
+      return next
+    })
+  }
 
   const workspaces = mergeEditors(mergeBrowsers(groupSessions(state), layout.browsers ?? {}), layout.editors ?? {})
   const ws = workspaces.find((w) => w.ws === activeWs) ?? workspaces[0]
@@ -671,8 +788,6 @@ function App(): JSX.Element {
   // tracking never re-renders. `sessionsRef` gives freezePane the live kind
   // without a dep on state.sessions.
   const suspendedRef = useRef<Set<string>>(new Set())
-  const sessionsRef = useRef(state.sessions)
-  sessionsRef.current = state.sessions
 
   // Freeze/unfreeze a pane. The sidecar `frozen` map is display-only (rule #1/#3).
   // For a CLAUDE pane, freezing ALSO suspends it on the daemon immediately: the
@@ -869,6 +984,8 @@ function App(): JSX.Element {
 
   if (!bridgeReady) return <p style={{ color: 'crimson', padding: 16 }}>preload bridge missing.</p>
 
+  // Desktop-only suite capabilities are intentionally absent from the web bridge.
+  const productivityAvailable = window.amber.loadProductivity !== undefined
   const nextOrd = (tab?.panes.reduce((m, p) => Math.max(m, p.ord), -1) ?? -1) + 1
   const nextTab = (tabs.reduce((m, t) => Math.max(m, t.tab), 0)) + 1
   // The workspace/tab actually on screen — NOT the raw activeWs/activeTab state,
@@ -877,6 +994,16 @@ function App(): JSX.Element {
   // dead workspace. Always create relative to what's displayed.
   const currentWs = ws?.ws ?? activeWs
   const currentTab = tab?.tab ?? activeTab
+  const navigateTo = (paneId: string, query?: string): void => {
+    const parsed = parseName(paneId) ?? parseBrowserName(paneId) ?? parseEditorName(paneId)
+    if (!parsed) { setNotice('That session no longer maps to a pane.'); return }
+    const seq = ++navigationSeq.current
+    setActiveWs(parsed.ws); setActiveTab(parsed.tab)
+    if (query !== undefined) setFindRequest({ paneId, query, seq })
+    else setFocusRequest({ paneId, seq })
+    setProductivityOverlay(null)
+  }
+  navigateRef.current = navigateTo
   // App-local browser pane: no daemon session. Write the sidecar entry and let
   // mergeBrowsers + deriveTab place it (reconcile appends it as a new leaf).
   // Returns the minted paneId so a split caller can position it with direction.
@@ -1049,37 +1176,37 @@ function App(): JSX.Element {
   const resetFont = (): void => setLayout((l) =>
     clampFont(l.fontSize ?? DEFAULT_FONT_SIZE) === DEFAULT_FONT_SIZE ? l : { ...l, fontSize: DEFAULT_FONT_SIZE })
 
-  // Save: dump each target pane's scrollback (name-correlated, per-pane timeout),
-  // assemble the file from live grouping + sidecar + dumps, write via native
-  // dialog. Cancel anywhere → clean no-op. Uses layoutRef for the freshest sidecar.
-  const doSave = async (scope: 'one' | 'all'): Promise<void> => {
-    setSaveScopeOpen(false)
+  const saveModel = (wsList: typeof workspaces): SaveWorkspace[] => wsList.map((w) => ({
+    ws: w.ws,
+    tabs: w.tabs.map((t) => ({ tab: t.tab, panes: t.panes.map((p) => ({
+      name: p.name, cwd: p.cwd, kind: p.kind, ord: p.ord,
+      ...(p.kind === 'browser' ? { url: layoutRef.current.browsers?.[p.name]?.url ?? '' } : {}),
+      ...(p.kind === 'editor' ? { path: layoutRef.current.editors?.[p.name]?.path ?? null } : {}),
+    })) })),
+  }))
+  const captureWorkspace = async (scope: 'one' | 'all', withScrollback: boolean): Promise<{ doc: WorkspaceDoc; stragglers: string[] }> => {
     const wsList = scope === 'one' ? workspaces.filter((w) => w.ws === currentWs) : workspaces
-    // Browser panes have no daemon session, so no backlog to dump — exclude them
-    // (a dumpBacklog for a non-session would just draw an Error reply).
-    const names = wsList.flatMap((w) => w.tabs.flatMap((t) => t.panes.filter((p) => p.kind === 'shell' || isAgentKind(p.kind)).map((p) => p.name)))
-    const { dumps, stragglers } = await collectDumps(
-      names,
-      (n) => window.amber.dumpBacklog(n),
+    const names = withScrollback
+      ? wsList.flatMap((w) => w.tabs.flatMap((t) => t.panes.filter((p) => p.kind === 'shell' || isAgentKind(p.kind)).map((p) => p.name)))
+      : []
+    const captured = names.length === 0 ? { dumps: {}, stragglers: [] } : await collectDumps(
+      names, (n) => window.amber.dumpBacklog(n),
       (n, cb) => { dumpResolvers.current.set(n, cb) },
       (n) => { dumpResolvers.current.delete(n) },
     )
-    const live: SaveWorkspace[] = wsList.map((w) => ({
-      ws: w.ws,
-      tabs: w.tabs.map((t) => ({ tab: t.tab, panes: t.panes.map((p) => ({
-        name: p.name, cwd: p.cwd, kind: p.kind, ord: p.ord,
-        ...(p.kind === 'browser' ? { url: layoutRef.current.browsers?.[p.name]?.url ?? '' } : {}),
-        ...(p.kind === 'editor' ? { path: layoutRef.current.editors?.[p.name]?.path ?? null } : {}),
-      })) })),
-    }))
-    const doc = assembleSave(scope, live, layoutRef.current, dumps)
+    return { doc: assembleSave(scope, saveModel(wsList), layoutRef.current, captured.dumps), stragglers: captured.stragglers }
+  }
+
+  // Save: dump each target pane's scrollback (name-correlated, per-pane timeout),
+  // assemble the file from live grouping + sidecar + dumps, write via native dialog.
+  const doSave = async (scope: 'one' | 'all'): Promise<void> => {
+    setSaveScopeOpen(false)
+    const { doc, stragglers } = await captureWorkspace(scope, true)
     const base = scope === 'one'
       ? (layoutRef.current.workspaces[String(currentWs)]?.label ?? `workspace-${currentWs}`)
       : 'workspaces'
     const ok = await window.amber.saveWorkspaceFile(serializeWorkspaceFile(doc), `${base}.amberws`)
-    if (ok && stragglers.length > 0) {
-      setNotice(`Saved. Scrollback capture timed out for ${stragglers.length} pane(s) — saved with empty history for those.`)
-    }
+    if (ok && stragglers.length > 0) setNotice(`Saved with empty history for ${stragglers.length} pane(s) whose capture timed out.`)
   }
 
   // Load step 1: pick + read + parse the file. Parse errors surface in the notice
@@ -1099,10 +1226,7 @@ function App(): JSX.Element {
   // Load step 2: chosen mode. Replace kills the current workspace's panes first
   // (one-way — removal lands via daemon events); createSession per planned pane;
   // the pendingLoad effect commits the sidecar + replay once the daemon confirms.
-  const applyLoad = (mode: 'new' | 'replace'): void => {
-    const doc = loadDoc
-    setLoadDoc(null)
-    if (!doc) return
+  const applyDocument = (doc: WorkspaceDoc, mode: 'new' | 'replace'): void => {
     const liveWs = workspaces.map((w) => w.ws)
     const killed: string[] = []
     if (mode === 'replace') {
@@ -1124,6 +1248,116 @@ function App(): JSX.Element {
     for (const c of plan.creates) window.amber.createSession(c.name, c.cwd, c.kind)
     setPendingLoad({ plan, createNames: plan.creates.map((c) => c.name), killed })
   }
+  const createCheckpoint = async (name: string, automatic = false, scope: 'one' | 'all' = 'one'): Promise<boolean> => {
+    if (!window.amber.writeCheckpoint) return false
+    try {
+      const { doc, stragglers } = await captureWorkspace(scope, true)
+      const id = `checkpoint-${makeId().toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 40)}`
+      await window.amber.writeCheckpoint(id, serializeCheckpoint(doc, { id, name: name.slice(0, 80), createdAt: Date.now(), scope, automatic }))
+      setCheckpoints(await window.amber.listCheckpoints?.() ?? [])
+      if (stragglers.length) {
+        setNotice(automatic
+          ? `Protected action cancelled: the restore point has ${stragglers.length} incomplete scrollback capture(s).`
+          : `Restore point created with ${stragglers.length} empty scrollback capture(s).`)
+        if (automatic) return false
+      }
+      return true
+    } catch (error) { setNotice(`Restore point failed — ${String(error)}`); return false }
+  }
+  const applyLoad = (mode: 'new' | 'replace'): void => {
+    const doc = loadDoc
+    setLoadDoc(null)
+    if (!doc) return
+    if (mode === 'replace') {
+      void (async () => { if (await createCheckpoint('Before workspace replacement', true)) applyDocument(doc, mode) })()
+    } else applyDocument(doc, mode)
+  }
+
+  const runGlobalSearch = (query: string, scope: SearchScope): void => {
+    if (!window.amber.searchScrollback) { setSearchError('Global search requires the current desktop daemon.'); return }
+    const requestId = (searchRequest.current + 1) >>> 0
+    searchRequest.current = requestId; setSearchLoading(true); setSearchError(null); setSearchResults([])
+    window.amber.searchScrollback(requestId, query, searchScopeNames(sessions, scope, currentWs, currentTab), 100)
+    if (searchTimeout.current) clearTimeout(searchTimeout.current)
+    searchTimeout.current = setTimeout(() => { if (searchRequest.current === requestId) { setSearchLoading(false); setSearchError('Search timed out — restart or update the Amber daemon.') } }, 8000)
+  }
+  const refreshRecovery = (): void => {
+    if (!window.amber.listRecoveryEvents) { setRecoveryError('Recovery history requires the current desktop daemon.'); return }
+    setRecoveryLoading(true); setRecoveryError(null); window.amber.listRecoveryEvents(200)
+    if (recoveryTimeout.current) clearTimeout(recoveryTimeout.current)
+    recoveryTimeout.current = setTimeout(() => { setRecoveryLoading(false); setRecoveryError('History request timed out — restart or update the daemon.') }, 8000)
+  }
+  const openProductivity = (overlay: ProductivityOverlay): void => {
+    setToolbarMenu(null); setProductivityOverlay(overlay)
+    if (overlay === 'recovery') refreshRecovery()
+    if (overlay === 'checkpoints') void window.amber.listCheckpoints?.().then(setCheckpoints)
+  }
+  const captureTemplate = (name: string): void => {
+    void captureWorkspace('one', false).then(({ doc }) => updateProductivity((file) => ({ ...file, templates: [
+      ...file.templates, { id: `template-${makeId().toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 40)}`, name, createdAt: Date.now(), doc },
+    ] })))
+  }
+  const addBookmark = (session: string, excerpt: string): void => {
+    const bookmark = makeBookmark(`bookmark-${makeId().toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 40)}`, excerpt, Date.now())
+    updateProductivity((file) => ({ ...file, bookmarks: { ...file.bookmarks, [session]: [...(file.bookmarks[session] ?? []), bookmark] } }))
+    setNotice('Terminal position bookmarked.')
+  }
+  const exportHandoff = (session: string): void => {
+    const info = sessions.find((entry) => entry.name === session)
+    if (!info || !window.amber.saveHandoffFile) return
+    void collectDumps([session], (name) => window.amber.dumpBacklog(name),
+      (name, cb) => { dumpResolvers.current.set(name, cb) }, (name) => { dumpResolvers.current.delete(name) })
+      .then(({ dumps }) => {
+        const bytes = dumps[session] ?? new Uint8Array()
+        let binary = ''; for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000))
+        const text = serializeHandoff({ version: 1, exportedAt: Date.now(), session: {
+          kind: info.kind, cwd: info.cwd, ...(info.slot ? { slot: info.slot } : {}),
+          ...(titles[session] ? { title: titles[session] } : {}), ...(info.run_state ? { runState: info.run_state } : {}),
+          ...(info.claude_id ? { conversationId: info.claude_id } : {}),
+        }, scrollback: btoa(binary), bookmarks: productivity.bookmarks[session] ?? [] })
+        return window.amber.saveHandoffFile?.(text, `amber-${info.slot ?? 'session'}.amberhandoff`)
+      }).then((saved) => { if (saved) setNotice('Session handoff exported. It may contain sensitive terminal output.') })
+  }
+  const createProjectWorkspace = (): void => {
+    if (!projectProfile) return
+    const panes = projectProfile.profile.panes.map((pane, index) => ({ id: `p${index}`, kind: pane.kind, cwd: projectProfile.resolvedCwds[index]!, ord: index, scrollback: '' }))
+    let profileTree: Node | null = panes[0] ? { kind: 'leaf', paneId: panes[0].id } : null
+    for (let i = 1; profileTree && i < panes.length; i += 1) profileTree = splitLeaf(profileTree, panes[i - 1]!.id, projectProfile.profile.panes[i]!.direction, panes[i]!.id)
+    const profileWorkspace = { tabs: [{ tab: 1, tree: profileTree, panes }], ...(projectProfile.profile.name ? { label: projectProfile.profile.name } : {}) }
+    const doc: WorkspaceDoc = { version: 1, scope: 'one', workspaces: [profileWorkspace] }
+    setProductivityOverlay(null); applyDocument(doc, 'new')
+  }
+  const paletteEntries: PaletteEntry[] = [
+    ...workspaces.flatMap((workspace) => workspace.tabs.flatMap((paneTab) => paneTab.panes.map((pane) => ({
+      id: `pane:${pane.name}`, label: `${pane.slot ? `#${pane.slot} ` : ''}${titles[pane.name] || shortCwd(pane.cwd, window.amber.homeDir) || pane.kind}`,
+      detail: `ws ${workspace.ws} · tab ${paneTab.tab} · ${pane.kind} · ${pane.cwd}`, keywords: pane.name,
+      run: () => navigateTo(pane.name),
+    })))),
+    ...workspaces.map((workspace) => ({
+      id: `workspace:${workspace.ws}`, label: layout.workspaces[String(workspace.ws)]?.label ?? `Workspace ${workspace.ws}`,
+      detail: `${workspace.tabs.length} tabs`, keywords: `ws ${workspace.ws}`, run: () => { setActiveWs(workspace.ws); setActiveTab(workspace.tabs[0]?.tab ?? 1) },
+    })),
+    ...orderedTabs.map((paneTab) => ({
+      id: `tab:${currentWs}:${paneTab.tab}`, label: layout.workspaces[String(currentWs)]?.tabs[String(paneTab.tab)]?.label ?? `Tab ${paneTab.tab}`,
+      detail: `Workspace ${currentWs} · ${paneTab.panes.length} panes`, keywords: `tab ${paneTab.tab}`, run: () => setActiveTab(paneTab.tab),
+    })),
+    ...(productivityAvailable ? [
+      { id: 'action:search', label: 'Search all scrollback', detail: chordLabel('global-search'), keywords: 'find global', run: () => openProductivity('search') },
+      { id: 'action:recovery', label: 'Recovery center', detail: 'Daemon lifecycle and restore history', keywords: 'errors crashes', run: () => openProductivity('recovery') },
+      { id: 'action:templates', label: 'Workspace templates', detail: 'Capture or instantiate a layout recipe', keywords: 'recipe project', run: () => openProductivity('templates') },
+      { id: 'action:checkpoints', label: 'Restore points', detail: 'Named structure and scrollback snapshots', keywords: 'checkpoint rollback', run: () => openProductivity('checkpoints') },
+      { id: 'action:bookmark-current', label: 'Bookmark active pane position', detail: 'Capture selected text or nearby cursor lines', keywords: 'terminal anchor', run: () => setPaneActionRequest({ action: 'bookmark', seq: ++navigationSeq.current }) },
+      { id: 'action:bookmarks', label: 'Browse bookmarks', detail: 'Terminal text anchors', keywords: 'saved positions', run: () => openProductivity('bookmarks') },
+      { id: 'action:handoff', label: 'Export active pane handoff', detail: 'Metadata, scrollback, and bookmarks', keywords: 'transfer archive', run: () => setPaneActionRequest({ action: 'handoff', seq: ++navigationSeq.current }) },
+      { id: 'action:project', label: 'Load project profile', detail: `${cwd}/.amber.toml`, keywords: 'local config', run: () => openProductivity('project') },
+    ] : []),
+    { id: 'action:sessions', label: 'Activity overview', detail: 'Sessions, memory, state, and cleanup', keywords: 'monitor sessions memory', run: () => setSessionsOpen(true) },
+    { id: 'action:save', label: 'Save workspace…', detail: 'Structure and retained scrollback', keywords: 'export amberws', run: () => setSaveScopeOpen(true) },
+    { id: 'action:load', label: 'Load workspace…', detail: 'Create or replace from .amberws', keywords: 'import restore', run: () => { void doLoad() } },
+    { id: 'action:help', label: 'Keyboard shortcuts', detail: chordLabel('help'), keywords: 'help keys', run: () => setShowHelp(true) },
+    { id: 'action:new-pane', label: 'New pane', detail: chordLabel('new-pane'), keywords: 'create terminal', run: () => startPane() },
+    { id: 'action:new-tab', label: 'New tab', detail: chordLabel('new-tab'), keywords: 'create', run: openTab },
+  ]
 
   // Refresh the keyboard-chord dispatcher with this render's live closures.
   chordRef.current = (c) => {
@@ -1132,6 +1366,8 @@ function App(): JSX.Element {
     else if (c?.type === 'prev-tab') stepTab(-1)
     else if (c?.type === 'next-tab') stepTab(1)
     else if (c?.type === 'help') setShowHelp(true)
+    else if (c?.type === 'command-palette') openProductivity('palette')
+    else if (c?.type === 'global-search' && productivityAvailable) openProductivity('search')
     else if (c?.type === 'font-bigger') bumpFont(1)
     else if (c?.type === 'font-smaller') bumpFont(-1)
     else if (c?.type === 'font-reset') resetFont()
@@ -1352,6 +1588,10 @@ function App(): JSX.Element {
                 <button className="btn btn-ghost" disabled={!continuity.canSnapshot || !window.amber.snapshotNow}
                   onClick={requestSnapshot}>{snapshotState.kind === 'pending' ? 'Saving…' : 'Snapshot now'}</button>
               </div>
+              {productivityAvailable && <div className="snapshot-row">
+                <button className="btn btn-ghost" onClick={() => openProductivity('recovery')}>Recovery center</button>
+                <button className="btn btn-ghost" onClick={() => openProductivity('checkpoints')}>Restore points</button>
+              </div>}
             </div>
           )}
         </div>
@@ -1376,9 +1616,30 @@ function App(): JSX.Element {
               <button className="popover-item" role="menuitem" onClick={() => { setToolbarMenu(null); void doLoad() }}>
                 <Icon name="load" /><span><strong>Load workspace…</strong><small>Open a portable .amberws file</small></span>
               </button>
+              {productivityAvailable && <>
+                <div className="ctx-sep" />
+                <button className="popover-item" role="menuitem" onClick={() => openProductivity('search')}>
+                  <Icon name="sessions" /><span><strong>Search all scrollback</strong><small>Find retained text across sessions</small></span>
+                </button>
+                <button className="popover-item" role="menuitem" onClick={() => openProductivity('recovery')}>
+                  <Icon name="preserve" /><span><strong>Recovery center</strong><small>Restore and lifecycle history</small></span>
+                </button>
+                <button className="popover-item" role="menuitem" onClick={() => openProductivity('templates')}>
+                  <Icon name="save" /><span><strong>Templates</strong><small>Reusable workspace recipes</small></span>
+                </button>
+                <button className="popover-item" role="menuitem" onClick={() => openProductivity('checkpoints')}>
+                  <Icon name="restore" /><span><strong>Restore points</strong><small>Named structure and scrollback captures</small></span>
+                </button>
+                <button className="popover-item" role="menuitem" onClick={() => openProductivity('bookmarks')}>
+                  <Icon name="preserve" /><span><strong>Bookmarks</strong><small>Saved terminal text anchors</small></span>
+                </button>
+                <button className="popover-item" role="menuitem" onClick={() => openProductivity('project')}>
+                  <Icon name="folder" /><span><strong>Project profile</strong><small>Review {cwd}/.amber.toml</small></span>
+                </button>
+              </>}
               <div className="ctx-sep" />
               <button className="popover-item" role="menuitem" onClick={() => { setToolbarMenu(null); setSessionsOpen(true) }}>
-                <Icon name="sessions" /><span><strong>Sessions</strong><small>Inspect every daemon session</small></span>
+                <Icon name="sessions" /><span><strong>Activity</strong><small>Inspect every daemon session</small></span>
               </button>
               <button className="popover-item" role="menuitem" onClick={() => { setToolbarMenu(null); setBudgetError(null); setBudgetOpen(true) }}>
                 <Icon name="memory" /><span><strong>Memory</strong><small>View and set the aggregate budget</small></span>
@@ -1386,6 +1647,8 @@ function App(): JSX.Element {
             </div>
           )}
         </div>
+        <button className="icon-btn help-btn" aria-label="command palette"
+          title={`Command palette (${chordLabel('command-palette')})`} onClick={() => openProductivity('palette')}><Icon name="sessions" /></button>
         <button className="icon-btn help-btn" aria-label="keyboard shortcuts"
           title={`Keyboard shortcuts (${chordLabel('help')})`} onClick={() => setShowHelp(true)}><Icon name="help" /></button>
       </div>
@@ -1470,6 +1733,9 @@ function App(): JSX.Element {
                           frozen={frozen}
                           onFreeze={freezePane}
                           onUnfreeze={unfreezePane}
+                          {...(productivityAvailable ? { onBookmark: addBookmark, onExportHandoff: exportHandoff, paneActionRequest } : {})}
+                          findRequest={findRequest}
+                          focusRequest={focusRequest}
                           onToggleZoom={toggleZoom}
                           onSetRatio={(path, r) => putTree(setRatio(layerTree, path, r))}
                           browsers={browserUrls}
@@ -1590,9 +1856,12 @@ function App(): JSX.Element {
                 </ul>
                 <div className="dialog-actions">
                   <button className="btn danger-btn" autoFocus onClick={() => {
-                    for (const n of killAsk) window.amber.killSession(n)
-                    setKillAsk(null)
-                    clearZoom()
+                    const names = [...killAsk]
+                    void (async () => {
+                      if (names.length > 1 && !(await createCheckpoint('Before bulk kill', true, 'all'))) return
+                      for (const n of names) window.amber.killSession(n)
+                      setKillAsk(null); clearZoom()
+                    })()
                   }}>Kill</button>
                   <button className="btn btn-ghost" onClick={() => setKillAsk(null)}>Cancel</button>
                 </div>
@@ -1606,7 +1875,25 @@ function App(): JSX.Element {
         // show. The daemon outlives the app by design (core rule #6), so
         // sessions accumulate across quits with nothing in the UI that admits
         // they exist; this is that place, and the only bulk way to end them.
-        const rows = sessionRows(sessions, claudeNames)
+        const allRows = sessionRows(sessions, claudeNames)
+        const needle = activityQuery.trim().toLowerCase()
+        const rows = allRows.filter((row) => {
+          if (needle !== '' && !`${row.name} ${row.cwd} ${row.kind} ${row.claudeName} ${titles[row.name] ?? ''}`.toLowerCase().includes(needle)) return false
+          const live = sessions.find((session) => session.name === row.name)
+          if (activityState === 'live') return row.alive
+          if (activityState === 'exited') return !row.alive
+          if (activityState === 'agents') return isAgentKind(row.kind)
+          if (activityState === 'retrying') return live?.run_state?.includes('retry') === true
+          if (activityState === 'fallback') return live?.run_state?.includes('shell') === true
+          if (activityState === 'suspended') return live?.run_state?.includes('suspended') === true
+          return true
+        }).sort((a, b) => {
+          if (activitySort === 'name') return a.name.localeCompare(b.name)
+          if (activitySort === 'memory') return (state.mem[b.name]?.rssKb ?? 0) - (state.mem[a.name]?.rssKb ?? 0)
+          if (activitySort === 'activity') return (state.lastActivity[b.name] ?? 0) - (state.lastActivity[a.name] ?? 0)
+          return (a.slot || Number.MAX_SAFE_INTEGER) - (b.slot || Number.MAX_SAFE_INTEGER)
+        })
+        const summary = activitySummary(sessions, state)
         const toggle = (n: string): void =>
           setPicked((p) => { const c = new Set(p); if (!c.delete(n)) c.add(n); return c })
         // Adopt a session no pane can show (`amber create foo`, or a name from
@@ -1625,15 +1912,35 @@ function App(): JSX.Element {
             <div className="help-card dialog-card sessions-card" role="dialog" aria-modal="true" aria-label="Sessions"
               onClick={(e) => e.stopPropagation()}>
               <div className="help-head">
-                <span className="help-title">Sessions ({rows.length})</span>
+                <span className="help-title">Activity ({rows.length})</span>
                 <button className="icon-btn" aria-label="close" title="close" onClick={() => setSessionsOpen(false)}><Icon name="close" /></button>
               </div>
               <div className="dialog-body">
                 <p className="dialog-text">
-                  Every live amber session. These outlive the app on purpose — quitting never
-                  kills them. Killing one ends its pty and everything running in it.
-                  One tagged <em>no pane</em> can be adopted into the current tab.
+                  Every daemon session. Quitting the app never kills them; lifecycle actions still flow from daemon truth.
                 </p>
+                <div className="productivity-controls" style={{ paddingInline: 0 }}>
+                  <input className="productivity-search" placeholder="Filter sessions" value={activityQuery} onChange={(event) => setActivityQuery(event.target.value)} />
+                  <select value={activityState} onChange={(event) => setActivityState(event.target.value as typeof activityState)}>
+                    <option value="all">all states</option><option value="live">live</option><option value="exited">exited</option><option value="agents">agents</option><option value="retrying">retrying</option><option value="fallback">fallback</option><option value="suspended">suspended</option>
+                  </select>
+                  <select value={activitySort} onChange={(event) => setActivitySort(event.target.value as typeof activitySort)}>
+                    <option value="slot">slot</option><option value="activity">activity</option><option value="memory">memory</option><option value="name">name</option>
+                  </select>
+                </div>
+                <div className="activity-summary" aria-label="session activity summary">
+                  <span><strong>{summary.total}</strong> total</span><span><strong>{summary.alive}</strong> live</span><span><strong>{summary.exited}</strong> exited</span>
+                  <span><strong>{Math.max(0, summary.agents - summary.retrying - summary.fallback - summary.suspended)}</strong> agents running</span>
+                  <span><strong>{summary.retrying}</strong> retrying</span><span><strong>{summary.fallback}</strong> fallback</span><span><strong>{summary.suspended}</strong> parked</span>
+                  <span><strong>{summary.unseen}</strong> unseen</span><span><strong>{fmtMem(summary.rssKb)}</strong> resident</span>
+                </div>
+                <div className="notification-prefs" aria-label="desktop notification preferences">
+                  {(['activity', 'exit', 'retry', 'fallback', 'pressure'] as const).map((pref) => <label key={pref}><input type="checkbox"
+                    checked={productivity.notifications[pref]} onChange={(event) => updateProductivity((file) => ({ ...file, notifications: { ...file.notifications, [pref]: event.target.checked } }))} /> {pref}</label>)}
+                  <label><input type="checkbox" checked={productivity.notifications.mutedWorkspaces.includes(currentWs)}
+                    onChange={(event) => updateProductivity((file) => ({ ...file, notifications: { ...file.notifications, mutedWorkspaces: event.target.checked
+                      ? [...file.notifications.mutedWorkspaces, currentWs] : file.notifications.mutedWorkspaces.filter((ws) => ws !== currentWs) } }))} /> mute ws {currentWs}</label>
+                </div>
                 <ul className="session-list">
                   {rows.map((r) => (
                     <li key={r.name} className={'session-row' + (picked.has(r.name) ? ' picked' : '')}>
@@ -1659,6 +1966,14 @@ function App(): JSX.Element {
                           title={`open as a pane in ws ${currentWs} · tab ${currentTab} (renames the session)`}
                           onClick={() => adopt(r.name)}>Adopt</button>
                       )}
+                      {r.inPane && <button className="btn btn-ghost session-adopt" onClick={() => { setSessionsOpen(false); navigateTo(r.name) }}>Focus</button>}
+                      {isAgentKind(r.kind) && r.alive && <button className="btn btn-ghost session-adopt" onClick={() => {
+                        const live = sessions.find((session) => session.name === r.name)
+                        if (live?.run_state?.includes('suspended')) window.amber.resumeSession(r.name)
+                        else window.amber.suspendSession(r.name)
+                      }}>{sessions.find((session) => session.name === r.name)?.run_state?.includes('suspended') ? 'Resume' : 'Suspend'}</button>}
+                      <button className="btn btn-ghost session-adopt" onClick={() => { setSessionsOpen(false); openProductivity('bookmarks') }}>Bookmarks</button>
+                      <button className="btn btn-ghost session-adopt" onClick={() => exportHandoff(r.name)}>Export</button>
                     </li>
                   ))}
                 </ul>
@@ -1816,6 +2131,43 @@ function App(): JSX.Element {
       {remoteOpen && (
         <RemoteAccess status={webStatus} onClose={() => setRemoteOpen(false)} onRefresh={() => { void window.amber.webStatus().then(setWebStatus) }} />
       )}
+      {productivityOverlay === 'palette' && <CommandPalette entries={paletteEntries} onClose={() => setProductivityOverlay(null)} />}
+      {productivityOverlay === 'search' && <GlobalSearchDialog results={searchResults} loading={searchLoading} error={searchError}
+        onClose={() => setProductivityOverlay(null)} onSearch={runGlobalSearch}
+        describe={(name) => { const info = sessions.find((session) => session.name === name); const parsed = parseName(name); return `${info?.slot ? `#${info.slot} · ` : ''}${titles[name] || shortCwd(info?.cwd ?? '', window.amber.homeDir) || name}${parsed ? ` · ws ${parsed.ws} · tab ${parsed.tab}` : ''}` }}
+        onPick={(result, query) => navigateTo(result.name, query)} />}
+      {productivityOverlay === 'recovery' && <RecoveryCenter events={recoveryEvents} sessions={sessions} loading={recoveryLoading} error={recoveryError}
+        onClose={() => setProductivityOverlay(null)} onRefresh={refreshRecovery}
+        onRetry={(session) => window.amber.resumeSession(session)} onCleanup={() => { setProductivityOverlay(null); setSessionsOpen(true) }}
+        onClear={() => { if (window.confirm('Clear daemon recovery history?')) { setRecoveryLoading(true); window.amber.clearRecoveryEvents?.(); if (recoveryTimeout.current) clearTimeout(recoveryTimeout.current); recoveryTimeout.current = setTimeout(() => { setRecoveryLoading(false); setRecoveryError('Clear timed out — restart or update the daemon.') }, 8000) } }}
+        onFocus={(session) => navigateTo(session)} />}
+      {productivityOverlay === 'templates' && <TemplatesDialog templates={productivity.templates}
+        onClose={() => setProductivityOverlay(null)} onCapture={captureTemplate}
+        onLoad={(template: WorkspaceTemplate) => { setProductivityOverlay(null); applyDocument(template.doc, 'new') }}
+        onRename={(id, name) => updateProductivity((file) => ({ ...file, templates: file.templates.map((template) => template.id === id ? { ...template, name } : template) }))}
+        onDelete={(id) => updateProductivity((file) => ({ ...file, templates: file.templates.filter((template) => template.id !== id) }))} />}
+      {productivityOverlay === 'bookmarks' && <BookmarksDialog
+        bookmarks={Object.entries(productivity.bookmarks).flatMap(([session, bookmarks]) => bookmarks.map((bookmark) => ({ session, bookmark })))}
+        onClose={() => setProductivityOverlay(null)} onPick={(session, bookmark: SessionBookmark) => navigateTo(session, bookmarkNeedle(bookmark))}
+        onRename={(session, id, label) => updateProductivity((file) => ({ ...file, bookmarks: { ...file.bookmarks, [session]: (file.bookmarks[session] ?? []).map((bookmark) => bookmark.id === id ? { ...bookmark, label } : bookmark) } }))}
+        onDelete={(session, id) => updateProductivity((file) => ({ ...file, bookmarks: { ...file.bookmarks, [session]: (file.bookmarks[session] ?? []).filter((bookmark) => bookmark.id !== id) } }))} />}
+      {productivityOverlay === 'checkpoints' && <CheckpointsDialog checkpoints={checkpoints}
+        onClose={() => setProductivityOverlay(null)} onCreate={(name, scope) => { void createCheckpoint(name, false, scope) }}
+        onDelete={(id) => { if (window.confirm('Delete this restore point?')) void window.amber.deleteCheckpoint?.(id).then(async () => setCheckpoints(await window.amber.listCheckpoints?.() ?? [])) }}
+        onRestore={(id, replace) => { void (async () => {
+          try {
+            if (replace && !(await createCheckpoint('Before restore-point replacement', true))) return
+            const text = await window.amber.readCheckpoint?.(id); if (!text) return
+            const doc = parseCheckpoint(text)
+            setProductivityOverlay(null); applyDocument(doc, replace ? 'replace' : 'new')
+          } catch (error) { setNotice(`Could not restore point — ${String(error)}`) }
+        })() }} />}
+      {productivityOverlay === 'project' && <ProjectProfileDialog loaded={projectProfile} error={projectError}
+        onClose={() => setProductivityOverlay(null)} onRead={() => { void window.amber.readProjectProfile?.(cwd).then((result) => {
+          if (!result) return
+          if ('error' in result) { setProjectError(result.error); setProjectProfile(null) }
+          else { setProjectError(null); setProjectProfile(result) }
+        }) }} onCreate={createProjectWorkspace} />}
       {showHelp && (
         <div className="help-overlay" onClick={() => setShowHelp(false)}>
           <div className="help-card" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts"

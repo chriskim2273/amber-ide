@@ -1,8 +1,8 @@
-import { mkdir, readFile, writeFile, rename, readdir, stat, rm, realpath } from 'node:fs/promises'
+import { mkdir, readFile, writeFile, rename, readdir, stat, lstat, open, rm, realpath } from 'node:fs/promises'
 import { dirname, join, resolve, relative, isAbsolute } from 'node:path'
 import type { LoadProductivityResult, SaveProductivityResult } from '../shared/productivity'
 import { parseProjectProfile, type ProjectProfile } from '../shared/projectProfile'
-import { CHECKPOINT_FILE_MAX, CHECKPOINT_ID, parseCheckpoint, type CheckpointSummary } from '../shared/checkpoint'
+import { CHECKPOINT_FILE_MAX, CHECKPOINT_ID, parseCheckpoint, parseCheckpointMeta, type CheckpointSummary } from '../shared/checkpoint'
 
 async function atomicWrite(path: string, text: string): Promise<void> {
   await mkdir(dirname(path), { recursive: true })
@@ -71,7 +71,11 @@ export async function writeCheckpoint(root: string, id: string, text: string): P
 }
 
 export async function readCheckpoint(root: string, id: string): Promise<string> {
-  const text = await readFile(checkpointPath(root, id), 'utf8')
+  const path = checkpointPath(root, id)
+  const info = await lstat(path)
+  if (!info.isFile() || info.isSymbolicLink()) throw new Error('checkpoint is not a regular file')
+  if (info.size > CHECKPOINT_FILE_MAX) throw new Error('checkpoint exceeds 128 MiB')
+  const text = await readFile(path, 'utf8')
   parseCheckpoint(text)
   return text
 }
@@ -80,24 +84,68 @@ export async function deleteCheckpoint(root: string, id: string): Promise<void> 
   await rm(checkpointPath(root, id), { force: true })
 }
 
-export async function listCheckpoints(root: string): Promise<CheckpointSummary[]> {
+const CHECKPOINT_META_PREFIX_MAX = 4096
+
+function firstJsonObject(text: string, start: number): string {
+  let depth = 0; let inString = false; let escaped = false
+  for (let index = start; index < text.length; index += 1) {
+    const char = text[index]!
+    if (inString) {
+      if (escaped) escaped = false
+      else if (char === '\\') escaped = true
+      else if (char === '"') inString = false
+      continue
+    }
+    if (char === '"') inString = true
+    else if (char === '{') depth += 1
+    else if (char === '}' && --depth === 0) return text.slice(start, index + 1)
+  }
+  throw new Error('checkpoint metadata exceeds its bounded prefix')
+}
+
+async function checkpointSummary(path: string, bytes: number): Promise<CheckpointSummary> {
+  const handle = await open(path, 'r')
+  try {
+    const buffer = Buffer.alloc(Math.min(bytes, CHECKPOINT_META_PREFIX_MAX))
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0)
+    const prefix = buffer.subarray(0, bytesRead).toString('utf8')
+    const marker = '{"checkpoint":'
+    if (!prefix.startsWith(marker)) throw new Error('checkpoint metadata is not first')
+    const metaText = firstJsonObject(prefix, marker.length)
+    return { ...parseCheckpointMeta(JSON.parse(metaText) as unknown), bytes }
+  } finally { await handle.close() }
+}
+
+async function checkpointCandidates(root: string): Promise<Array<{ path: string; bytes: number; mtime: number }>> {
   const dir = join(root, 'checkpoints')
   const names = await readdir(dir).catch(() => [])
-  const summaries: CheckpointSummary[] = []
-  for (const name of names.filter((entry) => entry.endsWith('.amberws')).slice(0, 100)) {
+  const candidates: Array<{ path: string; bytes: number; mtime: number }> = []
+  for (const name of names.filter((entry) => entry.endsWith('.amberws'))) {
     try {
       const path = join(dir, name)
-      const info = await stat(path)
-      if (!info.isFile() || info.size > CHECKPOINT_FILE_MAX) continue
-      const doc = parseCheckpoint(await readFile(path, 'utf8'))
-      summaries.push({ ...doc.checkpoint, bytes: info.size })
-    } catch { /* malformed checkpoints are isolated, never break the list */ }
+      const info = await lstat(path)
+      if (!info.isFile() || info.isSymbolicLink() || info.size > CHECKPOINT_FILE_MAX) continue
+      candidates.push({ path, bytes: info.size, mtime: info.mtimeMs })
+    } catch { /* a concurrently removed entry is simply absent */ }
+  }
+  return candidates.sort((a, b) => b.mtime - a.mtime)
+}
+
+export async function listCheckpoints(root: string): Promise<CheckpointSummary[]> {
+  const summaries: CheckpointSummary[] = []
+  for (const candidate of (await checkpointCandidates(root)).slice(0, 100)) {
+    try { summaries.push(await checkpointSummary(candidate.path, candidate.bytes)) }
+    catch { /* malformed checkpoints are isolated, never break the list */ }
   }
   return summaries.sort((a, b) => b.createdAt - a.createdAt)
 }
 
 async function pruneAutomaticCheckpoints(root: string): Promise<void> {
-  const automatic = (await listCheckpoints(root)).filter((entry) => entry.automatic)
+  const summaries: CheckpointSummary[] = []
+  for (const candidate of await checkpointCandidates(root)) {
+    try { summaries.push(await checkpointSummary(candidate.path, candidate.bytes)) } catch { /* isolated */ }
+  }
+  const automatic = summaries.filter((entry) => entry.automatic).sort((a, b) => b.createdAt - a.createdAt)
   for (const stale of automatic.slice(20)) await rm(checkpointPath(root, stale.id), { force: true })
 }
 

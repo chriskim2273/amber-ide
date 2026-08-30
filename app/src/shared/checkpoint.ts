@@ -12,12 +12,7 @@ export interface CheckpointMeta {
 export interface CheckpointDoc extends WorkspaceDoc { checkpoint: CheckpointMeta }
 export interface CheckpointSummary extends CheckpointMeta { bytes: number }
 
-export function parseCheckpoint(text: string): CheckpointDoc {
-  if (new TextEncoder().encode(text).length > CHECKPOINT_FILE_MAX) throw new Error('checkpoint exceeds 128 MiB')
-  let raw: unknown
-  try { raw = JSON.parse(text) } catch { throw new Error('invalid checkpoint JSON') }
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('invalid checkpoint')
-  const meta = (raw as Record<string, unknown>)['checkpoint']
+export function parseCheckpointMeta(meta: unknown): CheckpointMeta {
   if (!meta || typeof meta !== 'object' || Array.isArray(meta)) throw new Error('missing checkpoint metadata')
   const m = meta as Record<string, unknown>
   if (typeof m['id'] !== 'string' || !CHECKPOINT_ID.test(m['id'])) throw new Error('invalid checkpoint id')
@@ -25,10 +20,21 @@ export function parseCheckpoint(text: string): CheckpointDoc {
   if (typeof m['createdAt'] !== 'number' || !Number.isFinite(m['createdAt'])) throw new Error('invalid checkpoint time')
   if (m['scope'] !== 'one' && m['scope'] !== 'all') throw new Error('invalid checkpoint scope')
   if (typeof m['automatic'] !== 'boolean') throw new Error('invalid checkpoint origin')
+  return { id: m['id'], name: m['name'], createdAt: m['createdAt'], scope: m['scope'], automatic: m['automatic'] }
+}
+
+export function parseCheckpoint(text: string): CheckpointDoc {
+  if (new TextEncoder().encode(text).length > CHECKPOINT_FILE_MAX) throw new Error('checkpoint exceeds 128 MiB')
+  let raw: unknown
+  try { raw = JSON.parse(text) } catch { throw new Error('invalid checkpoint JSON') }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('invalid checkpoint')
+  const checkpoint = parseCheckpointMeta((raw as Record<string, unknown>)['checkpoint'])
   const doc = parseWorkspaceFile(text)
-  return { ...doc, checkpoint: { id: m['id'], name: m['name'], createdAt: m['createdAt'], scope: m['scope'], automatic: m['automatic'] } }
+  return { ...doc, checkpoint }
 }
 
 export function serializeCheckpoint(doc: WorkspaceDoc, checkpoint: CheckpointMeta): string {
-  return JSON.stringify({ ...doc, checkpoint })
+  // Metadata first lets the index read a tiny bounded prefix; restoring is the
+  // only operation that parses the potentially 128 MiB workspace payload.
+  return JSON.stringify({ checkpoint, ...doc })
 }

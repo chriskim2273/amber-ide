@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, writeFile, symlink } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { loadProductivityFile, saveProductivityFile, readProjectProfile, writeCheckpoint, readCheckpoint, deleteCheckpoint, listCheckpoints, contained } from './productivityIO'
@@ -31,10 +31,26 @@ describe('productivity IO', () => {
     const id = 'checkpoint-123'
     const text = serializeCheckpoint(doc, { id, name: 'manual', createdAt: 10, scope: 'one', automatic: false })
     await writeCheckpoint(root, id, text)
+    expect(text.startsWith('{"checkpoint":')).toBe(true)
     expect(await readCheckpoint(root, id)).toBe(text)
     expect((await listCheckpoints(root))[0]?.id).toBe(id)
     await deleteCheckpoint(root, id)
     expect(await listCheckpoints(root)).toEqual([])
     await expect(writeCheckpoint(root, '../escape', text)).rejects.toThrow(/id/)
+  })
+
+  it('lists bounded metadata without parsing the workspace body and rejects symlinks', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'amber-checkpoint-meta-'))
+    const dir = join(root, 'checkpoints')
+    await mkdir(dir)
+    const meta = { id: 'checkpoint-meta', name: 'metadata only', createdAt: 20, scope: 'one' as const, automatic: false }
+    await writeFile(join(dir, 'checkpoint-meta.amberws'), JSON.stringify({ checkpoint: meta, version: 1, scope: 'one', workspaces: 'not a workspace' }))
+    expect((await listCheckpoints(root))[0]).toMatchObject(meta)
+    await expect(readCheckpoint(root, meta.id)).rejects.toThrow(/workspace/)
+    const outside = join(root, 'outside.amberws')
+    await writeFile(outside, serializeCheckpoint(doc, { ...meta, id: 'checkpoint-link' }))
+    await symlink(outside, join(dir, 'checkpoint-link.amberws'))
+    expect((await listCheckpoints(root)).map((entry) => entry.id)).not.toContain('checkpoint-link')
+    await expect(readCheckpoint(root, 'checkpoint-link')).rejects.toThrow(/regular file/)
   })
 })

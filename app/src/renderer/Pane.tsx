@@ -27,6 +27,8 @@ export interface SearchApi {
   // The current terminal selection (empty string if nothing selected) — for the
   // copy chord.
   copySelection(): string
+  // Selected text, or a small semantic anchor around the live cursor.
+  captureBookmark(): string
   // Paste text into the pty via xterm, which wraps it in bracketed-paste markers
   // when the running program requested that mode (so multiline paste doesn't
   // submit line-by-line in claude/vim). Routes through onData → the port.
@@ -196,6 +198,18 @@ export const Pane = memo(function Pane(
       // term.onData below — so it targets the current pty even after a reconnect.
       insert: (text) => port?.postMessage({ data: new TextEncoder().encode(text) }),
       copySelection: () => term.getSelection(),
+      captureBookmark: () => {
+        const selection = term.getSelection().trim()
+        if (selection) return selection.slice(0, 500)
+        const buffer = term.buffer.active
+        const cursor = buffer.baseY + buffer.cursorY
+        const lines: string[] = []
+        for (let row = Math.max(0, cursor - 2); row <= cursor; row += 1) {
+          const text = buffer.getLine(row)?.translateToString(true).trimEnd()
+          if (text) lines.push(text)
+        }
+        return lines.join('\n').slice(0, 500)
+      },
       // term.paste() emits through onData (registered below) → the live port,
       // and applies bracketed-paste framing when the program enabled it.
       paste: (text) => term.paste(text),
