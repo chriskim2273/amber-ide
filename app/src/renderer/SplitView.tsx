@@ -9,6 +9,8 @@ import { appChord, chordLabel } from './keys'
 import { isAgentKind, paneDot, parkedOverlayText, shouldHintTerminalFocus, shouldResumeMemoryParked } from './store'
 import { ParkedOverlay } from './PressureBanners'
 import { reloadAgentCommand, reloadAgentVisibility } from './reloadAgent'
+import { Icon } from './Icon'
+import { PANE_KIND_OPTIONS } from './uiModel'
 // CodeMirror + marked (the editor's whole dependency graph) load LAZILY: they
 // are the largest single block in the bundle but matter only when an editor
 // pane actually mounts. A static import here made every app start pay for
@@ -105,10 +107,10 @@ function FindBar({ api, focusSeq, onClose }: { api: SearchApi; focusSeq: number;
         }} />
       <span className="find-count">{ordinal}</span>
       <button className="icon-btn" aria-label="previous match" title="previous (Shift+Enter)"
-        onClick={() => { if (query) { cancelDebounce(); api.findPrevious(query) } }}>↑</button>
+        onClick={() => { if (query) { cancelDebounce(); api.findPrevious(query) } }}><Icon name="up" /></button>
       <button className="icon-btn" aria-label="next match" title="next (Enter)"
-        onClick={() => { if (query) { cancelDebounce(); api.findNext(query) } }}>↓</button>
-      <button className="icon-btn" aria-label="close find" title="close (Esc)" onClick={onClose}>✕</button>
+        onClick={() => { if (query) { cancelDebounce(); api.findNext(query) } }}><Icon name="down" /></button>
+      <button className="icon-btn" aria-label="close find" title="close (Esc)" onClick={onClose}><Icon name="close" /></button>
     </div>
   )
 }
@@ -123,7 +125,7 @@ function FreezeNoteInput({ onCommit, onCancel }:
   const committed = useRef(false)
   return (
     <div className="freeze-note" onMouseDown={(e) => e.stopPropagation()}>
-      <span className="freeze-note-label">❄ freeze — add a note</span>
+      <span className="freeze-note-label"><Icon name="snowflake" size={14} /> Freeze pane — add a note</span>
       <input className="freeze-note-input" autoFocus aria-label="freeze note"
         placeholder="note (optional), Enter to freeze" spellCheck={false}
         onKeyDown={(e) => {
@@ -331,6 +333,14 @@ export function SplitView(props: {
     const r = btn.getBoundingClientRect()
     setFocused(paneId)
     setMenu({ paneId, x: r.left - b.left, y: r.bottom - b.top, split: dir })
+  }
+
+  const openPaneMenu = (paneId: string, btn: HTMLElement): void => {
+    const b = ref.current?.getBoundingClientRect()
+    if (!b) return
+    const r = btn.getBoundingClientRect()
+    setFocused(paneId)
+    setMenu({ paneId, x: r.right - b.left - 190, y: r.bottom - b.top })
   }
 
   // Per-pane title callbacks, cached by paneId so each `Pane` gets a REFERENTIALLY
@@ -765,23 +775,15 @@ export function SplitView(props: {
                   title={meta.growing ? 'memory climbing (possible leak)' : 'child process memory'}>
                   {meta.growing ? '▲ ' : ''}{fmtMem(meta.rssKb)}
                 </span>}
-              {isFrozen && <span className="frozen-badge" title="pane frozen">❄ frozen</span>}
+              {isFrozen && <span className="frozen-badge" title="pane frozen"><Icon name="snowflake" size={12} /> frozen</span>}
               {isZoomedPane &&
                 <span className="zoom-badge">zoomed — {chordLabel('zoom')} to restore</span>}
               <div className="pane-actions">
-                <button className="icon-btn" aria-label="move pane" title="drag to move" onPointerDown={startPaneDrag(paneId)} style={{ cursor: 'grab', touchAction: 'none' }}>⠿</button>
-                {!noTerm &&
-                  <button className="icon-btn" aria-label="refresh pane" title="force refresh (rebuild the terminal from the daemon)"
-                    onClick={() => setRebuild((r) => ({ ...r, [paneId]: (r[paneId] ?? 0) + 1 }))}>⟳</button>}
-                {!noTerm && meta && isAgentKind(meta.kind) && reloadAgentVisibility(agentOf(meta.kind), meta.claudeId ?? null).show &&
-                  <button className="icon-btn" aria-label={`reload ${agentOf(meta.kind)} session`}
-                    title={`reload ${agentOf(meta.kind)} — ${meta.claudeId ? 'resume this conversation' : 'pick a session'}`}
-                    onClick={() => setReloadPane(paneId)}>↺{agentOf(meta.kind)}</button>}
-                <button className="icon-btn" aria-label="split right" title="split right — choose kind"
-                  onClick={(e) => openSplitPicker(paneId, 'h', e.currentTarget)}>⬌</button>
-                <button className="icon-btn" aria-label="split down" title="split down — choose kind"
-                  onClick={(e) => openSplitPicker(paneId, 'v', e.currentTarget)}>⬍</button>
-                <button className="icon-btn danger" aria-label="close pane" title="close" onClick={() => props.onClose(paneId)}>✕</button>
+                <button className="icon-btn pane-move" aria-label="move pane" title="Drag to move pane"
+                  onPointerDown={startPaneDrag(paneId)} style={{ cursor: 'grab', touchAction: 'none' }}><Icon name="move" /></button>
+                <button className="icon-btn pane-more" aria-label="pane actions" title="Pane actions"
+                  aria-haspopup="menu" aria-expanded={menu?.paneId === paneId && menu.split === undefined}
+                  onClick={(e) => openPaneMenu(paneId, e.currentTarget)}><Icon name="more" /></button>
               </div>
             </div>
             <div className="pane-body" ref={(el) => { if (el) bodyEls.current.set(paneId, el); else bodyEls.current.delete(paneId) }}>
@@ -865,10 +867,10 @@ export function SplitView(props: {
                   header frozen badge still marks the pane as parked. */}
               {isFrozen && dead === undefined &&
                 <div className="frozen-overlay">
-                  <div className="frozen-badge-lg" role="img" aria-label="frozen pane">❄</div>
+                  <div className="frozen-badge-lg" role="img" aria-label="frozen pane"><Icon name="snowflake" size={30} /></div>
                   <div className="frozen-note-text">{frozenEntry.note?.trim() || 'frozen'}</div>
-                  <button className="frozen-unfreeze" aria-label="unfreeze pane"
-                    onClick={() => props.onUnfreeze(paneId)}>⏵ unfreeze</button>
+                  <button className="frozen-unfreeze btn-with-icon" aria-label="unfreeze pane"
+                    onClick={() => props.onUnfreeze(paneId)}><Icon name="play" size={14} /> Unfreeze</button>
                 </div>}
               {parkedText && !isFrozen && dead === undefined &&
                 <ParkedOverlay text={parkedText} active={props.active}
@@ -888,7 +890,7 @@ export function SplitView(props: {
           style={{ left: hoverRect.x, top: hoverRect.y, width: hoverRect.w, height: hoverRect.h }} />}
       {menu && (() => {
         // Clamp the menu box (approx dims) inside the stage so it never spills off.
-        const MW = 200, MH = 268
+        const MW = 236, MH = 400
         const x = Math.max(0, Math.min(menu.x, size.w - MW))
         const y = Math.max(0, Math.min(menu.y, size.h - MH))
         const paneId = menu.paneId
@@ -896,31 +898,51 @@ export function SplitView(props: {
         const run = (fn: () => void) => (): void => { fn(); close() }
         const isZoomed = props.zoomedPane === paneId
         const isFrozen = props.frozen[paneId] !== undefined
-        // Browser/editor panes have no terminal, so no selection to copy.
-        const menuKind = props.meta[paneId]?.kind
+        // Browser/editor panes have no terminal, so no terminal refresh or selection.
+        const menuMeta = props.meta[paneId]
+        const menuKind = menuMeta?.kind
         const menuHasTerm = menuKind !== 'browser' && menuKind !== 'editor'
+        const reload = menuMeta && isAgentKind(menuMeta.kind)
+          ? reloadAgentVisibility(agentOf(menuMeta.kind), menuMeta.claudeId ?? null)
+          : null
         // Kind picker variant: every pane kind, for the requested direction.
         if (menu.split) {
           const dir = menu.split
           return (
             <div className="ctx-menu" role="menu" aria-label={dir === 'h' ? 'split right as' : 'split down as'}
               style={{ left: x, top: y }} onMouseDown={(e) => e.stopPropagation()}>
-              {(['shell', 'claude', 'grok', 'codex', 'opencode', 'hermes', 'pi', 'browser', 'editor'] as const).map((k) => (
-                <button key={k} className="ctx-item" role="menuitem"
-                  onClick={run(() => props.onSplit(paneId, dir, k))}>{k}</button>
+              {PANE_KIND_OPTIONS.map((option) => (
+                <button key={option.kind} className="ctx-item ctx-kind" role="menuitem"
+                  onClick={run(() => props.onSplit(paneId, dir, option.kind))}>
+                  <span className={`kind-dot ${option.kind}`} />{option.label}
+                </button>
               ))}
             </div>
           )
         }
         return (
-          <div className="ctx-menu" role="menu" style={{ left: x, top: y }}
+          <div className="ctx-menu pane-menu" role="menu" aria-label="Pane actions" style={{ left: x, top: y }}
             onMouseDown={(e) => e.stopPropagation()}>
+            {menuHasTerm && <button className="ctx-item" role="menuitem" onClick={run(() =>
+              setRebuild((value) => ({ ...value, [paneId]: (value[paneId] ?? 0) + 1 })))}>
+              <Icon name="refresh" /><span>Refresh terminal</span>
+            </button>}
+            {reload?.show && menuMeta && <button className="ctx-item" role="menuitem" onClick={run(() => setReloadPane(paneId))}>
+              <Icon name="reload" /><span>Reload {agentOf(menuMeta.kind)}…</span>
+            </button>}
+            {menuHasTerm && <div className="ctx-sep" />}
             <button className="ctx-item" role="menuitem"
-              onClick={() => setMenu({ paneId, x: menu.x, y: menu.y, split: 'h' })}>Split right…</button>
+              onClick={() => setMenu({ paneId, x: menu.x, y: menu.y, split: 'h' })}>
+              <Icon name="split-right" /><span>Split right…</span>
+            </button>
             <button className="ctx-item" role="menuitem"
-              onClick={() => setMenu({ paneId, x: menu.x, y: menu.y, split: 'v' })}>Split down…</button>
+              onClick={() => setMenu({ paneId, x: menu.x, y: menu.y, split: 'v' })}>
+              <Icon name="split-down" /><span>Split down…</span>
+            </button>
             <div className="ctx-sep" />
-            <button className="ctx-item" role="menuitem" onClick={run(() => props.onToggleZoom(paneId))}>{isZoomed ? 'Restore' : 'Zoom'}</button>
+            <button className="ctx-item" role="menuitem" onClick={run(() => props.onToggleZoom(paneId))}>
+              <Icon name={isZoomed ? 'restore' : 'maximize'} /><span>{isZoomed ? 'Restore pane' : 'Zoom pane'}</span>
+            </button>
             {/* Touch copy/paste (spec §8). A phone has no copy chord and
                 xterm's own touch selection is not good enough to build on, so
                 the long-press menu — which is already the touch gesture for
@@ -946,15 +968,21 @@ export function SplitView(props: {
               )
             })()}
             {isFrozen
-              ? <button className="ctx-item" role="menuitem" onClick={run(() => props.onUnfreeze(paneId))}>Unfreeze</button>
-              : <button className="ctx-item" role="menuitem" onClick={run(() => setNotePane(paneId))}>Freeze pane…</button>}
+              ? <button className="ctx-item" role="menuitem" onClick={run(() => props.onUnfreeze(paneId))}>
+                  <Icon name="play" /><span>Unfreeze pane</span>
+                </button>
+              : <button className="ctx-item" role="menuitem" onClick={run(() => setNotePane(paneId))}>
+                  <Icon name="snowflake" /><span>Freeze pane…</span>
+                </button>}
             <button className="ctx-item" role="menuitem"
               onClick={run(() => {
                 // Swallow a rejection (clipboard perms) — no unhandled promise rejection.
                 navigator.clipboard?.writeText(props.meta[paneId]?.cwd ?? '').catch(() => {})
-              })}>Copy cwd</button>
+              })}><Icon name="folder" /><span>Copy working directory</span></button>
             <div className="ctx-sep" />
-            <button className="ctx-item danger" role="menuitem" onClick={run(() => props.onClose(paneId))}>Close</button>
+            <button className="ctx-item danger" role="menuitem" onClick={run(() => props.onClose(paneId))}>
+              <Icon name="close" /><span>Close pane</span>
+            </button>
           </div>
         )
       })()}

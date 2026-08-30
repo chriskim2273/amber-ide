@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useReducer, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
-import { SplitView, fmtMem, type PaneMeta } from './SplitView'
+import { SplitView, fmtMem, type PaneMeta, type PaneKind } from './SplitView'
+import { Icon } from './Icon'
+import { PANE_KIND_OPTIONS, continuityView, type SnapshotState } from './uiModel'
 import type { EditorApi } from './Editor'
 import { initialState, reduce, groupSessions, mergeBrowsers, mergeEditors, tabDot, hasActivity, isAgentKind, type DaemonEvent } from './store'
 import { ResourcePressureBanner } from './PressureBanners'
@@ -47,6 +49,9 @@ declare global {
       // onDaemonEvent. mb is MiB, 0 = auto.
       getMemoryBudget: () => void
       setMemoryBudget: (mb: number) => void
+      // Desktop-only capability. The browser client's security whitelist does
+      // not expose Snapshot, so its bridge intentionally omits this method.
+      snapshotNow?: () => void
       // CAS (spec 2026-08-01 §6): `saveLayout` must be given the version
       // `loadLayout`/the previous `saveLayout` returned, so a concurrent
       // writer (the browser, or another desktop instance) is detected rather
@@ -164,7 +169,13 @@ function App(): JSX.Element {
   // Tab id currently being dragged for reorder (HTML5 drag; ref, not state, so
   // the drag gesture never re-renders the terminals).
   const dragTab = useRef<number | null>(null)
-  const [kind, setKind] = useState<'shell' | 'claude' | 'grok' | 'codex' | 'opencode' | 'hermes' | 'pi' | 'browser' | 'editor'>('shell')
+  const [kind, setKind] = useState<PaneKind>('shell')
+  // Desktop command surfaces. Only one may be open at a time; each is a small
+  // popover rather than another permanent toolbar cluster.
+  const [toolbarMenu, setToolbarMenu] = useState<'pane-kind' | 'tools' | 'continuity' | null>(null)
+  // Presentation state for the existing daemon Snapshot/SnapshotOk exchange.
+  // A timestamp is shown only after the daemon explicitly confirms the write.
+  const [snapshotState, setSnapshotState] = useState<SnapshotState>({ kind: 'idle' })
   // Absolute working directory for newly created panes (default $HOME). Sent
   // verbatim so a session restores in the SAME folder — a relative '.' would
   // drift to the daemon's cwd ($HOME under systemd) on restart.
@@ -356,6 +367,12 @@ function App(): JSX.Element {
         if (cb) { dumpResolvers.current.delete(bf.msg.name); cb(bf.msg.data ?? new Uint8Array()) }
         return
       }
+      // Snapshot success is explicit daemon truth. Never infer it from a timer,
+      // layout save, connection health, or the periodic-snapshot guarantee.
+      if (bf?.type === 'control' && bf.msg?.kind === 'SnapshotOk') {
+        setSnapshotState({ kind: 'confirmed', at: Date.now() })
+        return
+      }
       // Budget replies feed the memory dialog directly (local state — not
       // store truth; the daemon remains the only authority).
       if (bf?.type === 'control' && bf.msg?.kind === 'BudgetApplied') {
@@ -385,6 +402,7 @@ function App(): JSX.Element {
       const st = (d as { status?: string }).status
       if (st === 'connected') setConnected(true)
       else if (st === 'disconnected') {
+        setSnapshotState({ kind: 'error' })
         // A reconnect to an older daemon may never send either pressure event,
         // so stale host and aggregate-memory warnings cannot cross the socket
         // boundary.
@@ -411,9 +429,40 @@ function App(): JSX.Element {
 
   // Detect the disconnected -> connected edge and bump the reconnect epoch.
   useEffect(() => {
-    if (connected && !prevConnected.current) setReconnectEpoch((e) => e + 1)
+    if (connected && !prevConnected.current) {
+      setReconnectEpoch((e) => e + 1)
+      setSnapshotState({ kind: 'idle' })
+    }
     prevConnected.current = connected
   }, [connected])
+
+  // “Just now” is truthful only briefly. Fall back to the daemon-managed
+  // automatic-snapshot statement rather than letting a stale success linger.
+  useEffect(() => {
+    if (snapshotState.kind === 'confirmed') {
+      const timer = setTimeout(() => setSnapshotState({ kind: 'idle' }), 60_000)
+      return () => clearTimeout(timer)
+    }
+    if (snapshotState.kind === 'pending') {
+      const timer = setTimeout(() => setSnapshotState({ kind: 'error' }), 8_000)
+      return () => clearTimeout(timer)
+    }
+  }, [snapshotState])
+
+  // One shared dismissal contract for all toolbar popovers.
+  useEffect(() => {
+    if (toolbarMenu === null) return
+    const onPointer = (event: PointerEvent): void => {
+      if (!(event.target instanceof Element) || !event.target.closest('.toolbar-popover-wrap')) setToolbarMenu(null)
+    }
+    const onKey = (event: KeyboardEvent): void => { if (event.key === 'Escape') setToolbarMenu(null) }
+    window.addEventListener('pointerdown', onPointer)
+    window.addEventListener('keydown', onKey)
+    return () => {
+      window.removeEventListener('pointerdown', onPointer)
+      window.removeEventListener('keydown', onKey)
+    }
+  }, [toolbarMenu])
 
   // CAS persist (spec 2026-08-01 §6). `local` is a snapshot of the tree at
   // the moment the write starts; the round trip to disk is async, so by the
@@ -826,10 +875,10 @@ function App(): JSX.Element {
     setLayout((l) => ({ ...l, editors: { ...(l.editors ?? {}), [name]: { ws: currentWs, tab: tabId, ord, path: null } } }))
     return name
   }
-  const newPane = (tabId: number, ord: number): void => {
-    if (kind === 'browser') { newBrowser(tabId, ord); return }
-    if (kind === 'editor') { newEditor(tabId, ord); return }
-    window.amber.createSession(formatName({ ws: currentWs, tab: tabId, ord, id: makeId() }), cwd, kind)
+  const newPane = (tabId: number, ord: number, paneKind: PaneKind = kind): void => {
+    if (paneKind === 'browser') { newBrowser(tabId, ord); return }
+    if (paneKind === 'editor') { newEditor(tabId, ord); return }
+    window.amber.createSession(formatName({ ws: currentWs, tab: tabId, ord, id: makeId() }), cwd, paneKind)
   }
   // url-only view of the sidecar browsers map for SplitView (referentially stable
   // enough — a new object only when layout changes, which already re-renders).
@@ -959,11 +1008,11 @@ function App(): JSX.Element {
 
   const openTab = (): void => { newPane(nextTab, 0); setActiveTab(nextTab) }
   // Create a pane in the displayed tab, or — when nothing exists yet — the very
-  // first session at tab 1, ord 0 in the shown workspace. Shared by the toolbar
-  // `+ Pane` button and the empty-state CTA.
-  const startPane = (): void => {
-    if (tab) newPane(tab.tab, nextOrd)
-    else { newPane(1, 0); setActiveTab(1) }
+  // first session at tab 1, ord 0 in the shown workspace. The toolbar picker
+  // passes a kind explicitly; shortcuts and new-tab/ws paths reuse the last pick.
+  const startPane = (paneKind: PaneKind = kind): void => {
+    if (tab) newPane(tab.tab, nextOrd, paneKind)
+    else { newPane(1, 0, paneKind); setActiveTab(1) }
   }
   // Keyboard nav follows the VISUAL order (orderedTabs), so prev/next and the
   // 1–9 jump match what the user sees after a reorder.
@@ -1123,6 +1172,12 @@ function App(): JSX.Element {
         : webStatus?.error !== null && webStatus?.error !== undefined
           ? 'error'
           : 'off'
+  const continuity = continuityView(connected, sessions, snapshotState)
+  const requestSnapshot = (): void => {
+    if (!continuity.canSnapshot || !connected || !window.amber.snapshotNow) return
+    setSnapshotState({ kind: 'pending' })
+    window.amber.snapshotNow?.()
+  }
 
   return (
     <div className={mobile ? 'app mobile' : 'app'}>
@@ -1134,9 +1189,9 @@ function App(): JSX.Element {
             {layout.workspaces[wsKey]?.tabs[tabKey]?.label ?? `tab ${tab?.tab ?? 1}`}
           </span>
           <span className="spacer" />
-          <button aria-label="new pane" title="new pane" onClick={startPane}>+</button>
+          <button aria-label="new pane" title="new pane" onClick={() => startPane()}><Icon name="add" /></button>
           <button aria-label="workspaces and tabs" title="workspaces and tabs"
-            onClick={() => setDrawerOpen(true)}>☰</button>
+            onClick={() => setDrawerOpen(true)}><Icon name="more" /></button>
         </div>
       )}
       {mobile && drawerOpen && (
@@ -1164,7 +1219,7 @@ function App(): JSX.Element {
         <div className="banner error-banner" role="alert">
           <span className="dot" />
           <span className="banner-msg">daemon error: {state.error}</span>
-          <button className="banner-close" aria-label="dismiss error" title="dismiss" onClick={() => dispatch({ kind: 'ClearError' })}>✕</button>
+          <button className="banner-close" aria-label="dismiss error" title="dismiss" onClick={() => dispatch({ kind: 'ClearError' })}><Icon name="close" /></button>
         </div>
       )}
       {state.pressure && state.pressure.level !== 'normal' && (() => {
@@ -1186,7 +1241,7 @@ function App(): JSX.Element {
         <div className="banner notice-banner" role="status" aria-live="polite">
           <span className="dot" />
           <span className="banner-msg">{notice}</span>
-          <button className="banner-close" aria-label="dismiss notice" title="dismiss" onClick={() => setNotice(null)}>✕</button>
+          <button className="banner-close" aria-label="dismiss notice" title="dismiss" onClick={() => setNotice(null)}><Icon name="close" /></button>
         </div>
       )}
       <div className="toolbar">
@@ -1206,7 +1261,7 @@ function App(): JSX.Element {
               onDoubleClick={() => setEditing({ kind: 'ws', id: w.ws })}>{wsLabel ?? w.ws}</button>
           )
         })}
-        <button className="btn btn-ghost" data-drop-ws={nextWs}
+        <button className="btn btn-ghost btn-with-icon" data-drop-ws={nextWs}
           title="new workspace · drop a pane here to move it to a new workspace"
           onClick={() => {
             setActiveWs(nextWs)
@@ -1221,56 +1276,101 @@ function App(): JSX.Element {
               setLayout((l) => ({ ...l, editors: { ...(l.editors ?? {}), [name]: { ws: nextWs, tab: 1, ord: 0, path: null } } }))
             } else window.amber.createSession(formatName({ ws: nextWs, tab: 1, ord: 0, id: makeId() }), cwd, kind)
             setActiveTab(1)
-          }}>+ ws</button>
-        <button className="icon-btn ws-io" aria-label="save workspace to file" title="Save workspace…"
-          onClick={() => setSaveScopeOpen(true)}>💾</button>
-        <button className="icon-btn ws-io" aria-label="load workspace from file" title="Load workspace…"
-          onClick={() => void doLoad()}>📂</button>
-        <button className="icon-btn ws-io" aria-label="manage daemon sessions" title="Sessions — see and kill every live amber session"
-          onClick={() => setSessionsOpen(true)}>🧹</button>
-        <button className="icon-btn ws-io" aria-label="memory budget" title="Memory — view and set amber's aggregate budget"
-          onClick={() => { setBudgetError(null); setBudgetOpen(true) }}>⚖</button>
+          }}><Icon name="add" size={14} /> ws</button>
         <div className="divider" />
-        <span className="label">new</span>
-        <select className="select" value={kind} onChange={(e) => setKind(e.target.value as 'shell' | 'claude' | 'grok' | 'codex' | 'opencode' | 'hermes' | 'pi' | 'browser' | 'editor')}>
-          <option value="shell">shell</option>
-          <option value="claude">claude</option>
-          <option value="grok">grok</option>
-          <option value="codex">codex</option>
-          <option value="opencode">opencode</option>
-          <option value="hermes">hermes</option>
-          <option value="pi">pi</option>
-          <option value="browser">browser</option>
-          <option value="editor">editor</option>
-        </select>
-        <span className="label">in</span>
-        <button className="btn cwd-chip" title={`${cwd} — click to choose folder`}
+        <button className="btn cwd-chip btn-with-icon" title={`${cwd} — choose folder`}
           onClick={() => void window.amber.pickFolder().then((p) => { if (p) setCwd(p) })}>
-          📁 {shortCwd(cwd, window.amber.homeDir)}
+          <Icon name="folder" size={14} />
+          <span>{shortCwd(cwd, window.amber.homeDir)}</span>
         </button>
+        <div className="toolbar-popover-wrap create-wrap">
+          <button className="btn btn-accent btn-with-icon pane-create" aria-haspopup="menu"
+            aria-expanded={toolbarMenu === 'pane-kind'}
+            onClick={() => setToolbarMenu((open) => open === 'pane-kind' ? null : 'pane-kind')}>
+            <Icon name="add" size={15} /> Pane
+          </button>
+          {toolbarMenu === 'pane-kind' && (
+            <div className="toolbar-popover kind-popover" role="menu" aria-label="Create pane">
+              <div className="popover-label">Create pane</div>
+              {PANE_KIND_OPTIONS.map((option) => (
+                <button key={option.kind} className="popover-item kind-option" role="menuitem"
+                  onClick={() => {
+                    setKind(option.kind)
+                    setToolbarMenu(null)
+                    startPane(option.kind)
+                  }}>
+                  <span className={`kind-dot ${option.kind}`} />
+                  <span><strong>{option.label}</strong><small>{option.detail}</small></span>
+                  {kind === option.kind && <span className="current-kind">last used</span>}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
         <div className="spacer" />
-        <button className="btn btn-accent" onClick={startPane}>+ Pane</button>
         {remoteHost.length > 0 && (
-          <span
-            className="remote-marker"
-            title={`Mirroring ${remoteHost} over ssh — this window does not write that machine's layout`}
-          >
+          <span className="remote-marker"
+            title={`Mirroring ${remoteHost} over ssh — this window does not write that machine's layout`}>
             {remoteHost} · read-only
           </span>
         )}
+        <div className="toolbar-popover-wrap">
+          <button className={`btn continuity-pill ${continuity.tone}`} aria-haspopup="dialog"
+            aria-expanded={toolbarMenu === 'continuity'}
+            aria-label={`${continuity.heading}, ${continuity.compact}`}
+            onClick={() => setToolbarMenu((open) => open === 'continuity' ? null : 'continuity')}>
+            <span className="continuity-dot" />
+            <Icon name="preserve" size={14} />
+            <span>{continuity.compact}</span>
+          </button>
+          {toolbarMenu === 'continuity' && (
+            <div className="toolbar-popover continuity-popover" role="dialog" aria-label="Continuity status">
+              <div className="continuity-head">
+                <span className={`continuity-mark ${continuity.tone}`}><Icon name="preserve" size={18} /></span>
+                <span><strong>{continuity.heading}</strong><small>{continuity.detail}</small></span>
+              </div>
+              <p>Your terminal sessions are owned by the daemon and continue independently of this window.</p>
+              <div className={`snapshot-row snapshot-${snapshotState.kind}`} role="status" aria-live="polite">
+                <span>{continuity.snapshot}</span>
+                <button className="btn btn-ghost" disabled={!continuity.canSnapshot || !window.amber.snapshotNow}
+                  onClick={requestSnapshot}>{snapshotState.kind === 'pending' ? 'Saving…' : 'Snapshot now'}</button>
+              </div>
+            </div>
+          )}
+        </div>
         {webManaged && <button
           className={`btn web-pill web-pill-${webDot}`}
           // NEVER the url here: a title attribute is read by screen readers,
-          // screenshots and hover — and the login url is a full-authority
-          // credential.
+          // screenshots and hover — and the login url is a full-authority credential.
           title="Remote access — run the browser/mobile server"
           aria-label={`Remote access: ${webDot}`}
-          onClick={() => setRemoteOpen(true)}
-        >
+          onClick={() => setRemoteOpen(true)}>
           <span className="web-dot" /> remote
         </button>}
+        <div className="toolbar-popover-wrap">
+          <button className="icon-btn toolbar-icon" aria-label="workspace tools" title="Workspace tools"
+            aria-haspopup="menu" aria-expanded={toolbarMenu === 'tools'}
+            onClick={() => setToolbarMenu((open) => open === 'tools' ? null : 'tools')}><Icon name="more" /></button>
+          {toolbarMenu === 'tools' && (
+            <div className="toolbar-popover tools-popover" role="menu" aria-label="Workspace tools">
+              <button className="popover-item" role="menuitem" onClick={() => { setToolbarMenu(null); setSaveScopeOpen(true) }}>
+                <Icon name="save" /><span><strong>Save workspace…</strong><small>Export structure and scrollback</small></span>
+              </button>
+              <button className="popover-item" role="menuitem" onClick={() => { setToolbarMenu(null); void doLoad() }}>
+                <Icon name="load" /><span><strong>Load workspace…</strong><small>Open a portable .amberws file</small></span>
+              </button>
+              <div className="ctx-sep" />
+              <button className="popover-item" role="menuitem" onClick={() => { setToolbarMenu(null); setSessionsOpen(true) }}>
+                <Icon name="sessions" /><span><strong>Sessions</strong><small>Inspect every daemon session</small></span>
+              </button>
+              <button className="popover-item" role="menuitem" onClick={() => { setToolbarMenu(null); setBudgetError(null); setBudgetOpen(true) }}>
+                <Icon name="memory" /><span><strong>Memory</strong><small>View and set the aggregate budget</small></span>
+              </button>
+            </div>
+          )}
+        </div>
         <button className="icon-btn help-btn" aria-label="keyboard shortcuts"
-          title={`Keyboard shortcuts (${chordLabel('help')})`} onClick={() => setShowHelp(true)}>?</button>
+          title={`Keyboard shortcuts (${chordLabel('help')})`} onClick={() => setShowHelp(true)}><Icon name="help" /></button>
       </div>
       <div className="tabbar" role="tablist">
         {orderedTabs.map((t) => {
@@ -1307,7 +1407,7 @@ function App(): JSX.Element {
                     <span className="tab-label">{tabLabel ?? `tab ${t.tab}`}</span>
                     <span className="count">{t.panes.length}</span>
                     <button className="tab-close" aria-label="close tab" title="close tab"
-                      onClick={(e) => { e.stopPropagation(); closeTab() }}>✕</button>
+                      onClick={(e) => { e.stopPropagation(); closeTab() }}><Icon name="close" /></button>
                   </>}
             </div>
           )
@@ -1329,7 +1429,7 @@ function App(): JSX.Element {
         {!(loaded && sawSessions)
           ? <div className="stage-loading">connecting to daemon…</div>
           : orderedTabs.length === 0
-            ? <button className="empty-cta" onClick={startPane}>
+            ? <button className="empty-cta" onClick={() => startPane()}>
                 <span className="empty-cta-title">Start a pane</span>
                 <span className="empty-cta-sub">{chordLabel('new-pane')}</span>
               </button>
@@ -1382,7 +1482,7 @@ function App(): JSX.Element {
                           onMoveTo={moveTo}
                           onClose={(paneId) => { closePane(paneId); clearZoom() }} />
                       : isActive
-                        ? <button className="empty-cta" onClick={startPane}>
+                        ? <button className="empty-cta" onClick={() => startPane()}>
                             <span className="empty-cta-title">Start a pane</span>
                             <span className="empty-cta-sub">{chordLabel('new-pane')}</span>
                           </button>
@@ -1414,7 +1514,7 @@ function App(): JSX.Element {
               onClick={(e) => e.stopPropagation()}>
               <div className="help-head">
                 <span className="help-title">Unsaved changes</span>
-                <button className="icon-btn" aria-label="close" title="close" onClick={() => setCloseAsk(null)}>✕</button>
+                <button className="icon-btn" aria-label="close" title="close" onClick={() => setCloseAsk(null)}><Icon name="close" /></button>
               </div>
               <div className="dialog-body">
                 <p className="dialog-text"><code>{name}</code> has unsaved changes.</p>
@@ -1450,7 +1550,7 @@ function App(): JSX.Element {
               onClick={(e) => e.stopPropagation()}>
               <div className="help-head">
                 <span className="help-title">{killAsk.length > 1 ? `Kill ${killAsk.length} sessions?` : 'Kill session?'}</span>
-                <button className="icon-btn" aria-label="close" title="close" onClick={() => setKillAsk(null)}>✕</button>
+                <button className="icon-btn" aria-label="close" title="close" onClick={() => setKillAsk(null)}><Icon name="close" /></button>
               </div>
               <div className="dialog-body">
                 {/* Deliberately not "closing this pane…": the cleanup dialog
@@ -1509,7 +1609,7 @@ function App(): JSX.Element {
               onClick={(e) => e.stopPropagation()}>
               <div className="help-head">
                 <span className="help-title">Sessions ({rows.length})</span>
-                <button className="icon-btn" aria-label="close" title="close" onClick={() => setSessionsOpen(false)}>✕</button>
+                <button className="icon-btn" aria-label="close" title="close" onClick={() => setSessionsOpen(false)}><Icon name="close" /></button>
               </div>
               <div className="dialog-body">
                 <p className="dialog-text">
@@ -1575,7 +1675,7 @@ function App(): JSX.Element {
               onClick={(e) => e.stopPropagation()}>
               <div className="help-head">
                 <span className="help-title">Memory</span>
-                <button className="icon-btn" aria-label="close" title="close" onClick={() => setBudgetOpen(false)}>✕</button>
+                <button className="icon-btn" aria-label="close" title="close" onClick={() => setBudgetOpen(false)}><Icon name="close" /></button>
               </div>
               <div className="dialog-body">
                 <p className="dialog-text">
@@ -1631,7 +1731,7 @@ function App(): JSX.Element {
             onClick={(e) => e.stopPropagation()}>
             <div className="help-head">
               <span className="help-title">Save workspace</span>
-              <button className="icon-btn" aria-label="close" title="close" onClick={() => setSaveScopeOpen(false)}>✕</button>
+              <button className="icon-btn" aria-label="close" title="close" onClick={() => setSaveScopeOpen(false)}><Icon name="close" /></button>
             </div>
             <div className="dialog-body">
               <p className="dialog-text">Save structure and scrollback to a portable <code>.amberws</code> file.</p>
@@ -1653,7 +1753,7 @@ function App(): JSX.Element {
               onClick={(e) => e.stopPropagation()}>
               <div className="help-head">
                 <span className="help-title">Load workspace{wsCount > 1 ? ` (${wsCount} workspaces)` : ''}</span>
-                <button className="icon-btn" aria-label="close" title="close" onClick={() => setLoadDoc(null)}>✕</button>
+                <button className="icon-btn" aria-label="close" title="close" onClick={() => setLoadDoc(null)}><Icon name="close" /></button>
               </div>
               <div className="dialog-body">
                 <div className="dialog-actions column">
@@ -1675,7 +1775,7 @@ function App(): JSX.Element {
             onClick={(e) => e.stopPropagation()}>
             <div className="help-head">
               <span className="help-title">Connect to host</span>
-              <button className="icon-btn" aria-label="close" onClick={() => setConnectOpen(false)}>✕</button>
+              <button className="icon-btn" aria-label="close" onClick={() => setConnectOpen(false)}><Icon name="close" /></button>
             </div>
             <div className="dialog-body">
               <p className="dialog-text">
@@ -1706,7 +1806,7 @@ function App(): JSX.Element {
             <div className="help-head">
               <span className="help-title">Keyboard shortcuts</span>
               <button className="icon-btn" aria-label="close shortcuts" title="close"
-                onClick={() => setShowHelp(false)}>✕</button>
+                onClick={() => setShowHelp(false)}><Icon name="close" /></button>
             </div>
             <ul className="help-list">
               {CHORD_TABLE.map((c) => (

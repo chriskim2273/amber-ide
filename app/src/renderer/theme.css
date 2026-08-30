@@ -18,6 +18,10 @@
   --text-faint: #64646f;
   /* accent (violet → blue) */
   --accent: #7c6cff;
+  /* Filled controls need stronger contrast with white than the focus violet.
+     #6553e6 gives ~5.3:1; --accent stays unchanged for focus/selection. */
+  --accent-fill: #6553e6;
+  --accent-fill-hover: #6f5ff0;
   --accent-soft: rgba(124, 108, 255, 0.16);
   --accent-2: #4d9fff;
   /* status */
@@ -48,6 +52,12 @@
 }
 
 * { box-sizing: border-box; }
+
+::selection { background: rgba(124, 108, 255, 0.35); color: var(--text); }
+* { scrollbar-color: var(--border-strong) var(--bg); scrollbar-width: thin; }
+*::-webkit-scrollbar { width: 9px; height: 9px; }
+*::-webkit-scrollbar-track { background: var(--bg); }
+*::-webkit-scrollbar-thumb { background: var(--border-strong); border: 2px solid var(--bg); border-radius: 6px; }
 
 /* The shell is `position:absolute; inset:0` — the document must NEVER scroll.
  * Without this, chrome that can't shrink below its min-content width overflows
@@ -118,6 +128,11 @@ body {
 .btn:active { transform: translateY(0.5px); }
 
 /* Visible keyboard-focus ring on every interactive surface (shared token). */
+button:focus-visible,
+input:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: 1px;
+}
 .btn:focus-visible,
 .icon-btn:focus-visible,
 .tab:focus-visible,
@@ -134,10 +149,13 @@ body {
 
 .btn-accent {
   color: #fff;
-  background: var(--accent);
+  background: var(--accent-fill);
   border-color: transparent;
 }
-.btn-accent:hover { background: #8b7cff; }
+.btn-accent:hover { background: var(--accent-fill-hover); color: #fff; }
+.btn:disabled { opacity: 0.48; cursor: default; transform: none; }
+.btn-with-icon { display: inline-flex; align-items: center; justify-content: center; gap: 6px; }
+.ui-icon { display: block; flex: none; }
 
 /* workspace pills */
 .ws-pill {
@@ -149,26 +167,14 @@ body {
 }
 .ws-pill.active {
   color: #fff;
-  background: var(--accent);
+  background: var(--accent-fill);
   border-color: transparent;
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
-/* select (new-pane kind) */
-.select {
-  font-family: inherit;
-  font-size: 12px;
-  color: var(--text);
-  background: var(--surface-2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 5px 8px;
-  cursor: pointer;
-}
-
 /* cwd chip */
 .cwd-chip {
-  max-width: 300px;
+  max-width: 260px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -177,6 +183,92 @@ body {
   color: var(--text-dim);
 }
 .cwd-chip:hover { color: var(--text); }
+.cwd-chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pane-create { min-height: 28px; padding-inline: 12px; font-weight: 600; }
+
+/* Toolbar command surfaces: one compact row at rest, labeled choices on demand. */
+.toolbar-popover-wrap { position: relative; flex: none; }
+.toolbar-popover {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 18;
+  display: flex;
+  flex-direction: column;
+  min-width: 260px;
+  padding: 5px;
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-2);
+}
+.create-wrap .toolbar-popover { left: 0; right: auto; }
+.popover-label {
+  padding: 7px 9px 5px;
+  color: var(--text-faint);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.popover-item {
+  width: 100%;
+  min-height: 38px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 9px;
+  color: var(--text-dim);
+  background: transparent;
+  border: 0;
+  border-radius: 5px;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.popover-item:hover { color: var(--text); background: var(--surface-3); }
+.popover-item:focus-visible { outline: var(--focus-ring); outline-offset: -2px; }
+.popover-item > span:not(.kind-dot):not(.current-kind) { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.popover-item strong { color: var(--text); font-size: 12px; font-weight: 550; }
+.popover-item small { color: var(--text-faint); font-size: 11.5px; line-height: 1.25; }
+.kind-popover { width: 330px; max-height: min(520px, calc(100vh - 64px)); overflow-y: auto; }
+.kind-option .kind-dot,
+.ctx-kind .kind-dot {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--accent-2);
+}
+.kind-option .kind-dot.claude, .kind-option .kind-dot.pi,
+.ctx-kind .kind-dot.claude, .ctx-kind .kind-dot.pi { background: var(--warn); }
+.kind-option .kind-dot.grok, .ctx-kind .kind-dot.grok { background: var(--grok, #8ab4f8); }
+.kind-option .kind-dot.codex, .ctx-kind .kind-dot.codex { background: var(--codex, #3dd68c); }
+.kind-option .kind-dot.opencode, .ctx-kind .kind-dot.opencode { background: var(--opencode, #c084fc); }
+.kind-option .kind-dot.hermes, .ctx-kind .kind-dot.hermes { background: var(--hermes, #f472b6); }
+.kind-option .kind-dot.browser, .ctx-kind .kind-dot.browser { background: var(--ok); }
+.kind-option .kind-dot.editor, .ctx-kind .kind-dot.editor { background: var(--accent); }
+.current-kind { margin-left: auto; color: var(--text-faint); font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.04em; }
+.tools-popover { width: 302px; }
+.toolbar-icon { width: 28px; height: 28px; border: 1px solid var(--border); }
+.toolbar-icon:hover { border-color: var(--border-strong); }
+.continuity-pill { display: inline-flex; align-items: center; gap: 6px; min-height: 28px; padding-inline: 9px; }
+.continuity-pill.healthy { color: var(--text-dim); }
+.continuity-pill.offline { color: var(--danger); border-color: rgba(255, 92, 92, 0.4); }
+.continuity-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); }
+.continuity-pill.offline .continuity-dot { background: var(--danger); }
+.continuity-popover { width: 350px; padding: 12px; gap: 11px; }
+.continuity-head { display: flex; align-items: center; gap: 10px; }
+.continuity-head > span:last-child { display: flex; flex-direction: column; gap: 2px; }
+.continuity-head strong { font-size: 13px; color: var(--text); }
+.continuity-head small { font-size: 11.5px; color: var(--text-faint); }
+.continuity-mark { width: 32px; height: 32px; display: grid; place-items: center; border-radius: 50%; color: var(--ok); background: rgba(82, 210, 115, 0.12); }
+.continuity-mark.offline { color: var(--danger); background: var(--danger-soft); }
+.continuity-popover p { margin: 0; color: var(--text-dim); font-size: 12px; line-height: 1.45; }
+.snapshot-row { display: flex; align-items: center; gap: 8px; padding-top: 10px; border-top: 1px solid var(--border); }
+.snapshot-row > span { min-width: 0; flex: 1; color: var(--text-faint); font-size: 11.5px; }
+.snapshot-confirmed > span { color: var(--ok); }
+.snapshot-error > span { color: var(--danger); }
+.snapshot-row .btn { flex: none; }
 
 /* ---------- tab bar ---------- */
 .tabbar {
@@ -186,7 +278,7 @@ body {
   padding: 0 var(--sp-2);
   background: var(--bg);
   border-bottom: 1px solid var(--border);
-  min-height: 36px;
+  min-height: 38px;
 }
 .tab {
   display: flex;
@@ -262,8 +354,8 @@ body {
 .tab-close {
   display: grid;
   place-items: center;
-  width: 16px;
-  height: 16px;
+  width: 26px;
+  height: 26px;
   margin-left: 2px;
   border: none;
   border-radius: 4px;
@@ -321,7 +413,7 @@ body {
   display: flex;
   align-items: center;
   gap: var(--sp-2);
-  height: 26px;
+  height: 28px;
   padding: 0 var(--sp-2);
   background: var(--surface);
   border-bottom: 1px solid var(--border);
@@ -388,18 +480,17 @@ body {
 }
 .pane-actions {
   display: flex;
-  gap: 1px;
-  opacity: 0;
+  gap: 2px;
+  opacity: 0.62;
   transition: opacity 0.12s;
 }
-/* Reveal the action cluster on hover, when the pane is focused, OR when any of
-   its buttons takes keyboard focus (so Tab-navigation can reach them). */
+/* Move and overflow are always findable; focus/hover raises their emphasis. */
 .pane:hover .pane-actions,
 .pane.focused .pane-actions,
 .pane-actions:focus-within { opacity: 1; }
 .icon-btn {
-  width: 20px;
-  height: 20px;
+  width: 26px;
+  height: 26px;
   display: grid;
   place-items: center;
   border: none;
@@ -417,7 +508,7 @@ body {
 /* Zoom badge: legibility cue in the zoomed pane's header (accent pill). */
 .zoom-badge {
   flex: none;
-  font-size: 10.5px;
+  font-size: 11.5px;
   color: var(--accent);
   background: var(--accent-soft);
   border: 1px solid transparent;
@@ -427,7 +518,7 @@ body {
   letter-spacing: 0.02em;
 }
 
-.pane-body { position: absolute; inset: 26px 0 0 0; }
+.pane-body { position: absolute; inset: 28px 0 0 0; }
 
 /* ---------- header context menu ---------- */
 /* Custom menu opened by right-click on a pane HEADER (xterm owns body events).
@@ -445,6 +536,10 @@ body {
   box-shadow: var(--shadow-2);
 }
 .ctx-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 34px;
   font-family: inherit;
   font-size: 12px;
   text-align: left;
@@ -458,6 +553,9 @@ body {
   transition: background 0.12s, color 0.12s;
 }
 .ctx-item:hover { background: var(--surface-3); color: var(--text); }
+.ctx-item .ui-icon { color: var(--text-faint); }
+.ctx-item:hover .ui-icon { color: currentColor; }
+.ctx-kind { flex-direction: row; }
 .ctx-item:focus-visible { outline: var(--focus-ring); outline-offset: -1px; }
 .ctx-item.danger:hover { background: var(--danger-soft); color: var(--danger); }
 .ctx-sep { height: 1px; margin: var(--sp-1) 4px; background: var(--border); }
@@ -541,7 +639,10 @@ body {
 /* Header badge: small frozen chip (mirrors the zoom-badge treatment, cool hue). */
 .frozen-badge {
   flex: none;
-  font-size: 10.5px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11.5px;
   color: var(--accent-2);
   background: rgba(77, 159, 255, 0.14);
   border-radius: 10px;
@@ -553,7 +654,8 @@ body {
    with a ▲ when the reading is a sustained climb (possible leak). */
 .mem-tag {
   flex: none;
-  font-size: 10.5px;
+  display: none;
+  font-size: 11.5px;
   color: var(--text-dim, #9a9aa5);
   background: rgba(255, 255, 255, 0.06);
   border-radius: 10px;
@@ -561,6 +663,11 @@ body {
   white-space: nowrap;
   font-variant-numeric: tabular-nums;
 }
+/* Exact values are secondary machine detail: reveal on intent. A growing value
+   remains visible because it is an actionable warning, not passive telemetry. */
+.pane:hover .mem-tag,
+.pane.focused .mem-tag,
+.mem-tag.growing { display: inline-flex; }
 .mem-tag.growing {
   color: var(--warn, #ffb454);
   background: rgba(255, 180, 84, 0.15);
@@ -645,7 +752,8 @@ body {
 .frozen-unfreeze:focus-visible,
 .memory-parked-overlay button:focus-visible { outline: var(--focus-ring); outline-offset: 1px; }
 .frozen-badge-lg {
-  font-size: 30px;
+  display: grid;
+  place-items: center;
   line-height: 1;
   color: var(--accent-2);
   filter: drop-shadow(0 0 10px rgba(77, 159, 255, 0.4));
@@ -668,7 +776,10 @@ body {
   box-shadow: var(--shadow-2);
 }
 .freeze-note-label {
-  font-size: 11px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11.5px;
   color: var(--text-dim);
   letter-spacing: 0.02em;
 }
@@ -869,10 +980,6 @@ body {
 }
 
 /* ---------- workspace save/load ---------- */
-/* Toolbar 💾/📂 buttons: emoji glyphs, slightly larger tap target than the
-   borderless pane icon-btns; no border so they sit quietly by the ws pills. */
-.ws-io { font-size: 14px; }
-
 /* Info notice banner (parse errors / dump-timeout): the banner shell, recolored
    from danger to a neutral accent so it never reads as a daemon error. */
 .notice-banner {
@@ -936,9 +1043,9 @@ body {
 .session-main { display: flex; flex-direction: column; min-width: 0; }
 .session-name, .session-sub { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .session-name { font-size: 12.5px; color: var(--text); }
-.session-sub { font-family: var(--font-mono); font-size: 10.5px; color: var(--text-faint); }
+.session-sub { font-family: var(--font-mono); font-size: 11.5px; color: var(--text-faint); }
 .session-tag {
-  font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em;
+  font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em;
   color: var(--text-faint);
 }
 .session-tag.dead { color: var(--danger); }
@@ -957,8 +1064,8 @@ body {
   padding: 3px 9px;
   font: 500 12px/1 var(--font-ui);
   color: #fff;
-  background: var(--accent);
-  border: 1px solid var(--accent);
+  background: var(--accent-fill);
+  border: 1px solid var(--accent-fill);
   border-radius: var(--radius);
   box-shadow: var(--shadow-2);
   cursor: pointer;
@@ -1077,7 +1184,6 @@ body {
   .btn,
   .icon-btn,
   .ws-pill,
-  .select,
   .cwd-chip {
     min-height: 44px;
     font-size: 13px;
@@ -1130,8 +1236,8 @@ body {
 /* Sticky Ctrl is a mode, so it has to look latched — a phone user cannot see a
    held modifier any other way. */
 .key-bar .key.armed {
-  background: var(--accent, #7c6cff);
-  border-color: var(--accent, #7c6cff);
+  background: var(--accent-fill, #6553e6);
+  border-color: var(--accent-fill, #6553e6);
   color: #fff;
 }
 
@@ -1179,8 +1285,10 @@ body {
   /* A zoomed pane is the phone's full-screen view; its header is the only
      chrome left, so give it room for a thumb. */
   .pane-header {
+    height: 44px;
     min-height: 44px;
   }
+  .pane-body { inset: 44px 0 0; }
 }
 
 /* ---- mobile drawer (spec §6) ------------------------------------------- */
@@ -1264,6 +1372,15 @@ body {
 @media (pointer: coarse) and (max-width: 820px) {
   .app.mobile > .toolbar,
   .app.mobile > .tabbar { display: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }
 
 /* SSH remote window marker (spec 2026-08-23): a divider that snaps back needs

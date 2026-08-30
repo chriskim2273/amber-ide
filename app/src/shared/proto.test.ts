@@ -28,6 +28,15 @@ describe('proto', () => {
     expect(roundtrip(f)).toEqual(f)
   })
 
+  it('encodes the manual snapshot request and confirmation as daemon unit variants', () => {
+    const request: Frame = { type: 'control', msg: { kind: 'Snapshot' } }
+    const confirmation: Frame = { type: 'control', msg: { kind: 'SnapshotOk' } }
+    expect(roundtrip(request)).toEqual(request)
+    expect(roundtrip(confirmation)).toEqual(confirmation)
+    expect(new TextDecoder().decode(encode(request).slice(5))).toBe('"Snapshot"')
+    expect(new TextDecoder().decode(encode(confirmation).slice(5))).toBe('"SnapshotOk"')
+  })
+
   it('roundtrips a data frame preserving raw bytes', () => {
     const bytes = new Uint8Array([0, 1, 255, 0, 27, 91, 50, 74])
     const f: Frame = { type: 'data', session: 's', bytes }
