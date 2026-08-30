@@ -1179,7 +1179,7 @@ mod tests {
         const LEN: usize = 64 * 1024;
 
         let mut handles = Vec::new();
-        for byte in [b'a', b'b'] {
+        for byte in *b"ab" {
             let target = target.clone();
             handles.push(std::thread::spawn(move || {
                 let payload = vec![byte; LEN];

@@ -278,10 +278,9 @@ fn handle_control(
             };
             let _ = write_frame(writer, &Frame::Control(reply));
             if result.is_ok() {
-                manager.record_recovery_event(
-                    "info", "session.created", Some(&name),
-                    format!("created {kind} session in {cwd}"), None,
-                );
+                // Publish daemon truth before the fsync-backed journal append.
+                // Otherwise a watcher that subscribes after the Created ack can
+                // receive a duplicate added-only delta after its full snapshot.
                 if let Ok(infos) = manager.session_infos() {
                     if let Some(info) = infos.into_iter().find(|i| i.name == name) {
                         watchers.broadcast(&ControlMsg::SessionsChanged {
@@ -290,6 +289,10 @@ fn handle_control(
                         });
                     }
                 }
+                manager.record_recovery_event(
+                    "info", "session.created", Some(&name),
+                    format!("created {kind} session in {cwd}"), None,
+                );
             }
         }
         ControlMsg::ListSessions => {
@@ -617,14 +620,14 @@ fn handle_control(
             let existed = manager.session(&name).is_some();
             match manager.remove(&name) {
                 Ok(()) if existed => {
+                    watchers.broadcast(&ControlMsg::SessionsChanged {
+                        added: vec![],
+                        removed: vec![name.clone()],
+                    });
                     manager.record_recovery_event(
                         "info", "session.killed", Some(&name),
                         "session killed by client request", None,
                     );
-                    watchers.broadcast(&ControlMsg::SessionsChanged {
-                        added: vec![],
-                        removed: vec![name],
-                    });
                 }
                 Ok(()) => {}
                 Err(error) => {
