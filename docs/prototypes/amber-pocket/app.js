@@ -2,6 +2,7 @@
   const screens = new Map(
     [...document.querySelectorAll('[data-screen]')].map((screen) => [screen.dataset.screen, screen]),
   )
+  const appShell = document.getElementById('appShell')
   const bottomNav = document.getElementById('bottomNav')
   const terminalInput = document.getElementById('terminalInput')
   const terminalOutput = document.getElementById('terminalOutput')
@@ -40,6 +41,7 @@
     }
 
     const focus = next === 'focus'
+    appShell.classList.toggle('is-focus-mode', focus)
     bottomNav.hidden = focus
     document.querySelectorAll('[data-nav]').forEach((button) => {
       const active = button.dataset.nav === next
@@ -62,7 +64,7 @@
     currentSession = name
     const session = sessions[name] ?? sessions['api-refactor']
     document.getElementById('focusTitle').textContent = name
-    document.getElementById('focusState').innerHTML = `<span class="status-mark ${session.state.includes('waiting') ? 'waiting' : session.state.includes('suspended') ? 'suspended' : session.state === 'quiet' ? 'quiet' : 'working'}" aria-hidden="true"></span>${session.kind} ${session.state}`
+    document.getElementById('focusState').innerHTML = `<span class="status-mark ${session.state.includes('waiting') ? 'waiting' : session.state.includes('suspended') ? 'suspended' : session.state === 'quiet' ? 'quiet' : 'working'}" aria-hidden="true"></span>teapot-dev / ${session.kind} ${session.state}`
     actionsTitle.textContent = name
     document.querySelector('#actionsSheet .sheet-header p').textContent = `${session.kind} / ${session.workspace}`
     terminalNotice.textContent = session.kind === 'Shell'
@@ -248,6 +250,32 @@
     }
   })
 
+  // Keep the whole mobile shell inside the visual viewport. On iOS and Android
+  // the layout viewport commonly stays full-height while the software keyboard
+  // overlays its bottom; binding to `visualViewport` makes flexbox spend the
+  // remaining height on the terminal and keeps the key deck directly above the
+  // keyboard. This is prototype-only geometry: production pins PTY rows and
+  // moves rendered xterm pixels instead of changing the shared grid.
+  const syncVisualViewport = () => {
+    const viewport = window.visualViewport
+    const mobile = window.matchMedia('(max-width: 780px)').matches
+    if (!viewport || !mobile) {
+      appShell.style.removeProperty('--visible-viewport-height')
+      appShell.style.removeProperty('--visible-viewport-top')
+      appShell.classList.remove('keyboard-open')
+      return
+    }
+    const covered = Math.max(0, window.innerHeight - (viewport.height + viewport.offsetTop))
+    const keyboard = covered > 120
+    appShell.style.setProperty('--visible-viewport-height', `${viewport.height}px`)
+    appShell.style.setProperty('--visible-viewport-top', `${viewport.offsetTop}px`)
+    appShell.classList.toggle('keyboard-open', keyboard)
+    if (keyboard && currentScreen === 'focus') terminalOutput.scrollTop = terminalOutput.scrollHeight
+  }
+  window.visualViewport?.addEventListener('resize', syncVisualViewport)
+  window.visualViewport?.addEventListener('scroll', syncVisualViewport)
+  window.addEventListener('resize', syncVisualViewport)
+
   window.addEventListener('popstate', (event) => {
     if (openSheetId) {
       closeSheet(openSheetId)
@@ -259,6 +287,7 @@
 
   const [requested, requestedSheet] = location.hash.replace('#', '').split('/')
   setScreen(screens.has(requested) ? requested : 'sessions', { push: false })
+  syncVisualViewport()
   if (requestedSheet && document.getElementById(requestedSheet)) {
     openSheet(requestedSheet, document.body)
   }

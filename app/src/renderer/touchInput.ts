@@ -41,13 +41,15 @@ export const KEY_BAR: KeyBarKey[] = [
   { key: 'tab', label: 'tab' },
   { key: 'shift-tab', label: '⇧tab', wide: true },
   { key: 'ctrl', label: 'ctrl' },
+  // Keep the emergency interrupt and submit keys in the first thumb-width.
+  // Arrows remain one horizontal swipe away instead of pushing ^C offscreen.
+  { key: 'ctrl-c', label: '^C' },
+  { key: 'enter', label: '⏎' },
+  { key: 'slash', label: '/' },
   { key: 'left', label: '←' },
   { key: 'down', label: '↓' },
   { key: 'up', label: '↑' },
   { key: 'right', label: '→' },
-  { key: 'enter', label: '⏎' },
-  { key: 'slash', label: '/' },
-  { key: 'ctrl-c', label: '^C' },
 ]
 
 /**

@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-29
 
-**Status:** visual prototype complete, production implementation not started
+**Status:** visual prototype complete; production keyboard-viewport hardening implemented; command center not started
 
 **Prototype:** `docs/prototypes/amber-pocket/index.html`
 
@@ -311,8 +311,19 @@ The bar:
 - uses 44px minimum targets,
 - announces sticky modifier state,
 - follows application cursor-key mode,
+- keeps interrupt and Enter ahead of the horizontally scrollable arrow cluster,
 - stays above `visualViewport` without re-fitting the PTY when the keyboard
   opens.
+
+Keyboard movement is visual-only. `KeyboardDock` translates the key bar by the
+covered bottom inset. `Pane` translates the already-rendered xterm host only far
+enough to put the active cursor above both the keyboard and key bar. Neither
+path changes width, height, padding, or margin. This is load-bearing because the
+pane's `ResizeObserver` watches the xterm host: the former `paddingBottom`
+approach changed its content box and could make keyboard close look like a real
+pane resize, causing FitAddon to reflow the shared PTY. Both the dock and pane
+listen to `visualViewport.resize` and `.scroll`, and the bottom inset includes
+`visualViewport.offsetTop` so moving browser chrome is not misclassified.
 
 ### 7.4 Mosaic
 
@@ -424,7 +435,8 @@ Activity is output, not completion.
 - Sheets contain overscroll and restore focus to their trigger.
 - Dialogs and sheets use semantic labels and modal state.
 - Destructive actions require clear confirmation.
-- Soft-keyboard opening never changes PTY rows.
+- Soft-keyboard opening never changes PTY rows; only the key bar and rendered
+  terminal pixels translate.
 - Platform back first closes a sheet, then exits focus mode, then follows normal
   browser history.
 - Landscape prioritizes terminal focus; the command center uses two columns only
@@ -499,8 +511,11 @@ terminal implementation.
 - “Needs you” contains only states supported by real data.
 - Opening an agent produces a readable borrowed grid.
 - Leaving focus restores the prior desktop-sized grid when no newer writer won.
-- Opening the software keyboard does not change PTY rows.
-- All required TUI keys remain available with 44px targets.
+- Opening or closing the software keyboard does not change PTY rows.
+- The key bar sits immediately above the keyboard, and the active cursor remains
+  visible above the key bar.
+- All required TUI keys remain available with 44px targets; interrupt and Enter
+  are visible before the arrow cluster.
 - Every sheet and navigation transition works with platform back.
 - No production renderer code branches on host.
 - Desktop layout and interaction remain unchanged.

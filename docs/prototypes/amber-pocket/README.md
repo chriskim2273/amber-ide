@@ -28,12 +28,18 @@ Useful routes:
 - Arm Ctrl and press another terminal key.
 - Send a quick text macro.
 - Type while the terminal has focus.
+- Open the software keyboard on a phone: the shell binds to `visualViewport`,
+  the key deck stays above the keyboard, and optional quick macros collapse to
+  preserve terminal height.
 
 ## Review captures
 
 Validated captures are in `screenshots/` for the command center, focus terminal,
-mosaic, action sheet, and desktop presentation. Each PNG carries a provenance
-text chunk naming its local Chrome capture route and viewport.
+keyboard-open focus, mosaic, action sheet, and desktop presentation. In
+`mobile-keyboard.png`, the black lower region is the simulated 336px software
+keyboard occlusion; the terminal and critical key row end at the visual viewport
+boundary above it. Each PNG carries a provenance text chunk naming its local
+Chrome capture route and viewport.
 
 ## Scope
 

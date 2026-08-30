@@ -1157,18 +1157,33 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   paths were resizing regardless (the font-size effect, which fires on the
   phone's 13→14 px flip, and the reconnect nudge) and now respect it. §3's soft-keyboard rule is implemented
   (`keyboardViewport.ts` + `Pane.tsx`): a `visualViewport` shrink that
-  `innerHeight` does not match is the keyboard, and the pane pins its rows and
-  scrolls the cursor above it instead of re-fitting — an orientation change,
-  which moves BOTH heights, still re-fits. Unit-tested both ways. Browser
-  pinch-zoom is left ENABLED: an earlier draft set `user-scalable=no` to make
-  room for app-owned pinch that was never built, which would have left a phone
-  unable to zoom at all. **Not verified:** any real device on either platform —
-  so the soft-keyboard path has never actually run — plus long-press arming,
-  real-finger touch scrolling, clipboard gestures, and PWA install.
+  `innerHeight` does not match is the keyboard, and the pane pins its rows
+  instead of re-fitting — an orientation change, which moves BOTH heights,
+  still re-fits. **Hardened 2026-08-29:** the first implementation mutated
+  `host.style.paddingBottom`; the key bar itself still stayed under an
+  overlaying keyboard, and padding changed ResizeObserver's content box, so
+  keyboard close could look like a real pane resize and reflow the shared PTY.
+  `KeyboardDock` now translates above the exact bottom inset (including
+  `visualViewport.offsetTop`), while `Pane` translates the already-rendered
+  xterm host only far enough to keep its real cursor above the keyboard AND key
+  bar. Both are transform-only, listen to visual-viewport resize + scroll, and
+  opening/closing the keyboard changes no observed layout dimension. Pure
+  keyboard-inset/cursor-lift geometry is unit-tested. **Live-verified through
+  the production web bundle against an isolated daemon:** at 390×844, an
+  explicit visual-viewport move to 508 px docked the bar by 336 px, lifted a
+  bottom-row shell cursor by 388 px, kept the hidden textarea focused, and left
+  daemon geometry exactly **44×42 → 44×42**. Hardening gates: app **594 tests**
+  + one intentional skip, typecheck and `build:web` green. Browser pinch-zoom
+  is left ENABLED: an earlier draft set `user-scalable=no` to make room for
+  app-owned pinch that was never built, which would have left a phone unable to
+  zoom at all. **Not verified:** any real device on either platform — the
+  explicit viewport override proves our reaction, not Safari/Chrome's real
+  keyboard timing or safe-area behavior — plus long-press arming, real-finger
+  touch scrolling, clipboard gestures, and PWA install.
 
 - [x] Amber Pocket product design (2026-08-29) — a reference-locked mobile
-  product direction and interactive code-led prototype, with **no production
-  renderer or protocol change yet**. Spec:
+  product direction and interactive code-led prototype, plus the production
+  soft-keyboard hardening above (**no protocol change**). Spec:
   `docs/superpowers/specs/2026-08-29-amber-pocket-mobile-product-design.md`;
   prototype: `docs/prototypes/amber-pocket/`. The phone now has a designed
   product model rather than “desktop chrome made larger”: it lands in a
@@ -1183,9 +1198,16 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   and terminal dominance. The prototype exercises command-center filters,
   machine/session sheets, focus/back history, a reordered critical terminal
   key deck, quick text macros, Mosaic, and new-session kind state; Phosphor
-  supplies the one icon family. Five validated captures are checked in under
+  supplies the one icon family. The prototype shell now binds to
+  `visualViewport`: keyboard open shrinks the visible terminal, removes the
+  duplicate machine bar and optional macro row, and leaves the critical key
+  deck immediately above the keyboard. Production `KEY_BAR` likewise moved
+  ^C and Enter ahead of the scrollable arrow cluster. Six validated captures are checked in under
   `docs/prototypes/amber-pocket/screenshots/` with embedded provenance
-  (`390×844` command center/focus/mosaic/sheet and `1440×900` presentation).
+  (`390×844` command center/focus/**keyboard-open focus**/mosaic/sheet and
+  `1440×900` presentation). The keyboard capture overrides the visual viewport
+  from 844 to 508 px; measured shell height and key-deck bottom both become
+  exactly 508 px while the optional quick row is absent.
   Raw CDP interaction checks pass; every visible control in sessions/focus/
   sheet states has an accessible name and a measured ≥44 px target (terminal
   keys deliberately use 45 px to avoid fractional layout rounding below the
@@ -1193,7 +1215,7 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   checks pass. Impeccable's detector ran once in degraded regex mode because
   its HTML parser modules are unavailable and returned no findings; the
   required finish review/documentation roles were performed inline because
-  this harness exposes no subagent tool. **Next work is production Slice 1,
+  this harness exposes no subagent tool. **Next product slice is Slice 1,
   not more prototype polish:** the pure urgency selector, then capability-gated
   command-center navigation, focus chrome, and real-device iOS/Android proof as
   ordered in the spec.

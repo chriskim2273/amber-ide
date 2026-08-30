@@ -1,6 +1,6 @@
 import { useRef, useState, useEffect, lazy, Suspense } from 'react'
 import { Pane, type SearchApi, type InputApi } from './Pane'
-import { KeyBar } from './KeyBar'
+import { KeyboardDock } from './KeyBar'
 import { useMobile } from './mobile'
 import { Browser } from './Browser'
 import type { EditorApi } from './Editor'
@@ -672,15 +672,11 @@ export function SplitView(props: {
 
   // The key bar is mounted only on a coarse-pointer, phone-width viewport —
   // that is the whole of its host-awareness (spec §0.1: capability, not host).
-  const keyBarTarget = mobile && focused !== null ? (inputApis.current.get(focused) ?? null) : null
+  const keyBarTarget = mobile && props.active && focused !== null ? (inputApis.current.get(focused) ?? null) : null
 
   return (
     <div ref={ref} style={{ position: 'absolute', inset: 0 }}>
-      {mobile && keyBarTarget !== null && (
-        <div className="key-bar-dock">
-          <KeyBar target={keyBarTarget} />
-        </div>
-      )}
+      {mobile && keyBarTarget !== null && <KeyboardDock target={keyBarTarget} />}
       {panes.map(({ paneId, rect }) => {
         const meta = props.meta[paneId]
         const dead = props.deadCodes[paneId]

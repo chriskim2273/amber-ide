@@ -1287,11 +1287,24 @@ legend,
   .app-shell {
     width: 100%;
     max-width: none;
-    height: 100dvh;
+    height: var(--visible-viewport-height, 100dvh);
     min-height: 0;
     border: 0;
     border-radius: 0;
     box-shadow: none;
+    transform: translate3d(0, var(--visible-viewport-top, 0px), 0);
+  }
+
+  /* Focus mode already names the machine in its identity line. Removing the
+     duplicate global machine bar returns 54px to the terminal on a phone. */
+  .app-shell.is-focus-mode .machine-bar { display: none; }
+
+  /* When the software keyboard is present, preserve the critical terminal
+     keys and spend the optional macro row on terminal visibility instead. */
+  .app-shell.keyboard-open .quick-row { display: none; }
+  .app-shell.keyboard-open .focus-header {
+    min-height: 44px;
+    flex-basis: 44px;
   }
 
   .prototype-notes {
