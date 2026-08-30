@@ -492,6 +492,67 @@ pub fn default_shell() -> OsString {
     }
 }
 
+/// Give the windowless Windows daemon safe standard handles. A GUI-subsystem
+/// process launched from HKCU Run can receive null handles; Rust diagnostics
+/// written before the listener loop may otherwise block startup indefinitely.
+#[cfg(windows)]
+pub fn redirect_standard_handles_to_null() -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows_sys::Win32::System::Console::{
+        SetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+
+    let null: Vec<u16> = std::ffi::OsStr::new("NUL")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let input = unsafe {
+        CreateFileW(
+            null.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    if input == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    let output = unsafe {
+        CreateFileW(
+            null.as_ptr(),
+            GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    if output == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe {
+        SetStdHandle(STD_INPUT_HANDLE, input) == 0
+            || SetStdHandle(STD_OUTPUT_HANDLE, output) == 0
+            || SetStdHandle(STD_ERROR_HANDLE, output) == 0
+    } {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn redirect_standard_handles_to_null() -> io::Result<()> {
+    Ok(())
+}
+
 pub fn user_home() -> Option<PathBuf> {
     user_home_from(std::env::var_os("HOME"), std::env::var_os("USERPROFILE"))
 }
