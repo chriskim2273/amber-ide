@@ -429,13 +429,80 @@ impl StateStore {
         tmp.write_all(bytes)?;
         tmp.sync_all()?;
         drop(tmp);
-        fs::rename(&tmp_path, path)?;
+        Self::replace_atomic(&tmp_path, path)?;
         Self::sync_dir(parent)?;
         Ok(())
     }
 
+    /// Replace an existing target without exposing a delete-then-rename gap.
+    /// Unix `rename` is atomic for files in the same directory. Windows needs
+    /// its documented replace-existing form explicitly; `std::fs::rename`
+    /// refuses an already-existing destination there.
+    #[cfg(not(windows))]
+    fn replace_atomic(tmp_path: &Path, path: &Path) -> anyhow::Result<()> {
+        fs::rename(tmp_path, path)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn replace_atomic(tmp_path: &Path, path: &Path) -> anyhow::Result<()> {
+        use std::os::windows::ffi::OsStrExt;
+        use std::time::{Duration, Instant};
+        use windows_sys::Win32::Foundation::{
+            ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{
+            MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        };
+
+        let from: Vec<u16> = tmp_path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let to: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if unsafe {
+                MoveFileExW(
+                    from.as_ptr(),
+                    to.as_ptr(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            } != 0
+            {
+                return Ok(());
+            }
+            let error = std::io::Error::last_os_error();
+            if matches!(
+                error.raw_os_error().map(|code| code as u32),
+                Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)
+            ) && Instant::now() < deadline
+            {
+                // A competing atomic replacement temporarily holds the name.
+                // Keep both files intact and retry the documented primitive;
+                // never create a delete-then-rename exposure window.
+                std::thread::yield_now();
+                continue;
+            }
+            return Err(error.into());
+        }
+    }
+
+    #[cfg(not(windows))]
     fn sync_dir(path: &Path) -> anyhow::Result<()> {
         fs::File::open(path)?.sync_all()?;
+        Ok(())
+    }
+
+    // Windows does not support opening a directory as a normal `File`, and
+    // MoveFileExW's WRITE_THROUGH flag is the durable replacement boundary.
+    #[cfg(windows)]
+    fn sync_dir(_path: &Path) -> anyhow::Result<()> {
         Ok(())
     }
 

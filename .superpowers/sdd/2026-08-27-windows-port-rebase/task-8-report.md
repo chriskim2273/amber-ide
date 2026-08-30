@@ -92,3 +92,26 @@ must complete on the Windows runner with its normal Cargo test timeout; it is
 not skipped or given a short artificial timeout. `cargo fmt --check` remains
 blocked by unrelated repository-wide formatting drift, and the prior
 Windows-GNU DLL-tool issue remains outside this task.
+
+## Review follow-up: Windows state-store durability
+
+Native Windows initially reproduced the state-store failure: `File::open` on a
+directory made `sync_dir` return `Access is denied (os error 5)`, and standard
+library rename did not replace an existing file. The state store now retains
+the Unix protocol (same-directory temporary file, file fsync, atomic rename,
+directory fsync) while Windows uses `MoveFileExW` with
+`MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH`. Directory sync is a
+Windows no-op because opening a directory as a normal file is unsupported; the
+write-through replacement is the Windows durable commit boundary. Temporary
+names remain unique, and a bounded retry handles only transient concurrent
+replace sharing/lock errors without a delete-then-rename window. Persistent
+errors still propagate.
+
+On `potato-server` (`dev@100.108.115.125`, Windows/MSVC),
+`cargo test -q -p amber-core` passed **115 passed, 0 failed** after the fix;
+the prior RED was 94 passed, 21 failed from directory sync, then one concurrent
+overwrite failure before the bounded retry. Native strict
+`RUSTFLAGS='-Dwarnings' cargo clippy -q -p amber-core` also passed. Linux
+`cargo test -q -p amber-core` passed **116 tests**, and local strict clippy
+passed. Codebase-memory MCP was unavailable in this session, so the durability
+path was traced by direct source search instead.
