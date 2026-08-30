@@ -1,8 +1,10 @@
 # Productivity & Continuity Suite — Implementation Plan
 
-**Design:** `docs/superpowers/specs/2026-08-29-productivity-continuity-suite-design.md`  
-**Worktree:** `/media/poyto/Teacup/Worktrees/amber-productivity-suite`  
-**Branch:** `feat/productivity-suite`  
+**Status:** complete (2026-08-30)
+**Final review:** `docs/superpowers/reviews/2026-08-30-productivity-continuity-suite-implementation-review.md`
+**Design:** `docs/superpowers/specs/2026-08-29-productivity-continuity-suite-design.md`
+**Worktree:** `/media/poyto/Teacup/Worktrees/amber-productivity-suite`
+**Branch:** `feat/productivity-suite`
 **Testing rule:** author tests in the worktree; mirror with `rsync` into `/tmp/amber-productivity-suite-test` and run every command there. Never execute tests/builds from `/media/poyto/Teacup`.
 
 ## Execution discipline

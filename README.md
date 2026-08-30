@@ -103,9 +103,21 @@ straight to a single xterm.js emulator.
 - A web-viewer pane kind (Electron `<webview>` + URL bar); its URL persists and
   survives reboot via the sidecar. Popups open in the system browser.
 
-**Workspaces**
+**Workspaces & continuity tools**
 - Save/load a whole workspace (structure + scrollback) to a portable
-  `.amberws` JSON file.
+  `.amberws` JSON file; capture reusable templates and named restore points.
+- A keyboard-first command palette switches among every pane, tab, workspace,
+  and common action.
+- Search retained scrollback across daemon sessions without loading every ring
+  into the renderer; selecting a result opens that pane's local find bar.
+- Recovery history records restores, exits, supervision transitions, snapshots,
+  and failures in a bounded daemon journal.
+- Terminal bookmarks, activity/memory overview, desktop notifications, and
+  bounded single-session handoff exports support long-running work.
+- Explicitly reviewed `.amber.toml` files may declare pane kinds, folders, and
+  split direction. They cannot run commands or escape their project root.
+- Restore points recreate session structure and replay scrollback; they are not
+  process-memory checkpoints and arbitrary programs do not resume after reboot.
 
 **CLI (`amber`)** — works standalone from any terminal
 - `ls`, `create`, `attach` (newest or by name), `kill`, `rename`.
