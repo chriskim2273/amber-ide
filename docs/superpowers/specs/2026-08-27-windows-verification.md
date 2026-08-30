@@ -1,8 +1,9 @@
 # Windows native CI and release verification
 
 **Status:** native implementation, full CI gate, NSIS packaging, and packaged
-daemon/CLI smoke proof complete. Interactive-desktop, agent-resume, logoff, and
-reboot restore proof remain open.
+daemon/CLI smoke proof complete before the final `main` sync. Current head passes
+Linux and Windows cross-target gates; its native Windows rerun plus interactive-
+desktop, agent-resume, logoff, and reboot restore proof remain open.
 
 Amber's Windows daemon uses current-user named pipes and ConPTY, so the
 mandatory proof runs on `windows-latest` x64 with the MSVC toolchain. Linux
@@ -28,8 +29,8 @@ remain executable, not a documentation-only checklist:
    `windows_pipe_peer.exe`, then run `node app/test/windows-pipe.mjs`. This is
    the real Node ↔ Rust named-pipe harness, not its platform-neutral lifecycle
    unit test.
-5. `npm ci`, `npm run typecheck`, `npx vitest run`, and `npm run build` in
-   `app`.
+5. `npm ci`, `npm run typecheck`, `npx vitest run`, `npm run build`, and
+   `npm run build:web` in `app`.
 6. The job stages the release Rust binaries, builds the per-user x64 NSIS
    installer, and asserts that the installer plus bundled `amber.exe` and
    `amberd.exe` exist.
@@ -45,7 +46,7 @@ then separately proves a peer close wakes that loop. Its console-mode test seam
 uses the same RAII teardown helper as the real guard and verifies output mode is
 restored before input mode without mutating the CI console.
 
-## Native evidence through `decb88a`
+## Pre-main-sync native evidence at `decb88a`
 
 The following commands ran on the native MSVC Windows host during the final
 implementation pass:
@@ -67,6 +68,21 @@ implementation pass:
   tests, typecheck, and production bundle also passed.
 - [ ] Run the committed `rust-windows` job on GitHub Actions. The same commands
   passed manually on the native host, but this branch has not been pushed.
+
+## Current-main integration evidence
+
+The branch was rebased onto `main` at `d07186f` after that native run. Integration
+work preserved Hermes and Pi supervision/setup, added `%USERPROFILE%` fallback
+for every agent's Windows home, removed an accidental Unix gate from the Hermes
+kind test, and made NSIS/package scripts build the new Pocket web bundle.
+
+- [x] Windows MSVC cross-target check passes for the full workspace and all
+  targets with `test-support`.
+- [x] Linux full workspace tests and strict all-target clippy pass.
+- [x] App typecheck, 645 passed tests plus 1 existing skip, Electron production
+  build, and Pocket web build pass.
+- [ ] Repeat the full native Windows workspace, app, package, and runtime gates
+  on current head.
 
 ## Native packaged-runtime evidence
 
@@ -96,7 +112,7 @@ the SSH Services-session package smoke do not substitute for interactive checks.
 
 - [ ] Fresh-user desktop install and first launch.
 - [ ] Resume each supported agent conversation after daemon restart: Claude,
-  Codex, Grok, and OpenCode.
+  Codex, Grok, OpenCode, Hermes, and Pi.
 - [ ] `amber attach` through an alternate-screen/full-screen TUI, including
   clean detach and terminal restoration.
 - [ ] `amber web` in a real Windows browser, including login and live terminal
