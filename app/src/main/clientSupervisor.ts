@@ -28,3 +28,11 @@ export function nextAttempt(prevAttempt: number, uptimeMs: number, stableMs: num
 export function launchIfAbsent<T>(current: T | null, launch: () => T): T {
   return current ?? launch()
 }
+
+export function shouldRelaunchClient(state: {
+  quitting: boolean
+  windowClosed: boolean
+  windowDestroyed: boolean
+}): boolean {
+  return !state.quitting && !state.windowClosed && !state.windowDestroyed
+}

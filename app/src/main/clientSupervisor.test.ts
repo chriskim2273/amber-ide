@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { backoffDelay, launchIfAbsent, nextAttempt } from './clientSupervisor'
+import { backoffDelay, launchIfAbsent, nextAttempt, shouldRelaunchClient } from './clientSupervisor'
 
 const cfg = { baseMs: 100, maxMs: 2000 }
 
@@ -52,5 +52,30 @@ describe('launchIfAbsent', () => {
 
     expect(second).toBe(first)
     expect(launches).toBe(1)
+  })
+})
+
+describe('shouldRelaunchClient', () => {
+  it('relaunches while its owning window and app remain active', () => {
+    expect(shouldRelaunchClient({
+      quitting: false,
+      windowClosed: false,
+      windowDestroyed: false,
+    })).toBe(true)
+  })
+
+  it('does not relaunch after its owning window closes', () => {
+    expect(shouldRelaunchClient({
+      quitting: false,
+      windowClosed: true,
+      windowDestroyed: false,
+    })).toBe(false)
+  })
+
+  it.each([
+    { quitting: true, windowClosed: false, windowDestroyed: false },
+    { quitting: false, windowClosed: false, windowDestroyed: true },
+  ])('does not relaunch for inactive app/window state %#', (state) => {
+    expect(shouldRelaunchClient(state)).toBe(false)
   })
 })

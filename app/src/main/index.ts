@@ -34,7 +34,7 @@ import {
   isWindowsTaskkillNoMatch,
   shouldStopWindowsDaemon,
 } from './serviceManager'
-import { backoffDelay, launchIfAbsent, nextAttempt } from './clientSupervisor'
+import { backoffDelay, launchIfAbsent, nextAttempt, shouldRelaunchClient } from './clientSupervisor'
 import {
   renderDesktopEntry,
   stableAppImagePath,
@@ -1005,19 +1005,24 @@ async function openWindow(target: WindowTarget): Promise<WindowCtx> {
   let controlPort: Electron.MessagePortMain | null = null
   let relaunchAttempt = 0
   let quitting = false
+  let windowClosed = false
+  const stopClient = (): void => {
+    try { controlPort?.close() } catch { /* already closed */ }
+    controlPort = null
+    try { child?.kill() } catch { /* already dead */ }
+    child = null
+  }
   // Tear the client utilityProcess down on quit. Spec §7: window close closes
   // the utilityProcess and leaves the daemon running. Without this kill, the
   // child outlives the window; combined with the historical darwin skip in
   // window-all-closed, the red traffic-light left a headless Electron process
   // in the Dock that required Force Quit.
-  app.on('before-quit', () => {
+  const onBeforeQuit = (): void => {
     killTunnels()
     quitting = true
-    try { controlPort?.close() } catch { /* already closed */ }
-    controlPort = null
-    try { child?.kill() } catch { /* already dead */ }
-    child = null
-  })
+    stopClient()
+  }
+  app.on('before-quit', onBeforeQuit)
 
   // Browser panes host <webview> web contents. Route popups (window.open /
   // target=_blank) to the system browser and refuse in-app popup windows, and
@@ -1064,14 +1069,14 @@ async function openWindow(target: WindowTarget): Promise<WindowCtx> {
       // (matches the "replace dead ports" intent; nothing will read port1 again).
       port1.close()
       if (child === c) { child = null; controlPort = null }
-      if (quitting) return
+      if (!shouldRelaunchClient({ quitting, windowClosed, windowDestroyed: win.isDestroyed() })) return
       // Crash is never silent: flip the renderer to disconnected right away
       // (same shape the daemon uses), even if the window is gone on macOS.
       notifyRenderer({ status: 'disconnected' })
       relaunchAttempt = nextAttempt(relaunchAttempt, Date.now() - spawnedAt, CLIENT_STABLE_MS)
       const delay = backoffDelay(relaunchAttempt, { baseMs: 100, maxMs: 2000 })
       setTimeout(() => {
-        if (quitting || win.isDestroyed()) return
+        if (!shouldRelaunchClient({ quitting, windowClosed, windowDestroyed: win.isDestroyed() })) return
         wireChild()
         // The renderer's MessagePorts died with the old child. Tell it to
         // re-request pane ports from the NEW child (handled via childEpoch).
@@ -1089,7 +1094,12 @@ async function openWindow(target: WindowTarget): Promise<WindowCtx> {
   }
   windowCtxs.set(win.webContents.id, ctx)
   const id = win.webContents.id
-  win.on('closed', () => { windowCtxs.delete(id) })
+  win.on('closed', () => {
+    windowClosed = true
+    windowCtxs.delete(id)
+    app.off('before-quit', onBeforeQuit)
+    stopClient()
+  })
   return ctx
 }
 
