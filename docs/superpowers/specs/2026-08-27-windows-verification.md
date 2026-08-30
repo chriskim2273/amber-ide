@@ -61,7 +61,7 @@ implementation pass:
   passed.
 - [x] The Node/Rust named-pipe peer harness passed with two clients, exact frame
   exchange, and blocked-peer release.
-- [x] App Vitest passed 582 tests across 43 files, with 5 explicitly
+- [x] App Vitest passed 583 tests across 43 files, with 5 explicitly
   Unix-specific skips; typecheck and production bundle build passed.
 - [x] Linux reruns of the full Rust workspace, strict all-target clippy, app
   tests, typecheck, and production bundle also passed.

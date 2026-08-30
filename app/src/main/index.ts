@@ -34,7 +34,7 @@ import {
   isWindowsTaskkillNoMatch,
   shouldStopWindowsDaemon,
 } from './serviceManager'
-import { backoffDelay, nextAttempt } from './clientSupervisor'
+import { backoffDelay, launchIfAbsent, nextAttempt } from './clientSupervisor'
 import {
   renderDesktopEntry,
   stableAppImagePath,
@@ -1043,13 +1043,14 @@ async function openWindow(target: WindowTarget): Promise<WindowCtx> {
     // The ONLY thing that makes a window remote: which socket its client
     // opens. `resolveSocketPath` honours AMBER_SOCKET, and an ssh -L tunnel
     // puts a remote daemon behind a local socket file (spec 2026-08-23 §2).
-    const c = utilityProcess.fork(
+    const c = launchIfAbsent(child, () => utilityProcess.fork(
       clientPath,
       [],
       target.socket !== undefined
         ? { env: { ...process.env, AMBER_SOCKET: target.socket } }
         : undefined,
-    )
+    ))
+    if (c === child) return
     child = c
     const spawnedAt = Date.now()
     const { port1, port2 } = new MessageChannelMain()
@@ -1078,7 +1079,6 @@ async function openWindow(target: WindowTarget): Promise<WindowCtx> {
       }, delay)
     })
   }
-  wireChild()
   wireChild()
 
   const ctx: WindowCtx = {

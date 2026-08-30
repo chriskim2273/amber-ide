@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { backoffDelay, nextAttempt } from './clientSupervisor'
+import { backoffDelay, launchIfAbsent, nextAttempt } from './clientSupervisor'
 
 const cfg = { baseMs: 100, maxMs: 2000 }
 
@@ -35,5 +35,22 @@ describe('nextAttempt', () => {
     expect(a).toBe(6)
     // and the delay it feeds is capped, not unbounded
     expect(backoffDelay(a, cfg)).toBe(2000)
+  })
+})
+
+describe('launchIfAbsent', () => {
+  it('keeps one active client when startup is requested twice', () => {
+    let launches = 0
+    const first = launchIfAbsent<object>(null, () => {
+      launches += 1
+      return { id: launches }
+    })
+    const second = launchIfAbsent(first, () => {
+      launches += 1
+      return { id: launches }
+    })
+
+    expect(second).toBe(first)
+    expect(launches).toBe(1)
   })
 })

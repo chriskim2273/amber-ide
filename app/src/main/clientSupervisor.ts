@@ -23,3 +23,8 @@ export function backoffDelay(attempt: number, cfg: BackoffConfig): number {
 export function nextAttempt(prevAttempt: number, uptimeMs: number, stableMs: number): number {
   return uptimeMs >= stableMs ? 0 : Math.max(0, prevAttempt) + 1
 }
+
+/** Keep one live utility client per window; relaunch only after exit clears it. */
+export function launchIfAbsent<T>(current: T | null, launch: () => T): T {
+  return current ?? launch()
+}
