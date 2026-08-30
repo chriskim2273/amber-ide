@@ -9,7 +9,7 @@ import '@xterm/xterm/css/xterm.css'
 import { appChord } from './keys'
 import { takeReplay } from './replay'
 import { decodeOsc52Payload } from './osc'
-import { shiftEnterSequence } from './terminalKeys'
+import { KeyboardInputModeTracker, shiftEnterSequence } from './terminalKeys'
 
 // Imperative scrollback-search handle handed to the chrome (the find bar in
 // SplitView) via `onSearchReady`. Search execution stays outside React — the
@@ -241,20 +241,23 @@ export const Pane = memo(function Pane(
 
     let port: MessagePort | null = null
     let wired = false
+    const keyboardMode = new KeyboardInputModeTracker()
 
     // App chords (Cmd on mac / Ctrl+Shift on Linux) must not be sent to the
     // pty — return false so xterm neither renders nor forwards them; the event
     // still bubbles to the window handlers in App/SplitView.
-    // Preserve the browser's Shift modifier for Pi via CSI-u. Other programs
-    // retain Amber's negotiation-free Meta+Enter compatibility fallback.
-    const shiftEnterBytes = new TextEncoder().encode(shiftEnterSequence(kind))
+    // Preserve the browser's Shift modifier. A supervised Pi pane is known by
+    // kind; a Pi launched later from a shell pane is detected from the live
+    // Kitty/modifyOtherKeys negotiation it writes to the terminal.
     term.attachCustomKeyEventHandler((e) => {
       // Checked BEFORE the keydown gate and preventDefault'd: returning false
       // only skips xterm's keydown path, it does not stop the event, so the
       // browser's follow-up keypress would make xterm emit a bare CR right after
       // our custom sequence — newline inserted, then submitted anyway.
       if (e.key === 'Enter' && e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) {
-        if (e.type === 'keydown') port?.postMessage({ data: shiftEnterBytes })
+        if (e.type === 'keydown') port?.postMessage({
+          data: new TextEncoder().encode(shiftEnterSequence(kind, keyboardMode.current)),
+        })
         e.preventDefault()
         return false
       }
@@ -510,7 +513,11 @@ export const Pane = memo(function Pane(
         // state. Skipped for the pane's FIRST backlog: a `.amberws` load stages
         // replay bytes before the port is wired, and clearing would wipe exactly
         // the history that load exists to restore.
-        if (isBacklog && attachedOnceRef.current) term.reset()
+        if (isBacklog && attachedOnceRef.current) {
+          term.reset()
+          keyboardMode.reset()
+        }
+        keyboardMode.feed(m.data)
         term.write(m.data) // xterm.write accepts Uint8Array (UTF-8)
         if (isBacklog) {
           attachedOnceRef.current = true

@@ -1272,6 +1272,20 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   secrets are not implied safe. Browser/editor panes and web/remote bridges do
   not receive this desktop-only input authority.
 
+- [x] Shift+Enter for Pi launched from shell panes (2026-08-30) — the earlier
+  fix selected CSI-u from the daemon's static session kind, so a supervised
+  `kind:"pi"` pane worked while typing `pi` inside an ordinary shell pane still
+  sent Amber's Claude-compatible Meta+Enter fallback; current Pi interpreted
+  that as follow-up/submit instead of newline. `Pane` now tracks only the live
+  Kitty keyboard / xterm modifyOtherKeys mode-control sequences in pty output
+  (bounded streaming recognizer, including split Data frames) and encodes
+  Shift+Enter for the negotiated mode. It resets before re-attach backlog
+  replay, while programs that negotiate neither keep the shell-safe Meta+Enter
+  fallback. TDD covers Kitty, realistic Pi fallback negotiation, chunk splits,
+  disable, and legacy behavior. Live xvfb+CDP proof against Pi 0.84.4 covered
+  both a supervised Pi pane and Pi launched manually inside a shell pane: text
+  stayed as two editor lines and was not submitted.
+
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**
   `std::io::Read` (dedicated thread); `take_writer()` is one-shot;
