@@ -2542,7 +2542,12 @@ mod tests {
             hook_command(Path::new(r"C:\Users\Ada Lovelace\amber.exe")),
             r#""C:\Users\Ada Lovelace\amber.exe" hook"#
         );
-        assert_eq!(hook_command(Path::new("/usr/local/bin/amber")), "/usr/local/bin/amber hook");
+        let expected = if cfg!(windows) {
+            r#""/usr/local/bin/amber" hook"#
+        } else {
+            "/usr/local/bin/amber hook"
+        };
+        assert_eq!(hook_command(Path::new("/usr/local/bin/amber")), expected);
     }
 
     #[test]
