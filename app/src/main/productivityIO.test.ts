@@ -9,12 +9,20 @@ import type { WorkspaceDoc } from '../shared/workspaceFile'
 const doc: WorkspaceDoc = { version: 1, scope: 'one', workspaces: [{ tabs: [] }] }
 
 describe('productivity IO', () => {
-  it('uses exact-content CAS', async () => {
+  it('uses exact-content CAS and refuses oversized loads', async () => {
     const root = await mkdtemp(join(tmpdir(), 'amber-productivity-'))
     const path = join(root, 'productivity.json')
     expect(await loadProductivityFile(path)).toEqual({ text: null, version: null })
     expect(await saveProductivityFile(path, '{"version":1}', null)).toEqual({ ok: true, version: '{"version":1}' })
     expect(await saveProductivityFile(path, 'new', null)).toEqual({ conflict: true, text: '{"version":1}', version: '{"version":1}' })
+    const invalid = join(root, 'invalid.json')
+    expect(await saveProductivityFile(invalid, 'not-json', null)).toEqual({ error: 'invalid productivity file' })
+    const link = join(root, 'linked.json')
+    await symlink(path, link)
+    expect(await loadProductivityFile(link)).toEqual({ text: null, version: null })
+    expect(await saveProductivityFile(link, '{"version":1}', null)).toEqual({ error: 'productivity path is not a regular file' })
+    await writeFile(path, 'x'.repeat(4 * 1024 * 1024 + 1))
+    expect(await loadProductivityFile(path)).toEqual({ text: null, version: null })
   })
 
   it('validates project containment and real directories', async () => {
@@ -37,6 +45,20 @@ describe('productivity IO', () => {
     await deleteCheckpoint(root, id)
     expect(await listCheckpoints(root)).toEqual([])
     await expect(writeCheckpoint(root, '../escape', text)).rejects.toThrow(/id/)
+  })
+
+  it('retains only the newest 20 automatic checkpoints and never prunes manual ones', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'amber-checkpoint-retention-'))
+    const manualId = 'checkpoint-manual'
+    await writeCheckpoint(root, manualId, serializeCheckpoint(doc, { id: manualId, name: 'manual', createdAt: 0, scope: 'one', automatic: false }))
+    for (let index = 0; index < 21; index += 1) {
+      const id = `checkpoint-auto-${String(index).padStart(2, '0')}`
+      await writeCheckpoint(root, id, serializeCheckpoint(doc, { id, name: `auto ${index}`, createdAt: index + 1, scope: 'one', automatic: true }))
+    }
+    const listed = await listCheckpoints(root)
+    expect(listed.filter((point) => point.automatic)).toHaveLength(20)
+    expect(listed.map((point) => point.id)).toContain(manualId)
+    expect(listed.map((point) => point.id)).not.toContain('checkpoint-auto-00')
   })
 
   it('lists bounded metadata without parsing the workspace body and rejects symlinks', async () => {

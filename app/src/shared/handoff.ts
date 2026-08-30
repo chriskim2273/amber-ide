@@ -1,6 +1,7 @@
 import type { SessionBookmark } from './productivity'
 
 export const HANDOFF_VERSION = 1
+export const HANDOFF_FILE_MAX = 8 * 1024 * 1024
 export interface SessionHandoff {
   version: 1
   exportedAt: number
@@ -23,6 +24,7 @@ export function serializeHandoff(value: SessionHandoff): string {
 }
 
 export function parseHandoff(text: string): SessionHandoff {
+  if (new TextEncoder().encode(text).length > HANDOFF_FILE_MAX) throw new Error('handoff exceeds 8 MiB')
   let value: unknown
   try { value = JSON.parse(text) } catch { throw new Error('invalid handoff JSON') }
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid handoff')
@@ -31,9 +33,12 @@ export function parseHandoff(text: string): SessionHandoff {
   const session = raw['session']
   if (!session || typeof session !== 'object' || Array.isArray(session)) throw new Error('invalid handoff session')
   const s = session as Record<string, unknown>
-  if (typeof s['kind'] !== 'string' || typeof s['cwd'] !== 'string') throw new Error('invalid handoff metadata')
+  if (typeof s['kind'] !== 'string' || s['kind'].length === 0 || s['kind'].length > 32
+    || typeof s['cwd'] !== 'string' || s['cwd'].length === 0 || s['cwd'].length > 4096) throw new Error('invalid handoff metadata')
   if (typeof raw['exportedAt'] !== 'number' || !Number.isFinite(raw['exportedAt'])) throw new Error('invalid export time')
-  if (typeof raw['scrollback'] !== 'string' || raw['scrollback'].length > 4 * 1024 * 1024) throw new Error('invalid handoff scrollback')
+  const scrollback = raw['scrollback']
+  const base64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/
+  if (typeof scrollback !== 'string' || scrollback.length > 4 * 1024 * 1024 || !base64.test(scrollback)) throw new Error('invalid handoff scrollback')
   const optionalString = (key: string): string | undefined => {
     const result = s[key]
     if (result === undefined) return undefined
@@ -41,11 +46,13 @@ export function parseHandoff(text: string): SessionHandoff {
     return result
   }
   const slot = s['slot']
-  if (slot !== undefined && (typeof slot !== 'number' || !Number.isFinite(slot))) throw new Error('invalid slot')
+  if (slot !== undefined && (typeof slot !== 'number' || !Number.isInteger(slot) || slot <= 0 || slot > 0xffff_ffff)) throw new Error('invalid slot')
   const bookmarks = Array.isArray(raw['bookmarks']) ? raw['bookmarks'].filter((entry): entry is SessionBookmark => {
     if (!entry || typeof entry !== 'object') return false
     const b = entry as Partial<SessionBookmark>
-    return typeof b.id === 'string' && typeof b.createdAt === 'number' && typeof b.label === 'string' && typeof b.excerpt === 'string'
+    return typeof b.id === 'string' && /^[a-z0-9-]{8,64}$/.test(b.id)
+      && typeof b.createdAt === 'number' && Number.isFinite(b.createdAt)
+      && typeof b.label === 'string' && typeof b.excerpt === 'string'
   }).slice(0, 100).map((b) => ({ ...b, label: [...b.label].slice(0, 120).join(''), excerpt: [...b.excerpt].slice(0, 500).join('') })) : []
   return {
     version: HANDOFF_VERSION,
@@ -57,6 +64,6 @@ export function parseHandoff(text: string): SessionHandoff {
       ...(() => { const runState = optionalString('runState'); return runState === undefined ? {} : { runState } })(),
       ...(() => { const conversationId = optionalString('conversationId'); return conversationId === undefined ? {} : { conversationId } })(),
     },
-    scrollback: raw['scrollback'], bookmarks,
+    scrollback, bookmarks,
   }
 }

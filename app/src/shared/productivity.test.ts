@@ -64,5 +64,11 @@ describe('productivity schemas', () => {
     const parsed = parseHandoff(text)
     expect(parsed.session).toEqual({ kind: 'shell', cwd: '/tmp', slot: 2, title: 'work' })
     expect(text).not.toContain('amber-1-1')
+    for (const corrupt of [
+      { ...parsed, scrollback: 'not base64!' },
+      { ...parsed, session: { ...parsed.session, kind: 'x'.repeat(33) } },
+      { ...parsed, session: { ...parsed.session, cwd: 'x'.repeat(4097) } },
+      { ...parsed, session: { ...parsed.session, slot: -1 } },
+    ]) expect(() => parseHandoff(JSON.stringify(corrupt))).toThrow()
   })
 })

@@ -12,8 +12,12 @@ async function atomicWrite(path: string, text: string): Promise<void> {
 }
 
 export async function loadProductivityFile(path: string): Promise<LoadProductivityResult> {
-  try { const text = await readFile(path, 'utf8'); return { text, version: text } }
-  catch { return { text: null, version: null } }
+  try {
+    const info = await lstat(path)
+    if (!info.isFile() || info.isSymbolicLink() || info.size > 4 * 1024 * 1024) return { text: null, version: null }
+    const text = await readFile(path, 'utf8')
+    return { text, version: text }
+  } catch { return { text: null, version: null } }
 }
 
 export async function saveProductivityFile(
@@ -21,8 +25,16 @@ export async function saveProductivityFile(
 ): Promise<SaveProductivityResult> {
   try {
     if (Buffer.byteLength(text) > 4 * 1024 * 1024) return { error: 'productivity file exceeds 4 MiB' }
+    const info = await lstat(path).catch(() => null)
+    if (info && (!info.isFile() || info.isSymbolicLink())) return { error: 'productivity path is not a regular file' }
     const current = await readFile(path, 'utf8').catch(() => null)
     if (current !== expected) return { conflict: true, text: current, version: current }
+    try {
+      const raw = JSON.parse(text) as unknown
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw) || (raw as Record<string, unknown>)['version'] !== 1) {
+        return { error: 'invalid productivity file' }
+      }
+    } catch { return { error: 'invalid productivity file' } }
     await atomicWrite(path, text)
     return { ok: true, version: text }
   } catch (error) { return { error: error instanceof Error ? error.message : String(error) } }

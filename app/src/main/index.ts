@@ -8,6 +8,7 @@ import { spawn, execFileSync } from 'node:child_process'
 import { readFile, writeFile, rename, mkdir, copyFile, chmod, realpath, rm, stat, mkdtemp } from 'node:fs/promises'
 import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
 import { resolveSocketPath } from '../shared/socketPath'
+import { HANDOFF_FILE_MAX, parseHandoff } from '../shared/handoff'
 import { pathCandidates } from '../shared/pathSel'
 import { ensureDaemon, probeSocket } from './daemonBoot'
 import { resolveAmberBinary } from './amberBin'
@@ -1010,15 +1011,19 @@ async function main(): Promise<void> {
   })
   ipcMain.handle('handoff-save-file', async (e, text: unknown, suggested: unknown) => {
     const ctx = ctxFor(e)
-    if (ctx?.target.kind === 'remote' || typeof text !== 'string' || typeof suggested !== 'string') return false
+    if (ctx?.target.kind === 'remote' || typeof text !== 'string' || typeof suggested !== 'string'
+      || Buffer.byteLength(text) > HANDOFF_FILE_MAX) return false
+    try { parseHandoff(text) } catch { return false }
+    const safeName = basename(suggested).slice(0, 120)
     const r = await dialog.showSaveDialog(ctx?.win ?? win, {
-      defaultPath: suggested,
+      defaultPath: safeName,
       filters: [{ name: 'amber session handoff', extensions: ['amberhandoff'] }],
     })
     if (r.canceled || !r.filePath) return false
     const path = r.filePath.endsWith('.amberhandoff') ? r.filePath : `${r.filePath}.amberhandoff`
-    await writeFile(`${path}.tmp`, text, { mode: 0o600 })
-    await rename(`${path}.tmp`, path)
+    const tmp = `${path}.${process.pid}.${Date.now()}.tmp`
+    await writeFile(tmp, text, { mode: 0o600 })
+    await rename(tmp, path)
     return true
   })
   ipcMain.on('desktop-notify', (e, payload: unknown) => {
