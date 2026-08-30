@@ -14,7 +14,7 @@ import { Drawer } from './Drawer'
 import { useMobile } from './mobile'
 import type { WebStatus } from '../shared/webStatus'
 import {
-  emptyProductivity, parseProductivity, serializeProductivity, mutateProductivity,
+  emptyProductivity, parseProductivity, serializeProductivity, mutateProductivity, replayProductivity,
   type LoadProductivityResult, type SaveProductivityResult, type ProductivityFile,
   type WorkspaceTemplate, type SessionBookmark,
 } from '../shared/productivity'
@@ -241,6 +241,8 @@ function App(): JSX.Element {
   const productivityRef = useRef(productivity)
   productivityRef.current = productivity
   const productivityVersion = useRef<string | null>(null)
+  const productivityPersisted = useRef<ProductivityFile>(emptyProductivity())
+  const productivityPending = useRef<Array<(file: ProductivityFile) => ProductivityFile>>([])
   const productivitySaveChain = useRef<Promise<void>>(Promise.resolve())
   const [searchResults, setSearchResults] = useState<import('../shared/proto').SearchResult[]>([])
   const [searchLoading, setSearchLoading] = useState(false)
@@ -535,6 +537,7 @@ function App(): JSX.Element {
     void window.amber.loadProductivity?.().then(({ text, version }) => {
       const next = text ? parseProductivity(text) : emptyProductivity()
       productivityVersion.current = version
+      productivityPersisted.current = next
       setProductivity(next)
     })
   }, [bridgeReady])
@@ -639,23 +642,30 @@ function App(): JSX.Element {
 
   const updateProductivity = (mutation: (file: ProductivityFile) => ProductivityFile): void => {
     if (!window.amber.saveProductivity || remoteHost) return
-    setProductivity((previous) => {
-      const next = mutateProductivity(previous, mutation)
-      productivitySaveChain.current = productivitySaveChain.current.then(async () => {
-        const save = window.amber.saveProductivity
-        if (!save) return
-        let result = await save(serializeProductivity(next), productivityVersion.current)
-        if ('conflict' in result) {
-          const remote = result.text ? parseProductivity(result.text) : emptyProductivity()
-          const merged = mutateProductivity(remote, mutation)
-          result = await save(serializeProductivity(merged), result.version)
-          if ('ok' in result) setProductivity(merged)
-        }
-        if ('ok' in result) productivityVersion.current = result.version
-        else if ('error' in result) setNotice(`Productivity data could not be saved — ${result.error}`)
-        else setNotice('Productivity data changed in another window; try again.')
-      })
-      return next
+    productivityPending.current.push(mutation)
+    setProductivity((previous) => mutateProductivity(previous, mutation))
+    productivitySaveChain.current = productivitySaveChain.current.then(async () => {
+      const save = window.amber.saveProductivity
+      if (!save || productivityPending.current.length === 0) return
+      // Replay every not-yet-persisted operation over the last confirmed disk
+      // value. On CAS conflict replay the same operations over the fresh remote;
+      // never write a stale optimistic snapshot that can erase another window.
+      const pending = [...productivityPending.current]
+      const replay = (base: ProductivityFile): ProductivityFile => replayProductivity(base, pending)
+      let next = replay(productivityPersisted.current)
+      let result = await save(serializeProductivity(next), productivityVersion.current)
+      if ('conflict' in result) {
+        const remote = result.text ? parseProductivity(result.text) : emptyProductivity()
+        next = replay(remote)
+        result = await save(serializeProductivity(next), result.version)
+      }
+      if ('ok' in result) {
+        productivityVersion.current = result.version
+        productivityPersisted.current = next
+        productivityPending.current.splice(0, pending.length)
+        setProductivity(replayProductivity(next, productivityPending.current))
+      } else if ('error' in result) setNotice(`Productivity data could not be saved — ${result.error}`)
+      else setNotice('Productivity data changed in another window; try again.')
     })
   }
 
@@ -1291,6 +1301,7 @@ function App(): JSX.Element {
     setToolbarMenu(null); setProductivityOverlay(overlay)
     if (overlay === 'recovery') refreshRecovery()
     if (overlay === 'checkpoints') void window.amber.listCheckpoints?.().then(setCheckpoints)
+    if (overlay === 'project') { setProjectProfile(null); setProjectError(null) }
   }
   const captureTemplate = (name: string): void => {
     void captureWorkspace('one', false).then(({ doc }) => updateProductivity((file) => ({ ...file, templates: [

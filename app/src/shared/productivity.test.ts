@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { emptyProductivity, parseProductivity, serializeProductivity } from './productivity'
+import { emptyProductivity, parseProductivity, replayProductivity, serializeProductivity } from './productivity'
 import { parseProjectProfile } from './projectProfile'
 import { parseCheckpoint, serializeCheckpoint } from './checkpoint'
 import { parseHandoff, serializeHandoff } from './handoff'
@@ -19,6 +19,18 @@ describe('productivity schemas', () => {
     expect(parsed.bookmarks['s']).toHaveLength(100)
     expect(parsed.bookmarks['s']![0]!.label).toHaveLength(120)
     expect(parsed.bookmarks['s']![0]!.excerpt).toHaveLength(500)
+  })
+
+  it('replays queued local operations over a fresh CAS-conflict remote', () => {
+    const remote = emptyProductivity()
+    remote.templates.push({ id: 'template-remote', name: 'remote', createdAt: 1, doc })
+    const rebased = replayProductivity(remote, [
+      (file) => ({ ...file, notifications: { ...file.notifications, activity: true } }),
+      (file) => ({ ...file, bookmarks: { ...file.bookmarks, session: [{ id: 'bookmark-local', createdAt: 2, label: 'local', excerpt: 'needle' }] } }),
+    ])
+    expect(rebased.templates[0]?.name).toBe('remote')
+    expect(rebased.notifications.activity).toBe(true)
+    expect(rebased.bookmarks['session']?.[0]?.label).toBe('local')
   })
 
   it('parses the strict non-executable project profile', () => {

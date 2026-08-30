@@ -129,3 +129,10 @@ export function mutateProductivity(
 ): ProductivityFile {
   return parseProductivity(JSON.stringify(mutation(parseProductivity(JSON.stringify(current)))))
 }
+
+export function replayProductivity(
+  base: ProductivityFile,
+  mutations: Array<(fresh: ProductivityFile) => ProductivityFile>,
+): ProductivityFile {
+  return mutations.reduce((file, mutation) => mutateProductivity(file, mutation), base)
+}
