@@ -1,7 +1,6 @@
 import { useRef, useState, useEffect, lazy, Suspense } from 'react'
 import { Pane, type SearchApi, type InputApi } from './Pane'
 import { KeyboardDock } from './KeyBar'
-import { useMobile } from './mobile'
 import { Browser } from './Browser'
 import type { EditorApi } from './Editor'
 import { paneRects, handles, nextPaneInDirection, focusCandidates, ratioAt, leaves, type Node, type Rect, type Zone, type FocusDir } from './layout'
@@ -215,6 +214,8 @@ export function SplitView(props: {
   hasPresetInputs?: boolean
   insertPresetRequest?: { paneId: string; text: string; seq: number } | undefined
   onPresetInserted?: (seq: number) => void
+  /** App-level effective mode, including the user's Pocket/Desktop override. */
+  mobile: boolean
 }): JSX.Element {
   const ref = useRef<HTMLDivElement>(null)
   const [size, setSize] = useState<Rect>({ x: 0, y: 0, w: 0, h: 0 })
@@ -222,7 +223,7 @@ export function SplitView(props: {
   // Focused pane lives HERE (not App) so a focus change doesn't churn App's
   // reconcile/persist effects. `focusin` bubbles up from xterm's textarea.
   const [focused, setFocused] = useState<string | null>(null)
-  const mobile = useMobile()
+  const mobile = props.mobile
   const focusedRef = useRef<string | null>(null)
   focusedRef.current = focused
   // Live `active` for the once-registered window keydown handler (read via ref so

@@ -42,6 +42,7 @@ function render(overrides: Partial<Parameters<typeof PocketCommandCenter>[0]> = 
     onOpen: () => {},
     onActions: () => {},
     onMosaic: () => {},
+    onDesktop: () => {},
     onNew: () => {},
     ...overrides,
   }))
@@ -97,6 +98,8 @@ describe('PocketCommandCenter', () => {
     expect(html).toContain('aria-label="Pocket navigation"')
     expect(html).toContain('>Sessions<')
     expect(html).toContain('>Mosaic<')
+    expect(html).toContain('aria-label="Full desktop view"')
+    expect(html).toContain('>Desktop<')
     expect(html).toContain('>New<')
   })
 
@@ -120,8 +123,10 @@ describe('PocketCommandCenter', () => {
   it('does not invoke callbacks while rendering', () => {
     const onOpen = vi.fn()
     const onMosaic = vi.fn()
-    render({ onOpen, onMosaic })
+    const onDesktop = vi.fn()
+    render({ onOpen, onMosaic, onDesktop })
     expect(onOpen).not.toHaveBeenCalled()
     expect(onMosaic).not.toHaveBeenCalled()
+    expect(onDesktop).not.toHaveBeenCalled()
   })
 })

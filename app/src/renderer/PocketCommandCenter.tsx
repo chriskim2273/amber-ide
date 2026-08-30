@@ -22,6 +22,7 @@ export interface PocketCommandCenterProps {
   onOpen: (item: CommandCenterItem) => void
   onActions: (item: CommandCenterItem) => void
   onMosaic: () => void
+  onDesktop: () => void
   onNew: () => void
 }
 
@@ -42,10 +43,11 @@ export function pocketSessionTitle(item: CommandCenterItem, titles: Record<strin
     : 'Session'
 }
 
-export function PocketNav({ active, onSessions, onMosaic, onNew }: {
+export function PocketNav({ active, onSessions, onMosaic, onDesktop, onNew }: {
   active: 'sessions' | 'mosaic'
   onSessions: () => void
   onMosaic: () => void
+  onDesktop: () => void
   onNew: () => void
 }): JSX.Element {
   return (
@@ -59,6 +61,11 @@ export function PocketNav({ active, onSessions, onMosaic, onNew }: {
         aria-current={active === 'mosaic' ? 'page' : undefined} onClick={onMosaic}>
         <span className="pocket-nav-mark mosaic" aria-hidden="true" />
         <span>Mosaic</span>
+      </button>
+      <button type="button" aria-label="Full desktop view"
+        title="Show the original full desktop interface" onClick={onDesktop}>
+        <span className="pocket-nav-mark desktop" aria-hidden="true" />
+        <span>Desktop</span>
       </button>
       <button type="button" onClick={onNew}>
         <span className="pocket-nav-mark new" aria-hidden="true" />
@@ -113,6 +120,7 @@ export function PocketCommandCenter({
   onOpen,
   onActions,
   onMosaic,
+  onDesktop,
   onNew,
 }: PocketCommandCenterProps): JSX.Element {
   return (
@@ -210,7 +218,8 @@ export function PocketCommandCenter({
         }))}
       </div>
 
-      <PocketNav active="sessions" onSessions={() => {}} onMosaic={onMosaic} onNew={onNew} />
+      <PocketNav active="sessions" onSessions={() => {}} onMosaic={onMosaic}
+        onDesktop={onDesktop} onNew={onNew} />
     </main>
   )
 }

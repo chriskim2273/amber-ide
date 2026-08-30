@@ -129,6 +129,20 @@ describe('PaneLink', () => {
     expect(socket.sent).toEqual([JSON.stringify({ t: 'resize', name: 's1', cols: 100, rows: 40 })])
   })
 
+  it('release cancels a pending resize before handing the borrowed grid back', () => {
+    vi.useFakeTimers()
+    const socket = new FakeSocket()
+    socket.open()
+    const port = new FakePort()
+    const link = new PaneLink('s1', () => socket, port, () => {})
+    socket.sent.length = 0
+
+    port.fromRenderer({ resize: { cols: 100, rows: 40 } })
+    link.release()
+    vi.advanceTimersByTime(300)
+    expect(socket.sent).toEqual([JSON.stringify({ t: 'release' })])
+  })
+
   it('a pending debounced resize is dropped, not sent late, once close() tears the pane down', () => {
     vi.useFakeTimers()
     const socket = new FakeSocket()

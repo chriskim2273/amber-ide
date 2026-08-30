@@ -1,5 +1,23 @@
 
 /* ---------- Amber Pocket command center ---------- */
+/* Desktop mode is intentionally scaled down by a 1180px viewport. This escape
+   control counter-scales its box in React so it remains a physical 48px touch
+   target instead of inheriting the tiny desktop toolbar scale. */
+.desktop-mobile-return {
+  position: fixed;
+  z-index: 1200;
+  border: 2px solid rgba(255, 255, 255, 0.2);
+  background: var(--accent-fill);
+  color: #fff;
+  font-family: var(--font-ui);
+  font-weight: 700;
+  line-height: 1;
+  box-shadow: var(--shadow-2);
+  cursor: pointer;
+}
+.desktop-mobile-return:active { background: var(--accent-fill-hover); }
+.desktop-mobile-return:focus-visible { outline: var(--focus-ring); outline-offset: 3px; }
+
 /* Mobile-only by component mount. This is a task-specific composition over the
    same session model, not a second responsive skin for desktop chrome. */
 /* Keep hidden terminals laid out while Sessions is in front. `display:none`
@@ -358,7 +376,7 @@
 .pocket-nav {
   min-height: calc(64px + env(safe-area-inset-bottom, 0px));
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(4, 1fr);
   padding: 6px 8px calc(6px + env(safe-area-inset-bottom, 0px));
   border-top: 1px solid var(--border);
   background: rgba(20, 20, 25, 0.98);
@@ -403,6 +421,20 @@
 }
 .pocket-nav-mark.mosaic::before { top: 0; bottom: 0; left: 7px; width: 1.5px; }
 .pocket-nav-mark.mosaic::after { top: 6px; right: 0; left: 7px; height: 1.5px; }
+.pocket-nav-mark.desktop {
+  height: 12px;
+  border: 1.5px solid currentColor;
+  border-radius: 2px;
+}
+.pocket-nav-mark.desktop::before {
+  content: '';
+  position: absolute;
+  top: 12px;
+  left: 7px;
+  width: 4px;
+  height: 3px;
+  border-bottom: 1.5px solid currentColor;
+}
 .pocket-nav-mark.new::before,
 .pocket-nav-mark.new::after {
   content: '';

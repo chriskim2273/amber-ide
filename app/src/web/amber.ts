@@ -373,6 +373,14 @@ export class PaneLink {
    * the common case: the user un-zoomed, backgrounded the tab, or closed it.
    */
   release(): void {
+    // A fit posted just before the user leaves desktop/focus mode is still
+    // sitting in this debounce window. Cancel it before releasing the borrowed
+    // grid or that stale resize can arrive afterward and immediately re-borrow
+    // the geometry we just handed back.
+    if (this.resizeTimer !== null) {
+      clearTimeout(this.resizeTimer)
+      this.resizeTimer = null
+    }
     if (this.closed || this.socket.readyState !== SOCKET_OPEN) return
     this.socket.send(JSON.stringify({ t: 'release' }))
   }

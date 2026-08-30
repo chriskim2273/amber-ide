@@ -15,7 +15,7 @@ import { PocketNewSessionSheet, PocketSessionSheet, type PocketSessionKind } fro
 import { deriveTab, shortCwd } from './tabView'
 import { RemoteAccess } from './RemoteAccess'
 import { Drawer } from './Drawer'
-import { useMobile } from './mobile'
+import { applyViewportMode, desktopControlSize, isMobileMode, useMobile, type MobileViewMode } from './mobile'
 import type { WebStatus } from '../shared/webStatus'
 import {
   emptyProductivity, parseProductivity, serializeProductivity, mutateProductivity, replayProductivity,
@@ -219,8 +219,26 @@ function App(): JSX.Element {
   const [webStatus, setWebStatus] = useState<WebStatus | null>(null)
   const [remoteOpen, setRemoteOpen] = useState(false)
   // Phone chrome (spec §6): the workspace pill row and tab row do not fit at
-  // 390px, so they collapse into one bar plus this drawer.
-  const mobile = useMobile()
+  // 390px, so they collapse into one bar plus this drawer. A user can opt into
+  // the original desktop renderer; that mode asks the browser for a desktop-
+  // sized layout viewport and bypasses Pocket until they explicitly return.
+  const mobileViewport = useMobile()
+  const [mobileViewMode, setMobileViewMode] = useState<MobileViewMode>('auto')
+  const desktopView = mobileViewMode === 'desktop'
+  const mobile = isMobileMode(mobileViewport, mobileViewMode)
+  const [desktopScale, setDesktopScale] = useState(1)
+  useEffect(() => {
+    if (!desktopView) return
+    const viewport = window.visualViewport
+    const update = (): void => setDesktopScale(viewport?.scale ?? 1)
+    update()
+    const frame = requestAnimationFrame(update)
+    viewport?.addEventListener('resize', update)
+    return () => {
+      cancelAnimationFrame(frame)
+      viewport?.removeEventListener('resize', update)
+    }
+  }, [desktopView])
   const [drawerOpen, setDrawerOpen] = useState(false)
   // Amber Pocket is a mobile composition over the same daemon truth and pane
   // lifecycle. The phone lands in Sessions; Mosaic exposes the existing split
@@ -229,6 +247,27 @@ function App(): JSX.Element {
   const [pocketWorkspace, setPocketWorkspace] = useState<number | null>(null)
   const [pocketAction, setPocketAction] = useState<CommandCenterItem | null>(null)
   const [pocketNewOpen, setPocketNewOpen] = useState(false)
+  const showDesktopView = (): void => {
+    setDrawerOpen(false)
+    applyViewportMode(document, true)
+    setMobileViewMode('desktop')
+  }
+  const showPocketView = (): void => {
+    // Commit scale mode first. The effect below releases the desktop borrow and
+    // restores device-width only after every Pane has rendered with fitMode=scale;
+    // otherwise the meta-tag resize can race through a stale fit-mode ref and
+    // immediately resize the PTY again after release.
+    setMobileViewMode('pocket')
+    setPocketView('sessions')
+  }
+  useEffect(() => {
+    if (mobileViewMode !== 'pocket') return
+    // Desktop fit mode may have borrowed a desktop-sized grid for every visible
+    // pane. PaneLink.release also cancels any resize still being debounced.
+    ;(window.amber as unknown as { releaseGrids?: () => void }).releaseGrids?.()
+    applyViewportMode(document, false)
+  }, [mobileViewMode])
+  useEffect(() => () => { applyViewportMode(document, false) }, [])
   // SSH remote window (spec 2026-08-23): this window mirrors another machine's
   // arrangement and never writes its sidecar. Read once — a window is local or
   // remote for its whole life.
@@ -1591,11 +1630,25 @@ function App(): JSX.Element {
     const workspace = workspaces.find((candidate) => candidate.ws === next)
     setActiveTab(layout.workspaces[String(next)]?.activeTab ?? workspace?.tabs[0]?.tab ?? 1)
   }
+  const desktopReturnSize = desktopControlSize(desktopScale)
 
   return (
     <div className={mobile
       ? `app mobile ${pocketFocused ? 'pocket-focus' : pocketView === 'sessions' ? 'pocket-sessions' : 'pocket-mosaic'}`
       : 'app'}>
+      {desktopView && (
+        <button className="desktop-mobile-return" aria-label="Return to mobile view"
+          title="Return to Amber Pocket" onClick={showPocketView}
+          style={{
+            minHeight: desktopReturnSize,
+            minWidth: desktopReturnSize * 2.75,
+            padding: `0 ${desktopReturnSize * 0.45}px`,
+            borderRadius: desktopReturnSize * 0.18,
+            fontSize: desktopReturnSize * 0.3,
+            right: desktopReturnSize / 3,
+            bottom: `calc(${desktopReturnSize / 3}px + env(safe-area-inset-bottom, 0px))`,
+          }}>Mobile view</button>
+      )}
       {mobile && pocketFocused && focusedPocketItem && (() => {
         const focusTitle = pocketSessionTitle(focusedPocketItem, titles, home)
         return <PocketFocusHeader
@@ -1685,6 +1738,7 @@ function App(): JSX.Element {
           onOpen={openPocketItem}
           onActions={setPocketAction}
           onMosaic={() => setPocketView('mosaic')}
+          onDesktop={showDesktopView}
           onNew={() => setPocketNewOpen(true)}
         />
       )}
@@ -1941,7 +1995,7 @@ function App(): JSX.Element {
                     style={{ position: 'absolute', inset: 0, display: isActive ? undefined : 'none' }}>
                     {layerTree
                       ? <SplitView tree={layerTree} active={isActive} deadCodes={d.deadCodes} meta={d.paneMeta}
-                          epoch={reconnectEpoch} portEpoch={childEpoch}
+                          epoch={reconnectEpoch} portEpoch={childEpoch} mobile={mobile}
                           fontSize={fontSize} onPaneTitle={onPaneTitle} onPaneFocus={onPaneFocus}
                           focusRequest={isActive ? focusRequest : null}
                           zoomedPane={isActive ? zoomedPane : null}
@@ -1997,6 +2051,7 @@ function App(): JSX.Element {
           active="mosaic"
           onSessions={() => setPocketView('sessions')}
           onMosaic={() => {}}
+          onDesktop={showDesktopView}
           onNew={() => setPocketNewOpen(true)}
         />
       )}

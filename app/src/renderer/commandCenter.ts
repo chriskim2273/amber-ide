@@ -97,8 +97,12 @@ function classify(
 }
 
 function compareItems(a: CommandCenterItem, b: CommandCenterItem): number {
+  // Activity is intentionally not a sort key. Output updates can arrive several
+  // times a second, and moving a row under the user's finger made the mobile
+  // command center difficult to operate. Slots are daemon-owned and stable for
+  // the lifetime of a session, so they provide a predictable touch target while
+  // urgency still keeps genuinely actionable states first.
   return a.urgency - b.urgency
-    || b.activitySeq - a.activitySeq
     || (a.pane.slot || Number.MAX_SAFE_INTEGER) - (b.pane.slot || Number.MAX_SAFE_INTEGER)
     || a.ws - b.ws
     || a.tab - b.tab

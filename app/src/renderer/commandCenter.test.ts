@@ -48,7 +48,7 @@ describe('commandCenterModel', () => {
     })
 
     expect(names(model, 'needs-you')).toEqual(['dead', 'retry', 'fallback', 'suspend-failed'])
-    expect(names(model, 'working')).toEqual(['active-shell', 'agent'])
+    expect(names(model, 'working')).toEqual(['agent', 'active-shell'])
     expect(names(model, 'parked')).toEqual(['parked'])
     expect(names(model, 'quiet')).toEqual(['quiet-shell'])
     expect(model.groups.flatMap((group) => group.items).every((item) => item.ws === 2 && item.tab === 3)).toBe(true)
@@ -70,7 +70,7 @@ describe('commandCenterModel', () => {
     expect(names(model, 'working')).toEqual([])
   })
 
-  it('orders urgent states deterministically, then uses newest activity and stable slot order', () => {
+  it('orders urgent states deterministically, then keeps stable slot order as activity changes', () => {
     const model = commandCenterModel({
       workspaces: workspaces(
         pane('fallback', { kind: 'claude', runState: 'shell-fallback', slot: 8 }),
@@ -89,7 +89,21 @@ describe('commandCenterModel', () => {
     })
 
     expect(names(model, 'needs-you')).toEqual(['dead', 'retry-a', 'retry-b', 'fallback'])
-    expect(names(model, 'working')).toEqual(['working-new', 'working-old'])
+    expect(names(model, 'working')).toEqual(['working-old', 'working-new'])
+
+    const afterMoreOutput = commandCenterModel({
+      workspaces: workspaces(
+        pane('working-old', { slot: 6 }),
+        pane('working-new', { slot: 7 }),
+      ),
+      state: state({
+        seq: 30,
+        lastActivity: { 'working-old': 29, 'working-new': 19 },
+        lastSeen: { 'working-old': 0, 'working-new': 0 },
+      }),
+      frozen: new Set(),
+    })
+    expect(names(afterMoreOutput, 'working')).toEqual(['working-old', 'working-new'])
   })
 
   it('filters by workspace without changing authoritative grouping', () => {
