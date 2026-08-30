@@ -9,6 +9,7 @@ import '@xterm/xterm/css/xterm.css'
 import { appChord } from './keys'
 import { takeReplay } from './replay'
 import { decodeOsc52Payload } from './osc'
+import { shiftEnterSequence } from './terminalKeys'
 
 // Imperative scrollback-search handle handed to the chrome (the find bar in
 // SplitView) via `onSearchReady`. Search execution stays outside React — the
@@ -78,11 +79,6 @@ const SEARCH_DECORATIONS = {
 // the header/chrome; cursor + selection use the violet accent.
 const FONT_STACK =
   "'JetBrains Mono','SF Mono','Menlo','Monaco','DejaVu Sans Mono','Consolas',monospace"
-// Shift+Enter → ESC+CR (Meta+Enter). Claude Code inserts a newline without
-// submitting on this sequence with NO terminal negotiation needed. The fixterms
-// CSI-u form (\x1b[13;2u) only works once the app negotiates the kitty keyboard
-// protocol — which xterm.js here never advertises, so claude ignored it.
-const SHIFT_ENTER_SEQ = new TextEncoder().encode('\x1b\r')
 const XTERM_THEME = {
   background: '#0c0c0f',
   foreground: '#e6e6ec',
@@ -118,8 +114,8 @@ const MOUSE_RESET = '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l'
 // (honors "xterm instances live outside React reconciliation").
 // Focus is tracked by SplitView via `focusin` on the wrapper; nothing here.
 export const Pane = memo(function Pane(
-  { session, epoch, portEpoch, activateSeq, fontSize, cwd, onTitle, onSearchReady, onInputReady, fitMode = 'fit' }:
-    { session: string; epoch: number; portEpoch: number; activateSeq: number; fontSize: number; cwd: string; onTitle?: (title: string) => void; onSearchReady?: (api: SearchApi) => void; onInputReady?: (api: InputApi) => void; fitMode?: FitMode },
+  { session, kind, epoch, portEpoch, activateSeq, fontSize, cwd, onTitle, onSearchReady, onInputReady, fitMode = 'fit' }:
+    { session: string; kind: string; epoch: number; portEpoch: number; activateSeq: number; fontSize: number; cwd: string; onTitle?: (title: string) => void; onSearchReady?: (api: SearchApi) => void; onInputReady?: (api: InputApi) => void; fitMode?: FitMode },
 ): JSX.Element {
   const containerRef = useRef<HTMLDivElement>(null)
   const hostRef = useRef<HTMLDivElement>(null)
@@ -235,16 +231,16 @@ export const Pane = memo(function Pane(
     // App chords (Cmd on mac / Ctrl+Shift on Linux) must not be sent to the
     // pty — return false so xterm neither renders nor forwards them; the event
     // still bubbles to the window handlers in App/SplitView.
-    // Shift+Enter → ESC+CR (Meta+Enter): Claude Code inserts a newline instead
-    // of submitting on this sequence, while plain Enter stays a bare CR (submit).
-    // A shell sees M-RET (unbound → no-op), so no stray echo.
+    // Preserve the browser's Shift modifier for Pi via CSI-u. Other programs
+    // retain Amber's negotiation-free Meta+Enter compatibility fallback.
+    const shiftEnterBytes = new TextEncoder().encode(shiftEnterSequence(kind))
     term.attachCustomKeyEventHandler((e) => {
       // Checked BEFORE the keydown gate and preventDefault'd: returning false
       // only skips xterm's keydown path, it does not stop the event, so the
-      // browser's follow-up keypress made xterm emit a bare CR right after our
-      // ESC+CR — newline inserted, then submitted anyway.
+      // browser's follow-up keypress would make xterm emit a bare CR right after
+      // our custom sequence — newline inserted, then submitted anyway.
       if (e.key === 'Enter' && e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) {
-        if (e.type === 'keydown') port?.postMessage({ data: SHIFT_ENTER_SEQ })
+        if (e.type === 'keydown') port?.postMessage({ data: shiftEnterBytes })
         e.preventDefault()
         return false
       }
