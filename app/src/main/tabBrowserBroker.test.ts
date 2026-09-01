@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { connect } from 'node:net'
-import { authorizeBrowserRequest, parseBrokerRequest, TabBrowserBrokerServer } from './tabBrowserBroker'
+import { authorizeBrowserRequest, isEligiblePiController, parseBrokerRequest, TabBrowserBrokerServer } from './tabBrowserBroker'
 import type { LayoutFile } from '../shared/layoutFile'
 
 const cleanup: string[] = []
@@ -18,6 +18,13 @@ describe('tab browser broker boundary', () => {
     expect(() => parseBrokerRequest({ version: 1, requestId: 'r1', amberSession: '', action: { type: 'status' } })).toThrow('INVALID_REQUEST')
     expect(() => parseBrokerRequest({ version: 1, requestId: 'r1', amberSession: 'amber-1-2-0-pane', action: { type: 'navigate', url: 'https://example.test', pageIncarnation: 'x'.repeat(257), expectedGeneration: 0 } })).toThrow('INVALID_REQUEST')
   })
+  it('rejects dead and shell-fallback Pi controllers', () => {
+    expect(isEligiblePiController({ kind: 'pi', alive: true, runState: 'claude' })).toBe(true)
+    expect(isEligiblePiController({ kind: 'pi', alive: false, runState: 'claude' })).toBe(false)
+    expect(isEligiblePiController({ kind: 'pi', alive: true, runState: 'shell-fallback' })).toBe(false)
+    expect(isEligiblePiController({ kind: 'shell', alive: true })).toBe(false)
+  })
+
   it('authorizes only the designated shared controller in its current tab', () => {
     expect(authorizeBrowserRequest(layout, 'amber-1-2-0-pane')).toEqual({ ws: 1, tab: 2, browserId: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' })
     expect(() => authorizeBrowserRequest(layout, 'amber-1-2-1-other')).toThrow('NOT_DESIGNATED_CONTROLLER')

@@ -72,7 +72,7 @@ import {
 } from './routerService'
 import { inspectLinuxInputMethod, repairLinuxInputMethod, resolveLinuxInputEnvironment } from './inputMethod'
 import { TabBrowserService, parseTabBrowserCommand } from './tabBrowserService'
-import { TabBrowserBrokerServer, authorizeBrowserRequest, type BrokerRequest } from './tabBrowserBroker'
+import { TabBrowserBrokerServer, authorizeBrowserRequest, isEligiblePiController, type BrokerRequest, type ControllerSession } from './tabBrowserBroker'
 import { TabBrowserStateStore } from './tabBrowserStateStore'
 import { coordinateTabBrowserMigration } from './tabBrowserMigrationCoordinator'
 import { parseLayout, serializeLayout } from '../shared/layoutFile'
@@ -727,7 +727,7 @@ interface WindowCtx {
 /** Per-window state, keyed by webContents id so IPC can route by sender. */
 const windowCtxs = new Map<number, WindowCtx>()
 let reopenLocalWindow: (() => Promise<void>) | null = null
-const browserDaemonSessions = new Map<string, string>()
+const browserDaemonSessions = new Map<string, ControllerSession>()
 let browserDaemonFresh = false
 let browserDaemonLastFullAt = 0
 function observeBrowserDaemonEvent(data: unknown): void {
@@ -741,8 +741,13 @@ function observeBrowserDaemonEvent(data: unknown): void {
   const add = (items: unknown): void => {
     if (!Array.isArray(items)) return
     for (const item of items) if (typeof item === 'object' && item !== null) {
-      const info = item as { name?: unknown; kind?: unknown }
-      if (typeof info.name === 'string' && typeof info.kind === 'string') browserDaemonSessions.set(info.name, info.kind)
+      const info = item as { name?: unknown; kind?: unknown; alive?: unknown; run_state?: unknown }
+      if (typeof info.name === 'string' && typeof info.kind === 'string' && typeof info.alive === 'boolean') {
+        browserDaemonSessions.set(info.name, {
+          kind: info.kind, alive: info.alive,
+          ...(typeof info.run_state === 'string' ? { runState: info.run_state } : {}),
+        })
+      }
     }
   }
   if (control.kind === 'Sessions') { browserDaemonSessions.clear(); add(control.sessions); browserDaemonFresh = true; browserDaemonLastFullAt = Date.now() }
@@ -1235,7 +1240,7 @@ async function main(): Promise<void> {
     }, 2_000)
     const handleBroker = async (request: BrokerRequest, signal: AbortSignal): Promise<unknown> => {
       if (!browserDaemonFresh || Date.now() - browserDaemonLastFullAt > 5_000) throw new Error('DAEMON_STATE_STALE')
-      if (browserDaemonSessions.get(request.amberSession) !== 'pi') throw new Error('NOT_DESIGNATED_CONTROLLER')
+      if (!isEligiblePiController(browserDaemonSessions.get(request.amberSession))) throw new Error('NOT_DESIGNATED_CONTROLLER')
       const loaded = await loadLayoutFile(layoutPath())
       const current = loaded.text ? parseLayout(loaded.text) : null
       if (!current) throw new Error('NO_BROWSER_FOR_TAB')

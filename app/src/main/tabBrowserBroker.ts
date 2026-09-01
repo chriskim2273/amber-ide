@@ -10,6 +10,10 @@ export type BrokerAction =
   | { type: 'navigate'; url: string; pageIncarnation: string; expectedGeneration: number }
   | { type: 'stop' }
 export interface BrokerRequest { version: 1; requestId: string; amberSession: string; action: BrokerAction }
+export interface ControllerSession { kind: string; alive: boolean; runState?: string }
+export function isEligiblePiController(session: ControllerSession | undefined): boolean {
+  return !!session && session.kind === 'pi' && session.alive && session.runState !== 'shell-fallback'
+}
 
 function exact(value: Record<string, unknown>, keys: string[]): boolean {
   return Object.keys(value).every((key) => keys.includes(key)) && keys.every((key) => key in value)

@@ -26,9 +26,13 @@ export class TabBrowserService {
 
   static async create(root: string, window: BrowserWindow): Promise<TabBrowserService> {
     const store = new TabBrowserStateStore(root)
-    const pages = new ElectronTabBrowserPageFactory(window)
+    const state = await store.load()
+    // The persisted profile descriptor is authoritative. Falling back to a
+    // constructor constant here silently reopens a different cookie/storage
+    // partition after a compatibility migration.
+    const pages = new ElectronTabBrowserPageFactory(window, state.profiles.global.partition)
     let service!: TabBrowserService
-    const host = new TabBrowserHost(await store.load(), pages, Date.now, undefined, () => {
+    const host = new TabBrowserHost(state, pages, Date.now, undefined, () => {
       void service.schedulePersist().catch((error) => console.error('tab browser state save failed', error))
     })
     service = new TabBrowserService(store, pages, host)
