@@ -18,7 +18,8 @@ pub enum PiStart {
 const EXTENSION_FILE: &str = "amber-hook.ts";
 
 /// The Pi extension amber installs to record session ids for exact resume.
-const EXTENSION_TS: &str = r#"import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
+const EXTENSION_TS: &str = r#"// amber-owned-extension:v2
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
 import { Type } from "typebox"
 import { spawn } from "node:child_process"
 import { connect } from "node:net"
@@ -127,6 +128,26 @@ export default function (pi: ExtensionAPI) {
 }
 "#;
 
+// Exact source shipped before browser tools. It had no ownership marker, so
+// equality is the only safe proof that Amber owns a legacy file.
+const LEGACY_EXTENSION_TS: &str = r#"import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
+import { spawn } from "node:child_process"
+
+export default function (pi: ExtensionAPI) {
+  pi.on("session_start", (_event, ctx) => {
+    if (!process.env.AMBER_SESSION) return
+    const session_id = ctx.sessionManager.getSessionId()
+    if (!session_id) return
+    const child = spawn(process.env.AMBER_BIN || "amber", ["hook"], {
+      stdio: ["pipe", "ignore", "ignore"],
+    })
+    child.on("error", () => {})
+    child.stdin.on("error", () => {})
+    child.stdin.end(JSON.stringify({ session_id, cwd: ctx.cwd }))
+  })
+}
+"#;
+
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Build Pi's argument vector (excluding the program itself).
@@ -195,7 +216,13 @@ pub fn install_extension_in(dir: &Path) -> anyhow::Result<PathBuf> {
     let path = dir.join(EXTENSION_FILE);
     match fs::read_to_string(&path) {
         Ok(existing) if existing == EXTENSION_TS => return Ok(path),
-        Ok(_) => {}
+        Ok(existing) if existing == LEGACY_EXTENSION_TS => {}
+        Ok(_) => {
+            anyhow::bail!(
+                "refusing to replace modified/unowned Pi extension {}",
+                path.display()
+            )
+        }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
@@ -308,21 +335,18 @@ mod tests {
     }
 
     #[test]
-    fn extension_installer_refreshes_only_its_owned_file_without_temp_residue() {
+    fn extension_installer_migrates_exact_owned_legacy_without_temp_residue() {
         let dir = tempfile::tempdir().unwrap();
         let extensions = dir.path().join("extensions");
         fs::create_dir_all(&extensions).unwrap();
         let other = extensions.join("neighbor.ts");
         fs::write(&other, "export default 42\n").unwrap();
         let owned = extensions.join("amber-hook.ts");
-        fs::write(&owned, "// stale owned content\n").unwrap();
+        fs::write(&owned, LEGACY_EXTENSION_TS).unwrap();
 
         install_extension_in(&extensions).unwrap();
 
-        assert_ne!(
-            fs::read_to_string(&owned).unwrap(),
-            "// stale owned content\n"
-        );
+        assert_eq!(fs::read_to_string(&owned).unwrap(), EXTENSION_TS);
         assert_eq!(fs::read_to_string(&other).unwrap(), "export default 42\n");
         assert!(fs::read_dir(&extensions).unwrap().all(|entry| {
             !entry
@@ -331,6 +355,18 @@ mod tests {
                 .to_string_lossy()
                 .contains(".amber-tmp")
         }));
+    }
+
+    #[test]
+    fn extension_installer_preserves_modified_or_unowned_legacy_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let extensions = dir.path().join("extensions");
+        fs::create_dir_all(&extensions).unwrap();
+        let path = extensions.join(EXTENSION_FILE);
+        fs::write(&path, "// user-owned extension\n").unwrap();
+        let error = install_extension_in(&extensions).unwrap_err();
+        assert!(error.to_string().contains("modified/unowned"));
+        assert_eq!(fs::read_to_string(path).unwrap(), "// user-owned extension\n");
     }
 
     #[test]
