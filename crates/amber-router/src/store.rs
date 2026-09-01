@@ -40,12 +40,41 @@ pub fn load(root: &Path) -> anyhow::Result<Vec<Slot>> {
     Ok(slots::from_config(&cfg))
 }
 
-/// Validate, then replace the slot file atomically at 0600.
+/// A stable id for a slot the UI has just invented.
+pub fn new_slot_id() -> anyhow::Result<String> {
+    let mut raw = [0u8; 9];
+    amber::platform::random_bytes(&mut raw)?;
+    Ok(amber::web::base64url(&raw))
+}
+
+/// Validate, then replace the slot file at 0600 — via a private temp file and
+/// a rename, never in place.
+///
+/// `write_user_private` truncates and rewrites, so a crash mid-write would
+/// leave a partial TOML holding every provider key the user configured: the
+/// file would no longer parse and the credentials would have to be retyped.
+/// This is the one file in the router whose loss actually costs the user
+/// something, so it gets the tmp+rename discipline every other amber state
+/// file already has.
 pub fn save(root: &Path, list: &[Slot]) -> anyhow::Result<()> {
     slots::validate(list).map_err(|e| anyhow::anyhow!(e))?;
-    let text = toml::to_string_pretty(&slots::to_config(default_server(), list))?;
+    let mut list = list.to_vec();
+    for slot in list.iter_mut() {
+        if slot.id.is_empty() {
+            slot.id = new_slot_id()?;
+        }
+    }
+    let text = toml::to_string_pretty(&slots::to_config(default_server(), &list))?;
     std::fs::create_dir_all(root)?;
-    web::write_secret(root, CONFIG_FILE, text.as_bytes())
+
+    let tmp = format!("{CONFIG_FILE}.{}.tmp", std::process::id());
+    web::write_secret(root, &tmp, text.as_bytes())?;
+    let tmp_path = root.join(&tmp);
+    if let Err(e) = std::fs::rename(&tmp_path, config_path(root)) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
+    Ok(())
 }
 
 /// The bearer token every caller must present. Minted on first use.
@@ -65,6 +94,7 @@ mod tests {
 
     fn slot(name: &str) -> Slot {
         Slot {
+            id: format!("id-{name}"),
             name: name.into(),
             base_url: format!("https://{name}.example/v1"),
             api_key: format!("sk-{name}-wxyz"),
@@ -92,6 +122,32 @@ mod tests {
         let names: Vec<String> =
             load(dir.path()).unwrap().into_iter().map(|s| s.name).collect();
         assert_eq!(names, ["c", "a", "b"]);
+    }
+
+    #[test]
+    fn saving_assigns_a_stable_id_to_a_new_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fresh = slot("a");
+        fresh.id = String::new();
+        save(dir.path(), &[fresh]).unwrap();
+        let first = load(dir.path()).unwrap();
+        assert!(!first[0].id.is_empty(), "an id must be minted before writing");
+
+        save(dir.path(), &first).unwrap();
+        assert_eq!(load(dir.path()).unwrap()[0].id, first[0].id, "and then never change");
+    }
+
+    #[test]
+    fn saving_leaves_no_temp_file_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        save(dir.path(), &[slot("a")]).unwrap();
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
     #[test]

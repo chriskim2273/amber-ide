@@ -33,19 +33,23 @@ EOF
         fi
         bash "$ROOT_DIR/scripts/dist.sh"
         SRC="$ROOT_DIR/dist/amber-linux-x86_64"
+        ROUTER_SRC="$ROOT_DIR/dist/amber-router-linux-x86_64"
         ;;
     Darwin)
         bash "$ROOT_DIR/scripts/dist.sh"
         if [ "${AMBER_MACOS_INTEL:-0}" = "1" ]; then
             SRC="$ROOT_DIR/dist/amber-x86_64-apple-darwin"
+            ROUTER_SRC="$ROOT_DIR/dist/amber-router-x86_64-apple-darwin"
         else
             SRC="$ROOT_DIR/dist/amber-macos-universal"
+            ROUTER_SRC="$ROOT_DIR/dist/amber-router-macos-universal"
         fi
         ;;
     MINGW*|MSYS*|CYGWIN*)
         bash "$ROOT_DIR/scripts/dist.sh"
         SRC="$ROOT_DIR/dist/amber-windows-x86_64.exe"
         DAEMON_SRC="$ROOT_DIR/dist/amberd-windows-x86_64.exe"
+        ROUTER_SRC="$ROOT_DIR/dist/amber-router-windows-x86_64.exe"
         ;;
     *)
         echo "error: unsupported OS: $os" >&2
@@ -58,6 +62,11 @@ if [ ! -f "$SRC" ]; then
     exit 1
 fi
 
+if [ ! -f "$ROUTER_SRC" ]; then
+    echo "error: expected distributable amber-router at $ROUTER_SRC but it was not produced" >&2
+    exit 1
+fi
+
 if [ "${DAEMON_SRC:-}" ] && [ ! -f "$DAEMON_SRC" ]; then
     echo "error: expected windowless amber daemon at $DAEMON_SRC but it was not produced" >&2
     exit 1
@@ -67,23 +76,31 @@ fi
 # glibc-fallback bug even when the musl target is present but the build somehow
 # produced a dynamic binary — a stronger guarantee than the up-front target check.
 if [ "$os" = "Linux" ]; then
-    if ! file "$SRC" | grep -Eq 'static-pie linked|statically linked'; then
-        echo "error: $SRC is not statically linked:" >&2
-        file "$SRC" >&2
-        echo "       refusing to bundle a glibc-dynamic amber (the original packaging bug)." >&2
-        exit 1
-    fi
-    echo "==> verified static: $(file "$SRC")"
+    for artifact in "$SRC" "$ROUTER_SRC"; do
+        if ! file "$artifact" | grep -Eq 'static-pie linked|statically linked'; then
+            echo "error: $artifact is not statically linked:" >&2
+            file "$artifact" >&2
+            echo "       refusing to bundle a glibc-dynamic binary (the original packaging bug)." >&2
+            exit 1
+        fi
+        echo "==> verified static: $(file "$artifact")"
+    done
 fi
 
 echo "==> bundling amber into app resources"
 mkdir -p "$APP_DIR/resources/bin"
 cp "$SRC" "$APP_DIR/resources/bin/amber"
 chmod +x "$APP_DIR/resources/bin/amber"
+# The router must sit BESIDE amber: `routerctl::sibling_binary` looks for it
+# there, and `amber ctl router enable` refuses to write a unit without it.
+cp "$ROUTER_SRC" "$APP_DIR/resources/bin/amber-router"
+chmod +x "$APP_DIR/resources/bin/amber-router"
 if [ "${DAEMON_SRC:-}" ]; then
     cp "$SRC" "$APP_DIR/resources/bin/amber.exe"
     cp "$DAEMON_SRC" "$APP_DIR/resources/bin/amberd.exe"
-    chmod +x "$APP_DIR/resources/bin/amber.exe" "$APP_DIR/resources/bin/amberd.exe"
+    cp "$ROUTER_SRC" "$APP_DIR/resources/bin/amber-router.exe"
+    chmod +x "$APP_DIR/resources/bin/amber.exe" "$APP_DIR/resources/bin/amberd.exe" \
+        "$APP_DIR/resources/bin/amber-router.exe"
 fi
 
 echo "==> building renderer/main/preload"

@@ -21,29 +21,35 @@ build_linux() {
 
 build_macos() {
     rustup target add x86_64-apple-darwin aarch64-apple-darwin
-    cargo build --release --target x86_64-apple-darwin --bin amber
-    cargo build --release --target aarch64-apple-darwin --bin amber
-    lipo -create -output "$OUT/amber-macos-universal" \
-        "$ROOT/target/x86_64-apple-darwin/release/amber" \
-        "$ROOT/target/aarch64-apple-darwin/release/amber"
-    echo "dist: $OUT/amber-macos-universal (universal)"
+    for bin in amber amber-router; do
+        cargo build --release --target x86_64-apple-darwin --bin "$bin"
+        cargo build --release --target aarch64-apple-darwin --bin "$bin"
+        lipo -create -output "$OUT/$bin-macos-universal" \
+            "$ROOT/target/x86_64-apple-darwin/release/$bin" \
+            "$ROOT/target/aarch64-apple-darwin/release/$bin"
+        echo "dist: $OUT/$bin-macos-universal (universal)"
+    done
 }
 
 # Intel-only macOS build (x86_64). Use on an Intel Mac when a universal binary
 # is not needed — avoids requiring the aarch64-apple-darwin target.
 build_macos_intel() {
     rustup target add x86_64-apple-darwin
-    cargo build --release --target x86_64-apple-darwin --bin amber
-    cp "$ROOT/target/x86_64-apple-darwin/release/amber" "$OUT/amber-x86_64-apple-darwin"
-    echo "dist: $OUT/amber-x86_64-apple-darwin (intel)"
+    for bin in amber amber-router; do
+        cargo build --release --target x86_64-apple-darwin --bin "$bin"
+        cp "$ROOT/target/x86_64-apple-darwin/release/$bin" "$OUT/$bin-x86_64-apple-darwin"
+        echo "dist: $OUT/$bin-x86_64-apple-darwin (intel)"
+    done
 }
 
 build_windows() {
     local target=x86_64-pc-windows-msvc
     rustup target add "$target"
-    cargo build --release --target "$target" --bin amber --bin amberd
+    cargo build --release --target "$target" --bin amber --bin amberd --bin amber-router
     cp "$ROOT/target/$target/release/amber.exe" "$OUT/amber-windows-x86_64.exe"
     cp "$ROOT/target/$target/release/amberd.exe" "$OUT/amberd-windows-x86_64.exe"
+    cp "$ROOT/target/$target/release/amber-router.exe" "$OUT/amber-router-windows-x86_64.exe"
+    echo "dist: $OUT/amber-router-windows-x86_64.exe (local proxy)"
     echo "dist: $OUT/amber-windows-x86_64.exe (console CLI)"
     echo "dist: $OUT/amberd-windows-x86_64.exe (windowless daemon)"
 }

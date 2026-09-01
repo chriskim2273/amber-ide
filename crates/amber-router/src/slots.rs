@@ -15,6 +15,10 @@ pub const DEFAULT_ALIAS: &str = "auto";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Slot {
+    /// Stable across renames. Empty on a slot the UI has just invented; the
+    /// store assigns one before writing.
+    #[serde(default)]
+    pub id: String,
     pub name: String,
     pub base_url: String,
     /// Secret. Never leaves the process except through an explicit reveal.
@@ -32,6 +36,7 @@ fn yes() -> bool {
 /// A slot with its key removed, for any surface the GUI or CLI can see.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlotView {
+    pub id: String,
     pub name: String,
     pub base_url: String,
     pub model: String,
@@ -52,6 +57,7 @@ pub fn mask_key(key: &str) -> String {
 
 pub fn view(slot: &Slot) -> SlotView {
     SlotView {
+        id: slot.id.clone(),
         name: slot.name.clone(),
         base_url: slot.base_url.clone(),
         model: slot.model.clone(),
@@ -111,6 +117,7 @@ pub fn to_config(server: ServerConfig, slots: &[Slot]) -> Config {
         .iter()
         .map(|s| ProviderConfig {
             name: s.name.clone(),
+            id: s.id.clone(),
             base_url: s.base_url.clone(),
             keys: if s.api_key.is_empty() { vec![] } else { vec![s.api_key.clone()] },
             ..provider_defaults()
@@ -149,6 +156,7 @@ pub fn from_config(cfg: &Config) -> Vec<Slot> {
     cfg.providers
         .iter()
         .map(|p| Slot {
+            id: p.id.clone(),
             name: p.name.clone(),
             base_url: p.base_url.clone(),
             api_key: p.keys.first().cloned().unwrap_or_default(),
@@ -177,6 +185,7 @@ mod tests {
 
     fn slot(name: &str, model: &str) -> Slot {
         Slot {
+            id: format!("id-{name}"),
             name: name.into(),
             base_url: format!("https://{name}.example/v1"),
             api_key: format!("sk-{name}-abcd1234"),

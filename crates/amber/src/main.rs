@@ -1126,13 +1126,23 @@ fn run_ctl_router(
         }
         RouterAction::RotateToken => {
             amber::web::load_or_create_secret(&root, amber::router_pi::TOKEN_FILE, true)?;
-            // The running service holds the old token in memory, so the
-            // restart IS the invalidation.
-            let _ = run_web_argv(&amber::routerctl::restart_argv(), &unit);
+            // The running service holds the OLD token in memory, so the
+            // restart IS the invalidation. If it did not happen, say so:
+            // silence here leaves a router serving the old token while Pi
+            // already reads the new one, and every request 401s with no
+            // visible cause.
+            let restarted = run_web_argv(&amber::routerctl::restart_argv(), &unit)
+                .map(|o| o.status.success())
+                .unwrap_or(false);
             if json {
-                println!("{}", serde_json::json!({ "ok": true }));
-            } else {
+                println!("{}", serde_json::json!({ "ok": true, "restarted": restarted }));
+            } else if restarted {
                 println!("router token rotated; the service was restarted");
+            } else {
+                println!(
+                    "router token rotated, but the service could not be restarted — a running \
+                     router still accepts the OLD token; restart it yourself"
+                );
             }
             Ok(())
         }

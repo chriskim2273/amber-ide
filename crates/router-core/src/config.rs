@@ -40,6 +40,11 @@ pub struct ServerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub name: String,
+    /// Stable identity assigned by the editing UI, so a slot can be RENAMED
+    /// without its stored key being mistaken for a different slot's.
+    /// Serde-default: configs written before this existed still load.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
     pub base_url: String,
     #[serde(default)]
     pub keys: Vec<String>,

@@ -17,6 +17,7 @@ fn server() -> ServerConfig {
 
 fn slot(name: &str, url: &str, model: &str) -> Slot {
     Slot {
+        id: format!("id-{name}"),
         name: name.into(),
         base_url: url.into(),
         api_key: format!("sk-{name}-secret-tail"),
@@ -119,6 +120,21 @@ async fn a_blank_key_edit_does_not_wipe_the_stored_one() {
     assert_eq!(body["api_key"], json!("sk-a-secret-tail"), "key survived the edit");
     let stored = store::load(h.root.path()).unwrap();
     assert_eq!(stored[0].model, "m9", "the rest of the edit landed");
+}
+
+#[tokio::test]
+async fn renaming_a_slot_from_the_dialog_keeps_its_key() {
+    let h = Harness::start(&[slot("groq", "https://a.example/v1", "m1")]).await;
+    let stored_id = h.get("/admin/slots").await.1["slots"][0]["id"].as_str().unwrap().to_string();
+
+    let mut renamed = slot("groq-free", "https://a.example/v1", "m1");
+    renamed.id = stored_id;
+    renamed.api_key = String::new(); // the dialog only ever saw a mask
+    let (status, _) = h.put_slots(&[renamed]).await;
+    assert_eq!(status, 200);
+
+    let (_, body) = h.get("/admin/slots/groq-free/key").await;
+    assert_eq!(body["api_key"], json!("sk-groq-secret-tail"), "a rename is not a new slot");
 }
 
 #[tokio::test]

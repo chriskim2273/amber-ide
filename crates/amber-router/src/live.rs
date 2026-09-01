@@ -103,14 +103,15 @@ impl Live {
 /// Blank keys mean "leave this one alone".
 ///
 /// The GUI is only ever shown masked keys, so a save round-trips a slot whose
-/// `api_key` is empty. Treating that as a real edit would wipe every key the
-/// first time somebody renamed a slot.
+/// `api_key` is empty. Matching is by the stable `id`, NEVER by name: under
+/// name-matching a rename is indistinguishable from a brand-new slot, so
+/// renaming without retyping the key would silently drop it.
 pub fn merge_keys(incoming: &mut [Slot], stored: &[Slot]) {
     for slot in incoming.iter_mut() {
-        if !slot.api_key.is_empty() {
+        if !slot.api_key.is_empty() || slot.id.is_empty() {
             continue;
         }
-        if let Some(prev) = stored.iter().find(|s| s.name == slot.name) {
+        if let Some(prev) = stored.iter().find(|s| s.id == slot.id) {
             slot.api_key = prev.api_key.clone();
         }
     }
@@ -122,6 +123,7 @@ mod tests {
 
     fn slot(name: &str, key: &str) -> Slot {
         Slot {
+            id: format!("id-{name}"),
             name: name.into(),
             base_url: format!("https://{name}.example/v1"),
             api_key: key.into(),
@@ -141,9 +143,21 @@ mod tests {
 
     #[test]
     fn a_blank_key_on_a_new_slot_stays_blank() {
-        let mut incoming = vec![slot("fresh", "")];
+        let mut fresh = slot("fresh", "");
+        fresh.id = String::new(); // the UI has not been given one yet
+        let mut incoming = vec![fresh];
         merge_keys(&mut incoming, &[slot("a", "sk-a")]);
         assert!(incoming[0].api_key.is_empty(), "never inherit another slot's key");
+    }
+
+    #[test]
+    fn renaming_a_slot_keeps_its_key() {
+        let stored = vec![slot("groq", "sk-groq")];
+        let mut renamed = slot("groq-free", "");
+        renamed.id = stored[0].id.clone(); // same slot, new label
+        let mut incoming = vec![renamed];
+        merge_keys(&mut incoming, &stored);
+        assert_eq!(incoming[0].api_key, "sk-groq", "a rename is not a new slot");
     }
 
     #[test]
