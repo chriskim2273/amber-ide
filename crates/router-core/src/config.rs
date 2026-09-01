@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -16,7 +16,7 @@ pub enum ConfigError {
     DuplicateAlias(String),
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub server: ServerConfig,
     #[serde(default, rename = "provider")]
@@ -25,7 +25,7 @@ pub struct Config {
     pub aliases: Vec<AliasConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     #[serde(default = "default_bind")]
     pub bind: String,
@@ -37,7 +37,7 @@ pub struct ServerConfig {
     pub queue_capacity: usize,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub name: String,
     pub base_url: String,
@@ -59,13 +59,13 @@ pub struct ProviderConfig {
     pub max_cooldown_ms: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AliasConfig {
     pub name: String,
     pub chain: Vec<ChainEntry>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChainEntry {
     pub provider: String,
     pub model: String,

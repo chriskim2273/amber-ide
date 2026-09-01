@@ -48,6 +48,7 @@ dependencies = [
 name = "amber-router"
 version = "0.0.2"
 dependencies = [
+ "amber",
  "amber-core",
  "anyhow",
  "axum",
@@ -62,6 +63,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
+ "toml",
  "tower",
  "tracing",
  "tracing-subscriber",

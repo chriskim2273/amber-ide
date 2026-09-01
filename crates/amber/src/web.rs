@@ -453,7 +453,20 @@ fn random_token() -> std::io::Result<String> {
 /// Load the web token from `<root>/web-token`, creating it (mode 0600) if it
 /// is missing/empty or `regenerate` is set (`amber web --new-token`).
 pub fn load_or_create_token(root: &Path, regenerate: bool) -> anyhow::Result<String> {
-    let path = root.join(TOKEN_FILE);
+    load_or_create_secret(root, TOKEN_FILE, regenerate)
+}
+
+/// Mint-or-read a 0600 random token under an arbitrary state-root filename.
+///
+/// The web token is one caller; the router has its own file with the same
+/// discipline, and duplicating this platform dance is how one of the two
+/// quietly loses the privacy check.
+pub fn load_or_create_secret(
+    root: &Path,
+    file: &str,
+    regenerate: bool,
+) -> anyhow::Result<String> {
+    let path = root.join(file);
     #[cfg(windows)]
     {
         std::fs::create_dir_all(root)?;
@@ -461,7 +474,7 @@ pub fn load_or_create_token(root: &Path, regenerate: bool) -> anyhow::Result<Str
         let stored = crate::platform::load_or_create_user_private(&path, candidate.as_bytes(), regenerate)?;
         let token = String::from_utf8(stored)?.trim().to_string();
         if token.is_empty() {
-            anyhow::bail!("refusing an empty private web token at {}", path.display());
+            anyhow::bail!("refusing an empty private token at {}", path.display());
         }
         Ok(token)
     }
@@ -489,22 +502,33 @@ pub fn load_or_create_token(root: &Path, regenerate: bool) -> anyhow::Result<Str
     }
 }
 
+
 /// Read the token WITHOUT creating one.
 ///
 /// `load_or_create_token` mints a credential as a side effect, which is wrong
 /// for a read-only query: `amber ctl web status` must be able to report "no
 /// token yet" rather than manufacture one.
 pub fn load_token(root: &Path) -> Option<String> {
+    read_secret(root, TOKEN_FILE)
+}
+
+/// Replace a 0600 state-root secret file.
+pub fn write_secret(root: &Path, file: &str, bytes: &[u8]) -> anyhow::Result<()> {
+    crate::platform::write_user_private(&root.join(file), bytes)
+}
+
+/// Read a 0600 state-root secret without ever creating one.
+pub fn read_secret(root: &Path, file: &str) -> Option<String> {
     #[cfg(windows)]
     {
-        let raw = crate::platform::read_user_private(&root.join(TOKEN_FILE)).ok()??;
+        let raw = crate::platform::read_user_private(&root.join(file)).ok()??;
         let trimmed = std::str::from_utf8(&raw).ok()?.trim();
         (!trimmed.is_empty()).then(|| trimmed.to_string())
     }
 
     #[cfg(unix)]
     {
-    let raw = std::fs::read_to_string(root.join(TOKEN_FILE)).ok()?;
+    let raw = std::fs::read_to_string(root.join(file)).ok()?;
     let trimmed = raw.trim();
     if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
     }
