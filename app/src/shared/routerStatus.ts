@@ -33,11 +33,10 @@ export type PiProviderState = 'no-config' | 'missing' | 'stale' | 'installed'
 
 export interface RouterStatus {
   /**
-   * Whether this host can manage the service at all. `false` in the browser
-   * build — a phone has no business editing the provider credentials of the
-   * desktop it is borrowing. The toolbar hides the pill entirely on `false`
-   * rather than routing it through the error state, which would put a
-   * permanently red badge on every phone.
+   * Whether this host can manage the service. The toolbar hides the pill on
+   * `false` rather than painting a permanent red badge. Hosted `/app` now
+   * reports `true`: `amber web` proxies router control over the same cookie
+   * as sessions, so the desktop dialog works in a remote browser too.
    */
   managed: boolean
   unit: 'active' | 'inactive' | 'unknown'
@@ -100,6 +99,75 @@ export function routerDot(s: RouterStatus): 'serving' | 'local' | 'error' | 'off
   if (s.error && s.unit === 'active') return 'error'
   if (s.unit !== 'active') return 'off'
   return s.slots.some((x) => x.enabled) ? 'serving' : 'local'
+}
+
+const PI_STATES: readonly PiProviderState[] = ['no-config', 'missing', 'stale', 'installed']
+
+function asStr(v: unknown, fallback = ''): string {
+  return typeof v === 'string' ? v : fallback
+}
+
+function asNum(v: unknown): number | null {
+  return typeof v === 'number' ? v : null
+}
+
+/**
+ * Parse, never throw. A dialog that dies on malformed CLI/API output is
+ * strictly worse than one that shows "unknown" and an error line.
+ */
+export function parseRouterStatus(stdout: string): RouterStatus {
+  const base: RouterStatus = {
+    managed: true,
+    unit: 'unknown',
+    port: 0,
+    url: '',
+    alias: 'auto',
+    hasToken: false,
+    pi: 'no-config',
+    slots: [],
+    keys: [],
+    queueAvailable: null,
+    uptimeSecs: null,
+    error: null,
+  }
+  let raw: Record<string, unknown>
+  try {
+    raw = JSON.parse(stdout) as Record<string, unknown>
+  } catch {
+    return { ...base, error: 'could not parse router status' }
+  }
+  if (raw === null || typeof raw !== 'object') {
+    return { ...base, error: 'unexpected router status payload' }
+  }
+  const unit = raw['unit']
+  const pi = raw['pi']
+  return {
+    ...base,
+    managed: raw['managed'] !== false,
+    unit: unit === 'active' || unit === 'inactive' ? unit : 'unknown',
+    port: typeof raw['port'] === 'number' ? raw['port'] : 0,
+    url: asStr(raw['url']),
+    alias: asStr(raw['alias'], 'auto'),
+    hasToken: raw['has_token'] === true,
+    pi: PI_STATES.includes(pi as PiProviderState) ? (pi as PiProviderState) : 'no-config',
+    slots: Array.isArray(raw['slots'])
+      ? (raw['slots'] as Record<string, unknown>[]).map(slotFromWire)
+      : [],
+    keys: Array.isArray(raw['keys'])
+      ? (raw['keys'] as Record<string, unknown>[]).map((k) => ({
+          label: asStr(k['label']),
+          state: asStr(k['state'], 'unknown'),
+          coolingSecsRemaining: asNum(k['cooling_secs_remaining']),
+          inFlight: typeof k['in_flight'] === 'number' ? k['in_flight'] : 0,
+          requests: typeof k['requests'] === 'number' ? k['requests'] : 0,
+          errors: typeof k['errors'] === 'number' ? k['errors'] : 0,
+          lastError: typeof k['last_error'] === 'string' ? k['last_error'] : null,
+        }))
+      : [],
+    queueAvailable: asNum(raw['queue_available']),
+    uptimeSecs: asNum(raw['uptime_secs']),
+    error: typeof raw['error'] === 'string' ? raw['error'] : null,
+  }
 }
 
 /** Move a slot within the list, returning a new array. Out-of-range is a no-op. */

@@ -3,8 +3,9 @@
 // or `navigator.clipboard`. Never imported by a test — `amber.test.ts` tests
 // `createAmber` directly against fakes.
 
-import { createAmber, type SocketLike, type PortLike } from './amber'
+import { createAmber, type SocketLike, type PortLike, type RouterApi } from './amber'
 import type { LoadLayoutResult, SaveLayoutResult, LayoutVersion } from '../shared/layoutFile'
+import { slotFromWire, type RouterSlot } from '../shared/routerStatus'
 
 function wsUrl(): string {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
@@ -47,6 +48,80 @@ async function layoutGet(): Promise<LoadLayoutResult> {
     return { text: body.text ?? null, version: body.version ?? null }
   } catch {
     return { text: null, version: null }
+  }
+}
+
+function routerApi(): RouterApi {
+  return {
+    status: async () => {
+      const r = await fetch('/api/router/status', { credentials: 'same-origin' })
+      return r.text()
+    },
+    action: async (action) => {
+      try {
+        const r = await fetch('/api/router/action', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ action }),
+        })
+        const body = (await r.json().catch(() => null)) as { ok?: boolean; error?: string } | null
+        if (r.ok && body?.ok) return { ok: true }
+        return { ok: false, error: body?.error ?? `HTTP ${r.status}` }
+      } catch (e) {
+        return { ok: false, error: e instanceof Error ? e.message : String(e) }
+      }
+    },
+    slots: async () => {
+      try {
+        const r = await fetch('/api/router/slots', { credentials: 'same-origin' })
+        const body = (await r.json().catch(() => null)) as
+          | { ok?: boolean; error?: string; slots?: Record<string, unknown>[] }
+          | null
+        const raw = Array.isArray(body?.slots) ? body.slots : []
+        const slots: RouterSlot[] = raw.map(slotFromWire)
+        if (!r.ok) return { ok: false, error: body?.error ?? `HTTP ${r.status}`, slots }
+        return { ok: true, slots }
+      } catch (e) {
+        return { ok: false, error: e instanceof Error ? e.message : String(e), slots: [] }
+      }
+    },
+    saveSlots: async (slots) => {
+      try {
+        const r = await fetch('/api/router/slots', {
+          method: 'PUT',
+          credentials: 'same-origin',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ slots }),
+        })
+        const body = (await r.json().catch(() => null)) as { ok?: boolean; error?: string } | null
+        if (r.ok) return { ok: true }
+        return { ok: false, error: body?.error ?? `HTTP ${r.status}` }
+      } catch (e) {
+        return { ok: false, error: e instanceof Error ? e.message : String(e) }
+      }
+    },
+    revealKey: async (name) => {
+      if (!name) return ''
+      try {
+        const r = await fetch(`/api/router/key?name=${encodeURIComponent(name)}`, {
+          credentials: 'same-origin',
+        })
+        if (!r.ok) return ''
+        const body = (await r.json().catch(() => null)) as { api_key?: string } | null
+        return typeof body?.api_key === 'string' ? body.api_key : ''
+      } catch {
+        return ''
+      }
+    },
+    logTail: async () => {
+      try {
+        const r = await fetch('/api/router/log', { credentials: 'same-origin' })
+        return r.ok ? r.text() : ''
+      } catch {
+        return ''
+      }
+    },
   }
 }
 
@@ -93,6 +168,7 @@ export function installAmber(home: string): void {
     softwareGl: probeSoftwareGl(),
     layoutGet,
     layoutSave,
+    routerApi: routerApi(),
   })
   window.amber = amber
 

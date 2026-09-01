@@ -5,3 +5,6 @@ Cargo.lock.orig
 .serena/
 .playwright-mcp/
 .worktrees/
+
+__pycache__/
+*.pyc

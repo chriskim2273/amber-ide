@@ -77,9 +77,13 @@ impl Fixture {
     }
 
     fn get(&self, path: &str, cookie: Option<&str>) -> (String, Vec<String>, String) {
+        self.get_ex(path, cookie, "")
+    }
+
+    fn get_ex(&self, path: &str, cookie: Option<&str>, extra: &str) -> (String, Vec<String>, String) {
         let c = cookie.map(|c| format!("Cookie: {c}\r\n")).unwrap_or_default();
         self.request(&format!(
-            "GET {path} HTTP/1.1\r\nHost: {}\r\n{c}Connection: close\r\n\r\n",
+            "GET {path} HTTP/1.1\r\nHost: {}\r\n{c}{extra}Connection: close\r\n\r\n",
             self.addr
         ))
     }
@@ -96,6 +100,15 @@ impl Fixture {
         let c = cookie.map(|c| format!("Cookie: {c}\r\n")).unwrap_or_default();
         self.request(&format!(
             "POST {path} HTTP/1.1\r\nHost: {}\r\n{c}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            self.addr,
+            body.len()
+        ))
+    }
+
+    fn put(&self, path: &str, cookie: Option<&str>, body: &str) -> (String, Vec<String>, String) {
+        let c = cookie.map(|c| format!("Cookie: {c}\r\n")).unwrap_or_default();
+        self.request(&format!(
+            "PUT {path} HTTP/1.1\r\nHost: {}\r\n{c}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             self.addr,
             body.len()
         ))
@@ -176,6 +189,58 @@ fn unauthenticated_data_routes_and_ws_are_refused() {
         f.addr
     ));
     assert!(status.contains("401"), "unauthenticated upgrade accepted: {status}");
+}
+
+const SERVE_HOP: &str = "X-Forwarded-Proto: https\r\n\
+X-Forwarded-Host: teapot-dev.tail3d57b4.ts.net\r\n\
+Tailscale-User-Login: alice@github\r\n";
+
+#[test]
+fn tailscale_serve_identity_skips_the_fragment_token() {
+    let f = fixture();
+    let (status, _, body) = f.get_ex("/api/sessions", None, SERVE_HOP);
+    assert!(status.contains("200"), "Serve hop should be logged in: {status} {body}");
+    assert!(body.contains("sessions"), "{body}");
+
+    let (status, _, _) = f.get_ex("/api/bootstrap", None, SERVE_HOP);
+    assert!(status.contains("200"), "bootstrap over Serve: {status}");
+
+    let (status, _, _) = f.request(&format!(
+        "GET /ws HTTP/1.1\r\nHost: {}\r\n{SERVE_HOP}Upgrade: websocket\r\nConnection: Upgrade\r\n\
+         Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+        f.addr
+    ));
+    assert!(status.contains("101"), "Serve hop WS upgrade refused: {status}");
+}
+
+#[test]
+fn funnel_and_spoofed_serve_headers_still_need_the_token() {
+    let f = fixture();
+    // Funnel: HTTPS + ts.net host, no identity header.
+    let (status, _, _) = f.get_ex(
+        "/api/sessions",
+        None,
+        "X-Forwarded-Proto: https\r\nX-Forwarded-Host: teapot-dev.tail3d57b4.ts.net\r\n",
+    );
+    assert!(status.contains("401"), "Funnel must not skip the token: {status}");
+
+    // Identity header but not HTTPS (LAN / http).
+    let (status, _, _) = f.get_ex(
+        "/api/sessions",
+        None,
+        "X-Forwarded-Proto: http\r\nX-Forwarded-Host: teapot-dev.tail3d57b4.ts.net\r\n\
+         Tailscale-User-Login: alice@github\r\n",
+    );
+    assert!(status.contains("401"), "http forwarded proto accepted: {status}");
+
+    // Identity header but host is not a tailnet MagicDNS name.
+    let (status, _, _) = f.get_ex(
+        "/api/sessions",
+        None,
+        "X-Forwarded-Proto: https\r\nX-Forwarded-Host: evil.example\r\n\
+         Tailscale-User-Login: alice@github\r\n",
+    );
+    assert!(status.contains("401"), "non-ts.net host accepted: {status}");
 }
 
 #[test]
@@ -743,4 +808,88 @@ fn create_and_kill_from_the_browser_reach_the_daemon() {
         }),
         "browser Kill never reached the daemon"
     );
+}
+
+fn assert_router_unauth(f: &Fixture, method: &str, path: &str, body: &str) {
+    let (status, _, response) = match method {
+        "GET" => f.get(path, None),
+        "POST" => f.post(path, None, body),
+        "PUT" => f.put(path, None, body),
+        other => panic!("unsupported {other}"),
+    };
+    assert!(status.contains("401"), "{method} {path} no cookie: {status}");
+    assert!(
+        !response.to_ascii_lowercase().contains("api_key"),
+        "{method} {path} leaked a key without a cookie: {response}"
+    );
+
+    let (status, _, response) = match method {
+        "GET" => f.get(path, Some("amber_web=forged")),
+        "POST" => f.post(path, Some("amber_web=forged"), body),
+        "PUT" => f.put(path, Some("amber_web=forged"), body),
+        other => panic!("unsupported {other}"),
+    };
+    assert!(status.contains("401"), "{method} {path} forged cookie: {status}");
+    assert!(
+        !response.to_ascii_lowercase().contains("api_key"),
+        "{method} {path} leaked a key to a forged cookie: {response}"
+    );
+}
+
+#[test]
+fn router_control_is_behind_the_cookie_boundary() {
+    let f = fixture();
+    assert_router_unauth(&f, "GET", "/api/router/status", "");
+    assert_router_unauth(&f, "GET", "/api/router/slots", "");
+    assert_router_unauth(&f, "GET", "/api/router/key?name=alpha", "");
+    assert_router_unauth(&f, "GET", "/api/router/log", "");
+    assert_router_unauth(&f, "POST", "/api/router/action", r#"{"action":"start"}"#);
+    assert_router_unauth(&f, "PUT", "/api/router/slots", r#"{"slots":[]}"#);
+}
+
+#[test]
+fn router_status_is_managed_and_carries_no_secrets() {
+    let f = fixture();
+    let cookie = f.login();
+    let (status, _, body) = f.get("/api/router/status", Some(&cookie));
+    assert!(status.contains("200"), "{status} {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|_| panic!("{body}"));
+    assert_eq!(v["managed"], true, "{body}");
+    assert_eq!(v["port"], 7719, "{body}");
+    assert_eq!(v["url"], "http://127.0.0.1:7719/v1", "{body}");
+    assert_eq!(v["has_token"], false, "status must not mint a token: {body}");
+    assert!(v.get("token").is_none(), "status leaked a token field: {body}");
+    assert!(!body.contains(&f.token), "status echoed the web token: {body}");
+    assert!(
+        !body.to_ascii_lowercase().contains("api_key"),
+        "status leaked a provider key: {body}"
+    );
+}
+
+#[test]
+fn router_unknown_action_is_rejected_without_touching_systemd() {
+    let f = fixture();
+    let cookie = f.login();
+    let (status, _, body) = f.post(
+        "/api/router/action",
+        Some(&cookie),
+        r#"{"action":"snapshot"}"#,
+    );
+    assert!(status.contains("400"), "{status} {body}");
+    assert!(
+        body.contains("unknown action") || body.contains("snapshot"),
+        "{body}"
+    );
+}
+
+#[test]
+fn router_key_reveal_requires_a_real_slot_name() {
+    let f = fixture();
+    let cookie = f.login();
+    let (status, _, body) = f.get("/api/router/key?name=../router-token", Some(&cookie));
+    assert!(
+        status.contains("400") || status.contains("404"),
+        "path-shaped name must not be forwarded: {status} {body}"
+    );
+    assert!(!body.contains(&f.token), "{body}");
 }

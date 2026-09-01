@@ -33,9 +33,16 @@ Decisions locked with the user:
 
 ## Non-goals (v1)
 
-Named routes/aliases in the UI; tailnet or phone reach; a mobile/`amber web`
-router surface (precedent: preset input slots are desktop-only authority);
-cost accounting; usage history across restarts.
+Named routes/aliases in the UI; exposing the router itself on the tailnet
+(it stays `127.0.0.1:7719`); cost accounting; usage history across restarts.
+
+The hosted `/app` **desktop view** does get the same pill and dialog as
+Electron (2026-09-01): `amber web` proxies `/api/router/*` over the existing
+session cookie so a remote browser can start/stop the unit and edit slots.
+The router's bearer token and provider keys never ride that cookie payload
+except the on-demand reveal GET. Pocket/phone chrome is unchanged — it uses
+the same renderer, so the pill appears there too when the viewport is the
+desktop toolbar.
 
 ## Architecture
 
@@ -150,7 +157,10 @@ Follow the Remote-access recipe end to end:
   a save would have sent `baseUrl`, which the router rejects.
 - `app/src/preload/index.ts` (~:95) + `window.amber` typings in
   `main.tsx` (~:121).
-- `app/src/web/amber.ts` (~:536) — stubs returning `managed: false`.
+- `app/src/web/amber.ts` — hosted `/app` calls cookie-gated
+  `/api/router/*` (`crates/amber/src/router_ops.rs` + `web.rs`). `managed`
+  is `true`; the router bearer token stays in `amber web`. Reveal is GET
+  `/api/router/key?name=` only.
 - Toolbar pill in the top-right cluster (`main.tsx:1863` neighbourhood),
   `router` label, dot tones off/local/serving/error, reusing `.web-pill` CSS
   shape under a `.router-pill` class.
@@ -248,7 +258,8 @@ Modified: root `Cargo.toml` (workspace member), `crates/amber/src/main.rs`
 `scripts/dist.sh` + `app/scripts/dist.sh` (ship the third binary),
 `app/src/main/index.ts`, `app/src/preload/index.ts`,
 `app/src/renderer/main.tsx`, `app/src/renderer/theme.css`,
-`app/src/web/amber.ts`.
+`app/src/web/amber.ts`, `app/src/web/install.ts`,
+`crates/amber/src/router_ops.rs`.
 
 ## Verification
 

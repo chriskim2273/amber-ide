@@ -65,7 +65,13 @@ The token is equivalent to a shell on the machine. It is protected by:
    replies `Set-Cookie: amber_web=<session>; HttpOnly; SameSite=Strict; Path=/`
    (plus `Secure` when served over https), and the page calls
    `history.replaceState` to strip the fragment.
-4. **Every other route requires the cookie**, including the WebSocket upgrade.
+4. **Every other route requires the cookie *or* a Tailscale Serve identity
+   hop**, including the WebSocket upgrade. Serve injects
+   `Tailscale-User-Login` (user-owned devices only) plus `X-Forwarded-Proto:
+   https` and an `X-Forwarded-Host` of `*.ts.net`. Funnel (public) and tagged
+   nodes do not get the login header and still need the fragment token. The
+   LAN TCP proxy (`infra/daemon/amber-web-lan-proxy.py`) strips those
+   headers so a Wi-Fi client cannot spoof a Serve hop.
 5. **Origin check** on the WebSocket upgrade (defence in depth against a
    malicious page on the phone driving the socket via the cookie).
 6. **Rate limit:** failed `/api/auth` attempts are throttled (fixed delay +

@@ -357,7 +357,11 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   TLS, no relay, no accounts; that stack stays the collab spec's job). Auth: 32
   random bytes in `<state>/web-token` (0600), carried in the URL **fragment**
   (never sent to the server / logs), POSTed for an `HttpOnly; SameSite=Strict`
-  cookie, constant-time compared, failed attempts throttled → 429. Browser
+  cookie, constant-time compared, failed attempts throttled → 429. Serve hop
+  (2026-09-01): loopback + `Tailscale-User-Login` + `X-Forwarded-Proto: https`
+  + `X-Forwarded-Host: *.ts.net` is logged in without the fragment; Funnel and
+  tagged nodes still need the token. The LAN proxy on :7718 strips those
+  headers so Wi-Fi cannot spoof Serve. Browser
   protocol is its own whitelist — `open`/`close` + raw binary input — mapping
   ONLY onto `Attach`/`Detach`/`Input`; **no browser message can reach
   Create/Kill/Rename/Suspend/Resume/DumpBacklog/Snapshot, and none can reach
@@ -1502,9 +1506,11 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   both artifacts are static, but neither has been run. Also unrun: the
   macOS/Windows unit paths (rendered + unit-tested only), `enable`/`disable`
   against a real systemd, and the Windows CI binary assertion, which now needs
-  to cover three binaries and newly exercises `ring` on MSVC. By design there is
-  no `amber web`/mobile router surface (desktop-only authority, the same call as
-  preset input slots).
+  to cover three binaries and newly exercises `ring` on MSVC. Hosted `/app`
+  (desktop view) uses the same pill/dialog: `amber web` proxies
+  `/api/router/*` over the session cookie; the router bearer token never
+  enters the browser, and plaintext keys only on the explicit reveal GET.
+  The proxy itself stays loopback-only.
 
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**

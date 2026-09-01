@@ -193,8 +193,9 @@ export function RouterPanel({ status, onClose, onRefresh }: Props): JSX.Element 
         <div className="dialog-body">
           <p className="dialog-text">
             One OpenAI-compatible endpoint in front of every provider below, tried in order.
-            Point any client at <code>{s?.url || 'http://127.0.0.1:7719/v1'}</code> and ask for
+            Point any client on the amber host at <code>{s?.url || 'http://127.0.0.1:7719/v1'}</code> and ask for
             model <code>{s?.alias ?? 'auto'}</code>, or a slot&apos;s own name to pin it.
+            The router binds loopback only — this browser never talks to it directly.
           </p>
 
           {error && <div className="remote-error">{error}</div>}
