@@ -8,6 +8,36 @@ import { TabBrowserStateStore } from './tabBrowserStateStore'
 
 export type LayoutSave = (path: string, text: string, expected: string | null) => Promise<SaveLayoutResult>
 
+export function collectBrowserOrphans(lastUsed: Record<string, number>, associated: Set<string>, now: number, graceMs = 24 * 60 * 60 * 1000): string[] {
+  return Object.entries(lastUsed).filter(([id, at]) => !associated.has(id) && now - at >= graceMs).map(([id]) => id)
+}
+
+export async function commitBrowserLayoutMutation(
+  layoutPath: string,
+  store: TabBrowserStateStore,
+  layoutText: string,
+  expectedLayoutVersion: string | null,
+  saveLayout: LayoutSave = saveLayoutFile,
+  transactionId: () => string = randomUUID,
+): Promise<SaveLayoutResult> {
+  const state = await store.load()
+  if (state.pendingTransaction) throw new Error('BROWSER_TRANSACTION_PENDING')
+  const pending: BrowserStateFile = {
+    ...state, revision: state.revision + 1,
+    pendingTransaction: { id: transactionId(), kind: 'browser-association', expectedLayoutVersion, layoutText },
+  }
+  await store.save(pending)
+  const saved = await saveLayout(layoutPath, layoutText, expectedLayoutVersion)
+  if (!('ok' in saved)) {
+    const { pendingTransaction: _pending, ...rolledBack } = pending
+    await store.save({ ...rolledBack, revision: pending.revision + 1 })
+    return saved
+  }
+  const { pendingTransaction: _pending, ...committed } = pending
+  await store.save({ ...committed, revision: pending.revision + 1, layoutRevision: state.layoutRevision + 1 })
+  return saved
+}
+
 /**
  * Upgrade legacy browser leaves with a journal stored before the layout CAS.
  * If the process dies after that write, startup replays the exact same target
@@ -37,7 +67,19 @@ export async function coordinateTabBrowserMigration(
   const loaded = await loadLayoutFile(layoutPath)
   if (!loaded.text) return
   const layout = parseLayout(loaded.text)
-  if (layout.readOnly || layout.version === TAB_BROWSER_LAYOUT_VERSION || !layout.browsers || Object.keys(layout.browsers).length === 0) return
+  if (layout.readOnly) return
+  if (layout.version === TAB_BROWSER_LAYOUT_VERSION) {
+    const associated = new Set<string>()
+    for (const workspace of Object.values(layout.workspaces)) for (const tab of Object.values(workspace.tabs)) if (tab.browser) associated.add(tab.browser.id)
+    const lastUsed = Object.fromEntries(Object.entries(state.records).flatMap(([id, record]) => record ? [[id, record.lastUsedAt]] : []))
+    const orphans = collectBrowserOrphans(lastUsed, associated, Date.now())
+    if (orphans.length > 0) {
+      const records = { ...state.records }; for (const id of orphans) delete records[id as keyof typeof records]
+      await store.save({ ...state, records, revision: state.revision + 1 })
+    }
+    return
+  }
+  if (!layout.browsers || Object.keys(layout.browsers).length === 0) return
 
   const migrated = migrateLegacyBrowsers({ workspaces: layout.workspaces, browsers: layout.browsers }, random)
   const nextLayout = {

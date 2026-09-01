@@ -28,7 +28,7 @@ export interface BrowserRecord {
 export interface MigrationRecoveryItem { workspace: number; tab: number; safeRestoreUrl: string }
 export interface BrowserStateTransaction {
   id: string
-  kind: 'legacy-layout-migration'
+  kind: 'legacy-layout-migration' | 'browser-association'
   expectedLayoutVersion: string | null
   layoutText: string
 }
@@ -97,11 +97,11 @@ export function parseBrowserState(text: string): BrowserStateFile {
       }
     }
     const pendingRaw = object(raw['pendingTransaction'])
-    const pendingTransaction = pendingRaw && pendingRaw['kind'] === 'legacy-layout-migration'
+    const pendingTransaction = pendingRaw && (pendingRaw['kind'] === 'legacy-layout-migration' || pendingRaw['kind'] === 'browser-association')
       && typeof pendingRaw['id'] === 'string' && pendingRaw['id'].length <= 128
       && (typeof pendingRaw['expectedLayoutVersion'] === 'string' || pendingRaw['expectedLayoutVersion'] === null)
       && typeof pendingRaw['layoutText'] === 'string' && pendingRaw['layoutText'].length <= 2 * 1024 * 1024
-      ? { id: pendingRaw['id'], kind: 'legacy-layout-migration' as const, expectedLayoutVersion: pendingRaw['expectedLayoutVersion'] as string | null, layoutText: pendingRaw['layoutText'] }
+      ? { id: pendingRaw['id'], kind: pendingRaw['kind'] as BrowserStateTransaction['kind'], expectedLayoutVersion: pendingRaw['expectedLayoutVersion'] as string | null, layoutText: pendingRaw['layoutText'] }
       : undefined
     return {
       version: 1,

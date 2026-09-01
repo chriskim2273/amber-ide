@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { loadLayoutFile, saveLayoutFile } from './layoutIO'
 import { TabBrowserStateStore } from './tabBrowserStateStore'
-import { coordinateTabBrowserMigration } from './tabBrowserMigrationCoordinator'
+import { collectBrowserOrphans, commitBrowserLayoutMutation, coordinateTabBrowserMigration } from './tabBrowserMigrationCoordinator'
 import { parseLayout } from '../shared/layoutFile'
 
 const dirs: string[] = []
@@ -15,6 +15,9 @@ function legacy(): string {
 }
 
 describe('coordinateTabBrowserMigration', () => {
+  it('collects only unassociated records older than the orphan grace', () => {
+    expect(collectBrowserOrphans({ keep: 20, young: 21, old: 1 }, new Set(['keep']), 30, 10)).toEqual(['old'])
+  })
   it('commits legacy layout and browser intent through a recoverable journal', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'amber-browser-migrate-')); dirs.push(dir)
     const path = join(dir, 'ui-layout.json'); await saveLayoutFile(path, legacy(), null)
@@ -27,6 +30,20 @@ describe('coordinateTabBrowserMigration', () => {
     expect(layout.workspaces['1']!.tabs['1']!.browser?.id).toBe('browser-04040404040404040404040404040404')
     expect(state.records['browser-04040404040404040404040404040404']?.safeRestoreUrl).toBe('https://example.test/path')
     expect(state.pendingTransaction).toBeUndefined()
+  })
+
+  it('journals ordinary browser association mutations before the layout CAS', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'amber-browser-mutate-')); dirs.push(dir)
+    const path = join(dir, 'ui-layout.json'); await saveLayoutFile(path, JSON.stringify({ version: 2, activeWorkspace: 1, browserRevision: 0, workspaces: {} }), null)
+    const loaded = await loadLayoutFile(path); const store = new TabBrowserStateStore(dir)
+    const target = JSON.stringify({ version: 2, activeWorkspace: 1, browserRevision: 1, workspaces: {} })
+    let observedJournal = false
+    await commitBrowserLayoutMutation(path, store, target, loaded.version, async (...args) => {
+      observedJournal = (await store.load()).pendingTransaction?.kind === 'browser-association'
+      return saveLayoutFile(...args)
+    })
+    expect(observedJournal).toBe(true)
+    expect((await store.load()).pendingTransaction).toBeUndefined()
   })
 
   it('replays the same migration after interruption instead of minting a duplicate browser', async () => {

@@ -24,8 +24,7 @@ export class TabBrowserService {
     private readonly host: TabBrowserHost,
   ) {}
 
-  static async create(root: string, window: BrowserWindow): Promise<TabBrowserService> {
-    const store = new TabBrowserStateStore(root)
+  static async create(root: string, window: BrowserWindow, store = new TabBrowserStateStore(root)): Promise<TabBrowserService> {
     const state = await store.load()
     // The persisted profile descriptor is authoritative. Falling back to a
     // constructor constant here silently reopens a different cookie/storage

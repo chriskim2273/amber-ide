@@ -76,7 +76,8 @@ import { TabBrowserBrokerServer, authorizeBrowserRequest, isEligiblePiController
 import { BrowserDaemonWatcher } from './browserDaemonWatcher'
 import { Connection } from '../client/connection'
 import { TabBrowserStateStore } from './tabBrowserStateStore'
-import { coordinateTabBrowserMigration } from './tabBrowserMigrationCoordinator'
+import { commitBrowserLayoutMutation, coordinateTabBrowserMigration } from './tabBrowserMigrationCoordinator'
+import { bindRendererBrowserCommand, deriveActiveBrowserId } from './browserAssociationAuthority'
 import { parseLayout, serializeLayout } from '../shared/layoutFile'
 import clientPath from '../client/index?modulePath'
 
@@ -724,6 +725,7 @@ interface WindowCtx {
   controlPort: () => Electron.MessagePortMain | null
   child: () => Electron.UtilityProcess | null
   resumeClient: () => void
+  activeBrowserId: string | null
 }
 
 /** Per-window state, keyed by webContents id so IPC can route by sender. */
@@ -1141,6 +1143,7 @@ async function openWindow(target: WindowTarget): Promise<WindowCtx> {
     target,
     controlPort: () => controlPort,
     child: () => child,
+    activeBrowserId: null,
     resumeClient: () => {
       if (!presentationSuspended) return
       presentationSuspended = false
@@ -1188,10 +1191,12 @@ async function main(): Promise<void> {
   // `amber web` process could otherwise rewrite or misread the sidecar.
   const tabBrowserSupported = tabBrowserHostEnabled()
   let tabBrowser: TabBrowserService | null = null
+  let tabBrowserStateStore: TabBrowserStateStore | null = null
   if (tabBrowserSupported) {
     try {
-      await coordinateTabBrowserMigration(layoutPath(), new TabBrowserStateStore(stateRoot()))
-      tabBrowser = await TabBrowserService.create(stateRoot(), win)
+      tabBrowserStateStore = new TabBrowserStateStore(stateRoot())
+      await coordinateTabBrowserMigration(layoutPath(), tabBrowserStateStore)
+      tabBrowser = await TabBrowserService.create(stateRoot(), win, tabBrowserStateStore)
     } catch (error) {
       console.error('tab browser migration failed; browser host remains unavailable', error)
     }
@@ -1226,7 +1231,9 @@ async function main(): Promise<void> {
           const browser = { id: opened.id, width: 420, collapsed: false }
           const next = { ...current, version: 2, browserRevision: (current.browserRevision ?? 0) + 1,
             workspaces: { ...current.workspaces, [location.ws]: { ...workspace, tabs: { ...workspace.tabs, [location.tab]: { ...previous, browser } } } } }
-          const saved = await saveLayoutFile(layoutPath(), serializeLayout(next), loaded.version)
+          const saved = tabBrowserStateStore
+            ? await commitBrowserLayoutMutation(layoutPath(), tabBrowserStateStore, serializeLayout(next), loaded.version)
+            : { error: 'BROWSER_HOST_UNAVAILABLE' as const }
           if (!('ok' in saved)) {
             // The record was persisted before the association CAS. Roll it
             // back immediately so a conflict cannot accumulate unreachable
@@ -1292,7 +1299,8 @@ async function main(): Promise<void> {
     const sender = ctxFor(e)
     if (!tabBrowser || sender?.target.kind !== 'local') return { ok: false, error: 'BROWSER_HOST_UNAVAILABLE' }
     try {
-      return { ok: true, result: await tabBrowser.command(parseTabBrowserCommand(raw)) }
+      const command = bindRendererBrowserCommand(sender.activeBrowserId, parseTabBrowserCommand(raw))
+      return { ok: true, result: await tabBrowser.command(command) }
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : 'INTERNAL_ERROR' }
     }
@@ -1518,13 +1526,23 @@ async function main(): Promise<void> {
       // default geometry — the same fallback core rule #3 already requires.
       return { text: probe.out.length > 0 ? probe.out : null, version: null }
     }
-    return loadLayoutFile(layoutPath())
+    const loaded = await loadLayoutFile(layoutPath())
+    if (ctx && loaded.text) ctx.activeBrowserId = deriveActiveBrowserId(parseLayout(loaded.text))
+    return loaded
   })
   ipcMain.handle('layout-save', async (e, text: string, version: string | null) => {
     if (ctxFor(e)?.target.kind === 'remote') return { ok: true, version: null }
+    const sender = ctxFor(e)
     const current = await loadLayoutFile(layoutPath())
     if (current.text && parseLayout(current.text).readOnly) return { error: 'layout belongs to a newer Amber version' }
-    return saveLayoutFile(layoutPath(), text, version)
+    const currentLayout = current.text ? parseLayout(current.text) : null
+    const nextLayout = parseLayout(text)
+    const browserChanged = (currentLayout?.browserRevision ?? 0) !== (nextLayout.browserRevision ?? 0)
+    const result = browserChanged && tabBrowserStateStore
+      ? await commitBrowserLayoutMutation(layoutPath(), tabBrowserStateStore, text, version)
+      : await saveLayoutFile(layoutPath(), text, version)
+    if ('ok' in result && sender) sender.activeBrowserId = deriveActiveBrowserId(parseLayout(text))
+    return result
   })
 
   const productivityPath = () => join(stateRoot(), 'productivity.json')

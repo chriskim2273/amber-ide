@@ -24,13 +24,13 @@
     {
       "id": "P1-main-association-authority",
       "severity": "important",
-      "status": "open",
+      "status": "completed",
       "work": "Move open/close/share/designation/geometry ownership fully behind a sender-derived main WindowCtx association API; renderer commands must not carry trusted browser ids and renderer layout edits must not be the authorization source."
     },
     {
       "id": "P1-two-store-all-mutations",
       "severity": "important",
-      "status": "partial",
+      "status": "completed",
       "work": "Generalize the migration journal to every browser association mutation (user open/close, broker creation, workspace import/replacement, recovery attach/delete), including rollback/replay and orphan GC grace."
     },
     {
