@@ -25,9 +25,15 @@ $ node -p 'process.platform'
 linux
 ```
 
-## Results
+## Linux prototype results
 
-Pending Linux Gates A–E. Exact commands, adapter/version decision, profile decision, fixture evidence, and measurements will be appended as each gate runs.
+A standalone Electron 43.1.0 fixture ran against a loopback hostile page with private userData/sessionData/profile/artifacts. It proved hardened preferences (no Node/Electron/Amber globals), default permission denial, popup denial, screenshot capture through the target-scoped debugger, debugger evaluation confined to the owned `WebContentsView`, detach/reattach, and window replacement while retaining the page.
+
+The prototype selects Electron's target-scoped `webContents.debugger` adapter: it requires no listening CDP endpoint or extra Chromium/Playwright dependency and exposes no target enumeration through the product contract. Electron is pinned exactly at 43.1.0.
+
+One physical-XTest assertion remained inconclusive on this host: the dev Electron binary needed a GPU-sandbox diagnostic switch to capture a painted frame, and the window manager delivered XTest to the top-level Electron X window while no DOM pointer/key event reached the child view. Programmatic child focus, debugger access, screenshot, detach/reparent, and page continuity all succeeded. This is recorded as a Linux live/manual acceptance item rather than claimed green; product integration remains feature-gated and portable work proceeds under orchestrator direction. It must be rerun against the packaged artifact with the repository's production physical-input smoke harness before default enablement.
+
+Latest artifact: `/tmp/amber-tab-browser-validation/phase0/run-1788297704/artifacts/result.json`. No production daemon was involved.
 
 ## macOS pre-merge checklist
 
