@@ -3,9 +3,15 @@ import { browserWebPreferences, isAllowedBrowserUrl } from './tabBrowserPolicy'
 import type { BrowserId } from '../shared/tabBrowser'
 import type { TabBrowserPage, TabBrowserPageFactory } from './tabBrowserHost'
 
+const hardenedSessions = new WeakSet<Session>()
 export function hardenBrowserSession(browserSession: Session): void {
+  if (hardenedSessions.has(browserSession)) return
+  hardenedSessions.add(browserSession)
   browserSession.setPermissionCheckHandler(() => false)
   browserSession.setPermissionRequestHandler((_contents, _permission, callback) => callback(false))
+  // Downloads are consequential and no approval coordinator exists on this
+  // narrow first surface, so fail closed rather than writing silently.
+  browserSession.on('will-download', (event) => event.preventDefault())
 }
 
 export class ElectronTabBrowserPage implements TabBrowserPage {
@@ -19,6 +25,7 @@ export class ElectronTabBrowserPage implements TabBrowserPage {
     this.view.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
     this.view.webContents.on('will-navigate', (event, url) => { if (!isAllowedBrowserUrl(url)) event.preventDefault() })
     this.view.webContents.on('will-redirect', (event, url) => { if (!isAllowedBrowserUrl(url)) event.preventDefault() })
+    this.view.webContents.on('will-frame-navigate', (event) => { if (!isAllowedBrowserUrl(event.url)) event.preventDefault() })
     this.view.webContents.on('before-input-event', onUserInput)
     this.view.webContents.on('before-mouse-event', onUserInput)
   }
