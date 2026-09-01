@@ -68,7 +68,28 @@ pub fn api_key_command(root: &Path) -> String {
 }
 
 /// The provider entry amber writes. Pure so the shape is testable.
+///
+/// `models` entries are OBJECTS, not id strings: Pi's `ModelDefinitionSchema`
+/// rejects a bare string ("providers.<p>.models.0: must be object") and then
+/// discards the whole file with a warning, which is exactly the failure a live
+/// `pi --list-models` caught.
 pub fn provider_entry(root: &Path, port: u16, models: &[String]) -> Value {
+    let models: Vec<Value> = models
+        .iter()
+        .map(|id| {
+            json!({
+                "id": id,
+                "name": if id == DEFAULT_ALIAS {
+                    "amber router · failover chain".to_string()
+                } else {
+                    format!("amber router · {id}")
+                },
+                "input": ["text"],
+                "contextWindow": 128_000,
+                "maxTokens": 16_000,
+            })
+        })
+        .collect();
     json!({
         "baseUrl": base_url(port),
         "api": "openai-completions",
@@ -104,6 +125,10 @@ pub fn remove(doc: &Value) -> (Value, bool) {
     root.insert("providers".into(), Value::Object(providers));
     (Value::Object(root), changed)
 }
+
+/// The router's failover alias. Mirrors `amber_router::slots::DEFAULT_ALIAS`;
+/// duplicated rather than depending on the router crate from `amber`.
+pub const DEFAULT_ALIAS: &str = "auto";
 
 /// Model ids to advertise: the failover alias plus each slot by name, which is
 /// exactly the alias set the router itself serves on `/v1/models`.
@@ -213,6 +238,19 @@ mod tests {
         assert_eq!(e["baseUrl"], json!("http://127.0.0.1:7719/v1"));
         assert_eq!(e["api"], json!("openai-completions"));
         assert_eq!(e["authHeader"], json!(true));
+    }
+
+    #[test]
+    fn models_are_objects_because_pi_rejects_bare_strings() {
+        let e = provider_entry(&root(), 7719, &["auto".into(), "groq".into()]);
+        let models = e["models"].as_array().unwrap();
+        assert_eq!(models.len(), 2);
+        for m in models {
+            assert!(m.is_object(), "pi discards the whole file otherwise: {m}");
+            assert!(m["id"].is_string());
+        }
+        assert_eq!(models[0]["id"], json!("auto"));
+        assert_eq!(models[1]["id"], json!("groq"));
     }
 
     #[test]
