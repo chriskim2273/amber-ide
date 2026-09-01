@@ -218,8 +218,16 @@ Parser rules:
 ```ts
 export const BROWSER_STATE_VERSION = 1
 
+export interface ProfileDescriptor {
+  id: 'global'
+  partition: string
+  createdAt: number
+  migratedFrom?: string
+}
+
 export interface BrowserRecord {
   id: string
+  profileId: 'global'
   mode: 'preview' | 'browse'
   safeRestoreUrl: string
   title: string
@@ -237,6 +245,7 @@ export interface BrowserStateFile {
   version: 1
   revision: number
   layoutRevision: number
+  profiles: Record<'global', ProfileDescriptor>
   records: Record<string, BrowserRecord>
   migrationRecovery: MigrationRecoveryItem[]
   pendingTransaction?: BrowserStateTransaction
@@ -247,7 +256,8 @@ Rules:
 
 - Main is the only writer.
 - `pageIncarnation` is a random process-page identity and changes on every create/thaw/crash replacement; `generation` is monotonic only within that incarnation. Both are required on mutations and snapshot references.
-- `safeRestoreUrl` is the only URL used after process death. Persistence strips user-info and fragments and redacts or drops known credential query keys; when a URL cannot be made safely restorable, retain only a neutral origin/home URL and disclose the loss. Raw current URLs may be shown transiently in chrome but are not automatically durable.
+- `safeRestoreUrl` is the only URL used after process death. Persistence strips user-info, query, and fragment unconditionally; v1 persists at most a validated HTTP(S) origin plus path. This deliberately loses query-driven application state rather than guessing which query keys are credentials. When even origin/path cannot be made safely restorable, retain a neutral origin/home URL and disclose the loss. Raw current URLs may be shown transiently in user-only chrome but are not automatically durable, logged, or model-visible.
+- `profiles.global` is the one durable `ProfileDescriptor`. Its `partition` is the Phase-0-proven canonical persistent partition; every v1 record references it through `profileId: 'global'`. Unknown profile IDs fail closed. This makes partition/profile migration explicit rather than an implied string constant.
 - Atomic unique-temp-file + file fsync + replace + parent-directory fsync discipline matches the strongest existing state stores.
 - Malformed records are dropped individually and logged; one bad record does not lose all browsers.
 - A record absent from every current tab association is garbage-collected after a bounded grace, not immediately, so a crash between layout and state writes does not destroy recoverable browser intent.
@@ -286,8 +296,8 @@ For each old `LayoutFile.browsers` entry:
 3. Sort candidates by active/visible status if known, then `ord`, then stable ID.
 4. Promote the first candidate to `TabLayout.browser` with a new opaque ID or a validated retained ID.
 5. Create a `BrowserRecord` carrying a redacted `safeRestoreUrl` and default viewport.
-6. Remove every promoted legacy browser leaf from the split tree and collapse its parent using existing `removeLeaf` semantics.
-7. Preserve additional browser candidates in durable `migrationRecovery` entries with their source workspace/tab and redacted safe URL; surface a bounded recovery notice allowing the user to attach, copy the safe URL, or delete them.
+6. Remove every **recognized legacy browser leaf** from the split tree, including non-promoted extras, and collapse each parent using existing `removeLeaf` semantics. Never remove an unrecognized app-local or terminal leaf merely because its sidecar entry is malformed.
+7. Preserve every non-promoted recognized browser candidate in durable `migrationRecovery` entries with their source workspace/tab and redacted safe URL; surface a bounded recovery notice allowing the user to attach, copy the safe URL, or delete them.
 8. Never silently discard an extra URL.
 9. Browser-only legacy tabs remain tabs: their terminal tree becomes `null`, and the rail provides the tab's content.
 10. `.amberws` version-1 browser panes load as the target tab's rail. If a document contains more than one browser in a target tab, import the first and persist the extras as recovery items.
@@ -496,7 +506,7 @@ The initial release treats same-user local processes as trusted code, matching P
 - extension version;
 - request ID.
 
-Authorization is based on current tab membership, designated Pi, and Share with Pi state. A claimed Pi UUID does not grant access. Future per-daemon-session capabilities may tighten local attribution without changing tool schemas.
+Authorization is based on a fresh daemon session listing, current tab membership, designated Pi, and Share with Pi state. A claimed Pi UUID does not grant access. There is exactly one narrowly scoped pre-share exception: an authenticated `open` request from a currently live `kind: pi` session that parses into an existing tab may ensure a browser record for that same tab, reveal/reopen the local GUI, and create or refresh a bounded user solicitation naming that session. It may not navigate (a proposed URL is displayed only as untrusted intent), inspect, mutate, designate itself, enable sharing, or operate on another browser. Duplicate solicitations are rate-limited and coalesced. All other requests require designation and Share with Pi. Future per-daemon-session capabilities may tighten local attribution without changing tool schemas.
 
 ### 14.3 Request envelope
 
@@ -648,7 +658,7 @@ Use a consistent `browser_*` namespace and avoid conflicting with installed thir
 
 - `browser_snapshot` — accessibility-first snapshot with bounded depth/text and ephemeral element references.
 - `browser_find` — search current snapshot by text/regex/role/name without returning the whole tree.
-- `browser_screenshot` — viewport or selected element; returns an image result/path with retention rules.
+- `browser_screenshot` — viewport or selected element; returns a bounded binary image attachment (never a filesystem path). The host captures to memory, the Pi extension forwards it through Pi's typed image-result channel, and both sides release it after the response/cancellation deadline.
 - `browser_inspect` — selected element's tag, role, accessible name, attributes allowlist, bounding box, computed-style allowlist, and concise DOM ancestry.
 - `browser_console` — bounded console/error entries since cursor/timestamp.
 - `browser_network` — bounded request summary, failed requests, status/type/timing; focused details exclude credentials and default to no bodies.
@@ -733,7 +743,7 @@ The browser rail lists Pi panes currently in that tab. The user chooses one. If 
 ### 18.2 Share with Pi
 
 - Off by default for migrated and user-created browsers.
-- A first Pi request creates/reveals the rail and asks the user to designate/share before navigation/action proceeds.
+- A first Pi `open` request may use only the §14.2 solicitation exception: after fresh daemon membership validation it creates/reveals the rail and asks the user to designate/share. Its proposed URL is shown as untrusted intent and is not loaded until the user explicitly accepts; no other navigation, observation, or action proceeds.
 - Sharing is a persistent tab presentation preference but is revalidated against the live daemon session on every broker call.
 - Visible rail badge names the designated pane/session.
 - Stop Sharing immediately blocks new calls, cancels cancellable work, clears pending approvals, increments generation, and leaves a visible revoked audit line. The toggle confirmation explains that sharing grants the designated Pi cross-origin access to the same logged-in Amber profile, not merely the current site.
@@ -813,20 +823,19 @@ Page-derived accessibility text, console logs, DOM, network metadata, and screen
 - access cookies/secrets;
 - grant the broker authority to run local commands. A model may still be socially influenced by page text and may invoke other tools it already possesses; Amber does not claim cross-tool prompt-injection prevention. Consequential browser actions therefore remain broker-enforced regardless of model reasoning.
 
-### 19.7 Secrets and redaction
+### 19.7 Secrets, minimization, and redaction
 
-Never return:
+Amber does not claim that arbitrary DOM text, accessibility names, console strings, or application-defined URLs can be perfectly classified as non-secret. The enforceable boundary is data minimization plus structural omission:
 
-- cookies;
-- authorization/cookie/proxy-auth headers;
-- password field values;
-- credit-card/security-code field values;
-- browser storage contents by default;
-- full URL fragments/query values known to be credentials;
-- download/upload paths beyond what the user explicitly chose;
-- host IPC token.
+- never return cookies, browser storage values, request/response bodies, host IPC tokens, or authorization/cookie/proxy-auth headers;
+- never return password, credit-card, security-code, hidden, or autocomplete-sensitive control values; sensitive controls appear only as redacted metadata;
+- omit URL user-info, query, and fragment from persistence, logs, console/network summaries, snapshot link targets, and normal model-visible results; return at most validated scheme/host/port/path unless a separately approved diagnostic explicitly needs more;
+- header output is an explicit benign allowlist, not a redact-known-bad denylist;
+- upload/download paths remain host-private capability objects and are never model-visible filesystem strings;
+- screenshots are bounded binary attachments and may visually contain secrets present on screen. Sharing and each screenshot request make that limitation explicit; Amber cannot redact arbitrary pixels reliably;
+- DOM/accessibility/console text remains untrusted and may itself contain application-rendered secrets. Results are bounded, clearly labeled, and focused by explicit query, but are not advertised as secret-free.
 
-Logs use structured metadata, not raw bodies. Redaction runs before persistence and before model-visible formatting.
+Redaction and omission run before persistence and before model-visible formatting. Automated canary fixtures place unique secrets in cookies, storage, auth headers, query/fragment, password controls, hidden controls, DOM text, console text, and pixels. Tests assert the structural channels never leak and document the unavoidable DOM/console/pixel cases rather than making an impossible blanket guarantee. Logs use structured metadata, never raw bodies.
 
 ### 19.8 Local IPC threat model
 
@@ -1127,7 +1136,7 @@ Never restart or disrupt the user's production daemon during verification.
 | Activation queue | 8 entries, 10 s | `BROWSER_CAPACITY_BUSY` |
 | Snapshot | 2,000 nodes, depth 20, 256 KiB text/result | truncate with explicit marker |
 | Console/network ring | 1,000 items and 1 MiB each per browser | drop oldest and report count |
-| Screenshot | 4096×4096, 10 MiB encoded | reject/scale only with caller consent |
+| Screenshot | 4096×4096, 10 MiB encoded binary attachment | reject/scale only with caller consent; never return a path |
 | Geometry | 1..32767 coordinates/dimensions; monotonic u53 revision | ignore invalid/stale update |
 | Browser state | 1,000 records; 8 MiB file | recovery/error, never unbounded parse |
 | Recovery items | 100 visible + bounded archived diagnostics | oldest metadata summarized, URL still redacted |

@@ -1,7 +1,7 @@
 # Tab Browser Host — Implementation Plan
 
 **Design:** `docs/superpowers/specs/2026-09-01-tab-browser-host-design.md`
-**Status:** reviewed execution plan; implementation has not started
+**Status:** approved for execution after synthesized design/plan review (2026-09-01); Phase 0 and deployed-reader barriers remain hard gates
 **Platforms:** macOS and Linux first; Windows compiles with the feature unavailable
 **Method:** tests first, narrow milestone commits, Phase-0 evidence before product code
 
@@ -36,7 +36,11 @@ export AMBER_FAST=/tmp/amber-tab-browser-validation
 export CARGO_TARGET_DIR="$AMBER_FAST/cargo-target"
 export npm_config_cache="$AMBER_FAST/npm-cache"
 export PLAYWRIGHT_BROWSERS_PATH=0
-mkdir -p "$AMBER_FAST" "$CARGO_TARGET_DIR" "$npm_config_cache"
+export ELECTRON_CACHE="$AMBER_FAST/electron-cache"
+export ELECTRON_BUILDER_CACHE="$AMBER_FAST/electron-builder-cache"
+export XDG_CACHE_HOME="$AMBER_FAST/xdg-cache"
+mkdir -p "$AMBER_FAST" "$CARGO_TARGET_DIR" "$npm_config_cache" \
+  "$ELECTRON_CACHE" "$ELECTRON_BUILDER_CACHE" "$XDG_CACHE_HOME"
 cd "$REPO"
 ```
 
@@ -56,11 +60,14 @@ export XDG_RUNTIME_DIR="$RUN/runtime"
 export AMBER_SOCKET="$RUN/runtime/amber.sock"
 export AMBER_BROWSER_HOST_SOCKET="$RUN/runtime/browser-host.sock"
 export AMBER_BROWSER_PROFILE_ROOT="$RUN/profile"
+export AMBER_ELECTRON_USER_DATA="$RUN/electron-user-data"
+export AMBER_ELECTRON_CACHE="$RUN/electron-cache"
 export AMBER_TAB_BROWSER_HOST=1
-mkdir -p "$XDG_STATE_HOME" "$XDG_RUNTIME_DIR" "$AMBER_BROWSER_PROFILE_ROOT"
+mkdir -p "$XDG_STATE_HOME" "$XDG_RUNTIME_DIR" "$AMBER_BROWSER_PROFILE_ROOT" \
+  "$AMBER_ELECTRON_USER_DATA" "$AMBER_ELECTRON_CACHE"
 ```
 
-The harness must spawn its own daemon binary with the private variables above, record its PID, and clean it with a shell `trap`. It must assert that `AMBER_SOCKET` is under `$RUN` before starting or stopping anything. Never call `systemctl --user`, launchctl, the app's Restart daemon command, or an unscoped `pkill amber` during verification.
+Every Electron process must call `app.setPath('userData', AMBER_ELECTRON_USER_DATA)` and `app.setPath('sessionData', AMBER_ELECTRON_CACHE)` before `app.requestSingleInstanceLock()`, partition/session access, or `ready`; the harness also passes a unique `--user-data-dir` defensively. A Phase-0 fixture that does not need daemon metadata must not start a daemon at all. A fixture that does need one must spawn its own binary with the private variables above, record its PID, and clean it with a shell `trap`. It must assert that `AMBER_SOCKET`, state, profile, and Electron user-data roots are under `$RUN` before starting or stopping anything. The existing `persist:amber-browser` probe runs only against a copied/synthetic private partition, never the user's live profile. Never call `systemctl --user`, launchctl, the app's Restart daemon command, or an unscoped `pkill amber` during verification.
 
 ## 3. Planned module map
 
@@ -126,11 +133,11 @@ The harness must spawn its own daemon binary with the private variables above, r
 
 ## 4. Phase 0 — mandatory prototypes and stop gates
 
-Phase 0 may add prototype tests/harness code but no production BrowserHost behavior, schema writer, migration, or package dependency commit. Keep prototype artifacts under `$AMBER_FAST/phase0`; record exact Electron, Chromium, Node, OS, display server, and candidate Playwright versions in `.reports/tab-browser-phase0.md`.
+Phase 0 may add prototype tests/harness code but no production BrowserHost behavior, schema writer, migration, or package dependency commit. The fixture is bounded: standalone Electron entry, hostile local HTTP server, native-view test shell, adapter prototype, and crash-matrix prototype only. It imports no production renderer/preload and exposes no product feature. Keep its npm install, userData/sessionData, partition, logs, sockets, screenshots, and all artifacts under `$AMBER_FAST/phase0`; record exact Electron, Chromium, Node, OS, display server, and candidate Playwright versions in `.reports/tab-browser-phase0.md`. Each run asserts its paths before launch and kills only recorded child PIDs. No production daemon is needed for Gates A–C/E; Gate D uses fake registration/readiness and the fixture singleton only.
 
 ### 4.1 Gate A: sandbox and profile
 
-Write the hostile fixture and assertions first. Create a standalone `WebContentsView` with the intended production preferences and resolved existing Amber partition.
+Write the hostile fixture and assertions first. Create a standalone `WebContentsView` with the intended production preferences. Probe profile compatibility only against a byte-for-byte copy or synthetic fixture of the legacy partition inside the private Phase-0 userData root; never open the user's live partition.
 
 Prove on Linux and macOS:
 
@@ -206,9 +213,34 @@ Suggested commit:
 test: prove tab browser host substrate
 ```
 
-## 5. Milestone 1 — Rust layout-v2 reader first
 
-This milestone must ship before any TypeScript writer emits layout v2.
+## 5. Milestone 0A — selected dependency and Electron E2E harness
+
+This milestone occurs only after the signed Phase-0 decision record and before any production import of the selected adapter. It is dependency/harness infrastructure, not BrowserHost product behavior.
+
+### RED
+
+Add a packaging-resolution test that launches the standalone Electron fixture through the same electron-vite/main bundling mode as production and proves the selected adapter can be resolved from the packaged dependency graph. Assert exact Electron `43.1.0`, an exact selected `playwright-core` version if Playwright won (or its complete absence if debugger won), `PLAYWRIGHT_BROWSERS_PATH=0`, no downloaded browser executable, and no second Chromium payload. Add one E2E smoke command whose userData/sessionData/profile/artifact roots are all rejected unless under `$AMBER_FAST`.
+
+### GREEN
+
+Pin Electron exactly. Add the chosen runtime dependency to production `dependencies` only after Phase 0 selects it; do not leave candidate packages in the lockfile. Create the reusable Electron fixture launcher and hostile fixture server under `app/e2e/tabBrowser/`, with explicit cache/profile flags and PID-scoped cleanup. Configure electron-vite packaging so the selected adapter resolves in packaged main without exposing it to preload/renderer.
+
+### REVIEW / COMMIT
+
+Inspect `package-lock.json`, installed package scripts, packaged `app.asar`, process command lines, and artifact directories. Record dependency license and package-size delta. This commit must contain only dependency, lockfile, fixture/harness, and report changes.
+
+```text
+build(app): pin browser host substrate
+```
+
+## 6. Milestone 1 — Rust layout-v2 reader first
+
+This milestone has two barriers and must ship before any TypeScript writer emits layout v2.
+
+**Barrier A — implementation:** land the additive Rust v1/v2 reader and fixtures with no TypeScript writer enabled.
+
+**Barrier B — deployment verification:** build/package that reader, upgrade an isolated installed-style daemon/web service, and prove it reads v1 and v2 fixtures. Then verify the minimum supported deployed Amber release carrying this reader is available through the actual upgrade channel and record the release/build identifier in `.reports/tab-browser-host.md`. No v2 writer, including tests that overwrite a shared fixture through production IO, may be enabled until Barrier B is signed off. A source commit alone is not compatibility deployment.
 
 ### RED
 
@@ -240,16 +272,16 @@ Review for core rule 3, serde unknown-field behavior, privacy, and backwards com
 feat(web): read layout v2 sidecars
 ```
 
-## 6. Milestone 2 — strict shared models, migration, and workspace v2
+## 7. Milestone 2 — strict shared models, migration, and workspace v2
 
 ### RED
 
 Add tests before implementation:
 
 - `browserName.test.ts`: cryptographic opaque IDs, exact grammar, bounded length, legacy IDs accepted only by migration.
-- `browserProtocol.test.ts`: every union member, unknown keys/version, frame/result limits, cancellation ownership, sequence/high-water replay behavior, incarnation/generation requirements.
-- `browserPolicy.test.ts`: scheme/redirect policy, user-info/fragment/credential-query redaction, non-restorable fallback, password/card/header redaction, approval digest stability.
-- `browserState.test.ts`: per-record corruption tolerance, file caps, duplicate IDs, recovery cap, orphan grace, unknown future versions.
+- parser-only `browserProtocol.test.ts`: action/result shapes, unknown keys/version, and normative scalar/collection limits. Stateful cancellation ownership, sequence/high-water replay, connection limits, and incarnation/generation dispatch semantics belong to Milestone 6 broker integration tests, not this pure-schema milestone.
+- `browserPolicy.test.ts`: scheme/redirect policy; unconditional URL user-info/query/fragment omission; non-restorable fallback; sensitive-control omission; benign header allowlist; approval digest stability; and canary fixtures proving cookies/storage/auth headers/query/fragment/password/hidden values never cross structural outputs while documenting that arbitrary DOM/console text and screenshot pixels cannot be guaranteed secret-free.
+- `browserState.test.ts`: explicit `ProfileDescriptor`/`profileId: 'global'`, per-record corruption tolerance, file caps, duplicate IDs, recovery cap, orphan grace, unknown future versions, and unknown profile fail-closed behavior.
 - `browserLayout.test.ts`: one rail per tab, legacy leaf collapse, browser-only tab, deterministic first browser, extra recovery, stale coordinate IDs, idempotence.
 - extend `layoutFile.test.ts`: v1 read, in-memory migration, v2 write/read, `browserRevision`, unknown future no rewrite, web-writer merge preservation.
 - extend `workspaceFile.test.ts`: complete v1/v2 compatibility, `WsBrowserV2`, duplicate browser rejection/recovery, placeholder/tree invariants, no share/controller/credentials, size/depth caps.
@@ -266,9 +298,9 @@ npx vitest run src/shared/browserName.test.ts src/shared/browserProtocol.test.ts
 
 ### GREEN
 
-Implement strict parsers and pure migrations. `parseLayout` reads v1/v2; only `serializeLayout` emits v2. Keep `LayoutFile.browsers` represented only inside the v1 input/migration type, not the v2 application model. Replace browser `SavePane` encoding with `WsTabV2.browser`; v1 remains readable.
+Implement strict parsers and pure migrations. `parseLayout` reads v1/v2; only `serializeLayout` can encode v2. Keep `LayoutFile.browsers` represented inside a transitional read model until the UI cutover: existing renderer/store/workspace code continues to receive an explicit legacy projection and can load browser panes without type lies. Add deprecation assertions that fail if any legacy minting path remains after Milestone 7. Introduce `WsTabV2.browser` parsers, but keep v1 save/load behavior active until Milestones 7–8 wire the transactional host path.
 
-Do not turn on v2 saves in `main.tsx` yet. No main-owned browser page exists in this milestone.
+Do not turn on v2 production saves, switch workspace serialization, or delete legacy renderer fields yet. No main-owned browser page exists in this milestone.
 
 ### REVIEW / COMMIT
 
@@ -278,14 +310,15 @@ Review migration information preservation, URL redaction, schema limits, and Typ
 feat(app): define tab browser persistence models
 ```
 
-## 7. Milestone 3 — crash-safe stores and association transactions
+## 8. Milestone 3 — crash-safe stores and association transactions
 
 ### RED
 
-Add `browserStateStore.test.ts` and `browserTransaction.test.ts` with temp directories under `/tmp`:
+First extend `layoutIO.test.ts` around the existing authoritative writer, then add `browserStateStore.test.ts` and `browserTransaction.test.ts`, all with temp directories under `/tmp`:
 
+- `layoutIO` unique temp names under concurrent writes, write/flush/file-fsync/atomic-replace/parent-directory-fsync ordering, stale-temp cleanup, preserved prior file on injected failure, symlink/reparse rejection, and restrictive file permissions/ACL where supported;
 - private token/state file mode and symlink/reparse rejection where supported;
-- unique temp, file fsync, rename, parent fsync;
+- browser-state unique temp, file fsync, replace, and parent fsync;
 - malformed record isolation and hard file/record caps;
 - v1 backup before migration;
 - fault after each two-store step;
@@ -302,7 +335,7 @@ Observe failure before adding the modules.
 
 ### GREEN
 
-Implement `BrowserStateStore` and `BrowserTransactionCoordinator`. Reuse `loadLayoutFile`/`saveLayoutFile` CAS, but do not weaken its content-token semantics. Browser association commands go through the coordinator; ordinary renderer layout writes continue through the existing merge chain and preserve `browserRevision`/tab browser fields.
+Harden `layoutIO` first so its atomicity/durability/private-file contract is real, preserving its content-token CAS semantics and all existing callers. Then implement `BrowserStateStore` and `BrowserTransactionCoordinator` on the same audited primitives. Browser association commands go through the coordinator; ordinary renderer layout writes continue through the existing merge chain and preserve `browserRevision`/tab browser fields.
 
 Add deterministic injected clock/ID/fsync/fault seams—no production fault flags. Recovery diagnostics are bounded structured values suitable for UI, without raw secrets.
 
@@ -314,7 +347,7 @@ Concurrency/persistence review must walk the complete crash matrix and two concu
 feat(app): persist browser rails transactionally
 ```
 
-## 8. Milestone 4 — security policy, daemon metadata watcher, and capacity
+## 9. Milestone 4 — security policy, daemon metadata watcher, and capacity
 
 ### RED
 
@@ -340,7 +373,7 @@ Security review checks navigation at every Electron event, both permission hooks
 feat(app): enforce browser host policy and capacity
 ```
 
-## 9. Milestone 5 — adapter and BrowserHost runtime
+## 10. Milestone 5 — adapter and BrowserHost runtime
 
 ### RED
 
@@ -375,7 +408,7 @@ Architecture review checks native ownership and no terminal path changes. Securi
 feat(app): own tab browsers in electron main
 ```
 
-## 10. Milestone 6 — broker, generation semantics, approvals, and tools
+## 11. Milestone 6 — broker, generation semantics, approvals, and tools
 
 ### RED
 
@@ -386,7 +419,8 @@ Add broker socket integration tests with a fake host/watcher:
 - bounded frame and malformed JSON/union disconnect;
 - unsupported version;
 - 8 connections, 32 global requests, 16 mutation queue;
-- current tab, designated Pi, live kind `pi`, Share, and fresh watcher all required;
+- current tab, designated Pi, live kind `pi`, Share, and fresh watcher all required for every normal action;
+- the sole first-use exception accepts only authenticated `open` from a freshly listed live Pi already in that tab, coalesces/rate-limits solicitation, reveals the GUI, stages but does not navigate to `proposedUrl`, and cannot self-designate/share/inspect/mutate another browser;
 - enqueue and pre-dispatch incarnation/generation checks;
 - same-controller FIFO and cross-browser bounded concurrency;
 - duplicate in-flight join, completed replay, changed-payload reject, evicted-sequence reject;
@@ -394,13 +428,13 @@ Add broker socket integration tests with a fake host/watcher:
 - approval digest changes on origin/target/argument/generation/controller changes;
 - approval timeout and visible-window requirement;
 - consequential action matrix;
-- read result bounds and redaction;
+- read result bounds, benign header allowlists, URL query/fragment omission, sensitive-control omission, binary screenshot attachments with no returned filesystem path, and canary leak tests for every structural secret channel;
 - no raw CDP/arbitrary script/target enumeration action;
 - first Pi request returns visible creation/share state and performs no hidden navigation.
 
 ### GREEN
 
-Implement `browserProtocol`, framed `BrowserBroker`, authorization, queues, cancellation, approval coordinator, and typed tool dispatch. `browser:command` remains the only renderer command route; Pi uses only the local broker.
+Implement the stateful `browserProtocol` enforcement, framed `BrowserBroker`, authorization, the narrowly scoped first-use solicitation path, queues, cancellation, approval coordinator, and typed tool dispatch. `browser:command` remains the only renderer command route; Pi uses only the local broker. Screenshots travel as bounded binary attachments/tool image content and are released on completion/cancel; broker JSON and tool text never contain a temporary path.
 
 Status/observation actions may omit expected generation where they explicitly return the current incarnation/generation. Every mutation and element reference requires both. User input remains enabled; disclose that accepted site effects cannot be rolled back.
 
@@ -412,7 +446,7 @@ Perform independent protocol/concurrency and security/privacy reviews. Mutation-
 feat(app): broker shared pi browser control
 ```
 
-## 11. Milestone 7 — renderer rail and removal of browser split panes
+## 12. Milestone 7 — renderer rail and removal of browser split panes
 
 ### RED
 
@@ -438,9 +472,9 @@ Add pure model tests and Electron component/acceptance assertions for:
 
 Implement `BrowserRail` and wire it beside the active tab's terminal stage. Main derives ownership from `event.sender`; geometry payload is data, not authority. BrowserHost events drive runtime display state.
 
-Remove all legacy browser-pane creation/update/move/close branches from `main.tsx`, `SplitView.tsx`, `store.ts`, and `uiModel.ts`. Delete `Browser.tsx`/`webview.d.ts` and old `setWindowOpenHandler` code that existed solely for `<webview>` guests. Keep editor behavior unchanged.
+Cut over legacy behavior atomically: first route currently loaded v1 browser panes and workspace v1 browser placeholders through the deterministic rail migration/recovery adapter; then remove all legacy browser-pane creation/update/move/close branches from `main.tsx`, `SplitView.tsx`, `store.ts`, and `uiModel.ts`. Delete `Browser.tsx`/`webview.d.ts` and old `setWindowOpenHandler` code that existed solely for `<webview>` guests only after transitional tests prove no load path drops browser intent. Keep editor behavior unchanged.
 
-Turn on v2 serialization only after Milestone 1 compatibility is present and the startup migration transaction succeeds. Remote windows remain read-only/unavailable.
+Turn on v2 layout serialization only after Milestone 1 **Barrier B deployed-reader verification** and a successful startup migration transaction. Keep workspace saves on v1 until Milestone 8 commits its complete v2 save/load transaction. Remote windows remain read-only/unavailable.
 
 ### REVIEW / COMMIT
 
@@ -450,7 +484,7 @@ UX/accessibility review uses real native child views, not screenshots of DOM chr
 feat(app): replace browser panes with tab rails
 ```
 
-## 12. Milestone 8 — `.amberws`, recovery, and destructive workflows
+## 13. Milestone 8 — `.amberws`, recovery, and destructive workflows
 
 ### RED
 
@@ -468,7 +502,7 @@ Extend workspace and renderer workflow tests:
 
 ### GREEN
 
-Wire save/load to BrowserHost snapshots/transactions. Ensure dump allowlists include daemon panes only; browser rails never request daemon backlog. Update labels and release-facing copy to say browser intent/profile, not exact page continuation.
+Wire v2 workspace save/load to BrowserHost snapshots/transactions in one cutover. Until that point existing v1 workspace behavior remains fully readable/writable through the transitional adapter. Ensure dump allowlists include daemon panes only; browser rails never request daemon backlog. Update labels and release-facing copy to say browser intent/profile, not exact page continuation.
 
 ### REVIEW / COMMIT
 
@@ -478,12 +512,13 @@ Migration/recovery reviewer opens hand-crafted v1/v2 files, malformed boundaries
 feat(app): round-trip tab browsers in workspaces
 ```
 
-## 13. Milestone 9 — resident lifecycle, launcher, and explicit Quit
+## 14. Milestone 9 — resident lifecycle, launcher, and explicit Quit
 
 ### RED
 
-Add state-machine and fake-process tests before changing app lifecycle:
+Add state-machine, IPC-registry, and fake-process tests before changing app lifecycle:
 
+- process-global IPC handlers register once and route by sender through a mutable window registry across close/reopen; a closed sender cannot target a replacement window and no `removeHandler` tears down handlers needed by surviving/reopened windows;
 - second-instance activation reopens one local window;
 - last-window close detaches views and closes per-window terminal clients/tunnels without stopping BrowserHost;
 - tray/menu reopen;
@@ -500,7 +535,9 @@ Rust tests use a fake executable and readiness socket under `/tmp`; they do not 
 
 ### GREEN
 
-Implement `browserResident.ts`, app registration, tray/menu behavior, and `browser_host_ctl.rs`. Change `window-all-closed` only through this state machine. Add explicit menu actions **Quit Amber IDE** and **Enable browser host** with unambiguous daemon wording.
+Refactor existing per-window IPC registration into process-global handlers before adding browser IPC; handlers resolve `event.sender` through the live `WindowCtx` registry and are removed only at final app teardown. Implement `browserResident.ts`, app registration, tray/menu behavior, and `browser_host_ctl.rs`. Change `window-all-closed` only through this state machine. Add explicit menu actions **Quit Amber IDE** and **Enable browser host** with unambiguous daemon wording.
+
+Registration stores a canonical versioned executable/bundle identity plus ownership metadata. On every normal launch and `ensure`, validate and atomically repair stale AppImage/bundle paths after upgrade; never execute an ephemeral AppImage mount. A broken/stale registration fails with actionable status and cannot fall back to an unvalidated path.
 
 The Pi ensure helper may launch only the registered canonical executable with separate arguments. It must never start after explicit inhibit or when registration ownership/permissions fail.
 
@@ -518,7 +555,7 @@ feat(cli): launch the registered browser host
 
 Use separate app/CLI commits if review or rollback boundaries benefit.
 
-## 14. Milestone 10 — Pi extension packaging and complete tool surface
+## 15. Milestone 10 — Pi extension packaging and complete tool surface
 
 ### RED
 
@@ -549,7 +586,7 @@ Review generated installed files as executable code, not just Rust strings. Run 
 feat(pi): install shared browser tools
 ```
 
-## 15. Milestone 11 — packaging, feature rollout, and docs
+## 16. Milestone 11 — packaging, feature rollout, and docs
 
 ### Dependencies and bundling
 
@@ -560,7 +597,9 @@ After Phase 0 selects an adapter:
 - keep `PLAYWRIGHT_BROWSERS_PATH=0` and verify no browser download/postinstall artifact;
 - if debugger wins, add no Playwright dependency;
 - ensure electron-vite does not externalize a runtime dependency that the packaged app cannot resolve;
-- inspect AppImage/dmg contents for the adapter, Pi assets, and both Amber binaries;
+- repair and invoke the repository's real packaging path (`npm run dist` → `app/scripts/dist.sh` → root `scripts/dist.sh`), including the existing three-binary reality (`amber`, `amberd`, `amber-router`) and the selected adapter assets; do not invent an unsupported output variable;
+- stage all packaging output/cache under `$AMBER_FAST` using only variables actually consumed by those scripts, and fail before packaging if any resolved output points under `/home`;
+- inspect unpacked and final AppImage/dmg contents for the adapter, Pi assets, `amber`, `amberd`, and `amber-router`, then launch the **packaged artifact** against the hostile local fixture/private profile and rerun sandbox, navigation, permission, target-confinement, resident, and inhibit smoke tests;
 - record package-size delta, license, idle resident RSS/CPU, and four-live RSS.
 
 ### Feature gates
@@ -589,7 +628,7 @@ build(app): package the tab browser host
 docs: record tab browser host verification
 ```
 
-## 16. Validation gates
+## 17. Validation gates
 
 Run focused tests after each RED/GREEN cycle, then the full gates from the `/tmp` worktree:
 
@@ -605,14 +644,7 @@ npm run build
 npm run build:web
 ```
 
-Then package on each target platform using only `/tmp` outputs. On Linux:
-
-```bash
-cd "$REPO/app"
-AMBER_DIST_DIR="$AMBER_FAST/dist" npm run package
-```
-
-Use the repository's actual packaging variable/script if `AMBER_DIST_DIR` is not supported; first inspect and redirect its output/cache to `$AMBER_FAST`. Do not run a package command that writes to `/home`.
+Then package on each target platform using only `/tmp` outputs. First inspect `app/package.json`, `app/scripts/dist.sh`, root `scripts/dist.sh`, and electron-builder configuration; record the variables they actually honor. Add/repair an explicit output override if needed, with a test, rather than relying on an invented variable. The Linux gate must run the real `npm run dist` chain, assert every resolved cache/staging/output path is under `$AMBER_FAST`, inspect static linkage and all three shipped Rust binaries, and launch the resulting AppImage against the hostile fixture with private `--user-data-dir`. Do not run any package command until the path guard passes; never write package output to `/home`.
 
 Required automated assertions:
 
@@ -622,14 +654,15 @@ Required automated assertions:
 - broker malformed/auth/replay/cancel/approval tests;
 - adapter target-confinement contract;
 - Electron fixture acceptance;
-- exact dependency/lockfile and no second Chromium;
+- exact dependency/lockfile, packaged main-module resolution, and no second Chromium;
+- packaged-artifact hostile-fixture, permission, target-confinement, resident/reopen, and explicit-inhibit smoke;
 - web build remains browser-host-unmanaged;
 - Windows compile/typecheck with unavailable gate;
 - `git diff --check` and no staged files at each review handoff.
 
 Rustfmt remains scoped: format touched Rust files only. Do not bulk-reformat pre-existing drift.
 
-## 17. Electron manual acceptance matrix
+## 18. Electron manual acceptance matrix
 
 Run with a private daemon/state/profile. Save artifacts under `$AMBER_FAST/manual/<platform>`.
 
@@ -674,7 +707,7 @@ Run with a private daemon/state/profile. Save artifacts under `$AMBER_FAST/manua
 
 Against local fixtures, exercise navigation/history/reload/waits, accessibility snapshot/find, inspect DOM/CSS, screenshot, console, failed network, click/hover/fill/type/press/select/check/scroll/drag, viewport, iframe, denied popup, and adapter reconnect. Verify truncation/cursors and no raw auth/cookie/password data.
 
-## 18. Review checkpoints
+## 19. Review checkpoints
 
 Do not combine these into one final glance:
 
@@ -687,7 +720,7 @@ Do not combine these into one final glance:
 
 At each checkpoint record findings and disposition in `.reports/tab-browser-host.md`. Any unresolved high-severity finding blocks the next phase.
 
-## 19. Rollback and recovery
+## 20. Rollback and recovery
 
 Rollback is feature disablement, not schema downgrade:
 
@@ -700,7 +733,7 @@ Rollback is feature disablement, not schema downgrade:
 7. If the selected adapter alone regresses, disable automation while preserving user browsing only if the hardened `WebContentsView` substrate itself still passes. Otherwise disable the entire host.
 8. Explicit Quit inhibit remains honored across rollback and upgrades.
 
-## 20. Stop conditions during implementation
+## 21. Stop conditions during implementation
 
 Stop and return to design/review rather than patching around any of these:
 
@@ -721,7 +754,7 @@ Stop and return to design/review rather than patching around any of these:
 - implementation requires a final `<webview>` or detached-window substitute;
 - any new product, security, architecture, or scope decision is required beyond the approved design.
 
-## 21. Planned commit sequence
+## 22. Planned commit sequence
 
 Keep commits conventional, reviewable, and independently green where possible:
 
@@ -741,3 +774,25 @@ Keep commits conventional, reviewable, and independently green where possible:
 14. `docs: record tab browser host verification`
 
 Tests should normally land with the code they drive; the Phase-0 test/report commit is separate because it is a hard decision gate. Never add `Co-Authored-By` trailers. Before every commit run `git diff --check`, inspect staged paths, and ensure no unrelated or generated user-state files are staged.
+
+
+## 23. Implementation-plan review and approval
+
+This plan incorporates the synthesized architecture/security/operability review and is approved for execution subject to its hard gates.
+
+| Finding | Disposition in this plan |
+| --- | --- |
+| P0 Phase-0 could touch live Electron/profile/daemon state or grow into product code | §2 and §4 now require private `userData`/`sessionData` before the singleton lock, copied/synthetic profiles, bounded fixture modules, PID/path guards, and no daemon unless a fixture explicitly needs one. |
+| P0 no dependency/E2E harness milestone | New Milestone 0A pins the selected adapter only after Phase 0 and proves packaged resolution/no second Chromium. |
+| P0 Rust v2 reader must be deployed before TS v2 writes | Milestone 1 now has separate implementation and deployed-release barriers; Milestone 7 keys enablement to Barrier B. |
+| P0 persistence durability and schema were underspecified | Milestone 3 hardens `layoutIO` first with fsync/replace/parent-fsync/failure tests; design adds explicit `ProfileDescriptor` and `profileId`. |
+| P0 migration wording could leave extra browser leaves | Design/plan require removal of every recognized legacy browser leaf and recovery of all non-promoted URLs while preserving browser-only tabs. |
+| P0 first-use Pi creation contradicted normal authorization | Design §14.2 and Milestone 6 define one fresh-daemon, same-tab, `open`-only solicitation exception with no navigation or self-grant. |
+| P0 blanket secret/redaction claims were impossible; screenshot paths unsafe | Policy/tests use structural omission and allowlists, document DOM/console/pixel limits, add canaries, and use bounded binary screenshot attachments only. |
+| P0 transitional renderer/workspace compile/cutover path missing | Milestones 2, 7, and 8 retain explicit legacy projections until atomic UI and workspace cutovers. |
+| P0 resident lifecycle conflicts with per-window IPC cleanup | Milestone 9 first moves handlers process-global with sender registry routing and adds upgrade-safe canonical registration repair. |
+| P0 packaging commands/contents were inaccurate | Milestone 11/validation now inspect and repair the actual dist chain, assert all three Rust binaries, and test the packaged artifact against hostile fixtures. |
+| Important protocol tests were assigned too early | Milestone 2 keeps parser tests; stateful replay/cancellation/concurrency tests live in Milestone 6. |
+| Important gate evidence/review needed to remain blocking | §19 records six independent checkpoints; unresolved high severity or missing supported-platform Phase-0 evidence blocks further product code. |
+
+Approval does not waive stop conditions. In particular, Linux-only evidence cannot satisfy the Linux-and-macOS Phase-0 gate; in that environment implementation must stop after safe prerequisites and report the missing platform evidence rather than silently narrowing support.
