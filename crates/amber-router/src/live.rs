@@ -42,7 +42,8 @@ impl Live {
     /// file's: the bind address and the bearer token come from the service
     /// arguments and the 0600 token file, never from editable config.
     pub fn from_store(root: &Path, server: ServerConfig) -> anyhow::Result<Live> {
-        let slots = store::load(root)?;
+        // Migrate legacy id-less slots before anything can edit them.
+        let slots = store::ensure_ids(root)?;
         let state = AppState::new(crate::slots::to_config(server.clone(), &slots));
         Ok(Live {
             current: Arc::new(RwLock::new(Arc::new(state))),

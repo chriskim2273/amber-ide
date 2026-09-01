@@ -77,6 +77,22 @@ pub fn save(root: &Path, list: &[Slot]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Give every stored slot a stable id, once.
+///
+/// A `router.toml` written before ids existed has `id = ""` on every provider,
+/// and `merge_keys` matches on id — so without this, the first rename of a
+/// legacy slot would silently drop its key. Minting ids at load time WITHOUT
+/// persisting them would be worse: they would differ per process, so the
+/// dialog and the save would disagree.
+pub fn ensure_ids(root: &Path) -> anyhow::Result<Vec<Slot>> {
+    let list = load(root)?;
+    if list.is_empty() || list.iter().all(|s| !s.id.is_empty()) {
+        return Ok(list);
+    }
+    save(root, &list)?; // `save` mints the missing ones
+    load(root)
+}
+
 /// The bearer token every caller must present. Minted on first use.
 pub fn load_or_create_token(root: &Path, regenerate: bool) -> anyhow::Result<String> {
     web::load_or_create_secret(root, TOKEN_FILE, regenerate)
@@ -135,6 +151,23 @@ mod tests {
 
         save(dir.path(), &first).unwrap();
         assert_eq!(load(dir.path()).unwrap()[0].id, first[0].id, "and then never change");
+    }
+
+    #[test]
+    fn a_legacy_config_without_ids_is_migrated_once() {
+        let dir = tempfile::tempdir().unwrap();
+        // Exactly what an older amber-router wrote: no `id` key at all.
+        let legacy = "[server]\n\n[[provider]]\nname = \"a\"\nbase_url = \"https://a.example/v1\"\n\
+                      keys = [\"sk-a\"]\n\n[[alias]]\nname = \"auto\"\n\
+                      chain = [ { provider = \"a\", model = \"m\" } ]\n\
+                      [[alias]]\nname = \"a\"\nchain = [ { provider = \"a\", model = \"m\" } ]\n";
+        web::write_secret(dir.path(), CONFIG_FILE, legacy.as_bytes()).unwrap();
+        assert!(load(dir.path()).unwrap()[0].id.is_empty());
+
+        let migrated = ensure_ids(dir.path()).unwrap();
+        assert!(!migrated[0].id.is_empty(), "the id must be minted");
+        assert_eq!(migrated[0].api_key, "sk-a", "and the key must survive it");
+        assert_eq!(ensure_ids(dir.path()).unwrap(), migrated, "and then be stable");
     }
 
     #[test]

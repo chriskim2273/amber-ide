@@ -326,6 +326,15 @@ enum RouterAction {
     RotateToken,
     /// Write amber's own provider entry into Pi's models.json.
     InstallPiProvider,
+    /// Print the slot list as JSON, keys masked.
+    Slots,
+    /// Replace the slot list from a JSON document on stdin.
+    ///
+    /// The app calls this instead of talking to the admin API itself, so the
+    /// router's bearer token never enters the desktop process or an IPC trace.
+    SetSlots,
+    /// Print one slot's plaintext API key. Deliberate user gesture only.
+    Key { name: String },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -1124,6 +1133,56 @@ fn run_ctl_router(
             println!("{base}");
             Ok(())
         }
+        RouterAction::Slots => {
+            let token = router_token(&root)?;
+            let (status, body) = router_request(port, &token, "GET", "/admin/slots", None)?;
+            if status != 200 {
+                anyhow::bail!("router returned {status}: {body}");
+            }
+            println!("{body}");
+            Ok(())
+        }
+        RouterAction::SetSlots => {
+            use std::io::Read;
+            let mut doc = String::new();
+            std::io::stdin().read_to_string(&mut doc)?;
+            // Fail fast on malformed input rather than letting the router
+            // answer 422 to something the app never meant to send.
+            let _: serde_json::Value = serde_json::from_str(&doc)
+                .map_err(|e| anyhow::anyhow!("stdin is not valid JSON: {e}"))?;
+            let token = router_token(&root)?;
+            let (status, body) = router_request(port, &token, "PUT", "/admin/slots", Some(&doc))?;
+            if status != 200 {
+                anyhow::bail!("{}", extract_error(&body).unwrap_or(body));
+            }
+            // Slot names are the model ids Pi advertises, so a slot change
+            // makes a registered provider entry stale unless we refresh it.
+            if !matches!(amber::router_pi::state(&root, port), amber::router_pi::PiState::NoConfig)
+            {
+                let _ = amber::router_pi::install(&root, port);
+            }
+            println!("{body}");
+            Ok(())
+        }
+        RouterAction::Key { name } => {
+            let token = router_token(&root)?;
+            let (status, body) = router_request(
+                port,
+                &token,
+                "GET",
+                &format!("/admin/slots/{name}/key"),
+                None,
+            )?;
+            if status != 200 {
+                anyhow::bail!("{}", extract_error(&body).unwrap_or(body));
+            }
+            let key = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v.get("api_key").and_then(|k| k.as_str()).map(str::to_string))
+                .unwrap_or_default();
+            println!("{key}");
+            Ok(())
+        }
         RouterAction::RotateToken => {
             amber::web::load_or_create_secret(&root, amber::router_pi::TOKEN_FILE, true)?;
             // The running service holds the OLD token in memory, so the
@@ -1279,6 +1338,59 @@ fn run_ctl_router(
             Ok(())
         }
     }
+}
+
+/// One bearer-authed request to the router's loopback admin surface.
+///
+/// Hand-rolled over `TcpStream` in the `fetch_web_status` style rather than
+/// pulling an HTTP client into `amber`: the router already owns that
+/// dependency, and this side speaks to 127.0.0.1 only.
+fn router_request(
+    port: u16,
+    token: &str,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> anyhow::Result<(u16, String)> {
+    use std::io::{Read, Write};
+    let deadline = Duration::from_secs(10);
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port))
+        .map_err(|e| anyhow::anyhow!("router not reachable on 127.0.0.1:{port}: {e}"))?;
+    s.set_read_timeout(Some(deadline))?;
+    s.set_write_timeout(Some(deadline))?;
+    let body = body.unwrap_or("");
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    s.write_all(req.as_bytes())?;
+    let mut raw = String::new();
+    s.read_to_string(&mut raw)?;
+    let status = raw
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse::<u16>().ok())
+        .ok_or_else(|| anyhow::anyhow!("malformed response from the router"))?;
+    let body = raw.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+    Ok((status, body))
+}
+
+/// Pull the human-readable message out of the router's JSON error envelope.
+fn extract_error(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()?
+        .get("error")?
+        .get("message")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// The token, or a message naming what to do about its absence.
+fn router_token(root: &Path) -> anyhow::Result<String> {
+    amber::web::read_secret(root, amber::router_pi::TOKEN_FILE).ok_or_else(|| {
+        anyhow::anyhow!("no router token yet — start the router once (`amber ctl router start`)")
+    })
 }
 
 /// One bearer-authed GET to the router's loopback admin surface.
