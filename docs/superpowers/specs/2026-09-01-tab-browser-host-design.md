@@ -1,9 +1,9 @@
 # Tab Browser Host — Design
 
-**Status:** draft for deep review  
+**Status:** approved for implementation after design review
 **Date:** 2026-09-01  
 **Supersedes for new browsers:** `2026-07-18-browser-pane-design.md`  
-**Scope:** desktop Amber IDE and supervised Pi panes; macOS and Linux first, with protocol shapes kept portable to the repository's Windows implementation.
+**Scope:** desktop Amber IDE and supervised Pi panes on macOS and Linux. Windows compiles with the feature disabled until its native-view, ACL, launcher, and lifecycle gates pass.
 
 ## 1. Executive summary
 
@@ -33,6 +33,8 @@ The following decisions were made after reviewing the current implementation and
 12. **Capacity:** at most four browser renderers are live; eligible background renderers freeze by LRU.
 13. **Window lifecycle:** closing the GUI leaves the host running; explicit Quit stops it.
 14. **Tool surface:** include everything needed for normal development workflows, but do not expose unrestricted raw CDP or arbitrary Playwright code by default.
+15. **Implementation boundary:** Electron main is the resident native browser host; no final `<webview>` or detached-window substitute.
+16. **Platform rollout:** macOS and Linux first. Windows keeps browser-host creation and broker startup behind a fail-closed feature gate.
 
 ## 3. Goals
 
@@ -145,7 +147,17 @@ No browser page or React optimistic mutation may claim that a navigation/action/
 
 `WebContentsView`, session partitions, permission handlers, download handling, native child-view bounds, and `webContents` lifecycle are main-process APIs. Keeping the broker in main ensures remote content never receives privileged browser-control IPC. It also lets a window close while BrowserHost keeps detached web contents alive.
 
-### 6.4 Resident does not mean immortal
+### 6.4 Narrow constitutional exception
+
+Core architecture rule 4 ordinarily limits Electron main to window management. This feature requires a narrow, explicit amendment: Electron main may own **native browser presentation and its local browser-control policy only** (`WebContentsView`, the dedicated browser session, BrowserHost state, broker, approval mediation, and Playwright/debugger adapter). It still may not handle terminal bytes, own daemon-session state, emulate a terminal, or become a second path for PTY control. Browser records are app-local and never enter the amber daemon protocol. Any broader main-process product authority requires a new approved design.
+
+### 6.5 Window command and authorization seam
+
+All renderer-originated browser commands use one typed `browser:command` IPC handler. It derives the `WindowCtx` from `event.sender`; callers never supply a trusted window, workspace, tab, browser, or remote/local identity. Main resolves the active association from its own window registry and rejects destroyed, remote, stale, or mismatched senders. Geometry, occlusion, navigation, share/designation, approval, close, and profile commands all pass through this seam. No parallel convenience IPC may bypass it.
+
+Pi authorization uses a metadata-only daemon watcher owned by main. It consumes `SessionInfo`/`SessionsChanged` (name, kind, liveness, rename/removal) and never attaches to PTYs or observes terminal bytes. Broker calls fail closed while the watcher is disconnected, has not completed an initial full list, or is older than a short bounded freshness window. A reconnect must obtain a new full list before authorization resumes; cached membership never authorizes a mutation.
+
+### 6.6 Resident does not mean immortal
 
 The Electron main process survives ordinary window closure. Explicit Quit, process crash, OOM, package upgrade restart, logout, and reboot terminate it. BrowserHost restores durable intent on next start but cannot restore arbitrary volatile page state. If future requirements demand continuous browser execution through Electron process death, this design must move the browser owner to a separate service and accept a streamed/remote view; that is explicitly outside this version.
 
@@ -162,6 +174,7 @@ export interface BrowserRailLayout {
   collapsed: boolean
   designatedPi?: string
   sharedWithPi: boolean
+  associationRevision: number
 }
 
 export interface TabLayout {
@@ -173,6 +186,7 @@ export interface TabLayout {
 export interface LayoutFileV2 {
   version: 2
   activeWorkspace: number
+  browserRevision?: number
   workspaces: Record<string, WsLayout>
   fontSize?: number
   frozen?: Record<string, FrozenEntry>
@@ -207,11 +221,13 @@ export const BROWSER_STATE_VERSION = 1
 export interface BrowserRecord {
   id: string
   mode: 'preview' | 'browse'
-  url: string
+  safeRestoreUrl: string
   title: string
   viewport: { width: number; height: number }
   lifecycle: 'live' | 'frozen'
+  pageIncarnation: string
   generation: number
+  stateRevision: number
   lastUsedAt: number
   lastFocusedAt: number
   restoreError?: string
@@ -219,14 +235,20 @@ export interface BrowserRecord {
 
 export interface BrowserStateFile {
   version: 1
+  revision: number
+  layoutRevision: number
   records: Record<string, BrowserRecord>
+  migrationRecovery: MigrationRecoveryItem[]
+  pendingTransaction?: BrowserStateTransaction
 }
 ```
 
 Rules:
 
 - Main is the only writer.
-- Atomic unique-temp-file + fsync + replace discipline matches existing state stores.
+- `pageIncarnation` is a random process-page identity and changes on every create/thaw/crash replacement; `generation` is monotonic only within that incarnation. Both are required on mutations and snapshot references.
+- `safeRestoreUrl` is the only URL used after process death. Persistence strips user-info and fragments and redacts or drops known credential query keys; when a URL cannot be made safely restorable, retain only a neutral origin/home URL and disclose the loss. Raw current URLs may be shown transiently in chrome but are not automatically durable.
+- Atomic unique-temp-file + file fsync + replace + parent-directory fsync discipline matches the strongest existing state stores.
 - Malformed records are dropped individually and logged; one bad record does not lose all browsers.
 - A record absent from every current tab association is garbage-collected after a bounded grace, not immediately, so a crash between layout and state writes does not destroy recoverable browser intent.
 - No cookie, local-storage, IndexedDB, history body, screenshot, accessibility tree, network body, or trace appears in this JSON.
@@ -244,6 +266,17 @@ Rules:
 
 The Pi conversation UUID may be included in requests and logs for attribution but never substitutes for tab membership authorization.
 
+### 7.5 Crash-consistent two-store transactions
+
+`ui-layout.json` (whose other writers must preserve unknown v2 browser fields and `browserRevision`) and `browser-state.json` cannot be atomically renamed together. BrowserHost therefore owns a small transaction journal in `browser-state.json` and uses monotonic `layoutRevision`/`stateRevision` values:
+
+1. write `pendingTransaction` containing transaction ID, before/after associations, and intended revisions; fsync;
+2. CAS-write layout v2 with the new `browserRevision`;
+3. write browser state with matching `layoutRevision`, records, and recovery items; fsync;
+4. clear the journal in a final atomic write.
+
+Startup compares revisions and replays or rolls back the idempotent journal. It never deletes an orphan until both stores agree plus the GC grace has elapsed. A conflicted layout CAS aborts and leaves the prior association authoritative. Migration uses the same transaction path and first creates a timestamped v1 backup. Recovery outcomes are durable and shown in a bounded Browser Recovery surface (attach, copy safe URL, or delete), not only logged.
+
 ## 8. Version-1 browser migration
 
 For each old `LayoutFile.browsers` entry:
@@ -252,12 +285,13 @@ For each old `LayoutFile.browsers` entry:
 2. Find the corresponding tab and all legacy browser leaves in its tree.
 3. Sort candidates by active/visible status if known, then `ord`, then stable ID.
 4. Promote the first candidate to `TabLayout.browser` with a new opaque ID or a validated retained ID.
-5. Create a `BrowserRecord` carrying its last URL and default viewport.
+5. Create a `BrowserRecord` carrying a redacted `safeRestoreUrl` and default viewport.
 6. Remove every promoted legacy browser leaf from the split tree and collapse its parent using existing `removeLeaf` semantics.
-7. Preserve additional browser candidates in a migration-recovery list in `browser-state.json` with no tab association; surface one migration notice allowing the user to attach or delete them.
+7. Preserve additional browser candidates in durable `migrationRecovery` entries with their source workspace/tab and redacted safe URL; surface a bounded recovery notice allowing the user to attach, copy the safe URL, or delete them.
 8. Never silently discard an extra URL.
 9. Browser-only legacy tabs remain tabs: their terminal tree becomes `null`, and the rail provides the tab's content.
-10. `.amberws` version-1 browser panes load as the target tab's rail. If a document contains more than one browser in a target tab, import the first and report the extras as skipped/recovery items.
+10. `.amberws` version-1 browser panes load as the target tab's rail. If a document contains more than one browser in a target tab, import the first and persist the extras as recovery items.
+11. Remove Browser from every split/pane creation picker and move it to a tab-level **Open browser** action before v2 is enabled; no code path may mint a legacy browser leaf after migration.
 
 Migration is idempotent. Tests cover interrupted write ordering in both directions.
 
@@ -289,7 +323,7 @@ Mode is metadata/policy, not a different renderer or profile. Switching mode doe
 
 ## 10. Global persistent browser profile
 
-Use a dedicated partition, versioned independently from the host renderer, for example:
+Reuse the existing `persist:amber-browser` partition if a Phase-0 profile-compatibility probe proves it can be opened safely with the hardened session policy; this preserves existing logins. Only move to a new partition if the probe detects an incompatible/corrupt profile, and then disclose the profile reset. The canonical partition name is therefore discovered/migrated once and recorded, rather than casually version-bumped. Example fallback:
 
 ```text
 persist:amber-browser-v2
@@ -341,7 +375,7 @@ Main validates finite integer bounds, owning window, browser/tab association, an
 - Width is clamped to a product minimum/maximum and available stage width.
 - Terminal stage keeps a usable minimum width; the rail cannot crush PTYs to pathological geometry.
 - Collapsing detaches/hides the view but does not immediately freeze it.
-- Only the active tab's rail is attached and visible.
+- Only the sender-derived active tab’s rail is attached and visible; main ignores renderer-supplied ownership claims.
 - Background browsers may remain live but detached, subject to capacity.
 - Opening overlays, modal dialogs, menus, or approvals must not allow the native child view to cover them; main receives an occlusion state and detaches/hides the view when necessary.
 - Dragging the rail divider updates DOM chrome immediately and sends settled bounds to main; avoid one IPC per pointer pixel when possible.
@@ -363,11 +397,13 @@ Removing a view from a window does not mean closing the page. Closing a browser 
 
 ### 12.1 Single-instance behavior
 
-The existing single-instance lock remains. A second launch sends an activation request to the resident process, which creates or shows the local window instead of quitting silently.
+The existing single-instance lock remains. All launch modes converge on one resident singleton. A second launch sends a validated activation request to the resident process, which creates or shows the local window instead of quitting silently. `--browser-host` never creates a competing owner. Startup holds readiness until state recovery, broker token/socket setup, permission policy, and daemon metadata watcher initialization complete.
+
+Startup compatibility mode is a hard browser-host gate: the current compat switches relax Chromium sandbox/GPU posture and must not host authenticated remote pages. In compat mode Amber shows browser rails unavailable with repair guidance; it does not silently fall back to `<webview>`.
 
 ### 12.2 Window close
 
-- Ordinary close hides or destroys the BrowserWindow presentation but keeps Electron main, BrowserHost, daemon utility client as needed, and live browser records running.
+- Ordinary close hides or destroys the BrowserWindow presentation but keeps Electron main and BrowserHost running. Per-window daemon utility clients/tunnels are drained and closed unless the metadata-only local watcher still needs its dedicated connection; no terminal client is retained merely for the browser.
 - Browser views detach from the closed window and remain registry-owned.
 - The app must provide an obvious background-running indication appropriate to the platform (tray/menu-bar item or documented launcher behavior) and a way to reopen the window.
 
@@ -375,7 +411,7 @@ The existing single-instance lock remains. A second launch sends an activation r
 
 - Explicit Quit is distinct from close.
 - If a Pi action, approval, download/upload, dialog, or page load is active, show a concise warning and offer Cancel or Quit anyway.
-- Quit revokes sharing, rejects broker requests, closes all browser contents, flushes `browser-state.json`, tears down the client utility process/tunnels, and exits.
+- Quit enters a coordinated drain state: stop accepting broker/renderer commands, reject queued work, cancel cancellable work, resolve/deny approvals, stop downloads/dialogs, persist the two-store journal to completion, close browser contents and adapters, close broker/watchers/utility clients/tunnels, then exit. A bounded timeout offers Cancel or force quit with an explicit persistence warning.
 - Quitting the Amber daemon remains a separate, more destructive command.
 
 ### 12.4 Host startup when Pi calls it
@@ -386,6 +422,8 @@ Pi tools first connect to the browser IPC endpoint. If absent:
 2. The helper resolves a previously registered stable app executable, starts `--browser-host` detached, and waits for a readiness handshake.
 3. If no stable app path is registered, the tool returns an actionable “open Amber once/install desktop app” error.
 4. Browser creation requested by Pi raises/reopens the GUI because creation must be visible.
+5. Registration stores canonical executable identity and install generation in a user-private file. Upgrades repair it atomically. A durable explicit-stop inhibit prevents Pi auto-start after the user chose Quit; only a normal app launch or explicit “Enable browser host” clears the inhibit.
+6. Windows returns a typed unsupported error until its native pipe ACL, launcher, resident lifecycle, sandbox, and packaged smoke gates pass.
 
 No shell string interpolation is used; executable and arguments are separate validated values.
 
@@ -418,7 +456,7 @@ To activate a frozen browser:
 5. Mark it frozen and emit lifecycle events.
 6. Create/thaw the requested renderer and navigate to the durable URL.
 
-If all four are protected, do not silently exceed the bound or kill active work. Queue one bounded activation request or return `BROWSER_CAPACITY_BUSY` with the protected records summarized. The final implementation plan must choose and test one behavior; default is one FIFO bounded queue with timeout.
+If all four are protected, do not silently exceed the bound or kill active work. Use one global FIFO activation queue, maximum 8 entries, one pending activation per browser, with a 10-second deadline. Overflow or timeout returns `BROWSER_CAPACITY_BUSY`; queued requests are cancellable. The invariant is at most four live **browser-record renderers**. Temporary Chromium process count and explicitly approved transient download/dialog machinery are not claimed to be four OS processes.
 
 ### 13.3 LRU updates
 
@@ -451,7 +489,7 @@ The browser rail surfaces “Reloaded after background freeze” on thaw.
 
 ### 14.2 Authentication and attribution
 
-The initial release treats same-user local processes as trusted code, matching Pi extensions' full user authority, but still uses an unguessable host token stored in a user-only file to prevent accidental/ambient connections. Requests additionally carry:
+The initial release treats same-user local processes as trusted code, matching Pi extensions' full user authority, but still uses an unguessable host token stored in a race-safely-created user-only file to prevent accidental/ambient connections. It never appears in argv, environment, renderer IPC, URLs, diagnostics, or logs; clients read it directly, compare through the authenticated handshake, and rotation closes existing connections. Requests additionally carry:
 
 - `AMBER_SESSION` daemon session name;
 - Pi session UUID;
@@ -466,20 +504,55 @@ Authorization is based on current tab membership, designated Pi, and Share with 
 interface BrowserRequest {
   version: 1
   requestId: string
+  clientInstanceId: string
+  sequence: number
   amberSession: string
   piSessionId: string
   browserId?: string
+  pageIncarnation?: string
   expectedGeneration?: number
   action: BrowserAction
 }
+
+type BrowserAction =
+  | { type: 'status' }
+  | { type: 'open'; proposedUrl?: string; mode?: BrowserMode }
+  | { type: 'navigate'; url: string }
+  | { type: 'reload'; ignoreCache?: boolean }
+  | { type: 'history'; direction: 'back' | 'forward' }
+  | { type: 'stop' }
+  | { type: 'wait'; condition: WaitCondition; timeoutMs?: number }
+  | { type: 'snapshot'; limits?: SnapshotLimits }
+  | { type: 'find'; query: FindQuery }
+  | { type: 'screenshot'; target?: ElementRef; fullPage?: boolean }
+  | { type: 'inspect'; target: ElementRef | TypedLocator }
+  | { type: 'console'; cursor?: string; levels?: ConsoleLevel[] }
+  | { type: 'network'; cursor?: string; filter?: NetworkFilter }
+  | { type: 'interact'; operation: Interaction }
+  | { type: 'setViewport'; viewport: Viewport }
+  | { type: 'cancel'; targetRequestId: string }
+
+type Interaction =
+  | { kind: 'click' | 'doubleClick' | 'hover' | 'check' | 'uncheck'; target: ElementRef | TypedLocator }
+  | { kind: 'fill' | 'type'; target: ElementRef | TypedLocator; text: string }
+  | { kind: 'press'; target?: ElementRef | TypedLocator; key: string }
+  | { kind: 'select'; target: ElementRef | TypedLocator; values: string[] }
+  | { kind: 'scroll'; target?: ElementRef | TypedLocator; deltaX: number; deltaY: number }
+  | { kind: 'drag'; source: ElementRef | TypedLocator; target: ElementRef | TypedLocator }
 ```
+
+Every nested union has a strict parser, bounded strings/arrays, and unknown-key rejection at the broker boundary. `clientInstanceId` is a random per-extension-process nonce and `sequence` strictly increases; the host retains a high-water mark for each authenticated connection/client incarnation, so an evicted result can never make an old mutation executable again. `cancel` is authorized like its target and may cancel only a request owned by the same connection/controller. Unknown protocol versions receive `UNSUPPORTED_VERSION` with the supported range; they never partially decode.
 
 ### 14.4 Response envelope
 
 ```ts
 type BrowserResponse =
-  | { version: 1; requestId: string; ok: true; browserId: string; generation: number; result: unknown }
-  | { version: 1; requestId: string; ok: false; code: BrowserErrorCode; retryable: boolean; message: string; generation?: number; snapshotHint?: boolean }
+  | { version: 1; requestId: string; ok: true; browserId: string; pageIncarnation: string; generation: number; result: BrowserResult }
+  | { version: 1; requestId: string; ok: false; code: BrowserErrorCode; retryable: boolean; message: string; pageIncarnation?: string; generation?: number; snapshotHint?: boolean }
+
+type BrowserResult = BrowserStatus | NavigationResult | WaitResult | SnapshotResult |
+  FindResult | ScreenshotResult | InspectResult | ConsoleResult | NetworkResult |
+  InteractionResult | ViewportResult | CancelResult
 ```
 
 ### 14.5 Error taxonomy
@@ -503,6 +576,9 @@ At minimum:
 - `UNSUPPORTED_PAGE`
 - `POLICY_BLOCKED`
 - `INVALID_REQUEST`
+- `UNSUPPORTED_VERSION`
+- `DAEMON_STATE_STALE`
+- `REQUEST_LIMIT`
 - `INTERNAL_ERROR`
 
 Messages are actionable but never include credentials, cookies, authorization headers, raw response bodies, or filesystem secrets.
@@ -514,7 +590,7 @@ BrowserHost emits typed events for:
 - record created/closed;
 - live/frozen/thawing;
 - URL/title/loading;
-- generation changed;
+- page incarnation/generation changed;
 - designated controller changed/revoked;
 - Share with Pi changed;
 - Pi observation/action started/completed/failed;
@@ -547,7 +623,7 @@ Migration preserves the existing hook behavior and removes/replaces the old owne
 
 - `session_start` continues recording the exact Pi session ID through `amber hook`.
 - Browser tools read `AMBER_SESSION` at execution time.
-- `ctx.signal` cancels broker requests.
+- `ctx.signal` sends a protocol `cancel` for the exact request ID and closes the request locally if the host does not acknowledge before the cancellation deadline.
 - `session_shutdown` closes pooled IPC resources.
 - Tools register globally but return an explicit unavailable message outside Amber instead of operating on an unbound browser.
 - Tool output is bounded to Pi's 50 KB/2,000-line limits; large snapshots/network details use focused queries or artifact files outside model context.
@@ -617,7 +693,7 @@ These are not silently available just because Share with Pi is enabled.
 
 ### 17.1 Generation
 
-Every browser record has a monotonically increasing in-memory/durable-safe integer. Increment before emitting any event that invalidates an agent's view, including:
+Every live page has a random `pageIncarnation` and a monotonically increasing generation within that incarnation. A request or element reference matches only when both values match; process restart, crash replacement, freeze/thaw, or target remap always changes the incarnation, so a persisted/old generation can never replay against a new page. Increment before emitting any event that invalidates an agent's view, including:
 
 - top-level or frame navigation relevant to the target;
 - user pointer/keyboard/composition input;
@@ -632,14 +708,17 @@ Dynamic DOM mutation may invalidate a locator without a generation signal. Playw
 
 ### 17.2 Ephemeral references
 
-Snapshot element references are scoped to `{browserId, generation, snapshotId}`. They are opaque, bounded, never persisted, and rejected after generation changes. Broker maps them to Playwright locators/backend nodes without returning arbitrary object handles to Pi.
+Snapshot element references are scoped to `{browserId, pageIncarnation, generation, snapshotId}`. They are opaque, bounded, never persisted, and rejected after generation changes. Broker maps them to Playwright locators/backend nodes without returning arbitrary object handles to Pi.
 
 ### 17.3 Concurrent user and Pi behavior
 
 - User input is never blocked merely because Pi is acting.
 - Pi reads may run concurrently.
-- Pi mutations serialize per browser.
-- A generation mismatch before dispatch rejects the mutation.
+- Pi mutations serialize per browser in a FIFO queue (maximum 16 including the active item); overflow fails with `REQUEST_LIMIT`. Observations are bounded separately and never jump ahead of an earlier mutation when they could expose a misleading post-action state.
+- A page-incarnation/generation mismatch at enqueue **and again immediately before dispatch** rejects the mutation.
+- Each `{clientInstanceId, sequence, requestId}` is accepted once per live host epoch. Completed IDs in the result cache return the original response; a duplicate still active joins the original result; a duplicate with a changed payload fails closed. A sequence at or below the connection/client high-water mark whose result was evicted returns `ACTION_CANCELLED`, never executes again. Requests are never automatically replayed across host restart.
+- Approval binds a digest of request ID, controller, browser ID, page incarnation, generation, origin, action, target, and redacted arguments. Any change invalidates it. Approval expiry, navigation, controller loss, revoke, cancellation, or host drain denies the action.
+- Cancellation removes queued work or aborts adapter work where supported. Once dispatch crosses a documented non-cancellable boundary, the result reports that cancellation cannot imply rollback.
 - A user action during a dispatched mutation may still interleave; completion reports the observed final generation and any Playwright failure.
 - Browser chrome displays Pi activity and the last action.
 - `Stop Pi` cancels cancellable broker work but cannot undo site-side effects.
@@ -657,7 +736,7 @@ The browser rail lists Pi panes currently in that tab. The user chooses one. If 
 - A first Pi request creates/reveals the rail and asks the user to designate/share before navigation/action proceeds.
 - Sharing is a persistent tab presentation preference but is revalidated against the live daemon session on every broker call.
 - Visible rail badge names the designated pane/session.
-- Stop Sharing immediately blocks new calls, cancels cancellable work, and clears pending approvals.
+- Stop Sharing immediately blocks new calls, cancels cancellable work, clears pending approvals, increments generation, and leaves a visible revoked audit line. The toggle confirmation explains that sharing grants the designated Pi cross-origin access to the same logged-in Amber profile, not merely the current site.
 - Closing/moving/renaming the designated Pi revokes sharing until explicitly reassigned.
 
 ### 18.3 Consequential action classifier
@@ -683,7 +762,7 @@ Classification combines action type, target role/name, form metadata, URL/origin
 - Approve once, Reject, and where safe “allow this action class for this origin until tab closes.”
 - No permanent blanket allow for credential, financial, destructive, permission, or external-protocol actions in v1.
 - Pending approval times out and fails closed.
-- Host can service approvals only with a visible local window; headless requests return `APPROVAL_REQUIRED` and raise the GUI.
+- Host can service approvals only with a visible local window; headless requests return `APPROVAL_REQUIRED` and raise the GUI. Approval surfaces show controller, origin, action category, target, non-secret argument summary, expiry, and whether dispatch has started; secrets are never echoed.
 
 ## 19. Security and privacy
 
@@ -715,7 +794,7 @@ Even with main-owned `WebContentsView`, validate every creation option. If legac
 
 ### 19.4 Permissions
 
-Install both `setPermissionRequestHandler` and `setPermissionCheckHandler` on `persist:amber-browser-v2`. Default deny all. Camera, microphone, display capture, notifications, geolocation, MIDI, clipboard, HID, USB, serial, Bluetooth, filesystem, pointer lock, and related requests require explicit product support and user approval. Remembered grants, if any, are origin- and permission-scoped and revocable.
+Install both `setPermissionRequestHandler` and `setPermissionCheckHandler` on the resolved dedicated Amber browser partition. Default deny all. Camera, microphone, display capture, notifications, geolocation, MIDI, clipboard, HID, USB, serial, Bluetooth, filesystem, pointer lock, and related requests require explicit product support and user approval. Remembered grants, if any, are origin- and permission-scoped and revocable.
 
 ### 19.5 Downloads/uploads
 
@@ -725,14 +804,14 @@ Install both `setPermissionRequestHandler` and `setPermissionCheckHandler` on `p
 
 ### 19.6 Prompt injection
 
-Page-derived accessibility text, console logs, DOM, network metadata, and screenshots are untrusted data. Tool results label them as such. They cannot:
+Page-derived accessibility text, console logs, DOM, network metadata, and screenshots are untrusted data. Tool results label them as such. Amber treats them as untrusted and enforces that broker-visible page data cannot directly:
 
 - enable tools;
 - change broker policy;
 - grant sharing;
 - approve actions;
 - access cookies/secrets;
-- instruct the extension to call arbitrary local commands.
+- grant the broker authority to run local commands. A model may still be socially influenced by page text and may invoke other tools it already possesses; Amber does not claim cross-tool prompt-injection prevention. Consequential browser actions therefore remain broker-enforced regardless of model reasoning.
 
 ### 19.7 Secrets and redaction
 
@@ -757,7 +836,7 @@ Pi extensions run with the user's authority, so the broker is not a sandbox agai
 
 ### 20.1 Preferred adapter
 
-Use `playwright-core` connected to Electron's Chromium through a random loopback CDP endpoint started before `app.ready`. The endpoint is not exposed to renderer or page code. Broker maps each browser `webContents` target ID to a Playwright `Page` and never lets Pi enumerate or control the Amber host renderer.
+Prototype with an **exact** Electron `43.1.0` and exact compatible `playwright-core` pin (no caret). Use `playwright-core` connected to Electron's Chromium through a random loopback CDP endpoint started before `app.ready`. The endpoint is not exposed to renderer or page code. Broker maps each browser `webContents` target ID to a Playwright `Page` and never lets Pi enumerate or control the Amber host renderer.
 
 ### 20.2 Prototype gate
 
@@ -770,12 +849,16 @@ Before full implementation, prove on exact locked Electron and Playwright versio
 5. Child targets/iframes do not escape browser-record authorization.
 6. Remote debugging binds only to loopback and does not permit remote-page abuse in the packaged configuration.
 7. Host renderer cannot be reached through broker APIs.
+8. A hostile fixture page cannot discover, connect to, or drive the CDP endpoint; command-line exposure, IPv4/IPv6 binding, token/origin behavior, and another same-user process are tested explicitly. If same-user endpoint confinement is not acceptable, CDP fails the gate and the implementation uses `webContents.debugger`.
+9. The exact `WebContentsView` `webPreferences` prove sandboxed renderer process state (`process.sandboxed`/process model), no preload/Node/IPC, permission request **and check** denial, blocked schemes/redirects/popups, and behavior while Amber compatibility mode is active. Compat mode must disable the browser host.
+10. Real pointer, keyboard, composition/IME, drag/drop, context menu, focus transfer, accessibility-tree traversal, overlay occlusion, device-scale-factor changes, multi-monitor/negative coordinates, maximize/fullscreen, resize, tab switch, window close/reopen, and rapid revision reordering work on Linux and macOS. Synthetic-only input is insufficient.
+11. No raw CDP command, arbitrary script, target enumeration, or Playwright object crosses the broker API.
 
 If this gate fails or the endpoint is judged unacceptable, implement a narrower adapter over `webContents.debugger`; do not use the unmaintained `puppeteer-in-electron` package.
 
 ### 20.3 Dependency policy
 
-- Pin exact compatible Playwright core version or a narrow tested range.
+- Pin exact Electron and Playwright core versions in `package.json`/lockfile for v1; upgrades rerun Phase 0.
 - Do not download a second Chromium; Electron supplies the browser.
 - Record Electron/Chromium/Playwright compatibility in tests and packaging docs.
 - Keep Playwright in production dependencies only if the packaged host imports it at runtime.
@@ -841,34 +924,49 @@ App-local browser pages are not daemon sessions and remain omitted from remote m
 
 ## 24. Workspace save/load
 
-### 24.1 Save
+### 24.1 Versioned schema and save
 
-A tab browser serializes as browser intent, not a layout leaf:
+Version 2 makes a browser tab-owned intent rather than a pane placeholder:
 
 ```ts
-interface WsBrowser {
+export const WORKSPACE_VERSION = 2
+
+interface WorkspaceDocV2 {
+  version: 2
+  scope: 'one' | 'all'
+  workspaces: WsWorkspaceV2[]
+}
+interface WsWorkspaceV2 { label?: string; tabOrder?: number[]; tabs: WsTabV2[] }
+interface WsTabV2 {
+  tab: number
+  label?: string
+  tree: Node | null
+  panes: WsPaneV2[] // daemon + editor only; kind:'browser' is invalid in v2
+  browser?: WsBrowserV2
+}
+interface WsBrowserV2 {
   mode: 'preview' | 'browse'
-  url: string
+  safeRestoreUrl: string
   viewport?: { width: number; height: number }
   collapsed?: boolean
   width?: number
 }
 ```
 
-Never serialize cookies, local storage, controller designation, Share with Pi, generation, console/network buffers, history bodies, or profile credentials.
+The parser reads v1 and v2. V1 browser pane placeholders migrate through the same deterministic first-plus-recovery rule as layout migration. V2 rejects browser pane leaves, duplicate tab browsers, malformed URLs, invalid dimensions, duplicate pane placeholders, and trees referencing unknown placeholders. Size/count/depth limits apply before allocation. Serialization never includes cookies, local storage, controller designation, Share with Pi, generation/incarnation, console/network buffers, history bodies, raw credential-bearing URLs, or profile credentials.
 
 ### 24.2 Load
 
 - Mint a new browser ID.
-- Create frozen browser intent and attach it to the target tab.
-- `sharedWithPi` defaults false.
-- `designatedPi` is unset even if the saved workspace had one.
+- Create frozen browser intent and attach it to the target tab through the two-store transaction.
+- `sharedWithPi` defaults false and `designatedPi` is unset.
 - Thaw only when the tab is visible or explicitly requested.
-- Multiple browser intents in one legacy tab are recovered/skipped with notice as defined in migration.
+- Multiple browser intents in one legacy tab become durable recovery items with a visible notice.
+- A non-restorable URL loads a neutral page and reports why; it is never silently persisted with credentials.
 
 ### 24.3 Replace current workspace
 
-Browser records being replaced enter the garbage-collection grace until layout commit succeeds. Unsaved editor guards and daemon session confirmation remain unchanged.
+Browser records being replaced enter the garbage-collection grace until the layout/state transaction commits. A destructive-close confirmation names live browser pages that will lose volatile state. Unsaved editor guards and daemon session confirmation remain unchanged.
 
 ## 25. Failure handling
 
@@ -892,15 +990,15 @@ Pi receives retryable structured errors. Pi itself remains usable. Renderer show
 
 ### 25.4 State-write failure
 
-- Keep live browser running.
-- Surface persistence warning.
+- Keep live browser running, but mark the affected association/runtime intent as not durably saved.
+- Surface a persistent warning and entry in Browser Recovery diagnostics.
 - Retry with bounded backoff.
 - Do not claim durable restore.
 - Explicit Quit warns if final flush fails.
 
 ### 25.5 Layout/browser-state mismatch
 
-- Layout references missing record: create a frozen blank/error record and surface recovery.
+- Layout references a missing record: consult/replay the journal; if unrecoverable, create a frozen blank/error record and surface durable recovery.
 - Orphan record: retain through grace and show in recovery list.
 - Duplicate browser ID associations: deterministically keep the first valid tab and clear/report the rest.
 - Duplicate browser records for one tab: keep the associated ID and orphan/recover the extras.
@@ -1004,16 +1102,44 @@ Never restart or disrupt the user's production daemon during verification.
 
 ## 28. Rollout and compatibility
 
-1. Land permission/navigation hardening independently where possible.
-2. Gate the new rail/host behind an internal feature flag until Phase-0 prototypes pass.
-3. Parse old layout/workspace files throughout the rollout.
-4. Keep one release capable of reading version 1 and version 2 layouts; do not silently downgrade version 2.
-5. Backup the v1 layout before first migration.
-6. If rollback occurs after migration, preserve `browser-state.json` and a migration report so URLs are recoverable.
-7. Add clear release notes: close now leaves Amber resident; explicit Quit stops browser tooling; global Amber browser profile; four-live bound; page restoration limitation.
-8. Measure resident idle CPU/RSS and four-live browser RSS before enabling by default.
+1. **Land Rust `mosaic.rs` layout-v2 read compatibility first**, with fixtures proving v1 and v2 trees/labels still render and browser-rail/private fields are ignored. No desktop writer may emit v2 before that compatible reader ships.
+2. Land permission/navigation hardening independently where possible.
+3. Gate the new rail/host behind an internal feature flag until all Phase-0 prototypes pass.
+4. Parse old layout/workspace files throughout the rollout.
+5. Keep one release capable of reading version 1 and version 2 layouts; do not silently downgrade version 2.
+6. Backup the v1 layout before first migration.
+7. If rollback occurs after migration, preserve `browser-state.json` and a migration report so URLs are recoverable.
+8. Add clear release notes: close now leaves Amber resident; explicit Quit stops browser tooling; global Amber browser profile; four-live bound; page restoration limitation.
+9. Measure resident idle CPU/RSS and four-live browser RSS before enabling by default.
 
-## 29. Acceptance criteria
+## 29. Normative limits
+
+| Resource | Limit | Failure behavior |
+|---|---:|---|
+| Broker frame | 1 MiB | disconnect malformed client |
+| Request/action string | 64 KiB total; URL 8 KiB | `INVALID_REQUEST` |
+| Connections | 8 global; 2 per controller | reject/close excess |
+| Active requests | 32 global; 16 per browser mutation queue | `REQUEST_LIMIT` |
+| Request deadline | 30 s default; wait up to 120 s explicit | `ACTION_TIMEOUT` |
+| Approval lifetime | 60 s | deny |
+| Replay cache | 256 responses or 5 min, whichever first | high-water rejects an evicted duplicate |
+| Live browser-record renderers | 4 | freeze eligible LRU or queue |
+| Activation queue | 8 entries, 10 s | `BROWSER_CAPACITY_BUSY` |
+| Snapshot | 2,000 nodes, depth 20, 256 KiB text/result | truncate with explicit marker |
+| Console/network ring | 1,000 items and 1 MiB each per browser | drop oldest and report count |
+| Screenshot | 4096×4096, 10 MiB encoded | reject/scale only with caller consent |
+| Geometry | 1..32767 coordinates/dimensions; monotonic u53 revision | ignore invalid/stale update |
+| Browser state | 1,000 records; 8 MiB file | recovery/error, never unbounded parse |
+| Recovery items | 100 visible + bounded archived diagnostics | oldest metadata summarized, URL still redacted |
+| GC grace | 24 h and two successful matching-store commits | retain orphan before grace |
+
+These constants live in one shared policy module where TypeScript can reuse them; the protocol documents values so Pi clients can format useful errors. Security-sensitive host checks do not trust client-side copies.
+
+## 30. Design review
+
+A six-dimensional review (architecture, security/privacy, concurrency/persistence, product/UX, performance, and verification/operability) found the direction sound only after tightening its authority and failure boundaries. This revision adds the narrow constitutional exception, sender-derived command seam, fail-closed daemon metadata watcher, crash-consistent two-store journal, incarnation-plus-generation concurrency contract, complete versioned broker/workspace envelopes, durable recovery UX, explicit lifecycle inhibit/drain, Rust-v2-first rollout, hard Phase-0 sandbox/CDP/input/geometry gates, and normative limits. It preserves every locked product decision. With those blockers resolved, the design is coherent and **approved for implementation**, subject to every Phase-0 stop gate.
+
+## 31. Acceptance criteria
 
 ### Product
 
@@ -1063,7 +1189,7 @@ Never restart or disrupt the user's production daemon during verification.
 - Document, plan, and implementation receive independent architecture, security, concurrency, performance, UX/accessibility, and correctness reviews.
 - Full diff contains no unrelated formatting churn or staged user files.
 
-## 30. Deliberate tradeoffs and residual risks
+## 32. Deliberate tradeoffs and residual risks
 
 1. **Global profile blast radius:** explicitly chosen for convenience; Share per tab mitigates agent access but not cross-project browser identity.
 2. **Concurrent input races:** explicitly chosen; generation checks reduce stale actions but do not prevent mid-action interleaving or undo committed effects.
@@ -1076,11 +1202,11 @@ Never restart or disrupt the user's production daemon during verification.
 9. **Remote gap:** SSH remote windows and mobile do not receive browser-host parity in v1.
 10. **Package size:** Playwright core adds production weight even without downloading Chromium.
 
-## 31. Primary sources
+## 33. Primary sources
 
 ### Local
 
-- `AGENTS.md`
+- `CLAUDE.md`
 - `docs/superpowers/specs/2026-07-18-browser-pane-design.md`
 - `docs/superpowers/plans/2026-07-18-browser-pane.md`
 - `docs/superpowers/specs/2026-08-24-pi-session-kind-design.md`
@@ -1107,7 +1233,7 @@ Never restart or disrupt the user's production daemon during verification.
 - CDP Target domain: https://chromedevtools.github.io/devtools-protocol/tot/Target/
 - Pi extensions: local installed `docs/extensions.md` and `docs/environment-variables.md`
 
-## 32. Stop conditions
+## 34. Stop conditions
 
 Stop implementation and revisit this design if any prototype proves one of these:
 
@@ -1118,3 +1244,7 @@ Stop implementation and revisit this design if any prototype proves one of these
 5. Pi identity cannot be authorized against current tab membership without trusting stale renderer state.
 6. A requirement would make remote page content privileged.
 7. The implementation would require the Rust daemon to treat browser existence as a PTY session.
+8. The hardened browser cannot remain sandboxed under the app's supported launch modes, or compatibility mode would expose authenticated pages.
+9. The two-store transaction cannot recover every crash point without silent URL/association loss.
+10. Physical input/IME or native geometry/occlusion cannot be proven on either Linux or macOS.
+11. Windows feature gating cannot prevent partial broker/host activation before its native gates pass.
