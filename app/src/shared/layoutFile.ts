@@ -44,6 +44,8 @@ export interface LayoutFile {
   editors?: Record<string, EditorEntry>
   recentFiles?: string[] // most-recent-first, deduped, capped at RECENT_FILES_MAX
   browserRevision?: number
+  /** In-memory guard only: an unknown future on-disk version must never be overwritten. */
+  readOnly?: true
 }
 
 // Shape-guard the frozen map (Task 4 lesson): reject a non-object/array top
@@ -279,9 +281,10 @@ export function mergeLayout(base: LayoutFile, local: LayoutFile, remote: LayoutF
 export function parseLayout(text: string): LayoutFile {
   try {
     const v = JSON.parse(text) as Partial<LayoutFile>
-    if ((v.version !== LAYOUT_VERSION && v.version !== TAB_BROWSER_LAYOUT_VERSION) || typeof v.workspaces !== 'object' || v.workspaces === null) {
-      return emptyLayout()
+    if (v.version !== LAYOUT_VERSION && v.version !== TAB_BROWSER_LAYOUT_VERSION) {
+      return { ...emptyLayout(), readOnly: true }
     }
+    if (typeof v.workspaces !== 'object' || v.workspaces === null) return emptyLayout()
     return {
       version: v.version,
       activeWorkspace: typeof v.activeWorkspace === 'number' ? v.activeWorkspace : 1,
@@ -314,5 +317,6 @@ export function parseLayout(text: string): LayoutFile {
 }
 
 export function serializeLayout(l: LayoutFile): string {
-  return JSON.stringify(l)
+  const { readOnly: _readOnly, ...serializable } = l
+  return JSON.stringify(serializable)
 }

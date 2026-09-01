@@ -7,6 +7,7 @@
 // Electron main process and `amber web`'s Rust side), made safe by CAS
 // instead of moving ownership into the daemon.
 import { readFile, rename, mkdir, open, lstat, unlink } from 'node:fs/promises'
+import type { FileHandle } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import { dirname } from 'node:path'
 import type { LoadLayoutResult, SaveLayoutResult } from '../shared/layoutFile'
@@ -17,6 +18,35 @@ async function rejectSymlink(p: string): Promise<void> {
     throw error
   })
   if (stat?.isSymbolicLink()) throw new Error('refusing to replace layout symlink')
+}
+
+const LOCK_STALE_MS = 30_000
+const LOCK_WAIT_MS = 2_000
+
+async function acquireLock(path: string): Promise<{ handle: FileHandle; release: () => Promise<void> }> {
+  const started = Date.now()
+  for (;;) {
+    try {
+      const handle = await open(path, 'wx', 0o600)
+      await handle.writeFile(`${process.pid} ${Date.now()}\n`, 'utf8')
+      return {
+        handle,
+        release: async () => {
+          await handle.close().catch(() => {})
+          await unlink(path).catch(() => {})
+        },
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+      const stat = await lstat(path).catch(() => null)
+      if (stat && Date.now() - stat.mtimeMs > LOCK_STALE_MS) {
+        await unlink(path).catch(() => {})
+        continue
+      }
+      if (Date.now() - started >= LOCK_WAIT_MS) throw new Error('layout write lock timeout')
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+  }
 }
 
 async function atomicWrite(p: string, text: string): Promise<void> {
@@ -69,16 +99,19 @@ export async function loadLayoutFile(path: string): Promise<LoadLayoutResult> {
  * collide there, and a false version match is a silent clobber — exactly the
  * bug CAS exists to prevent. The sidecar is a few KB; comparing full content
  * costs nothing a hash would meaningfully save, and content equality cannot
- * false-positive. Every writer only compares its OWN token against its own
- * re-read, so this never has to agree with the Rust side's algorithm
- * (`crates/amber/src/layout_cas.rs`) — only the wire shape does.
+ * false-positive. Node and Rust writers also share `ui-layout.json.lock`, so
+ * the compare and atomic replace form one cross-process critical section. The
+ * lock is bounded and stale-recoverable; content remains the CAS token.
  */
 export async function saveLayoutFile(
   path: string,
   text: string,
   expectedVersion: string | null,
 ): Promise<SaveLayoutResult> {
+  let lock: Awaited<ReturnType<typeof acquireLock>> | null = null
   try {
+    await mkdir(dirname(path), { recursive: true, mode: 0o700 })
+    lock = await acquireLock(`${path}.lock`)
     const current = await readFile(path, 'utf8').catch(() => null)
     if (current !== expectedVersion) {
       return { conflict: true, text: current, version: current }
@@ -87,5 +120,7 @@ export async function saveLayoutFile(
     return { ok: true, version: text }
   } catch (e) {
     return { error: e instanceof Error ? e.message : String(e) }
+  } finally {
+    await lock?.release()
   }
 }

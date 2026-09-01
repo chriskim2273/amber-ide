@@ -51,6 +51,38 @@ Physical XTest input remained inconclusive on this host because of the host's GP
 - Focused browser broker, host, state, layout, service, policy, and shared-model tests passed.
 - `git diff --check`: passed at every commit boundary.
 
+## Synthesized-review fix wave (2026-09-01)
+
+A follow-up correctness/security review found the foundation unsafe to extend as-is. The branch now additionally:
+
+- serializes BrowserHost commands and state saves;
+- projects top-level navigation/loading/title/crash state from the actual `WebContents` and persists safe restore changes;
+- stops active navigation when the broker client disconnects or times out;
+- bounds broker buffered frames, per-connection queue depth, global in-flight work, request time, socket idle time, replayed request IDs, and server shutdown;
+- strictly parses opaque IDs, exact command keys, URL/incarnation/generation sizes, and native-view bounds;
+- protects the visible renderer from LRU eviction and guarantees only one native browser view is attached visibly;
+- makes collapse functional and sizes `WebContentsView` to a dedicated DOM slot so errors/chrome are not covered by native content;
+- adds a shared Node/Rust lock around layout content-CAS so simultaneous cross-process writers cannot both commit;
+- marks unknown future layout files read-only through renderer and main save paths;
+- adds journaled, idempotent legacy migration, trusts sidecar coordinates over stale encoded IDs, retains bounded migration recovery, and restores persisted `live` records honestly as frozen;
+- rolls back a newly-created broker browser if its association CAS conflicts;
+- refreshes a full daemon session list every two seconds and rejects Pi authorization after five seconds without a full list;
+- drains all PTY pane subscriptions when the resident window is hidden while retaining the metadata control connection.
+
+The layout-v2 deployed-reader barrier is now enforced in code: browser hosting requires both `AMBER_TAB_BROWSER_HOST=1` and `AMBER_TAB_BROWSER_V2_READER_DEPLOYED=1`. The second variable must not be set in production until the real upgrade-channel proof exists.
+
+The exact continuation contract is machine-readable in `.reports/tab-browser-host-remaining.json`. The feature remains **not merge-ready**.
+
+## Review-fix validation
+
+- App: 64 files passed, 762 tests passed, one intentional real-daemon skip.
+- App strict typecheck: passed.
+- Electron production bundle and web production bundle: passed.
+- Rust warnings-as-errors clippy: passed.
+- Rust layout-CAS focused suite: 8 passed.
+- Full Rust all-target run reached 436/437 library tests, with unrelated pre-existing timing test `manager::tests::automatic_pressure_suspend_rechecks_liveness_under_the_transition_lock` failing once with `ESRCH`; immediate isolated rerun passed. This is recorded as a flaky full gate, not claimed green.
+- All commands used `/tmp/amber-ide-tab-browser-host` and `/tmp/amber-tab-browser-validation`; no production daemon command was issued.
+
 ## Open blocking work
 
 1. Add the complete typed Pi tool surface required by the design (bounded observation, semantic interaction, wait/assert, binary screenshot attachment) without exposing unrestricted raw CDP/Playwright or filesystem screenshot paths.

@@ -3,14 +3,24 @@ import { BrowserCapacity } from './tabBrowserPolicy'
 import { createBrowserId, isOpaqueBrowserId, safeRestoreUrl, type BrowserId } from '../shared/tabBrowser'
 import type { BrowserRecord, BrowserStateFile } from '../shared/tabBrowserState'
 
+export type TabBrowserPageEvent =
+  | { type: 'navigation-started' }
+  | { type: 'navigation-committed'; url: string }
+  | { type: 'loading-stopped' }
+  | { type: 'title'; title: string }
+  | { type: 'crashed'; reason: string }
+
 export interface TabBrowserPage {
   loadURL(url: string): Promise<void>
   show(): void
   hide(): void
+  stop(): void
   setBounds?(bounds: { x: number; y: number; width: number; height: number }): void
   destroy(): void
 }
-export interface TabBrowserPageFactory { create(id: BrowserId, onUserInput: () => void): TabBrowserPage }
+export interface TabBrowserPageFactory {
+  create(id: BrowserId, onUserInput: () => void, onPageEvent: (event: TabBrowserPageEvent) => void): TabBrowserPage
+}
 export interface BrowserRuntimeStatus extends BrowserRecord { pageIncarnation: string; generation: number; loading: boolean }
 interface Runtime { page: TabBrowserPage; incarnation: string; generation: number; loading: boolean }
 
@@ -22,7 +32,12 @@ export class TabBrowserHost {
     private readonly pages: TabBrowserPageFactory,
     private readonly now = Date.now,
     private readonly randomBytes?: () => Uint8Array,
-  ) {}
+    private readonly onStateChange: () => void = () => {},
+  ) {
+    // A persisted `live` bit cannot mean a renderer survived process death.
+    // Restore records frozen and recreate a page only on explicit activation.
+    for (const record of Object.values(this.state.records)) if (record) record.lifecycle = 'frozen'
+  }
 
   private record(id: string): BrowserRecord {
     if (!isOpaqueBrowserId(id)) throw new Error('NO_BROWSER_FOR_TAB')
@@ -33,11 +48,43 @@ export class TabBrowserHost {
 
   private makeRuntime(id: BrowserId): Runtime {
     let runtime!: Runtime
-    const page = this.pages.create(id, () => { runtime.generation += 1 })
+    const page = this.pages.create(
+      id,
+      () => { runtime.generation += 1; this.onStateChange() },
+      (event) => this.pageEvent(id, runtime, event),
+    )
     runtime = { page, incarnation: randomUUID(), generation: 0, loading: false }
     this.runtimes.set(id, runtime)
     this.capacity.markLive(id, this.now())
     return runtime
+  }
+
+  private pageEvent(id: BrowserId, runtime: Runtime, event: TabBrowserPageEvent): void {
+    if (this.runtimes.get(id) !== runtime) return
+    const record = this.record(id)
+    if (event.type === 'navigation-started') {
+      if (!runtime.loading) runtime.generation += 1
+      runtime.loading = true
+    } else if (event.type === 'navigation-committed') {
+      runtime.loading = false
+      record.safeRestoreUrl = safeRestoreUrl(event.url)
+      record.lastUsedAt = this.now()
+      record.stateRevision += 1
+    } else if (event.type === 'loading-stopped') {
+      runtime.loading = false
+    } else if (event.type === 'title') {
+      record.title = event.title.slice(0, 512)
+      record.stateRevision += 1
+    } else {
+      runtime.loading = false
+      runtime.page.destroy()
+      this.runtimes.delete(id)
+      this.capacity.markFrozen(id)
+      record.lifecycle = 'frozen'
+      record.restoreError = `Page crashed: ${event.reason}`.slice(0, 1024)
+      record.stateRevision += 1
+    }
+    this.onStateChange()
   }
 
   async open(options: { visible: boolean }): Promise<{ status: BrowserRuntimeStatus; page: TabBrowserPage }> {
@@ -52,7 +99,10 @@ export class TabBrowserHost {
     if (activation.busy) { delete this.state.records[id]; throw new Error('BROWSER_CAPACITY_BUSY') }
     if (activation.freeze && isOpaqueBrowserId(activation.freeze)) this.freeze(activation.freeze)
     const runtime = this.makeRuntime(id)
-    if (options.visible) runtime.page.show(); else runtime.page.hide()
+    if (options.visible) {
+      for (const [otherId, other] of this.runtimes) if (otherId !== id) { other.page.hide(); this.capacity.protect(otherId, false) }
+      runtime.page.show(); this.capacity.protect(id, true)
+    } else runtime.page.hide()
     return { status: this.status(id), page: runtime.page }
   }
 
@@ -66,28 +116,50 @@ export class TabBrowserHost {
     const record = this.record(id); const runtime = this.runtimes.get(record.id)
     if (!runtime) throw new Error('BROWSER_FROZEN')
     if (bounds) runtime.page.setBounds?.(bounds)
-    runtime.page.show(); record.lastFocusedAt = this.now(); this.capacity.touch(record.id, record.lastFocusedAt)
+    for (const [otherId, other] of this.runtimes) if (otherId !== record.id) { other.page.hide(); this.capacity.protect(otherId, false) }
+    runtime.page.show(); this.capacity.protect(record.id, true)
+    record.lastFocusedAt = this.now(); this.capacity.touch(record.id, record.lastFocusedAt)
     return this.status(record.id)
   }
 
-  hide(id: string): void { const record = this.record(id); this.runtimes.get(record.id)?.page.hide() }
+  hide(id: string): void { const record = this.record(id); this.runtimes.get(record.id)?.page.hide(); this.capacity.protect(record.id, false) }
 
   setBounds(id: string, bounds: { x: number; y: number; width: number; height: number }): void {
     if (![bounds.x, bounds.y, bounds.width, bounds.height].every(Number.isFinite) || bounds.width < 1 || bounds.height < 1) throw new Error('INVALID_BOUNDS')
     const record = this.record(id); this.runtimes.get(record.id)?.page.setBounds?.(bounds)
   }
 
-  async navigate(id: string, url: string, incarnation: string, generation: number): Promise<BrowserRuntimeStatus> {
+  async navigate(id: string, url: string, incarnation: string, generation: number, signal?: AbortSignal): Promise<BrowserRuntimeStatus> {
     const record = this.record(id)
     const runtime = this.runtimes.get(record.id)
     if (!runtime || runtime.incarnation !== incarnation || runtime.generation !== generation) throw new Error('STALE_GENERATION')
     const parsed = new URL(url)
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') throw new Error('NAVIGATION_BLOCKED')
+    if (signal?.aborted) throw new Error('ACTION_CANCELLED')
     runtime.generation += 1
     runtime.loading = true
-    try { await runtime.page.loadURL(parsed.href) } finally { runtime.loading = false }
+    let abort: (() => void) | undefined
+    const cancelled = new Promise<never>((_resolve, reject) => {
+      abort = () => { runtime.page.stop(); reject(new Error('ACTION_CANCELLED')) }
+      signal?.addEventListener('abort', abort, { once: true })
+    })
+    try { await (signal ? Promise.race([runtime.page.loadURL(parsed.href), cancelled]) : runtime.page.loadURL(parsed.href)) }
+    finally {
+      runtime.loading = false
+      if (abort) signal?.removeEventListener('abort', abort)
+    }
     record.safeRestoreUrl = safeRestoreUrl(parsed.href)
     record.lastUsedAt = this.now(); record.stateRevision += 1
+    return this.status(record.id)
+  }
+
+  stop(id: string): BrowserRuntimeStatus {
+    const record = this.record(id)
+    const runtime = this.runtimes.get(record.id)
+    if (!runtime) throw new Error('BROWSER_FROZEN')
+    runtime.page.stop()
+    runtime.loading = false
+    runtime.generation += 1
     return this.status(record.id)
   }
 

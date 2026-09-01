@@ -2,6 +2,7 @@ import { isOpaqueBrowserId, safeRestoreUrl, type BrowserId } from './tabBrowser'
 
 export const BROWSER_STATE_VERSION = 1
 export const BROWSER_STATE_RECORD_MAX = 1000
+export const BROWSER_RECOVERY_MAX = 100
 
 export interface ProfileDescriptor {
   id: 'global'
@@ -25,6 +26,12 @@ export interface BrowserRecord {
 }
 
 export interface MigrationRecoveryItem { workspace: number; tab: number; safeRestoreUrl: string }
+export interface BrowserStateTransaction {
+  id: string
+  kind: 'legacy-layout-migration'
+  expectedLayoutVersion: string | null
+  layoutText: string
+}
 export interface BrowserStateFile {
   version: 1
   revision: number
@@ -32,6 +39,7 @@ export interface BrowserStateFile {
   profiles: { global: ProfileDescriptor }
   records: Partial<Record<BrowserId, BrowserRecord>>
   migrationRecovery: MigrationRecoveryItem[]
+  pendingTransaction?: BrowserStateTransaction
 }
 
 function object(value: unknown): Record<string, unknown> | null {
@@ -72,20 +80,37 @@ export function parseBrowserState(text: string): BrowserStateFile {
   try {
     const raw = object(JSON.parse(text))
     const profiles = object(raw?.['profiles']); const global = object(profiles?.['global'])
-    if (!raw || raw['version'] !== 1 || !global || global['id'] !== 'global' || typeof global['partition'] !== 'string' || !finite(global['createdAt'])) return fallback
+    if (!raw || raw['version'] !== 1 || !global || global['id'] !== 'global' || typeof global['partition'] !== 'string'
+        || !/^persist:amber-browser(?:-[a-z0-9-]+)?$/.test(global['partition']) || !finite(global['createdAt'])) return fallback
     const recordsRaw = object(raw['records']) ?? {}
     const records: Partial<Record<BrowserId, BrowserRecord>> = {}
     for (const [key, value] of Object.entries(recordsRaw).slice(0, BROWSER_STATE_RECORD_MAX)) {
       const parsed = record(value, key)
       if (parsed) records[parsed.id] = parsed
     }
+    const migrationRecovery: MigrationRecoveryItem[] = []
+    if (Array.isArray(raw['migrationRecovery'])) {
+      for (const value of raw['migrationRecovery'].slice(0, BROWSER_RECOVERY_MAX)) {
+        const item = object(value)
+        if (!item || !finite(item['workspace']) || !finite(item['tab']) || typeof item['safeRestoreUrl'] !== 'string') continue
+        migrationRecovery.push({ workspace: item['workspace'], tab: item['tab'], safeRestoreUrl: safeRestoreUrl(item['safeRestoreUrl']) })
+      }
+    }
+    const pendingRaw = object(raw['pendingTransaction'])
+    const pendingTransaction = pendingRaw && pendingRaw['kind'] === 'legacy-layout-migration'
+      && typeof pendingRaw['id'] === 'string' && pendingRaw['id'].length <= 128
+      && (typeof pendingRaw['expectedLayoutVersion'] === 'string' || pendingRaw['expectedLayoutVersion'] === null)
+      && typeof pendingRaw['layoutText'] === 'string' && pendingRaw['layoutText'].length <= 2 * 1024 * 1024
+      ? { id: pendingRaw['id'], kind: 'legacy-layout-migration' as const, expectedLayoutVersion: pendingRaw['expectedLayoutVersion'] as string | null, layoutText: pendingRaw['layoutText'] }
+      : undefined
     return {
       version: 1,
       revision: finite(raw['revision']) ? raw['revision'] : 0,
       layoutRevision: finite(raw['layoutRevision']) ? raw['layoutRevision'] : 0,
       profiles: { global: { id: 'global', partition: global['partition'].slice(0, 128), createdAt: global['createdAt'], ...(typeof global['migratedFrom'] === 'string' ? { migratedFrom: global['migratedFrom'].slice(0, 128) } : {}) } },
       records,
-      migrationRecovery: [],
+      migrationRecovery,
+      ...(pendingTransaction ? { pendingTransaction } : {}),
     }
   } catch { return fallback }
 }

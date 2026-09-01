@@ -37,6 +37,16 @@ describe('legacy migration', () => {
     expect(result.recovery).toEqual([{ workspace: 1, tab: 1, safeRestoreUrl: 'https://two.test/path' }])
   })
 
+  it('trusts sidecar coordinates rather than stale coordinates encoded in a legacy id', () => {
+    const input: LegacyBrowserMigrationInput = {
+      workspaces: { '2': { activeTab: 3, tabs: { '3': { tree: leaf('browser-1-1-7-stale') } } } },
+      browsers: { 'browser-1-1-7-stale': { ws: 2, tab: 3, ord: 7, url: 'https://moved.test/path' } },
+    }
+    const result = migrateLegacyBrowsers(input, () => new Uint8Array(16).fill(3))
+    expect(result.workspaces['2']!.tabs['3']!.tree).toBeNull()
+    expect(result.workspaces['2']!.tabs['3']!.browser?.id).toBe('browser-03030303030303030303030303030303')
+  })
+
   it('preserves a browser-only tab with a null terminal tree', () => {
     const input: LegacyBrowserMigrationInput = {
       workspaces: { '1': { activeTab: 1, tabs: { '1': { tree: leaf('browser-1-1-0-a') } } } },
@@ -63,5 +73,15 @@ describe('browser state parser', () => {
     }))
     expect(Object.keys(parsed.records)).toEqual(['browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'])
     expect(parsed.profiles.global.partition).toBe('persist:amber-browser')
+  })
+
+  it('retains bounded, redacted migration recovery entries', () => {
+    const parsed = parseBrowserState(JSON.stringify({
+      version: 1, revision: 0, layoutRevision: 0,
+      profiles: { global: { id: 'global', partition: 'persist:amber-browser', createdAt: 1 } },
+      records: {},
+      migrationRecovery: [{ workspace: 1, tab: 2, safeRestoreUrl: 'https://example.test/a?token=secret' }, { workspace: 'bad', tab: 2, safeRestoreUrl: 'https://bad.test' }],
+    }))
+    expect(parsed.migrationRecovery).toEqual([{ workspace: 1, tab: 2, safeRestoreUrl: 'https://example.test/a' }])
   })
 })

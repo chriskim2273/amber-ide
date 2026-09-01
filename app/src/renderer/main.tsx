@@ -702,6 +702,10 @@ function App(): JSX.Element {
   const persistLayout = useCallback(async (): Promise<void> => {
     try {
       const local = layoutRef.current
+      if (local.readOnly) {
+        setNotice('This layout was written by a newer Amber version and is read-only here.')
+        return
+      }
       const text = serializeLayout(local)
       const result = await window.amber.saveLayout(text, versionRef.current)
       if ('ok' in result) {
@@ -711,6 +715,10 @@ function App(): JSX.Element {
       }
       if ('conflict' in result) {
         const remote = result.text ? parseLayout(result.text) : emptyLayout()
+        if (remote.readOnly) {
+          setNotice('Layout changes were not saved because a newer Amber version owns this file.')
+          return
+        }
         const merged = mergeLayout(baseRef.current, local, remote)
         const retry = await window.amber.saveLayout(serializeLayout(merged), result.version)
         if ('ok' in retry) {
@@ -2177,12 +2185,13 @@ function App(): JSX.Element {
               })}
       </div>
       {tabBrowser && !mobile && remoteHost.length === 0 && (
-        <BrowserRail id={tabBrowser.id} width={tabBrowser.width}
+        <BrowserRail id={tabBrowser.id} width={tabBrowser.width} collapsed={tabBrowser.collapsed}
           {...(tabBrowser.designatedPi ? { designatedPi: tabBrowser.designatedPi } : {})}
           {...(tabBrowser.sharedWithPi !== undefined ? { sharedWithPi: tabBrowser.sharedWithPi } : {})}
           controllers={(tab?.panes ?? []).filter((pane) => pane.kind === 'pi').map((pane) => ({ name: pane.name, label: titles[pane.name] || pane.name }))}
           onPolicy={(policy) => updateTabBrowser({ ...tabBrowser, ...policy })}
           onWidth={(width) => updateTabBrowser({ ...tabBrowser, width })}
+          onCollapsed={(collapsed) => updateTabBrowser({ ...tabBrowser, collapsed })}
           onClose={() => void closeTabBrowser()} />
       )}
       </div>

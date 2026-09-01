@@ -1,7 +1,7 @@
 import { WebContentsView, session, type BrowserWindow, type Rectangle, type Session } from 'electron'
 import { browserWebPreferences, isAllowedBrowserUrl } from './tabBrowserPolicy'
 import type { BrowserId } from '../shared/tabBrowser'
-import type { TabBrowserPage, TabBrowserPageFactory } from './tabBrowserHost'
+import type { TabBrowserPage, TabBrowserPageEvent, TabBrowserPageFactory } from './tabBrowserHost'
 
 const hardenedSessions = new WeakSet<Session>()
 export function hardenBrowserSession(browserSession: Session): void {
@@ -17,8 +17,9 @@ export function hardenBrowserSession(browserSession: Session): void {
 export class ElectronTabBrowserPage implements TabBrowserPage {
   readonly view: WebContentsView
   private attached = false
+  private disposing = false
   private bounds: Rectangle = { x: 0, y: 0, width: 1, height: 1 }
-  constructor(private window: BrowserWindow, partition: string, onUserInput: () => void, private readonly onDestroy: () => void) {
+  constructor(private window: BrowserWindow, partition: string, onUserInput: () => void, onPageEvent: (event: TabBrowserPageEvent) => void, private readonly onDestroy: () => void) {
     const browserSession = session.fromPartition(partition)
     hardenBrowserSession(browserSession)
     this.view = new WebContentsView({ webPreferences: browserWebPreferences(partition) })
@@ -28,11 +29,17 @@ export class ElectronTabBrowserPage implements TabBrowserPage {
     this.view.webContents.on('will-frame-navigate', (event) => { if (!isAllowedBrowserUrl(event.url)) event.preventDefault() })
     this.view.webContents.on('before-input-event', onUserInput)
     this.view.webContents.on('before-mouse-event', onUserInput)
+    this.view.webContents.on('did-start-navigation', (_event, _url, _inPlace, isMainFrame) => { if (isMainFrame) onPageEvent({ type: 'navigation-started' }) })
+    this.view.webContents.on('did-navigate', (_event, url) => onPageEvent({ type: 'navigation-committed', url }))
+    this.view.webContents.on('did-stop-loading', () => onPageEvent({ type: 'loading-stopped' }))
+    this.view.webContents.on('page-title-updated', (_event, title) => onPageEvent({ type: 'title', title }))
+    this.view.webContents.on('render-process-gone', (_event, details) => { if (!this.disposing) onPageEvent({ type: 'crashed', reason: details.reason }) })
   }
   async loadURL(url: string): Promise<void> {
     if (!isAllowedBrowserUrl(url)) throw new Error('NAVIGATION_BLOCKED')
     await this.view.webContents.loadURL(url)
   }
+  stop(): void { this.view.webContents.stop() }
   setWindow(window: BrowserWindow): void {
     if (window === this.window) return
     this.hide(); this.window = window
@@ -45,15 +52,15 @@ export class ElectronTabBrowserPage implements TabBrowserPage {
   hide(): void {
     if (this.attached) { this.window.contentView.removeChildView(this.view); this.attached = false }
   }
-  destroy(): void { this.hide(); if (!this.view.webContents.isDestroyed()) this.view.webContents.close(); this.onDestroy() }
+  destroy(): void { this.disposing = true; this.hide(); if (!this.view.webContents.isDestroyed()) this.view.webContents.close(); this.onDestroy() }
 }
 
 export class ElectronTabBrowserPageFactory implements TabBrowserPageFactory {
   readonly pages = new Map<BrowserId, ElectronTabBrowserPage>()
   constructor(private window: BrowserWindow, private readonly partition = 'persist:amber-browser') {}
   setWindow(window: BrowserWindow): void { this.window = window; for (const page of this.pages.values()) page.setWindow(window) }
-  create(id: BrowserId, onUserInput: () => void): ElectronTabBrowserPage {
-    const page = new ElectronTabBrowserPage(this.window, this.partition, onUserInput, () => this.pages.delete(id))
+  create(id: BrowserId, onUserInput: () => void, onPageEvent: (event: TabBrowserPageEvent) => void): ElectronTabBrowserPage {
+    const page = new ElectronTabBrowserPage(this.window, this.partition, onUserInput, onPageEvent, () => this.pages.delete(id))
     this.pages.set(id, page)
     return page
   }

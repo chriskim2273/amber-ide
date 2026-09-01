@@ -3,12 +3,12 @@ import { createBrowserId, parseLegacyBrowserName, safeRestoreUrl, type BrowserId
 import type { BrowserRecord, MigrationRecoveryItem } from './tabBrowserState'
 
 export interface LegacyBrowserEntry { ws: number; tab: number; ord: number; url: string }
-export interface MigratingTab { tree: Node | null; label?: string; browser?: { id: BrowserId; width: number; collapsed: boolean } }
+export interface MigratingTab { tree: Node | null; label?: string; browser?: { id: string; width: number; collapsed: boolean; designatedPi?: string; sharedWithPi?: boolean } }
 export interface MigratingWorkspace { activeTab: number; tabs: Record<string, MigratingTab>; label?: string; tabOrder?: number[] }
 export interface LegacyBrowserMigrationInput { workspaces: Record<string, MigratingWorkspace>; browsers: Record<string, LegacyBrowserEntry> }
 export interface LegacyBrowserMigrationResult {
   workspaces: Record<string, MigratingWorkspace>
-  records: Partial<Record<BrowserId, BrowserRecord>>
+  records: Partial<Record<string, BrowserRecord>>
   recovery: MigrationRecoveryItem[]
 }
 
@@ -22,8 +22,10 @@ export function migrateLegacyBrowsers(input: LegacyBrowserMigrationInput, random
   const recovery: MigrationRecoveryItem[] = []
   const grouped = new Map<string, { name: string; entry: LegacyBrowserEntry }[]>()
   for (const [name, entry] of Object.entries(input.browsers)) {
-    const parsed = parseLegacyBrowserName(name)
-    if (!parsed || parsed.ws !== entry.ws || parsed.tab !== entry.tab || parsed.ord !== entry.ord) continue
+    // Coordinates in legacy IDs became stale after cross-tab moves. The
+    // sidecar entry is authoritative; parsing the ID only proves this is a
+    // recognized legacy browser leaf rather than an unrelated app-local pane.
+    if (!parseLegacyBrowserName(name)) continue
     const key = `${entry.ws}:${entry.tab}`
     grouped.set(key, [...(grouped.get(key) ?? []), { name, entry }])
   }

@@ -1,0 +1,88 @@
+{
+  "schemaVersion": 1,
+  "feature": "tab-browser-host",
+  "branch": "feat/tab-browser-host",
+  "mergeReady": false,
+  "completedInReviewFixWave": [
+    "cross-process layout CAS lock shared by Node and Rust writers",
+    "unknown future layout versions are read-only and cannot be overwritten",
+    "journaled/idempotent legacy browser migration with stale-coordinate handling and recovery parsing",
+    "serialized BrowserHost commands and durable state writes",
+    "user navigation/loading/title/crash lifecycle projection from WebContents",
+    "strict renderer command parsing and bounded native-view geometry",
+    "visible renderer capacity protection and single-visible-view enforcement",
+    "bounded broker frames/connections/queue/global in-flight work/deadlines",
+    "broker disconnect and timeout cancellation reaches navigation stop",
+    "fresh full daemon session list polling before Pi authorization",
+    "hidden resident window drains all PTY pane subscriptions while keeping metadata control",
+    "functional rail collapse and exact native page-slot geometry"
+  ],
+  "remaining": [
+    {
+      "id": "P1-main-association-authority",
+      "severity": "important",
+      "status": "open",
+      "work": "Move open/close/share/designation/geometry ownership fully behind a sender-derived main WindowCtx association API; renderer commands must not carry trusted browser ids and renderer layout edits must not be the authorization source."
+    },
+    {
+      "id": "P1-two-store-all-mutations",
+      "severity": "important",
+      "status": "partial",
+      "work": "Generalize the migration journal to every browser association mutation (user open/close, broker creation, workspace import/replacement, recovery attach/delete), including rollback/replay and orphan GC grace."
+    },
+    {
+      "id": "P1-dedicated-daemon-watcher",
+      "severity": "important",
+      "status": "partial",
+      "work": "Replace the temporary 2-second ListSessionsDetailed refresh through the window utility client with a dedicated metadata-only main watcher and tested reconnect/full-list epoch barrier."
+    },
+    {
+      "id": "P1-broker-replay-and-mutation-queues",
+      "severity": "important",
+      "status": "partial",
+      "work": "Add clientInstanceId/sequence high-water replay semantics, payload-digest duplicate handling, per-browser FIFO mutation queues, observation ordering, cancellation ownership, and bounded result cache."
+    },
+    {
+      "id": "P1-capacity-activation-queue",
+      "severity": "important",
+      "status": "partial",
+      "work": "Implement the approved global FIFO activation queue (8 entries/10 seconds), operation/approval protection, cancellation, and capacity-wait UI instead of immediate busy-only behavior."
+    },
+    {
+      "id": "P1-pi-tools-and-approvals",
+      "severity": "important",
+      "status": "open",
+      "work": "Implement bounded snapshot/find/inspect/screenshot/console/network/wait/history/reload/interaction/viewport tools and the consequential-action classifier, exact approval digest, visible approval coordinator, revoke/Stop Pi semantics, redaction canaries, and binary image transport."
+    },
+    {
+      "id": "P1-workspace-contract",
+      "severity": "important",
+      "status": "open",
+      "work": "Implement .amberws v2 rail save/load/import/recovery and destructive replace transactions; remove all transitional legacy browser-pane branches only after round-trip tests pass."
+    },
+    {
+      "id": "P1-resident-launcher-quit",
+      "severity": "important",
+      "status": "partial",
+      "work": "Add tray/menu reopening, coordinated quit drain and warning, explicit-stop inhibit, stable packaged app registration, amber ctl browser-host ensure/status/enable, stale endpoint recovery, and platform tests."
+    },
+    {
+      "id": "P1-rail-product-states",
+      "severity": "important",
+      "status": "partial",
+      "work": "Add host event subscription (no polling), raw current URL in user-only chrome, back/forward/reload/mode/viewport, activity/restore/capacity/approval/recovery states, keyboard divider and native-view overlay occlusion."
+    },
+    {
+      "id": "GATE-deployed-reader",
+      "severity": "blocking-gate",
+      "status": "open",
+      "work": "Prove the Rust layout-v2 reader through the actual upgrade channel. Until then AMBER_TAB_BROWSER_V2_READER_DEPLOYED=1 must not be set in production."
+    },
+    {
+      "id": "GATE-packaging-platforms",
+      "severity": "blocking-gate",
+      "status": "open",
+      "work": "Run packaged Linux hostile-fixture/physical-input/resident smoke, static artifact checks, and macOS WebContentsView focus/IME/accessibility/lifecycle/profile/package matrix. Windows remains unavailable."
+    }
+  ]
+}

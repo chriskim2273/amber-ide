@@ -73,6 +73,8 @@ import {
 import { inspectLinuxInputMethod, repairLinuxInputMethod, resolveLinuxInputEnvironment } from './inputMethod'
 import { TabBrowserService, parseTabBrowserCommand } from './tabBrowserService'
 import { TabBrowserBrokerServer, authorizeBrowserRequest, type BrokerRequest } from './tabBrowserBroker'
+import { TabBrowserStateStore } from './tabBrowserStateStore'
+import { coordinateTabBrowserMigration } from './tabBrowserMigrationCoordinator'
 import { parseLayout, serializeLayout } from '../shared/layoutFile'
 import clientPath from '../client/index?modulePath'
 
@@ -106,6 +108,12 @@ function readCompatFlag(): string | null {
 }
 
 const compat = shouldUseCompat(process.env, readCompatFlag(), COMPAT_SIGNATURE)
+
+function tabBrowserHostEnabled(): boolean {
+  return process.env['AMBER_TAB_BROWSER_HOST'] === '1'
+    && process.env['AMBER_TAB_BROWSER_V2_READER_DEPLOYED'] === '1'
+    && !compat && process.platform !== 'win32'
+}
 
 if (compat) {
   for (const [name, value] of COMPAT_SWITCHES) {
@@ -713,6 +721,7 @@ interface WindowCtx {
   target: WindowTarget
   controlPort: () => Electron.MessagePortMain | null
   child: () => Electron.UtilityProcess | null
+  resumeClient: () => void
 }
 
 /** Per-window state, keyed by webContents id so IPC can route by sender. */
@@ -720,9 +729,10 @@ const windowCtxs = new Map<number, WindowCtx>()
 let reopenLocalWindow: (() => Promise<void>) | null = null
 const browserDaemonSessions = new Map<string, string>()
 let browserDaemonFresh = false
+let browserDaemonLastFullAt = 0
 function observeBrowserDaemonEvent(data: unknown): void {
   if (typeof data !== 'object' || data === null) return
-  if ((data as { status?: unknown }).status === 'disconnected') { browserDaemonFresh = false; browserDaemonSessions.clear(); return }
+  if ((data as { status?: unknown }).status === 'disconnected') { browserDaemonFresh = false; browserDaemonLastFullAt = 0; browserDaemonSessions.clear(); return }
   const frame = (data as { frame?: unknown }).frame
   if (typeof frame !== 'object' || frame === null || (frame as { type?: unknown }).type !== 'control') return
   const msg = (frame as { msg?: unknown }).msg
@@ -735,7 +745,7 @@ function observeBrowserDaemonEvent(data: unknown): void {
       if (typeof info.name === 'string' && typeof info.kind === 'string') browserDaemonSessions.set(info.name, info.kind)
     }
   }
-  if (control.kind === 'Sessions') { browserDaemonSessions.clear(); add(control.sessions); browserDaemonFresh = true }
+  if (control.kind === 'Sessions') { browserDaemonSessions.clear(); add(control.sessions); browserDaemonFresh = true; browserDaemonLastFullAt = Date.now() }
   if (control.kind === 'SessionsChanged') {
     add(control.added)
     if (Array.isArray(control.removed)) for (const name of control.removed) if (typeof name === 'string') browserDaemonSessions.delete(name)
@@ -1067,6 +1077,7 @@ async function openWindow(target: WindowTarget): Promise<WindowCtx> {
   let relaunchAttempt = 0
   let quitting = false
   let windowClosed = false
+  let presentationSuspended = false
   const stopClient = (): void => {
     try { controlPort?.close() } catch { /* already closed */ }
     controlPort = null
@@ -1153,12 +1164,19 @@ async function openWindow(target: WindowTarget): Promise<WindowCtx> {
     target,
     controlPort: () => controlPort,
     child: () => child,
+    resumeClient: () => {
+      if (!presentationSuspended) return
+      presentationSuspended = false
+      notifyRenderer({ childRestart: true })
+    },
   }
   windowCtxs.set(win.webContents.id, ctx)
   const id = win.webContents.id
   win.on('close', (event) => {
-    if (process.env['AMBER_TAB_BROWSER_HOST'] === '1' && target.kind === 'local' && !quitting) {
+    if (tabBrowserHostEnabled() && target.kind === 'local' && !quitting) {
       event.preventDefault()
+      presentationSuspended = true
+      child?.postMessage({ kind: 'suspend-panes' })
       win.hide()
     }
   })
@@ -1188,24 +1206,40 @@ async function main(): Promise<void> {
 
   const ctx = await openWindow({ kind: 'local' })
   const win = ctx.win
-  const tabBrowserSupported = process.env['AMBER_TAB_BROWSER_HOST'] === '1'
-    && !compat && process.platform !== 'win32'
-  const tabBrowser = tabBrowserSupported ? await TabBrowserService.create(stateRoot(), win) : null
+  // Layout-v2 writes stay behind the deployed-reader barrier from the approved
+  // rollout plan. Source compatibility alone is insufficient: an older
+  // `amber web` process could otherwise rewrite or misread the sidecar.
+  const tabBrowserSupported = tabBrowserHostEnabled()
+  let tabBrowser: TabBrowserService | null = null
+  if (tabBrowserSupported) {
+    try {
+      await coordinateTabBrowserMigration(layoutPath(), new TabBrowserStateStore(stateRoot()))
+      tabBrowser = await TabBrowserService.create(stateRoot(), win)
+    } catch (error) {
+      console.error('tab browser migration failed; browser host remains unavailable', error)
+    }
+  }
   reopenLocalWindow = async (): Promise<void> => {
     const existing = [...windowCtxs.values()].find((candidate) => candidate.target.kind === 'local' && !candidate.win.isDestroyed())
-    if (existing) { existing.win.show(); existing.win.focus(); return }
+    if (existing) { existing.resumeClient(); existing.win.show(); existing.win.focus(); return }
     const reopened = await openWindow({ kind: 'local' })
     tabBrowser?.setWindow(reopened.win)
   }
 
   let tabBrowserBroker: TabBrowserBrokerServer | null = null
+  let browserSessionRefresh: NodeJS.Timeout | null = null
   if (tabBrowser) {
-    const handleBroker = async (request: BrokerRequest): Promise<unknown> => {
-      if (!browserDaemonFresh) throw new Error('DAEMON_STATE_STALE')
+    browserSessionRefresh = setInterval(() => {
+      const local = [...windowCtxs.values()].find((candidate) => candidate.target.kind === 'local' && !candidate.win.isDestroyed())
+      local?.controlPort()?.postMessage({ cmd: 'refreshSessions' })
+    }, 2_000)
+    const handleBroker = async (request: BrokerRequest, signal: AbortSignal): Promise<unknown> => {
+      if (!browserDaemonFresh || Date.now() - browserDaemonLastFullAt > 5_000) throw new Error('DAEMON_STATE_STALE')
       if (browserDaemonSessions.get(request.amberSession) !== 'pi') throw new Error('NOT_DESIGNATED_CONTROLLER')
       const loaded = await loadLayoutFile(layoutPath())
       const current = loaded.text ? parseLayout(loaded.text) : null
       if (!current) throw new Error('NO_BROWSER_FOR_TAB')
+      if (current.readOnly) throw new Error('UNSUPPORTED_LAYOUT_VERSION')
       if (request.action.type === 'open') {
         const location = authorizeBrowserRequest(current, request.amberSession, true)
         if (!location.browserId) {
@@ -1217,7 +1251,13 @@ async function main(): Promise<void> {
           const next = { ...current, version: 2, browserRevision: (current.browserRevision ?? 0) + 1,
             workspaces: { ...current.workspaces, [location.ws]: { ...workspace, tabs: { ...workspace.tabs, [location.tab]: { ...previous, browser } } } } }
           const saved = await saveLayoutFile(layoutPath(), serializeLayout(next), loaded.version)
-          if (!('ok' in saved)) throw new Error('LAYOUT_CONFLICT')
+          if (!('ok' in saved)) {
+            // The record was persisted before the association CAS. Roll it
+            // back immediately so a conflict cannot accumulate unreachable
+            // live renderers for every retry.
+            await tabBrowser.command({ type: 'close', id: opened.id }).catch(() => {})
+            throw new Error('LAYOUT_CONFLICT')
+          }
           await reopenLocalWindow?.()
           for (const candidate of windowCtxs.values()) if (candidate.target.kind === 'local' && !candidate.win.isDestroyed()) {
             candidate.win.webContents.send('tab-browser-association', { ws: location.ws, tab: location.tab, browser })
@@ -1228,14 +1268,19 @@ async function main(): Promise<void> {
       }
       const authorized = authorizeBrowserRequest(current, request.amberSession)
       const id = authorized.browserId!
-      if (request.action.type === 'status' || request.action.type === 'stop') return tabBrowser.command({ type: 'status', id })
-      return tabBrowser.command({ type: 'navigate', id, url: request.action.url, pageIncarnation: request.action.pageIncarnation, expectedGeneration: request.action.expectedGeneration })
+      if (request.action.type === 'status') return tabBrowser.command({ type: 'status', id })
+      if (request.action.type === 'stop') return tabBrowser.command({ type: 'stop', id })
+      return tabBrowser.command({ type: 'navigate', id, url: request.action.url, pageIncarnation: request.action.pageIncarnation, expectedGeneration: request.action.expectedGeneration }, signal)
     }
     const runtime = process.env['XDG_RUNTIME_DIR'] ?? tmpdir()
     const socketPath = process.env['AMBER_BROWSER_HOST_SOCKET'] ?? join(runtime, 'amber-ide', 'browser-host.sock')
     tabBrowserBroker = new TabBrowserBrokerServer(socketPath, join(stateRoot(), 'browser-host-token'), handleBroker)
     await tabBrowserBroker.start()
-    app.once('before-quit', () => { void tabBrowserBroker?.close() })
+    app.once('before-quit', () => {
+      if (browserSessionRefresh) clearInterval(browserSessionRefresh)
+      browserSessionRefresh = null
+      void tabBrowserBroker?.close()
+    })
   }
 
   // These three are the only per-WINDOW handlers: each window has its own
@@ -1502,6 +1547,8 @@ async function main(): Promise<void> {
   })
   ipcMain.handle('layout-save', async (e, text: string, version: string | null) => {
     if (ctxFor(e)?.target.kind === 'remote') return { ok: true, version: null }
+    const current = await loadLayoutFile(layoutPath())
+    if (current.text && parseLayout(current.text).readOnly) return { error: 'layout belongs to a newer Amber version' }
     return saveLayoutFile(layoutPath(), text, version)
   })
 
@@ -1561,7 +1608,7 @@ async function main(): Promise<void> {
     const notification = new Notification({ title: raw['title'].slice(0, 80), body: raw['body'].slice(0, 240) })
     notification.on('click', () => {
       if (ctx.win.isDestroyed()) return
-      ctx.win.show(); ctx.win.focus()
+      ctx.resumeClient(); ctx.win.show(); ctx.win.focus()
       if (session) ctx.win.webContents.send('notification-activate', session)
     })
     notification.show()
@@ -1651,11 +1698,10 @@ if (!app.requestSingleInstanceLock()) {
     app.quit()
   })
 }
-// Single-window app: red traffic-light / window close must quit the process on
-// every platform, including macOS. The common Electron pattern of keeping the
-// app alive with zero windows on darwin left amber-ide headless in the Dock
-// (no activate handler recreates a window) until Force Quit. Spec §6/§7: window
-// close never stops the daemon, but it DOES exit the GUI.
+// Without the browser host, preserve the existing close-means-exit behavior.
+// With it, the local window's close handler hides presentation and drains pane
+// subscriptions while the metadata watcher and BrowserHost remain resident;
+// second-instance/activate reopens that same window.
 app.on('window-all-closed', () => {
-  if (process.env['AMBER_TAB_BROWSER_HOST'] !== '1') app.quit()
+  if (!tabBrowserHostEnabled()) app.quit()
 })

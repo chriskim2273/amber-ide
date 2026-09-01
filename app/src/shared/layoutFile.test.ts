@@ -71,6 +71,14 @@ describe('layout recentFiles', () => {
   })
 })
 
+describe('layout version safety', () => {
+  it('marks unknown future layouts read-only and never serializes the marker', () => {
+    const parsed = parseLayout(JSON.stringify({ version: 99, activeWorkspace: 7, workspaces: { secret: {} } }))
+    expect(parsed.readOnly).toBe(true)
+    expect(JSON.parse(serializeLayout(parsed))).not.toHaveProperty('readOnly')
+  })
+})
+
 describe('pushRecent', () => {
   it('puts the path first', () => {
     expect(pushRecent(['/a', '/b'], '/c')).toEqual(['/c', '/a', '/b'])
@@ -119,8 +127,8 @@ describe('layoutFile', () => {
   it('falls back to empty on corrupt json', () => {
     expect(parseLayout('{not json')).toEqual(emptyLayout())
   })
-  it('falls back to empty on version mismatch', () => {
-    expect(parseLayout(JSON.stringify({ version: LAYOUT_VERSION + 99, workspaces: {} }))).toEqual(emptyLayout())
+  it('falls back read-only on version mismatch', () => {
+    expect(parseLayout(JSON.stringify({ version: LAYOUT_VERSION + 99, workspaces: {} }))).toEqual({ ...emptyLayout(), readOnly: true })
   })
   it('round-trips ws label, tab label, and tabOrder', () => {
     const l = emptyLayout()

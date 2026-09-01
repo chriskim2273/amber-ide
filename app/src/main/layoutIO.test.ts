@@ -76,6 +76,18 @@ describe('saveLayoutFile', () => {
     expect(await readFile(path, 'utf8')).toBe('v1-from-b')
   })
 
+  it('allows only one of two truly simultaneous writers with the same version', async () => {
+    await saveLayoutFile(path, 'v0', null)
+    const loaded = await loadLayoutFile(path)
+    const results = await Promise.all([
+      saveLayoutFile(path, 'from-a', loaded.version),
+      saveLayoutFile(path, 'from-b', loaded.version),
+    ])
+    expect(results.filter((result) => 'ok' in result)).toHaveLength(1)
+    expect(results.filter((result) => 'conflict' in result)).toHaveLength(1)
+    expect(['from-a', 'from-b']).toContain(await readFile(path, 'utf8'))
+  })
+
   it('creates the parent directory on first write with private permissions', async () => {
     const nested = join(dir, 'nested', 'ui-layout.json')
     const r = await saveLayoutFile(nested, '{}', null)

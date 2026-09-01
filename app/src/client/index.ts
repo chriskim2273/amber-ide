@@ -31,8 +31,12 @@ process.parentPort.on('message', (event) => {
     | { kind: 'control' }
     | { kind: 'pane'; session: string }
     | { kind: 'pane-close'; session: string }
-  // A pane going away carries no port — it releases the one we already hold.
+    | { kind: 'suspend-panes' }
+  // These lifecycle messages carry no port. `suspend-panes` keeps the metadata
+  // control connection alive for BrowserHost authorization while releasing
+  // every PTY subscription owned only by the hidden renderer.
   if (msg.kind === 'pane-close') { router.detach(msg.session); return }
+  if (msg.kind === 'suspend-panes') { router.detachAll(); return }
   const [port] = event.ports
   if (!port) return
   if (msg.kind === 'control') {
@@ -52,6 +56,7 @@ process.parentPort.on('message', (event) => {
         | { cmd: 'getMemoryBudget' }
         | { cmd: 'setMemoryBudget'; mb: number }
         | { cmd: 'snapshot' }
+        | { cmd: 'refreshSessions' }
       if (cmd.cmd === 'create') {
         conn.send({ type: 'control', msg: { kind: 'Create', name: cmd.name, cwd: cmd.cwd, sessionKind: cmd.sessionKind } })
       } else if (cmd.cmd === 'kill') {
@@ -84,6 +89,8 @@ process.parentPort.on('message', (event) => {
         conn.send({ type: 'control', msg: { kind: 'SetMemoryBudget', mb: cmd.mb } })
       } else if (cmd.cmd === 'snapshot') {
         conn.send({ type: 'control', msg: { kind: 'Snapshot' } })
+      } else if (cmd.cmd === 'refreshSessions') {
+        conn.send({ type: 'control', msg: { kind: 'ListSessionsDetailed' } })
       }
     })
     port.start()

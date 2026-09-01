@@ -15,6 +15,8 @@ describe('tab browser broker boundary', () => {
   it('strictly parses bounded typed requests', () => {
     expect(parseBrokerRequest({ version: 1, requestId: 'r1', amberSession: 'amber-1-2-0-pane', action: { type: 'status' } }).action).toEqual({ type: 'status' })
     expect(() => parseBrokerRequest({ version: 1, requestId: 'r1', amberSession: 'amber-1-2-0-pane', action: { type: 'cdp' } })).toThrow('INVALID_REQUEST')
+    expect(() => parseBrokerRequest({ version: 1, requestId: 'r1', amberSession: '', action: { type: 'status' } })).toThrow('INVALID_REQUEST')
+    expect(() => parseBrokerRequest({ version: 1, requestId: 'r1', amberSession: 'amber-1-2-0-pane', action: { type: 'navigate', url: 'https://example.test', pageIncarnation: 'x'.repeat(257), expectedGeneration: 0 } })).toThrow('INVALID_REQUEST')
   })
   it('authorizes only the designated shared controller in its current tab', () => {
     expect(authorizeBrowserRequest(layout, 'amber-1-2-0-pane')).toEqual({ ws: 1, tab: 2, browserId: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' })
@@ -56,6 +58,62 @@ describe('tab browser broker boundary', () => {
       })
     })
     expect(replies).toEqual([{ ok: true }, { version: 1, requestId: 'x', ok: true, result: { action: 'status' } }])
+    await server.close()
+  })
+
+  it('aborts in-flight work when its client disconnects', async () => {
+    if (process.platform === 'win32') return
+    const dir = await mkdtemp(join(tmpdir(), 'amber-browser-broker-')); cleanup.push(dir)
+    const socketPath = join(dir, 'broker.sock'); const tokenPath = join(dir, 'token')
+    let aborted = false
+    const server = new TabBrowserBrokerServer(socketPath, tokenPath, async (_request, signal) => new Promise((_resolve, reject) => {
+      signal.addEventListener('abort', () => { aborted = true; reject(new Error('ACTION_CANCELLED')) }, { once: true })
+    }))
+    await server.start()
+    const token = (await readFile(tokenPath, 'utf8')).trim()
+    const encode = (value: unknown): Buffer => { const body = Buffer.from(JSON.stringify(value)); const out = Buffer.alloc(body.length + 4); out.writeUInt32BE(body.length); body.copy(out, 4); return out }
+    await new Promise<void>((resolve, reject) => {
+      const socket = connect(socketPath)
+      socket.on('error', reject)
+      socket.on('connect', () => socket.write(encode({ token })))
+      socket.once('data', () => {
+        socket.end(encode({ version: 1, requestId: 'cancel', amberSession: 'amber-1-2-0-pane', action: { type: 'status' } }))
+        resolve()
+      })
+    })
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    expect(aborted).toBe(true)
+    await server.close()
+  })
+
+  it('bounds request execution time and rejects replayed request ids', async () => {
+    if (process.platform === 'win32') return
+    const dir = await mkdtemp(join(tmpdir(), 'amber-browser-broker-')); cleanup.push(dir)
+    const socketPath = join(dir, 'broker.sock'); const tokenPath = join(dir, 'token')
+    const server = new TabBrowserBrokerServer(socketPath, tokenPath, async (request) => {
+      if (request.requestId === 'slow') await new Promise(() => {})
+      return { action: request.action.type }
+    }, { requestTimeoutMs: 20 })
+    await server.start()
+    const token = (await readFile(tokenPath, 'utf8')).trim()
+    const encode = (value: unknown): Buffer => { const body = Buffer.from(JSON.stringify(value)); const out = Buffer.alloc(body.length + 4); out.writeUInt32BE(body.length); body.copy(out, 4); return out }
+    const replies = await new Promise<Record<string, unknown>[]>((resolve, reject) => {
+      const socket = connect(socketPath); let buffer = Buffer.alloc(0); const values: Record<string, unknown>[] = []
+      socket.on('error', reject)
+      socket.on('connect', () => socket.write(encode({ token })))
+      socket.on('data', (chunk) => {
+        buffer = Buffer.concat([buffer, chunk])
+        while (buffer.length >= 4 && buffer.length >= buffer.readUInt32BE(0) + 4) {
+          const size = buffer.readUInt32BE(0); values.push(JSON.parse(buffer.subarray(4, 4 + size).toString()) as Record<string, unknown>); buffer = buffer.subarray(4 + size)
+          if (values.length === 1) socket.write(Buffer.concat([
+            encode({ version: 1, requestId: 'slow', amberSession: 'amber-1-2-0-pane', action: { type: 'status' } }),
+            encode({ version: 1, requestId: 'slow', amberSession: 'amber-1-2-0-pane', action: { type: 'status' } }),
+          ]))
+          if (values.length === 3) { socket.end(); resolve(values) }
+        }
+      })
+    })
+    expect(replies.slice(1).map((reply) => reply['error'])).toEqual(['ACTION_TIMEOUT', 'ACTION_CANCELLED'])
     await server.close()
   })
 })

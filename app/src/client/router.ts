@@ -135,6 +135,11 @@ export class Router {
     this.conn.send({ type: 'control', msg: { kind: 'Detach', name: session } })
   }
 
+  /** Drain terminal subscriptions when the resident browser host hides its UI. */
+  detachAll(): void {
+    for (const session of [...this.ports.keys()]) this.detach(session)
+  }
+
   /** Live pane count. Daemon-state-free observable for the leak regression test. */
   attachedCount(): number {
     return this.ports.size

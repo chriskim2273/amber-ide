@@ -7,9 +7,9 @@ interface BrowserStatus {
 type BrowserReply = { ok: true; result: BrowserStatus | { closed: true } } | { ok: false; error: string }
 
 export function BrowserRail(props: {
-  id: string; width: number; designatedPi?: string; sharedWithPi?: boolean
+  id: string; width: number; collapsed: boolean; designatedPi?: string; sharedWithPi?: boolean
   controllers: { name: string; label: string }[]
-  onWidth: (width: number) => void; onClose: () => void
+  onWidth: (width: number) => void; onCollapsed: (collapsed: boolean) => void; onClose: () => void
   onPolicy: (policy: { designatedPi?: string; sharedWithPi: boolean }) => void
 }): JSX.Element {
   const host = useRef<HTMLDivElement>(null)
@@ -26,12 +26,16 @@ export function BrowserRail(props: {
   }, [props.designatedPi, props.controllers, props.onPolicy])
 
   useEffect(() => {
+    let stopped = false
+    if (props.collapsed) {
+      void command({ type: 'hide', id: props.id })
+      return () => { stopped = true }
+    }
     const element = host.current
     if (!element) return
-    let stopped = false
     const update = async (): Promise<void> => {
       const rect = element.getBoundingClientRect()
-      const bounds = { x: Math.round(rect.x), y: Math.round(rect.y + 42), width: Math.max(1, Math.round(rect.width)), height: Math.max(1, Math.round(rect.height - 42)) }
+      const bounds = { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.max(1, Math.round(rect.width)), height: Math.max(1, Math.round(rect.height)) }
       const reply = await command({ type: 'show', id: props.id, bounds })
       if (!stopped && reply.ok && 'id' in reply.result) {
         setStatus(reply.result); if (!address) setAddress(reply.result.safeRestoreUrl === 'about:blank' ? '' : reply.result.safeRestoreUrl)
@@ -42,8 +46,13 @@ export function BrowserRail(props: {
     const observer = new ResizeObserver(() => { void update() })
     observer.observe(element)
     window.addEventListener('resize', update)
-    return () => { stopped = true; observer.disconnect(); window.removeEventListener('resize', update); void command({ type: 'hide', id: props.id }) }
-  }, [props.id])
+    const poll = window.setInterval(() => {
+      void command({ type: 'status', id: props.id }).then((reply) => {
+        if (!stopped && reply.ok && 'id' in reply.result) setStatus(reply.result)
+      })
+    }, 500)
+    return () => { stopped = true; window.clearInterval(poll); observer.disconnect(); window.removeEventListener('resize', update); void command({ type: 'hide', id: props.id }) }
+  }, [props.id, props.collapsed])
 
   const navigate = async (): Promise<void> => {
     if (!status || !address.trim()) return
@@ -55,7 +64,11 @@ export function BrowserRail(props: {
     else if (!reply.ok) setError(reply.error)
   }
 
-  return <aside ref={host} className="tab-browser-rail" style={{ width: props.width }} aria-label="Tab browser">
+  if (props.collapsed) return <aside className="tab-browser-rail collapsed" aria-label="Tab browser collapsed">
+    <button className="icon-btn" aria-label="Expand tab browser" onClick={() => props.onCollapsed(false)}>‹</button>
+  </aside>
+
+  return <aside className="tab-browser-rail" style={{ width: props.width }} aria-label="Tab browser">
     <div className="tab-browser-chrome">
       <input aria-label="Browser address" value={address} placeholder="https://…" onChange={(event) => setAddress(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') void navigate() }} />
       <button className="btn" onClick={() => void navigate()}>Go</button>
@@ -71,9 +84,11 @@ export function BrowserRail(props: {
             props.onPolicy({ ...(props.designatedPi ? { designatedPi: props.designatedPi } : {}), sharedWithPi: event.target.checked })
           }} /> Pi
       </label>
+      <button className="icon-btn" aria-label="Collapse tab browser" onClick={() => props.onCollapsed(true)}>›</button>
       <button className="icon-btn" aria-label="Close tab browser" onClick={props.onClose}>×</button>
     </div>
     {error && <div className="tab-browser-error" role="alert">{error}</div>}
+    <div ref={host} className="tab-browser-page-slot" />
     <div className="tab-browser-grip" role="separator" aria-orientation="vertical" aria-label="Resize browser rail"
       onPointerDown={(event) => {
         const startX = event.clientX; const startWidth = props.width
