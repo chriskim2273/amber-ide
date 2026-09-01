@@ -1539,7 +1539,14 @@ async function main(): Promise<void> {
     const result = browserChanged && tabBrowserStateStore
       ? await commitBrowserLayoutMutation(layoutPath(), tabBrowserStateStore, text, version)
       : await saveLayoutFile(layoutPath(), text, version)
-    if ('ok' in result && sender) sender.activeBrowserId = deriveActiveBrowserId(parseLayout(text))
+    if ('ok' in result && sender) sender.activeBrowserId = deriveActiveBrowserId(nextLayout)
+    if ('ok' in result && browserChanged && tabBrowser && currentLayout) {
+      const associated = (layout: typeof nextLayout): Set<string> => new Set(Object.values(layout.workspaces).flatMap((workspace) => Object.values(workspace.tabs).flatMap((tab) => tab.browser ? [tab.browser.id] : [])))
+      const nextIds = associated(nextLayout)
+      for (const id of associated(currentLayout)) {
+        if (!nextIds.has(id)) await tabBrowser.command({ type: 'close', id }).catch(() => {})
+      }
+    }
     return result
   })
 

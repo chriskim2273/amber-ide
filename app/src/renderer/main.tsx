@@ -2536,6 +2536,7 @@ function App(): JSX.Element {
       {loadDoc && (() => {
         const cur = workspaces.find((w) => w.ws === currentWs)
         const paneCount = cur?.tabs.reduce((m, t) => m + t.panes.length, 0) ?? 0
+        const browserIds = Object.values(layout.workspaces[String(currentWs)]?.tabs ?? {}).flatMap((tab) => tab.browser ? [tab.browser.id] : [])
         const wsCount = loadDoc.workspaces.length
         return (
           <div className="help-overlay" onClick={() => setLoadDoc(null)}>
@@ -2546,6 +2547,7 @@ function App(): JSX.Element {
                 <button className="icon-btn" aria-label="close" title="close" onClick={() => setLoadDoc(null)}><Icon name="close" /></button>
               </div>
               <div className="dialog-body">
+                {browserIds.length > 0 && <p className="dialog-text" role="note">Replacing closes volatile state in: {browserIds.join(', ')}. Durable restore URLs remain recoverable until the transaction commits.</p>}
                 <div className="dialog-actions column">
                   <button className="btn btn-accent" onClick={() => applyLoad('new')}>
                     Load as new workspace{wsCount > 1 ? 's' : ''}
