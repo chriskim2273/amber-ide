@@ -67,6 +67,7 @@ import { webCtlArgv, parseWebStatus, redactUrl, type WebStatus } from './webServ
 import {
   routerCtlArgv,
   parseRouterStatus,
+  slotFromWire,
   type RouterStatus,
 } from './routerService'
 import { inspectLinuxInputMethod, repairLinuxInputMethod, resolveLinuxInputEnvironment } from './inputMethod'
@@ -1308,7 +1309,15 @@ async function main(): Promise<void> {
     if (code !== 0) return { ok: false, error: stderr.trim() || `exit ${code}`, slots: [] }
     try {
       const parsed = JSON.parse(stdout) as { slots?: unknown }
-      return { ok: true, slots: Array.isArray(parsed.slots) ? parsed.slots : [] }
+      // Map here, not in the renderer: the wire is snake_case and the UI shape
+      // is camelCase, and passing the raw object through left `hasKey`
+      // undefined so every stored key rendered as "no key yet".
+      return {
+        ok: true,
+        slots: Array.isArray(parsed.slots)
+          ? (parsed.slots as Record<string, unknown>[]).map(slotFromWire)
+          : [],
+      }
     } catch {
       return { ok: false, error: 'could not parse the router slot list', slots: [] }
     }

@@ -15,7 +15,7 @@
 
 import { useEffect, useState } from 'react'
 import type { RouterSlot, RouterStatus } from '../shared/routerStatus'
-import { moveSlot } from '../main/routerService'
+import { moveSlot, slotToWire } from '../main/routerService'
 
 interface Props {
   status: RouterStatus | null
@@ -126,7 +126,9 @@ export function RouterPanel({ status, onClose, onRefresh }: Props): JSX.Element 
 
   const save = async (next: RouterSlot[], typed: Record<number, string>): Promise<void> => {
     setBusy(true)
-    const payload = next.map((s, i) => ({ ...s, api_key: typed[i] ?? '' }))
+    // Back to the wire shape: spreading the UI object would send `baseUrl`,
+    // which the router's deserializer rejects for want of `base_url`.
+    const payload = next.map((s, i) => slotToWire(s, typed[i] ?? ''))
     const res = await window.amber.routerSaveSlots(payload as unknown as RouterSlot[])
     setBusy(false)
     if (!res.ok) {

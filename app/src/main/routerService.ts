@@ -20,6 +20,32 @@ function num(v: unknown): number | null {
   return typeof v === 'number' ? v : null
 }
 
+/**
+ * Wire (snake_case, as the router serves it) -> UI shape.
+ *
+ * Exported because the slot-list IPC needs the SAME mapping the status parser
+ * uses: returning the raw wire object left `hasKey` undefined, so every stored
+ * key rendered as "no key yet".
+ */
+export function slotFromWire(raw: Record<string, unknown>): RouterSlot {
+  return slot(raw)
+}
+
+/**
+ * UI shape -> wire. `apiKey` is passed separately: an empty string means
+ * "unchanged", and the UI never holds the stored value to send back.
+ */
+export function slotToWire(s: RouterSlot, apiKey: string): Record<string, unknown> {
+  return {
+    id: s.id,
+    name: s.name,
+    base_url: s.baseUrl,
+    model: s.model,
+    enabled: s.enabled,
+    api_key: apiKey,
+  }
+}
+
 function slot(raw: Record<string, unknown>): RouterSlot {
   return {
     id: str(raw['id']),

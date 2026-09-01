@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { moveSlot, parseRouterStatus, routerCtlArgv, routerDot } from './routerService'
+import { moveSlot, parseRouterStatus, routerCtlArgv, routerDot, slotFromWire, slotToWire } from './routerService'
 import type { RouterSlot, RouterStatus } from '../shared/routerStatus'
 
 const base: RouterStatus = {
@@ -150,5 +150,37 @@ describe('moveSlot', () => {
     expect(moveSlot(list, 0, 5)).toBe(list)
     expect(moveSlot(list, -1, 0)).toBe(list)
     expect(moveSlot(list, 0, 0)).toBe(list)
+  })
+})
+
+describe('wire mapping', () => {
+  it('round-trips a slot through both directions', () => {
+    const wire = {
+      id: 'abc',
+      name: 'alpha',
+      base_url: 'https://a.example/v1',
+      model: 'm',
+      enabled: true,
+      has_key: true,
+      key_hint: '••••1111',
+    }
+    const ui = slotFromWire(wire)
+    expect(ui.hasKey).toBe(true)
+    expect(ui.baseUrl).toBe('https://a.example/v1')
+    expect(ui.keyHint).toBe('••••1111')
+
+    const back = slotToWire(ui, '')
+    expect(back['base_url']).toBe('https://a.example/v1')
+    expect(back['api_key']).toBe('')
+    // The router only knows snake_case; a camelCase key would be rejected.
+    expect(back['baseUrl']).toBeUndefined()
+    expect(back['hasKey']).toBeUndefined()
+  })
+
+  it('sends a typed key and nothing else about the key', () => {
+    const ui = slotFromWire({ id: 'a', name: 'a', base_url: 'https://x/v1', has_key: true })
+    const back = slotToWire(ui, 'sk-typed')
+    expect(back['api_key']).toBe('sk-typed')
+    expect(JSON.stringify(back)).not.toContain('key_hint')
   })
 })
