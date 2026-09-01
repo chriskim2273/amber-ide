@@ -10,6 +10,25 @@ export function shortCwd(cwd: string, home: string): string {
   return home && cwd.startsWith(home) ? '~' + cwd.slice(home.length) : cwd
 }
 
+// Leading brand token Pi puts on its OSC title (`π - ` / `Pi - ` / `pi - `).
+const PI_BRAND = /^(?:π|Pi|pi)\s*-\s+/
+
+// A Pi pane's OSC title is "<app> - <sessionName> - <cwdBasename>" (or
+// "<app> - <cwdBasename>" when the session is unnamed). Both the brand and the
+// trailing cwd token are redundant with the header's kind suffix and the cwd the
+// daemon already shows, so the header reads a bare session name. Conservative:
+// only the pane's own cwd basename is dropped from the tail, so a legitimately
+// dash-separated name survives untouched. Non-Pi panes are never rewritten.
+export function cleanOscTitle(osc: string, kind: string, cwd: string): string {
+  if (kind !== 'pi') return osc
+  let t = osc.trim().replace(PI_BRAND, '')
+  const base = cwd.split('/').filter(Boolean).pop() ?? ''
+  if (base && t.endsWith(` - ${base}`)) {
+    t = t.slice(0, -(base.length + 3)) // drop ' - <base>'
+  }
+  return t.trim()
+}
+
 export interface DerivedTab {
   tree: Node | null
   paneMeta: Record<string, PaneMeta>
@@ -33,11 +52,13 @@ export function deriveTab(
   panes.forEach((p) => {
     if (p.deadCode !== null) deadCodes[p.name] = p.deadCode
     // Prefer a live OSC title over cwd; blank OSC 2 (some prompts) falls back.
+    // Pi panes are cleaned of their brand/cwd tokens so the header reads a bare
+    // session name (cleanOscTitle no-ops for every other kind).
     const osc = titles[p.name]
     // An editor pane has no OSC stream: it reports its file name through the same
     // title channel, and an unsaved buffer has neither that nor a cwd.
     const lead = osc && osc.trim().length > 0
-      ? osc
+      ? cleanOscTitle(osc, p.kind, p.cwd)
       : (p.kind === 'editor' ? (p.cwd ? shortCwd(p.cwd, home) : 'untitled') : shortCwd(p.cwd, home))
     // An agent pane that fell back to a shell is labelled as such, not by its
     // kind (`shell (claude exited)` / `shell (grok exited)`).

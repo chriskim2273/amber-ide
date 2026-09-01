@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { deriveTab, shortCwd } from './tabView'
+import { cleanOscTitle, deriveTab, shortCwd } from './tabView'
 import { leaves } from './layout'
 import type { PaneModel } from './store'
 
@@ -17,6 +17,48 @@ describe('shortCwd', () => {
 
 describe('deriveTab', () => {
   const home = '/home/u'
+
+  it('strips the Pi app-brand prefix and the duplicate cwd token from a Pi OSC title', () => {
+    const { paneMeta } = deriveTab(
+      [pane({ name: 'a', kind: 'pi', cwd: '/home/u/proj' }), pane({ name: 'b', kind: 'pi', cwd: '/home/u/proj' })],
+      null, {}, { a: 'π - refactor-auth - proj', b: 'Pi - refactor-auth - proj' }, home,
+    )
+    expect(paneMeta.a!.title).toBe('refactor-auth · pi')
+    expect(paneMeta.b!.title).toBe('refactor-auth · pi')
+  })
+
+  it('renders a name-less Pi title (brand + cwd) as just the cwd basename', () => {
+    const { paneMeta } = deriveTab(
+      [pane({ name: 'a', kind: 'pi', cwd: '/home/u/proj' })],
+      null, {}, { a: 'π - proj' }, home,
+    )
+    expect(paneMeta.a!.title).toBe('proj · pi')
+  })
+
+  it('does not rewrite a non-Pi shell pane OSC title', () => {
+    // Only Pi panes are rewritten; a shell keeps its own title verbatim.
+    const { paneMeta } = deriveTab(
+      [pane({ name: 'a', kind: 'shell', cwd: '/home/u/proj' })],
+      null, {}, { a: 'vim - README' }, home,
+    )
+    expect(paneMeta.a!.title).toBe('vim - README · shell')
+  })
+
+  it('does not strip a trailing dash token that is not the cwd basename (Pi)', () => {
+    const { paneMeta } = deriveTab(
+      [pane({ name: 'a', kind: 'pi', cwd: '/home/u/proj' })],
+      null, {}, { a: 'π - my-session - README' }, home,
+    )
+    expect(paneMeta.a!.title).toBe('my-session - README · pi')
+  })
+
+  it('empty/blank agent title falls back to shortCwd and keeps the brand intact nowhere', () => {
+    const { paneMeta } = deriveTab(
+      [pane({ name: 'a', kind: 'pi', cwd: '/home/u/proj' })],
+      null, {}, { a: '   ' }, home,
+    )
+    expect(paneMeta.a!.title).toBe('~/proj · pi')
+  })
 
   it('titles a pane from its OSC title when present, else the short cwd', () => {
     const { paneMeta } = deriveTab(
