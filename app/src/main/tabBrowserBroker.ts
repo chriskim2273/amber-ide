@@ -9,7 +9,7 @@ export type BrokerAction =
   | { type: 'status' }
   | { type: 'navigate'; url: string; pageIncarnation: string; expectedGeneration: number }
   | { type: 'stop' }
-export interface BrokerRequest { version: 1; requestId: string; amberSession: string; action: BrokerAction }
+export interface BrokerRequest { version: 1; requestId: string; clientInstanceId: string; sequence: number; amberSession: string; action: BrokerAction }
 export interface ControllerSession { kind: string; alive: boolean; runState?: string }
 export function isEligiblePiController(session: ControllerSession | undefined): boolean {
   return !!session && session.kind === 'pi' && session.alive && session.runState !== 'shell-fallback'
@@ -22,18 +22,20 @@ function object(value: unknown): Record<string, unknown> | null { return typeof 
 
 export function parseBrokerRequest(value: unknown): BrokerRequest {
   const request = object(value); const action = object(request?.['action'])
-  if (!request || !action || !exact(request, ['version', 'requestId', 'amberSession', 'action']) || request['version'] !== 1
+  if (!request || !action || !exact(request, ['version', 'requestId', 'clientInstanceId', 'sequence', 'amberSession', 'action']) || request['version'] !== 1
       || typeof request['requestId'] !== 'string' || request['requestId'].length < 1 || request['requestId'].length > 128
+      || typeof request['clientInstanceId'] !== 'string' || request['clientInstanceId'].length < 8 || request['clientInstanceId'].length > 128
+      || typeof request['sequence'] !== 'number' || !Number.isSafeInteger(request['sequence']) || request['sequence'] < 1
       || typeof request['amberSession'] !== 'string' || request['amberSession'].length < 1 || request['amberSession'].length > 256) throw new Error('INVALID_REQUEST')
   if (action['type'] === 'open' || action['type'] === 'status' || action['type'] === 'stop') {
     if (!exact(action, ['type'])) throw new Error('INVALID_REQUEST')
-    return { version: 1, requestId: request['requestId'], amberSession: request['amberSession'], action: { type: action['type'] } }
+    return { version: 1, requestId: request['requestId'], clientInstanceId: request['clientInstanceId'], sequence: request['sequence'], amberSession: request['amberSession'], action: { type: action['type'] } }
   }
   if (action['type'] === 'navigate' && exact(action, ['type', 'url', 'pageIncarnation', 'expectedGeneration'])
       && typeof action['url'] === 'string' && action['url'].length <= 8192 && typeof action['pageIncarnation'] === 'string'
       && action['pageIncarnation'].length >= 1 && action['pageIncarnation'].length <= 256
       && typeof action['expectedGeneration'] === 'number' && Number.isSafeInteger(action['expectedGeneration']) && action['expectedGeneration'] >= 0) {
-    return { version: 1, requestId: request['requestId'], amberSession: request['amberSession'], action: { type: 'navigate', url: action['url'], pageIncarnation: action['pageIncarnation'], expectedGeneration: action['expectedGeneration'] } }
+    return { version: 1, requestId: request['requestId'], clientInstanceId: request['clientInstanceId'], sequence: request['sequence'], amberSession: request['amberSession'], action: { type: 'navigate', url: action['url'], pageIncarnation: action['pageIncarnation'], expectedGeneration: action['expectedGeneration'] } }
   }
   throw new Error('INVALID_REQUEST')
 }
@@ -86,6 +88,9 @@ export class TabBrowserBrokerServer {
   private connections = 0
   private inFlight = 0
   private readonly sockets = new Set<Socket>()
+  private readonly highWater = new Map<string, number>()
+  private readonly results = new Map<string, { digest: string; promise: Promise<unknown> }>()
+  private readonly queues = new Map<string, Promise<void>>()
   constructor(
     private readonly socketPath: string,
     private readonly tokenPath: string,
@@ -106,7 +111,6 @@ export class TabBrowserBrokerServer {
   }
   private accept(socket: Socket, token: string): void {
     let authenticated = false; let buffer = Buffer.alloc(0); let chain = Promise.resolve(); let queued = 0
-    const seen = new Set<string>()
     const active = new Set<AbortController>()
     const safeWrite = (value: unknown): void => { if (!socket.destroyed && socket.writable) socket.write(frame(value)) }
     socket.on('error', () => {})
@@ -132,28 +136,44 @@ export class TabBrowserBrokerServer {
               authenticated = true; safeWrite({ ok: true }); return
             }
             const request = parseBrokerRequest(value); requestId = request.requestId
-            if (seen.has(request.requestId)) throw new Error('ACTION_CANCELLED')
-            seen.add(request.requestId)
-            if (seen.size > 1024) seen.delete(seen.values().next().value!)
-            if (this.inFlight >= 32) throw new Error('REQUEST_LIMIT')
-            this.inFlight += 1
-            const controller = new AbortController(); active.add(controller)
-            try {
-              const timeoutMs = this.options.requestTimeoutMs ?? 30_000
-              let timer: NodeJS.Timeout | undefined
-              const timeout = new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error('ACTION_TIMEOUT')), timeoutMs) })
-              let result: unknown
-              try { result = await Promise.race([this.handle(request, controller.signal), timeout]) }
-              finally { if (timer) clearTimeout(timer) }
-              safeWrite({ version: 1, requestId: request.requestId, ok: true, result })
-            } catch (error) {
-              if (error instanceof Error && error.message === 'ACTION_TIMEOUT') controller.abort()
-              throw error
-            } finally { active.delete(controller); this.inFlight -= 1 }
+            const cacheKey = `${request.clientInstanceId}:${request.requestId}`
+            const digest = JSON.stringify({ sequence: request.sequence, amberSession: request.amberSession, action: request.action })
+            const cached = this.results.get(cacheKey)
+            let result: unknown
+            if (cached) {
+              if (cached.digest !== digest) throw new Error('INVALID_REQUEST')
+              result = await cached.promise
+            } else {
+              const previousSequence = this.highWater.get(request.clientInstanceId) ?? 0
+              if (request.sequence <= previousSequence) throw new Error('ACTION_CANCELLED')
+              this.highWater.set(request.clientInstanceId, request.sequence)
+              if (this.highWater.size > 1024) this.highWater.delete(this.highWater.keys().next().value!)
+              const controller = new AbortController(); active.add(controller)
+              const execute = async (): Promise<unknown> => {
+                if (controller.signal.aborted) throw new Error('ACTION_CANCELLED')
+                if (this.inFlight >= 32) throw new Error('REQUEST_LIMIT')
+                this.inFlight += 1
+                try {
+                  const timeoutMs = this.options.requestTimeoutMs ?? 30_000
+                  let timer: NodeJS.Timeout | undefined
+                  const timeout = new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error('ACTION_TIMEOUT')), timeoutMs) })
+                  try { return await Promise.race([this.handle(request, controller.signal), timeout]) }
+                  catch (error) { if (error instanceof Error && error.message === 'ACTION_TIMEOUT') controller.abort(); throw error }
+                  finally { if (timer) clearTimeout(timer) }
+                } finally { active.delete(controller); this.inFlight -= 1 }
+              }
+              const prior = this.queues.get(request.amberSession) ?? Promise.resolve()
+              const promise = prior.catch(() => {}).then(execute)
+              this.queues.set(request.amberSession, promise.then(() => {}, () => {}))
+              this.results.set(cacheKey, { digest, promise })
+              if (this.results.size > 256) this.results.delete(this.results.keys().next().value!)
+              result = await promise
+            }
+            safeWrite({ version: 1, requestId: request.requestId, ok: true, result })
           } catch (error) {
             const message = error instanceof Error ? error.message : 'INTERNAL_ERROR'
             safeWrite({ ...(requestId ? { version: 1, requestId } : {}), ok: false, error: message })
-            if (!authenticated || message === 'INVALID_REQUEST') socket.destroySoon()
+            if (!authenticated || (message === 'INVALID_REQUEST' && !requestId)) socket.destroySoon()
           } finally { queued -= 1 }
         })
       }

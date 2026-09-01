@@ -42,7 +42,7 @@
     {
       "id": "P1-broker-replay-and-mutation-queues",
       "severity": "important",
-      "status": "partial",
+      "status": "completed",
       "work": "Add clientInstanceId/sequence high-water replay semantics, payload-digest duplicate handling, per-browser FIFO mutation queues, observation ordering, cancellation ownership, and bounded result cache."
     },
     {

@@ -44,6 +44,9 @@ function encode(value: unknown) {
   return out
 }
 
+const browserClientInstanceId = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`
+let browserSequence = 0
+
 async function browserRequest(action: unknown, signal?: AbortSignal) {
   const amberSession = process.env.AMBER_SESSION
   if (!amberSession) throw new Error("Amber browser tools are unavailable outside an Amber pane")
@@ -73,7 +76,7 @@ async function browserRequest(action: unknown, signal?: AbortSignal) {
         if (!authenticated) {
           if (!reply?.ok) return finish(new Error("Amber browser host authentication failed"))
           authenticated = true
-          socket.write(encode({ version: 1, requestId: `${Date.now()}-${Math.random()}`, amberSession, action }))
+          socket.write(encode({ version: 1, requestId: `${Date.now()}-${Math.random()}`, clientInstanceId: browserClientInstanceId, sequence: ++browserSequence, amberSession, action }))
           continue
         }
         if (!reply?.ok) return finish(new Error(String(reply?.error || "Amber browser request failed")))
@@ -185,17 +188,16 @@ pub fn pi_agent_dir() -> Option<PathBuf> {
         .ok()
         .filter(|dir| !dir.is_empty())
         .map(PathBuf::from)
-        .or_else(|| {
-            crate::platform::user_home().map(|home| home.join(".pi").join("agent"))
-        })
+        .or_else(|| crate::platform::user_home().map(|home| home.join(".pi").join("agent")))
 }
 
 /// Install or refresh Amber's global Pi extension and return its verified path.
 /// This fallible form is for explicit repair commands, which must never claim
 /// success if the exact-resume hook was not actually installed.
 pub fn install_global_pi_extension() -> anyhow::Result<PathBuf> {
-    let agent_dir = pi_agent_dir()
-        .ok_or_else(|| anyhow::anyhow!("Pi extension install requires HOME or PI_CODING_AGENT_DIR"))?;
+    let agent_dir = pi_agent_dir().ok_or_else(|| {
+        anyhow::anyhow!("Pi extension install requires HOME or PI_CODING_AGENT_DIR")
+    })?;
     install_extension_in(&agent_dir.join("extensions"))
 }
 
@@ -328,6 +330,8 @@ mod tests {
         assert!(first.contains("browser_status"));
         assert!(first.contains("browser_navigate"));
         assert!(first.contains("browser-host-token"));
+        assert!(first.contains("clientInstanceId: browserClientInstanceId"));
+        assert!(first.contains("sequence: ++browserSequence"));
         assert!(!first.contains("Runtime.evaluate"));
 
         install_extension_in(&extensions).unwrap();
@@ -366,7 +370,10 @@ mod tests {
         fs::write(&path, "// user-owned extension\n").unwrap();
         let error = install_extension_in(&extensions).unwrap_err();
         assert!(error.to_string().contains("modified/unowned"));
-        assert_eq!(fs::read_to_string(path).unwrap(), "// user-owned extension\n");
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            "// user-owned extension\n"
+        );
     }
 
     #[test]

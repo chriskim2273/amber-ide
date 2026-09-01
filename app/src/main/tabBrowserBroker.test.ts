@@ -13,10 +13,10 @@ const layout: LayoutFile = { version: 2, activeWorkspace: 1, workspaces: { '1': 
 
 describe('tab browser broker boundary', () => {
   it('strictly parses bounded typed requests', () => {
-    expect(parseBrokerRequest({ version: 1, requestId: 'r1', amberSession: 'amber-1-2-0-pane', action: { type: 'status' } }).action).toEqual({ type: 'status' })
-    expect(() => parseBrokerRequest({ version: 1, requestId: 'r1', amberSession: 'amber-1-2-0-pane', action: { type: 'cdp' } })).toThrow('INVALID_REQUEST')
-    expect(() => parseBrokerRequest({ version: 1, requestId: 'r1', amberSession: '', action: { type: 'status' } })).toThrow('INVALID_REQUEST')
-    expect(() => parseBrokerRequest({ version: 1, requestId: 'r1', amberSession: 'amber-1-2-0-pane', action: { type: 'navigate', url: 'https://example.test', pageIncarnation: 'x'.repeat(257), expectedGeneration: 0 } })).toThrow('INVALID_REQUEST')
+    expect(parseBrokerRequest({ version: 1, clientInstanceId: 'client-01', sequence: 1, requestId: 'r1', amberSession: 'amber-1-2-0-pane', action: { type: 'status' } }).action).toEqual({ type: 'status' })
+    expect(() => parseBrokerRequest({ version: 1, clientInstanceId: 'client-01', sequence: 1, requestId: 'r1', amberSession: 'amber-1-2-0-pane', action: { type: 'cdp' } })).toThrow('INVALID_REQUEST')
+    expect(() => parseBrokerRequest({ version: 1, clientInstanceId: 'client-01', sequence: 1, requestId: 'r1', amberSession: '', action: { type: 'status' } })).toThrow('INVALID_REQUEST')
+    expect(() => parseBrokerRequest({ version: 1, clientInstanceId: 'client-01', sequence: 1, requestId: 'r1', amberSession: 'amber-1-2-0-pane', action: { type: 'navigate', url: 'https://example.test', pageIncarnation: 'x'.repeat(257), expectedGeneration: 0 } })).toThrow('INVALID_REQUEST')
   })
   it('rejects dead and shell-fallback Pi controllers', () => {
     expect(isEligiblePiController({ kind: 'pi', alive: true, runState: 'claude' })).toBe(true)
@@ -59,7 +59,7 @@ describe('tab browser broker boundary', () => {
         buffer = Buffer.concat([buffer, chunk])
         while (buffer.length >= 4 && buffer.length >= buffer.readUInt32BE(0) + 4) {
           const size = buffer.readUInt32BE(0); values.push(JSON.parse(buffer.subarray(4, 4 + size).toString())); buffer = buffer.subarray(4 + size)
-          if (values.length === 1) socket.write(encode({ version: 1, requestId: 'x', amberSession: 'amber-1-2-0-pane', action: { type: 'status' } }))
+          if (values.length === 1) socket.write(encode({ version: 1, clientInstanceId: 'client-01', sequence: 1, requestId: 'x', amberSession: 'amber-1-2-0-pane', action: { type: 'status' } }))
           if (values.length === 2) { socket.end(); resolve(values) }
         }
       })
@@ -84,12 +84,77 @@ describe('tab browser broker boundary', () => {
       socket.on('error', reject)
       socket.on('connect', () => socket.write(encode({ token })))
       socket.once('data', () => {
-        socket.end(encode({ version: 1, requestId: 'cancel', amberSession: 'amber-1-2-0-pane', action: { type: 'status' } }))
+        socket.end(encode({ version: 1, clientInstanceId: 'client-01', sequence: 1, requestId: 'cancel', amberSession: 'amber-1-2-0-pane', action: { type: 'status' } }))
         resolve()
       })
     })
     await new Promise((resolve) => setTimeout(resolve, 20))
     expect(aborted).toBe(true)
+    await server.close()
+  })
+
+  it('replays identical results but rejects changed payloads and evicted sequences', async () => {
+    if (process.platform === 'win32') return
+    const dir = await mkdtemp(join(tmpdir(), 'amber-browser-broker-')); cleanup.push(dir)
+    const socketPath = join(dir, 'broker.sock'); const tokenPath = join(dir, 'token'); let calls = 0
+    const server = new TabBrowserBrokerServer(socketPath, tokenPath, async (request) => ({ call: ++calls, action: request.action.type }))
+    await server.start(); const token = (await readFile(tokenPath, 'utf8')).trim()
+    const encode = (value: unknown): Buffer => { const body = Buffer.from(JSON.stringify(value)); const out = Buffer.alloc(body.length + 4); out.writeUInt32BE(body.length); body.copy(out, 4); return out }
+    const base = { version: 1, clientInstanceId: 'client-replay', amberSession: 'amber-1-2-0-pane' }
+    const requests = [
+      { ...base, sequence: 2, requestId: 'same', action: { type: 'status' } },
+      { ...base, sequence: 2, requestId: 'same', action: { type: 'status' } },
+      { ...base, sequence: 2, requestId: 'same', action: { type: 'stop' } },
+      { ...base, sequence: 1, requestId: 'old', action: { type: 'status' } },
+    ]
+    const replies = await new Promise<Record<string, unknown>[]>((resolve, reject) => {
+      const socket = connect(socketPath); let buffer = Buffer.alloc(0); const values: Record<string, unknown>[] = []
+      socket.on('error', reject); socket.on('connect', () => socket.write(encode({ token })))
+      socket.on('data', (chunk) => {
+        buffer = Buffer.concat([buffer, chunk])
+        while (buffer.length >= 4 && buffer.length >= buffer.readUInt32BE(0) + 4) {
+          const size = buffer.readUInt32BE(0); values.push(JSON.parse(buffer.subarray(4, 4 + size).toString()) as Record<string, unknown>); buffer = buffer.subarray(4 + size)
+          if (values.length === 1) socket.write(Buffer.concat(requests.map(encode)))
+          if (values.length === 5) { socket.end(); resolve(values.slice(1)) }
+        }
+      })
+    })
+    expect((replies[0]!['result'] as { call: number }).call).toBe(1)
+    expect((replies[1]!['result'] as { call: number }).call).toBe(1)
+    expect(replies[2]!['error']).toBe('INVALID_REQUEST')
+    expect(replies[3]!['error']).toBe('ACTION_CANCELLED')
+    expect(calls).toBe(1)
+    await server.close()
+  })
+
+  it('serializes mutations and following observations for one browser key', async () => {
+    if (process.platform === 'win32') return
+    const dir = await mkdtemp(join(tmpdir(), 'amber-browser-broker-')); cleanup.push(dir)
+    const socketPath = join(dir, 'broker.sock'); const tokenPath = join(dir, 'token'); const order: string[] = []
+    const server = new TabBrowserBrokerServer(socketPath, tokenPath, async (request) => {
+      order.push(`start:${request.requestId}`)
+      if (request.requestId === 'mutation') await new Promise((resolve) => setTimeout(resolve, 20))
+      order.push(`end:${request.requestId}`); return {}
+    })
+    await server.start(); const token = (await readFile(tokenPath, 'utf8')).trim()
+    const encode = (value: unknown): Buffer => { const body = Buffer.from(JSON.stringify(value)); const out = Buffer.alloc(body.length + 4); out.writeUInt32BE(body.length); body.copy(out, 4); return out }
+    const replies = await new Promise<unknown[]>((resolve, reject) => {
+      const socket = connect(socketPath); let buffer = Buffer.alloc(0); const values: unknown[] = []
+      socket.on('error', reject); socket.on('connect', () => socket.write(encode({ token })))
+      socket.on('data', (chunk) => {
+        buffer = Buffer.concat([buffer, chunk])
+        while (buffer.length >= 4 && buffer.length >= buffer.readUInt32BE(0) + 4) {
+          const size = buffer.readUInt32BE(0); values.push(JSON.parse(buffer.subarray(4, 4 + size).toString())); buffer = buffer.subarray(4 + size)
+          if (values.length === 1) socket.write(Buffer.concat([
+            encode({ version: 1, clientInstanceId: 'client-fifo', sequence: 1, requestId: 'mutation', amberSession: 'amber-1-2-0-pane', action: { type: 'stop' } }),
+            encode({ version: 1, clientInstanceId: 'client-fifo', sequence: 2, requestId: 'observation', amberSession: 'amber-1-2-0-pane', action: { type: 'status' } }),
+          ]))
+          if (values.length === 3) { socket.end(); resolve(values) }
+        }
+      })
+    })
+    expect(replies).toHaveLength(3)
+    expect(order).toEqual(['start:mutation', 'end:mutation', 'start:observation', 'end:observation'])
     await server.close()
   })
 
@@ -113,14 +178,14 @@ describe('tab browser broker boundary', () => {
         while (buffer.length >= 4 && buffer.length >= buffer.readUInt32BE(0) + 4) {
           const size = buffer.readUInt32BE(0); values.push(JSON.parse(buffer.subarray(4, 4 + size).toString()) as Record<string, unknown>); buffer = buffer.subarray(4 + size)
           if (values.length === 1) socket.write(Buffer.concat([
-            encode({ version: 1, requestId: 'slow', amberSession: 'amber-1-2-0-pane', action: { type: 'status' } }),
-            encode({ version: 1, requestId: 'slow', amberSession: 'amber-1-2-0-pane', action: { type: 'status' } }),
+            encode({ version: 1, clientInstanceId: 'client-01', sequence: 1, requestId: 'slow', amberSession: 'amber-1-2-0-pane', action: { type: 'status' } }),
+            encode({ version: 1, clientInstanceId: 'client-01', sequence: 1, requestId: 'slow', amberSession: 'amber-1-2-0-pane', action: { type: 'status' } }),
           ]))
           if (values.length === 3) { socket.end(); resolve(values) }
         }
       })
     })
-    expect(replies.slice(1).map((reply) => reply['error'])).toEqual(['ACTION_TIMEOUT', 'ACTION_CANCELLED'])
+    expect(replies.slice(1).map((reply) => reply['error'])).toEqual(['ACTION_TIMEOUT', 'ACTION_TIMEOUT'])
     await server.close()
   })
 })
