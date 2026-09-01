@@ -15,7 +15,10 @@
     "broker disconnect and timeout cancellation reaches navigation stop",
     "fresh full daemon session list polling before Pi authorization",
     "hidden resident window drains all PTY pane subscriptions while keeping metadata control",
-    "functional rail collapse and exact native page-slot geometry"
+    "functional rail collapse and exact native page-slot geometry",
+    "workspace browser URLs are scheme-validated and secret-redacted on parse/save/load planning",
+    "Pi controller authorization rejects dead and shell-fallback sessions",
+    "WebContents pages use the persisted profile partition descriptor"
   ],
   "remaining": [
     {
