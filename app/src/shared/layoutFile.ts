@@ -1,10 +1,12 @@
 import type { Node } from '../renderer/layout'
 
 export const LAYOUT_VERSION = 1
+export const TAB_BROWSER_LAYOUT_VERSION = 2
+export interface BrowserRailLayout { id: string; width: number; collapsed: boolean; designatedPi?: string; sharedWithPi?: boolean }
 // `label` is app-owned display metadata ONLY (never touches daemon session
 // names). All added fields are OPTIONAL — old sidecars parse fine (missing →
 // undefined) and old readers ignore unknown-but-additive keys.
-export interface TabLayout { tree: Node | null; label?: string }
+export interface TabLayout { tree: Node | null; label?: string; browser?: BrowserRailLayout }
 export interface WsLayout { activeTab: number; tabs: Record<string, TabLayout>; label?: string; tabOrder?: number[] }
 // `fontSize` is an app-owned top-level display preference (optional — old
 // sidecars omit it → undefined → the renderer's default).
@@ -41,6 +43,7 @@ export interface LayoutFile {
   browsers?: Record<string, BrowserEntry>
   editors?: Record<string, EditorEntry>
   recentFiles?: string[] // most-recent-first, deduped, capped at RECENT_FILES_MAX
+  browserRevision?: number
 }
 
 // Shape-guard the frozen map (Task 4 lesson): reject a non-object/array top
@@ -113,6 +116,31 @@ export function pushRecent(list: string[] | undefined, path: string): string[] {
 // render, a non-string `label` renders garbage. Drop `tabOrder` unless it's an
 // array (filtered to finite numbers); drop `label` unless it's a string. Other
 // fields (activeTab, tabs) pass through — malformed non-objects are skipped.
+function parseBrowserRail(v: unknown): BrowserRailLayout | undefined {
+  if (!isPlainObj(v) || typeof v['id'] !== 'string' || !/^browser-[0-9a-f]{32}$/.test(v['id'])) return undefined
+  if (typeof v['width'] !== 'number' || !Number.isFinite(v['width']) || typeof v['collapsed'] !== 'boolean') return undefined
+  return {
+    id: v['id'], width: Math.min(1200, Math.max(240, v['width'])), collapsed: v['collapsed'],
+    ...(typeof v['designatedPi'] === 'string' ? { designatedPi: v['designatedPi'] } : {}),
+    ...(typeof v['sharedWithPi'] === 'boolean' ? { sharedWithPi: v['sharedWithPi'] } : {}),
+  }
+}
+
+function parseTabs(v: unknown): Record<string, TabLayout> {
+  if (!isPlainObj(v)) return {}
+  const out: Record<string, TabLayout> = {}
+  for (const [key, value] of Object.entries(v)) {
+    if (!isPlainObj(value)) continue
+    const browser = parseBrowserRail(value['browser'])
+    out[key] = {
+      tree: (value['tree'] ?? null) as Node | null,
+      ...(typeof value['label'] === 'string' ? { label: value['label'] } : {}),
+      ...(browser ? { browser } : {}),
+    }
+  }
+  return out
+}
+
 function parseWorkspaces(v: unknown): Record<string, WsLayout> {
   if (typeof v !== 'object' || v === null || Array.isArray(v)) return {}
   const out: Record<string, WsLayout> = {}
@@ -121,7 +149,7 @@ function parseWorkspaces(v: unknown): Record<string, WsLayout> {
     const w = ws as Partial<WsLayout> & { label?: unknown; tabOrder?: unknown }
     out[k] = {
       activeTab: typeof w.activeTab === 'number' ? w.activeTab : 1,
-      tabs: (w.tabs ?? {}) as Record<string, TabLayout>,
+      tabs: parseTabs(w.tabs),
       ...(typeof w.label === 'string' ? { label: w.label } : {}),
       ...(Array.isArray(w.tabOrder)
         ? { tabOrder: w.tabOrder.filter((n): n is number => typeof n === 'number' && Number.isFinite(n)) }
@@ -251,11 +279,11 @@ export function mergeLayout(base: LayoutFile, local: LayoutFile, remote: LayoutF
 export function parseLayout(text: string): LayoutFile {
   try {
     const v = JSON.parse(text) as Partial<LayoutFile>
-    if (v.version !== LAYOUT_VERSION || typeof v.workspaces !== 'object' || v.workspaces === null) {
+    if ((v.version !== LAYOUT_VERSION && v.version !== TAB_BROWSER_LAYOUT_VERSION) || typeof v.workspaces !== 'object' || v.workspaces === null) {
       return emptyLayout()
     }
     return {
-      version: LAYOUT_VERSION,
+      version: v.version,
       activeWorkspace: typeof v.activeWorkspace === 'number' ? v.activeWorkspace : 1,
       workspaces: parseWorkspaces(v.workspaces),
       // Conditional spread so a missing fontSize stays absent (not `undefined`)
@@ -266,6 +294,7 @@ export function parseLayout(text: string): LayoutFile {
         return f ? { frozen: f } : {}
       })(),
       ...((): { browsers?: Record<string, BrowserEntry> } => {
+        if (v.version === TAB_BROWSER_LAYOUT_VERSION) return {}
         const b = parseBrowsers(v.browsers)
         return b ? { browsers: b } : {}
       })(),
@@ -277,6 +306,7 @@ export function parseLayout(text: string): LayoutFile {
         const r = parseRecentFiles(v.recentFiles)
         return r ? { recentFiles: r } : {}
       })(),
+      ...(typeof v.browserRevision === 'number' && Number.isFinite(v.browserRevision) ? { browserRevision: v.browserRevision } : {}),
     }
   } catch {
     return emptyLayout()

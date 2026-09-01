@@ -1,6 +1,18 @@
 import { describe, it, expect } from 'vitest'
 import { emptyLayout, parseLayout, serializeLayout, orderTabs, moveTab, pushRecent, mergeLayout, LAYOUT_VERSION, type LayoutFile } from './layoutFile'
 
+describe('layout v2 tab browser compatibility', () => {
+  it('reads tab browser metadata without reintroducing browser leaves', () => {
+    const parsed = parseLayout(JSON.stringify({
+      version: 2, activeWorkspace: 1, browserRevision: 4,
+      workspaces: { '1': { activeTab: 1, tabs: { '1': { tree: null, browser: { id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', width: 420, collapsed: false } } } } },
+    }))
+    expect(parsed.version).toBe(2)
+    expect(parsed.browserRevision).toBe(4)
+    expect(parsed.workspaces['1']!.tabs['1']!.browser?.id).toBe('browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')
+  })
+})
+
 describe('layout editors map', () => {
   it('round-trips valid entries (incl. all optional fields)', () => {
     const l: LayoutFile = { version: 1, activeWorkspace: 1, workspaces: {},
