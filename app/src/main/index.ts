@@ -72,7 +72,9 @@ import {
 } from './routerService'
 import { inspectLinuxInputMethod, repairLinuxInputMethod, resolveLinuxInputEnvironment } from './inputMethod'
 import { TabBrowserService, parseTabBrowserCommand } from './tabBrowserService'
-import { TabBrowserBrokerServer, authorizeBrowserRequest, isEligiblePiController, type BrokerRequest, type ControllerSession } from './tabBrowserBroker'
+import { TabBrowserBrokerServer, authorizeBrowserRequest, isEligiblePiController, type BrokerRequest } from './tabBrowserBroker'
+import { BrowserDaemonWatcher } from './browserDaemonWatcher'
+import { Connection } from '../client/connection'
 import { TabBrowserStateStore } from './tabBrowserStateStore'
 import { coordinateTabBrowserMigration } from './tabBrowserMigrationCoordinator'
 import { parseLayout, serializeLayout } from '../shared/layoutFile'
@@ -727,35 +729,6 @@ interface WindowCtx {
 /** Per-window state, keyed by webContents id so IPC can route by sender. */
 const windowCtxs = new Map<number, WindowCtx>()
 let reopenLocalWindow: (() => Promise<void>) | null = null
-const browserDaemonSessions = new Map<string, ControllerSession>()
-let browserDaemonFresh = false
-let browserDaemonLastFullAt = 0
-function observeBrowserDaemonEvent(data: unknown): void {
-  if (typeof data !== 'object' || data === null) return
-  if ((data as { status?: unknown }).status === 'disconnected') { browserDaemonFresh = false; browserDaemonLastFullAt = 0; browserDaemonSessions.clear(); return }
-  const frame = (data as { frame?: unknown }).frame
-  if (typeof frame !== 'object' || frame === null || (frame as { type?: unknown }).type !== 'control') return
-  const msg = (frame as { msg?: unknown }).msg
-  if (typeof msg !== 'object' || msg === null) return
-  const control = msg as { kind?: unknown; sessions?: unknown; added?: unknown; removed?: unknown }
-  const add = (items: unknown): void => {
-    if (!Array.isArray(items)) return
-    for (const item of items) if (typeof item === 'object' && item !== null) {
-      const info = item as { name?: unknown; kind?: unknown; alive?: unknown; run_state?: unknown }
-      if (typeof info.name === 'string' && typeof info.kind === 'string' && typeof info.alive === 'boolean') {
-        browserDaemonSessions.set(info.name, {
-          kind: info.kind, alive: info.alive,
-          ...(typeof info.run_state === 'string' ? { runState: info.run_state } : {}),
-        })
-      }
-    }
-  }
-  if (control.kind === 'Sessions') { browserDaemonSessions.clear(); add(control.sessions); browserDaemonFresh = true; browserDaemonLastFullAt = Date.now() }
-  if (control.kind === 'SessionsChanged') {
-    add(control.added)
-    if (Array.isArray(control.removed)) for (const name of control.removed) if (typeof name === 'string') browserDaemonSessions.delete(name)
-  }
-}
 
 /** The window an IPC message came from. */
 function ctxFor(e: { sender: Electron.WebContents }): WindowCtx | undefined {
@@ -1118,7 +1091,6 @@ async function openWindow(target: WindowTarget): Promise<WindowCtx> {
   })
 
   const notifyRenderer = (data: unknown): void => {
-    if (target.kind === 'local') observeBrowserDaemonEvent(data)
     if (!win.isDestroyed()) win.webContents.send('daemon-event', data)
   }
 
@@ -1232,15 +1204,14 @@ async function main(): Promise<void> {
   }
 
   let tabBrowserBroker: TabBrowserBrokerServer | null = null
-  let browserSessionRefresh: NodeJS.Timeout | null = null
+  let browserDaemonWatcher: BrowserDaemonWatcher | null = null
   if (tabBrowser) {
-    browserSessionRefresh = setInterval(() => {
-      const local = [...windowCtxs.values()].find((candidate) => candidate.target.kind === 'local' && !candidate.win.isDestroyed())
-      local?.controlPort()?.postMessage({ cmd: 'refreshSessions' })
-    }, 2_000)
+    browserDaemonWatcher = new BrowserDaemonWatcher(new Connection(socket))
+    browserDaemonWatcher.start()
     const handleBroker = async (request: BrokerRequest, signal: AbortSignal): Promise<unknown> => {
-      if (!browserDaemonFresh || Date.now() - browserDaemonLastFullAt > 5_000) throw new Error('DAEMON_STATE_STALE')
-      if (!isEligiblePiController(browserDaemonSessions.get(request.amberSession))) throw new Error('NOT_DESIGNATED_CONTROLLER')
+      const controller = browserDaemonWatcher?.controller(request.amberSession)
+      if (!controller) throw new Error('DAEMON_STATE_STALE')
+      if (!isEligiblePiController(controller)) throw new Error('NOT_DESIGNATED_CONTROLLER')
       const loaded = await loadLayoutFile(layoutPath())
       const current = loaded.text ? parseLayout(loaded.text) : null
       if (!current) throw new Error('NO_BROWSER_FOR_TAB')
@@ -1282,8 +1253,7 @@ async function main(): Promise<void> {
     tabBrowserBroker = new TabBrowserBrokerServer(socketPath, join(stateRoot(), 'browser-host-token'), handleBroker)
     await tabBrowserBroker.start()
     app.once('before-quit', () => {
-      if (browserSessionRefresh) clearInterval(browserSessionRefresh)
-      browserSessionRefresh = null
+      browserDaemonWatcher?.close(); browserDaemonWatcher = null
       void tabBrowserBroker?.close()
     })
   }

@@ -36,7 +36,7 @@
     {
       "id": "P1-dedicated-daemon-watcher",
       "severity": "important",
-      "status": "partial",
+      "status": "completed",
       "work": "Replace the temporary 2-second ListSessionsDetailed refresh through the window utility client with a dedicated metadata-only main watcher and tested reconnect/full-list epoch barrier."
     },
     {

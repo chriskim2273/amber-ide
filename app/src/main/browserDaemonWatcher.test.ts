@@ -1,0 +1,55 @@
+import { describe, expect, it, vi } from 'vitest'
+import type { Frame } from '../shared/proto'
+import { BrowserDaemonWatcher, type MetadataConnection } from './browserDaemonWatcher'
+
+class FakeConnection implements MetadataConnection {
+  sent: Frame[] = []; closed = false
+  callbacks: Record<'open'|'close'|'frame', Function[]> = { open: [], close: [], frame: [] }
+  on(event: 'frame', cb: (value: Frame) => void): void
+  on(event: 'open'|'close', cb: () => void): void
+  on(event: 'open'|'close'|'frame', cb: ((value: Frame) => void) | (() => void)): void { this.callbacks[event].push(cb) }
+  connect(): void {}
+  send(frame: Frame): void { this.sent.push(frame) }
+  close(): void { this.closed = true }
+  emit(event: 'open'|'close', value?: never): void
+  emit(event: 'frame', value: Frame): void
+  emit(event: 'open'|'close'|'frame', value?: Frame): void { for (const cb of this.callbacks[event]) cb(value) }
+}
+
+const sessions = (items: unknown[]): Frame => ({ type: 'control', msg: { kind: 'Sessions', sessions: items as never[] } })
+
+describe('BrowserDaemonWatcher', () => {
+  it('requires a current-epoch full list and rejects dead or shell fallback Pi', () => {
+    let now = 10; const connection = new FakeConnection()
+    const watcher = new BrowserDaemonWatcher(connection, () => now, 5000)
+    watcher.start(); connection.emit('open')
+    expect(watcher.controller('pi')).toBeUndefined()
+    connection.emit('frame', sessions([{ name: 'pi', cwd: '/', kind: 'pi', alive: true, run_state: 'claude' }]))
+    expect(watcher.controller('pi')).toMatchObject({ kind: 'pi', alive: true })
+    now += 5001; expect(watcher.controller('pi')).toBeUndefined()
+    connection.emit('frame', sessions([{ name: 'pi', cwd: '/', kind: 'pi', alive: true, run_state: 'shell-fallback' }]))
+    expect(watcher.controller('pi')).toMatchObject({ runState: 'shell-fallback' })
+  })
+
+  it('drops cached authority on disconnect and ignores deltas before the next full list', () => {
+    const connection = new FakeConnection(); const watcher = new BrowserDaemonWatcher(connection)
+    watcher.start(); connection.emit('open')
+    connection.emit('frame', sessions([{ name: 'pi', cwd: '/', kind: 'pi', alive: true }]))
+    expect(watcher.controller('pi')).toBeDefined()
+    connection.emit('close'); expect(watcher.controller('pi')).toBeUndefined()
+    connection.emit('open')
+    connection.emit('frame', { type: 'control', msg: { kind: 'SessionsChanged', added: [{ name: 'other', cwd: '/', kind: 'pi', alive: true }], removed: [] } })
+    expect(watcher.controller('other')).toBeUndefined()
+  })
+
+  it('polls only metadata and closes cleanly', () => {
+    vi.useFakeTimers()
+    const connection = new FakeConnection(); const watcher = new BrowserDaemonWatcher(connection, Date.now, 5000, 2000)
+    watcher.start(); connection.emit('open')
+    expect(connection.sent.map((f) => f.type === 'control' ? f.msg.kind : '')).toEqual(['WatchSessions', 'ListSessionsDetailed'])
+    vi.advanceTimersByTime(2000)
+    expect(connection.sent.at(-1)).toEqual({ type: 'control', msg: { kind: 'ListSessionsDetailed' } })
+    watcher.close(); expect(connection.closed).toBe(true)
+    vi.useRealTimers()
+  })
+})

@@ -56,7 +56,6 @@ process.parentPort.on('message', (event) => {
         | { cmd: 'getMemoryBudget' }
         | { cmd: 'setMemoryBudget'; mb: number }
         | { cmd: 'snapshot' }
-        | { cmd: 'refreshSessions' }
       if (cmd.cmd === 'create') {
         conn.send({ type: 'control', msg: { kind: 'Create', name: cmd.name, cwd: cmd.cwd, sessionKind: cmd.sessionKind } })
       } else if (cmd.cmd === 'kill') {
@@ -89,8 +88,6 @@ process.parentPort.on('message', (event) => {
         conn.send({ type: 'control', msg: { kind: 'SetMemoryBudget', mb: cmd.mb } })
       } else if (cmd.cmd === 'snapshot') {
         conn.send({ type: 'control', msg: { kind: 'Snapshot' } })
-      } else if (cmd.cmd === 'refreshSessions') {
-        conn.send({ type: 'control', msg: { kind: 'ListSessionsDetailed' } })
       }
     })
     port.start()
