@@ -7,9 +7,10 @@ export interface TabBrowserPage {
   loadURL(url: string): Promise<void>
   show(): void
   hide(): void
+  setBounds?(bounds: { x: number; y: number; width: number; height: number }): void
   destroy(): void
 }
-export interface TabBrowserPageFactory { create(id: BrowserId): TabBrowserPage }
+export interface TabBrowserPageFactory { create(id: BrowserId, onUserInput: () => void): TabBrowserPage }
 export interface BrowserRuntimeStatus extends BrowserRecord { pageIncarnation: string; generation: number; loading: boolean }
 interface Runtime { page: TabBrowserPage; incarnation: string; generation: number; loading: boolean }
 
@@ -31,8 +32,9 @@ export class TabBrowserHost {
   }
 
   private makeRuntime(id: BrowserId): Runtime {
-    const page = this.pages.create(id)
-    const runtime = { page, incarnation: randomUUID(), generation: 0, loading: false }
+    let runtime!: Runtime
+    const page = this.pages.create(id, () => { runtime.generation += 1 })
+    runtime = { page, incarnation: randomUUID(), generation: 0, loading: false }
     this.runtimes.set(id, runtime)
     this.capacity.markLive(id, this.now())
     return runtime
@@ -58,6 +60,21 @@ export class TabBrowserHost {
     const record = this.record(id)
     const runtime = this.runtimes.get(record.id)
     return { ...record, pageIncarnation: runtime?.incarnation ?? '', generation: runtime?.generation ?? 0, loading: runtime?.loading ?? false }
+  }
+
+  show(id: string, bounds?: { x: number; y: number; width: number; height: number }): BrowserRuntimeStatus {
+    const record = this.record(id); const runtime = this.runtimes.get(record.id)
+    if (!runtime) throw new Error('BROWSER_FROZEN')
+    if (bounds) runtime.page.setBounds?.(bounds)
+    runtime.page.show(); record.lastFocusedAt = this.now(); this.capacity.touch(record.id, record.lastFocusedAt)
+    return this.status(record.id)
+  }
+
+  hide(id: string): void { const record = this.record(id); this.runtimes.get(record.id)?.page.hide() }
+
+  setBounds(id: string, bounds: { x: number; y: number; width: number; height: number }): void {
+    if (![bounds.x, bounds.y, bounds.width, bounds.height].every(Number.isFinite) || bounds.width < 1 || bounds.height < 1) throw new Error('INVALID_BOUNDS')
+    const record = this.record(id); this.runtimes.get(record.id)?.page.setBounds?.(bounds)
   }
 
   async navigate(id: string, url: string, incarnation: string, generation: number): Promise<BrowserRuntimeStatus> {

@@ -10,7 +10,8 @@ class FakePage implements TabBrowserPage {
   destroy() { this.destroyed = true }
 }
 
-const factory: TabBrowserPageFactory = { create: () => new FakePage() }
+const userInputs = new Map<string, () => void>()
+const factory: TabBrowserPageFactory = { create: (id, onUserInput) => { userInputs.set(id, onUserInput); return new FakePage() } }
 
 describe('TabBrowserHost', () => {
   it('creates visibly before navigation and advances generation', async () => {
@@ -25,10 +26,12 @@ describe('TabBrowserHost', () => {
     expect(host.status(opened.status.id).safeRestoreUrl).toBe('https://example.test/a')
   })
 
-  it('rejects stale mutations', async () => {
+  it('rejects stale mutations, including after physical user input', async () => {
     const host = new TabBrowserHost(emptyBrowserState(1), factory)
     const opened = await host.open({ visible: true })
     await expect(host.navigate(opened.status.id, 'https://example.test', 'stale', 0)).rejects.toThrow('STALE_GENERATION')
+    userInputs.get(opened.status.id)!()
+    await expect(host.navigate(opened.status.id, 'https://example.test', opened.status.pageIncarnation, opened.status.generation)).rejects.toThrow('STALE_GENERATION')
   })
 
   it('freezes the eligible LRU fifth page and changes incarnation on thaw', async () => {

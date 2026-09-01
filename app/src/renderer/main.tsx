@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useReducer, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { SplitView, fmtMem, type PaneMeta, type PaneKind } from './SplitView'
+import { BrowserRail } from './BrowserRail'
 import { Icon } from './Icon'
 import { PANE_KIND_OPTIONS, continuityView, machineWindowTitle, type SnapshotState } from './uiModel'
 import type { EditorApi } from './Editor'
@@ -51,6 +52,7 @@ import {
   BookmarksDialog, PresetInputsDialog, CheckpointsDialog, ProjectProfileDialog,
 } from './ProductivityDialogs'
 import './theme.css'
+import './BrowserRail.css'
 
 declare global {
   interface Window {
@@ -83,6 +85,7 @@ declare global {
       // than silently overwritten. See the persist effect below.
       loadLayout: () => Promise<LoadLayoutResult>
       saveLayout: (text: string, version: string | null) => Promise<SaveLayoutResult>
+      browserCommand: (command: unknown) => Promise<unknown>
       loadProductivity?: () => Promise<LoadProductivityResult>
       saveProductivity?: (text: string, version: string | null) => Promise<SaveProductivityResult>
       readProjectProfile?: (root: string) => Promise<{ profile: ProjectProfile; root: string; resolvedCwds: string[] } | { error: string }>
@@ -759,6 +762,7 @@ function App(): JSX.Element {
   const home = window.amber?.homeDir ?? ''
   const wsKey = String(ws?.ws ?? activeWs)
   const tabKey = String(tab?.tab ?? activeTab)
+  const tabBrowser = layout.workspaces[wsKey]?.tabs[tabKey]?.browser
   const storedTree = layout.workspaces[wsKey]?.tabs[tabKey]?.tree ?? null
   // Active-tab render inputs, via the shared deriveTab (same path the keep-alive
   // layer map uses below — no drift). allLive is the UNFILTERED name set (keeps
@@ -909,6 +913,28 @@ function App(): JSX.Element {
   const orderedTabs = orderTabs(tabs.map((t) => t.tab), layout.workspaces[wsKey]?.tabOrder)
     .map((id) => tabs.find((t) => t.tab === id))
     .filter((t): t is (typeof tabs)[number] => t !== undefined)
+
+  const updateTabBrowser = useCallback((browser: NonNullable<LayoutFile['workspaces'][string]['tabs'][string]['browser']> | undefined) => {
+    setLayout((current) => {
+      const workspace = current.workspaces[wsKey] ?? { activeTab, tabs: {} }
+      const previous = workspace.tabs[tabKey] ?? { tree: null }
+      const nextTab = { ...previous, ...(browser ? { browser } : {}) }
+      if (!browser) delete nextTab.browser
+      return { ...current, version: 2, browserRevision: (current.browserRevision ?? 0) + 1, workspaces: { ...current.workspaces, [wsKey]: { ...workspace, tabs: { ...workspace.tabs, [tabKey]: nextTab } } } }
+    })
+  }, [wsKey, tabKey, activeTab])
+
+  const openTabBrowser = useCallback(async (): Promise<void> => {
+    const reply = await window.amber.browserCommand({ type: 'open' }) as { ok: boolean; result?: { id: string }; error?: string }
+    if (reply.ok && reply.result) updateTabBrowser({ id: reply.result.id, width: 420, collapsed: false })
+    else setNotice(reply.error ?? 'Browser host unavailable')
+  }, [updateTabBrowser])
+
+  const closeTabBrowser = useCallback(async (): Promise<void> => {
+    if (!tabBrowser) return
+    await window.amber.browserCommand({ type: 'close', id: tabBrowser.id })
+    updateTabBrowser(undefined)
+  }, [tabBrowser, updateTabBrowser])
 
   const putTree = useCallback((next: Node | null) => {
     setLayout((l) => {
@@ -1869,6 +1895,11 @@ function App(): JSX.Element {
             </div>
           )}
         </div>
+        {!mobile && remoteHost.length === 0 && !tabBrowser && (
+          <button className="btn btn-with-icon" onClick={() => void openTabBrowser()} aria-label="Open tab browser">
+            Browser
+          </button>
+        )}
         <div className="spacer" />
         {remoteHost.length > 0 && (
           <span className="remote-marker"
@@ -2034,6 +2065,7 @@ function App(): JSX.Element {
         <button className="btn btn-ghost tab-add" data-drop-tab={nextTab}
           title="new tab · drop a pane here to move it to a new tab" onClick={openTab}>+ Tab</button>
       </div>
+      <div className="tab-browser-workarea">
       <div className={`pane-stage${pocketCommandActive ? ' pocket-stage-hidden' : ''}`}>
         {/* Keep-alive: render ONE SplitView per tab in the workspace, hiding the
             inactive ones with display:none instead of unmounting them. Switching
@@ -2116,6 +2148,16 @@ function App(): JSX.Element {
                   </div>
                 )
               })}
+      </div>
+      {tabBrowser && !mobile && remoteHost.length === 0 && (
+        <BrowserRail id={tabBrowser.id} width={tabBrowser.width}
+          {...(tabBrowser.designatedPi ? { designatedPi: tabBrowser.designatedPi } : {})}
+          {...(tabBrowser.sharedWithPi !== undefined ? { sharedWithPi: tabBrowser.sharedWithPi } : {})}
+          controllers={(tab?.panes ?? []).filter((pane) => pane.kind === 'pi').map((pane) => ({ name: pane.name, label: titles[pane.name] || pane.name }))}
+          onPolicy={(policy) => updateTabBrowser({ ...tabBrowser, ...policy })}
+          onWidth={(width) => updateTabBrowser({ ...tabBrowser, width })}
+          onClose={() => void closeTabBrowser()} />
+      )}
       </div>
       {pocketMosaicActive && (
         <PocketNav

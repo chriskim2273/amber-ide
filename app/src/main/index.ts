@@ -71,6 +71,7 @@ import {
   type RouterStatus,
 } from './routerService'
 import { inspectLinuxInputMethod, repairLinuxInputMethod, resolveLinuxInputEnvironment } from './inputMethod'
+import { TabBrowserService, parseTabBrowserCommand } from './tabBrowserService'
 import clientPath from '../client/index?modulePath'
 
 // A client child that stays up this long counts as a genuine run; a shorter
@@ -683,7 +684,7 @@ function buildAppMenu(
     { label: 'Restart amber daemon', click: () => onRestartDaemon() },
     { label: 'Quit amber daemon', click: () => onQuitDaemon() },
   ]
-  if (!isMac) submenu.push({ type: 'separator' }, { role: 'quit' })
+  if (!isMac) submenu.push({ type: 'separator' }, { role: 'quit', label: 'Quit Amber IDE' })
   template.push({ label: isMac ? 'Daemon' : 'File', submenu })
   if (isMac) template.push({ role: 'editMenu' }, { role: 'windowMenu' })
   return Menu.buildFromTemplate(template)
@@ -714,6 +715,7 @@ interface WindowCtx {
 
 /** Per-window state, keyed by webContents id so IPC can route by sender. */
 const windowCtxs = new Map<number, WindowCtx>()
+let reopenLocalWindow: (() => Promise<void>) | null = null
 
 /** The window an IPC message came from. */
 function ctxFor(e: { sender: Electron.WebContents }): WindowCtx | undefined {
@@ -1128,6 +1130,12 @@ async function openWindow(target: WindowTarget): Promise<WindowCtx> {
   }
   windowCtxs.set(win.webContents.id, ctx)
   const id = win.webContents.id
+  win.on('close', (event) => {
+    if (process.env['AMBER_TAB_BROWSER_HOST'] === '1' && target.kind === 'local' && !quitting) {
+      event.preventDefault()
+      win.hide()
+    }
+  })
   win.on('closed', () => {
     windowClosed = true
     windowCtxs.delete(id)
@@ -1154,6 +1162,15 @@ async function main(): Promise<void> {
 
   const ctx = await openWindow({ kind: 'local' })
   const win = ctx.win
+  const tabBrowserSupported = process.env['AMBER_TAB_BROWSER_HOST'] === '1'
+    && !compat && process.platform !== 'win32'
+  const tabBrowser = tabBrowserSupported ? await TabBrowserService.create(stateRoot(), win) : null
+  reopenLocalWindow = async (): Promise<void> => {
+    const existing = [...windowCtxs.values()].find((candidate) => candidate.target.kind === 'local' && !candidate.win.isDestroyed())
+    if (existing) { existing.win.show(); existing.win.focus(); return }
+    const reopened = await openWindow({ kind: 'local' })
+    tabBrowser?.setWindow(reopened.win)
+  }
 
   // These three are the only per-WINDOW handlers: each window has its own
   // client process (a remote window's talks through an ssh tunnel), so they
@@ -1183,6 +1200,16 @@ async function main(): Promise<void> {
 
   ipcMain.on('close-pane', (e, session: string) => {
     ctxFor(e)?.child()?.postMessage({ kind: 'pane-close', session })
+  })
+
+  ipcMain.handle('browser:command', async (e, raw: unknown) => {
+    const sender = ctxFor(e)
+    if (!tabBrowser || sender?.target.kind !== 'local') return { ok: false, error: 'BROWSER_HOST_UNAVAILABLE' }
+    try {
+      return { ok: true, result: await tabBrowser.command(parseTabBrowserCommand(raw)) }
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : 'INTERNAL_ERROR' }
+    }
   })
 
   // Resolve a terminal selection to an EXISTING absolute path so the pane's
@@ -1551,6 +1578,8 @@ async function main(): Promise<void> {
 if (!app.requestSingleInstanceLock()) {
   app.quit()
 } else {
+  app.on('second-instance', () => { void reopenLocalWindow?.() })
+  app.on('activate', () => { void reopenLocalWindow?.() })
   app.whenReady().then(main).catch((e) => {
     console.error(e)
     app.quit()
@@ -1561,4 +1590,6 @@ if (!app.requestSingleInstanceLock()) {
 // app alive with zero windows on darwin left amber-ide headless in the Dock
 // (no activate handler recreates a window) until Force Quit. Spec §6/§7: window
 // close never stops the daemon, but it DOES exit the GUI.
-app.on('window-all-closed', () => { app.quit() })
+app.on('window-all-closed', () => {
+  if (process.env['AMBER_TAB_BROWSER_HOST'] !== '1') app.quit()
+})
