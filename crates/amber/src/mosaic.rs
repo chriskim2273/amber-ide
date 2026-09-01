@@ -71,10 +71,9 @@ pub struct WsLayout {
 /// deserialized — the mosaic renders no app-local panes, and `recentFiles` is a
 /// list of arbitrary host paths with no business crossing the web boundary.
 ///
-/// `version` must be 1 (the current LAYOUT_VERSION). If present and not 1, the
-/// sidecar is treated as incompatible and returns an empty layout (same as the
-/// TS parser). If version is missing, it's treated as 0 (pre-versioning), which
-/// also returns empty — matching `layoutFile.ts:165` behavior.
+/// `version` may be 1 (legacy browser leaves) or 2 (tab browser rails). The
+/// mosaic deliberately ignores browser-private fields in both forms. Other or
+/// missing versions degrade to an empty layout rather than guessing.
 #[derive(Debug, Clone, Deserialize)]
 pub struct LayoutFile {
     #[serde(default)]
@@ -105,15 +104,15 @@ impl Default for LayoutFile {
 /// fallback the desktop app itself uses. Core rule #3 — grouping must be
 /// reconstructable from session names alone.
 ///
-/// Version validation: if the sidecar's version is present and not 1, it is
-/// treated as incompatible and returns empty (matching `layoutFile.ts:165`).
-/// If version is missing, it defaults to 0, which is also treated as invalid.
+/// Version validation: v1 and v2 share the subset this read-only projection
+/// consumes. Unknown or missing versions return empty so a future writer can
+/// never be misinterpreted.
 pub fn load(root: &Path) -> LayoutFile {
     match std::fs::read_to_string(root.join(LAYOUT_FILE))
         .ok()
         .and_then(|s| serde_json::from_str::<LayoutFile>(&s).ok())
     {
-        Some(layout) if layout.version == 1 => layout,
+        Some(layout) if matches!(layout.version, 1 | 2) => layout,
         _ => LayoutFile::default(),
     }
 }
@@ -454,14 +453,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_incompatible_version_2_sidecar() {
+    fn accepts_version_2_sidecar_and_ignores_tab_browser_metadata() {
         let dir = tempfile::tempdir().unwrap();
-        // Valid LayoutFile shape with one workspace, but version 2 (incompatible).
-        let v2_sidecar = r#"{"version": 2, "activeWorkspace": 1, "workspaces": {"1": {"activeTab": 1, "tabs": {}}}}"#;
+        let v2_sidecar = r#"{"version":2,"activeWorkspace":2,"browserRevision":7,"workspaces":{"2":{"activeTab":3,"tabs":{"3":{"label":"work","browser":{"id":"browser-0123456789abcdef0123456789abcdef","width":420,"collapsed":false},"tree":null}}}}}"#;
         std::fs::write(dir.path().join("ui-layout.json"), v2_sidecar).unwrap();
         let f = load(dir.path());
-        assert!(f.workspaces.is_empty(), "version 2 sidecar rejected");
-        assert_eq!(f.active_workspace, 1, "degraded to empty with activeWorkspace == 1");
+        assert_eq!(f.version, 2);
+        assert_eq!(f.active_workspace, 2);
+        assert_eq!(f.workspaces["2"].active_tab, 3);
+        assert_eq!(f.workspaces["2"].tabs["3"].label.as_deref(), Some("work"));
     }
 
     #[test]
