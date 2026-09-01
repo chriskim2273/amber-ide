@@ -19,7 +19,73 @@ const EXTENSION_FILE: &str = "amber-hook.ts";
 
 /// The Pi extension amber installs to record session ids for exact resume.
 const EXTENSION_TS: &str = r#"import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
+import { Type } from "typebox"
 import { spawn } from "node:child_process"
+import { connect } from "node:net"
+import { readFile } from "node:fs/promises"
+import { join } from "node:path"
+import { tmpdir } from "node:os"
+
+function browserPaths() {
+  const state = process.env.AMBER_STATE_DIR
+  if (!state) throw new Error("Amber browser tools require a supervised Pi pane")
+  const runtime = process.env.XDG_RUNTIME_DIR || tmpdir()
+  return {
+    token: join(state, "browser-host-token"),
+    socket: process.env.AMBER_BROWSER_HOST_SOCKET || join(runtime, "amber-ide", "browser-host.sock"),
+  }
+}
+
+function encode(value: unknown) {
+  const body = Buffer.from(JSON.stringify(value))
+  const out = Buffer.allocUnsafe(body.length + 4)
+  out.writeUInt32BE(body.length); body.copy(out, 4)
+  return out
+}
+
+async function browserRequest(action: unknown, signal?: AbortSignal) {
+  const amberSession = process.env.AMBER_SESSION
+  if (!amberSession) throw new Error("Amber browser tools are unavailable outside an Amber pane")
+  const paths = browserPaths()
+  const token = (await readFile(paths.token, "utf8")).trim()
+  return await new Promise<unknown>((resolve, reject) => {
+    const socket = connect(paths.socket)
+    let buffer = Buffer.alloc(0), authenticated = false, settled = false
+    const finish = (error?: Error, value?: unknown) => {
+      if (settled) return; settled = true; clearTimeout(timer); socket.destroy()
+      if (error) reject(error); else resolve(value)
+    }
+    const timer = setTimeout(() => finish(new Error("Amber browser host timed out")), 8000)
+    const abort = () => finish(new Error("Amber browser request cancelled"))
+    signal?.addEventListener("abort", abort, { once: true })
+    socket.on("error", (error) => finish(error))
+    socket.on("connect", () => socket.write(encode({ token })))
+    socket.on("data", (chunk) => {
+      buffer = Buffer.concat([buffer, chunk])
+      while (buffer.length >= 4) {
+        const length = buffer.readUInt32BE(0)
+        if (length > 256 * 1024) return finish(new Error("Amber browser host sent an oversized reply"))
+        if (buffer.length < length + 4) return
+        const body = buffer.subarray(4, length + 4); buffer = buffer.subarray(length + 4)
+        let reply: any
+        try { reply = JSON.parse(body.toString("utf8")) } catch { return finish(new Error("Amber browser host sent invalid JSON")) }
+        if (!authenticated) {
+          if (!reply?.ok) return finish(new Error("Amber browser host authentication failed"))
+          authenticated = true
+          socket.write(encode({ version: 1, requestId: `${Date.now()}-${Math.random()}`, amberSession, action }))
+          continue
+        }
+        if (!reply?.ok) return finish(new Error(String(reply?.error || "Amber browser request failed")))
+        finish(undefined, reply.result)
+      }
+    })
+  })
+}
+
+function result(value: unknown) {
+  const text = JSON.stringify(value, null, 2)
+  return { content: [{ type: "text" as const, text: text.length > 50000 ? text.slice(0, 50000) + "\\n…truncated" : text }], details: {} }
+}
 
 export default function (pi: ExtensionAPI) {
   pi.on("session_start", (_event, ctx) => {
@@ -32,6 +98,31 @@ export default function (pi: ExtensionAPI) {
     child.on("error", () => {})
     child.stdin.on("error", () => {})
     child.stdin.end(JSON.stringify({ session_id, cwd: ctx.cwd }))
+  })
+
+  pi.registerTool({
+    name: "browser_open", label: "Open tab browser",
+    description: "Create or reveal this Amber tab's shared browser. First use waits for visible user sharing approval.",
+    parameters: Type.Object({}, { additionalProperties: false }),
+    async execute(_id, _params, signal) { return result(await browserRequest({ type: "open" }, signal)) },
+  })
+  pi.registerTool({
+    name: "browser_status", label: "Browser status",
+    description: "Read this tab browser's current URL, lifecycle, page incarnation, and generation.",
+    parameters: Type.Object({}, { additionalProperties: false }),
+    async execute(_id, _params, signal) { return result(await browserRequest({ type: "status" }, signal)) },
+  })
+  pi.registerTool({
+    name: "browser_navigate", label: "Navigate browser",
+    description: "Navigate the shared tab browser when its page generation is still current.",
+    parameters: Type.Object({
+      url: Type.String({ maxLength: 8192 }),
+      pageIncarnation: Type.String({ maxLength: 128 }),
+      expectedGeneration: Type.Number({ minimum: 0 }),
+    }, { additionalProperties: false }),
+    async execute(_id, params, signal) {
+      return result(await browserRequest({ type: "navigate", url: params.url, pageIncarnation: params.pageIncarnation, expectedGeneration: params.expectedGeneration }, signal))
+    },
   })
 }
 "#;
@@ -206,6 +297,11 @@ mod tests {
         assert!(first.contains("AMBER_BIN"));
         assert!(first.contains("session_id"));
         assert!(first.contains("cwd"));
+        assert!(first.contains("browser_open"));
+        assert!(first.contains("browser_status"));
+        assert!(first.contains("browser_navigate"));
+        assert!(first.contains("browser-host-token"));
+        assert!(!first.contains("Runtime.evaluate"));
 
         install_extension_in(&extensions).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), first);

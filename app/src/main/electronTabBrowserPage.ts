@@ -12,7 +12,7 @@ export class ElectronTabBrowserPage implements TabBrowserPage {
   readonly view: WebContentsView
   private attached = false
   private bounds: Rectangle = { x: 0, y: 0, width: 1, height: 1 }
-  constructor(private window: BrowserWindow, partition: string, onUserInput: () => void) {
+  constructor(private window: BrowserWindow, partition: string, onUserInput: () => void, private readonly onDestroy: () => void) {
     const browserSession = session.fromPartition(partition)
     hardenBrowserSession(browserSession)
     this.view = new WebContentsView({ webPreferences: browserWebPreferences(partition) })
@@ -38,7 +38,7 @@ export class ElectronTabBrowserPage implements TabBrowserPage {
   hide(): void {
     if (this.attached) { this.window.contentView.removeChildView(this.view); this.attached = false }
   }
-  destroy(): void { this.hide(); if (!this.view.webContents.isDestroyed()) this.view.webContents.close() }
+  destroy(): void { this.hide(); if (!this.view.webContents.isDestroyed()) this.view.webContents.close(); this.onDestroy() }
 }
 
 export class ElectronTabBrowserPageFactory implements TabBrowserPageFactory {
@@ -46,7 +46,7 @@ export class ElectronTabBrowserPageFactory implements TabBrowserPageFactory {
   constructor(private window: BrowserWindow, private readonly partition = 'persist:amber-browser') {}
   setWindow(window: BrowserWindow): void { this.window = window; for (const page of this.pages.values()) page.setWindow(window) }
   create(id: BrowserId, onUserInput: () => void): ElectronTabBrowserPage {
-    const page = new ElectronTabBrowserPage(this.window, this.partition, onUserInput)
+    const page = new ElectronTabBrowserPage(this.window, this.partition, onUserInput, () => this.pages.delete(id))
     this.pages.set(id, page)
     return page
   }

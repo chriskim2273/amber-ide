@@ -508,6 +508,7 @@ export function createAmber(deps: AmberDeps): WebAmber {
     dumpBacklog: (name): void => control.send({ t: 'dumpBacklog', name }),
     // A hosted Pocket/web client never owns a local Electron WebContentsView.
     browserCommand: async (): Promise<unknown> => ({ ok: false, error: 'BROWSER_HOST_UNAVAILABLE' }),
+    onBrowserAssociation: (): void => {},
 
     // --- native browser API, not a stub (spec §3 "Clipboard" row) ----------
     clipboardWrite: (text): void => {

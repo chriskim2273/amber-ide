@@ -86,6 +86,7 @@ declare global {
       loadLayout: () => Promise<LoadLayoutResult>
       saveLayout: (text: string, version: string | null) => Promise<SaveLayoutResult>
       browserCommand: (command: unknown) => Promise<unknown>
+      onBrowserAssociation: (cb: (association: unknown) => void) => void
       loadProductivity?: () => Promise<LoadProductivityResult>
       saveProductivity?: (text: string, version: string | null) => Promise<SaveProductivityResult>
       readProjectProfile?: (root: string) => Promise<{ profile: ProjectProfile; root: string; resolvedCwds: string[] } | { error: string }>
@@ -601,6 +602,32 @@ function App(): JSX.Element {
       if ((d as { childRestart?: boolean }).childRestart) setChildEpoch((e) => e + 1)
       const ev = toEvent(d); if (ev) dispatchEvent(ev)
       if (ev?.kind === 'Sessions') setSawSessions(true)
+    })
+    window.amber.onBrowserAssociation((value) => {
+      if (typeof value !== 'object' || value === null) return
+      const association = value as { ws?: unknown; tab?: unknown; browser?: unknown }
+      if (typeof association.ws !== 'number' || typeof association.tab !== 'number' || typeof association.browser !== 'object' || association.browser === null) return
+      const browser = association.browser as { id?: unknown; width?: unknown; collapsed?: unknown }
+      if (typeof browser.id !== 'string' || typeof browser.width !== 'number' || typeof browser.collapsed !== 'boolean') return
+      const browserLayout = { id: browser.id, width: browser.width, collapsed: browser.collapsed }
+      setLayout((current) => {
+        const workspace = current.workspaces[String(association.ws)] ?? { activeTab: association.tab as number, tabs: {} }
+        const previous = workspace.tabs[String(association.tab)] ?? { tree: null }
+        return {
+          ...current,
+          version: 2,
+          browserRevision: (current.browserRevision ?? 0) + 1,
+          workspaces: {
+            ...current.workspaces,
+            [String(association.ws)]: {
+              ...workspace,
+              activeTab: association.tab as number,
+              tabs: { ...workspace.tabs, [String(association.tab)]: { ...previous, browser: browserLayout } },
+            },
+          },
+        }
+      })
+      setActiveWs(association.ws); setActiveTab(association.tab)
     })
     void window.amber.loadLayout().then(({ text, version }) => {
       const l = text ? parseLayout(text) : emptyLayout()

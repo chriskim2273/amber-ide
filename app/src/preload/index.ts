@@ -59,6 +59,9 @@ contextBridge.exposeInMainWorld('amber', {
   // Tab-owned native browser rail. A single typed command seam; main derives
   // the owning window from event.sender and rejects remote/unsupported hosts.
   browserCommand: (command: unknown): Promise<unknown> => ipcRenderer.invoke('browser:command', command),
+  onBrowserAssociation: (cb: (association: unknown) => void): void => {
+    ipcRenderer.on('tab-browser-association', (_event, association) => cb(association))
+  },
   loadProductivity: (): Promise<LoadProductivityResult> => ipcRenderer.invoke('productivity-load'),
   saveProductivity: (text: string, version: string | null): Promise<SaveProductivityResult> =>
     ipcRenderer.invoke('productivity-save', text, version),

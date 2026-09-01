@@ -35,8 +35,11 @@ export class TabBrowserService {
         const opened = await this.host.open({ visible: true }); await this.persist(); return opened.status
       }
       case 'show': {
-        try { await this.host.thaw(command.id) } catch (error) { if (!(error instanceof Error) || error.message !== 'BROWSER_CAPACITY_BUSY') throw error }
-        return this.host.show(command.id, command.bounds)
+        const before = this.host.status(command.id).stateRevision
+        await this.host.thaw(command.id)
+        const status = this.host.show(command.id, command.bounds)
+        if (status.stateRevision !== before) await this.persist()
+        return status
       }
       case 'hide': this.host.hide(command.id); return this.host.status(command.id)
       case 'bounds': this.host.setBounds(command.id, command.bounds); return this.host.status(command.id)

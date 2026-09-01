@@ -72,6 +72,8 @@ import {
 } from './routerService'
 import { inspectLinuxInputMethod, repairLinuxInputMethod, resolveLinuxInputEnvironment } from './inputMethod'
 import { TabBrowserService, parseTabBrowserCommand } from './tabBrowserService'
+import { TabBrowserBrokerServer, authorizeBrowserRequest, type BrokerRequest } from './tabBrowserBroker'
+import { parseLayout, serializeLayout } from '../shared/layoutFile'
 import clientPath from '../client/index?modulePath'
 
 // A client child that stays up this long counts as a genuine run; a shorter
@@ -716,6 +718,29 @@ interface WindowCtx {
 /** Per-window state, keyed by webContents id so IPC can route by sender. */
 const windowCtxs = new Map<number, WindowCtx>()
 let reopenLocalWindow: (() => Promise<void>) | null = null
+const browserDaemonSessions = new Map<string, string>()
+let browserDaemonFresh = false
+function observeBrowserDaemonEvent(data: unknown): void {
+  if (typeof data !== 'object' || data === null) return
+  if ((data as { status?: unknown }).status === 'disconnected') { browserDaemonFresh = false; browserDaemonSessions.clear(); return }
+  const frame = (data as { frame?: unknown }).frame
+  if (typeof frame !== 'object' || frame === null || (frame as { type?: unknown }).type !== 'control') return
+  const msg = (frame as { msg?: unknown }).msg
+  if (typeof msg !== 'object' || msg === null) return
+  const control = msg as { kind?: unknown; sessions?: unknown; added?: unknown; removed?: unknown }
+  const add = (items: unknown): void => {
+    if (!Array.isArray(items)) return
+    for (const item of items) if (typeof item === 'object' && item !== null) {
+      const info = item as { name?: unknown; kind?: unknown }
+      if (typeof info.name === 'string' && typeof info.kind === 'string') browserDaemonSessions.set(info.name, info.kind)
+    }
+  }
+  if (control.kind === 'Sessions') { browserDaemonSessions.clear(); add(control.sessions); browserDaemonFresh = true }
+  if (control.kind === 'SessionsChanged') {
+    add(control.added)
+    if (Array.isArray(control.removed)) for (const name of control.removed) if (typeof name === 'string') browserDaemonSessions.delete(name)
+  }
+}
 
 /** The window an IPC message came from. */
 function ctxFor(e: { sender: Electron.WebContents }): WindowCtx | undefined {
@@ -1077,6 +1102,7 @@ async function openWindow(target: WindowTarget): Promise<WindowCtx> {
   })
 
   const notifyRenderer = (data: unknown): void => {
+    if (target.kind === 'local') observeBrowserDaemonEvent(data)
     if (!win.isDestroyed()) win.webContents.send('daemon-event', data)
   }
 
@@ -1170,6 +1196,46 @@ async function main(): Promise<void> {
     if (existing) { existing.win.show(); existing.win.focus(); return }
     const reopened = await openWindow({ kind: 'local' })
     tabBrowser?.setWindow(reopened.win)
+  }
+
+  let tabBrowserBroker: TabBrowserBrokerServer | null = null
+  if (tabBrowser) {
+    const handleBroker = async (request: BrokerRequest): Promise<unknown> => {
+      if (!browserDaemonFresh) throw new Error('DAEMON_STATE_STALE')
+      if (browserDaemonSessions.get(request.amberSession) !== 'pi') throw new Error('NOT_DESIGNATED_CONTROLLER')
+      const loaded = await loadLayoutFile(layoutPath())
+      const current = loaded.text ? parseLayout(loaded.text) : null
+      if (!current) throw new Error('NO_BROWSER_FOR_TAB')
+      if (request.action.type === 'open') {
+        const location = authorizeBrowserRequest(current, request.amberSession, true)
+        if (!location.browserId) {
+          const opened = await tabBrowser.command({ type: 'open' })
+          if (!('id' in opened)) throw new Error('INTERNAL_ERROR')
+          const workspace = current.workspaces[String(location.ws)]!
+          const previous = workspace.tabs[String(location.tab)]!
+          const browser = { id: opened.id, width: 420, collapsed: false }
+          const next = { ...current, version: 2, browserRevision: (current.browserRevision ?? 0) + 1,
+            workspaces: { ...current.workspaces, [location.ws]: { ...workspace, tabs: { ...workspace.tabs, [location.tab]: { ...previous, browser } } } } }
+          const saved = await saveLayoutFile(layoutPath(), serializeLayout(next), loaded.version)
+          if (!('ok' in saved)) throw new Error('LAYOUT_CONFLICT')
+          await reopenLocalWindow?.()
+          for (const candidate of windowCtxs.values()) if (candidate.target.kind === 'local' && !candidate.win.isDestroyed()) {
+            candidate.win.webContents.send('tab-browser-association', { ws: location.ws, tab: location.tab, browser })
+          }
+          return { code: 'CREATION_AWAITING_USER', browserId: opened.id }
+        }
+        return tabBrowser.command({ type: 'status', id: location.browserId })
+      }
+      const authorized = authorizeBrowserRequest(current, request.amberSession)
+      const id = authorized.browserId!
+      if (request.action.type === 'status' || request.action.type === 'stop') return tabBrowser.command({ type: 'status', id })
+      return tabBrowser.command({ type: 'navigate', id, url: request.action.url, pageIncarnation: request.action.pageIncarnation, expectedGeneration: request.action.expectedGeneration })
+    }
+    const runtime = process.env['XDG_RUNTIME_DIR'] ?? tmpdir()
+    const socketPath = process.env['AMBER_BROWSER_HOST_SOCKET'] ?? join(runtime, 'amber-ide', 'browser-host.sock')
+    tabBrowserBroker = new TabBrowserBrokerServer(socketPath, join(stateRoot(), 'browser-host-token'), handleBroker)
+    await tabBrowserBroker.start()
+    app.once('before-quit', () => { void tabBrowserBroker?.close() })
   }
 
   // These three are the only per-WINDOW handlers: each window has its own
