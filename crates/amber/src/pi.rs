@@ -68,7 +68,7 @@ pub fn resolve_pi() -> Option<PathBuf> {
 }
 
 /// Pi's agent directory, respecting its non-empty override before `$HOME`.
-fn pi_agent_dir() -> Option<PathBuf> {
+pub fn pi_agent_dir() -> Option<PathBuf> {
     std::env::var("PI_CODING_AGENT_DIR")
         .ok()
         .filter(|dir| !dir.is_empty())

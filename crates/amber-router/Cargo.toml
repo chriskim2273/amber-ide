@@ -1,0 +1,36 @@
+[package]
+name = "amber-router"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "amber_router"
+path = "src/lib.rs"
+
+[[bin]]
+name = "amber-router"
+path = "src/main.rs"
+
+[dependencies]
+router-core = { path = "../router-core" }
+amber = { path = "../amber" }
+axum = "0.7"
+bytes = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+eventsource-stream = "0.2"
+futures-util = "0.3"
+clap = { version = "4.6.1", features = ["derive"] }
+tracing = "0.1"
+toml = "0.8"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { version = "1", features = ["full"] }
+thiserror = "2"
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tower = "0.5"
+tempfile = "3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }

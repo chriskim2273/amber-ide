@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import {
   parseServerMsg, toDaemonEvent, ControlLink, PaneLink, createAmber,
-  type SocketLike, type PortLike, type AmberDeps,
+  type SocketLike, type PortLike, type AmberDeps, type RouterApi,
 } from './amber'
 
 class FakeSocket implements SocketLike {
@@ -234,6 +234,14 @@ describe('PaneLink', () => {
       softwareGl: false,
       layoutGet: () => Promise.resolve({ text: null, version: null }),
       layoutSave: () => Promise.resolve({ ok: true, version: null }),
+      routerApi: {
+        status: async () => '{}',
+        action: async () => ({ ok: false }),
+        slots: async () => ({ ok: true, slots: [] }),
+        saveSlots: async () => ({ ok: true }),
+        revealKey: async () => '',
+        logTail: async () => '',
+      },
     }
     const amber = createAmber(deps)
     amber.openPane('s1')
@@ -326,7 +334,19 @@ describe('createAmber', () => {
       softwareGl: false,
       layoutGet: () => Promise.resolve({ text: null, version: null }),
       layoutSave: () => Promise.resolve({ ok: true, version: null }),
+      routerApi: silentRouterApi(),
       ...overrides,
+    }
+  }
+
+  function silentRouterApi(): RouterApi {
+    return {
+      status: async () => JSON.stringify({ managed: true, unit: 'inactive', port: 7719, error: 'router unreachable' }),
+      action: async () => ({ ok: false, error: 'router unreachable' }),
+      slots: async () => ({ ok: false, error: 'router unreachable', slots: [] }),
+      saveSlots: async () => ({ ok: false, error: 'router unreachable' }),
+      revealKey: async () => '',
+      logTail: async () => '',
     }
   }
 
@@ -446,5 +466,57 @@ describe('createAmber', () => {
   it('resolvePath declines to null instead of throwing (hot path: every mouse selection)', async () => {
     const amber = createAmber(deps())
     await expect(amber.resolvePath('/', 'x')).resolves.toBeNull()
+  })
+
+  it('routerStatus is managed so the hosted desktop view shows the pill', async () => {
+    const amber = createAmber(deps({
+      routerApi: {
+        status: async () => JSON.stringify({
+          managed: true,
+          unit: 'active',
+          port: 7719,
+          url: 'http://127.0.0.1:7719/v1',
+          has_token: true,
+          pi: 'installed',
+          alias: 'auto',
+          slots: [{ id: 'a', name: 'alpha', base_url: 'http://x', model: 'm', enabled: true, has_key: true, key_hint: '••••1111' }],
+          keys: [],
+        }),
+        action: async () => ({ ok: true }),
+        slots: async () => ({ ok: true, slots: [] }),
+        saveSlots: async () => ({ ok: true }),
+        revealKey: async () => '',
+        logTail: async () => '',
+      },
+    }))
+    const s = await amber.routerStatus()
+    expect(s.managed).toBe(true)
+    expect(s.unit).toBe('active')
+    expect(s.hasToken).toBe(true)
+    expect(s.slots[0]?.hasKey).toBe(true)
+    expect(JSON.stringify(s).toLowerCase()).not.toContain('api_key')
+  })
+
+  it('routerAction and saveSlots go through the injected API', async () => {
+    const calls: unknown[] = []
+    const amber = createAmber(deps({
+      routerApi: {
+        status: async () => '{}',
+        action: async (action) => { calls.push(['action', action]); return { ok: true } },
+        slots: async () => ({ ok: true, slots: [] }),
+        saveSlots: async (slots) => { calls.push(['save', slots]); return { ok: true } },
+        revealKey: async (name) => { calls.push(['key', name]); return 'sk-secret' },
+        logTail: async () => 'log',
+      },
+    }))
+    await expect(amber.routerAction('start')).resolves.toEqual({ ok: true })
+    await expect(amber.routerSaveSlots([{ id: 'a' } as never])).resolves.toEqual({ ok: true })
+    await expect(amber.routerRevealKey('alpha')).resolves.toBe('sk-secret')
+    await expect(amber.routerLogTail()).resolves.toBe('log')
+    expect(calls).toEqual([
+      ['action', 'start'],
+      ['save', [{ id: 'a' }]],
+      ['key', 'alpha'],
+    ])
   })
 })

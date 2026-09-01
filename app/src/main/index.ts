@@ -64,6 +64,12 @@ import {
   isSupportedOnPlatform,
 } from './sshRemote'
 import { webCtlArgv, parseWebStatus, redactUrl, type WebStatus } from './webService'
+import {
+  routerCtlArgv,
+  parseRouterStatus,
+  slotFromWire,
+  type RouterStatus,
+} from './routerService'
 import { inspectLinuxInputMethod, repairLinuxInputMethod, resolveLinuxInputEnvironment } from './inputMethod'
 import clientPath from '../client/index?modulePath'
 
@@ -119,15 +125,23 @@ if (compat) {
  * unit; the dialog offers no port editor yet, so this is deliberate for now.
  */
 const WEB_PORT = 7717
+// Must match `routerctl::DEFAULT_PORT` and the shipped unit.
+const ROUTER_PORT = 7719
 
 /** Run a command and collect its output. Never rejects — callers report. */
 function runCapture(
   cmd: string,
   args: string[],
   timeoutMs?: number,
+  stdin?: string,
 ): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolveRun) => {
-    const p = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] })
+    const p = spawn(cmd, args, {
+      stdio: [stdin === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
+    })
+    if (stdin !== undefined) {
+      p.stdin?.end(stdin)
+    }
     let stdout = ''
     let stderr = ''
     let settled = false
@@ -155,8 +169,11 @@ function runCapture(
   })
 }
 
-function runAmberCapture(args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
-  return runCapture(amberBinary(), args)
+function runAmberCapture(
+  args: string[],
+  stdin?: string,
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  return runCapture(amberBinary(), args, undefined, stdin)
 }
 
 async function isSocket(path: string): Promise<boolean> {
@@ -251,6 +268,14 @@ async function preflightLinuxInputMethod(): Promise<boolean> {
 
 function amberBinary(): string {
   return resolveAmberBinary(process.env, app.isPackaged, process.resourcesPath)
+}
+
+/** The bundled `amber-router`, which ships beside `amber` in resources/bin. */
+function routerBinary(): string {
+  const override = process.env['AMBER_ROUTER_BIN']
+  if (override && override.length > 0) return override
+  const name = process.platform === 'win32' ? 'amber-router.exe' : 'amber-router'
+  return app.isPackaged ? join(process.resourcesPath, 'bin', name) : name
 }
 
 function amberDaemonBinary(): string {
@@ -376,6 +401,15 @@ async function installDaemon(socket?: string): Promise<void> {
     const stable = join(home, '.local', 'bin', 'amber')
     await mkdir(dirname(stable), { recursive: true })
     await installBinary(amberBinary(), stable)
+    // The router ships beside amber and must be installed beside it too:
+    // `routerctl::sibling_binary` resolves it relative to the running amber,
+    // so without this `amber ctl router enable` bails on every packaged
+    // install. Best-effort — a missing router must never block the daemon.
+    try {
+      await installBinary(routerBinary(), join(home, '.local', 'bin', 'amber-router'))
+    } catch (e) {
+      process.stderr.write(`amber: could not install amber-router: ${String(e)}\n`)
+    }
     // These repairs are independent and strictly best-effort: neither changes
     // daemon lifecycle, and a failed Codex repair must not skip Pi's hook.
     await repairAgentExtensions((args) => runCapture(stable, args), (warning) => {
@@ -1245,6 +1279,107 @@ async function main(): Promise<void> {
     if (url.length === 0) return
     console.log('[amber] opening', redactUrl(url))
     await shell.openExternal(url)
+  })
+
+  // ---- local router (design 2026-09-01) --------------------------------
+  //
+  // Same posture as remote access: the app is a CONTROLLER. `amber-router` is
+  // boot-managed by its own unit, and every call here shells to `amber ctl
+  // router`, which owns the unit file, the 0600 slot file and the token.
+  //
+  // Slot editing goes through the CLI rather than the router's HTTP admin API
+  // so the bearer token never enters this process or an IPC trace — the same
+  // reason `web:url` is on-demand only.
+
+  ipcMain.handle('router:status', async (): Promise<RouterStatus> => {
+    const { stdout } = await runAmberCapture(routerCtlArgv('status', ROUTER_PORT))
+    return parseRouterStatus(stdout)
+  })
+
+  ipcMain.handle('router:action', async (_e, action: unknown) => {
+    // Allowlist, not passthrough: this argument crosses the renderer boundary
+    // and is spliced into an argv.
+    const allowed = [
+      'start',
+      'stop',
+      'restart',
+      'enable',
+      'disable',
+      'rotate-token',
+      'install-pi-provider',
+    ]
+    if (typeof action !== 'string' || !allowed.includes(action)) {
+      return { ok: false, error: `unknown action ${String(action)}` }
+    }
+    const { code, stderr } = await runAmberCapture(routerCtlArgv(action, ROUTER_PORT))
+    return code === 0 ? { ok: true } : { ok: false, error: stderr.trim() || `exit ${code}` }
+  })
+
+  ipcMain.handle('router:slots', async () => {
+    const { code, stdout, stderr } = await runAmberCapture([
+      'ctl',
+      'router',
+      'slots',
+      '--port',
+      String(ROUTER_PORT),
+    ])
+    if (code !== 0) return { ok: false, error: stderr.trim() || `exit ${code}`, slots: [] }
+    try {
+      const parsed = JSON.parse(stdout) as { slots?: unknown }
+      // Map here, not in the renderer: the wire is snake_case and the UI shape
+      // is camelCase, and passing the raw object through left `hasKey`
+      // undefined so every stored key rendered as "no key yet".
+      return {
+        ok: true,
+        slots: Array.isArray(parsed.slots)
+          ? (parsed.slots as Record<string, unknown>[]).map(slotFromWire)
+          : [],
+      }
+    } catch {
+      return { ok: false, error: 'could not parse the router slot list', slots: [] }
+    }
+  })
+
+  ipcMain.handle('router:saveSlots', async (_e, slots: unknown) => {
+    if (!Array.isArray(slots)) return { ok: false, error: 'expected a slot list' }
+    const { code, stderr } = await runAmberCapture(
+      ['ctl', 'router', 'set-slots', '--port', String(ROUTER_PORT)],
+      JSON.stringify({ slots }),
+    )
+    return code === 0 ? { ok: true } : { ok: false, error: stderr.trim() || `exit ${code}` }
+  })
+
+  // On-demand ONLY, behind a deliberate Reveal gesture — never on the poll.
+  ipcMain.handle('router:revealKey', async (_e, name: unknown) => {
+    if (typeof name !== 'string' || name.length === 0) return ''
+    const { code, stdout } = await runAmberCapture([
+      'ctl',
+      'router',
+      'key',
+      name,
+      '--port',
+      String(ROUTER_PORT),
+    ])
+    return code === 0 ? stdout.trim() : ''
+  })
+
+  ipcMain.handle('router:logTail', async (): Promise<string> => {
+    if (process.platform === 'linux') {
+      const { stdout, stderr } = await runCapture('journalctl', [
+        '--user',
+        '-u',
+        'amber-router.service',
+        '-n',
+        '200',
+        '--no-pager',
+      ])
+      return stdout || stderr
+    }
+    try {
+      return await readFile(join(homedir(), 'Library', 'Logs', 'amber-router.log'), 'utf8')
+    } catch (e) {
+      return `no log available: ${String(e)}`
+    }
   })
 
   ipcMain.handle('pick-folder', async () => {

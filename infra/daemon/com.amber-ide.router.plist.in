@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Template: __AMBER_ROUTER_BIN__ is substituted with the installed path. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.amber-ide.router</string>
+    <!-- Binds 127.0.0.1 ONLY. It holds real provider API keys. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__AMBER_ROUTER_BIN__</string>
+        <string>serve</string>
+        <string>--port</string>
+        <string>7719</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <!-- launchd has no journal; the desktop log panel reads this file. -->
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/amber-router.log</string>
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/amber-router.log</string>
+</dict>
+</plist>

@@ -71,7 +71,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
@@ -84,6 +84,8 @@ use crate::transport::{self, LocalReader, LocalWriter};
 
 use crate::layout_cas;
 use crate::mosaic;
+use crate::router_ops;
+use crate::routerctl;
 
 // ---- constant-time comparison ------------------------------------------
 
@@ -138,8 +140,8 @@ impl Request {
     }
 }
 
-/// Largest accepted request head + body. The browser only ever POSTs a token,
-/// so anything larger is hostile/garbage.
+/// Largest accepted request head + body. Auth is a short token; slot saves
+/// are a small JSON list. Anything larger is hostile/garbage.
 pub const MAX_REQUEST_LEN: usize = 32 * 1024;
 
 /// Parse one complete request from `buf`. `Ok(None)` means "need more bytes".
@@ -455,7 +457,20 @@ fn random_token() -> std::io::Result<String> {
 /// Load the web token from `<root>/web-token`, creating it (mode 0600) if it
 /// is missing/empty or `regenerate` is set (`amber web --new-token`).
 pub fn load_or_create_token(root: &Path, regenerate: bool) -> anyhow::Result<String> {
-    let path = root.join(TOKEN_FILE);
+    load_or_create_secret(root, TOKEN_FILE, regenerate)
+}
+
+/// Mint-or-read a 0600 random token under an arbitrary state-root filename.
+///
+/// The web token is one caller; the router has its own file with the same
+/// discipline, and duplicating this platform dance is how one of the two
+/// quietly loses the privacy check.
+pub fn load_or_create_secret(
+    root: &Path,
+    file: &str,
+    regenerate: bool,
+) -> anyhow::Result<String> {
+    let path = root.join(file);
     #[cfg(windows)]
     {
         std::fs::create_dir_all(root)?;
@@ -463,7 +478,7 @@ pub fn load_or_create_token(root: &Path, regenerate: bool) -> anyhow::Result<Str
         let stored = crate::platform::load_or_create_user_private(&path, candidate.as_bytes(), regenerate)?;
         let token = String::from_utf8(stored)?.trim().to_string();
         if token.is_empty() {
-            anyhow::bail!("refusing an empty private web token at {}", path.display());
+            anyhow::bail!("refusing an empty private token at {}", path.display());
         }
         Ok(token)
     }
@@ -491,22 +506,33 @@ pub fn load_or_create_token(root: &Path, regenerate: bool) -> anyhow::Result<Str
     }
 }
 
+
 /// Read the token WITHOUT creating one.
 ///
 /// `load_or_create_token` mints a credential as a side effect, which is wrong
 /// for a read-only query: `amber ctl web status` must be able to report "no
 /// token yet" rather than manufacture one.
 pub fn load_token(root: &Path) -> Option<String> {
+    read_secret(root, TOKEN_FILE)
+}
+
+/// Replace a 0600 state-root secret file.
+pub fn write_secret(root: &Path, file: &str, bytes: &[u8]) -> anyhow::Result<()> {
+    crate::platform::write_user_private(&root.join(file), bytes)
+}
+
+/// Read a 0600 state-root secret without ever creating one.
+pub fn read_secret(root: &Path, file: &str) -> Option<String> {
     #[cfg(windows)]
     {
-        let raw = crate::platform::read_user_private(&root.join(TOKEN_FILE)).ok()??;
+        let raw = crate::platform::read_user_private(&root.join(file)).ok()??;
         let trimmed = std::str::from_utf8(&raw).ok()?.trim();
         (!trimmed.is_empty()).then(|| trimmed.to_string())
     }
 
     #[cfg(unix)]
     {
-    let raw = std::fs::read_to_string(root.join(TOKEN_FILE)).ok()?;
+    let raw = std::fs::read_to_string(root.join(file)).ok()?;
     let trimmed = raw.trim();
     if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
     }
@@ -575,6 +601,59 @@ impl Auth {
             .iter()
             .fold(false, |ok, s| ct_eq(s.as_bytes(), value.as_bytes()) | ok)
     }
+
+    /// Cookie session *or* a real `tailscale serve` hop. Funnel, LAN, and
+    /// tagged-node Serve traffic have no identity header and still need the
+    /// fragment token.
+    fn authorized(&self, peer: IpAddr, req: &Request) -> bool {
+        self.valid_cookie(req) || serve_identity_ok(peer, req)
+    }
+}
+
+/// True when this request was proxied by Tailscale Serve from a user-owned
+/// tailnet device.
+///
+/// Serve strips any client `Tailscale-User-*` and injects its own. Funnel
+/// (public) and tagged devices do not get a login header — those still use
+/// the fragment token. The peer must be loopback because Serve (and only
+/// Serve, after the LAN proxy strips these headers) talks to us on
+/// 127.0.0.1.
+pub fn serve_identity_ok(peer: IpAddr, req: &Request) -> bool {
+    if !peer.is_loopback() {
+        return false;
+    }
+    let login = req.header("tailscale-user-login").unwrap_or("").trim();
+    if login.is_empty() {
+        return false;
+    }
+    if req.header("x-forwarded-proto") != Some("https") {
+        return false;
+    }
+    ts_net_host(
+        req.header("x-forwarded-host")
+            .or_else(|| req.header("host")),
+    )
+}
+
+/// MagicDNS Serve host: `device.tailnet.ts.net`, optional `:port`.
+fn ts_net_host(host: Option<&str>) -> bool {
+    let Some(raw) = host else { return false };
+    let first = raw.trim().split(',').next().unwrap_or("").trim();
+    let host = first
+        .strip_prefix('[')
+        .and_then(|s| s.split_once(']'))
+        .map(|(h, _)| h)
+        .unwrap_or(first);
+    let host = match host.rsplit_once(':') {
+        Some((h, port)) if port.chars().all(|c| c.is_ascii_digit()) => h,
+        _ => host,
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host.len() <= ".ts.net".len() || host.contains('/') || host.contains('\\') || host.contains(' ')
+    {
+        return false;
+    }
+    host.ends_with(".ts.net") && !host.starts_with('.')
 }
 
 // ---- the daemon-connection hub -----------------------------------------
@@ -1322,6 +1401,20 @@ fn respond(
     stream.flush()
 }
 
+fn router_err(stream: &mut TcpStream, err: router_ops::OpsError) -> std::io::Result<()> {
+    let status = match err.status {
+        400 => "400 Bad Request",
+        404 => "404 Not Found",
+        501 => "501 Not Implemented",
+        502 => "502 Bad Gateway",
+        503 => "503 Service Unavailable",
+        _ if err.status >= 500 => "500 Internal Server Error",
+        _ => "400 Bad Request",
+    };
+    let body = serde_json::json!({ "ok": false, "error": err.message }).to_string();
+    respond(stream, status, CT_JSON, &[], body.as_bytes())
+}
+
 fn handle_conn(
     mut stream: TcpStream,
     hub: &Arc<Hub>,
@@ -1343,7 +1436,8 @@ fn handle_conn(
         buf.extend_from_slice(&chunk[..n]);
     };
 
-    match (req.method.as_str(), req.path.as_str()) {
+    let (path, query) = req.path.split_once('?').unwrap_or((req.path.as_str(), ""));
+    match (req.method.as_str(), path) {
         ("POST", "/api/auth") => {
             if auth.throttled(peer) {
                 return Ok(respond(&mut stream, "429 Too Many Requests", "", &[], b"")?);
@@ -1364,7 +1458,7 @@ fn handle_conn(
             Ok(())
         }
         ("GET", "/api/sessions") => {
-            if !auth.valid_cookie(&req) {
+            if !auth.authorized(peer, &req) {
                 return Ok(respond(&mut stream, "401 Unauthorized", "", &[], b"")?);
             }
             let body = hub.sessions_json();
@@ -1373,7 +1467,7 @@ fn handle_conn(
         // Operator status for `amber ctl web status` (spec §9.3). Same cookie
         // boundary as `/api/sessions`; carries no secret of its own.
         ("GET", "/api/status") => {
-            if !auth.valid_cookie(&req) {
+            if !auth.authorized(peer, &req) {
                 return Ok(respond(&mut stream, "401 Unauthorized", "", &[], b"")?);
             }
             let body = hub.status_json(port);
@@ -1386,7 +1480,7 @@ fn handle_conn(
         // the server cannot know), unlike Electron's main process which reads
         // its OWN compat marker.
         ("GET", "/api/bootstrap") => {
-            if !auth.valid_cookie(&req) {
+            if !auth.authorized(peer, &req) {
                 return Ok(respond(&mut stream, "401 Unauthorized", "", &[], b"")?);
             }
             // A boot-managed `amber web` can start with a minimal env (the
@@ -1404,7 +1498,7 @@ fn handle_conn(
         // through `layout_cas`, which re-checks the version under the same
         // call that renames the file into place — never a plain overwrite.
         ("GET", "/api/layout") => {
-            if !auth.valid_cookie(&req) {
+            if !auth.authorized(peer, &req) {
                 return Ok(respond(&mut stream, "401 Unauthorized", "", &[], b"")?);
             }
             let loaded = layout_cas::load(&hub.root);
@@ -1412,7 +1506,7 @@ fn handle_conn(
             Ok(respond(&mut stream, "200 OK", CT_JSON, &[], body.as_bytes())?)
         }
         ("POST", "/api/layout") => {
-            if !auth.valid_cookie(&req) {
+            if !auth.authorized(peer, &req) {
                 return Ok(respond(&mut stream, "401 Unauthorized", "", &[], b"")?);
             }
             let Ok(body) = serde_json::from_slice::<serde_json::Value>(&req.body) else {
@@ -1438,8 +1532,74 @@ fn handle_conn(
                 }
             }
         }
+        // Hosted `/app` desktop view: the same pill/dialog as Electron, behind
+        // the same cookie as `/api/sessions`. The router's bearer token is
+        // loaded here and never sent to the browser. Keys appear only on the
+        // explicit reveal GET, never on the polled status.
+        ("GET", "/api/router/status") => {
+            if !auth.authorized(peer, &req) {
+                return Ok(respond(&mut stream, "401 Unauthorized", "", &[], b"")?);
+            }
+            let body = router_ops::status_json(&hub.root, routerctl::DEFAULT_PORT);
+            Ok(respond(&mut stream, "200 OK", CT_JSON, &[], body.as_bytes())?)
+        }
+        ("GET", "/api/router/slots") => {
+            if !auth.authorized(peer, &req) {
+                return Ok(respond(&mut stream, "401 Unauthorized", "", &[], b"")?);
+            }
+            match router_ops::slots_json(&hub.root, routerctl::DEFAULT_PORT) {
+                Ok(body) => Ok(respond(&mut stream, "200 OK", CT_JSON, &[], body.as_bytes())?),
+                Err(e) => Ok(router_err(&mut stream, e)?),
+            }
+        }
+        ("PUT", "/api/router/slots") => {
+            if !auth.authorized(peer, &req) {
+                return Ok(respond(&mut stream, "401 Unauthorized", "", &[], b"")?);
+            }
+            let text = std::str::from_utf8(&req.body).unwrap_or("");
+            match router_ops::set_slots(&hub.root, routerctl::DEFAULT_PORT, text) {
+                Ok(body) => Ok(respond(&mut stream, "200 OK", CT_JSON, &[], body.as_bytes())?),
+                Err(e) => Ok(router_err(&mut stream, e)?),
+            }
+        }
+        ("GET", "/api/router/key") => {
+            if !auth.authorized(peer, &req) {
+                return Ok(respond(&mut stream, "401 Unauthorized", "", &[], b"")?);
+            }
+            let name = router_ops::query_param(query, "name").unwrap_or("");
+            match router_ops::reveal_key(&hub.root, routerctl::DEFAULT_PORT, name) {
+                Ok(key) => {
+                    let body = serde_json::json!({ "api_key": key }).to_string();
+                    Ok(respond(&mut stream, "200 OK", CT_JSON, &[], body.as_bytes())?)
+                }
+                Err(e) => Ok(router_err(&mut stream, e)?),
+            }
+        }
+        ("GET", "/api/router/log") => {
+            if !auth.authorized(peer, &req) {
+                return Ok(respond(&mut stream, "401 Unauthorized", "", &[], b"")?);
+            }
+            let body = router_ops::log_tail();
+            Ok(respond(&mut stream, "200 OK", "text/plain; charset=utf-8", &[], body.as_bytes())?)
+        }
+        ("POST", "/api/router/action") => {
+            if !auth.authorized(peer, &req) {
+                return Ok(respond(&mut stream, "401 Unauthorized", "", &[], b"")?);
+            }
+            let action = serde_json::from_slice::<serde_json::Value>(&req.body)
+                .ok()
+                .and_then(|v| v.get("action").and_then(|a| a.as_str()).map(str::to_string))
+                .unwrap_or_default();
+            match router_ops::run_action(&hub.root, routerctl::DEFAULT_PORT, &action) {
+                Ok(()) => {
+                    let out = serde_json::json!({ "ok": true }).to_string();
+                    Ok(respond(&mut stream, "200 OK", CT_JSON, &[], out.as_bytes())?)
+                }
+                Err(e) => Ok(router_err(&mut stream, e)?),
+            }
+        }
         ("GET", "/ws") => {
-            if !auth.valid_cookie(&req) {
+            if !auth.authorized(peer, &req) {
                 return Ok(respond(&mut stream, "401 Unauthorized", "", &[], b"")?);
             }
             // Defence in depth (spec §3.5): a malicious page on the phone must
@@ -1678,6 +1838,61 @@ mod tests {
             Some("127.0.0.1:7717"),
             Some("box.ts.net")
         ));
+    }
+
+    fn serve_req(extra: &[u8]) -> Request {
+        let mut buf = b"GET /api/sessions HTTP/1.1\r\nHost: 127.0.0.1:7717\r\n".to_vec();
+        buf.extend_from_slice(extra);
+        buf.extend_from_slice(b"\r\n");
+        parse_request(&buf).unwrap().unwrap()
+    }
+
+    #[test]
+    fn serve_identity_ok_accepts_a_real_serve_hop() {
+        let req = serve_req(
+            b"X-Forwarded-Proto: https\r\n\
+              X-Forwarded-Host: teapot-dev.tail3d57b4.ts.net\r\n\
+              Tailscale-User-Login: alice@github\r\n",
+        );
+        assert!(serve_identity_ok("127.0.0.1".parse().unwrap(), &req));
+        assert!(serve_identity_ok("::1".parse().unwrap(), &req));
+    }
+
+    #[test]
+    fn serve_identity_ok_rejects_funnel_lan_and_spoofs() {
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        let real = serve_req(
+            b"X-Forwarded-Proto: https\r\n\
+              X-Forwarded-Host: teapot-dev.tail3d57b4.ts.net\r\n\
+              Tailscale-User-Login: alice@github\r\n",
+        );
+        assert!(!serve_identity_ok("8.8.8.8".parse().unwrap(), &real));
+
+        let funnel = serve_req(
+            b"X-Forwarded-Proto: https\r\nX-Forwarded-Host: teapot-dev.tail3d57b4.ts.net\r\n",
+        );
+        assert!(!serve_identity_ok(loopback, &funnel));
+
+        let http = serve_req(
+            b"X-Forwarded-Proto: http\r\n\
+              X-Forwarded-Host: teapot-dev.tail3d57b4.ts.net\r\n\
+              Tailscale-User-Login: alice@github\r\n",
+        );
+        assert!(!serve_identity_ok(loopback, &http));
+
+        let evil = serve_req(
+            b"X-Forwarded-Proto: https\r\n\
+              X-Forwarded-Host: evil.example\r\n\
+              Tailscale-User-Login: alice@github\r\n",
+        );
+        assert!(!serve_identity_ok(loopback, &evil));
+
+        let empty = serve_req(
+            b"X-Forwarded-Proto: https\r\n\
+              X-Forwarded-Host: teapot-dev.tail3d57b4.ts.net\r\n\
+              Tailscale-User-Login:   \r\n",
+        );
+        assert!(!serve_identity_ok(loopback, &empty));
     }
 
     /// Build a `SessionInfo` for the tests below with only the fields the

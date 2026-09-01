@@ -39,6 +39,8 @@
 
 import type { LoadLayoutResult, SaveLayoutResult, LayoutVersion } from '../shared/layoutFile'
 import type { WebStatus } from '../shared/webStatus'
+import type { RouterSlot, RouterStatus } from '../shared/routerStatus'
+import { parseRouterStatus } from '../shared/routerStatus'
 
 export interface SocketLike {
   send(data: string | Uint8Array): void
@@ -413,6 +415,18 @@ export interface AmberDeps {
   // `/api/sessions`.
   layoutGet: () => Promise<LoadLayoutResult>
   layoutSave: (text: string, version: LayoutVersion) => Promise<SaveLayoutResult>
+  // Cookie-gated `/api/router/*` on `amber web`. Injected so this file stays
+  // fetch-free; `install.ts` supplies the real wrappers.
+  routerApi: RouterApi
+}
+
+export interface RouterApi {
+  status: () => Promise<string>
+  action: (action: string) => Promise<{ ok: boolean; error?: string }>
+  slots: () => Promise<{ ok: boolean; error?: string; slots: RouterSlot[] }>
+  saveSlots: (slots: unknown[]) => Promise<{ ok: boolean; error?: string }>
+  revealKey: (name: string) => Promise<string>
+  logTail: () => Promise<string>
 }
 
 function notImplemented(name: string): () => never {
@@ -560,6 +574,21 @@ export function createAmber(deps: AmberDeps): WebAmber {
     webUrl: (): Promise<string> => Promise.resolve(''),
     webLogTail: (): Promise<string> => Promise.resolve(''),
     webOpenLocal: (): Promise<void> => Promise.resolve(),
+
+    // --- local router (design 2026-09-01, hosted desktop view 2026-09-01) --
+    // Same cookie boundary as `/api/sessions`. The shim never holds the
+    // router's bearer token; `amber web` loads it server-side. Keys arrive
+    // only from `revealKey`, on a deliberate press.
+    routerStatus: async (): Promise<RouterStatus> =>
+      parseRouterStatus(await deps.routerApi.status()),
+    routerAction: (action: string): Promise<{ ok: boolean; error?: string }> =>
+      deps.routerApi.action(action),
+    routerSlots: (): Promise<{ ok: boolean; error?: string; slots: RouterSlot[] }> =>
+      deps.routerApi.slots(),
+    routerSaveSlots: (slots: RouterSlot[]): Promise<{ ok: boolean; error?: string }> =>
+      deps.routerApi.saveSlots(slots),
+    routerRevealKey: (name: string): Promise<string> => deps.routerApi.revealKey(name),
+    routerLogTail: (): Promise<string> => deps.routerApi.logTail(),
   }
   return {
     ...api,

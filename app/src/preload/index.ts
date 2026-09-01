@@ -100,6 +100,17 @@ contextBridge.exposeInMainWorld('amber', {
   webUrl: (): Promise<string> => ipcRenderer.invoke('web:url'),
   webLogTail: (): Promise<string> => ipcRenderer.invoke('web:logTail'),
   webOpenLocal: (): Promise<void> => ipcRenderer.invoke('web:openLocal'),
+  // ---- local router
+  routerStatus: (): Promise<unknown> => ipcRenderer.invoke('router:status'),
+  routerAction: (action: string): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('router:action', action),
+  routerSlots: (): Promise<{ ok: boolean; error?: string; slots: unknown[] }> =>
+    ipcRenderer.invoke('router:slots'),
+  routerSaveSlots: (slots: unknown[]): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('router:saveSlots', slots),
+  routerRevealKey: (name: string): Promise<string> =>
+    ipcRenderer.invoke('router:revealKey', name),
+  routerLogTail: (): Promise<string> => ipcRenderer.invoke('router:logTail'),
   editorOpenDialog: (): Promise<
     { path: string; text: string; mtimeMs: number } | { path: string; error: string } | null
   > => ipcRenderer.invoke('editor-open-dialog'),
