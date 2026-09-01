@@ -77,7 +77,7 @@ import { BrowserDaemonWatcher } from './browserDaemonWatcher'
 import { Connection } from '../client/connection'
 import { TabBrowserStateStore } from './tabBrowserStateStore'
 import { commitBrowserLayoutMutation, coordinateTabBrowserMigration } from './tabBrowserMigrationCoordinator'
-import { bindRendererBrowserCommand, deriveActiveBrowserId } from './browserAssociationAuthority'
+import { bindRendererBrowserCommand, deriveActiveBrowserId, removedBrowserIds } from './browserAssociationAuthority'
 import { parseLayout, serializeLayout } from '../shared/layoutFile'
 import clientPath from '../client/index?modulePath'
 
@@ -1541,11 +1541,7 @@ async function main(): Promise<void> {
       : await saveLayoutFile(layoutPath(), text, version)
     if ('ok' in result && sender) sender.activeBrowserId = deriveActiveBrowserId(nextLayout)
     if ('ok' in result && browserChanged && tabBrowser && currentLayout) {
-      const associated = (layout: typeof nextLayout): Set<string> => new Set(Object.values(layout.workspaces).flatMap((workspace) => Object.values(workspace.tabs).flatMap((tab) => tab.browser ? [tab.browser.id] : [])))
-      const nextIds = associated(nextLayout)
-      for (const id of associated(currentLayout)) {
-        if (!nextIds.has(id)) await tabBrowser.command({ type: 'close', id }).catch(() => {})
-      }
+      for (const id of removedBrowserIds(currentLayout, nextLayout)) await tabBrowser.command({ type: 'close', id }).catch(() => {})
     }
     return result
   })

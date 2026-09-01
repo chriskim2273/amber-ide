@@ -1,6 +1,15 @@
 import type { LayoutFile } from '../shared/layoutFile'
 import type { TabBrowserCommand } from './tabBrowserService'
 
+function browserIds(layout: LayoutFile): Set<string> {
+  return new Set(Object.values(layout.workspaces).flatMap((workspace) => Object.values(workspace.tabs).flatMap((tab) => tab.browser ? [tab.browser.id] : [])))
+}
+
+export function removedBrowserIds(before: LayoutFile, after: LayoutFile): string[] {
+  const next = browserIds(after)
+  return [...browserIds(before)].filter((id) => !next.has(id)).sort()
+}
+
 export function deriveActiveBrowserId(layout: LayoutFile): string | null {
   const workspace = layout.workspaces[String(layout.activeWorkspace)]
   return workspace?.tabs[String(workspace.activeTab)]?.browser?.id ?? null
