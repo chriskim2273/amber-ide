@@ -82,5 +82,7 @@ Rust `--workspace`: all suites green (430 lib + every integration suite);
   `app/scripts/dist.sh` asserts both artifacts are static — but neither has been
   exercised. **`sudo apt install musl-tools`, then run `npm run dist`.**
 - macOS/Windows unit install paths are rendered and unit-tested, never run.
+- The Windows CI job asserts "both shipped Rust binaries"; it now builds three,
+  and `ring` on MSVC is a newly exercised surface there.
 - `enable`/`disable` write a real unit into `~/.config/systemd/user/`; not run.
 - No `amber web`/mobile router surface by design (desktop-only authority).

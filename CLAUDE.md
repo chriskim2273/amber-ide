@@ -1435,6 +1435,77 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   utility client and suppresses reconnect. See
   `docs/superpowers/specs/2026-08-27-windows-verification.md`.
 
+- [x] Native token router (2026-09-01) — `~/Projects/token-router` brought in as
+  a first-class amber feature: one OpenAI-compatible endpoint on 127.0.0.1 in
+  front of many providers, tried in a **user-ordered chain**, with a toolbar
+  pill and an editing dialog. Spec:
+  `docs/superpowers/specs/2026-09-01-token-router-design.md`; report
+  `.reports/token-router.md`. **The daemon is untouched** — no protocol change,
+  no new control message, no session involvement: the router is its own
+  boot-managed service (`amber-router.service` / `com.amber-ide.router`) on its
+  own listener, so a wedged upstream can never backpressure a pty. token-router
+  was vendored NEAR-VERBATIM into `crates/router-core` + `crates/amber-router`
+  (proxy, selector, SSE first-frame gate, key health, taxonomy) **with its 1.6k
+  lines of tests**: rewriting that failover/streaming logic std-only was
+  considered and rejected. That brings tokio/axum/reqwest-rustls into the
+  workspace for the FIRST time — confined to the router binary; `amber` and
+  `amberd` stay std-only. **`amber-router` does depend on the `amber` crate**,
+  for the 0600 private-file helpers only (`write_user_private`'s Windows
+  reparse/DACL checks, the race-safe create) — a deliberate size-for-safety
+  trade, recorded rather than discovered at packaging. On top of the vendored
+  code: config in `<state>/router.toml` (0600, **tmp+rename** — the in-place
+  write `write_user_private` does would truncate a file holding every provider
+  key on a crash), hot reload behind an `RwLock<Arc<AppState>>` so an edit never
+  yanks the registry out from under an in-flight stream, a bearer-authed admin
+  API, and its own token in `<state>/router-token`.
+  **A slot is a provider** (name, base_url, key, model) and **slot order IS the
+  failover order** for one implicit `auto` alias; each slot also gets a
+  single-entry alias so a caller can pin it. Slots carry a **stable `id`**,
+  which is load-bearing, not bookkeeping: the dialog only ever sees a masked
+  key, so a save round-trips a blank one meaning "unchanged", and under
+  name-matching a rename is indistinguishable from a new slot — renaming would
+  silently drop the credential. `store::ensure_ids` migrates legacy id-less
+  configs once. **Pi ignores `OPENAI_BASE_URL`** (verified in the installed
+  0.84.4 bundle: the only base-URL env vars it reads are the Azure trio), so
+  registration is an amber-OWNED entry in `~/.pi/agent/models.json` — every
+  other provider preserved byte-for-byte — whose `apiKey` is Pi's `!<command>`
+  escape reading the 0600 token file, so **the token is never copied and
+  rotation needs no re-registration**. Pi's `models` entries must be OBJECTS;
+  id strings make Pi discard the whole file with a warning. No supervisor/argv
+  change: a Pi pane launches exactly as before and the user selects the
+  provider. Claude/Codex/Grok/OpenCode are deliberately out of scope (env
+  injection through `manager.rs`'s spawn env is a much larger blast radius).
+  App: `shared/routerStatus.ts` (with `managed` from day one — the web build
+  hides the pill rather than painting it red), `main/routerService.ts`,
+  IPC + preload, `RouterPanel.tsx` on the repo's own `.help-overlay`/
+  `.help-card` shell, ↑/↓ reorder rather than drag. **Slot editing goes through
+  `amber ctl router slots|set-slots|key`, not the admin API, so the bearer token
+  never enters the desktop process or an IPC trace.** Gates: Rust workspace
+  green ×2 + clippy `--workspace --all-targets` clean, app **711 tests** +
+  typecheck + `build` + `build:web`. **Live-verified** against an isolated
+  private daemon/router/upstream: failover past a 429
+  (`x-router-attempts: beta#0:cooldown:429,alpha#0:success:200`), SSE arriving
+  incrementally (400 ms apart, not one blob), reorder taking effect with no
+  restart, 0600 on both secrets, status minting no token and leaking no key,
+  401 unauthenticated, and **`pi --provider amber-router` returning a real
+  answer through the chain**. In the live GUI (xvfb+CDP): pill, dialog on the
+  real overlay classes, masked hints with no key anywhere in the DOM, **↑
+  rewriting `router.toml` on disk**, Reveal behind its gesture, and no toolbar
+  overflow at 1024/1100/1400 px. Seven bugs were found by testing and fixed —
+  a disabled slot losing its model, Pi's object-vs-string models, the legacy
+  id migration, `has_key` never reaching the UI, a save sending camelCase,
+  `rotate-token` claiming a restart that did not happen, and the non-atomic
+  config write. **Still open: the static-musl release is UNVERIFIED** —
+  `amber-router` links `ring`, which needs a musl C toolchain, and this box has
+  no `musl-gcc` (`musl-tools` not installed); `scripts/dist.sh` exports
+  `CC_x86_64_unknown_linux_musl` when present and `app/scripts/dist.sh` asserts
+  both artifacts are static, but neither has been run. Also unrun: the
+  macOS/Windows unit paths (rendered + unit-tested only), `enable`/`disable`
+  against a real systemd, and the Windows CI binary assertion, which now needs
+  to cover three binaries and newly exercises `ring` on MSVC. By design there is
+  no `amber web`/mobile router surface (desktop-only authority, the same call as
+  preset input slots).
+
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**
   `std::io::Read` (dedicated thread); `take_writer()` is one-shot;

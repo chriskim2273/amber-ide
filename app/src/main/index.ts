@@ -270,6 +270,14 @@ function amberBinary(): string {
   return resolveAmberBinary(process.env, app.isPackaged, process.resourcesPath)
 }
 
+/** The bundled `amber-router`, which ships beside `amber` in resources/bin. */
+function routerBinary(): string {
+  const override = process.env['AMBER_ROUTER_BIN']
+  if (override && override.length > 0) return override
+  const name = process.platform === 'win32' ? 'amber-router.exe' : 'amber-router'
+  return app.isPackaged ? join(process.resourcesPath, 'bin', name) : name
+}
+
 function amberDaemonBinary(): string {
   return resolveAmberDaemonBinary(process.env, app.isPackaged, process.resourcesPath)
 }
@@ -393,6 +401,15 @@ async function installDaemon(socket?: string): Promise<void> {
     const stable = join(home, '.local', 'bin', 'amber')
     await mkdir(dirname(stable), { recursive: true })
     await installBinary(amberBinary(), stable)
+    // The router ships beside amber and must be installed beside it too:
+    // `routerctl::sibling_binary` resolves it relative to the running amber,
+    // so without this `amber ctl router enable` bails on every packaged
+    // install. Best-effort — a missing router must never block the daemon.
+    try {
+      await installBinary(routerBinary(), join(home, '.local', 'bin', 'amber-router'))
+    } catch (e) {
+      process.stderr.write(`amber: could not install amber-router: ${String(e)}\n`)
+    }
     // These repairs are independent and strictly best-effort: neither changes
     // daemon lifecycle, and a failed Codex repair must not skip Pi's hook.
     await repairAgentExtensions((args) => runCapture(stable, args), (warning) => {

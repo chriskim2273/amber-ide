@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { moveSlot, parseRouterStatus, routerCtlArgv, routerDot, slotFromWire, slotToWire } from './routerService'
+import { parseRouterStatus, routerCtlArgv } from './routerService'
+import { moveSlot, routerDot, slotFromWire, slotToWire } from '../shared/routerStatus'
 import type { RouterSlot, RouterStatus } from '../shared/routerStatus'
 
 const base: RouterStatus = {

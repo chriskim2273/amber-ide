@@ -50,7 +50,6 @@ name = "amber-router"
 version = "0.0.2"
 dependencies = [
  "amber",
- "amber-core",
  "anyhow",
  "axum",
  "bytes",

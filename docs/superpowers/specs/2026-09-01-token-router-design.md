@@ -1,6 +1,7 @@
 # Native token router — design
 
-**Status:** planned (2026-09-01).
+**Status:** implemented (2026-09-01). Sections below were corrected after
+implementation to describe what actually shipped, not the pre-build plan.
 
 ## Context
 
@@ -18,6 +19,7 @@ my own routing table" capability.
 
 Decisions locked with the user:
 
+- **Port:** 7719 (`routerctl::DEFAULT_PORT`, matching the shipped units).
 - **Runtime:** vendor token-router as a **third binary** in the amber workspace,
   keeping tokio/axum/reqwest-rustls. Rewriting the failover + SSE gate std-only
   was rejected as needless risk.
@@ -60,14 +62,17 @@ Changes made on top of the vendored code:
    so an edit from the GUI takes effect without dropping in-flight streams.
    Existing leases finish against the old registry; new requests use the new one.
 3. **Admin surface** (loopback, bearer-authed, same token as `/stats`):
-   `GET /admin/config` → slots **with keys masked** (`has_key`, last 4 chars);
-   `PUT /admin/config` → full slot list (add / edit / delete / reorder in one
-   atomic write, mirroring the `layout_cas.rs` conflict discipline);
-   `POST /admin/reload`.
-   No endpoint ever returns a plaintext key; a dedicated `GET /admin/key/<n>`
-   behind an explicit user gesture is the only reveal path, matching how
-   `web:url` fetches the web token on demand only.
-4. **Auth token** in `<state-root>/router-token`, 0600, minted the same way as
+   `GET /admin/slots` → slots **with keys masked** (`has_key` plus a
+   `••••1234` hint); `PUT /admin/slots` → the full list (add / edit / delete /
+   reorder are all this one call, so the order on screen is the order on disk
+   with no merge to get wrong); `POST /admin/reload`; `GET /admin/status` for
+   the pill and dialog. No endpoint ever returns a plaintext key —
+   `GET /admin/slots/<name>/key`, behind an explicit user gesture, is the only
+   reveal path, matching how `web:url` fetches the web token on demand.
+4. **Auth token** in `<state-root>/router-token`, 0600, reusing
+   `web::load_or_create_secret` / `web::read_secret` (generalised from the web
+   token's own functions rather than reimplementing the platform privacy
+   checks), minted the same way as
    `web-token` (`platform::random_bytes` + `base64url` + `ct_eq` + per-IP
    throttle). Copy `web.rs`'s `Auth` discipline; do not leave the proxy open
    even on loopback — it holds externally valuable credentials.
@@ -80,12 +85,26 @@ keeps the alias explicit in `router.toml` so the file stays a valid
 token-router config and named routes are a pure additive change later.
 
 ```
+id          stable across renames; minted on first save, persisted
 name        display + provider name (unique, validated)
-base_url    https://… (must parse; https enforced unless loopback)
-api_key     secret, 0600 file only
+base_url    http(s) URL
+api_key     secret, 0600 file only; every slot needs one
 model       upstream model id
 enabled     bool (a disabled slot is skipped, not deleted)
 ```
+
+`id` is load-bearing and was added during implementation: the dialog only ever
+sees a masked key, so a save round-trips a blank one meaning "unchanged". Under
+name-matching a rename is indistinguishable from a new slot, so renaming
+without retyping would silently drop the key. `store::ensure_ids` migrates a
+config written before ids existed, once, on load.
+
+Every slot also gets its own single-entry alias, so a caller can pin one slot
+by name — and so a DISABLED slot still has somewhere to keep its model id.
+
+The file is written **tmp + rename**, not in place: `write_user_private`
+truncates, so a crash mid-write would leave a partial TOML holding every
+provider key the user configured.
 
 ### CLI: `crates/amber/src/routerctl.rs`
 
@@ -97,8 +116,13 @@ Clone `webctl.rs` exactly: **pure** render/argv functions, all IO in `main.rs`.
   following `<string>--port</string>` — never exact-string replace
   (`webctl.rs` documents why: a reformat silently no-ops it).
 - `amber ctl router status|start|stop|restart|enable|disable|url`, all `--json`.
-  `status` returns port / uptime / managed / slot count / per-key health,
-  and **never a token or key**.
+  plus `slots` / `set-slots` (JSON on stdin) / `key <name>` /
+  `install-pi-provider`. `status` returns port / uptime / unit state / slots
+  with keys masked / per-key health, and **never a token or key**.
+
+  The app drives slot editing through these commands rather than calling the
+  admin API itself, so the router's bearer token never enters the desktop
+  process or an IPC trace.
 - Add `install.sh` hooks next to `install_web_linux` / `install_web_macos`.
 
 `status` talks to the router over loopback in the hand-rolled
@@ -112,13 +136,18 @@ Follow the Remote-access recipe end to end:
 - `app/src/shared/routerStatus.ts` — `RouterStatus` + `RouterSlot` types, with
   the `managed: boolean` flag from day one (the web build shipped a permanently
   red pill last time because the shim returned an error string).
-- `app/src/main/routerService.ts` — pure `routerCtlArgv(action, port)` +
-  `parseRouterStatus(stdout)` that never throws. Colocated
-  `routerService.test.ts`.
+- `app/src/main/routerService.ts` — CLI-shaped helpers only:
+  `routerCtlArgv(action, port)` and a `parseRouterStatus(stdout)` that never
+  throws. Everything the renderer needs (`slotFromWire` / `slotToWire` /
+  `moveSlot` / `routerDot`) lives in `shared/`, because a VALUE import from
+  `main/` would pull main-process module code into the renderer bundle and the
+  browser build.
 - `app/src/main/index.ts` — `router:status` / `router:action` (action
-  **allowlist**, the argv-splicing boundary) / `router:config` /
-  `router:saveConfig` / `router:revealKey` / `router:logTail`, registered beside
-  the `web:*` block (~:1196).
+  **allowlist**, the argv-splicing boundary) / `router:slots` /
+  `router:saveSlots` / `router:revealKey` / `router:logTail`, registered beside
+  the `web:*` block. The slot IPC maps snake_case wire to camelCase UI shape in
+  BOTH directions; passing the raw object through left `hasKey` undefined, and
+  a save would have sent `baseUrl`, which the router rejects.
 - `app/src/preload/index.ts` (~:95) + `window.amber` typings in
   `main.tsx` (~:121).
 - `app/src/web/amber.ts` (~:536) — stubs returning `managed: false`.
@@ -193,6 +222,14 @@ amber-router --model <alias>` invocation to copy. A repair path
   in `ui-layout.json` — SSH-remote windows mirror that sidecar across machines
   over ssh, which would be a live key-exfiltration path.
 - Bind 127.0.0.1 in exactly one place; no flag may reach another interface.
+- `amber-router` depends on the `amber` crate for the 0600 private-file helpers
+  (`write_user_private`'s Windows reparse/DACL checks and the race-safe
+  create). That links the daemon crate into the router binary — a deliberate
+  tradeoff, taken because reimplementing security-critical file handling is
+  worse than a larger artifact.
+- The router binary must be installed BESIDE `amber`: `sibling_binary` resolves
+  it relative to the running exe, so `install.sh` and the packaged first-run
+  install both place it in `~/.local/bin/`.
 - Static-musl release: rustls is pure Rust, so `scripts/dist.sh`'s
   static-linkage assertion should still hold — **verify this early**, it gates
   packaging.

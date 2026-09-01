@@ -59,3 +59,58 @@ export interface RouterStatus {
   uptimeSecs: number | null
   error: string | null
 }
+
+/**
+ * Wire (snake_case, as the router serves it) -> UI shape.
+ *
+ * Exported because the slot-list IPC needs the SAME mapping the status parser
+ * uses: returning the raw wire object left `hasKey` undefined, so every stored
+ * key rendered as "no key yet".
+ */
+export function slotFromWire(raw: Record<string, unknown>): RouterSlot {
+  const str = (v: unknown): string => (typeof v === 'string' ? v : '')
+  return {
+    id: str(raw['id']),
+    name: str(raw['name']),
+    baseUrl: str(raw['base_url']),
+    model: str(raw['model']),
+    enabled: raw['enabled'] === true,
+    hasKey: raw['has_key'] === true,
+    keyHint: str(raw['key_hint']),
+  }
+}
+
+/**
+ * UI shape -> wire. `apiKey` is passed separately: an empty string means
+ * "unchanged", and the UI never holds the stored value to send back.
+ */
+export function slotToWire(s: RouterSlot, apiKey: string): Record<string, unknown> {
+  return {
+    id: s.id,
+    name: s.name,
+    base_url: s.baseUrl,
+    model: s.model,
+    enabled: s.enabled,
+    api_key: apiKey,
+  }
+}
+
+/** Pill tone. `off` is a router that is simply not running — not an error. */
+export function routerDot(s: RouterStatus): 'serving' | 'local' | 'error' | 'off' {
+  if (s.error && s.unit === 'active') return 'error'
+  if (s.unit !== 'active') return 'off'
+  return s.slots.some((x) => x.enabled) ? 'serving' : 'local'
+}
+
+/** Move a slot within the list, returning a new array. Out-of-range is a no-op. */
+export function moveSlot(slots: RouterSlot[], from: number, to: number): RouterSlot[] {
+  if (from < 0 || to < 0 || from >= slots.length || to >= slots.length || from === to) {
+    return slots
+  }
+  const next = slots.slice()
+  const item = next[from]
+  if (item === undefined) return slots
+  next.splice(from, 1)
+  next.splice(to, 0, item)
+  return next
+}

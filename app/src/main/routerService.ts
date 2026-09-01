@@ -1,10 +1,15 @@
+// CLI-shaped helpers only. Anything the RENDERER needs lives in `shared/`:
+// a value import from `main/` would pull main-process module code into the
+// Electron renderer bundle and the browser build.
 export type {
   PiProviderState,
   RouterKey,
   RouterSlot,
   RouterStatus,
 } from '../shared/routerStatus'
+export { moveSlot, routerDot, slotFromWire, slotToWire } from '../shared/routerStatus'
 import type { PiProviderState, RouterSlot, RouterStatus } from '../shared/routerStatus'
+import { slotFromWire } from '../shared/routerStatus'
 
 const PI_STATES: readonly PiProviderState[] = ['no-config', 'missing', 'stale', 'installed']
 
@@ -18,44 +23,6 @@ function str(v: unknown, fallback = ''): string {
 
 function num(v: unknown): number | null {
   return typeof v === 'number' ? v : null
-}
-
-/**
- * Wire (snake_case, as the router serves it) -> UI shape.
- *
- * Exported because the slot-list IPC needs the SAME mapping the status parser
- * uses: returning the raw wire object left `hasKey` undefined, so every stored
- * key rendered as "no key yet".
- */
-export function slotFromWire(raw: Record<string, unknown>): RouterSlot {
-  return slot(raw)
-}
-
-/**
- * UI shape -> wire. `apiKey` is passed separately: an empty string means
- * "unchanged", and the UI never holds the stored value to send back.
- */
-export function slotToWire(s: RouterSlot, apiKey: string): Record<string, unknown> {
-  return {
-    id: s.id,
-    name: s.name,
-    base_url: s.baseUrl,
-    model: s.model,
-    enabled: s.enabled,
-    api_key: apiKey,
-  }
-}
-
-function slot(raw: Record<string, unknown>): RouterSlot {
-  return {
-    id: str(raw['id']),
-    name: str(raw['name']),
-    baseUrl: str(raw['base_url']),
-    model: str(raw['model']),
-    enabled: raw['enabled'] === true,
-    hasKey: raw['has_key'] === true,
-    keyHint: str(raw['key_hint']),
-  }
 }
 
 /**
@@ -97,7 +64,7 @@ export function parseRouterStatus(stdout: string): RouterStatus {
     hasToken: raw['has_token'] === true,
     pi: PI_STATES.includes(pi as PiProviderState) ? (pi as PiProviderState) : 'no-config',
     slots: Array.isArray(raw['slots'])
-      ? (raw['slots'] as Record<string, unknown>[]).map(slot)
+      ? (raw['slots'] as Record<string, unknown>[]).map(slotFromWire)
       : [],
     keys: Array.isArray(raw['keys'])
       ? (raw['keys'] as Record<string, unknown>[]).map((k) => ({
@@ -114,24 +81,4 @@ export function parseRouterStatus(stdout: string): RouterStatus {
     uptimeSecs: num(raw['uptime_secs']),
     error: typeof raw['error'] === 'string' ? raw['error'] : null,
   }
-}
-
-/** Pill tone. `off` is a router that is simply not running — not an error. */
-export function routerDot(s: RouterStatus): 'serving' | 'local' | 'error' | 'off' {
-  if (s.error && s.unit === 'active') return 'error'
-  if (s.unit !== 'active') return 'off'
-  return s.slots.some((x) => x.enabled) ? 'serving' : 'local'
-}
-
-/** Move a slot within the list, returning a new array. Out-of-range is a no-op. */
-export function moveSlot(slots: RouterSlot[], from: number, to: number): RouterSlot[] {
-  if (from < 0 || to < 0 || from >= slots.length || to >= slots.length || from === to) {
-    return slots
-  }
-  const next = slots.slice()
-  const item = next[from]
-  if (item === undefined) return slots
-  next.splice(from, 1)
-  next.splice(to, 0, item)
-  return next
 }

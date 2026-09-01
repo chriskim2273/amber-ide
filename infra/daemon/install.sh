@@ -25,10 +25,15 @@ log() { printf 'amber-install: %s\n' "$*"; }
 # 1. Build the release binary and place it on PATH.
 build_and_install_bin() {
     log "building release binary (cargo build --release)"
-    (cd "$REPO_ROOT" && cargo build --release --bin amber)
+    (cd "$REPO_ROOT" && cargo build --release --bin amber --bin amber-router)
     mkdir -p "$BIN_DIR"
     install -m 0755 "$REPO_ROOT/target/release/amber" "$AMBER_BIN"
     log "installed $AMBER_BIN"
+    # The router must land BESIDE amber: `routerctl::sibling_binary` looks for
+    # it there, and `amber ctl router enable` refuses to write a unit without
+    # it. Installing amber alone leaves the router permanently un-enableable.
+    install -m 0755 "$REPO_ROOT/target/release/amber-router" "$BIN_DIR/amber-router"
+    log "installed $BIN_DIR/amber-router"
     "$AMBER_BIN" ctl install-codex-skill
     case ":$PATH:" in
         *":$BIN_DIR:"*) ;;

@@ -14,7 +14,6 @@ path = "src/main.rs"
 
 [dependencies]
 router-core = { path = "../router-core" }
-amber-core = { path = "../amber-core" }
 amber = { path = "../amber" }
 axum = "0.7"
 bytes = "1"

@@ -15,7 +15,7 @@
 
 import { useEffect, useState } from 'react'
 import type { RouterSlot, RouterStatus } from '../shared/routerStatus'
-import { moveSlot, slotToWire } from '../main/routerService'
+import { moveSlot, slotToWire } from '../shared/routerStatus'
 
 interface Props {
   status: RouterStatus | null

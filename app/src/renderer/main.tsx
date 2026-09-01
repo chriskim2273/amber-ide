@@ -19,7 +19,7 @@ import { Drawer } from './Drawer'
 import { applyViewportMode, desktopControlSize, isMobileMode, useMobile, type MobileViewMode } from './mobile'
 import type { WebStatus } from '../shared/webStatus'
 import type { RouterSlot, RouterStatus } from '../shared/routerStatus'
-import { routerDot } from '../main/routerService'
+import { routerDot } from '../shared/routerStatus'
 import {
   emptyProductivity, parseProductivity, serializeProductivity, mutateProductivity, replayProductivity,
   type LoadProductivityResult, type SaveProductivityResult, type ProductivityFile,
