@@ -1,0 +1,17 @@
+[Unit]
+Description=amber router (local OpenAI-compatible failover proxy)
+Documentation=https://github.com/chriskim2273/amber-ide
+# Independent of amber.service: the router owns no sessions and talks to no
+# daemon socket. It is listed here only so a `systemctl --user` stop of the
+# workspace does not leave a confusing orphan.
+
+[Service]
+Type=simple
+# Binds 127.0.0.1 ONLY. It holds real provider API keys; there is deliberately
+# no flag that can move it to another interface.
+ExecStart=%h/.local/bin/amber-router serve --port 7719
+Restart=on-failure
+RestartSec=1
+
+[Install]
+WantedBy=default.target

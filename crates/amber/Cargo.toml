@@ -23,6 +23,7 @@ nix = { version = "0.31.3", features = ["term", "poll", "signal"] }
 portable-pty = "0.9"
 signal-hook = "0.4.4"
 terminal_size = "0.4.4"
+toml = "0.8"
 tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
 
 [target.'cfg(windows)'.dependencies]

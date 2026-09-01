@@ -32,6 +32,8 @@ pub mod pi;
 pub mod platform;
 pub mod procinfo;
 pub mod pty;
+pub mod router_pi;
+pub mod routerctl;
 pub mod search;
 pub mod supervisor;
 pub mod tailscale;

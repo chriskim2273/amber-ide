@@ -27,6 +27,7 @@ dependencies = [
  "signal-hook",
  "tempfile",
  "terminal_size",
+ "toml",
  "tungstenite",
  "widestring",
  "windows-sys 0.61.2",
