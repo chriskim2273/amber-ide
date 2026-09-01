@@ -39,6 +39,7 @@
 
 import type { LoadLayoutResult, SaveLayoutResult, LayoutVersion } from '../shared/layoutFile'
 import type { WebStatus } from '../shared/webStatus'
+import type { RouterSlot, RouterStatus } from '../shared/routerStatus'
 
 export interface SocketLike {
   send(data: string | Uint8Array): void
@@ -560,6 +561,34 @@ export function createAmber(deps: AmberDeps): WebAmber {
     webUrl: (): Promise<string> => Promise.resolve(''),
     webLogTail: (): Promise<string> => Promise.resolve(''),
     webOpenLocal: (): Promise<void> => Promise.resolve(),
+
+    // --- local router (design 2026-09-01) ---------------------------------
+    // A phone borrowing the desktop has no business editing the provider
+    // credentials that desktop routes through. Same `managed: false` shape as
+    // remote access: the pill is HIDDEN, not painted red.
+    routerStatus: (): Promise<RouterStatus> =>
+      Promise.resolve({
+        managed: false,
+        unit: 'unknown',
+        port: 0,
+        url: '',
+        alias: 'auto',
+        hasToken: false,
+        pi: 'no-config',
+        slots: [],
+        keys: [],
+        queueAvailable: null,
+        uptimeSecs: null,
+        error: 'the router is managed from the desktop app',
+      }),
+    routerAction: (): Promise<{ ok: boolean; error?: string }> =>
+      Promise.resolve({ ok: false, error: 'not available in the browser' }),
+    routerSlots: (): Promise<{ ok: boolean; error?: string; slots: RouterSlot[] }> =>
+      Promise.resolve({ ok: false, error: 'not available in the browser', slots: [] }),
+    routerSaveSlots: (): Promise<{ ok: boolean; error?: string }> =>
+      Promise.resolve({ ok: false, error: 'not available in the browser' }),
+    routerRevealKey: (): Promise<string> => Promise.resolve(''),
+    routerLogTail: (): Promise<string> => Promise.resolve(''),
   }
   return {
     ...api,

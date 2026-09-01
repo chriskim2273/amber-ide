@@ -103,7 +103,9 @@ export function moveSlot(slots: RouterSlot[], from: number, to: number): RouterS
     return slots
   }
   const next = slots.slice()
-  const [item] = next.splice(from, 1)
+  const item = next[from]
+  if (item === undefined) return slots
+  next.splice(from, 1)
   next.splice(to, 0, item)
   return next
 }

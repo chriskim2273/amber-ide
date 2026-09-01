@@ -64,6 +64,11 @@ import {
   isSupportedOnPlatform,
 } from './sshRemote'
 import { webCtlArgv, parseWebStatus, redactUrl, type WebStatus } from './webService'
+import {
+  routerCtlArgv,
+  parseRouterStatus,
+  type RouterStatus,
+} from './routerService'
 import { inspectLinuxInputMethod, repairLinuxInputMethod, resolveLinuxInputEnvironment } from './inputMethod'
 import clientPath from '../client/index?modulePath'
 
@@ -119,15 +124,23 @@ if (compat) {
  * unit; the dialog offers no port editor yet, so this is deliberate for now.
  */
 const WEB_PORT = 7717
+// Must match `routerctl::DEFAULT_PORT` and the shipped unit.
+const ROUTER_PORT = 7719
 
 /** Run a command and collect its output. Never rejects — callers report. */
 function runCapture(
   cmd: string,
   args: string[],
   timeoutMs?: number,
+  stdin?: string,
 ): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolveRun) => {
-    const p = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] })
+    const p = spawn(cmd, args, {
+      stdio: [stdin === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
+    })
+    if (stdin !== undefined) {
+      p.stdin?.end(stdin)
+    }
     let stdout = ''
     let stderr = ''
     let settled = false
@@ -155,8 +168,11 @@ function runCapture(
   })
 }
 
-function runAmberCapture(args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
-  return runCapture(amberBinary(), args)
+function runAmberCapture(
+  args: string[],
+  stdin?: string,
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  return runCapture(amberBinary(), args, undefined, stdin)
 }
 
 async function isSocket(path: string): Promise<boolean> {
@@ -1245,6 +1261,99 @@ async function main(): Promise<void> {
     if (url.length === 0) return
     console.log('[amber] opening', redactUrl(url))
     await shell.openExternal(url)
+  })
+
+  // ---- local router (design 2026-09-01) --------------------------------
+  //
+  // Same posture as remote access: the app is a CONTROLLER. `amber-router` is
+  // boot-managed by its own unit, and every call here shells to `amber ctl
+  // router`, which owns the unit file, the 0600 slot file and the token.
+  //
+  // Slot editing goes through the CLI rather than the router's HTTP admin API
+  // so the bearer token never enters this process or an IPC trace — the same
+  // reason `web:url` is on-demand only.
+
+  ipcMain.handle('router:status', async (): Promise<RouterStatus> => {
+    const { stdout } = await runAmberCapture(routerCtlArgv('status', ROUTER_PORT))
+    return parseRouterStatus(stdout)
+  })
+
+  ipcMain.handle('router:action', async (_e, action: unknown) => {
+    // Allowlist, not passthrough: this argument crosses the renderer boundary
+    // and is spliced into an argv.
+    const allowed = [
+      'start',
+      'stop',
+      'restart',
+      'enable',
+      'disable',
+      'rotate-token',
+      'install-pi-provider',
+    ]
+    if (typeof action !== 'string' || !allowed.includes(action)) {
+      return { ok: false, error: `unknown action ${String(action)}` }
+    }
+    const { code, stderr } = await runAmberCapture(routerCtlArgv(action, ROUTER_PORT))
+    return code === 0 ? { ok: true } : { ok: false, error: stderr.trim() || `exit ${code}` }
+  })
+
+  ipcMain.handle('router:slots', async () => {
+    const { code, stdout, stderr } = await runAmberCapture([
+      'ctl',
+      'router',
+      'slots',
+      '--port',
+      String(ROUTER_PORT),
+    ])
+    if (code !== 0) return { ok: false, error: stderr.trim() || `exit ${code}`, slots: [] }
+    try {
+      const parsed = JSON.parse(stdout) as { slots?: unknown }
+      return { ok: true, slots: Array.isArray(parsed.slots) ? parsed.slots : [] }
+    } catch {
+      return { ok: false, error: 'could not parse the router slot list', slots: [] }
+    }
+  })
+
+  ipcMain.handle('router:saveSlots', async (_e, slots: unknown) => {
+    if (!Array.isArray(slots)) return { ok: false, error: 'expected a slot list' }
+    const { code, stderr } = await runAmberCapture(
+      ['ctl', 'router', 'set-slots', '--port', String(ROUTER_PORT)],
+      JSON.stringify({ slots }),
+    )
+    return code === 0 ? { ok: true } : { ok: false, error: stderr.trim() || `exit ${code}` }
+  })
+
+  // On-demand ONLY, behind a deliberate Reveal gesture — never on the poll.
+  ipcMain.handle('router:revealKey', async (_e, name: unknown) => {
+    if (typeof name !== 'string' || name.length === 0) return ''
+    const { code, stdout } = await runAmberCapture([
+      'ctl',
+      'router',
+      'key',
+      name,
+      '--port',
+      String(ROUTER_PORT),
+    ])
+    return code === 0 ? stdout.trim() : ''
+  })
+
+  ipcMain.handle('router:logTail', async (): Promise<string> => {
+    if (process.platform === 'linux') {
+      const { stdout, stderr } = await runCapture('journalctl', [
+        '--user',
+        '-u',
+        'amber-router.service',
+        '-n',
+        '200',
+        '--no-pager',
+      ])
+      return stdout || stderr
+    }
+    try {
+      return await readFile(join(homedir(), 'Library', 'Logs', 'amber-router.log'), 'utf8')
+    } catch (e) {
+      return `no log available: ${String(e)}`
+    }
   })
 
   ipcMain.handle('pick-folder', async () => {

@@ -1483,3 +1483,53 @@ input:focus-visible {
 .productivity-textarea { box-sizing: border-box; width: calc(100% - 32px); min-height: 88px; max-height: 180px; resize: vertical; margin: 0 16px 8px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg); color: var(--text); padding: 9px 11px; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 .productivity-textarea:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
 @media (max-width: 700px) { .productivity-controls, .productivity-row.static { align-items: stretch; flex-direction: column; } }
+
+/* ---- local model router ------------------------------------------------ */
+/* Reuses .web-pill's shape; only the dialog body is new. */
+.router-dialog { width: min(720px, calc(100vw - 2 * var(--sp-4))); max-height: 84vh; overflow-y: auto; }
+.router-slot {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--sp-2);
+  margin-bottom: var(--sp-2);
+}
+.router-slot-head,
+.router-slot-body { display: flex; gap: var(--sp-2); align-items: center; }
+.router-slot-body { margin-top: var(--sp-2); flex-wrap: wrap; }
+.router-slot-ord {
+  min-width: 1.5em;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-dim);
+}
+.router-input {
+  flex: 1 1 8em;
+  min-width: 6em;
+  background: var(--surface-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 4px 6px;
+  font: inherit;
+}
+.router-toggle { display: flex; align-items: center; gap: 4px; color: var(--text-dim); }
+.router-revealed {
+  margin-top: var(--sp-2);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  word-break: break-all;
+}
+.router-ok { color: #3fb950; }
+.router-bad { color: #d29922; }
+.router-log {
+  max-height: 220px;
+  overflow: auto;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--sp-2);
+  white-space: pre-wrap;
+}
+/* Its own section, like the remote dialog's — never beside "Load log". */
+.router-danger { border-top: 1px solid var(--border-strong); padding-top: var(--sp-2); }

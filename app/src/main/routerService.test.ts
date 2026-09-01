@@ -97,7 +97,7 @@ describe('parseRouterStatus', () => {
       hasKey: true,
       keyHint: '••••1111',
     })
-    expect(s.keys[0].coolingSecsRemaining).toBe(19)
+    expect(s.keys[0]?.coolingSecsRemaining).toBe(19)
     expect(s.uptimeSecs).toBe(31)
   })
 

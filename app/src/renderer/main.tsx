@@ -14,9 +14,12 @@ import { PocketCommandCenter, PocketFocusHeader, PocketNav, pocketSessionTitle }
 import { PocketNewSessionSheet, PocketSessionSheet, type PocketSessionKind } from './PocketSheets'
 import { deriveTab, shortCwd } from './tabView'
 import { RemoteAccess } from './RemoteAccess'
+import { RouterPanel } from './RouterPanel'
 import { Drawer } from './Drawer'
 import { applyViewportMode, desktopControlSize, isMobileMode, useMobile, type MobileViewMode } from './mobile'
 import type { WebStatus } from '../shared/webStatus'
+import type { RouterSlot, RouterStatus } from '../shared/routerStatus'
+import { routerDot } from '../main/routerService'
 import {
   emptyProductivity, parseProductivity, serializeProductivity, mutateProductivity, replayProductivity,
   type LoadProductivityResult, type SaveProductivityResult, type ProductivityFile,
@@ -125,6 +128,17 @@ declare global {
       webUrl: () => Promise<string>
       webLogTail: () => Promise<string>
       webOpenLocal: () => Promise<void>
+      // Local router (design 2026-09-01). `routerRevealKey` returns a
+      // plaintext provider key and is called on a deliberate gesture only —
+      // never on the status poll.
+      routerStatus: () => Promise<RouterStatus>
+      routerAction: (action: string) => Promise<{ ok: boolean; error?: string }>
+      routerSlots: () => Promise<{ ok: boolean; error?: string; slots: RouterSlot[] }>
+      routerSaveSlots: (
+        slots: RouterSlot[],
+      ) => Promise<{ ok: boolean; error?: string }>
+      routerRevealKey: (name: string) => Promise<string>
+      routerLogTail: () => Promise<string>
     }
   }
 }
@@ -207,6 +221,8 @@ function App(): JSX.Element {
   // Desktop command surfaces. Only one may be open at a time; each is a small
   // popover rather than another permanent toolbar cluster.
   const [toolbarMenu, setToolbarMenu] = useState<'pane-kind' | 'tools' | 'continuity' | 'attention' | null>(null)
+  const [routerStatus, setRouterStatus] = useState<RouterStatus | null>(null)
+  const [routerOpen, setRouterOpen] = useState(false)
   // Presentation state for the existing daemon Snapshot/SnapshotOk exchange.
   // A timestamp is shown only after the daemon explicitly confirms the write.
   const [snapshotState, setSnapshotState] = useState<SnapshotState>({ kind: 'idle' })
@@ -1587,6 +1603,54 @@ function App(): JSX.Element {
     }
   }, [remoteOpen])
 
+  // Router status. Same shape as the remote-access poll above and for the
+  // same reason: a 3 s spawn of `amber ctl router status` forever would be
+  // pure waste, so it only ticks while the dialog is open.
+  useEffect(() => {
+    let cancelled = false
+    const poll = async (): Promise<void> => {
+      const s = await window.amber?.routerStatus?.()
+      if (!cancelled && s) setRouterStatus(s)
+    }
+    void poll()
+    if (!routerOpen) {
+      const onFocus = (): void => {
+        void poll()
+      }
+      window.addEventListener('focus', onFocus)
+      return () => {
+        cancelled = true
+        window.removeEventListener('focus', onFocus)
+      }
+    }
+    const t = setInterval(() => {
+      void poll()
+    }, 3000)
+    return () => {
+      cancelled = true
+      clearInterval(t)
+    }
+  }, [routerOpen])
+
+  const routerManaged = routerStatus === null || routerStatus.managed
+  // Green only when it is actually routing somewhere.
+  const routerTone = routerDot(
+    routerStatus ?? {
+      managed: true,
+      unit: 'unknown',
+      port: 0,
+      url: '',
+      alias: 'auto',
+      hasToken: false,
+      pi: 'no-config',
+      slots: [],
+      keys: [],
+      queueAvailable: null,
+      uptimeSecs: null,
+      error: null,
+    },
+  )
+
   // The browser build cannot manage the service that serves it, so the whole
   // control is hidden there rather than shown broken. `null` (first paint,
   // before the first poll answers) keeps it visible: hiding then showing would
@@ -1868,6 +1932,13 @@ function App(): JSX.Element {
           aria-label={`Remote access: ${webDot}`}
           onClick={() => setRemoteOpen(true)}>
           <span className="web-dot" /> remote
+        </button>}
+        {routerManaged && <button
+          className={`btn web-pill router-pill web-pill-${routerTone}`}
+          title="Local model router — one endpoint, ordered failover"
+          aria-label={`Model router: ${routerTone}`}
+          onClick={() => setRouterOpen(true)}>
+          <span className="web-dot" /> router
         </button>}
         <div className="toolbar-popover-wrap">
           <button className="icon-btn toolbar-icon" aria-label="workspace tools" title="Workspace tools"
@@ -2473,6 +2544,13 @@ function App(): JSX.Element {
       )}
       {remoteOpen && (
         <RemoteAccess status={webStatus} onClose={() => setRemoteOpen(false)} onRefresh={() => { void window.amber.webStatus().then(setWebStatus) }} />
+      )}
+      {routerOpen && (
+        <RouterPanel
+          status={routerStatus}
+          onClose={() => setRouterOpen(false)}
+          onRefresh={() => { void window.amber.routerStatus().then(setRouterStatus) }}
+        />
       )}
       {productivityOverlay === 'palette' && <CommandPalette entries={paletteEntries} onClose={() => setProductivityOverlay(null)} />}
       {productivityOverlay === 'search' && <GlobalSearchDialog results={searchResults} loading={searchLoading} error={searchError}
