@@ -1,3 +1,4 @@
+pub mod admin;
 pub mod live;
 pub mod store;
 pub mod slots;

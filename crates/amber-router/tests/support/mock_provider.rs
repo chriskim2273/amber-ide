@@ -1,3 +1,4 @@
+#![allow(dead_code)] // vendored harness: not every test file uses every helper
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;

@@ -8,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 use router_core::config::ServerConfig;
 
@@ -21,6 +22,9 @@ pub struct Live {
     /// State root. `None` in tests and anywhere the admin surface is off.
     root: Option<PathBuf>,
     server: ServerConfig,
+    started: Instant,
+    /// The port actually bound, for status. 0 until `serve` reports it.
+    port: u16,
 }
 
 impl Live {
@@ -29,6 +33,8 @@ impl Live {
             current: Arc::new(RwLock::new(Arc::new(state))),
             root: None,
             server: store::default_server(),
+            started: Instant::now(),
+            port: 0,
         }
     }
 
@@ -42,7 +48,22 @@ impl Live {
             current: Arc::new(RwLock::new(Arc::new(state))),
             root: Some(root.to_path_buf()),
             server,
+            started: Instant::now(),
+            port: 0,
         })
+    }
+
+    pub fn with_port(mut self, port: u16) -> Live {
+        self.port = port;
+        self
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub fn uptime_secs(&self) -> u64 {
+        self.started.elapsed().as_secs()
     }
 
     pub fn current(&self) -> Arc<AppState> {

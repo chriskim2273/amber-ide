@@ -6,26 +6,34 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
+use crate::admin;
+use crate::live::Live;
 use crate::proxy::{proxy_once, Attempt, ProxyError};
 use crate::state::AppState;
 use crate::upstream::is_stream_requested;
 
+/// A router with no editable config — the shape the proxy tests drive.
 pub fn build_router(state: AppState) -> Router {
-    let limit = state.max_body_bytes;
+    build_live_router(Live::detached(state))
+}
+
+pub fn build_live_router(live: Live) -> Router {
+    let limit = live.current().max_body_bytes;
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(models))
         .route("/stats", get(stats))
         .route("/v1/chat/completions", post(chat_completions))
+        .merge(admin::routes())
         .layer(DefaultBodyLimit::max(limit))
-        .with_state(state)
+        .with_state(live)
 }
 
 async fn health() -> impl IntoResponse {
     Json(json!({ "status": "ok" }))
 }
 
-fn authorized(state: &AppState, headers: &HeaderMap) -> bool {
+pub(crate) fn authorized(state: &AppState, headers: &HeaderMap) -> bool {
     let Some(expected) = state.auth_token.as_deref() else {
         return true;
     };
@@ -37,7 +45,7 @@ fn authorized(state: &AppState, headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
-fn unauthorized() -> Response {
+pub(crate) fn unauthorized() -> Response {
     (
         StatusCode::UNAUTHORIZED,
         Json(json!({ "error": { "message": "invalid or missing bearer token" } })),
@@ -45,7 +53,8 @@ fn unauthorized() -> Response {
         .into_response()
 }
 
-async fn models(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn models(State(live): State<Live>, headers: HeaderMap) -> Response {
+    let state = live.current();
     if !authorized(&state, &headers) {
         return unauthorized();
     }
@@ -58,7 +67,8 @@ async fn models(State(state): State<AppState>, headers: HeaderMap) -> Response {
     Json(json!({ "object": "list", "data": data })).into_response()
 }
 
-async fn stats(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn stats(State(live): State<Live>, headers: HeaderMap) -> Response {
+    let state = live.current();
     if !authorized(&state, &headers) {
         return unauthorized();
     }
@@ -101,10 +111,11 @@ fn attempts_header(attempts: &[Attempt]) -> String {
 }
 
 async fn chat_completions(
-    State(state): State<AppState>,
+    State(live): State<Live>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let state = live.current();
     // Authenticate before parsing JSON so missing/wrong bearer yields 401
     // even when Content-Type/body would otherwise produce 415/422.
     if !authorized(&state, &headers) {

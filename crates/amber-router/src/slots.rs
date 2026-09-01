@@ -269,7 +269,7 @@ mod tests {
     #[test]
     fn validation_rejects_the_ways_a_slot_breaks_the_config() {
         let ok = slot("a", "m1");
-        assert!(validate(&[ok.clone()]).is_ok());
+        assert!(validate(std::slice::from_ref(&ok)).is_ok());
 
         let dup = vec![ok.clone(), ok.clone()];
         assert!(validate(&dup).unwrap_err().contains("more than once"));
