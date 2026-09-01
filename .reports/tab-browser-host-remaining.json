@@ -30,7 +30,7 @@
     {
       "id": "P1-two-store-all-mutations",
       "severity": "important",
-      "status": "completed",
+      "status": "partial",
       "work": "Generalize the migration journal to every browser association mutation (user open/close, broker creation, workspace import/replacement, recovery attach/delete), including rollback/replay and orphan GC grace."
     },
     {
