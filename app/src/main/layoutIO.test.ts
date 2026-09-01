@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtemp, rm, readFile } from 'node:fs/promises'
+import { mkdtemp, rm, readFile, lstat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { loadLayoutFile, saveLayoutFile } from './layoutIO'
@@ -76,9 +76,18 @@ describe('saveLayoutFile', () => {
     expect(await readFile(path, 'utf8')).toBe('v1-from-b')
   })
 
-  it('creates the parent directory on first write', async () => {
+  it('creates the parent directory on first write with private permissions', async () => {
     const nested = join(dir, 'nested', 'ui-layout.json')
     const r = await saveLayoutFile(nested, '{}', null)
     expect(r).toEqual({ ok: true, version: '{}' })
+    if (process.platform !== 'win32') expect((await lstat(nested)).mode & 0o777).toBe(0o600)
+  })
+
+  it('rejects replacing a symlink', async () => {
+    const target = join(dir, 'target')
+    await writeFile(target, 'do-not-touch')
+    await symlink(target, path)
+    expect(await saveLayoutFile(path, '{}', 'do-not-touch')).toMatchObject({ error: expect.stringContaining('symlink') })
+    expect(await readFile(target, 'utf8')).toBe('do-not-touch')
   })
 })

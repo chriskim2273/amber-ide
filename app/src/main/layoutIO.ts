@@ -6,15 +6,42 @@
 // module keeps that: the sidecar stays a plain file with two writers (the
 // Electron main process and `amber web`'s Rust side), made safe by CAS
 // instead of moving ownership into the daemon.
-import { readFile, writeFile, rename, mkdir } from 'node:fs/promises'
+import { readFile, rename, mkdir, open, lstat, unlink } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
 import { dirname } from 'node:path'
 import type { LoadLayoutResult, SaveLayoutResult } from '../shared/layoutFile'
 
+async function rejectSymlink(p: string): Promise<void> {
+  const stat = await lstat(p).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === 'ENOENT') return null
+    throw error
+  })
+  if (stat?.isSymbolicLink()) throw new Error('refusing to replace layout symlink')
+}
+
 async function atomicWrite(p: string, text: string): Promise<void> {
-  await mkdir(dirname(p), { recursive: true })
-  const tmp = `${p}.${process.pid}.${Date.now()}.tmp`
-  await writeFile(tmp, text)
-  await rename(tmp, p)
+  const parent = dirname(p)
+  await mkdir(parent, { recursive: true, mode: 0o700 })
+  await rejectSymlink(p)
+  const tmp = `${p}.${process.pid}.${randomUUID()}.tmp`
+  let handle: Awaited<ReturnType<typeof open>> | null = null
+  try {
+    handle = await open(tmp, 'wx', 0o600)
+    await handle.writeFile(text, 'utf8')
+    await handle.sync()
+    await handle.close()
+    handle = null
+    await rejectSymlink(p)
+    await rename(tmp, p)
+    if (process.platform !== 'win32') {
+      const directory = await open(parent, 'r')
+      try { await directory.sync() } finally { await directory.close() }
+    }
+  } catch (error) {
+    await handle?.close().catch(() => {})
+    await unlink(tmp).catch(() => {})
+    throw error
+  }
 }
 
 /** Read the sidecar. `version` is the file's exact current content (see
