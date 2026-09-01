@@ -408,8 +408,12 @@ function main() {
       theme: THEME,
       cursorBlink: true,
       scrollback: 5000,
+      allowProposedApi: true,
       // No WebGL addon (mobile GPU variance) — xterm's DOM renderer is fine here.
     });
+    // Match modern TUI cell widths (notably emoji-presentation sequences such
+    // as ❤️). Without this, OpenTUI's absolute-column diffs leave stale glyphs.
+    term.loadAddon(new window.UnicodeGraphemesAddon.UnicodeGraphemesAddon());
     term.open(hostEl);
     // Input path: raw bytes, BINARY frame. Sticky Ctrl applies here too, so the
     // phone keyboard's next letter gets modified after tapping Ctrl.

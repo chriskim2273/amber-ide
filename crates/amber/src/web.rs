@@ -407,6 +407,7 @@ const INDEX_HTML: &[u8] = include_bytes!("../assets/index.html");
 const APP_JS: &[u8] = include_bytes!("../assets/app.js");
 const STYLE_CSS: &[u8] = include_bytes!("../assets/style.css");
 const XTERM_JS: &[u8] = include_bytes!("../assets/xterm.js");
+const XTERM_UNICODE_GRAPHEMES_JS: &[u8] = include_bytes!("../assets/xterm-unicode-graphemes.js");
 const XTERM_CSS: &[u8] = include_bytes!("../assets/xterm.css");
 
 const CT_HTML: &str = "text/html; charset=utf-8";
@@ -427,6 +428,7 @@ fn asset(path: &str) -> Option<(&'static [u8], &'static str)> {
         "/app.js" => Some((APP_JS, CT_JS)),
         "/style.css" => Some((STYLE_CSS, CT_CSS)),
         "/xterm.js" => Some((XTERM_JS, CT_JS)),
+        "/xterm-unicode-graphemes.js" => Some((XTERM_UNICODE_GRAPHEMES_JS, CT_JS)),
         "/xterm.css" => Some((XTERM_CSS, CT_CSS)),
         _ => None,
     }

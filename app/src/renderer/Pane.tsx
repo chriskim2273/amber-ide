@@ -10,6 +10,7 @@ import { appChord } from './keys'
 import { takeReplay } from './replay'
 import { decodeOsc52Payload } from './osc'
 import { KeyboardInputModeTracker, shiftEnterSequence } from './terminalKeys'
+import { installTerminalUnicode } from './terminalUnicode'
 
 // Imperative scrollback-search handle handed to the chrome (the find bar in
 // SplitView) via `onSearchReady`. Search execution stays outside React — the
@@ -172,6 +173,7 @@ export const Pane = memo(function Pane(
       allowProposedApi: true,
     })
     const fit = new FitAddon()
+    installTerminalUnicode(term)
     term.open(host)
     term.loadAddon(fit)
     // WebGL is the fast path on hardware GL, but pathologically slow on

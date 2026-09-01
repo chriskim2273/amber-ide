@@ -184,12 +184,38 @@ fn static_assets_are_public_so_the_page_can_exchange_its_token() {
     // sends; only JS on the served page can read it and POST it. So the page
     // and its assets must load without a cookie (they hold no secrets).
     let f = fixture();
-    for path in ["/", "/app.js", "/style.css", "/xterm.js", "/xterm.css"] {
+    for path in [
+        "/",
+        "/app.js",
+        "/style.css",
+        "/xterm.js",
+        "/xterm-unicode-graphemes.js",
+        "/xterm.css",
+    ] {
         let (status, _, _) = f.get(path, None);
         assert!(status.contains("200"), "{path} -> {status}");
     }
     let (status, _, _) = f.get("/nope", None);
     assert!(status.contains("404"), "{status}");
+}
+
+#[test]
+fn legacy_web_installs_unicode_graphemes_before_rendering() {
+    let f = fixture();
+    let (_, _, index) = f.get("/", None);
+    let xterm = index.find("/xterm.js").expect("xterm script");
+    let unicode = index
+        .find("/xterm-unicode-graphemes.js")
+        .expect("unicode grapheme script");
+    let app = index.find("/app.js").expect("app script");
+    assert!(
+        xterm < unicode && unicode < app,
+        "scripts loaded out of order"
+    );
+
+    let (_, _, app_js) = f.get("/app.js", None);
+    assert!(app_js.contains("allowProposedApi: true"));
+    assert!(app_js.contains("new window.UnicodeGraphemesAddon.UnicodeGraphemesAddon()"));
 }
 
 #[test]
