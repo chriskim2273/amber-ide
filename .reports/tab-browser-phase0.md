@@ -1,9 +1,9 @@
 # Tab Browser Host — Phase 0 Decision Record
 
-**Status:** Linux evidence pending; macOS is a pre-merge/manual gate
+**Status:** Linux substrate evidence complete with physical-input exception; macOS remains a blocking pre-merge/manual gate
 **Date:** 2026-09-01
 **Branch:** `feat/tab-browser-host`
-**Approved plan commits:** `afca111`, amendment pending
+**Approved plan commits:** `afca111`, amendment `9046c33`
 
 ## Gate interpretation
 
