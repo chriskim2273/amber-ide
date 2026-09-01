@@ -84,5 +84,9 @@ Rust `--workspace`: all suites green (430 lib + every integration suite);
 - macOS/Windows unit install paths are rendered and unit-tested, never run.
 - The Windows CI job asserts "both shipped Rust binaries"; it now builds three,
   and `ring` on MSVC is a newly exercised surface there.
-- `enable`/`disable` write a real unit into `~/.config/systemd/user/`; not run.
+- `enable` WAS exercised against a fake `HOME`: with `amber-router` beside
+  `amber` it wrote `ExecStart=<abs path>/amber-router serve --port 7719`, and
+  with the router removed it refused with a named error. The `systemctl --user`
+  half (which ignores `HOME`) was not driven against a real unit; the real
+  system was checked afterwards and has no stray router unit.
 - No `amber web`/mobile router surface by design (desktop-only authority).
