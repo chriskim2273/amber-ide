@@ -1,5 +1,5 @@
 import { createServer, type Server, type Socket } from 'node:net'
-import { mkdir, open, readFile, unlink } from 'node:fs/promises'
+import { mkdir, open, readFile, unlink, lstat } from 'node:fs/promises'
 import { randomBytes } from 'node:crypto'
 import { dirname } from 'node:path'
 import type { LayoutFile } from '../shared/layoutFile'
@@ -59,6 +59,8 @@ function frame(value: unknown): Buffer {
 
 async function tokenFile(path: string): Promise<string> {
   try {
+    const stat = await lstat(path)
+    if (stat.isSymbolicLink() || !stat.isFile() || (process.platform !== 'win32' && (stat.mode & 0o077) !== 0)) throw new Error('invalid browser host token file')
     const token = (await readFile(path, 'utf8')).trim()
     if (/^[A-Za-z0-9_-]{43}$/.test(token)) return token
     throw new Error('invalid browser host token')

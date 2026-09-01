@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { connect } from 'node:net'
@@ -23,6 +23,15 @@ describe('tab browser broker boundary', () => {
   it('allows an open-only solicitation from a Pi-shaped current tab without sharing', () => {    const unshared: LayoutFile = { version: 1, activeWorkspace: 1, workspaces: { '1': { activeTab: 2, tabs: { '2': { tree: null } } } } }
     expect(authorizeBrowserRequest(unshared, 'amber-1-2-0-pane', true)).toEqual({ ws: 1, tab: 2 })
     expect(() => authorizeBrowserRequest(unshared, 'amber-1-2-0-pane')).toThrow('NO_BROWSER_FOR_TAB')
+  })
+
+  it('rejects a symlink token file', async () => {
+    if (process.platform === 'win32') return
+    const dir = await mkdtemp(join(tmpdir(), 'amber-browser-broker-')); cleanup.push(dir)
+    await writeFile(join(dir, 'target'), 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n', { mode: 0o600 })
+    await symlink(join(dir, 'target'), join(dir, 'token'))
+    const server = new TabBrowserBrokerServer(join(dir, 'broker.sock'), join(dir, 'token'), async () => ({}))
+    await expect(server.start()).rejects.toThrow('invalid browser host token file')
   })
 
   it('requires the private token before dispatching a framed request', async () => {
