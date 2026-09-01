@@ -3,7 +3,7 @@
 **Design:** `docs/superpowers/specs/2026-09-01-tab-browser-host-design.md`
 **Status:** approved for execution after synthesized design/plan review (2026-09-01); Phase 0 and deployed-reader barriers remain hard gates
 **Platforms:** macOS and Linux first; Windows compiles with the feature unavailable
-**Method:** tests first, narrow milestone commits, Phase-0 evidence before product code
+**Method:** tests first, narrow milestone commits, Linux Phase-0 evidence before product code on this host; macOS native verification before merge/default enablement
 
 ## 1. Purpose and invariants
 
@@ -22,7 +22,7 @@ The following are non-negotiable throughout implementation:
 9. Compatibility mode disables browser hosting. Windows returns a typed unsupported result until its gates pass.
 10. Closing the last GUI window leaves BrowserHost resident. Explicit Quit performs a coordinated drain and writes the durable inhibit.
 11. Existing `persist:amber-browser` data is preserved if the profile probe passes. A fallback partition is disclosed, never silent.
-12. No product slice proceeds past a failed Phase-0 gate. Do not substitute `<webview>` or a detached browser window.
+12. No product slice proceeds past a failed Phase-0 gate on the implementation host. Linux Phase-0 gates implementation here; equivalent macOS native-view/focus/IME/lifecycle evidence is a blocking pre-merge/manual gate, not a blocker to portable implementation. Do not substitute `<webview>` or a detached browser window.
 
 ## 2. Fast-drive and isolation discipline
 
@@ -139,7 +139,7 @@ Phase 0 may add prototype tests/harness code but no production BrowserHost behav
 
 Write the hostile fixture and assertions first. Create a standalone `WebContentsView` with the intended production preferences. Probe profile compatibility only against a byte-for-byte copy or synthetic fixture of the legacy partition inside the private Phase-0 userData root; never open the user's live partition.
 
-Prove on Linux and macOS:
+Prove on Linux before implementation proceeds on this host; repeat on macOS before merge/default enablement:
 
 - `nodeIntegration:false`, `contextIsolation:true`, `sandbox:true`, `webSecurity:true`;
 - no preload, Node globals, Electron APIs, page-accessible IPC, or Amber bridges;
@@ -180,7 +180,7 @@ Build a minimal rail shell with the native child view. Test real hardware/displa
 - renderer overlays, menus, approval modal, sheets, and window close never sit behind a still-visible child view;
 - detach/reparent/reopen preserves the page and does not leak child contents.
 
-**Stop:** geometry or occlusion cannot be made deterministic on Linux and macOS, physical input/IME is unusable, or accessibility has no acceptable focus path.
+**Stop implementation on this host:** Linux geometry/occlusion is not deterministic, physical input/IME is unusable, or accessibility has no acceptable focus path. The same failures on macOS block merge/default enablement; missing macOS hardware alone does not block portable implementation.
 
 ### 4.4 Gate D: resident singleton and launcher
 
@@ -205,7 +205,7 @@ Write a pure fault-injection prototype around layout/state files. Crash after ev
 
 ### 4.6 Phase-0 decision record
 
-Commit the report only after all gates pass. It must name the selected adapter and exact Playwright version, profile partition decision, platform evidence, known limitations, measurements, and every command. Architecture and security reviewers must approve the report before Milestone 1.
+Commit the Linux report after all Linux gates pass. It must name the selected adapter and exact Playwright version, profile partition decision, platform evidence, known limitations, measurements, and every command. Architecture and security review of Linux evidence gates Milestone 0A. Append equivalent macOS evidence before merge/default enablement; do not claim it before it exists.
 
 Suggested commit:
 
@@ -604,7 +604,7 @@ After Phase 0 selects an adapter:
 
 ### Feature gates
 
-Use one internal gate during development. Before default enablement, require Phase-0 evidence and full acceptance on both macOS and Linux. Windows must render a clear unavailable state and must not create browser socket/token/profile/state files.
+Use one internal gate during development. Before merge/default enablement, require Phase-0 native evidence and full acceptance on both macOS and Linux. Linux evidence gates implementation on this host; macOS evidence may follow as the manual pre-merge gate. Windows must render a clear unavailable state and must not create browser socket/token/profile/state files.
 
 Do not retain a production `<webview>` fallback. Rollback disables the rail, preserves `browser-state.json`, v1 backup, v2 layout, and recovery report, and offers safe URLs; it never downgrades/re-writes v2 as v1.
 
@@ -711,7 +711,7 @@ Against local fixtures, exercise navigation/history/reload/waits, accessibility 
 
 Do not combine these into one final glance:
 
-1. **After Phase 0:** architecture + Electron security reviewers approve substrate and adapter choice.
+1. **After Linux Phase 0:** architecture + Electron security reviewers approve substrate and adapter choice for portable implementation; macOS native evidence remains a blocking pre-merge checklist item.
 2. **After Milestones 1–3:** persistence/migration reviewer approves Rust-first rollout and crash matrix.
 3. **After Milestones 4–6:** security/privacy + concurrency reviewers approve policy, watcher freshness, broker protocol, replay, cancellation, and approvals.
 4. **After Milestones 7–8:** product/UX/accessibility reviewer approves native rail behavior, migration/recovery, and workspace files.
@@ -793,6 +793,6 @@ This plan incorporates the synthesized architecture/security/operability review 
 | P0 resident lifecycle conflicts with per-window IPC cleanup | Milestone 9 first moves handlers process-global with sender registry routing and adds upgrade-safe canonical registration repair. |
 | P0 packaging commands/contents were inaccurate | Milestone 11/validation now inspect and repair the actual dist chain, assert all three Rust binaries, and test the packaged artifact against hostile fixtures. |
 | Important protocol tests were assigned too early | Milestone 2 keeps parser tests; stateful replay/cancellation/concurrency tests live in Milestone 6. |
-| Important gate evidence/review needed to remain blocking | §19 records six independent checkpoints; unresolved high severity or missing supported-platform Phase-0 evidence blocks further product code. |
+| Important gate evidence/review needed to remain blocking | §19 records six independent checkpoints; unresolved Linux high severity blocks implementation here, while missing macOS native evidence blocks merge/default enablement rather than portable product code. |
 
-Approval does not waive stop conditions. In particular, Linux-only evidence cannot satisfy the Linux-and-macOS Phase-0 gate; in that environment implementation must stop after safe prerequisites and report the missing platform evidence rather than silently narrowing support.
+Approval does not waive stop conditions. Linux Phase-0 evidence gates implementation on this Linux host. Equivalent macOS `WebContentsView` geometry/focus/IME/accessibility/lifecycle evidence remains explicitly unverified and blocks merge/default enablement, but its absence does not block safe portable implementation and tests.
