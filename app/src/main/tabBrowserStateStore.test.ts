@@ -19,6 +19,27 @@ describe('TabBrowserStateStore', () => {
     if (process.platform !== 'win32') expect((await lstat(join(dir, 'browser-state.json'))).mode & 0o777).toBe(0o600)
   })
 
+  it('serializes an async host save behind a multi-step journal transaction', async () => {
+    const store = new TabBrowserStateStore(dir)
+    const initial = emptyBrowserState(1); await store.save(initial)
+    let release!: () => void
+    const paused = new Promise<void>((resolve) => { release = resolve })
+    const journal = store.withLock(async (io) => {
+      const state = await io.load()
+      await io.save({ ...state, revision: 1, pendingTransaction: { id: 'tx', kind: 'browser-association', expectedLayoutVersion: null, layoutText: '{}' } })
+      await paused
+      const pending = await io.load()
+      expect(pending.pendingTransaction?.id).toBe('tx')
+      const { pendingTransaction: _pending, ...committed } = pending
+      await io.save({ ...committed, revision: 2 })
+    })
+    const staleHost = store.save({ ...initial, revision: 3 })
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(await readFile(join(dir, 'browser-state.json'), 'utf8')).toContain('pendingTransaction')
+    release(); await journal; await staleHost
+    expect((await store.load()).pendingTransaction).toBeUndefined()
+  })
+
   it('returns an empty state when the file is malformed', async () => {
     const store = new TabBrowserStateStore(dir)
     await writeFile(join(dir, 'browser-state.json'), '{bad')

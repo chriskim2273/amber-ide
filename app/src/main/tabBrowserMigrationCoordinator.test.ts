@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { loadLayoutFile, saveLayoutFile } from './layoutIO'
@@ -39,7 +39,7 @@ describe('coordinateTabBrowserMigration', () => {
     const target = JSON.stringify({ version: 2, activeWorkspace: 1, browserRevision: 1, workspaces: {} })
     let observedJournal = false
     await commitBrowserLayoutMutation(path, store, target, loaded.version, async (...args) => {
-      observedJournal = (await store.load()).pendingTransaction?.kind === 'browser-association'
+      observedJournal = JSON.parse(await readFile(store.path, 'utf8')).pendingTransaction?.kind === 'browser-association'
       return saveLayoutFile(...args)
     })
     expect(observedJournal).toBe(true)

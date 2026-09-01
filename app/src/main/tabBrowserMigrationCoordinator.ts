@@ -20,22 +20,24 @@ export async function commitBrowserLayoutMutation(
   saveLayout: LayoutSave = saveLayoutFile,
   transactionId: () => string = randomUUID,
 ): Promise<SaveLayoutResult> {
-  const state = await store.load()
-  if (state.pendingTransaction) throw new Error('BROWSER_TRANSACTION_PENDING')
-  const pending: BrowserStateFile = {
-    ...state, revision: state.revision + 1,
-    pendingTransaction: { id: transactionId(), kind: 'browser-association', expectedLayoutVersion, layoutText },
-  }
-  await store.save(pending)
-  const saved = await saveLayout(layoutPath, layoutText, expectedLayoutVersion)
-  if (!('ok' in saved)) {
-    const { pendingTransaction: _pending, ...rolledBack } = pending
-    await store.save({ ...rolledBack, revision: pending.revision + 1 })
+  return store.withLock(async (io) => {
+    const state = await io.load()
+    if (state.pendingTransaction) throw new Error('BROWSER_TRANSACTION_PENDING')
+    const pending: BrowserStateFile = {
+      ...state, revision: state.revision + 1,
+      pendingTransaction: { id: transactionId(), kind: 'browser-association', expectedLayoutVersion, layoutText },
+    }
+    await io.save(pending)
+    const saved = await saveLayout(layoutPath, layoutText, expectedLayoutVersion)
+    if (!('ok' in saved)) {
+      const { pendingTransaction: _pending, ...rolledBack } = pending
+      await io.save({ ...rolledBack, revision: pending.revision + 1 })
+      return saved
+    }
+    const { pendingTransaction: _pending, ...committed } = pending
+    await io.save({ ...committed, revision: pending.revision + 1, layoutRevision: state.layoutRevision + 1 })
     return saved
-  }
-  const { pendingTransaction: _pending, ...committed } = pending
-  await store.save({ ...committed, revision: pending.revision + 1, layoutRevision: state.layoutRevision + 1 })
-  return saved
+  })
 }
 
 /**
@@ -50,7 +52,8 @@ export async function coordinateTabBrowserMigration(
   transactionId: () => string = randomUUID,
   saveLayout: LayoutSave = saveLayoutFile,
 ): Promise<void> {
-  let state = await store.load()
+  return store.withLock(async (io) => {
+  let state = await io.load()
   if (state.pendingTransaction) {
     const pending = state.pendingTransaction
     const loaded = await loadLayoutFile(layoutPath)
@@ -60,7 +63,7 @@ export async function coordinateTabBrowserMigration(
     }
     const { pendingTransaction: _pending, ...committed } = state
     state = { ...committed, layoutRevision: state.layoutRevision + 1, revision: state.revision + 1 }
-    await store.save(state)
+    await io.save(state)
     return
   }
 
@@ -75,7 +78,7 @@ export async function coordinateTabBrowserMigration(
     const orphans = collectBrowserOrphans(lastUsed, associated, Date.now())
     if (orphans.length > 0) {
       const records = { ...state.records }; for (const id of orphans) delete records[id as keyof typeof records]
-      await store.save({ ...state, records, revision: state.revision + 1 })
+      await io.save({ ...state, records, revision: state.revision + 1 })
     }
     return
   }
@@ -99,9 +102,10 @@ export async function coordinateTabBrowserMigration(
       id: transactionId(), kind: 'legacy-layout-migration', expectedLayoutVersion: loaded.version, layoutText,
     },
   }
-  await store.save(nextState)
+  await io.save(nextState)
   const saved = await saveLayout(layoutPath, layoutText, loaded.version)
   if (!('ok' in saved)) throw new Error('error' in saved ? saved.error : 'LAYOUT_CONFLICT')
   const { pendingTransaction: _pending, ...committed } = nextState
-  await store.save({ ...committed, layoutRevision: state.layoutRevision + 1, revision: nextState.revision + 1 })
+  await io.save({ ...committed, layoutRevision: state.layoutRevision + 1, revision: nextState.revision + 1 })
+  })
 }
