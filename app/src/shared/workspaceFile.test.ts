@@ -59,9 +59,16 @@ describe('browser panes in .amberws', () => {
       {})
     const pane = doc.workspaces[0]!.tabs[0]!.panes[0]!
     expect(pane.kind).toBe('browser')
-    expect(pane.url).toBe('https://x.dev')
+    expect(pane.url).toBe('https://x.dev/')
     expect(pane.scrollback).toBe('')
   })
+  it('rejects workspace browser URL scheme bypasses and strips persisted secrets', () => {
+    const unsafe = JSON.stringify({ version: 1, scope: 'one', workspaces: [{ tabs: [{ tab: 1, tree: { kind: 'leaf', paneId: 'p0' }, panes: [{ id: 'p0', kind: 'browser', cwd: '', ord: 0, scrollback: '', url: 'javascript:alert(1)' }] }] }] })
+    expect(_parse(unsafe).workspaces[0]!.tabs[0]!.panes[0]!.url).toBe('about:blank')
+    const secret = JSON.stringify({ version: 1, scope: 'one', workspaces: [{ tabs: [{ tab: 1, tree: { kind: 'leaf', paneId: 'p0' }, panes: [{ id: 'p0', kind: 'browser', cwd: '', ord: 0, scrollback: '', url: 'https://user:pass@example.test/a?q=secret#token' }] }] }] })
+    expect(_parse(secret).workspaces[0]!.tabs[0]!.panes[0]!.url).toBe('https://example.test/a')
+  })
+
   it('load routes a browser pane to browsers, not creates', () => {
     const doc: WorkspaceDoc = { version: 1, scope: 'one', workspaces: [{ tabs: [{ tab: 1, tree: { kind: 'leaf', paneId: 'p0' },
       panes: [{ id: 'p0', kind: 'browser', cwd: '', ord: 0, scrollback: '', url: 'https://y.dev' }] }] }] }
@@ -70,7 +77,7 @@ describe('browser panes in .amberws', () => {
     expect(plan.creates).toEqual([])
     const [name, entry] = Object.entries(plan.browsers)[0]!
     expect(name.startsWith('browser-2-1-0-')).toBe(true)
-    expect(entry).toEqual({ ws: 2, tab: 1, ord: 0, url: 'https://y.dev' })
+    expect(entry).toEqual({ ws: 2, tab: 1, ord: 0, url: 'https://y.dev/' })
   })
 })
 

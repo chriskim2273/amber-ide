@@ -2,6 +2,7 @@ import type { Node } from '../renderer/layout'
 import { formatName } from './names'
 import { formatBrowserName } from './browserName'
 import { formatEditorName } from './editorName'
+import { safeRestoreUrl } from './tabBrowser'
 import { isDaemonSessionKind, type DaemonSessionKind } from './proto'
 import type { LayoutFile, WsLayout, TabLayout, FrozenEntry, BrowserEntry, EditorEntry } from './layoutFile'
 
@@ -94,7 +95,7 @@ function parsePane(v: unknown): WsPane {
     scrollback: p['scrollback'],
     // frozenNote is optional; drop it unless a string ('' is valid = frozen, no note).
     ...(typeof p['frozenNote'] === 'string' ? { frozenNote: p['frozenNote'] } : {}),
-    ...(typeof p['url'] === 'string' ? { url: p['url'] } : {}),
+    ...(kind === 'browser' && typeof p['url'] === 'string' ? { url: safeRestoreUrl(p['url']) } : {}),
     // `path` is string | null; anything else (incl. missing) loads as a scratch
     // buffer rather than failing the whole file.
     ...('path' in p ? { path: typeof p['path'] === 'string' ? p['path'] : null } : {}),
@@ -219,7 +220,7 @@ export function assembleSave(
           // Frozen presence must survive even with no note → encode '' so the
           // pane still round-trips as frozen (presence, not truthiness).
           ...(fz ? { frozenNote: fz.note ?? '' } : {}),
-          ...(p.kind === 'browser' ? { url: p.url ?? '' } : {}),
+          ...(p.kind === 'browser' ? { url: safeRestoreUrl(p.url ?? '') } : {}),
           ...(p.kind === 'editor' ? { path: p.path ?? null } : {}),
         }
       })
@@ -277,7 +278,7 @@ export function buildLoadPlan(doc: WorkspaceDoc, opts: LoadOptions): LoadPlan {
         if (pane.kind === 'browser') {
           const bname = formatBrowserName({ ws: targetWs, tab: tab.tab, ord: pane.ord, id: opts.mintId() })
           idToName[pane.id] = bname
-          browsers[bname] = { ws: targetWs, tab: tab.tab, ord: pane.ord, url: pane.url ?? '' }
+          browsers[bname] = { ws: targetWs, tab: tab.tab, ord: pane.ord, url: safeRestoreUrl(pane.url ?? '') }
           continue
         }
         // Editor panes are app-local too (same class as browser): sidecar entry,
