@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { BrowserCapacity } from './tabBrowserPolicy'
 import { createBrowserId, isOpaqueBrowserId, safeRestoreUrl, type BrowserId } from '../shared/tabBrowser'
+import type { WsBrowser } from '../shared/workspaceFile'
 import type { BrowserRecord, BrowserStateFile } from '../shared/tabBrowserState'
 
 export type TabBrowserPageEvent =
@@ -199,11 +200,41 @@ export class TabBrowserHost {
     const record = this.record(id); this.capacity.protectFor(record.id, 'approval', protectedValue)
   }
 
+  importWorkspace(entries: { id: BrowserId; browser: WsBrowser }[], recovery: { ws: number; tab: number; browser: WsBrowser }[]): BrowserRuntimeStatus[] {
+    if (entries.some((entry) => this.state.records[entry.id])) throw new Error('BROWSER_ID_COLLISION')
+    if (this.state.migrationRecovery.length + recovery.length > 100) throw new Error('BROWSER_RECOVERY_LIMIT')
+    const statuses = entries.map((entry) => this.importFrozen(entry.id, entry.browser))
+    this.state.migrationRecovery.push(...recovery.map((item) => ({ workspace: item.ws, tab: item.tab, safeRestoreUrl: safeRestoreUrl(item.browser.safeRestoreUrl) })))
+    this.onStateChange()
+    return statuses
+  }
+
+  importFrozen(id: BrowserId, browser: WsBrowser): BrowserRuntimeStatus {
+    if (this.state.records[id]) throw new Error('BROWSER_ID_COLLISION')
+    const at = this.now()
+    this.state.records[id] = {
+      id, profileId: 'global', mode: browser.mode, safeRestoreUrl: safeRestoreUrl(browser.safeRestoreUrl), title: '',
+      viewport: browser.viewport ?? { width: 1280, height: 800 }, lifecycle: 'frozen', stateRevision: 1,
+      lastUsedAt: at, lastFocusedAt: 0,
+    }
+    this.onStateChange()
+    return this.status(id)
+  }
+
   close(id: string): void {
     const record = this.record(id)
     this.runtimes.get(record.id)?.page.destroy()
     this.runtimes.delete(record.id); this.capacity.markFrozen(record.id)
     delete this.state.records[record.id]
+  }
+
+  workspaceSnapshot(): Record<string, { mode: 'preview' | 'browse'; safeRestoreUrl: string; viewport: { width: number; height: number } }> {
+    const out: Record<string, { mode: 'preview' | 'browse'; safeRestoreUrl: string; viewport: { width: number; height: number } }> = {}
+    for (const record of Object.values(this.state.records)) {
+      if (!record) continue
+      out[record.id] = { mode: record.mode, safeRestoreUrl: record.safeRestoreUrl, viewport: { ...record.viewport } }
+    }
+    return out
   }
 
   snapshot(): BrowserStateFile { return structuredClone(this.state) }

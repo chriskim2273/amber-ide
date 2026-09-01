@@ -52,32 +52,58 @@ describe('editor panes in .amberws', () => {
 })
 
 describe('browser panes in .amberws', () => {
-  it('save emits a browser pane with url, no scrollback', () => {
+  it('save emits a tab-owned v2 browser and no browser tree leaf', () => {
     const doc = _asm('one',
       [{ ws: 1, tabs: [{ tab: 1, panes: [{ name: 'browser-1-1-0-a', cwd: '', kind: 'browser', ord: 0, url: 'https://x.dev' }] }] }],
       { version: 1, activeWorkspace: 1, workspaces: { '1': { activeTab: 1, tabs: { '1': { tree: { kind: 'leaf', paneId: 'browser-1-1-0-a' } } } } } },
       {})
-    const pane = doc.workspaces[0]!.tabs[0]!.panes[0]!
-    expect(pane.kind).toBe('browser')
-    expect(pane.url).toBe('https://x.dev/')
-    expect(pane.scrollback).toBe('')
+    const tab = doc.workspaces[0]!.tabs[0]!
+    expect(doc.version).toBe(2)
+    expect(tab.panes).toEqual([])
+    expect(tab.tree).toBeNull()
+    expect(tab.browser).toEqual({ mode: 'browse', safeRestoreUrl: 'https://x.dev/' })
+    expect(_parse(_ser(doc)).workspaces[0]!.tabs[0]!.browser).toEqual(tab.browser)
   })
   it('rejects workspace browser URL scheme bypasses and strips persisted secrets', () => {
     const unsafe = JSON.stringify({ version: 1, scope: 'one', workspaces: [{ tabs: [{ tab: 1, tree: { kind: 'leaf', paneId: 'p0' }, panes: [{ id: 'p0', kind: 'browser', cwd: '', ord: 0, scrollback: '', url: 'javascript:alert(1)' }] }] }] })
-    expect(_parse(unsafe).workspaces[0]!.tabs[0]!.panes[0]!.url).toBe('about:blank')
+    expect(_parse(unsafe).workspaces[0]!.tabs[0]!.browser!.safeRestoreUrl).toBe('about:blank')
     const secret = JSON.stringify({ version: 1, scope: 'one', workspaces: [{ tabs: [{ tab: 1, tree: { kind: 'leaf', paneId: 'p0' }, panes: [{ id: 'p0', kind: 'browser', cwd: '', ord: 0, scrollback: '', url: 'https://user:pass@example.test/a?q=secret#token' }] }] }] })
-    expect(_parse(secret).workspaces[0]!.tabs[0]!.panes[0]!.url).toBe('https://example.test/a')
+    expect(_parse(secret).workspaces[0]!.tabs[0]!.browser!.safeRestoreUrl).toBe('https://example.test/a')
   })
 
-  it('load routes a browser pane to browsers, not creates', () => {
-    const doc: WorkspaceDoc = { version: 1, scope: 'one', workspaces: [{ tabs: [{ tab: 1, tree: { kind: 'leaf', paneId: 'p0' },
-      panes: [{ id: 'p0', kind: 'browser', cwd: '', ord: 0, scrollback: '', url: 'https://y.dev' }] }] }] }
+  it('migrates v1 browsers to a collision-safe rail and resets sharing/controller', () => {
+    const doc = _parse(JSON.stringify({ version: 1, scope: 'one', workspaces: [{ tabs: [{ tab: 1, tree: { kind: 'leaf', paneId: 'p0' },
+      panes: [{ id: 'p0', kind: 'browser', cwd: '', ord: 0, scrollback: '', url: 'https://y.dev' }] }] }] }))
+    const ids = ['browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'browser-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'] as const
     let n = 0
-    const plan = _pl(doc, { mode: 'new', currentWs: 1, liveWs: [1], mintId: () => `m${n++}` })
+    const plan = _pl(doc, { mode: 'new', currentWs: 1, liveWs: [1], mintId: () => `m${n++}`, mintBrowserId: () => ids[n++ % 2]!, existingBrowserIds: new Set([ids[0]]) })
     expect(plan.creates).toEqual([])
-    const [name, entry] = Object.entries(plan.browsers)[0]!
-    expect(name.startsWith('browser-2-1-0-')).toBe(true)
-    expect(entry).toEqual({ ws: 2, tab: 1, ord: 0, url: 'https://y.dev/' })
+    expect(plan.browsers).toEqual({})
+    expect(plan.browserRails[0]).toMatchObject({ id: ids[1], ws: 2, tab: 1, rail: { id: ids[1], width: 420, collapsed: false } })
+    expect(plan.workspaces['2']!.tabs['1']!.browser).not.toHaveProperty('sharedWithPi')
+    expect(plan.workspaces['2']!.tabs['1']!.browser).not.toHaveProperty('designatedPi')
+  })
+
+  it('recovers extra v1 browsers and serializes neither recovery nor sharing secrets', () => {
+    const doc = _parse(JSON.stringify({ version: 1, scope: 'one', workspaces: [{ tabs: [{ tab: 1, tree: { kind: 'split', dir: 'h', ratio: 0.5, a: { kind: 'leaf', paneId: 'p0' }, b: { kind: 'leaf', paneId: 'p1' } }, panes: [
+      { id: 'p0', kind: 'browser', cwd: '', ord: 0, scrollback: '', url: 'https://one.test/?secret=x' },
+      { id: 'p1', kind: 'browser', cwd: '', ord: 1, scrollback: '', url: 'https://two.test/#token' },
+    ] }] }] }))
+    expect(doc.workspaces[0]!.tabs[0]!.browser!.safeRestoreUrl).toBe('https://one.test/')
+    expect(doc.workspaces[0]!.tabs[0]!.browserRecovery).toEqual([{ mode: 'browse', safeRestoreUrl: 'https://two.test/' }])
+    const wire = _ser(doc)
+    expect(wire).not.toContain('browserRecovery')
+    expect(wire).not.toContain('sharedWithPi')
+    expect(wire).not.toContain('designatedPi')
+  })
+
+  it('rejects v2 browser panes, duplicate placeholders, unknown tree leaves, and invalid browser geometry', () => {
+    const base = { version: 2, scope: 'one', workspaces: [{ tabs: [{ tab: 1, tree: null, panes: [] }] }] }
+    expect(() => _parse(JSON.stringify({ ...base, workspaces: [{ tabs: [{ tab: 1, tree: null, panes: [{ id: 'p0', kind: 'browser', cwd: '', ord: 0, scrollback: '' }] }] }] }))).toThrow(/tab-owned/)
+    const pane = { id: 'p0', kind: 'shell', cwd: '', ord: 0, scrollback: '' }
+    expect(() => _parse(JSON.stringify({ ...base, workspaces: [{ tabs: [{ tab: 1, tree: null, panes: [pane, pane] }] }] }))).toThrow(/duplicate/)
+    expect(() => _parse(JSON.stringify({ ...base, workspaces: [{ tabs: [{ tab: 1, tree: { kind: 'leaf', paneId: 'gone' }, panes: [] }] }] }))).toThrow(/unknown placeholder/)
+    expect(() => _parse(JSON.stringify({ ...base, workspaces: [{ tabs: [{ tab: 1, tree: null, panes: [], browser: { mode: 'browse', safeRestoreUrl: 'https://x.test', viewport: { width: 1, height: 600 } } }] }] }))).toThrow(/viewport/)
   })
 })
 
@@ -91,6 +117,7 @@ describe('Pi panes in .amberws', () => {
     const kind: DaemonSessionKind = plan.creates[0]!.kind
     expect(kind).toBe('pi')
     expect(plan.browsers).toEqual({})
+    expect(plan.browserRails).toEqual([])
     expect(plan.editors).toEqual({})
   })
 

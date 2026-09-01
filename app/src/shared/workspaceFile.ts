@@ -1,15 +1,14 @@
 import type { Node } from '../renderer/layout'
 import { formatName } from './names'
-import { formatBrowserName } from './browserName'
 import { formatEditorName } from './editorName'
-import { safeRestoreUrl } from './tabBrowser'
+import { createBrowserId, safeRestoreUrl, type BrowserId } from './tabBrowser'
 import { isDaemonSessionKind, type DaemonSessionKind } from './proto'
-import type { LayoutFile, WsLayout, TabLayout, FrozenEntry, BrowserEntry, EditorEntry } from './layoutFile'
+import type { LayoutFile, WsLayout, TabLayout, FrozenEntry, BrowserEntry, BrowserRailLayout, EditorEntry } from './layoutFile'
 
 // The `.amberws` portable workspace file. Structure (grouping/tree/labels) +
 // per-pane scrollback, versioned. Tree leaves are file-local placeholders
 // (`p0`, `p1`…) — session names are minted fresh on load.
-export const WORKSPACE_VERSION = 1
+export const WORKSPACE_VERSION = 2
 export type AppLocalPaneKind = 'browser' | 'editor'
 export type WorkspacePaneKind = DaemonSessionKind | AppLocalPaneKind
 
@@ -29,11 +28,21 @@ export interface WsPane {
   // editor pane re-reads the file from disk. null = unsaved scratch buffer.
   path?: string | null
 }
+export interface WsBrowser {
+  mode: 'preview' | 'browse'
+  safeRestoreUrl: string
+  viewport?: { width: number; height: number }
+  collapsed?: boolean
+  width?: number
+}
 export interface WsTab {
   tab: number
   label?: string
   tree: Node | null // placeholder-leaf layout tree (null → equal splits on load)
   panes: WsPane[]
+  browser?: WsBrowser
+  /** Extra v1 browser leaves retained for explicit recovery, never serialized in v2. */
+  browserRecovery?: WsBrowser[]
 }
 export interface WsWorkspace {
   label?: string
@@ -102,27 +111,68 @@ function parsePane(v: unknown): WsPane {
   }
 }
 
-function parseTab(v: unknown): WsTab {
+function parseWsBrowser(v: unknown): WsBrowser {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) fail('tab.browser must be an object')
+  const b = v as Record<string, unknown>
+  if (b['mode'] !== 'preview' && b['mode'] !== 'browse') fail('browser.mode is unsupported')
+  if (typeof b['safeRestoreUrl'] !== 'string') fail('browser.safeRestoreUrl must be a string')
+  const viewport = b['viewport']
+  if (viewport !== undefined && (typeof viewport !== 'object' || viewport === null || Array.isArray(viewport)
+      || typeof (viewport as Record<string, unknown>)['width'] !== 'number' || !Number.isFinite((viewport as Record<string, unknown>)['width'])
+      || typeof (viewport as Record<string, unknown>)['height'] !== 'number' || !Number.isFinite((viewport as Record<string, unknown>)['height'])
+      || ((viewport as Record<string, number>)['width'] ?? 0) < 320 || ((viewport as Record<string, number>)['width'] ?? 0) > 4096
+      || ((viewport as Record<string, number>)['height'] ?? 0) < 240 || ((viewport as Record<string, number>)['height'] ?? 0) > 4096)) fail('browser.viewport is invalid')
+  const width = b['width']
+  if (width !== undefined && (typeof width !== 'number' || !Number.isFinite(width) || width < 240 || width > 1200)) fail('browser.width is invalid')
+  return {
+    mode: b['mode'], safeRestoreUrl: safeRestoreUrl(b['safeRestoreUrl']),
+    ...(viewport ? { viewport: { width: Math.min(4096, Math.max(320, (viewport as { width: number }).width)), height: Math.min(4096, Math.max(240, (viewport as { height: number }).height)) } } : {}),
+    ...(typeof b['collapsed'] === 'boolean' ? { collapsed: b['collapsed'] } : {}), ...(typeof width === 'number' ? { width } : {}),
+  }
+}
+
+function parseTab(v: unknown, version: 1 | 2): WsTab {
   if (typeof v !== 'object' || v === null || Array.isArray(v)) fail('tab is not an object')
   const t = v as Record<string, unknown>
   if (typeof t['tab'] !== 'number' || !Number.isFinite(t['tab'])) fail('tab.tab must be a number')
   if (!Array.isArray(t['panes'])) fail('tab.panes must be an array')
   const tree = t['tree']
   if (tree !== null && tree !== undefined && !isNode(tree)) fail('tab.tree is a malformed layout node')
+  const parsedPanes = t['panes'].map(parsePane)
+  if (version === 2 && parsedPanes.some((pane) => pane.kind === 'browser')) fail('v2 browser must be tab-owned')
+  const ids = new Set<string>()
+  for (const pane of parsedPanes) { if (ids.has(pane.id)) fail('duplicate pane placeholder'); ids.add(pane.id) }
+  const browserPanes = version === 1 ? parsedPanes.filter((pane) => pane.kind === 'browser').sort((a, b) => a.ord - b.ord || a.id.localeCompare(b.id)) : []
+  const panes = version === 1 ? parsedPanes.filter((pane) => pane.kind !== 'browser') : parsedPanes
+  const browserIds = new Set(browserPanes.map((pane) => pane.id))
+  const removeBrowsers = (node: Node | null): Node | null => {
+    if (!node) return null
+    if (node.kind === 'leaf') return browserIds.has(node.paneId) ? null : node
+    const a = removeBrowsers(node.a); const b = removeBrowsers(node.b)
+    if (!a) return b; if (!b) return a
+    return { ...node, a, b }
+  }
+  const cleanTree = version === 1 ? removeBrowsers((tree ?? null) as Node | null) : (tree ?? null) as Node | null
+  const referenced = new Set<string>()
+  const visit = (node: Node | null): void => { if (!node) return; if (node.kind === 'leaf') referenced.add(node.paneId); else { visit(node.a); visit(node.b) } }
+  visit(cleanTree)
+  if (version === 2 && [...referenced].some((id) => !ids.has(id))) fail('tree references unknown placeholder')
+  const legacyBrowsers = browserPanes.map((pane) => ({ mode: 'browse' as const, safeRestoreUrl: safeRestoreUrl(pane.url ?? '') }))
   return {
-    tab: t['tab'],
-    tree: (tree ?? null) as Node | null,
-    panes: t['panes'].map(parsePane),
+    tab: t['tab'], tree: cleanTree, panes,
     ...(typeof t['label'] === 'string' ? { label: t['label'] } : {}),
+    ...(version === 2 && t['browser'] !== undefined ? { browser: parseWsBrowser(t['browser']) } : {}),
+    ...(legacyBrowsers[0] ? { browser: legacyBrowsers[0] } : {}),
+    ...(legacyBrowsers.length > 1 ? { browserRecovery: legacyBrowsers.slice(1) } : {}),
   }
 }
 
-function parseWorkspace(v: unknown): WsWorkspace {
+function parseWorkspace(v: unknown, version: 1 | 2): WsWorkspace {
   if (typeof v !== 'object' || v === null || Array.isArray(v)) fail('workspace is not an object')
   const w = v as Record<string, unknown>
   if (!Array.isArray(w['tabs'])) fail('workspace.tabs must be an array')
   return {
-    tabs: w['tabs'].map(parseTab),
+    tabs: w['tabs'].map((tab) => parseTab(tab, version)),
     ...(typeof w['label'] === 'string' ? { label: w['label'] } : {}),
     ...(Array.isArray(w['tabOrder'])
       ? { tabOrder: w['tabOrder'].filter((n): n is number => typeof n === 'number' && Number.isFinite(n)) }
@@ -139,18 +189,21 @@ export function parseWorkspaceFile(text: string): WorkspaceDoc {
   }
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) fail('top level is not an object')
   const d = raw as Record<string, unknown>
-  if (d['version'] !== WORKSPACE_VERSION) throw new Error('unsupported version')
+  if (d['version'] !== 1 && d['version'] !== WORKSPACE_VERSION) throw new Error('unsupported version')
   if (d['scope'] !== 'one' && d['scope'] !== 'all') fail('scope must be "one" or "all"')
   if (!Array.isArray(d['workspaces'])) fail('workspaces must be an array')
   return {
     version: WORKSPACE_VERSION,
     scope: d['scope'],
-    workspaces: d['workspaces'].map(parseWorkspace),
+    workspaces: d['workspaces'].map((workspace) => parseWorkspace(workspace, d['version'] as 1 | 2)),
   }
 }
 
 export function serializeWorkspaceFile(doc: WorkspaceDoc): string {
-  return JSON.stringify(doc)
+  return JSON.stringify({
+    version: WORKSPACE_VERSION, scope: doc.scope,
+    workspaces: doc.workspaces.map((workspace) => ({ ...workspace, tabs: workspace.tabs.map(({ browserRecovery: _recovery, ...tab }) => tab) })),
+  })
 }
 
 // ---- placeholder tree rewrites (pure, both directions) ----------------------
@@ -182,7 +235,7 @@ export function treeFromPlaceholders(tree: Node | null, idToName: Record<string,
 // TabModel/PaneModel) so this module stays pure and never imports the renderer
 // store.
 export interface SavePane { name: string; cwd: string; kind: string; ord: number; url?: string; path?: string | null }
-export interface SaveTab { tab: number; panes: SavePane[] }
+export interface SaveTab { tab: number; panes: SavePane[]; browser?: WsBrowser }
 export interface SaveWorkspace { ws: number; tabs: SaveTab[] }
 
 // Precondition: `live` and `sidecar` derive from the same reconciled state —
@@ -202,7 +255,9 @@ export function assembleSave(
       const tabSide = wsSide?.tabs[String(tab.tab)]
       // Placeholder per pane, in ord order (live groupings already sort by ord).
       const nameToId: Record<string, string> = {}
-      const panes: WsPane[] = tab.panes.map((p, i) => {
+      const legacyBrowsers = tab.panes.filter((pane) => pane.kind === 'browser')
+      const portablePanes = tab.panes.filter((pane) => pane.kind !== 'browser')
+      const panes: WsPane[] = portablePanes.map((p, i) => {
         if (!isWorkspacePaneKind(p.kind)) throw new Error(`unsupported pane kind: ${p.kind}`)
         const id = `p${i}`
         nameToId[p.name] = id
@@ -213,14 +268,11 @@ export function assembleSave(
           kind: p.kind,
           cwd: p.cwd,
           ord: p.ord,
-          // Browser panes have no daemon scrollback; they carry a URL instead.
-          // Browser/editor panes are app-local: no daemon scrollback. They carry
-          // a URL / a file path instead.
-          scrollback: p.kind === 'browser' || p.kind === 'editor' ? '' : (dump ? toBase64(dump) : ''),
+          // Editor panes are app-local and have no daemon scrollback.
+          scrollback: p.kind === 'editor' ? '' : (dump ? toBase64(dump) : ''),
           // Frozen presence must survive even with no note → encode '' so the
           // pane still round-trips as frozen (presence, not truthiness).
           ...(fz ? { frozenNote: fz.note ?? '' } : {}),
-          ...(p.kind === 'browser' ? { url: safeRestoreUrl(p.url ?? '') } : {}),
           ...(p.kind === 'editor' ? { path: p.path ?? null } : {}),
         }
       })
@@ -229,6 +281,8 @@ export function assembleSave(
         tree: treeToPlaceholders(tabSide?.tree ?? null, nameToId),
         panes,
         ...(typeof tabSide?.label === 'string' ? { label: tabSide.label } : {}),
+        ...(tab.browser ? { browser: { ...tab.browser, safeRestoreUrl: safeRestoreUrl(tab.browser.safeRestoreUrl) } }
+          : legacyBrowsers[0] ? { browser: { mode: 'browse' as const, safeRestoreUrl: safeRestoreUrl(legacyBrowsers[0].url ?? '') } } : {}),
       }
     })
     return {
@@ -242,16 +296,20 @@ export function assembleSave(
 
 // ---- build a load plan (pure; name minting injected for deterministic tests) -
 export type LoadOptions =
-  | { mode: 'new'; nextWs: number; mintId: () => string }
-  | { mode: 'replace'; ws: number; mintId: () => string }
+  | { mode: 'new'; nextWs: number; mintId: () => string; mintBrowserId?: () => BrowserId; existingBrowserIds?: Set<string> }
+  | { mode: 'replace'; ws: number; mintId: () => string; mintBrowserId?: () => BrowserId; existingBrowserIds?: Set<string> }
 
 export interface LoadCreate { name: string; cwd: string; kind: DaemonSessionKind }
+export interface BrowserLoadIntent { id: BrowserId; ws: number; tab: number; browser: WsBrowser; rail: BrowserRailLayout }
+export interface BrowserRecoveryIntent { ws: number; tab: number; browser: WsBrowser }
 export interface LoadPlan {
   creates: LoadCreate[]
   workspaces: Record<string, WsLayout> // sidecar mutations, keyed by ws-number string
   frozen: Record<string, FrozenEntry> // keyed by minted session name
   scrollback: Record<string, Uint8Array> // keyed by minted session name
-  browsers: Record<string, BrowserEntry> // app-local browser panes, keyed by minted browser id
+  browsers: Record<string, BrowserEntry> // transitional legacy map; v2 plans leave this empty
+  browserRails: BrowserLoadIntent[]
+  browserRecovery: BrowserRecoveryIntent[]
   editors: Record<string, EditorEntry> // app-local editor panes, keyed by minted editor id
   targetWorkspaces: number[] // ws numbers used, in doc order
 }
@@ -264,6 +322,16 @@ export function buildLoadPlan(doc: WorkspaceDoc, opts: LoadOptions): LoadPlan {
   const scrollback: Record<string, Uint8Array> = {}
   const browsers: Record<string, BrowserEntry> = {}
   const editors: Record<string, EditorEntry> = {}
+  const browserRails: BrowserLoadIntent[] = []
+  const browserRecovery: BrowserRecoveryIntent[] = []
+  const usedBrowserIds = new Set(opts.existingBrowserIds ?? [])
+  const mintBrowser = (): BrowserId => {
+    for (let attempt = 0; attempt < 100; attempt++) {
+      const id = opts.mintBrowserId ? opts.mintBrowserId() : createBrowserId()
+      if (!usedBrowserIds.has(id)) { usedBrowserIds.add(id); return id }
+    }
+    throw new Error('browser id collision limit exceeded')
+  }
   const targetWorkspaces: number[] = []
 
   doc.workspaces.forEach((ws, wsIdx) => {
@@ -273,14 +341,9 @@ export function buildLoadPlan(doc: WorkspaceDoc, opts: LoadOptions): LoadPlan {
     for (const tab of ws.tabs) {
       const idToName: Record<string, string> = {}
       for (const pane of tab.panes) {
-        // Browser panes are app-local: mint a browser id, record a sidecar entry,
-        // and DO NOT create a daemon session (no `creates` push).
-        if (pane.kind === 'browser') {
-          const bname = formatBrowserName({ ws: targetWs, tab: tab.tab, ord: pane.ord, id: opts.mintId() })
-          idToName[pane.id] = bname
-          browsers[bname] = { ws: targetWs, tab: tab.tab, ord: pane.ord, url: safeRestoreUrl(pane.url ?? '') }
-          continue
-        }
+        // Browser pane placeholders are a v1 wire concern. Parsed documents
+        // migrate them to tab.browser before planning and v2 rejects them.
+        if (pane.kind === 'browser') continue
         // Editor panes are app-local too (same class as browser): sidecar entry,
         // no daemon session. Only the path is restored; contents come from disk.
         if (pane.kind === 'editor') {
@@ -298,7 +361,14 @@ export function buildLoadPlan(doc: WorkspaceDoc, opts: LoadOptions): LoadPlan {
       // A saved null tree stays null — the renderer reconciles it to equal
       // splits at mount (core rule #3: grouping reconstructable from names).
       const tree = tab.tree ? treeFromPlaceholders(tab.tree, idToName) : null
-      tabs[String(tab.tab)] = { tree, ...(typeof tab.label === 'string' ? { label: tab.label } : {}) }
+      let rail: BrowserRailLayout | undefined
+      if (tab.browser) {
+        const id = mintBrowser()
+        rail = { id, width: tab.browser.width ?? 420, collapsed: tab.browser.collapsed ?? false }
+        browserRails.push({ id, ws: targetWs, tab: tab.tab, browser: tab.browser, rail })
+      }
+      for (const browser of tab.browserRecovery ?? []) browserRecovery.push({ ws: targetWs, tab: tab.tab, browser })
+      tabs[String(tab.tab)] = { tree, ...(typeof tab.label === 'string' ? { label: tab.label } : {}), ...(rail ? { browser: rail } : {}) }
     }
     const firstTab = ws.tabs[0]?.tab ?? 1
     workspaces[String(targetWs)] = {
@@ -309,7 +379,7 @@ export function buildLoadPlan(doc: WorkspaceDoc, opts: LoadOptions): LoadPlan {
     }
   })
 
-  return { creates, workspaces, frozen, scrollback, browsers, editors, targetWorkspaces }
+  return { creates, workspaces, frozen, scrollback, browsers, browserRails, browserRecovery, editors, targetWorkspaces }
 }
 
 // Lowest free workspace number: one above the highest live number (gaps are NOT
@@ -325,22 +395,25 @@ export function nextFreeWs(liveWs: number[]): number {
 //   max live ws. Free allocation always scans ALL live workspaces (nextFreeWs).
 export function planLoad(
   doc: WorkspaceDoc,
-  opts: { mode: 'new' | 'replace'; currentWs: number; liveWs: number[]; mintId: () => string },
+  opts: { mode: 'new' | 'replace'; currentWs: number; liveWs: number[]; mintId: () => string; mintBrowserId?: () => BrowserId; existingBrowserIds?: Set<string> },
 ): LoadPlan {
   const free = nextFreeWs(opts.liveWs)
   if (opts.mode === 'new' || doc.workspaces.length === 0) {
-    return buildLoadPlan(doc, { mode: 'new', nextWs: free, mintId: opts.mintId })
+    return buildLoadPlan(doc, { mode: 'new', nextWs: free, mintId: opts.mintId, ...(opts.mintBrowserId ? { mintBrowserId: opts.mintBrowserId } : {}), ...(opts.existingBrowserIds ? { existingBrowserIds: opts.existingBrowserIds } : {}) })
   }
   const [first, ...rest] = doc.workspaces
-  const firstPlan = buildLoadPlan({ ...doc, workspaces: [first!] }, { mode: 'replace', ws: opts.currentWs, mintId: opts.mintId })
+  const firstPlan = buildLoadPlan({ ...doc, workspaces: [first!] }, { mode: 'replace', ws: opts.currentWs, mintId: opts.mintId, ...(opts.mintBrowserId ? { mintBrowserId: opts.mintBrowserId } : {}), ...(opts.existingBrowserIds ? { existingBrowserIds: opts.existingBrowserIds } : {}) })
   if (rest.length === 0) return firstPlan
-  const restPlan = buildLoadPlan({ ...doc, workspaces: rest }, { mode: 'new', nextWs: free, mintId: opts.mintId })
+  const used = new Set([...(opts.existingBrowserIds ?? []), ...firstPlan.browserRails.map((entry) => entry.id)])
+  const restPlan = buildLoadPlan({ ...doc, workspaces: rest }, { mode: 'new', nextWs: free, mintId: opts.mintId, ...(opts.mintBrowserId ? { mintBrowserId: opts.mintBrowserId } : {}), existingBrowserIds: used })
   return {
     creates: [...firstPlan.creates, ...restPlan.creates],
     workspaces: { ...firstPlan.workspaces, ...restPlan.workspaces },
     frozen: { ...firstPlan.frozen, ...restPlan.frozen },
     scrollback: { ...firstPlan.scrollback, ...restPlan.scrollback },
     browsers: { ...firstPlan.browsers, ...restPlan.browsers },
+    browserRails: [...firstPlan.browserRails, ...restPlan.browserRails],
+    browserRecovery: [...firstPlan.browserRecovery, ...restPlan.browserRecovery],
     editors: { ...firstPlan.editors, ...restPlan.editors },
     targetWorkspaces: [...firstPlan.targetWorkspaces, ...restPlan.targetWorkspaces],
   }

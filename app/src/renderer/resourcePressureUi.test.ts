@@ -70,7 +70,7 @@ function splitView(active: boolean, onPaneFocus: () => void): JSX.Element {
     tree: TREE, deadCodes: {}, meta: { [PANE]: { kind: 'claude', title: 'agent', cwd: '/tmp', runState: 'resource-suspended' } }, active,
     epoch: 0, portEpoch: 0, fontSize: 13, mobile: false, onPaneTitle: () => {}, onPaneFocus,
     onSetRatio: () => {}, onSplit: () => {}, onMove: () => {}, onMoveTo: () => {}, onClose: () => {},
-    browsers: {}, onBrowserNav: () => {}, editors: {}, onEditorPath: () => {}, onEditorViewState: () => {},
+    editors: {}, onEditorPath: () => {}, onEditorViewState: () => {},
     onEditorDirty: () => {}, onEditorReady: () => {}, zoomedPane: null, onToggleZoom: () => {},
     frozen: {}, onFreeze: () => {}, onUnfreeze: () => {},
   })

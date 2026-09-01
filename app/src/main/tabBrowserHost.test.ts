@@ -112,6 +112,21 @@ describe('TabBrowserHost', () => {
     expect((opened.page as FakePage).stopped).toBe(true)
   })
 
+  it('imports a workspace browser frozen without controller/share authority', () => {
+    const host = new TabBrowserHost(emptyBrowserState(1), factory, () => 20)
+    const status = host.importFrozen('browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', {
+      mode: 'preview', safeRestoreUrl: 'https://u:p@example.test/a?q=x', viewport: { width: 900, height: 700 }, collapsed: true, width: 500,
+    })
+    expect(status).toMatchObject({ lifecycle: 'frozen', mode: 'preview', safeRestoreUrl: 'https://example.test/a', viewport: { width: 900, height: 700 } })
+    expect(status).not.toHaveProperty('sharedWithPi')
+    expect(status).not.toHaveProperty('designatedPi')
+    expect(() => host.importWorkspace([
+      { id: 'browser-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', browser: { mode: 'browse', safeRestoreUrl: 'https://new.test' } },
+      { id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', browser: { mode: 'browse', safeRestoreUrl: 'about:blank' } },
+    ], [])).toThrow('BROWSER_ID_COLLISION')
+    expect(() => host.status('browser-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')).toThrow('NO_BROWSER_FOR_TAB')
+  })
+
   it('stops an active page load without closing the browser', async () => {
     const host = new TabBrowserHost(emptyBrowserState(1), factory)
     const opened = await host.open({ visible: true })

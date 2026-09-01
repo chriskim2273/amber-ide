@@ -71,7 +71,7 @@ import {
   type RouterStatus,
 } from './routerService'
 import { inspectLinuxInputMethod, repairLinuxInputMethod, resolveLinuxInputEnvironment } from './inputMethod'
-import { TabBrowserService, parseTabBrowserCommand } from './tabBrowserService'
+import { TabBrowserService, parseTabBrowserCommand, parseWorkspaceBrowserImports } from './tabBrowserService'
 import { TabBrowserBrokerServer, authorizeBrowserRequest, isEligiblePiController, type BrokerRequest } from './tabBrowserBroker'
 import { BrowserDaemonWatcher } from './browserDaemonWatcher'
 import { Connection } from '../client/connection'
@@ -938,10 +938,7 @@ async function openWindow(target: WindowTarget): Promise<WindowCtx> {
       preload: join(__dirname, '../preload/index.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
-      // Browser panes (web-viewer): the renderer hosts <webview> tags. Each runs
-      // unprivileged (no nodeIntegration, its own persist partition) — see
-      // Browser.tsx + spec 2026-07-18 §8.
-      webviewTag: true,
+      webviewTag: false,
       // Keep the preload SANDBOXED (default) for security. A sandboxed preload
       // has no node builtins and no `process.env`, so the two values it needs
       // are passed as argv flags (reachable via `process.argv` in sandbox).
@@ -1075,22 +1072,6 @@ async function openWindow(target: WindowTarget): Promise<WindowCtx> {
     stopClient()
   }
   app.on('before-quit', onBeforeQuit)
-
-  // Browser panes host <webview> web contents. Route popups (window.open /
-  // target=_blank) to the system browser and refuse in-app popup windows, and
-  // restrict navigation to http/https/about (spec 2026-07-18 §8). Electron 43
-  // removed the renderer <webview> `new-window` event, so this MUST live in the
-  // main process. Non-webview contents (the app window itself) are untouched.
-  app.on('web-contents-created', (_e, contents) => {
-    if (contents.getType() !== 'webview') return
-    contents.setWindowOpenHandler(({ url }) => {
-      if (/^https?:\/\//i.test(url)) void shell.openExternal(url)
-      return { action: 'deny' }
-    })
-    contents.on('will-navigate', (ev, url) => {
-      if (!/^(https?:|about:)/i.test(url)) ev.preventDefault()
-    })
-  })
 
   const notifyRenderer = (data: unknown): void => {
     if (!win.isDestroyed()) win.webContents.send('daemon-event', data)
@@ -1293,6 +1274,23 @@ async function main(): Promise<void> {
 
   ipcMain.on('close-pane', (e, session: string) => {
     ctxFor(e)?.child()?.postMessage({ kind: 'pane-close', session })
+  })
+
+  ipcMain.handle('browser:workspace-snapshot', async (e) => {
+    const sender = ctxFor(e)
+    if (!tabBrowser || sender?.target.kind !== 'local') return { ok: false, error: 'BROWSER_HOST_UNAVAILABLE' }
+    try {
+      return { ok: true, result: tabBrowser.workspaceSnapshot() }
+    } catch (error) { return { ok: false, error: error instanceof Error ? error.message : 'INTERNAL_ERROR' } }
+  })
+
+  ipcMain.handle('browser:import-workspace', async (e, raw: unknown) => {
+    const sender = ctxFor(e)
+    if (!tabBrowser || sender?.target.kind !== 'local') return { ok: false, error: 'BROWSER_HOST_UNAVAILABLE' }
+    try {
+      await tabBrowser.importWorkspaceBrowsers(parseWorkspaceBrowserImports(raw))
+      return { ok: true }
+    } catch (error) { return { ok: false, error: error instanceof Error ? error.message : 'INTERNAL_ERROR' } }
   })
 
   ipcMain.handle('browser:command', async (e, raw: unknown) => {

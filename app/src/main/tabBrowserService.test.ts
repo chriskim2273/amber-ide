@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { parseTabBrowserCommand } from './tabBrowserService'
+import { parseTabBrowserCommand, parseWorkspaceBrowserImports } from './tabBrowserService'
 
 describe('parseTabBrowserCommand', () => {
   it('accepts the bounded renderer command surface', () => {
@@ -12,5 +12,18 @@ describe('parseTabBrowserCommand', () => {
     expect(() => parseTabBrowserCommand({ type: 'status', id: 'browser-a' })).toThrow('INVALID_REQUEST')
     expect(() => parseTabBrowserCommand({ type: 'bounds', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', bounds: { x: 0, y: 0, width: NaN, height: 2 } })).toThrow('INVALID_REQUEST')
     expect(() => parseTabBrowserCommand({ type: 'bounds', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', bounds: { x: 0, y: 0, width: 100_000, height: 2 } })).toThrow('INVALID_REQUEST')
+  })
+})
+
+describe('parseWorkspaceBrowserImports', () => {
+  it('accepts only bounded safe restore intent and strips credentials', () => {
+    expect(parseWorkspaceBrowserImports({ entries: [{ id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', browser: { mode: 'browse', safeRestoreUrl: 'https://u:p@example.test/a?q=x#y', viewport: { width: 800, height: 600 }, sharedWithPi: true } }], recovery: [] })).toEqual({
+      entries: [{ id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', browser: { mode: 'browse', safeRestoreUrl: 'https://example.test/a', viewport: { width: 800, height: 600 } } }], recovery: [],
+    })
+  })
+  it('rejects excessive volume, malformed ids, and malformed viewports', () => {
+    expect(() => parseWorkspaceBrowserImports({ entries: new Array(101).fill({}), recovery: [] })).toThrow('INVALID_REQUEST')
+    expect(() => parseWorkspaceBrowserImports({ entries: [{ id: 'browser-bad', browser: { mode: 'browse', safeRestoreUrl: 'https://x.test' } }], recovery: [] })).toThrow('INVALID_REQUEST')
+    expect(() => parseWorkspaceBrowserImports({ entries: [{ id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', browser: { mode: 'browse', safeRestoreUrl: 'https://x.test', viewport: { width: '800', height: 600 } } }], recovery: [] })).toThrow('INVALID_REQUEST')
   })
 })

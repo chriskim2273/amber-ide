@@ -17,12 +17,12 @@ export const PANE_KIND_OPTIONS: readonly PaneKindOption[] = [
   { kind: 'editor', label: 'Editor', detail: 'App-local file editor' },
 ] as const
 
-export type DaemonPaneKind = Exclude<PaneKind, 'browser' | 'editor'>
+export type DaemonPaneKind = Exclude<PaneKind, 'editor'>
 export type DaemonPaneKindOption = PaneKindOption & { kind: DaemonPaneKind }
 
 /** One metadata source for every client; capability filters choose the surface. */
 export const DAEMON_PANE_KIND_OPTIONS: readonly DaemonPaneKindOption[] = PANE_KIND_OPTIONS.filter(
-  (option): option is DaemonPaneKindOption => option.kind !== 'browser' && option.kind !== 'editor',
+  (option): option is DaemonPaneKindOption => option.kind !== 'editor',
 )
 
 export function machineWindowTitle(localMachine: string, remoteHost: string): string {
