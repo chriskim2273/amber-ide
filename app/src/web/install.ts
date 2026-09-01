@@ -4,6 +4,7 @@
 // `createAmber` directly against fakes.
 
 import { createAmber, type SocketLike, type PortLike, type RouterApi } from './amber'
+import { createGestureClipboard } from './webClipboard'
 import type { LoadLayoutResult, SaveLayoutResult, LayoutVersion } from '../shared/layoutFile'
 import { slotFromWire, type RouterSlot } from '../shared/routerStatus'
 
@@ -143,11 +144,64 @@ async function layoutSave(text: string, version: LayoutVersion): Promise<SaveLay
   }
 }
 
+/**
+ * Small self-contained "copy pending" hint for the gesture-retry path.
+ *
+ * `navigator.clipboard.writeText` succeeds without a user gesture in Chrome,
+ * but Safari/Firefox reject it (`NotAllowedError`) when not called from a
+ * keydown/click. When that happens we queue the copy and finish it on the next
+ * user gesture (see `createGestureClipboard`), so the user must know to tap
+ * once — otherwise `/copy` looks like it silently did nothing. This renders a
+ * transient toast in the corner (NOT React chrome: the web build shares the
+ * Electron renderer, and this hint is purely web-side, so it stays in
+ * `install.ts`, the single real-DOM glue file).
+ */
+function makeCopyHint(): { show: (text: string) => void; hide: () => void } {
+  const el = document.createElement('div')
+  el.setAttribute('role', 'status')
+  el.setAttribute('aria-live', 'polite')
+  Object.assign(el.style, {
+    position: 'fixed', right: '14px', bottom: '14px',
+    padding: '8px 14px', borderRadius: '8px', fontSize: '13px',
+    background: 'rgba(20, 22, 30, 0.92)', color: '#e6e6e6',
+    boxShadow: '0 4px 18px rgba(0,0,0,0.4)', zIndex: '9999',
+    pointerEvents: 'none', display: 'none',
+  })
+  document.body.appendChild(el)
+  let timer = 0
+  const show = (text: string): void => {
+    el.textContent = `Copy pending — press a key to finish${text ? ` (${text.length} chars)` : ''}`
+    el.style.display = 'block'
+    clearTimeout(timer)
+    timer = window.setTimeout(hide, 6000)
+  }
+  const hide = (): void => {
+    clearTimeout(timer)
+    el.style.display = 'none'
+  }
+  return { show, hide }
+}
+
 /** Install `window.amber`. Must run with `home` already known — `main.tsx`
  * reads `homeDir` via a lazy `useState` initializer that runs exactly once,
  * so a placeholder patched in later would permanently stick every new pane's
  * default cwd at that placeholder. */
 export function installAmber(home: string): void {
+  // Safari/Firefox reject gesture-less clipboard writes. The gesture wrapper
+  // queues a rejected OSC 52 copy and finishes it on the next keydown/click
+  // (which runs inside transient activation), with a corner hint so the user
+  // knows a tap is expected. Chrome writes immediately and never queues.
+  const hint = makeCopyHint()
+  const clipboard = createGestureClipboard(
+    (text) => navigator.clipboard.writeText(text),
+    () => navigator.clipboard.readText(),
+    { onQueued: (text) => hint.show(text), onDone: () => hint.hide() },
+  )
+  const gestures = ['keydown', 'click', 'pointerdown']
+  gestures.forEach((ev) => {
+    window.addEventListener(ev, () => clipboard.gesture(), { capture: true, passive: true })
+  })
+
   const amber = createAmber({
     connectSocket,
     newChannel: () => {
@@ -158,8 +212,8 @@ export function installAmber(home: string): void {
       window.postMessage({ amberPanePort: true, session }, '*', [port2 as MessagePort])
     },
     clipboard: {
-      writeText: (text) => navigator.clipboard.writeText(text),
-      readText: () => navigator.clipboard.readText(),
+      writeText: (text) => clipboard.writeText(text),
+      readText: () => clipboard.readText(),
     },
     home,
     // The web renderer is already on the remote machine's HTTPS origin. Keep

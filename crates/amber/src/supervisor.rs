@@ -225,6 +225,19 @@ pub fn supervise_agent(
         if let Ok(exe) = crate::manager::resolve_command_exe() {
             command.env("AMBER_BIN", exe);
         }
+        // Pi's clipboard only falls back to OSC 52 when it believes the session is
+        // remote (`isRemoteSession` checks SSH_CONNECTION/SSH_CLIENT/MOSH_CONNECTION;
+        // it is read in exactly one place, `copyToClipboard`). In an amber pane the pty
+        // is relayed to arbitrary clients (desktop, `amber web`, the web build) over the
+        // socket, so a *local* xclip copy on the host would never reach a remote viewer.
+        // Assuring Pi this is a remote session makes it emit OSC 52 in addition to the
+        // native xclip write: on desktop that's a harmless duplicate (OSC 52→Electron
+        // clipboard + xclip→X clipboard, same text), on a remote/web viewer it's exactly
+        // the transport amber already routes to the browser. Pi-only: the env is set on
+        // the agent child, never the shell fallback, and no other agent reads it.
+        if matches!(agent, Agent::Pi) {
+            command.env("SSH_CONNECTION", "amber-daemon");
+        }
         let outcome = match spawn_agent(&mut command, slot) {
             Err(e) => Err(e),
             Ok(mut child) => {
