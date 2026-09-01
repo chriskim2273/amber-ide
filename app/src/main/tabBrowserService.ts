@@ -47,6 +47,9 @@ export class TabBrowserService {
   }
 
   async command(command: TabBrowserCommand, signal?: AbortSignal): Promise<BrowserRuntimeStatus | { closed: true }> {
+    // Observations and capacity-releasing commands must not sit behind an
+    // activation wait; otherwise four visible/protected pages can deadlock.
+    if (command.type === 'status' || command.type === 'hide' || command.type === 'close') return this.runCommand(command, signal)
     let resolve!: (value: BrowserRuntimeStatus | { closed: true }) => void
     let reject!: (reason: unknown) => void
     const result = new Promise<BrowserRuntimeStatus | { closed: true }>((ok, fail) => { resolve = ok; reject = fail })
@@ -60,11 +63,11 @@ export class TabBrowserService {
   private async runCommand(command: TabBrowserCommand, signal?: AbortSignal): Promise<BrowserRuntimeStatus | { closed: true }> {
     switch (command.type) {
       case 'open': {
-        const opened = await this.host.open({ visible: true }); await this.schedulePersist(); return opened.status
+        const opened = await this.host.open({ visible: true }, signal); await this.schedulePersist(); return opened.status
       }
       case 'show': {
         const before = this.host.status(command.id).stateRevision
-        await this.host.thaw(command.id)
+        await this.host.thaw(command.id, signal)
         const status = this.host.show(command.id, command.bounds)
         if (status.stateRevision !== before) await this.schedulePersist()
         return status

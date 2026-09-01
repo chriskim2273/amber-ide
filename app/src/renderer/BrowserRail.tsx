@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 
 interface BrowserStatus {
   id: string; safeRestoreUrl: string; pageIncarnation: string; generation: number
-  lifecycle: 'live' | 'frozen'; loading: boolean
+  lifecycle: 'live' | 'frozen'; loading: boolean; capacityWaiting?: boolean
 }
 type BrowserReply = { ok: true; result: BrowserStatus | { closed: true } } | { ok: false; error: string }
 
@@ -87,6 +87,7 @@ export function BrowserRail(props: {
       <button className="icon-btn" aria-label="Collapse tab browser" onClick={() => props.onCollapsed(true)}>›</button>
       <button className="icon-btn" aria-label="Close tab browser" onClick={props.onClose}>×</button>
     </div>
+    {status?.capacityWaiting && <div className="tab-browser-status" role="status">Waiting for browser capacity…</div>}
     {error && <div className="tab-browser-error" role="alert">{error}</div>}
     <div ref={host} className="tab-browser-page-slot" />
     <div className="tab-browser-grip" role="separator" aria-orientation="vertical" aria-label="Resize browser rail"

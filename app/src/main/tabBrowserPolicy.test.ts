@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { BrowserCapacity, browserWebPreferences, isAllowedBrowserUrl } from './tabBrowserPolicy'
 
 describe('browser security policy', () => {
@@ -14,6 +14,8 @@ describe('browser security policy', () => {
   })
 })
 
+afterEach(() => vi.useRealTimers())
+
 describe('four-live capacity', () => {
   it('freezes the eligible least-recent browser', () => {
     const c = new BrowserCapacity(4)
@@ -26,5 +28,37 @@ describe('four-live capacity', () => {
     const c = new BrowserCapacity(2)
     c.markLive('a', 1); c.markLive('b', 2); c.protect('a', true); c.protect('b', true)
     expect(c.activate('c', 3)).toEqual({ busy: true })
+  })
+  it('queues activations FIFO and protects visible, operation, and approval reasons', async () => {
+    const c = new BrowserCapacity(2)
+    c.markLive('a', 1); c.markLive('b', 2)
+    c.protect('a', true); c.protectFor('b', 'operation', true); c.protectFor('b', 'approval', true)
+    const first = c.activateQueued('c', 3)
+    const second = c.activateQueued('d', 4)
+    expect(c.waitingIds()).toEqual(['c', 'd'])
+    c.protect('a', false)
+    await expect(first).resolves.toEqual({ freeze: 'a' })
+    expect(c.waitingIds()).toEqual(['d'])
+    c.protectFor('b', 'operation', false)
+    expect(c.waitingIds()).toEqual(['d'])
+    c.protectFor('b', 'approval', false)
+    await expect(second).resolves.toEqual({ freeze: 'b' })
+  })
+  it('bounds the activation queue, joins one browser, cancels, and times out deterministically', async () => {
+    vi.useFakeTimers()
+    const c = new BrowserCapacity(1, 10_000, 2)
+    c.markLive('a', 1); c.protect('a', true)
+    const controller = new AbortController()
+    const first = c.activateQueued('b', 2, controller.signal)
+    expect(c.activateQueued('b', 3)).toBe(first)
+    const second = c.activateQueued('c', 3)
+    await expect(c.activateQueued('d', 4)).rejects.toThrow('BROWSER_CAPACITY_BUSY')
+    controller.abort()
+    await expect(first).rejects.toThrow('ACTION_CANCELLED')
+    expect(c.waitingIds()).toEqual(['c'])
+    const timedOut = expect(second).rejects.toThrow('BROWSER_CAPACITY_BUSY')
+    await vi.advanceTimersByTimeAsync(10_000)
+    await timedOut
+    expect(c.waitingIds()).toEqual([])
   })
 })

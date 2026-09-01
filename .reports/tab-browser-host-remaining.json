@@ -48,7 +48,7 @@
     {
       "id": "P1-capacity-activation-queue",
       "severity": "important",
-      "status": "partial",
+      "status": "completed",
       "work": "Implement the approved global FIFO activation queue (8 entries/10 seconds), operation/approval protection, cancellation, and capacity-wait UI instead of immediate busy-only behavior."
     },
     {

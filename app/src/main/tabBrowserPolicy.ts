@@ -20,28 +20,80 @@ export function isAllowedBrowserUrl(value: string): boolean {
   } catch { return false }
 }
 
-interface LiveEntry { lastUsedAt: number; protected: boolean }
+interface LiveEntry { lastUsedAt: number; protections: Set<string> }
+interface CapacityWaiter {
+  id: string; now: number; promise: Promise<{ freeze?: string }>
+  resolve: (value: { freeze?: string }) => void; reject: (error: Error) => void
+  timer: NodeJS.Timeout; signal?: AbortSignal; abort?: () => void; onWaiting?: (waiting: boolean) => void
+}
 
 /** Pure four-live renderer policy. OS process count is deliberately unrelated. */
 export class BrowserCapacity {
   private readonly live = new Map<string, LiveEntry>()
-  constructor(private readonly maxLive = 4) {}
-  markLive(id: string, lastUsedAt: number): void { this.live.set(id, { lastUsedAt, protected: this.live.get(id)?.protected ?? false }) }
-  markFrozen(id: string): void { this.live.delete(id) }
-  protect(id: string, protectedValue: boolean): void {
+  private readonly queue: CapacityWaiter[] = []
+  private readonly pending = new Map<string, CapacityWaiter>()
+  constructor(private readonly maxLive = 4, private readonly waitMs = 10_000, private readonly maxQueue = 8) {}
+  markLive(id: string, lastUsedAt: number): void { this.live.set(id, { lastUsedAt, protections: this.live.get(id)?.protections ?? new Set() }) }
+  markFrozen(id: string): void { this.live.delete(id); this.drain() }
+  protect(id: string, protectedValue: boolean): void { this.protectFor(id, 'visible', protectedValue) }
+  protectFor(id: string, reason: 'visible' | 'operation' | 'approval' | 'activation', protectedValue: boolean): void {
     const value = this.live.get(id)
-    if (value) value.protected = protectedValue
+    if (!value) return
+    if (protectedValue) value.protections.add(reason)
+    else value.protections.delete(reason)
+    if (!protectedValue) this.drain()
   }
   touch(id: string, lastUsedAt: number): void { const value = this.live.get(id); if (value) value.lastUsedAt = lastUsedAt }
   liveIds(): string[] { return [...this.live.keys()] }
   activate(id: string, now: number): { freeze?: string; busy?: true } {
     if (this.live.has(id)) { this.touch(id, now); return {} }
     if (this.live.size < this.maxLive) { this.markLive(id, now); return {} }
-    const eligible = [...this.live.entries()].filter(([, value]) => !value.protected).sort((a, b) => a[1].lastUsedAt - b[1].lastUsedAt || a[0].localeCompare(b[0]))
+    const eligible = [...this.live.entries()].filter(([, value]) => value.protections.size === 0).sort((a, b) => a[1].lastUsedAt - b[1].lastUsedAt || a[0].localeCompare(b[0]))
     const victim = eligible[0]?.[0]
     if (!victim) return { busy: true }
     this.live.delete(victim)
     this.markLive(id, now)
     return { freeze: victim }
+  }
+  waitingIds(): string[] { return this.queue.map((entry) => entry.id) }
+  settleActivation(id: string): void { this.protectFor(id, 'activation', false) }
+  activateQueued(id: string, now: number, signal?: AbortSignal, onWaiting?: (waiting: boolean) => void): Promise<{ freeze?: string }> {
+    const immediate = this.activate(id, now)
+    if (!immediate.busy) { this.protectFor(id, 'activation', true); return Promise.resolve(immediate) }
+    const existing = this.pending.get(id)
+    if (existing) return existing.promise
+    if (signal?.aborted) return Promise.reject(new Error('ACTION_CANCELLED'))
+    if (this.queue.length >= this.maxQueue) return Promise.reject(new Error('BROWSER_CAPACITY_BUSY'))
+    let resolve!: CapacityWaiter['resolve']; let reject!: CapacityWaiter['reject']
+    const promise = new Promise<{ freeze?: string }>((res, rej) => { resolve = res; reject = rej })
+    const waiter: CapacityWaiter = {
+      id, now, promise, resolve, reject, ...(signal ? { signal } : {}), ...(onWaiting ? { onWaiting } : {}),
+      timer: setTimeout(() => this.remove(waiter, new Error('BROWSER_CAPACITY_BUSY')), this.waitMs),
+    }
+    if (signal) {
+      waiter.abort = () => this.remove(waiter, new Error('ACTION_CANCELLED'))
+      signal.addEventListener('abort', waiter.abort, { once: true })
+    }
+    this.queue.push(waiter); this.pending.set(id, waiter); onWaiting?.(true)
+    return promise
+  }
+  private remove(waiter: CapacityWaiter, error?: Error): void {
+    if (this.pending.get(waiter.id) !== waiter) return
+    this.pending.delete(waiter.id)
+    const index = this.queue.indexOf(waiter)
+    if (index >= 0) this.queue.splice(index, 1)
+    clearTimeout(waiter.timer)
+    if (waiter.abort) waiter.signal?.removeEventListener('abort', waiter.abort)
+    waiter.onWaiting?.(false)
+    if (error) waiter.reject(error)
+  }
+  private drain(): void {
+    const waiter = this.queue[0]
+    if (!waiter) return
+    const activation = this.activate(waiter.id, waiter.now)
+    if (activation.busy) return
+    this.protectFor(waiter.id, 'activation', true)
+    this.remove(waiter)
+    waiter.resolve(activation)
   }
 }

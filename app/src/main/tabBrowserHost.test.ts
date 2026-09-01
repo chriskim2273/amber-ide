@@ -65,6 +65,25 @@ describe('TabBrowserHost', () => {
     expect(host.status(opened[0]!.status.id).pageIncarnation).not.toBe(incarnation)
   })
 
+  it('emits capacity-wait state and cancels a queued activation', async () => {
+    const events: { type: string; id: string; waiting: boolean }[] = []
+    const host = new TabBrowserHost(emptyBrowserState(1), factory, Date.now, undefined, () => {}, (event) => events.push(event))
+    const opened = []
+    for (let i = 0; i < 4; i++) {
+      const page = await host.open({ visible: false }); opened.push(page)
+      host.protectApproval(page.status.id, true)
+    }
+    const controller = new AbortController()
+    const pending = host.open({ visible: false }, controller.signal)
+    await Promise.resolve()
+    const waiting = events.find((event) => event.waiting)
+    expect(waiting).toBeTruthy()
+    expect(host.status(waiting!.id).capacityWaiting).toBe(true)
+    controller.abort()
+    await expect(pending).rejects.toThrow('ACTION_CANCELLED')
+    expect(events.at(-1)).toMatchObject({ id: waiting!.id, waiting: false })
+  })
+
   it('tracks user navigation, loading, and title events as host state', async () => {
     const host = new TabBrowserHost(emptyBrowserState(1), factory)
     const opened = await host.open({ visible: true })
