@@ -5,6 +5,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { basename, dirname, join, resolve as resolvePathJoin, isAbsolute } from 'node:path'
 import { homedir, hostname, release as osRelease, tmpdir } from 'node:os'
 import { spawn, execFileSync } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { readFile, writeFile, rename, mkdir, copyFile, chmod, realpath, rm, stat, mkdtemp } from 'node:fs/promises'
 import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
 import { resolveSocketPath } from '../shared/socketPath'
@@ -71,14 +72,17 @@ import {
   type RouterStatus,
 } from './routerService'
 import { inspectLinuxInputMethod, repairLinuxInputMethod, resolveLinuxInputEnvironment } from './inputMethod'
-import { TabBrowserService, parseTabBrowserCommand, parseWorkspaceBrowserImports, stageWorkspaceBrowserState } from './tabBrowserService'
+import { TabBrowserService, parseTabBrowserCommand, stageWorkspaceBrowserState } from './tabBrowserService'
 import { TabBrowserBrokerServer, authorizeBrowserRequest, isEligiblePiController, type BrokerRequest } from './tabBrowserBroker'
 import { BrowserDaemonWatcher } from './browserDaemonWatcher'
 import { Connection } from '../client/connection'
 import { TabBrowserStateStore } from './tabBrowserStateStore'
 import { commitBrowserLayoutMutation, coordinateTabBrowserMigration } from './tabBrowserMigrationCoordinator'
-import { bindRendererBrowserCommand, browserAuthorityChanged, deriveActiveBrowserId, removedBrowserIds } from './browserAssociationAuthority'
-import { emptyLayout, parseLayout, serializeLayout } from '../shared/layoutFile'
+import { bindRendererBrowserCommand, browserAuthorityChanged } from './browserAssociationAuthority'
+import { emptyLayout, parseLayout, serializeLayout, type LayoutFile } from '../shared/layoutFile'
+import { parseWorkspaceFile } from '../shared/workspaceFile'
+import { commitPreparedWorkspaceImport, prepareWorkspaceImport } from './workspaceImport'
+import { resolveBrowserContext } from './browserWindowContext'
 import { createBrowserId } from '../shared/tabBrowser'
 import clientPath from '../client/index?modulePath'
 
@@ -727,6 +731,8 @@ interface WindowCtx {
   child: () => Electron.UtilityProcess | null
   resumeClient: () => void
   activeBrowserId: string | null
+  activeWorkspace: number | null
+  activeTab: number | null
 }
 
 /** Per-window state, keyed by webContents id so IPC can route by sender. */
@@ -736,6 +742,13 @@ let reopenLocalWindow: (() => Promise<void>) | null = null
 /** The window an IPC message came from. */
 function ctxFor(e: { sender: Electron.WebContents }): WindowCtx | undefined {
   return windowCtxs.get(e.sender.id)
+}
+
+function setWindowContextFromLayout(ctx: WindowCtx, layout: LayoutFile): void {
+  const workspace = layout.workspaces[String(layout.activeWorkspace)]
+  ctx.activeWorkspace = layout.activeWorkspace
+  ctx.activeTab = workspace?.activeTab ?? null
+  ctx.activeBrowserId = workspace?.tabs[String(workspace.activeTab)]?.browser?.id ?? null
 }
 
 /** A live ssh tunnel backing one remote window. */
@@ -1126,6 +1139,8 @@ async function openWindow(target: WindowTarget): Promise<WindowCtx> {
     controlPort: () => controlPort,
     child: () => child,
     activeBrowserId: null,
+    activeWorkspace: null,
+    activeTab: null,
     resumeClient: () => {
       if (!presentationSuspended) return
       presentationSuspended = false
@@ -1301,8 +1316,9 @@ async function main(): Promise<void> {
       if (!item) throw new Error('NO_RECOVERY_ITEM')
       const loaded = await loadLayoutFile(layoutPath())
       if (!loaded.text) throw new Error('NO_BROWSER_FOR_TAB')
-      const current = parseLayout(loaded.text); const wsKey = String(current.activeWorkspace); const workspace = current.workspaces[wsKey]
-      const tabKey = String(workspace?.activeTab ?? 0); const previous = workspace?.tabs[tabKey]
+      if (sender.activeWorkspace === null || sender.activeTab === null) throw new Error('NO_ACTIVE_TAB')
+      const current = parseLayout(loaded.text); const wsKey = String(sender.activeWorkspace); const workspace = current.workspaces[wsKey]
+      const tabKey = String(sender.activeTab); const previous = workspace?.tabs[tabKey]
       if (!workspace || !previous || previous.browser) throw new Error(previous?.browser ? 'BROWSER_ALREADY_ATTACHED' : 'NO_BROWSER_FOR_TAB')
       const id = createBrowserId(); const browser = { id, width: 420, collapsed: false }
       const next = { ...current, version: 2, browserRevision: (current.browserRevision ?? 0) + 1,
@@ -1315,7 +1331,7 @@ async function main(): Promise<void> {
       })
       if (!('ok' in saved)) throw new Error('error' in saved ? saved.error : 'LAYOUT_CONFLICT')
       await tabBrowser.attachRecovery(request['index'], id)
-      sender.activeBrowserId = id; sender.win.webContents.send('tab-browser-association', { ws: current.activeWorkspace, tab: workspace.activeTab, browser })
+      sender.activeBrowserId = id; sender.win.webContents.send('tab-browser-association', { ws: sender.activeWorkspace, tab: sender.activeTab, browser })
       return { ok: true }
     } catch (error) { return { ok: false, error: error instanceof Error ? error.message : 'INTERNAL_ERROR' } }
   })
@@ -1330,34 +1346,36 @@ async function main(): Promise<void> {
 
   ipcMain.handle('browser:import-workspace', async (e, raw: unknown) => {
     const sender = ctxFor(e)
-    if (!tabBrowser || !tabBrowserStateStore || sender?.target.kind !== 'local') return { ok: false, error: 'BROWSER_HOST_UNAVAILABLE' }
+    if (sender?.target.kind !== 'local') return { ok: false, error: 'BROWSER_HOST_UNAVAILABLE' }
     try {
       if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) throw new Error('INVALID_REQUEST')
       const request = raw as Record<string, unknown>
-      if (request['mode'] !== 'new' && request['mode'] !== 'replace') throw new Error('INVALID_REQUEST')
-      if (typeof request['currentWs'] !== 'number' || !Number.isSafeInteger(request['currentWs'])) throw new Error('INVALID_REQUEST')
-      const imports = parseWorkspaceBrowserImports(request['imports'])
-      const candidate = parseLayout(JSON.stringify({ version: 2, activeWorkspace: request['currentWs'], workspaces: request['workspaces'] }))
+      if (Object.keys(request).length !== 2 || !Object.hasOwn(request, 'mode') || !Object.hasOwn(request, 'text') || (request['mode'] !== 'new' && request['mode'] !== 'replace') || typeof request['text'] !== 'string') throw new Error('INVALID_REQUEST')
+      if (sender.activeWorkspace === null || sender.activeTab === null) throw new Error('NO_ACTIVE_TAB')
+      const doc = parseWorkspaceFile(request['text'])
       const loaded = await loadLayoutFile(layoutPath())
-      const current = loaded.text ? parseLayout(loaded.text) : candidate
-      const workspaces = { ...current.workspaces }
-      if (request['mode'] === 'replace') delete workspaces[String(request['currentWs'])]
-      Object.assign(workspaces, candidate.workspaces)
-      const next = { ...current, version: 2, workspaces, browserRevision: (current.browserRevision ?? 0) + 1 }
-      const importedIds = new Set(imports.entries.map((entry) => entry.id))
-      const plannedBrowsers = Object.values(candidate.workspaces).flatMap((workspace) => Object.values(workspace.tabs).flatMap((tab) => tab.browser ? [tab.browser] : []))
-      if (plannedBrowsers.some((browser) => browser.designatedPi !== undefined || browser.sharedWithPi === true)) throw new Error('INVALID_REQUEST')
-      const plannedIds = new Set(plannedBrowsers.map((browser) => browser.id))
-      if (importedIds.size !== plannedIds.size || [...importedIds].some((id) => !plannedIds.has(id))) throw new Error('INVALID_REQUEST')
-      const saved = await commitBrowserLayoutMutation(layoutPath(), tabBrowserStateStore, serializeLayout(next), loaded.version, undefined, undefined,
-        (state) => stageWorkspaceBrowserState(state, imports))
-      if (!('ok' in saved)) throw new Error('error' in saved ? saved.error : 'LAYOUT_CONFLICT')
-      const removed = removedBrowserIds(current, next)
-      await tabBrowser.importWorkspaceBrowsers(imports)
-      for (const id of removed) await tabBrowser.command({ type: 'destroy', id }).catch(() => {})
-      sender.activeBrowserId = deriveActiveBrowserId(next)
-      return { ok: true, layout: serializeLayout(next), version: saved.version }
+      const current = loaded.text ? parseLayout(loaded.text) : emptyLayout()
+      const state = tabBrowserStateStore ? await tabBrowserStateStore.load() : null
+      const prepared = prepareWorkspaceImport({ current, browserState: state, doc, mode: request['mode'], activeWorkspace: sender.activeWorkspace, mintId: () => randomUUID().replaceAll('-', '') })
+      const committed = await commitPreparedWorkspaceImport({ prepared, layoutPath: layoutPath(), expectedLayoutVersion: loaded.version, browserStore: tabBrowserStateStore, browserHost: tabBrowser })
+      setWindowContextFromLayout(sender, prepared.next)
+      return { ok: true, layout: serializeLayout(prepared.next), version: committed.version, plan: prepared.plan }
     } catch (error) { return { ok: false, error: error instanceof Error ? error.message : 'INTERNAL_ERROR' } }
+  })
+
+  ipcMain.handle('browser:set-context', async (e, raw: unknown) => {
+    const sender = ctxFor(e)
+    if (sender?.target.kind !== 'local' || !raw || typeof raw !== 'object') return { ok: false, error: 'BROWSER_HOST_UNAVAILABLE' }
+    const request = raw as Record<string, unknown>
+    if (Object.keys(request).length !== 2 || !Object.hasOwn(request, 'workspace') || !Object.hasOwn(request, 'tab')) return { ok: false, error: 'INVALID_REQUEST' }
+    const loaded = await loadLayoutFile(layoutPath())
+    if (!loaded.text) return { ok: false, error: 'NO_ACTIVE_TAB' }
+    try {
+      const context = resolveBrowserContext(parseLayout(loaded.text), request['workspace'], request['tab'])
+      if (tabBrowser && sender.activeBrowserId && sender.activeBrowserId !== context.browserId) await tabBrowser.command({ type: 'hide', id: sender.activeBrowserId }).catch(() => {})
+      sender.activeWorkspace = context.workspace; sender.activeTab = context.tab; sender.activeBrowserId = context.browserId
+      return { ok: true, ...context }
+    } catch (error) { return { ok: false, error: error instanceof Error ? error.message : 'INVALID_REQUEST' } }
   })
 
   ipcMain.handle('browser:command', async (e, raw: unknown) => {
@@ -1369,9 +1387,10 @@ async function main(): Promise<void> {
         const loaded = await loadLayoutFile(layoutPath())
         if (!loaded.text) throw new Error('NO_BROWSER_FOR_TAB')
         const current = parseLayout(loaded.text)
-        const wsKey = String(current.activeWorkspace)
+        if (sender.activeWorkspace === null || sender.activeTab === null) throw new Error('NO_ACTIVE_TAB')
+        const wsKey = String(sender.activeWorkspace)
         const workspace = current.workspaces[wsKey]
-        const tabKey = String(workspace?.activeTab ?? 0)
+        const tabKey = String(sender.activeTab)
         const previous = workspace?.tabs[tabKey]
         if (!workspace || !previous) throw new Error('NO_BROWSER_FOR_TAB')
         let openedId: string | null = null
@@ -1392,7 +1411,7 @@ async function main(): Promise<void> {
             if (parsed.designatedPi) {
               const match = /^amber-(\d+)-(\d+)-/.exec(parsed.designatedPi)
               const controller = browserDaemonWatcher?.controller(parsed.designatedPi)
-              if (!match || Number(match[1]) !== current.activeWorkspace || Number(match[2]) !== workspace.activeTab || !isEligiblePiController(controller)) throw new Error('NOT_DESIGNATED_CONTROLLER')
+              if (!match || Number(match[1]) !== sender.activeWorkspace || Number(match[2]) !== sender.activeTab || !isEligiblePiController(controller)) throw new Error('NOT_DESIGNATED_CONTROLLER')
             }
             const { designatedPi: _old, sharedWithPi: _shared, ...base } = browser
             browser = parsed.designatedPi ? { ...base, designatedPi: parsed.designatedPi, sharedWithPi: false } : { ...base, sharedWithPi: false }
@@ -1409,11 +1428,21 @@ async function main(): Promise<void> {
         }
         if (parsed.type === 'close' && previous.browser) await tabBrowser.command({ type: 'destroy', id: previous.browser.id })
         sender.activeBrowserId = browser?.id ?? null
-        sender.win.webContents.send('tab-browser-association', { ws: current.activeWorkspace, tab: workspace.activeTab, ...(browser ? { browser } : {}) })
+        sender.win.webContents.send('tab-browser-association', { ws: sender.activeWorkspace, tab: sender.activeTab, ...(browser ? { browser } : {}) })
         return { ok: true, result: parsed.type === 'close' ? { closed: true } : browser ? await tabBrowser.command({ type: 'status', id: browser.id }) : { closed: true } }
       }
+      const loaded = await loadLayoutFile(layoutPath())
+      if (!loaded.text || sender.activeWorkspace === null || sender.activeTab === null) throw new Error('NO_ACTIVE_TAB')
+      const associated = parseLayout(loaded.text).workspaces[String(sender.activeWorkspace)]?.tabs[String(sender.activeTab)]?.browser?.id ?? null
+      if (associated !== sender.activeBrowserId) throw new Error('STALE_BROWSER_CONTEXT')
       const command = bindRendererBrowserCommand(sender.activeBrowserId, parsed)
-      return { ok: true, result: await tabBrowser.command(command) }
+      const expected = { workspace: sender.activeWorkspace, tab: sender.activeTab, browserId: sender.activeBrowserId }
+      const stillAssociated = async (): Promise<boolean> => {
+        if (sender.activeWorkspace !== expected.workspace || sender.activeTab !== expected.tab || sender.activeBrowserId !== expected.browserId) return false
+        const latest = await loadLayoutFile(layoutPath())
+        return !!latest.text && parseLayout(latest.text).workspaces[String(expected.workspace)]?.tabs[String(expected.tab)]?.browser?.id === expected.browserId
+      }
+      return { ok: true, result: await tabBrowser.command(command, undefined, stillAssociated) }
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : 'INTERNAL_ERROR' }
     }
@@ -1639,21 +1668,16 @@ async function main(): Promise<void> {
       // default geometry — the same fallback core rule #3 already requires.
       return { text: probe.out.length > 0 ? probe.out : null, version: null }
     }
-    const loaded = await loadLayoutFile(layoutPath())
-    if (ctx && loaded.text) ctx.activeBrowserId = deriveActiveBrowserId(parseLayout(loaded.text))
-    return loaded
+    return loadLayoutFile(layoutPath())
   })
   ipcMain.handle('layout-save', async (e, text: string, version: string | null) => {
     if (ctxFor(e)?.target.kind === 'remote') return { ok: true, version: null }
-    const sender = ctxFor(e)
     const current = await loadLayoutFile(layoutPath())
     if (current.text && parseLayout(current.text).readOnly) return { error: 'layout belongs to a newer Amber version' }
     const currentLayout = current.text ? parseLayout(current.text) : null
     const nextLayout = parseLayout(text)
     if (browserAuthorityChanged(currentLayout ?? emptyLayout(), nextLayout)) return { error: 'browser association is main-owned' }
-    const result = await saveLayoutFile(layoutPath(), text, version)
-    if ('ok' in result && sender) sender.activeBrowserId = deriveActiveBrowserId(nextLayout)
-    return result
+    return saveLayoutFile(layoutPath(), text, version)
   })
 
   const productivityPath = () => join(stateRoot(), 'productivity.json')

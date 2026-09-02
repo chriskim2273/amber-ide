@@ -121,10 +121,9 @@ describe('commandCenterModel', () => {
     expect(model.groups.flatMap((group) => group.items).map((item) => item.pane.name)).toEqual(['ws-two'])
   })
 
-  it('keeps app-local browser and editor panes out of the mobile terminal command center', () => {
+  it('keeps app-local editor panes out of the mobile terminal command center', () => {
     const model = commandCenterModel({
       workspaces: workspaces(
-        pane('browser-2-3-0-x', { kind: 'browser' }),
         pane('editor-2-3-1-y', { kind: 'editor', slot: 2 }),
         pane('amber-2-3-2-z', { slot: 3 }),
       ),

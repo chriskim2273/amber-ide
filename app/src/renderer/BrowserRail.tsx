@@ -11,13 +11,17 @@ export function BrowserRail(props: {
   controllers: { name: string; label: string }[]
   onWidth: (width: number) => void; onCollapsed: (collapsed: boolean) => void; onClose: () => void
   onPolicy: (policy: { designatedPi?: string; sharedWithPi: boolean }) => void
+  ensureContext: () => Promise<void>
 }): JSX.Element {
   const host = useRef<HTMLDivElement>(null)
   const [status, setStatus] = useState<BrowserStatus | null>(null)
   const [address, setAddress] = useState('')
   const [error, setError] = useState('')
 
-  const command = async (value: unknown): Promise<BrowserReply> => window.amber.browserCommand(value) as Promise<BrowserReply>
+  const command = async (value: unknown): Promise<BrowserReply> => {
+    await props.ensureContext()
+    return window.amber.browserCommand(value) as Promise<BrowserReply>
+  }
 
   useEffect(() => {
     return window.amber.onTabBrowserEvent?.((value) => {
@@ -57,7 +61,7 @@ export function BrowserRail(props: {
     const observer = new ResizeObserver(() => { void update() })
     observer.observe(element)
     window.addEventListener('resize', update)
-    return () => { stopped = true; observer.disconnect(); window.removeEventListener('resize', update); void command({ type: 'hide', id: props.id }) }
+    return () => { stopped = true; observer.disconnect(); window.removeEventListener('resize', update) }
   }, [props.id, props.collapsed])
 
   const navigate = async (): Promise<void> => {

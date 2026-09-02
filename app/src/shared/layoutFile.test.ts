@@ -99,10 +99,11 @@ describe('pushRecent', () => {
 })
 
 describe('layout browsers map', () => {
-  it('round-trips valid entries', () => {
-    const l: LayoutFile = { version: 1, activeWorkspace: 1, workspaces: {},
-      browsers: { 'browser-1-1-0-a': { ws: 1, tab: 1, ord: 0, url: 'https://x.dev' } } }
-    expect(parseLayout(serializeLayout(l)).browsers).toEqual(l.browsers)
+  it('decodes v1 entries but never writes them back', () => {
+    const text = JSON.stringify({ version: 1, activeWorkspace: 1, workspaces: {}, browsers: { 'browser-1-1-0-a': { ws: 1, tab: 1, ord: 0, url: 'https://x.dev' } } })
+    const decoded = parseLayout(text)
+    expect(decoded.browsers).toEqual({ 'browser-1-1-0-a': { ws: 1, tab: 1, ord: 0, url: 'https://x.dev' } })
+    expect(parseLayout(serializeLayout(decoded)).browsers).toBeUndefined()
   })
   it('drops malformed entries, keeps valid', () => {
     const text = JSON.stringify({ version: 1, activeWorkspace: 1, workspaces: {}, browsers: {
@@ -273,10 +274,9 @@ describe('mergeLayout (spec §6 CAS conflict retry)', () => {
     expect(merged.workspaces['2']?.tabs['1']?.tree).toEqual(leaf('b-edited'))
   })
 
-  it('never prunes desktop-only browser/editor panes the web build cannot create', () => {
-    // Reproduces the exact risk the spec calls out (§7): a web client's local
-    // tree has no browsers/editors at all (it never created any), and while
-    // its save was in flight the desktop added one of each. A naive
+  it('never prunes desktop-only editor panes the web build cannot create', () => {
+    // A web client's local tree has no editors, and while its save was in
+    // flight the desktop added one. A naive
     // "overwrite with local" retry would silently destroy them.
     const base: LayoutFile = {
       version: 1, activeWorkspace: 1,
@@ -288,12 +288,10 @@ describe('mergeLayout (spec §6 CAS conflict retry)', () => {
     }
     const remote: LayoutFile = {
       ...base,
-      browsers: { 'browser-1-1-1-x': { ws: 1, tab: 1, ord: 1, url: 'https://example.com' } },
       editors: { 'editor-1-1-2-y': { ws: 1, tab: 1, ord: 2, path: '/tmp/notes.md' } },
     }
     const merged = mergeLayout(base, local, remote)
     expect(merged.workspaces['1']?.tabs['1']?.tree).toEqual(leaf('a-edited-by-browser'))
-    expect(merged.browsers).toEqual(remote.browsers)
     expect(merged.editors).toEqual(remote.editors)
   })
 

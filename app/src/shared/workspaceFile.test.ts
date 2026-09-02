@@ -9,6 +9,7 @@ import { assembleSave as _asm, planLoad as _pl, parseWorkspaceFile as _parse, re
 describe('workspace browser snapshot boundary', () => {
   it('aborts rather than writing a workspace with missing browser intent', () => {
     expect(() => requireWorkspaceBrowserSnapshots({ ok: false })).toThrow('browser snapshot unavailable')
+    expect(() => requireWorkspaceBrowserSnapshots({ ok: true, result: {} }, ['browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'])).toThrow('browser snapshot incomplete')
     expect(requireWorkspaceBrowserSnapshots({ ok: true, result: {} })).toEqual({})
   })
 })
@@ -71,17 +72,11 @@ describe('browser panes in .amberws', () => {
     expect(plan.workspaces['4']!.tabs['7']!.browser).toEqual({ id: 'browser-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', width: 510, collapsed: true })
     expect(plan.browserRails[0]!.browser).toMatchObject({ mode: 'preview', safeRestoreUrl: 'https://example.test/app' })
   })
-  it('save emits a tab-owned v2 browser and no browser tree leaf', () => {
-    const doc = _asm('one',
-      [{ ws: 1, tabs: [{ tab: 1, panes: [{ name: 'browser-1-1-0-a', cwd: '', kind: 'browser', ord: 0, url: 'https://x.dev' }] }] }],
+  it('rejects the removed live browser-pane save fallback', () => {
+    expect(() => _asm('one',
+      [{ ws: 1, tabs: [{ tab: 1, panes: [{ name: 'browser-1-1-0-a', cwd: '', kind: 'browser', ord: 0 }] }] }],
       { version: 1, activeWorkspace: 1, workspaces: { '1': { activeTab: 1, tabs: { '1': { tree: { kind: 'leaf', paneId: 'browser-1-1-0-a' } } } } } },
-      {})
-    const tab = doc.workspaces[0]!.tabs[0]!
-    expect(doc.version).toBe(2)
-    expect(tab.panes).toEqual([])
-    expect(tab.tree).toBeNull()
-    expect(tab.browser).toEqual({ mode: 'browse', safeRestoreUrl: 'https://x.dev/' })
-    expect(_parse(_ser(doc)).workspaces[0]!.tabs[0]!.browser).toEqual(tab.browser)
+      {})).toThrow('unsupported live pane kind: browser')
   })
   it('rejects workspace browser URL scheme bypasses and strips persisted secrets', () => {
     const unsafe = JSON.stringify({ version: 1, scope: 'one', workspaces: [{ tabs: [{ tab: 1, tree: { kind: 'leaf', paneId: 'p0' }, panes: [{ id: 'p0', kind: 'browser', cwd: '', ord: 0, scrollback: '', url: 'javascript:alert(1)' }] }] }] })
@@ -97,7 +92,6 @@ describe('browser panes in .amberws', () => {
     let n = 0
     const plan = _pl(doc, { mode: 'new', currentWs: 1, liveWs: [1], mintId: () => `m${n++}`, mintBrowserId: () => ids[n++ % 2]!, existingBrowserIds: new Set([ids[0]]) })
     expect(plan.creates).toEqual([])
-    expect(plan.browsers).toEqual({})
     expect(plan.browserRails[0]).toMatchObject({ id: ids[1], ws: 2, tab: 1, rail: { id: ids[1], width: 420, collapsed: false } })
     expect(plan.workspaces['2']!.tabs['1']!.browser).not.toHaveProperty('sharedWithPi')
     expect(plan.workspaces['2']!.tabs['1']!.browser).not.toHaveProperty('designatedPi')
@@ -135,7 +129,6 @@ describe('Pi panes in .amberws', () => {
     expect(plan.creates).toEqual([{ name: 'amber-2-1-0-pi-id', cwd: '/work', kind: 'pi' }])
     const kind: DaemonSessionKind = plan.creates[0]!.kind
     expect(kind).toBe('pi')
-    expect(plan.browsers).toEqual({})
     expect(plan.browserRails).toEqual([])
     expect(plan.editors).toEqual({})
   })

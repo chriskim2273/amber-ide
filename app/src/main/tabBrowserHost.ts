@@ -188,10 +188,16 @@ export class TabBrowserHost {
     record.lifecycle = 'frozen'; record.stateRevision += 1
   }
 
-  async thaw(id: string, signal?: AbortSignal): Promise<BrowserRuntimeStatus> {
+  async thaw(id: string, signal?: AbortSignal, validate?: () => boolean | Promise<boolean>): Promise<BrowserRuntimeStatus> {
     const record = this.record(id)
     if (this.runtimes.has(record.id)) return this.status(record.id)
     const activation = await this.capacity.activateQueued(record.id, this.now(), signal, (waiting) => this.capacityEvent(record.id, waiting))
+    if (validate) {
+      let valid = false
+      try { valid = await validate() } catch (error) { this.capacity.settleActivation(record.id); throw error }
+      if (!valid) { this.capacity.settleActivation(record.id); throw new Error('STALE_BROWSER_CONTEXT') }
+    }
+    if (signal?.aborted) { this.capacity.settleActivation(record.id); throw new Error('ACTION_CANCELLED') }
     if (activation.freeze && isOpaqueBrowserId(activation.freeze)) this.freeze(activation.freeze)
     const runtime = this.makeRuntime(record.id)
     record.lifecycle = 'live'; record.stateRevision += 1

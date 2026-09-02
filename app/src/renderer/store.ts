@@ -261,8 +261,8 @@ export function mergeBrowserRailTabs(workspaces: WorkspaceModel[], layouts: Reco
   return [...wsMap.entries()].sort((a, b) => a[0] - b[0]).map(([ws, tabs]) => ({ ws, tabs: [...tabs.values()].sort((a, b) => a.tab - b.tab) }))
 }
 
-// Editor panes (spec 2026-07-19) are the same class as browser panes: app-local,
-// sidecar-owned, no daemon session. `cwd` carries the file's directory so the
+// Editor panes are app-local, sidecar-owned, and have no daemon session.
+// `cwd` carries the file's directory so the
 // pane header/title can show something useful; an unsaved scratch pane has none.
 export function mergeEditors(
   workspaces: WorkspaceModel[],

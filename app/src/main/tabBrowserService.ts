@@ -32,19 +32,56 @@ export function stageWorkspaceBrowserState(state: BrowserStateFile, input: Works
   return { ...state, records, migrationRecovery: [...state.migrationRecovery, ...input.recovery.map((item) => ({ workspace: item.ws, tab: item.tab, safeRestoreUrl: safeRestoreUrl(item.browser.safeRestoreUrl) }))] }
 }
 
+function recoveryKey(item: BrowserStateFile['migrationRecovery'][number]): string {
+  return `${item.workspace}\u0000${item.tab}\u0000${item.safeRestoreUrl}`
+}
+
+/** Apply only host-owned runtime changes, preserving transaction fields and records changed by another writer. */
+export function applyBrowserRuntimeDelta(current: BrowserStateFile, previous: BrowserStateFile, runtime: BrowserStateFile): BrowserStateFile {
+  const records = { ...current.records }
+  for (const id of Object.keys(previous.records) as BrowserId[]) {
+    if (!runtime.records[id] && JSON.stringify(current.records[id]) === JSON.stringify(previous.records[id])) delete records[id]
+  }
+  for (const [id, record] of Object.entries(runtime.records) as Array<[BrowserId, NonNullable<BrowserStateFile['records'][BrowserId]>]>) {
+    if (JSON.stringify(previous.records[id]) !== JSON.stringify(record)) records[id] = record
+  }
+  const priorCounts = new Map<string, number>(); const nextCounts = new Map<string, number>()
+  for (const item of previous.migrationRecovery) priorCounts.set(recoveryKey(item), (priorCounts.get(recoveryKey(item)) ?? 0) + 1)
+  for (const item of runtime.migrationRecovery) nextCounts.set(recoveryKey(item), (nextCounts.get(recoveryKey(item)) ?? 0) + 1)
+  const remove = new Map<string, number>()
+  for (const [key, count] of priorCounts) if (count > (nextCounts.get(key) ?? 0)) remove.set(key, count - (nextCounts.get(key) ?? 0))
+  const recovery = current.migrationRecovery.filter((item) => {
+    const key = recoveryKey(item); const count = remove.get(key) ?? 0
+    if (count === 0) return true
+    remove.set(key, count - 1); return false
+  })
+  const currentCounts = new Map<string, number>()
+  for (const item of recovery) currentCounts.set(recoveryKey(item), (currentCounts.get(recoveryKey(item)) ?? 0) + 1)
+  for (const item of runtime.migrationRecovery) {
+    const key = recoveryKey(item); const wanted = nextCounts.get(key) ?? 0; const have = currentCounts.get(key) ?? 0
+    if (wanted > have) { recovery.push(item); currentCounts.set(key, have + 1) }
+  }
+  return { ...current, revision: current.revision + 1, profiles: runtime.profiles, records, migrationRecovery: recovery }
+}
+
 export class TabBrowserService {
   private readonly browserQueues = new Map<string, Promise<void>>()
+  private readonly activationControllers = new Map<string, AbortController>()
   private eventSink: (event: unknown) => void = () => {}
   private persistQueue: Promise<void> = Promise.resolve()
+  private persistedState: BrowserStateFile
+  private suppressPersist = false
 
   private constructor(
     private readonly store: TabBrowserStateStore,
     private readonly pages: ElectronTabBrowserPageFactory,
     private readonly host: TabBrowserHost,
-  ) {}
+    initialState: BrowserStateFile,
+  ) { this.persistedState = structuredClone(initialState) }
 
   static async create(root: string, window: BrowserWindow, store = new TabBrowserStateStore(root)): Promise<TabBrowserService> {
     const state = await store.load()
+    const persistedState = structuredClone(state)
     // The persisted profile descriptor is authoritative. Falling back to a
     // constructor constant here silently reopens a different cookie/storage
     // partition after a compatibility migration.
@@ -53,7 +90,7 @@ export class TabBrowserService {
     const host = new TabBrowserHost(state, pages, Date.now, undefined, () => {
       void service.schedulePersist().catch((error) => console.error('tab browser state save failed', error))
     }, (event) => service.eventSink(event))
-    service = new TabBrowserService(store, pages, host)
+    service = new TabBrowserService(store, pages, host, persistedState)
     return service
   }
 
@@ -68,52 +105,59 @@ export class TabBrowserService {
       ids.add(entry.id)
       if (entry.browser.mode !== 'preview' && entry.browser.mode !== 'browse') throw new Error('INVALID_REQUEST')
     }
-    this.host.importWorkspace(entries, recovery)
-    await this.schedulePersist()
+    this.suppressPersist = true
+    try { this.host.importWorkspace(entries, recovery) } finally { this.suppressPersist = false }
+    this.persistedState = structuredClone(await this.store.load())
   }
 
   workspaceSnapshot(): ReturnType<TabBrowserHost['workspaceSnapshot']> { return this.host.workspaceSnapshot() }
   recoveryItems(): ReturnType<TabBrowserHost['recoveryItems']> { return this.host.recoveryItems() }
   async deleteRecovery(index: number): Promise<void> { this.host.deleteRecovery(index); await this.schedulePersist() }
-  async attachRecovery(index: number, id: BrowserId): Promise<BrowserRuntimeStatus> { const status = this.host.attachRecovery(index, id); await this.schedulePersist(); return status }
+  async attachRecovery(index: number, id: BrowserId): Promise<BrowserRuntimeStatus> {
+    this.suppressPersist = true
+    try { return this.host.attachRecovery(index, id) } finally { this.suppressPersist = false; this.persistedState = structuredClone(await this.store.load()) }
+  }
 
   private schedulePersist(): Promise<void> {
-    const save = this.persistQueue.then(() => {
-      const runtime = this.host.snapshot()
-      return this.store.update((current) => ({
-        ...current,
-        revision: current.revision + 1,
-        profiles: runtime.profiles,
-        records: runtime.records,
-        migrationRecovery: runtime.migrationRecovery.length >= current.migrationRecovery.length ? runtime.migrationRecovery : current.migrationRecovery,
-      }))
+    if (this.suppressPersist) return Promise.resolve()
+    const runtime = this.host.snapshot()
+    const save = this.persistQueue.then(async () => {
+      const previous = this.persistedState
+      await this.store.update((current) => applyBrowserRuntimeDelta(current, previous, runtime))
+      this.persistedState = structuredClone(runtime)
     })
     this.persistQueue = save.catch(() => {})
     return save
   }
 
-  command(command: TabBrowserCommand, signal?: AbortSignal): Promise<BrowserRuntimeStatus | { closed: true }> {
+  command(command: TabBrowserCommand, signal?: AbortSignal, validate?: () => boolean | Promise<boolean>): Promise<BrowserRuntimeStatus | { closed: true }> {
     // Opens must reach the host concurrently so the global capacity FIFO sees
     // every contender. Observations and hide also cannot sit behind a wait.
-    if (command.type === 'open' || command.type === 'status' || command.type === 'hide' || command.type === 'destroy') return this.runCommand(command, signal)
+    if (command.type === 'hide' || command.type === 'destroy') this.activationControllers.get(command.id)?.abort()
+    if (command.type === 'open' || command.type === 'status' || command.type === 'hide' || command.type === 'destroy') return this.runCommand(command, signal, validate)
     if (command.type === 'close' || command.type === 'share' || command.type === 'designate') return Promise.reject(new Error('ASSOCIATION_COMMAND_REQUIRES_MAIN'))
     const key = command.id
     const prior = this.browserQueues.get(key) ?? Promise.resolve()
-    const result = prior.catch(() => {}).then(() => this.runCommand(command, signal))
+    const controller = command.type === 'show' ? new AbortController() : null
+    if (controller) {
+      this.activationControllers.get(command.id)?.abort(); this.activationControllers.set(command.id, controller)
+      signal?.addEventListener('abort', () => controller.abort(), { once: true })
+    }
+    const result = prior.catch(() => {}).then(() => this.runCommand(command, controller?.signal ?? signal, validate))
     const tail = result.then(() => {}, () => {})
     this.browserQueues.set(key, tail)
-    void tail.finally(() => { if (this.browserQueues.get(key) === tail) this.browserQueues.delete(key) })
+    void tail.finally(() => { if (this.browserQueues.get(key) === tail) this.browserQueues.delete(key); if (controller && this.activationControllers.get(key) === controller) this.activationControllers.delete(key) })
     return result
   }
 
-  private async runCommand(command: TabBrowserCommand, signal?: AbortSignal): Promise<BrowserRuntimeStatus | { closed: true }> {
+  private async runCommand(command: TabBrowserCommand, signal?: AbortSignal, validate?: () => boolean | Promise<boolean>): Promise<BrowserRuntimeStatus | { closed: true }> {
     switch (command.type) {
       case 'open': {
         const opened = await this.host.open({ visible: true }, signal); await this.schedulePersist(); return opened.status
       }
       case 'show': {
         const before = this.host.status(command.id).stateRevision
-        await this.host.thaw(command.id, signal)
+        await this.host.thaw(command.id, signal, validate)
         const status = this.host.show(command.id, command.bounds)
         if (status.stateRevision !== before) await this.schedulePersist()
         return status
@@ -134,37 +178,6 @@ export class TabBrowserService {
 
 function exact(value: Record<string, unknown>, keys: string[]): boolean {
   return Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key))
-}
-
-export function parseWorkspaceBrowserImports(value: unknown): { entries: { id: BrowserId; browser: WsBrowser }[]; recovery: { ws: number; tab: number; browser: WsBrowser }[] } {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new Error('INVALID_REQUEST')
-  const input = value as Record<string, unknown>
-  if (!exact(input, ['entries', 'recovery']) || !Array.isArray(input['entries']) || input['entries'].length > 100 || !Array.isArray(input['recovery']) || input['recovery'].length > 100) throw new Error('INVALID_REQUEST')
-  const parseBrowser = (browser: unknown): WsBrowser => {
-    if (typeof browser !== 'object' || browser === null || Array.isArray(browser)) throw new Error('INVALID_REQUEST')
-    const b = browser as Record<string, unknown>
-    if (b['mode'] !== 'preview' && b['mode'] !== 'browse') throw new Error('INVALID_REQUEST')
-    if (typeof b['safeRestoreUrl'] !== 'string' || b['safeRestoreUrl'].length > 8192) throw new Error('INVALID_REQUEST')
-    const viewport = b['viewport']
-    const viewportObject = typeof viewport === 'object' && viewport !== null && !Array.isArray(viewport) ? viewport as Record<string, unknown> : undefined
-    if (viewport !== undefined && (!viewportObject || typeof viewportObject['width'] !== 'number' || !Number.isFinite(viewportObject['width'])
-        || typeof viewportObject['height'] !== 'number' || !Number.isFinite(viewportObject['height']))) throw new Error('INVALID_REQUEST')
-    return { mode: b['mode'], safeRestoreUrl: safeRestoreUrl(b['safeRestoreUrl']),
-      ...(viewportObject ? { viewport: { width: Math.min(4096, Math.max(320, viewportObject['width'] as number)), height: Math.min(4096, Math.max(240, viewportObject['height'] as number)) } } : {}) }
-  }
-  const entries = input['entries'].map((entry) => {
-    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) throw new Error('INVALID_REQUEST')
-    const v = entry as Record<string, unknown>
-    if (!exact(v, ['id', 'browser']) || !isOpaqueBrowserId(v['id'])) throw new Error('INVALID_REQUEST')
-    return { id: v['id'], browser: parseBrowser(v['browser']) }
-  })
-  const recovery = input['recovery'].map((entry) => {
-    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) throw new Error('INVALID_REQUEST')
-    const v = entry as Record<string, unknown>
-    if (!exact(v, ['ws', 'tab', 'browser']) || typeof v['ws'] !== 'number' || !Number.isSafeInteger(v['ws']) || typeof v['tab'] !== 'number' || !Number.isSafeInteger(v['tab'])) throw new Error('INVALID_REQUEST')
-    return { ws: v['ws'], tab: v['tab'], browser: parseBrowser(v['browser']) }
-  })
-  return { entries, recovery }
 }
 
 export function parseTabBrowserCommand(value: unknown): TabBrowserCommand {

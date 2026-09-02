@@ -58,6 +58,7 @@ contextBridge.exposeInMainWorld('amber', {
     ipcRenderer.invoke('layout-save', text, version),
   // Tab-owned native browser rail. A single typed command seam; main derives
   // the owning window from event.sender and rejects remote/unsupported hosts.
+  setBrowserContext: (context: unknown): Promise<unknown> => ipcRenderer.invoke('browser:set-context', context),
   browserCommand: (command: unknown): Promise<unknown> => ipcRenderer.invoke('browser:command', command),
   importWorkspaceBrowsers: (entries: unknown): Promise<unknown> => ipcRenderer.invoke('browser:import-workspace', entries),
   snapshotWorkspaceBrowsers: (): Promise<unknown> => ipcRenderer.invoke('browser:workspace-snapshot'),

@@ -135,7 +135,7 @@ export function commandCenterModel({ workspaces, state, frozen, workspace }: Com
         // Browser/editor panes have no daemon terminal transport in the mobile
         // web surface. Hiding by kind here is the explicit product cut; these
         // entries remain untouched in the authoritative sidecar.
-        if (pane.kind === 'browser' || pane.kind === 'editor') continue
+        if (pane.kind === 'editor') continue
         const activitySeq = state.lastActivity[pane.name] ?? 0
         const unseenActivity = activitySeq > (state.lastSeen[pane.name] ?? 0)
         const classification = classify(pane, frozen.has(pane.name), unseenActivity)

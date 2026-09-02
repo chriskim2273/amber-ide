@@ -3,7 +3,7 @@ import { formatName } from './names'
 import { formatEditorName } from './editorName'
 import { createBrowserId, safeRestoreUrl, type BrowserId } from './tabBrowser'
 import { isDaemonSessionKind, type DaemonSessionKind } from './proto'
-import type { LayoutFile, WsLayout, TabLayout, FrozenEntry, BrowserEntry, BrowserRailLayout, EditorEntry } from './layoutFile'
+import type { LayoutFile, WsLayout, TabLayout, FrozenEntry, BrowserRailLayout, EditorEntry } from './layoutFile'
 
 // The `.amberws` portable workspace file. Structure (grouping/tree/labels) +
 // per-pane scrollback, versioned. Tree leaves are file-local placeholders
@@ -235,12 +235,14 @@ export function treeFromPlaceholders(tree: Node | null, idToName: Record<string,
 // TabModel/PaneModel) so this module stays pure and never imports the renderer
 // store.
 export type WorkspaceBrowserSnapshots = Record<string, { mode: 'preview' | 'browse'; safeRestoreUrl: string; viewport: { width: number; height: number } }>
-export function requireWorkspaceBrowserSnapshots(reply: { ok?: boolean; result?: WorkspaceBrowserSnapshots }): WorkspaceBrowserSnapshots {
+export function requireWorkspaceBrowserSnapshots(reply: { ok?: boolean; result?: WorkspaceBrowserSnapshots }, expectedIds: readonly string[] = []): WorkspaceBrowserSnapshots {
   if (!reply.ok) throw new Error('browser snapshot unavailable')
-  return reply.result ?? {}
+  const result = reply.result ?? {}
+  if (expectedIds.some((id) => !Object.hasOwn(result, id))) throw new Error('browser snapshot incomplete')
+  return result
 }
 
-export interface SavePane { name: string; cwd: string; kind: string; ord: number; url?: string; path?: string | null }
+export interface SavePane { name: string; cwd: string; kind: string; ord: number; path?: string | null }
 export interface SaveTab { tab: number; panes: SavePane[]; browser?: WsBrowser }
 export interface SaveWorkspace { ws: number; tabs: SaveTab[] }
 
@@ -261,10 +263,8 @@ export function assembleSave(
       const tabSide = wsSide?.tabs[String(tab.tab)]
       // Placeholder per pane, in ord order (live groupings already sort by ord).
       const nameToId: Record<string, string> = {}
-      const legacyBrowsers = tab.panes.filter((pane) => pane.kind === 'browser')
-      const portablePanes = tab.panes.filter((pane) => pane.kind !== 'browser')
-      const panes: WsPane[] = portablePanes.map((p, i) => {
-        if (!isWorkspacePaneKind(p.kind)) throw new Error(`unsupported pane kind: ${p.kind}`)
+      const panes: WsPane[] = tab.panes.map((p, i) => {
+        if (!isWorkspacePaneKind(p.kind) || p.kind === 'browser') throw new Error(`unsupported live pane kind: ${p.kind}`)
         const id = `p${i}`
         nameToId[p.name] = id
         const dump = dumps[p.name]
@@ -287,8 +287,7 @@ export function assembleSave(
         tree: treeToPlaceholders(tabSide?.tree ?? null, nameToId),
         panes,
         ...(typeof tabSide?.label === 'string' ? { label: tabSide.label } : {}),
-        ...(tab.browser ? { browser: { ...tab.browser, safeRestoreUrl: safeRestoreUrl(tab.browser.safeRestoreUrl) } }
-          : legacyBrowsers[0] ? { browser: { mode: 'browse' as const, safeRestoreUrl: safeRestoreUrl(legacyBrowsers[0].url ?? '') } } : {}),
+        ...(tab.browser ? { browser: { ...tab.browser, safeRestoreUrl: safeRestoreUrl(tab.browser.safeRestoreUrl) } } : {}),
       }
     })
     return {
@@ -313,7 +312,6 @@ export interface LoadPlan {
   workspaces: Record<string, WsLayout> // sidecar mutations, keyed by ws-number string
   frozen: Record<string, FrozenEntry> // keyed by minted session name
   scrollback: Record<string, Uint8Array> // keyed by minted session name
-  browsers: Record<string, BrowserEntry> // transitional legacy map; v2 plans leave this empty
   browserRails: BrowserLoadIntent[]
   browserRecovery: BrowserRecoveryIntent[]
   editors: Record<string, EditorEntry> // app-local editor panes, keyed by minted editor id
@@ -326,7 +324,6 @@ export function buildLoadPlan(doc: WorkspaceDoc, opts: LoadOptions): LoadPlan {
   const workspaces: Record<string, WsLayout> = {}
   const frozen: Record<string, FrozenEntry> = {}
   const scrollback: Record<string, Uint8Array> = {}
-  const browsers: Record<string, BrowserEntry> = {}
   const editors: Record<string, EditorEntry> = {}
   const browserRails: BrowserLoadIntent[] = []
   const browserRecovery: BrowserRecoveryIntent[] = []
@@ -385,7 +382,7 @@ export function buildLoadPlan(doc: WorkspaceDoc, opts: LoadOptions): LoadPlan {
     }
   })
 
-  return { creates, workspaces, frozen, scrollback, browsers, browserRails, browserRecovery, editors, targetWorkspaces }
+  return { creates, workspaces, frozen, scrollback, browserRails, browserRecovery, editors, targetWorkspaces }
 }
 
 // Lowest free workspace number: one above the highest live number (gaps are NOT
@@ -417,7 +414,6 @@ export function planLoad(
     workspaces: { ...firstPlan.workspaces, ...restPlan.workspaces },
     frozen: { ...firstPlan.frozen, ...restPlan.frozen },
     scrollback: { ...firstPlan.scrollback, ...restPlan.scrollback },
-    browsers: { ...firstPlan.browsers, ...restPlan.browsers },
     browserRails: [...firstPlan.browserRails, ...restPlan.browserRails],
     browserRecovery: [...firstPlan.browserRecovery, ...restPlan.browserRecovery],
     editors: { ...firstPlan.editors, ...restPlan.editors },

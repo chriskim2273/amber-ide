@@ -179,7 +179,7 @@ export function SplitView(props: {
   onMove: (sourceId: string, targetId: string, zone: Zone) => void
   // Cross-group move: the pane was dropped on a tab header (`{ tab }`) or a
   // workspace pill (`{ ws }`). Grouping is name-encoded, so App turns this into a
-  // daemon Rename (or a sidecar edit for browser panes) — never a local tree move.
+  // daemon Rename (or a sidecar edit for editor panes) — never a local tree move.
   onMoveTo: (sourceId: string, target: { ws: number } | { tab: number }) => void
   onClose: (paneId: string) => void
   // App-local editor panes (kind==='editor'): the sidecar entry IS the pane.
@@ -244,7 +244,7 @@ export function SplitView(props: {
 
   // Custom header context menu, if open: which pane and where (stage-relative,
   // clamped on render). Bound to the pane HEADER only — xterm owns body events.
-  // With `split` set it renders the kind picker instead (shell/claude/browser for
+  // With `split` set it renders the pane-kind picker for
   // that direction) — same state so dismissal/clamping/pruning are shared.
   const [menu, setMenu] = useState<{ paneId: string; x: number; y: number; split?: 'h' | 'v' } | null>(null)
   // Which pane (if any) has the inline freeze-note prompt open (context-menu

@@ -37,7 +37,7 @@ import {
   type LayoutFile, type TabLayout, type LoadLayoutResult, type SaveLayoutResult,
 } from '../shared/layoutFile'
 import {
-  parseWorkspaceFile, serializeWorkspaceFile, assembleSave, planLoad, requireWorkspaceBrowserSnapshots,
+  parseWorkspaceFile, serializeWorkspaceFile, assembleSave, requireWorkspaceBrowserSnapshots,
   type WorkspaceDoc, type SaveWorkspace, type LoadPlan,
 } from '../shared/workspaceFile'
 import { collectDumps, matchDumpError } from './dumps'
@@ -84,6 +84,7 @@ declare global {
       // than silently overwritten. See the persist effect below.
       loadLayout: () => Promise<LoadLayoutResult>
       saveLayout: (text: string, version: string | null) => Promise<SaveLayoutResult>
+      setBrowserContext?: (context: unknown) => Promise<unknown>
       browserCommand: (command: unknown) => Promise<unknown>
       importWorkspaceBrowsers?: (entries: unknown) => Promise<unknown>
       snapshotWorkspaceBrowsers?: () => Promise<unknown>
@@ -312,6 +313,7 @@ function App(): JSX.Element {
   // SEPARATE from the daemon-error banner (state.error) so neither hijacks the other.
   const [saveScopeOpen, setSaveScopeOpen] = useState(false)
   const [loadDoc, setLoadDoc] = useState<WorkspaceDoc | null>(null)
+  const workspaceSourceTexts = useRef(new WeakMap<WorkspaceDoc, string>())
   const [notice, setNotice] = useState<string | null>(null)
   const [browserRecoveryOpen, setBrowserRecoveryOpen] = useState(false)
   const [browserRecovery, setBrowserRecovery] = useState<Array<{ index: number; workspace: number; tab: number; safeRestoreUrl: string }>>([])
@@ -419,6 +421,7 @@ function App(): JSX.Element {
   const [focusRequest, setFocusRequest] = useState<{ paneId: string; seq: number } | null>(null)
   const focusRequestSeq = useRef(0)
   const layoutRef = useRef(layout)
+  const browserContextReady = useRef<Promise<unknown>>(Promise.resolve())
   layoutRef.current = layout
   // CAS state (spec 2026-08-01 §6) — see the persist effect below for how
   // these are used together. Refs because updating them must never itself
@@ -471,9 +474,8 @@ function App(): JSX.Element {
   useEffect(() => {
     setTitles((prev) => {
       const live = new Set(sessions.map((s) => s.name))
-      // App-local panes (browser/editor) are NEVER in the daemon's session list,
-      // so they must be exempt — otherwise the very next Sessions event deletes
-      // the title they just reported (an editor's file name, a page's title) and
+      // Editor panes are never in the daemon's session list, so they must be
+      // exempt — otherwise the next Sessions event deletes their file title and
       // the header falls back to the cwd. Their own close path prunes them.
       const stale = Object.keys(prev).filter((n) =>
         !live.has(n) && !isEditorName(n))
@@ -488,7 +490,7 @@ function App(): JSX.Element {
   //
   // `Activity` fires up to 2/s per session and `MemoryStat` every 3 s per
   // session; each was dispatched on its own IPC task, so each forced a full App
-  // render — which rebuilds groupSessions/mergeBrowsers/mergeEditors and calls
+  // render — which rebuilds groupSessions/mergeEditors and calls
   // deriveTab once PER KEEP-ALIVE LAYER, not just the visible tab. At the box's
   // 19 sessions that is ~45 full-tree renders per second while completely idle.
   // `Pane` is memoized so terminals are not reconciled, but everything else in
@@ -803,6 +805,9 @@ function App(): JSX.Element {
   const wsKey = String(ws?.ws ?? activeWs)
   const tabKey = String(tab?.tab ?? activeTab)
   const tabBrowser = layout.workspaces[wsKey]?.tabs[tabKey]?.browser
+  useEffect(() => {
+    browserContextReady.current = window.amber.setBrowserContext?.({ workspace: Number(wsKey), tab: Number(tabKey) }) ?? Promise.resolve({ ok: true })
+  }, [wsKey, tabKey, tabBrowser?.id])
   const storedTree = layout.workspaces[wsKey]?.tabs[tabKey]?.tree ?? null
   // Active-tab render inputs, via the shared deriveTab (same path the keep-alive
   // layer map uses below — no drift). allLive is the UNFILTERED name set (keeps
@@ -970,16 +975,26 @@ function App(): JSX.Element {
     setBrowserRecovery(reply.result ?? []); setBrowserRecoveryOpen(true)
   }, [])
 
+  const ensureBrowserContext = useCallback(async (): Promise<void> => {
+    await browserContextReady.current.catch(() => {})
+    const pending = window.amber.setBrowserContext?.({ workspace: Number(wsKey), tab: Number(tabKey) }) ?? Promise.resolve({ ok: true })
+    browserContextReady.current = pending
+    const reply = await pending as { ok?: boolean; error?: string }
+    if (!reply?.ok) throw new Error(reply?.error ?? 'STALE_BROWSER_CONTEXT')
+  }, [wsKey, tabKey])
+
   const openTabBrowser = useCallback(async (): Promise<void> => {
+    try { await ensureBrowserContext() } catch (error) { setNotice(error instanceof Error ? error.message : 'STALE_BROWSER_CONTEXT'); return }
     const reply = await window.amber.browserCommand({ type: 'open' }) as { ok: boolean; error?: string }
     if (!reply.ok) setNotice(reply.error ?? 'Browser host unavailable')
-  }, [])
+  }, [ensureBrowserContext])
 
   const closeTabBrowser = useCallback(async (): Promise<void> => {
     if (!tabBrowser) return
+    try { await ensureBrowserContext() } catch (error) { setNotice(error instanceof Error ? error.message : 'STALE_BROWSER_CONTEXT'); return }
     const reply = await window.amber.browserCommand({ type: 'close' }) as { ok: boolean; error?: string }
     if (!reply.ok) setNotice(reply.error ?? 'Could not close tab browser')
-  }, [tabBrowser])
+  }, [tabBrowser, ensureBrowserContext])
 
   const putTree = useCallback((next: Node | null) => {
     setLayout((l) => {
@@ -1122,8 +1137,7 @@ function App(): JSX.Element {
         for (const [wsKey, wl] of Object.entries(plan.workspaces)) {
           const tabs: Record<string, TabLayout> = {}
           for (const [tabKey, tl] of Object.entries(wl.tabs)) {
-            // Browser leaves are app-local (never a daemon session), so they must
-            // survive the live-daemon filter — keep any browser id unconditionally.
+            // Editor leaves are app-local and must survive the daemon-live filter.
             tabs[tabKey] = tl.tree
               ? { ...tl, tree: reconcile(tl.tree, leaves(tl.tree).filter((n) => liveForFix.has(n) || isEditorName(n))) }
               : tl
@@ -1241,8 +1255,7 @@ function App(): JSX.Element {
     setProductivityOverlay(null)
   }
   navigateRef.current = navigateTo
-  // App-local editor pane (spec 2026-07-19) — same class as a browser pane: no
-  // daemon session, the sidecar entry IS the pane. Starts unsaved (path null).
+  // App-local editor pane: no daemon session; the sidecar entry is authoritative.
   const newEditor = (tabId: number, ord: number): string => {
     const name = formatEditorName({ ws: currentWs, tab: tabId, ord, id: makeId() })
     setLayout((l) => ({ ...l, editors: { ...(l.editors ?? {}), [name]: { ws: currentWs, tab: tabId, ord, path: null } } }))
@@ -1255,8 +1268,7 @@ function App(): JSX.Element {
   // Same shape for editor panes: the sidecar entry IS the pane (path + per-pane
   // view state). SplitView feeds these straight to <Editor>.
   const editorEntries = layout.editors ?? EMPTY_EDITORS
-  // Close a pane: browser panes are purged from the sidecar (mergeBrowsers then
-  // drops them → reconcile prunes the leaf); daemon panes go through Kill (the
+  // Close a pane: daemon panes go through Kill (the
   // reap broadcast prunes the leaf — one-way flow, no optimistic tree edit).
   // Live editor handles, keyed by paneId (same pattern as SplitView's searchApis):
   // the close guard needs a SYNCHRONOUS dirty read and an awaitable save.
@@ -1336,8 +1348,7 @@ function App(): JSX.Element {
   // Grouping is name-encoded (rule #2), so a daemon pane moves by a real daemon
   // Rename and the leaf follows one-way via SessionsChanged -> groupSessions ->
   // reconcile (prunes the source-tab leaf, appends it in the target tab). Never
-  // an optimistic local tree edit. A browser pane has no daemon session — its
-  // grouping already lives in the sidecar, so it moves by an entry edit (id kept).
+  // an optimistic local tree edit. Editor panes move by updating their sidecar entry.
   const moveTo = (paneId: string, target: { ws: number } | { tab: number }): void => {
     const destWs = 'ws' in target ? target.ws : currentWs
     const destTabs = workspaces.find((w) => w.ws === destWs)?.tabs ?? []
@@ -1416,13 +1427,17 @@ function App(): JSX.Element {
       (n, cb) => { dumpResolvers.current.set(n, cb) },
       (n) => { dumpResolvers.current.delete(n) },
     )
-    const hasBrowserRails = wsList.some((workspace) => workspace.tabs.some((tab) => !!layoutRef.current.workspaces[String(workspace.ws)]?.tabs[String(tab.tab)]?.browser))
+    const expectedBrowserIds = wsList.flatMap((workspace) => workspace.tabs.flatMap((tab) => {
+      const browser = layoutRef.current.workspaces[String(workspace.ws)]?.tabs[String(tab.tab)]?.browser
+      return browser ? [browser.id] : []
+    }))
+    const hasBrowserRails = expectedBrowserIds.length > 0
     const snapshotReply = hasBrowserRails
       ? window.amber.snapshotWorkspaceBrowsers
         ? await window.amber.snapshotWorkspaceBrowsers() as { ok?: boolean; result?: Record<string, { mode: 'preview' | 'browse'; safeRestoreUrl: string; viewport: { width: number; height: number } }> }
         : { ok: false }
       : { ok: true, result: {} }
-    const browserSnapshots = requireWorkspaceBrowserSnapshots(snapshotReply)
+    const browserSnapshots = requireWorkspaceBrowserSnapshots(snapshotReply, expectedBrowserIds)
     return { doc: assembleSave(scope, saveModel(wsList, browserSnapshots), layoutRef.current, captured.dumps), stragglers: captured.stragglers }
   }
 
@@ -1451,6 +1466,7 @@ function App(): JSX.Element {
       return
     }
     if (doc.workspaces.length === 0) { setNotice('That workspace file has no workspaces.'); return }
+    workspaceSourceTexts.current.set(doc, text)
     setLoadDoc(doc)
   }
 
@@ -1458,16 +1474,13 @@ function App(): JSX.Element {
   // (one-way — removal lands via daemon events); createSession per planned pane;
   // the pendingLoad effect commits the sidecar + replay once the daemon confirms.
   const applyDocument = async (doc: WorkspaceDoc, mode: 'new' | 'replace'): Promise<void> => {
-    const liveWs = workspaces.map((w) => w.ws)
     const killed: string[] = []
-    const existingBrowserIds = new Set(Object.values(layoutRef.current.workspaces).flatMap((workspace) => Object.values(workspace.tabs).flatMap((tab) => tab.browser ? [tab.browser.id] : [])))
-    const plan = planLoad(doc, { mode, currentWs, liveWs, mintId: makeId, existingBrowserIds })
-    if (!window.amber.importWorkspaceBrowsers) { setNotice('This Amber build cannot restore tab browsers.'); return }
-    const imported = await window.amber.importWorkspaceBrowsers({
-      mode, currentWs, workspaces: plan.workspaces,
-      imports: { entries: plan.browserRails.map(({ id, browser }) => ({ id, browser })), recovery: plan.browserRecovery },
-    }) as { ok?: boolean; error?: string; layout?: string; version?: string }
+    if (!window.amber.importWorkspaceBrowsers) { setNotice('This Amber build cannot restore workspaces.'); return }
+    try { await ensureBrowserContext() } catch (error) { setNotice(error instanceof Error ? error.message : 'STALE_BROWSER_CONTEXT'); return }
+    const imported = await window.amber.importWorkspaceBrowsers({ mode, text: workspaceSourceTexts.current.get(doc) ?? serializeWorkspaceFile(doc) }) as { ok?: boolean; error?: string; layout?: string; version?: string; plan?: LoadPlan }
     if (!imported.ok || !imported.layout) { setNotice(`Could not restore workspace — ${imported.error ?? 'unknown error'}.`); return }
+    if (!imported.plan) { setNotice('Could not restore workspace — missing main-owned plan.'); return }
+    const plan = imported.plan
     versionRef.current = imported.version ?? versionRef.current
     setLayout(parseLayout(imported.layout))
     if (plan.browserRecovery.length) setNotice(`${plan.browserRecovery.length} additional browser URL${plan.browserRecovery.length === 1 ? '' : 's'} saved for recovery.`)
@@ -2173,10 +2186,11 @@ function App(): JSX.Element {
           {...(tabBrowser.designatedPi ? { designatedPi: tabBrowser.designatedPi } : {})}
           {...(tabBrowser.sharedWithPi !== undefined ? { sharedWithPi: tabBrowser.sharedWithPi } : {})}
           controllers={(tab?.panes ?? []).filter((pane) => pane.kind === 'pi').map((pane) => ({ name: pane.name, label: titles[pane.name] || pane.name }))}
-          onPolicy={(policy) => {
-            if (policy.designatedPi !== tabBrowser.designatedPi) void window.amber.browserCommand({ type: 'designate', ...(policy.designatedPi ? { designatedPi: policy.designatedPi } : {}) })
-            else if (policy.sharedWithPi !== !!tabBrowser.sharedWithPi) void window.amber.browserCommand({ type: 'share', sharedWithPi: policy.sharedWithPi })
-          }}
+          onPolicy={(policy) => { void ensureBrowserContext().then(() => {
+            if (policy.designatedPi !== tabBrowser.designatedPi) return window.amber.browserCommand({ type: 'designate', ...(policy.designatedPi ? { designatedPi: policy.designatedPi } : {}) })
+            if (policy.sharedWithPi !== !!tabBrowser.sharedWithPi) return window.amber.browserCommand({ type: 'share', sharedWithPi: policy.sharedWithPi })
+          }).catch((error) => setNotice(error instanceof Error ? error.message : 'STALE_BROWSER_CONTEXT')) }}
+          ensureContext={ensureBrowserContext}
           onWidth={(width) => updateTabBrowser({ ...tabBrowser, width })}
           onCollapsed={(collapsed) => updateTabBrowser({ ...tabBrowser, collapsed })}
           onClose={() => void closeTabBrowser()} />
@@ -2562,7 +2576,7 @@ function App(): JSX.Element {
               {browserRecovery.length === 0 ? <p className="dialog-text">No recoverable browser URLs.</p> : browserRecovery.map((item) => (
                 <div className="recovery-row" key={`${item.index}:${item.safeRestoreUrl}`}><code>{item.safeRestoreUrl}</code><span>ws {item.workspace} · tab {item.tab}</span>
                   <div className="dialog-actions">
-                    <button className="btn" onClick={() => void window.amber.browserRecovery?.({ action: 'attach', index: item.index }).then(() => refreshBrowserRecovery())}>Attach here</button>
+                    <button className="btn" onClick={() => void ensureBrowserContext().then(() => window.amber.browserRecovery?.({ action: 'attach', index: item.index })).then(() => refreshBrowserRecovery())}>Attach here</button>
                     <button className="btn" onClick={() => void window.amber.browserRecovery?.({ action: 'copy', index: item.index })}>Copy URL</button>
                     <button className="btn danger-btn" onClick={() => void window.amber.browserRecovery?.({ action: 'delete', index: item.index }).then(() => refreshBrowserRecovery())}>Delete</button>
                   </div>

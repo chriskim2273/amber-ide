@@ -507,6 +507,7 @@ export function createAmber(deps: AmberDeps): WebAmber {
     focusSession: (name): void => control.send({ t: 'focus', name }),
     dumpBacklog: (name): void => control.send({ t: 'dumpBacklog', name }),
     // A hosted Pocket/web client never owns a local Electron WebContentsView.
+    setBrowserContext: async (): Promise<unknown> => ({ ok: true }),
     browserCommand: async (): Promise<unknown> => ({ ok: false, error: 'BROWSER_HOST_UNAVAILABLE' }),
     importWorkspaceBrowsers: async (): Promise<unknown> => ({ ok: false, error: 'BROWSER_HOST_UNAVAILABLE' }),
     snapshotWorkspaceBrowsers: async (): Promise<unknown> => ({ ok: true, result: {} }),

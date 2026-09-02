@@ -141,6 +141,16 @@ describe('TabBrowserHost', () => {
     expect(host.recoveryItems()).toEqual([])
   })
 
+  it('revalidates a queued thaw before creating or attaching a page', async () => {
+    const id = 'browser-cccccccccccccccccccccccccccccccc' as const
+    const state = emptyBrowserState(1); state.records[id] = { id, profileId: 'global', mode: 'browse', safeRestoreUrl: 'https://stale.test/', title: '', viewport: { width: 800, height: 600 }, lifecycle: 'frozen', stateRevision: 1, lastUsedAt: 1, lastFocusedAt: 0 }
+    let creates = 0
+    const host = new TabBrowserHost(state, { create: (...args) => { creates += 1; return factory.create(...args) } })
+    await expect(host.thaw(id, undefined, () => false)).rejects.toThrow('STALE_BROWSER_CONTEXT')
+    expect(creates).toBe(0)
+    expect(host.status(id).lifecycle).toBe('frozen')
+  })
+
   it('stops an active page load without closing the browser', async () => {
     const host = new TabBrowserHost(emptyBrowserState(1), factory)
     const opened = await host.open({ visible: true })

@@ -14,12 +14,10 @@ export interface WsLayout { activeTab: number; tabs: Record<string, TabLayout>; 
 // SESSION NAME → optional note. Session names are stable across reboots, so
 // parking survives restart; stale entries are pruned on load-reconcile.
 export interface FrozenEntry { note?: string }
-// `browsers` are app-local web-viewer panes (spec 2026-07-18): a synthetic leaf
-// with NO daemon session, keyed by a `browser-<ws>-<tab>-<ord>-<id>` paneId.
-// This map is the pane's entire existence — grouping (ws/tab/ord) + last URL.
+// Decode-only v1 browser-pane payload. Startup migration consumes this field;
+// v2 writers never emit it and runtime code must not create or preserve it.
 export interface BrowserEntry { ws: number; tab: number; ord: number; url: string }
-// `editors` are app-local file-editor panes (spec 2026-07-19): the same class as
-// `browsers` — a synthetic leaf with NO daemon session, keyed by an
+// `editors` are app-local file-editor panes, keyed by an
 // `editor-<ws>-<tab>-<ord>-<id>` paneId. This map is the pane's entire
 // existence: grouping (ws/tab/ord) + the file path + per-pane view prefs.
 // `path: null` = an unsaved scratch buffer. Buffer TEXT never lives here (the
@@ -241,7 +239,7 @@ function deepEqual(a: unknown, b: unknown): boolean {
  * objects — so e.g. the browser editing workspace 2's tree and the desktop
  * editing workspace 1's tree both survive even though they share the
  * top-level `workspaces` key, and this is schema-agnostic (works the same
- * for `browsers`/`editors`/`frozen`/anything added later), which is what
+ * for `editors`/`frozen`/anything added later), which is what
  * makes it safe against silently dropping a desktop-only pane.
  *
  * ponytail: a genuine double-edit of the exact same leaf (rare — two clients
@@ -317,6 +315,6 @@ export function parseLayout(text: string): LayoutFile {
 }
 
 export function serializeLayout(l: LayoutFile): string {
-  const { readOnly: _readOnly, ...serializable } = l
+  const { readOnly: _readOnly, browsers: _legacyBrowsers, ...serializable } = l
   return JSON.stringify(serializable)
 }
