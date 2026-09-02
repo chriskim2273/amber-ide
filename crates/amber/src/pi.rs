@@ -18,7 +18,7 @@ pub enum PiStart {
 const EXTENSION_FILE: &str = "amber-hook.ts";
 
 /// The Pi extension amber installs to record session ids for exact resume.
-const EXTENSION_TS: &str = r#"// amber-owned-extension:v3
+const EXTENSION_TS: &str = r#"// amber-owned-extension:v4
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
 import { Type } from "typebox"
 import { spawn } from "node:child_process"
@@ -123,6 +123,10 @@ const pageLease = {
   pageIncarnation: Type.String({ minLength: 1, maxLength: 256 }),
   expectedGeneration: Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
 }
+const browserTarget = Type.Union([
+  Type.Object({ snapshotId: Type.String({ minLength: 1, maxLength: 128 }), ref: Type.String({ minLength: 1, maxLength: 64 }) }, { additionalProperties: false }),
+  Type.Object({ snapshotId: Type.String({ minLength: 1, maxLength: 128 }), role: Type.String({ minLength: 1, maxLength: 128 }), name: Type.Optional(Type.String({ minLength: 1, maxLength: 1024 })) }, { additionalProperties: false }),
+])
 
 export default function (pi: ExtensionAPI) {
   pi.on("session_start", (_event, ctx) => {
@@ -251,6 +255,38 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({ ...pageLease }, { additionalProperties: false }),
     async execute(_id, params, signal) { return result(await browserRequest({ type: "history", direction, ...params }, signal)) },
   })
+  for (const [name, kind] of [["browser_click", "click"], ["browser_double_click", "doubleClick"], ["browser_hover", "hover"], ["browser_check", "check"], ["browser_uncheck", "uncheck"]] as const) pi.registerTool({
+    name, label: name.replaceAll("_", " "),
+    description: "Perform one bounded semantic action on a current snapshot target. Consequential actions wait for visible user approval.",
+    parameters: Type.Object({ ...pageLease, target: browserTarget }, { additionalProperties: false }),
+    async execute(_id, params, signal) { return result(await browserRequest({ type: "interact", pageIncarnation: params.pageIncarnation, expectedGeneration: params.expectedGeneration, operation: { kind, target: params.target } }, signal)) },
+  })
+  for (const [name, kind] of [["browser_fill", "fill"], ["browser_type", "type"]] as const) pi.registerTool({
+    name, label: name.replaceAll("_", " "),
+    description: "Enter bounded text into a current snapshot target. Credential/payment values are never echoed and consequential entry requires approval.",
+    parameters: Type.Object({ ...pageLease, target: browserTarget, text: Type.String({ maxLength: 8192 }) }, { additionalProperties: false }),
+    async execute(_id, params, signal) { return result(await browserRequest({ type: "interact", pageIncarnation: params.pageIncarnation, expectedGeneration: params.expectedGeneration, operation: { kind, target: params.target, text: params.text } }, signal)) },
+  })
+  pi.registerTool({
+    name: "browser_press", label: "browser press", description: "Press one allowlisted key, optionally on a current snapshot target.",
+    parameters: Type.Object({ ...pageLease, target: Type.Optional(browserTarget), key: Type.String({ minLength: 1, maxLength: 64, pattern: "^(Enter|Tab|Escape|Backspace|Delete|Space|Arrow(Up|Down|Left|Right)|Home|End|Page(Up|Down)|[A-Za-z0-9])$" }) }, { additionalProperties: false }),
+    async execute(_id, params, signal) { return result(await browserRequest({ type: "interact", pageIncarnation: params.pageIncarnation, expectedGeneration: params.expectedGeneration, operation: { kind: "press", key: params.key, ...(params.target ? { target: params.target } : {}) } }, signal)) },
+  })
+  pi.registerTool({
+    name: "browser_select", label: "browser select", description: "Select one bounded native option on a current snapshot target.",
+    parameters: Type.Object({ ...pageLease, target: browserTarget, values: Type.Array(Type.String({ minLength: 1, maxLength: 256 }), { minItems: 1, maxItems: 1 }) }, { additionalProperties: false }),
+    async execute(_id, params, signal) { return result(await browserRequest({ type: "interact", pageIncarnation: params.pageIncarnation, expectedGeneration: params.expectedGeneration, operation: { kind: "select", target: params.target, values: params.values } }, signal)) },
+  })
+  pi.registerTool({
+    name: "browser_scroll", label: "browser scroll", description: "Scroll the page or a current snapshot target by bounded deltas.",
+    parameters: Type.Object({ ...pageLease, target: Type.Optional(browserTarget), deltaX: Type.Integer({ minimum: -10000, maximum: 10000 }), deltaY: Type.Integer({ minimum: -10000, maximum: 10000 }) }, { additionalProperties: false }),
+    async execute(_id, params, signal) { return result(await browserRequest({ type: "interact", pageIncarnation: params.pageIncarnation, expectedGeneration: params.expectedGeneration, operation: { kind: "scroll", deltaX: params.deltaX, deltaY: params.deltaY, ...(params.target ? { target: params.target } : {}) } }, signal)) },
+  })
+  pi.registerTool({
+    name: "browser_drag", label: "browser drag", description: "Drag between two current snapshot targets with actionability and fingerprint revalidation.",
+    parameters: Type.Object({ ...pageLease, source: browserTarget, target: browserTarget }, { additionalProperties: false }),
+    async execute(_id, params, signal) { return result(await browserRequest({ type: "interact", pageIncarnation: params.pageIncarnation, expectedGeneration: params.expectedGeneration, operation: { kind: "drag", source: params.source, target: params.target } }, signal)) },
+  })
   pi.registerTool({
     name: "browser_set_viewport", label: "Set browser viewport",
     description: "Set a bounded emulated viewport for responsive development.",
@@ -342,7 +378,7 @@ pub fn ensure_global_pi_extension() {
 fn is_owned_extension_source(source: &str) -> bool {
     matches!(
         source.lines().next(),
-        Some("// amber-owned-extension:v2" | "// amber-owned-extension:v3")
+        Some("// amber-owned-extension:v2" | "// amber-owned-extension:v3" | "// amber-owned-extension:v4")
     )
 }
 
@@ -455,7 +491,7 @@ mod tests {
         let path = extensions.join("amber-hook.ts");
         let first = fs::read_to_string(&path).unwrap();
         assert_eq!(first, EXTENSION_TS);
-        assert!(first.starts_with("// amber-owned-extension:v3\n"));
+        assert!(first.starts_with("// amber-owned-extension:v4\n"));
         assert!(first.contains("ExtensionAPI"));
         assert!(first.contains("@earendil-works/pi-coding-agent"));
         assert!(first.contains("session_start"));
@@ -480,6 +516,17 @@ mod tests {
             "browser_back",
             "browser_forward",
             "browser_set_viewport",
+            "browser_click",
+            "browser_double_click",
+            "browser_hover",
+            "browser_fill",
+            "browser_type",
+            "browser_press",
+            "browser_select",
+            "browser_check",
+            "browser_uncheck",
+            "browser_scroll",
+            "browser_drag",
         ] {
             assert!(first.contains(tool), "missing installed Pi tool {tool}");
         }
@@ -558,7 +605,7 @@ mod tests {
         let extensions = dir.path().join("extensions");
         fs::create_dir_all(&extensions).unwrap();
         let path = extensions.join(EXTENSION_FILE);
-        let future = "// amber-owned-extension:v4\n// future payload\n";
+        let future = "// amber-owned-extension:v5\n// future payload\n";
         fs::write(&path, future).unwrap();
 
         assert!(install_extension_in(&extensions).is_err());
