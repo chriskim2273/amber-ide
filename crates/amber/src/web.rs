@@ -669,6 +669,8 @@ const RECONNECT_MIN: Duration = Duration::from_millis(250);
 const RECONNECT_MAX: Duration = Duration::from_secs(5);
 /// Cadence of the pty-geometry refresh (see the call site in [`serve`]).
 const GEOMETRY_POLL: Duration = Duration::from_secs(1);
+/// Agent plan quota refresh — matches the daemon's own poller interval.
+const USAGE_POLL: Duration = Duration::from_secs(60);
 
 /// One queued frame for a browser client. `Arc` so a broadcast clones a
 /// pointer, not the payload.
@@ -704,6 +706,9 @@ struct HubInner {
     /// `Frame::Backlog` carries no client id, so this is the only way to
     /// route the one-shot reply back to whoever asked).
     dump_pending: HashMap<String, Vec<u64>>,
+    /// Last `Usage` reply, already serialized for `GET /api/usage`. Empty
+    /// until the 60 s quota tick has been answered once.
+    usage: String,
     /// Pty grids a browser client has taken over, keyed by session name
     /// (spec §2.2). A phone reflows an agent pane to a readable width while it
     /// is looking at it, and the desktop's grid is handed back when it stops.
@@ -764,11 +769,26 @@ impl Hub {
                 clients: Vec::new(),
                 pending_backlog: HashSet::new(),
                 dump_pending: HashMap::new(),
+                usage: String::new(),
                 borrows: HashMap::new(),
             }),
             next_id: AtomicU64::new(0),
             started: Instant::now(),
         })
+    }
+
+    /// JSON body for `GET /api/usage`: the daemon's cached agent plan quota.
+    ///
+    /// `{"providers":[]}` until the daemon has answered once — an empty list,
+    /// never a fabricated zero. Carries no credential: the daemon does the
+    /// provider call and the token never leaves it.
+    fn usage_json(&self) -> String {
+        let inner = self.inner.lock().unwrap();
+        if inner.usage.is_empty() {
+            r#"{"providers":[]}"#.to_string()
+        } else {
+            inner.usage.clone()
+        }
     }
 
     /// JSON body for `GET /api/status`: the operator-facing snapshot behind
@@ -1145,6 +1165,12 @@ impl Hub {
                 let msg = Self::sessions_msg(&inner.sessions, &inner.layout);
                 Self::queue(&mut inner, |_| true, msg);
             }
+            // Cached for the authenticated HTTP route, never pushed at a
+            // browser: quota moves on a scale of minutes and the mosaic push
+            // path is for session truth.
+            Frame::Control(ControlMsg::Usage { providers }) => {
+                inner.usage = serde_json::json!({ "providers": providers }).to_string();
+            }
             Frame::Control(ControlMsg::Exit { name, code }) => {
                 let msg = Out::Text(Arc::new(
                     serde_json::json!({ "t": "exit", "name": name, "code": code }).to_string(),
@@ -1356,6 +1382,21 @@ pub fn serve(
             }
         });
     }
+    // Agent plan quota. Its own tick, deliberately far slower than the 1 s
+    // session poll: the daemon refreshes at 60 s and its answer crosses the
+    // network to the providers, so asking faster only re-reads a cache.
+    {
+        let hub = Arc::clone(&hub);
+        thread::spawn(move || loop {
+            {
+                let mut inner = hub.inner.lock().unwrap();
+                if inner.daemon.is_some() {
+                    Hub::write_daemon(&mut inner, &Frame::Control(ControlMsg::GetUsage));
+                }
+            }
+            thread::sleep(USAGE_POLL);
+        });
+    }
     let auth = Arc::new(Auth::new(token));
     // The honest port is the one actually bound — the tests bind port 0, and a
     // caller-supplied argument would report a lie.
@@ -1462,6 +1503,17 @@ fn handle_conn(
                 return Ok(respond(&mut stream, "401 Unauthorized", "", &[], b"")?);
             }
             let body = hub.sessions_json();
+            Ok(respond(&mut stream, "200 OK", CT_JSON, &[], body.as_bytes())?)
+        }
+        // Agent plan quota (design 2026-09-01 §3). Same cookie boundary as
+        // `/api/sessions`. The browser control whitelist is deliberately NOT
+        // widened: the server owns this fetch, so no new ControlMsg becomes
+        // reachable from a browser socket.
+        ("GET", "/api/usage") => {
+            if !auth.authorized(peer, &req) {
+                return Ok(respond(&mut stream, "401 Unauthorized", "", &[], b"")?);
+            }
+            let body = hub.usage_json();
             Ok(respond(&mut stream, "200 OK", CT_JSON, &[], body.as_bytes())?)
         }
         // Operator status for `amber ctl web status` (spec §9.3). Same cookie
@@ -2828,5 +2880,79 @@ mod tests {
         // handshake this server writes is the one browsers expect.
         let accept = tungstenite::handshake::derive_accept_key(b"dGhlIHNhbXBsZSBub25jZQ==");
         assert_eq!(accept, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+    }
+
+    // ---- agent plan quota (design 2026-09-01 §3) ----------------------
+
+    #[test]
+    fn usage_json_is_an_empty_list_before_the_first_reply() {
+        let hub = borrow_hub(vec![]);
+        assert_eq!(hub.usage_json(), r#"{"providers":[]}"#);
+    }
+
+    #[test]
+    fn a_usage_frame_is_cached_for_the_route() {
+        let hub = borrow_hub(vec![]);
+        hub.on_frame(Frame::Control(ControlMsg::Usage {
+            providers: vec![amber_core::proto::ProviderUsage {
+                provider: "codex".into(),
+                plan: Some("pro".into()),
+                gauges: vec![amber_core::proto::Gauge {
+                    kind: "session".into(),
+                    label: "5h window".into(),
+                    percent: 12.0,
+                    resets_at: Some(1_788_328_800),
+                    stale: false,
+                }],
+                updated: 5,
+                state: "ok".into(),
+                detail: None,
+            }],
+        }));
+        let body = hub.usage_json();
+        assert!(body.contains("\"codex\""), "{body}");
+        assert!(body.contains("\"pro\""), "{body}");
+        assert!(body.contains("\"percent\":12.0"), "{body}");
+    }
+
+    #[test]
+    fn a_usage_frame_pushes_nothing_at_browsers() {
+        // Quota rides an authenticated HTTP route the SERVER polls; pushing it
+        // would put a once-a-minute payload on the session-truth path.
+        let hub = borrow_hub(vec![s("a", "shell")]);
+        let (tx, rx) = std::sync::mpsc::sync_channel(8);
+        hub.inner
+            .lock()
+            .unwrap()
+            .clients
+            .push(Client { id: 1, open: Some("a".into()), tx });
+        hub.on_frame(Frame::Control(ControlMsg::Usage { providers: vec![] }));
+        // Nothing was queued at the client, and the cache took the value.
+        assert!(rx.try_recv().is_err(), "a Usage frame must not reach a browser");
+        assert_eq!(hub.inner.lock().unwrap().usage, r#"{"providers":[]}"#);
+    }
+
+    #[test]
+    fn no_browser_message_can_reach_get_usage() {
+        // The browser whitelist is unchanged by this feature: usage is served
+        // over HTTP, so no new control message becomes socket-reachable.
+        let live = [s("a", "shell"), s("b", "claude")];
+        let msgs = [
+            BrowserMsg::Open { name: "a".into() },
+            BrowserMsg::Close { name: "a".into() },
+            BrowserMsg::Focus { name: "a".into() },
+            BrowserMsg::Resize { name: "a".into(), cols: 80, rows: 24 },
+        ];
+        for msg in msgs {
+            for control in map_browser_msg(&msg, None, &live) {
+                assert!(
+                    !matches!(
+                        control,
+                        ControlMsg::GetUsage | ControlMsg::Snapshot | ControlMsg::ReportRunState { .. }
+                    ),
+                    "browser reached a forbidden control: {control:?}"
+                );
+            }
+        }
     }
 }
