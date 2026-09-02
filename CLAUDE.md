@@ -1512,6 +1512,66 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   enters the browser, and plaintext keys only on the explicit reveal GET.
   The proxy itself stays loopback-only.
 
+- [x] Agent usage-limit tracking (2026-09-01) — "how much of my plan is left
+  this week", inside amber. Spec:
+  `docs/superpowers/specs/2026-09-01-usage-limit-tracking-design.md`; plan:
+  `docs/superpowers/plans/2026-09-01-usage-limit-tracking.md`; report
+  `.reports/usage-limits.md`. **No new Cargo dependency**: the daemon owns a
+  60 s poller (`crates/amber/src/usage.rs`, its own thread — never a connection
+  read thread) that collects one `ProviderUsage` per provider into an
+  `Arc<Mutex<..>>` cache, and the new additive `GetUsage` → `Usage` control
+  pair answers from that cache, so the desktop, `amber ctl usage [--json]`, and
+  Pocket/`amber web` all read one truth for the machine the sessions actually
+  run on (app-local placement was rejected: a phone or SSH-remote window would
+  have read the LOCAL `~/.claude`, i.e. the wrong machine's quota — the
+  `resolveSocketPath` class of bug). **claude**: `GET
+  https://api.anthropic.com/api/oauth/usage` with the user's own stored OAuth
+  token — the call `/usage` itself makes, endpoint string found in the `claude`
+  binary — reached by **invoking `curl`**, never by linking TLS: core rule #8
+  constrains linking, not invoking, the same reading `login_path()` and the
+  `systemctl --user show-environment` display-env fix already rest on. Parses
+  the server-driven `limits[]` array in preference to `five_hour`/`seven_day`,
+  and deliberately ignores the codename keys (`tangelo`, `iguana_necktie`,
+  `nimbus_quill`, …) — unstable server-side experiment slots. The token is read
+  per poll, passed only as a curl argv element, and never logged, persisted, or
+  placed in any frame or HTTP body; an expired one yields `needs-auth` with NO
+  spawn, because **amber never refreshes or mints the credential** (the mistake
+  `load_token()` exists to avoid), and curl's stderr is never echoed since it
+  can carry the request line. **codex**: the newest **non-null** `rate_limits`
+  across `~/.codex/sessions/**/rollout-*.jsonl` — "newest file" is the wrong
+  rule, the current rollout is usually all-null. **The bug live testing caught
+  and no unit test could:** codex has moved that block between releases —
+  older rollouts nest it at `payload.info.rate_limits`, current ones write it
+  as `info`'s SIBLING at `payload.rate_limits` — so the first implementation
+  reported "no codex usage recorded yet" on a box with 196 populated files;
+  now an ordered `RATE_LIMIT_PATHS` list with a regression test built from the
+  real line. A `resets_at` in the past renders `stale` ("window rolled"), never
+  the number it measured. **grok**: nothing exists to read (no `x-ratelimit`
+  string and no usage endpoint in its binary, no token/limit data in
+  `~/.grok/logs`, sessions are an FTS sqlite index; its `rate_limit` string is
+  a hook/error EVENT name), so it gets a row that says so — and its quota is
+  **not** inferred from pane bytes, the antipattern the Pocket pass ruled out.
+  **No derived percentages anywhere**: a gauge is rendered only from a number
+  the provider itself reports, and the wire carries USED percent with the UI
+  deriving "remaining". App: `shared/usageView.ts` (pure), toolbar pill +
+  `UsagePanel` on the repo's own `.help-overlay`/`.help-card` shell, hidden
+  outright when nothing is known (the web build's permanently-red remote pill
+  is the lesson), pill polling 60 s / open dialog 15 s; a compact Pocket row.
+  `amber web` gains its own 60 s `GetUsage` tick and authenticated
+  `GET /api/usage` — **the browser control whitelist is NOT widened**, so no
+  new `ControlMsg` becomes socket-reachable (a test enumerates every
+  `BrowserMsg` to prove it). `Usage` is never broadcast to watchers. Gates:
+  Rust 813 tests ×2 + clippy clean, app 744 tests + typecheck + Electron and
+  web builds green. **Live-verified** on an isolated private daemon + private
+  `amber web`: claude matched its own endpoint exactly (56.0/6.0, `resets_at`
+  epochs correct), codex read the real record with its rolled 5 h window shown
+  as words, `needs-auth` surfaced without touching the real credential and left
+  codex unaffected, zero token strings in any output, and `/api/usage` 401 → 204
+  → 200 across the cookie boundary. **A running daemon must be restarted to
+  answer `GetUsage`** (an older one replies `Error`, which the pill renders as
+  unknown, never as zero); `amber web` likewise. Still open: real-phone and
+  macOS/Windows verification.
+
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**
   `std::io::Read` (dedicated thread); `take_writer()` is one-shot;

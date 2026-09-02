@@ -291,6 +291,15 @@ fn tail_of(path: &Path) -> Option<String> {
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
+/// Where a `token_count` record can carry its `rate_limits`, most specific
+/// first. Codex has emitted both shapes; both are present on a real box.
+const RATE_LIMIT_PATHS: [&str; 4] = [
+    "/payload/rate_limits",
+    "/payload/info/rate_limits",
+    "/rate_limits",
+    "/info/rate_limits",
+];
+
 /// The newest non-null `rate_limits` object across codex's rollout logs.
 ///
 /// "Newest non-null RECORD", not "newest file": the most recent rollout very
@@ -303,9 +312,11 @@ fn newest_rate_limits(sessions_dir: &Path) -> Option<serde_json::Value> {
             let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
                 continue;
             };
-            let rl = v
-                .pointer("/payload/info/rate_limits")
-                .or_else(|| v.pointer("/info/rate_limits"));
+            // Codex has moved this block between releases: some rollouts put
+            // it INSIDE `info`, newer ones write it as `info`'s SIBLING under
+            // `payload` (verified live on both shapes). Checking one path only
+            // silently reports "no usage recorded" on a machine full of it.
+            let rl = RATE_LIMIT_PATHS.iter().find_map(|path| v.pointer(path));
             if let Some(rl) = rl.filter(|rl| !rl.is_null()) {
                 return Some(rl.clone());
             }
@@ -640,6 +651,22 @@ mod tests {
         assert_eq!(u.gauges[0].percent, 10.0);
         assert_eq!(u.gauges[1].label, "weekly");
         assert_eq!(u.gauges[1].percent, 3.0);
+    }
+
+    /// The shape codex actually writes today: `rate_limits` beside `info`,
+    /// not inside it. Reading only the nested path reports "no usage recorded"
+    /// on a machine whose rollouts are full of it (caught live, 2026-09-01).
+    #[test]
+    fn reads_rate_limits_written_beside_info() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        let line = r#"{"timestamp":"2026-08-30T22:09:11Z","type":"event_msg","payload":{"type":"token_count","info":{"model_context_window":258400},"rate_limits":{"limit_id":"codex_bengalfox","primary":{"used_percent":21.0,"window_minutes":300,"resets_at":2000000000},"secondary":{"used_percent":6.0,"window_minutes":10080,"resets_at":2000600000},"plan_type":"pro"}}}"#;
+        write_rollout(&sessions.join("2026/08/30"), "rollout-a.jsonl", &[line]);
+        let u = codex_usage_in(&sessions, 1_000_000_000);
+        assert_eq!(u.state, "ok");
+        assert_eq!(u.plan.as_deref(), Some("pro"));
+        assert_eq!(u.gauges[0].percent, 21.0);
+        assert_eq!(u.gauges[1].percent, 6.0);
     }
 
     #[test]
