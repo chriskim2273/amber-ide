@@ -105,7 +105,7 @@ Screenshots cross the local broker as a JSON metadata frame followed by a bounde
 
 Phase A deliberately does not implement element interaction or approvals. `.reports/tab-browser-host-remaining.json` therefore marks `P1-pi-tools-and-approvals` partial, not complete, and `mergeReady` remains false.
 
-Phase-A automated evidence: 811 app tests passed with one intentional real-daemon skip; focused browser tests passed 50/50; strict app typecheck, Electron build, hosted-web build, and workspace warnings-as-errors clippy passed; Pi extension installer tests passed 18/18 under the focused Cargo filter. Final independent review remains required after the tranche commit.
+Phase-A automated evidence: 812 app tests passed with one intentional real-daemon skip; focused browser tests passed 50/50; strict app typecheck, Electron build, hosted-web build, and workspace warnings-as-errors clippy passed; Pi extension installer tests passed 18/18 under the focused Cargo filter. Final independent review remains required after the tranche commit.
 
 ## Open blocking work
 
