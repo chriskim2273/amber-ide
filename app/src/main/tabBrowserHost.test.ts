@@ -65,6 +65,38 @@ describe('TabBrowserHost', () => {
     expect(snapshot).toHaveBeenCalledWith(expect.objectContaining({ browserId: opened.status.id, pageIncarnation: opened.status.pageIncarnation }), action.limits, expect.any(AbortSignal))
   })
 
+  it('counts synchronous and asynchronous reload navigation events exactly once', async () => {
+    for (const timing of ['synchronous', 'asynchronous'] as const) {
+      let emit!: (event: TabBrowserPageEvent) => void
+      let deferredEvent: (() => void) | undefined
+      const automation = {
+        invalidate: vi.fn(),
+        reload: vi.fn(() => {
+          const navigate = () => emit({ type: 'navigation-started' })
+          if (timing === 'synchronous') navigate(); else deferredEvent = navigate
+          return { accepted: true }
+        }),
+      } as unknown as BrowserAutomation
+      const localFactory: TabBrowserPageFactory = { create: (_id, _input, onEvent) => { emit = onEvent; return Object.assign(new FakePage(), { automation }) } }
+      const host = new TabBrowserHost(emptyBrowserState(1), localFactory)
+      const opened = await host.open({ visible: true })
+      const result = await host.runAutomation(opened.status.id, { type: 'reload', pageIncarnation: opened.status.pageIncarnation, expectedGeneration: 0, ignoreCache: false }, new AbortController().signal) as { generation: number }
+      expect(result.generation).toBe(1)
+      deferredEvent?.()
+      expect(host.status(opened.status.id).generation).toBe(1)
+    }
+  })
+
+  it('does not advance generation when back/forward has no history entry', async () => {
+    const automation = { invalidate: vi.fn(), history: vi.fn(() => ({ accepted: false })) } as unknown as BrowserAutomation
+    const localFactory: TabBrowserPageFactory = { create: () => Object.assign(new FakePage(), { automation }) }
+    const host = new TabBrowserHost(emptyBrowserState(1), localFactory)
+    const opened = await host.open({ visible: true })
+    const result = await host.runAutomation(opened.status.id, { type: 'history', direction: 'back', pageIncarnation: opened.status.pageIncarnation, expectedGeneration: 0 }, new AbortController().signal) as { generation: number; accepted: boolean }
+    expect(result).toMatchObject({ generation: 0, accepted: false })
+    expect(host.status(opened.status.id).generation).toBe(0)
+  })
+
   it('does not choose the visible renderer as the LRU victim', async () => {
     let time = 0
     const host = new TabBrowserHost(emptyBrowserState(1), factory, () => ++time)

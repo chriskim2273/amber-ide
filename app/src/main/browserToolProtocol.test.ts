@@ -29,6 +29,7 @@ describe('browser tool protocol', () => {
       { type: 'setViewport', ...page, viewport: { width: 800, height: 600, deviceScaleFactor: Number.NaN } },
       { type: 'screenshot', ...page, path: '/tmp/leak.png' },
       { type: 'console', ...page, levels: new Array(20).fill('error') },
+      { type: 'console', ...page, cursor: '9999999999999999' },
     ]) expect(() => parseBrowserToolAction(action)).toThrow('INVALID_REQUEST')
   })
 

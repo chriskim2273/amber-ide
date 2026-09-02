@@ -27,7 +27,7 @@ export interface TabBrowserPageFactory {
 }
 export interface BrowserRuntimeStatus extends BrowserRecord { pageIncarnation: string; generation: number; loading: boolean; capacityWaiting?: boolean }
 export type TabBrowserHostEvent = { type: 'capacity-wait'; id: BrowserId; waiting: boolean } | { type: 'runtime'; id: BrowserId; status: BrowserRuntimeStatus }
-interface Runtime { page: TabBrowserPage; incarnation: string; generation: number; loading: boolean }
+interface Runtime { page: TabBrowserPage; incarnation: string; generation: number; loading: boolean; automationNavigationPending: boolean }
 
 export class TabBrowserHost {
   private readonly capacity = new BrowserCapacity(4)
@@ -60,7 +60,7 @@ export class TabBrowserHost {
       () => { runtime.generation += 1; runtime.page.automation?.invalidate(); this.onStateChange(); this.emitRuntime(id) },
       (event) => this.pageEvent(id, runtime, event),
     )
-    runtime = { page, incarnation: randomUUID(), generation: 0, loading: false }
+    runtime = { page, incarnation: randomUUID(), generation: 0, loading: false, automationNavigationPending: false }
     this.runtimes.set(id, runtime)
     this.capacity.markLive(id, this.now())
     return runtime
@@ -70,20 +70,24 @@ export class TabBrowserHost {
     if (this.runtimes.get(id) !== runtime) return
     const record = this.record(id)
     if (event.type === 'navigation-started') {
-      if (!runtime.loading) runtime.generation += 1
+      if (runtime.automationNavigationPending) runtime.automationNavigationPending = false
+      else if (!runtime.loading) runtime.generation += 1
       runtime.page.automation?.invalidate()
       runtime.loading = true
     } else if (event.type === 'navigation-committed') {
+      runtime.automationNavigationPending = false
       runtime.loading = false
       record.safeRestoreUrl = safeRestoreUrl(event.url)
       record.lastUsedAt = this.now()
       record.stateRevision += 1
     } else if (event.type === 'loading-stopped') {
+      runtime.automationNavigationPending = false
       runtime.loading = false
     } else if (event.type === 'title') {
       record.title = event.title.slice(0, 512)
       record.stateRevision += 1
     } else {
+      runtime.automationNavigationPending = false
       runtime.loading = false
       runtime.page.destroy()
       this.runtimes.delete(id)
@@ -187,7 +191,7 @@ export class TabBrowserHost {
     if (signal.aborted) throw new Error('ACTION_CANCELLED')
     const automation = runtime.page.automation
     const lease = { browserId: record.id, pageIncarnation: runtime.incarnation, generation: runtime.generation }
-    let result: unknown
+    let result: unknown; let generationDelta = 0
     this.capacity.protectFor(record.id, 'operation', true)
     try {
       if (action.type === 'snapshot') result = await automation.snapshot(lease, action.limits, signal)
@@ -197,13 +201,16 @@ export class TabBrowserHost {
       else if (action.type === 'console') result = automation.consoleSince(action.cursor, action.levels, action.limit)
       else if (action.type === 'network') result = automation.networkSince(action.cursor, action.limit, action.failedOnly)
       else if (action.type === 'wait') result = await automation.wait(lease, action.condition, action.timeoutMs, signal, () => this.runtimes.get(record.id) === runtime && runtime.generation === action.expectedGeneration)
-      else if (action.type === 'reload') { result = automation.reload(action.ignoreCache); runtime.generation += 1 }
-      else if (action.type === 'history') { result = automation.history(action.direction); runtime.generation += 1 }
-      else { result = await automation.setViewport(action.viewport, signal); runtime.generation += 1; record.viewport = { width: action.viewport.width, height: action.viewport.height }; record.stateRevision += 1 }
+      else if (action.type === 'reload' || action.type === 'history') {
+        runtime.automationNavigationPending = true
+        try { result = action.type === 'reload' ? automation.reload(action.ignoreCache) : automation.history(action.direction) }
+        catch (error) { runtime.automationNavigationPending = false; throw error }
+        if ((result as { accepted: boolean }).accepted) { runtime.generation += 1; generationDelta = 1 }
+        else runtime.automationNavigationPending = false
+      } else { result = await automation.setViewport(action.viewport, signal); runtime.generation += 1; generationDelta = 1; record.viewport = { width: action.viewport.width, height: action.viewport.height }; record.stateRevision += 1 }
     } finally { this.capacity.protectFor(record.id, 'operation', false) }
     if (signal.aborted) throw new Error('ACTION_CANCELLED')
-    const isMutation = action.type === 'reload' || action.type === 'history' || action.type === 'setViewport'
-    const expectedAfter = action.expectedGeneration + (isMutation ? 1 : 0)
+    const expectedAfter = action.expectedGeneration + generationDelta
     if (this.runtimes.get(record.id) !== runtime || runtime.incarnation !== action.pageIncarnation || runtime.generation !== expectedAfter) throw new Error('STALE_GENERATION')
     this.onStateChange(); this.emitRuntime(record.id)
     const context = { browserId: record.id, pageIncarnation: runtime.incarnation, generation: runtime.generation }

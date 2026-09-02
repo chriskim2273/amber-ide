@@ -55,18 +55,43 @@ function paneLocation(name: string): { ws: number; tab: number } | null {
   return { ws: Number(match[1]), tab: Number(match[2]) }
 }
 
-export function dispatchAttachedBrokerAction(
+export async function dispatchAttachedBrokerAction(
   action: BrokerAction,
   id: string,
   signal: AbortSignal,
   stillAuthorized: () => boolean | Promise<boolean>,
   dispatch: (command: TabBrowserCommand, signal?: AbortSignal, validate?: () => boolean | Promise<boolean>) => Promise<unknown>,
+  authorizationPollMs = 100,
 ): Promise<unknown> {
-  if (action.type === 'status') return dispatch({ type: 'status', id })
-  if (action.type === 'stop') return dispatch({ type: 'stop', id, pageIncarnation: action.pageIncarnation, expectedGeneration: action.expectedGeneration }, signal, stillAuthorized)
-  if (action.type === 'navigate') return dispatch({ type: 'navigate', id, url: action.url, pageIncarnation: action.pageIncarnation, expectedGeneration: action.expectedGeneration }, signal, stillAuthorized)
-  if (action.type !== 'open') return dispatch({ type: 'automation', id, action }, signal, stillAuthorized)
-  return Promise.reject(new Error('INVALID_REQUEST'))
+  let command: TabBrowserCommand
+  if (action.type === 'status') command = { type: 'status', id }
+  else if (action.type === 'stop') command = { type: 'stop', id, pageIncarnation: action.pageIncarnation, expectedGeneration: action.expectedGeneration }
+  else if (action.type === 'navigate') command = { type: 'navigate', id, url: action.url, pageIncarnation: action.pageIncarnation, expectedGeneration: action.expectedGeneration }
+  else if (action.type !== 'open') command = { type: 'automation', id, action }
+  else throw new Error('INVALID_REQUEST')
+
+  const controller = new AbortController(); let revoked = false; let checking = false
+  const abortFromCaller = (): void => controller.abort()
+  signal.addEventListener('abort', abortFromCaller, { once: true })
+  if (signal.aborted) controller.abort()
+  const checkAuthority = async (): Promise<boolean> => {
+    try { return await stillAuthorized() } catch { return false }
+  }
+  const timer = setInterval(() => {
+    if (checking || controller.signal.aborted) return
+    checking = true
+    void checkAuthority().then((valid) => { if (!valid) { revoked = true; controller.abort() } }).finally(() => { checking = false })
+  }, Math.max(1, authorizationPollMs))
+  timer.unref()
+  try {
+    let result: unknown
+    try { result = await dispatch(command, controller.signal, checkAuthority) }
+    catch (error) { if (revoked) throw new Error('STALE_BROWSER_CONTEXT'); throw error }
+    if (!(await checkAuthority())) { revoked = true; controller.abort(); throw new Error('STALE_BROWSER_CONTEXT') }
+    return result
+  } finally {
+    clearInterval(timer); signal.removeEventListener('abort', abortFromCaller)
+  }
 }
 
 export function authorizeBrowserRequest(layout: LayoutFile, amberSession: string, solicitation = false): { ws: number; tab: number; browserId?: string } {
@@ -117,7 +142,7 @@ async function tokenFile(path: string): Promise<string> {
   return token
 }
 
-export interface TabBrowserBrokerOptions { requestTimeoutMs?: number; socketTimeoutMs?: number }
+export interface TabBrowserBrokerOptions { requestTimeoutMs?: number; socketTimeoutMs?: number; authorizeReplay?: (request: BrokerRequest) => boolean | Promise<boolean> }
 
 export class TabBrowserBrokerServer {
   private server: Server | null = null
@@ -152,7 +177,7 @@ export class TabBrowserBrokerServer {
     const safeWrite = (value: unknown): void => { if (!socket.destroyed && socket.writable) socket.write(frame(value)) }
     const safeWriteResult = (requestId: string, result: unknown): void => {
       if (binaryAttachment(result)) {
-        safeWrite({ version: 1, requestId, ok: true, result: { mediaType: result.mediaType, ...(result.width === undefined ? {} : { width: result.width }), ...(result.height === undefined ? {} : { height: result.height }), ...(result.browserId === undefined ? {} : { browserId: result.browserId }), ...(result.pageIncarnation === undefined ? {} : { pageIncarnation: result.pageIncarnation }), ...(result.generation === undefined ? {} : { generation: result.generation }), attachment: { encoding: 'binary-frame', byteLength: result.data.length } } })
+        safeWrite({ version: 1, requestId, ok: true, result: { contentTrust: 'untrusted-browser-content', mediaType: result.mediaType, ...(result.width === undefined ? {} : { width: result.width }), ...(result.height === undefined ? {} : { height: result.height }), ...(result.browserId === undefined ? {} : { browserId: result.browserId }), ...(result.pageIncarnation === undefined ? {} : { pageIncarnation: result.pageIncarnation }), ...(result.generation === undefined ? {} : { generation: result.generation }), attachment: { encoding: 'binary-frame', byteLength: result.data.length } } })
         if (!socket.destroyed && socket.writable) { socket.write(binaryFrameHeader(result.data)); socket.write(result.data) }
       } else safeWrite({ version: 1, requestId, ok: true, result })
     }
@@ -186,6 +211,7 @@ export class TabBrowserBrokerServer {
             let result: unknown
             if (cached) {
               if (cached.digest !== digest) throw new Error('INVALID_REQUEST')
+              if (this.options.authorizeReplay && !(await this.options.authorizeReplay(request))) throw new Error('STALE_BROWSER_CONTEXT')
               result = await cached.promise
             } else {
               const previousSequence = this.highWater.get(request.clientInstanceId) ?? 0

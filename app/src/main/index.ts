@@ -1231,7 +1231,7 @@ async function main(): Promise<void> {
   if (tabBrowser) {
     browserDaemonWatcher = new BrowserDaemonWatcher(new Connection(socket))
     browserDaemonWatcher.start()
-    const handleBroker = async (request: BrokerRequest, signal: AbortSignal): Promise<unknown> => {
+    const currentBrokerLayout = async (request: BrokerRequest): Promise<ReturnType<typeof parseLayout>> => {
       const controller = browserDaemonWatcher?.controller(request.amberSession)
       if (!controller) throw new Error('DAEMON_STATE_STALE')
       if (!isEligiblePiController(controller)) throw new Error('NOT_DESIGNATED_CONTROLLER')
@@ -1239,6 +1239,11 @@ async function main(): Promise<void> {
       const current = loaded.text ? parseLayout(loaded.text) : null
       if (!current) throw new Error('NO_BROWSER_FOR_TAB')
       if (current.readOnly) throw new Error('UNSUPPORTED_LAYOUT_VERSION')
+      authorizeBrowserRequest(current, request.amberSession, request.action.type === 'open')
+      return current
+    }
+    const handleBroker = async (request: BrokerRequest, signal: AbortSignal): Promise<unknown> => {
+      const current = await currentBrokerLayout(request)
       if (request.action.type === 'open') {
         const location = authorizeBrowserRequest(current, request.amberSession, true)
         if (!location.browserId) {
@@ -1307,7 +1312,9 @@ async function main(): Promise<void> {
     }
     const runtime = process.env['XDG_RUNTIME_DIR'] ?? tmpdir()
     const socketPath = process.env['AMBER_BROWSER_HOST_SOCKET'] ?? join(runtime, 'amber-ide', 'browser-host.sock')
-    tabBrowserBroker = new TabBrowserBrokerServer(socketPath, join(stateRoot(), 'browser-host-token'), handleBroker)
+    tabBrowserBroker = new TabBrowserBrokerServer(socketPath, join(stateRoot(), 'browser-host-token'), handleBroker, {
+      authorizeReplay: async (request) => { try { await currentBrokerLayout(request); return true } catch { return false } },
+    })
     await tabBrowserBroker.start()
     app.once('before-quit', () => {
       browserDaemonWatcher?.close(); browserDaemonWatcher = null

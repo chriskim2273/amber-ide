@@ -17,8 +17,8 @@ export interface BrowserDebuggerTransport {
 export interface BrowserAutomationLease { browserId: string; pageIncarnation: string; generation: number }
 export interface BrowserAutomationOptions { ringItems?: number; ringBytes?: number }
 export interface BrowserAutomationControls {
-  reload?(ignoreCache: boolean): void
-  history?(direction: 'back' | 'forward'): void
+  reload?(ignoreCache: boolean): boolean | void
+  history?(direction: 'back' | 'forward'): boolean | void
 }
 export interface AccessibilityNodeResult { ref: string; depth: number; role: string; name: string; disabled?: boolean; focused?: boolean }
 export interface SnapshotResult { snapshotId: string; url: string; nodes: AccessibilityNodeResult[]; truncated: boolean }
@@ -37,29 +37,29 @@ class BoundedRing {
   private entries: RingEntry[] = []
   private bytes = 0
   private cursor = 0
-  private dropped = 0
   constructor(private readonly maxItems: number, private readonly maxBytes: number) {}
   push(value: Record<string, unknown>): void {
+    const cursor = ++this.cursor
     const bytes = Buffer.byteLength(JSON.stringify(value))
-    if (bytes > this.maxBytes) { this.dropped += 1; return }
-    const entry = { cursor: ++this.cursor, bytes, value }
+    if (bytes > this.maxBytes) return
+    const entry = { cursor, bytes, value }
     this.entries.push(entry); this.bytes += bytes
     while (this.entries.length > this.maxItems || this.bytes > this.maxBytes) {
-      const removed = this.entries.shift()!; this.bytes -= removed.bytes; this.dropped += 1
+      const removed = this.entries.shift()!; this.bytes -= removed.bytes
     }
   }
   since(cursor: string | undefined, limit: number, filter?: (entry: Record<string, unknown>) => boolean): { cursor: string; items: Record<string, unknown>[]; dropped: number; truncated: boolean } {
     const numeric = cursor === undefined ? 0 : Number(cursor)
-    const first = this.entries[0]?.cursor ?? this.cursor + 1
-    const lost = numeric > 0 && numeric < first - 1 ? first - numeric - 1 : 0
-    const eligible = this.entries.filter((entry) => entry.cursor > numeric && (!filter || filter(entry.value)))
+    const retainedAfterCursor = this.entries.filter((entry) => entry.cursor > numeric)
+    const dropped = Math.max(0, this.cursor - numeric - retainedAfterCursor.length)
+    const eligible = retainedAfterCursor.filter((entry) => !filter || filter(entry.value))
     const candidates = eligible.slice(-limit), selected: RingEntry[] = []; let bytes = 0
     for (let index = candidates.length - 1; index >= 0; index--) {
       const entry = candidates[index]!
       if (bytes + entry.bytes > 256 * 1024) break
       selected.unshift(entry); bytes += entry.bytes
     }
-    return { cursor: String(this.cursor), items: selected.map((entry) => entry.value), dropped: this.dropped + lost, truncated: selected.length < eligible.length }
+    return { cursor: String(this.cursor), items: selected.map((entry) => entry.value), dropped, truncated: selected.length < eligible.length }
   }
 }
 
@@ -329,7 +329,7 @@ export class BrowserAutomation {
     }
     throw new Error('ACTION_TIMEOUT')
   }
-  reload(ignoreCache: boolean): { accepted: true } { this.invalidate(); this.controls.reload?.(ignoreCache); return { accepted: true } }
-  history(direction: 'back' | 'forward'): { accepted: true } { this.invalidate(); this.controls.history?.(direction); return { accepted: true } }
+  reload(ignoreCache: boolean): { accepted: boolean } { this.invalidate(); return { accepted: this.controls.reload?.(ignoreCache) !== false } }
+  history(direction: 'back' | 'forward'): { accepted: boolean } { this.invalidate(); return { accepted: this.controls.history?.(direction) !== false } }
   async setViewport(viewport: BrowserViewport, signal: AbortSignal): Promise<{ viewport: BrowserViewport }> { abort(signal); await this.ensureAttached(); await this.transport.send('Emulation.setDeviceMetricsOverride', { width: viewport.width, height: viewport.height, deviceScaleFactor: viewport.deviceScaleFactor ?? 1, mobile: viewport.mobile ?? false, screenWidth: viewport.width, screenHeight: viewport.height }); abort(signal); this.invalidate(); return { viewport } }
 }

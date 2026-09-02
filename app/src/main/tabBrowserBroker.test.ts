@@ -13,13 +13,14 @@ const layout: LayoutFile = { version: 2, activeWorkspace: 1, workspaces: { '1': 
 
 describe('tab browser broker boundary', () => {
   it('forwards stop cancellation and fresh authorization to the service queue', async () => {
-    const controller = new AbortController(); const validator = () => false
+    const controller = new AbortController(); const validator = () => true
     let captured: unknown[] = []
     await dispatchAttachedBrokerAction({ type: 'stop', pageIncarnation: 'page', expectedGeneration: 2 }, 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', controller.signal, validator,
       async (...args) => { captured = args; return {} })
     expect(captured[0]).toEqual({ type: 'stop', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', pageIncarnation: 'page', expectedGeneration: 2 })
-    expect(captured[1]).toBe(controller.signal)
-    expect(captured[2]).toBe(validator)
+    expect(captured[1]).toBeInstanceOf(AbortSignal)
+    expect(captured[1]).not.toBe(controller.signal)
+    await expect((captured[2] as () => Promise<boolean>)()).resolves.toBe(true)
   })
 
   it('strictly parses bounded typed requests', () => {
@@ -36,13 +37,44 @@ describe('tab browser broker boundary', () => {
     await dispatchAttachedBrokerAction(action, 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', signal, validate, async (...args) => { calls.push(args); return {} })
     expect(calls).toHaveLength(1)
     expect(calls[0]?.[0]).toEqual({ type: 'automation', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', action })
-    expect(calls[0]?.[1]).toBe(signal)
-    expect(calls[0]?.[2]).toBe(validate)
+    expect(calls[0]?.[1]).toBeInstanceOf(AbortSignal)
+    expect(calls[0]?.[1]).not.toBe(signal)
+    await expect((calls[0]?.[2] as () => Promise<boolean>)()).resolves.toBe(true)
   })
 
   it('maps implementation errors to a stable code without leaking diagnostic canaries', () => {
     expect(safeBrokerError(new Error('ACTION_TIMEOUT'))).toBe('ACTION_TIMEOUT')
     expect(safeBrokerError(new Error('Authorization: Bearer secret /home/user/file'))).toBe('INTERNAL_ERROR')
+  })
+
+  it.each([
+    ['Share off during screenshot', { type: 'screenshot' as const, pageIncarnation: 'page', expectedGeneration: 1, fullPage: false }, 'shared'],
+    ['designation changes during wait', { type: 'wait' as const, pageIncarnation: 'page', expectedGeneration: 1, condition: { kind: 'text' as const, value: 'ready' }, timeoutMs: 1000 }, 'designated'],
+    ['association changes during navigation', { type: 'navigate' as const, pageIncarnation: 'page', expectedGeneration: 1, url: 'https://example.test/' }, 'associated'],
+    ['controller dies during screenshot', { type: 'screenshot' as const, pageIncarnation: 'page', expectedGeneration: 1, fullPage: false }, 'controllerAlive'],
+  ])('suppresses results when %s', async (_label, action, revokedKey) => {
+    const authority = { shared: true, designated: true, associated: true, controllerAlive: true }
+    let release!: () => void
+    const dispatched = new Promise<Record<string, unknown>>((resolve) => { release = () => resolve({ secretResult: true }) })
+    const request = dispatchAttachedBrokerAction(action, 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', new AbortController().signal,
+      () => Object.values(authority).every(Boolean), async () => dispatched, 1)
+    authority[revokedKey as keyof typeof authority] = false
+    release()
+    await expect(request).rejects.toThrow('STALE_BROWSER_CONTEXT')
+  })
+
+  it('aborts active cancellable work when controller authority is revoked', async () => {
+    let authorized = true; let operationSignal: AbortSignal | undefined
+    const request = dispatchAttachedBrokerAction(
+      { type: 'wait', pageIncarnation: 'page', expectedGeneration: 1, condition: { kind: 'networkIdle' }, timeoutMs: 1000 },
+      'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', new AbortController().signal, () => authorized,
+      async (_command, signal) => new Promise((_resolve, reject) => {
+        operationSignal = signal
+        signal?.addEventListener('abort', () => reject(new Error('ACTION_CANCELLED')), { once: true })
+      }), 1)
+    authorized = false
+    await expect(request).rejects.toThrow('STALE_BROWSER_CONTEXT')
+    expect(operationSignal?.aborted).toBe(true)
   })
 
   it('rejects dead and shell-fallback Pi controllers', () => {
@@ -116,7 +148,7 @@ describe('tab browser broker boundary', () => {
       })
     })
     expect(received.bytes).toEqual(image)
-    expect(received.meta).toMatchObject({ ok: true, result: { mediaType: 'image/png', attachment: { encoding: 'binary-frame', byteLength: 4 } } })
+    expect(received.meta).toMatchObject({ ok: true, result: { contentTrust: 'untrusted-browser-content', mediaType: 'image/png', attachment: { encoding: 'binary-frame', byteLength: 4 } } })
     expect(JSON.stringify(received.meta)).not.toMatch(/path|"data"/)
     const replay = await new Promise<Record<string, unknown>>((resolve, reject) => {
       const socket = connect(socketPath); let buffer = Buffer.alloc(0); let authenticated = false
@@ -160,8 +192,8 @@ describe('tab browser broker boundary', () => {
   it('replays identical results but rejects changed payloads and evicted sequences', async () => {
     if (process.platform === 'win32') return
     const dir = await mkdtemp(join(tmpdir(), 'amber-browser-broker-')); cleanup.push(dir)
-    const socketPath = join(dir, 'broker.sock'); const tokenPath = join(dir, 'token'); let calls = 0
-    const server = new TabBrowserBrokerServer(socketPath, tokenPath, async (request) => ({ call: ++calls, action: request.action.type }))
+    const socketPath = join(dir, 'broker.sock'); const tokenPath = join(dir, 'token'); let calls = 0; let replayChecks = 0
+    const server = new TabBrowserBrokerServer(socketPath, tokenPath, async (request) => ({ call: ++calls, action: request.action.type }), { authorizeReplay: () => { replayChecks += 1; return true } })
     await server.start(); const token = (await readFile(tokenPath, 'utf8')).trim()
     const encode = (value: unknown): Buffer => { const body = Buffer.from(JSON.stringify(value)); const out = Buffer.alloc(body.length + 4); out.writeUInt32BE(body.length); body.copy(out, 4); return out }
     const base = { version: 1, clientInstanceId: 'client-replay', amberSession: 'amber-1-2-0-pane' }
@@ -188,6 +220,7 @@ describe('tab browser broker boundary', () => {
     expect(replies[2]!['error']).toBe('INVALID_REQUEST')
     expect(replies[3]!['error']).toBe('ACTION_CANCELLED')
     expect(calls).toBe(1)
+    expect(replayChecks).toBe(1)
     await server.close()
   })
 

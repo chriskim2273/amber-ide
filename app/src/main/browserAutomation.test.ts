@@ -143,6 +143,25 @@ describe('browser automation', () => {
     expect(transport.listeners).toHaveLength(1)
   })
 
+  it('reports cursor-relative ring gaps without double-counting prior evictions', async () => {
+    const transport = new FakeDebugger()
+    const automation = new BrowserAutomation(transport, () => 'about:blank', () => false, { ringItems: 2, ringBytes: 1024 })
+    await automation.ensureAttached()
+    const emit = (value: string) => transport.listeners.forEach((listener) => listener('Runtime.consoleAPICalled', { type: 'log', args: [{ value }] }))
+    emit('one'); emit('two'); emit('three')
+    expect(automation.consoleSince('0', undefined, 20)).toMatchObject({ dropped: 1, items: [{ message: 'two' }, { message: 'three' }] })
+    expect(automation.consoleSince('1', undefined, 20)).toMatchObject({ dropped: 0, items: [{ message: 'two' }, { message: 'three' }] })
+    const cursor = automation.consoleSince(undefined, undefined, 20).cursor
+    emit('four')
+    expect(automation.consoleSince(cursor, undefined, 20)).toMatchObject({ dropped: 0, items: [{ message: 'four' }] })
+
+    const tinyTransport = new FakeDebugger()
+    const tiny = new BrowserAutomation(tinyTransport, () => 'about:blank', () => false, { ringItems: 2, ringBytes: 100 })
+    await tiny.ensureAttached()
+    tinyTransport.listeners.at(-1)!('Runtime.consoleAPICalled', { type: 'log', args: [{ value: 'x'.repeat(1000) }] })
+    expect(tiny.consoleSince('0', undefined, 20)).toMatchObject({ dropped: 1, items: [] })
+  })
+
   it('uses only a fixed allowlist of debugger methods and supports cancellation', async () => {
     const transport = new FakeDebugger()
     const automation = new BrowserAutomation(transport, () => 'about:blank', () => false)

@@ -34,6 +34,9 @@ function boundedString(value: unknown, max: number, allowEmpty = false): value i
 function boundedInt(value: unknown, min: number, max: number): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= min && value <= max
 }
+function validCursor(value: unknown): value is string {
+  return typeof value === 'string' && /^\d{1,16}$/.test(value) && Number.isSafeInteger(Number(value))
+}
 function pageLease(value: Record<string, unknown>): BrowserPageLease {
   if (!boundedString(value['pageIncarnation'], 256) || !boundedInt(value['expectedGeneration'], 0, Number.MAX_SAFE_INTEGER)) throw new Error('INVALID_REQUEST')
   return { pageIncarnation: value['pageIncarnation'], expectedGeneration: value['expectedGeneration'] }
@@ -99,14 +102,14 @@ export function parseBrowserToolAction(value: unknown): BrowserToolAction {
     return { type: 'screenshot', ...lease, ...(action['target'] === undefined ? {} : { target: elementRef(action['target']) }), fullPage: action['fullPage'] === true }
   }
   if (action['type'] === 'console' && exact(action, [...BASE, 'cursor', 'levels', 'limit'], BASE)) {
-    if (action['cursor'] !== undefined && !/^\d{1,16}$/.test(String(action['cursor']))) throw new Error('INVALID_REQUEST')
+    if (action['cursor'] !== undefined && !validCursor(action['cursor'])) throw new Error('INVALID_REQUEST')
     const valid = new Set<ConsoleLevel>(['log', 'info', 'warning', 'error'])
     if (action['levels'] !== undefined && (!Array.isArray(action['levels']) || action['levels'].length > 4 || action['levels'].some((level) => !valid.has(level as ConsoleLevel)))) throw new Error('INVALID_REQUEST')
     const limit = action['limit'] ?? 100; if (!boundedInt(limit, 1, 200)) throw new Error('INVALID_REQUEST')
     return { type: 'console', ...lease, ...(action['cursor'] === undefined ? {} : { cursor: String(action['cursor']) }), ...(action['levels'] === undefined ? {} : { levels: action['levels'] as ConsoleLevel[] }), limit }
   }
   if (action['type'] === 'network' && exact(action, [...BASE, 'cursor', 'limit', 'failedOnly'], BASE)) {
-    if (action['cursor'] !== undefined && !/^\d{1,16}$/.test(String(action['cursor']))) throw new Error('INVALID_REQUEST')
+    if (action['cursor'] !== undefined && !validCursor(action['cursor'])) throw new Error('INVALID_REQUEST')
     if (action['failedOnly'] !== undefined && typeof action['failedOnly'] !== 'boolean') throw new Error('INVALID_REQUEST')
     const limit = action['limit'] ?? 100; if (!boundedInt(limit, 1, 200)) throw new Error('INVALID_REQUEST')
     return { type: 'network', ...lease, ...(action['cursor'] === undefined ? {} : { cursor: String(action['cursor']) }), limit, failedOnly: action['failedOnly'] === true }

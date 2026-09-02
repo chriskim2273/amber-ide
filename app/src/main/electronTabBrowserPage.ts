@@ -34,11 +34,12 @@ export class ElectronTabBrowserPage implements TabBrowserPage {
       onMessage: (listener) => { contents.debugger.on('message', (_event, method, params) => listener(method, (params ?? {}) as Record<string, unknown>)) },
     }
     this.automation = new BrowserAutomation(debuggerTransport, () => contents.getURL(), () => contents.isLoading(), {}, {
-      reload: (ignoreCache) => { if (ignoreCache) contents.reloadIgnoringCache(); else contents.reload() },
+      reload: (ignoreCache) => { if (ignoreCache) contents.reloadIgnoringCache(); else contents.reload(); return true },
       history: (direction) => {
         const history = contents.navigationHistory
-        if (direction === 'back' && history.canGoBack()) history.goBack()
-        if (direction === 'forward' && history.canGoForward()) history.goForward()
+        if (direction === 'back' && history.canGoBack()) { history.goBack(); return true }
+        if (direction === 'forward' && history.canGoForward()) { history.goForward(); return true }
+        return false
       },
     })
     // Attach to this WebContents only; there is no remote-debugging endpoint
