@@ -1,8 +1,12 @@
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import type { BrowserElementRef, BrowserViewport, ConsoleLevel, FindQuery, SnapshotLimits, WaitCondition } from './browserToolProtocol'
 
 const SCREENSHOT_MAX_BYTES = 10 * 1024 * 1024
 const SCREENSHOT_MAX_DIMENSION = 4096
+// Include ordinary rendered text nodes, while excluding whitespace-only and
+// non-content containers before CDP returns any node ids. CSS/ARIA-hidden nodes
+// are filtered again by their ignored accessibility projection.
+const SNAPSHOT_SEARCH_XPATH = "//*[not(self::script or self::style or self::noscript or self::template) and not(ancestor::script or ancestor::style or ancestor::noscript or ancestor::template)] | //text()[normalize-space(.) != '' and not(ancestor::script or ancestor::style or ancestor::noscript or ancestor::template)]"
 const SAFE_ATTRIBUTES = new Set(['id', 'class', 'role', 'aria-label', 'aria-labelledby', 'aria-describedby', 'name', 'type', 'placeholder', 'title', 'alt'])
 const SAFE_COMPUTED_STYLES = new Set(['display', 'visibility', 'position', 'color', 'background-color', 'font-family', 'font-size', 'font-weight', 'line-height', 'width', 'height', 'overflow', 'opacity'])
 const ENABLE_METHODS = ['Accessibility.enable', 'DOM.enable', 'CSS.enable', 'Page.enable', 'Runtime.enable', 'Network.enable'] as const
@@ -188,15 +192,23 @@ export class BrowserAutomation {
     // caller can apply limits. Search DOM node ids in small pages, then ask for
     // one node's partial AX projection at a time. No response is accumulated
     // into the snapshot until it fits the hard input and output budgets.
-    const search = await this.transport.send('DOM.performSearch', { query: '//*', includeUserAgentShadowDOM: false }); abort(signal)
+    const snapshotId = randomBytes(12).toString('base64url'), entries = new Map<string, SnapshotEntry>(), nodes: AccessibilityNodeResult[] = []
+    const depthByNodeId = new Map<number, number>(), seenAXNodes = new Set<string>()
+    const safeUrl = sanitizeBrowserUrl(this.currentUrl()), inputLimit = Math.min(512 * 1024, Math.max(16 * 1024, limits.maxBytes * 2))
+    const document = await this.transport.send('DOM.getDocument', { depth: 0, pierce: false }); abort(signal)
+    let inputBytes = Buffer.byteLength(JSON.stringify(document))
+    if (inputBytes > inputLimit) {
+      this.snapshotCache = { lease: { ...lease }, snapshotId, entries, nodes }
+      return { snapshotId, url: safeUrl, nodes, truncated: true }
+    }
+    const search = await this.transport.send('DOM.performSearch', { query: SNAPSHOT_SEARCH_XPATH, includeUserAgentShadowDOM: false }); abort(signal)
     const searchId = text(search['searchId'], 256), resultCount = typeof search['resultCount'] === 'number' && Number.isSafeInteger(search['resultCount']) ? Math.max(0, search['resultCount']) : 0
     if (!searchId) throw new Error('UNSUPPORTED_PAGE')
-    const snapshotId = randomBytes(12).toString('base64url'), entries = new Map<string, SnapshotEntry>(), nodes: AccessibilityNodeResult[] = []
-    const depthByNodeId = new Map<number, number>()
-    let used = 512 + Buffer.byteLength(sanitizeBrowserUrl(this.currentUrl())), inputBytes = Buffer.byteLength(JSON.stringify(search)), scanned = 0, truncated = false
-    const inputLimit = Math.min(512 * 1024, Math.max(16 * 1024, limits.maxBytes * 2))
+    let used = 512 + Buffer.byteLength(safeUrl), scanned = 0, truncated = false
+    inputBytes += Buffer.byteLength(JSON.stringify(search))
     try {
-      outer: for (let start = 0; start < resultCount && scanned < limits.maxNodes; start += 32) {
+      if (inputBytes > inputLimit) truncated = true
+      outer: for (let start = 0; !truncated && start < resultCount && scanned < limits.maxNodes; start += 32) {
         abort(signal)
         const page = await this.transport.send('DOM.getSearchResults', { searchId, fromIndex: start, toIndex: Math.min(resultCount, start + 32) }); abort(signal)
         inputBytes += Buffer.byteLength(JSON.stringify(page))
@@ -219,19 +231,23 @@ export class BrowserAutomation {
           const candidates = Array.isArray(partial['nodes']) ? partial['nodes'] as AXNode[] : []
           const node = candidates.find((candidate) => !candidate.ignored)
           if (!node) continue
+          const backendDOMNodeId = typeof node.backendDOMNodeId === 'number' ? node.backendDOMNodeId : (typeof domNode?.['backendNodeId'] === 'number' ? domNode['backendNodeId'] : undefined)
+          const axNodeId = typeof node.nodeId === 'string' && node.nodeId ? createHash('sha256').update(node.nodeId).digest('base64url') : ''
+          const identity = axNodeId ? `ax:${axNodeId}` : (backendDOMNodeId === undefined ? '' : `dom:${backendDOMNodeId}`)
+          if (identity && seenAXNodes.has(identity)) continue
           const role = text(node.role?.value, 256), name = redactBrowserText(text(node.name?.value, 4096)), ref = `n${nodes.length + 1}`
           const disabled = property(node, 'disabled'), focused = property(node, 'focused')
           const publicNode: AccessibilityNodeResult = { ref, depth, role, name, ...(disabled === undefined ? {} : { disabled }), ...(focused === undefined ? {} : { focused }) }
           const estimated = Buffer.byteLength(JSON.stringify(publicNode)) + 1
           if (nodes.length >= limits.maxNodes || used + estimated > limits.maxBytes) { truncated = true; break outer }
-          const backendDOMNodeId = typeof node.backendDOMNodeId === 'number' ? node.backendDOMNodeId : (typeof domNode?.['backendNodeId'] === 'number' ? domNode['backendNodeId'] : undefined)
+          if (identity) seenAXNodes.add(identity)
           entries.set(ref, { ...publicNode, ...(backendDOMNodeId === undefined ? {} : { backendDOMNodeId }) }); nodes.push(publicNode); used += estimated
         }
       }
       if (scanned < resultCount) truncated = true
     } finally { await this.transport.send('DOM.discardSearchResults', { searchId }).catch(() => {}) }
     this.snapshotCache = { lease: { ...lease }, snapshotId, entries, nodes }
-    return { snapshotId, url: sanitizeBrowserUrl(this.currentUrl()), nodes, truncated }
+    return { snapshotId, url: safeUrl, nodes, truncated }
   }
   private resolve(lease: BrowserAutomationLease, target: BrowserElementRef): SnapshotEntry {
     const cache = this.snapshotCache

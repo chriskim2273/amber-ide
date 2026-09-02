@@ -52,13 +52,62 @@ describe('browser automation', () => {
     expect(JSON.stringify(snapshot)).not.toContain('hunter2')
   })
 
+  it('includes ordinary StaticText for snapshot and text wait without script, style, whitespace, hidden, or duplicate output', async () => {
+    class TextPageDebugger extends FakeDebugger {
+      query = ''
+      override async send(method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>> {
+        this.calls.push(method)
+        if (method === 'DOM.getDocument') return { root: { nodeId: 200, backendNodeId: 200, nodeName: '#document' } }
+        if (method === 'DOM.performSearch') {
+          this.query = String(params?.['query'] ?? '')
+          return { searchId: 'text-page', resultCount: this.query.includes('//text()') ? 6 : 3 }
+        }
+        if (method === 'DOM.getSearchResults') return { nodeIds: [201, 202, 203, 204, 205, 206].slice(params?.['fromIndex'] as number, params?.['toIndex'] as number) }
+        if (method === 'DOM.describeNode') {
+          const nodeId = params?.['nodeId'] as number
+          const nodes: Record<number, Record<string, unknown>> = {
+            201: { nodeName: 'HTML', backendNodeId: 201 },
+            202: { nodeName: 'BODY', parentId: 201, backendNodeId: 202 },
+            203: { nodeName: 'P', parentId: 202, backendNodeId: 203 },
+            204: { nodeName: '#text', parentId: 203, backendNodeId: 204, nodeValue: 'Ready' },
+            205: { nodeName: '#text', parentId: 202, backendNodeId: 205, nodeValue: 'Hidden secret' },
+            206: { nodeName: '#text', parentId: 203, backendNodeId: 204, nodeValue: 'Ready' },
+          }
+          return { node: nodes[nodeId] }
+        }
+        if (method === 'Accessibility.getPartialAXTree') {
+          const nodeId = params?.['nodeId'] as number
+          if (nodeId === 201) return { nodes: [{ nodeId: 'ax-root', role: { value: 'RootWebArea' }, name: { value: 'Fixture' }, backendDOMNodeId: 201 }] }
+          if (nodeId === 202) return { nodes: [{ nodeId: 'ax-body', ignored: true }] }
+          if (nodeId === 203) return { nodes: [{ nodeId: 'ax-p', role: { value: 'paragraph' }, name: { value: '' }, backendDOMNodeId: 203 }] }
+          if (nodeId === 205) return { nodes: [{ nodeId: 'ax-hidden', ignored: true }] }
+          return { nodes: [{ nodeId: 'ax-ready', role: { value: 'StaticText' }, name: { value: 'Ready' }, backendDOMNodeId: 204 }] }
+        }
+        if (method === 'DOM.discardSearchResults') return {}
+        return super.send(method, params)
+      }
+    }
+    const transport = new TextPageDebugger()
+    const automation = new BrowserAutomation(transport, () => 'https://example.test/text', () => false)
+    const snapshot = await automation.snapshot(lease, { maxDepth: 20, maxNodes: 20, maxBytes: 256 * 1024 }, new AbortController().signal)
+    expect(snapshot.nodes.filter((node) => node.role === 'StaticText')).toEqual([expect.objectContaining({ name: 'Ready', depth: 3 })])
+    expect(snapshot.nodes).not.toEqual(expect.arrayContaining([expect.objectContaining({ name: 'Hidden secret' })]))
+    expect(transport.calls.indexOf('DOM.getDocument')).toBeGreaterThanOrEqual(0)
+    expect(transport.calls.indexOf('DOM.getDocument')).toBeLessThan(transport.calls.indexOf('DOM.performSearch'))
+    expect(transport.query).toContain('//text()')
+    expect(transport.query).toContain('normalize-space(.)')
+    expect(transport.query).toContain('ancestor::script')
+    expect(transport.query).toContain('ancestor::style')
+    await expect(automation.wait(lease, { kind: 'text', value: 'Ready' }, 500, new AbortController().signal)).resolves.toMatchObject({ matched: true })
+  })
+
   it('never materializes a hostile full AX tree and stops incremental traversal at hard budgets', async () => {
     class HostileWideDebugger extends FakeDebugger {
       override async send(method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>> {
         if (method === 'DOM.performSearch') { this.calls.push(method); return { searchId: 'wide', resultCount: 1_000_000 } }
         if (method === 'DOM.getSearchResults') { this.calls.push(method); return { nodeIds: Array.from({ length: 32 }, (_, index) => index + 1) } }
-        if (method === 'DOM.describeNode') { this.calls.push(method); return { node: { nodeName: 'DIV', backendNodeId: params?.['nodeId'] } } }
-        if (method === 'Accessibility.getPartialAXTree') { this.calls.push(method); return { nodes: [{ role: { value: 'button' }, name: { value: 'wide' }, backendDOMNodeId: params?.['nodeId'] }] } }
+        if (method === 'DOM.describeNode') { this.calls.push(method); return { node: { nodeName: '#text', backendNodeId: params?.['nodeId'] } } }
+        if (method === 'Accessibility.getPartialAXTree') { this.calls.push(method); return { nodes: [{ nodeId: `ax-${String(params?.['nodeId'])}`, role: { value: 'StaticText' }, name: { value: 'wide text' }, backendDOMNodeId: params?.['nodeId'] }] } }
         return super.send(method, params)
       }
     }
@@ -80,6 +129,36 @@ describe('browser automation', () => {
     const textSnapshot = await textAutomation.snapshot(lease, { maxDepth: 20, maxNodes: 2, maxBytes: 4096 }, new AbortController().signal)
     expect(textSnapshot.nodes).toEqual([])
     expect(textSnapshot.truncated).toBe(true)
+
+    class HostileDocumentDebugger extends HostileWideDebugger {
+      override async send(method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>> {
+        if (method === 'DOM.getDocument') { this.calls.push(method); return { root: { nodeName: '#document', attackerData: 'x'.repeat(600_000) } } }
+        return super.send(method, params)
+      }
+    }
+    const documentTransport = new HostileDocumentDebugger()
+    const documentSnapshot = await new BrowserAutomation(documentTransport, () => 'about:blank', () => false).snapshot(lease, { maxDepth: 20, maxNodes: 2, maxBytes: 4096 }, new AbortController().signal)
+    expect(documentSnapshot.nodes).toEqual([])
+    expect(documentSnapshot.truncated).toBe(true)
+    expect(documentTransport.calls).not.toContain('DOM.performSearch')
+
+    class HostileDeepTextDebugger extends HostileWideDebugger {
+      override async send(method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>> {
+        if (method === 'DOM.performSearch') { this.calls.push(method); return { searchId: 'deep-text', resultCount: 1_000_000 } }
+        if (method === 'DOM.describeNode') {
+          this.calls.push(method)
+          const nodeId = params?.['nodeId'] as number
+          return { node: { nodeName: '#text', ...(nodeId === 1 ? {} : { parentId: nodeId - 1 }), backendNodeId: nodeId } }
+        }
+        return super.send(method, params)
+      }
+    }
+    const deepTransport = new HostileDeepTextDebugger()
+    const deepSnapshot = await new BrowserAutomation(deepTransport, () => 'about:blank', () => false).snapshot(lease, { maxDepth: 2, maxNodes: 5, maxBytes: 4096 }, new AbortController().signal)
+    expect(deepSnapshot.nodes).toHaveLength(3)
+    expect(deepSnapshot.truncated).toBe(true)
+    expect(deepTransport.calls.filter((method) => method === 'DOM.describeNode')).toHaveLength(5)
+    expect(deepTransport.calls.filter((method) => method === 'Accessibility.getPartialAXTree')).toHaveLength(3)
   })
 
   it('fails closed on references from another snapshot, generation, incarnation, or browser', async () => {
