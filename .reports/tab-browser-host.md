@@ -5,7 +5,7 @@ Branch: `feat/tab-browser-host`
 
 ## Result
 
-This branch implements and Linux-validates the durable main-owned tab-browser foundation, rail UI, persistence, capacity policy, and authenticated Pi observation, navigation, and approval-gated semantic interaction substrate. It does **not** satisfy the full approved product acceptance contract yet. Independent Phase-B review, deployed-reader upgrade proof, packaged-artifact gates, and macOS manual gates remain open. Those omissions must block merge of the complete feature.
+This branch implements and Linux-validates the durable main-owned tab-browser foundation, rail UI, persistence, capacity policy, and authenticated Pi observation, navigation, and approval-gated semantic interaction substrate. It does **not** satisfy the full approved product acceptance contract yet. Independent Phase-B re-review, deployed-reader upgrade proof, packaged-artifact gates, and macOS manual gates remain open. Those omissions must block merge of the complete feature.
 
 ## Implemented
 
@@ -153,6 +153,18 @@ The first independent Phase-B review failed with valid P1/P2 findings. Commits `
 Post-remediation `/tmp` gates: 850 app tests passed with one intentional real-daemon skip; focused review tests passed 87/87; strict typecheck, Electron and hosted-web production builds, 779 Rust tests with one intentional delegated-cgroup ignore, workspace all-target warnings-as-errors clippy, generated Pi extension install/compile/production-loader verification, and diff checks passed. No production daemon was contacted.
 
 Phase B now stops for independent re-review. `P1-pi-tools-and-approvals` remains partial and `mergeReady` remains false until that review passes and the external package/platform gates are complete.
+
+## Second Phase-B re-review remediation (2026-09-02; re-review pending)
+
+The next independent review found three additional integration failures. This remediation closes them without weakening the merge gate:
+
+- Browser surface authority is now acknowledged rather than inferred from a lagging sidecar write. Every renderer context update carries the current collapsed state; main resets `activeBrowserExpanded` on every context/show/hide transition and sets it true only after an associated `show` succeeds. The approval boundary additionally requires the Host runtime to report that exact page visible. Collapse, tab switch, and direct hide synchronously invalidate approvals/dialogs and abort owned Pi work, while reveal still fails the triggering request and requires a retry after the exact workspace/tab/browser has mounted and acknowledged `show`.
+- Pending dialogs now bind browser ID, page incarnation, generation, request owner, owner AbortSignal, and expiry into their lifecycle and digest. Resolution rechecks exact identity plus surface visibility. Cancellation/disconnect, Stop Pi, navigation/stop intent, generation or incarnation advance, collapse/tab switch, freeze/crash/close, and controller revocation all dismiss pending dialogs. Interaction execution holds its broker request through the dialog decision/`Page.handleJavaScriptDialog`, and broker navigation now carries request identity while awaiting beforeunload, so disconnect remains a real cancellation owner rather than stale metadata.
+- The resident main-process service retains the latest bounded, secret-safe Pi action per browser (maximum 256 browser entries; bounded controller/action/error fields; request IDs and arguments omitted). `status` replays that authoritative summary, so background actions and renderer remounts no longer lose the rail's last-action state. Destroy removes the entry.
+
+Race coverage now includes host-hidden approval refusal, collapse while an approval is pending, dialog owner cancellation, stale-generation dialog resolution, and bounded last-action replay after remount. Post-remediation `/tmp` gates passed: 857 app tests with one intentional real-daemon skip; focused browser review tests 94/94; strict typecheck; Electron and hosted-web production builds; 779 Rust tests with one intentional delegated-cgroup ignore; warnings-as-errors workspace clippy; exact generated Pi extension install/compile/production-loader/runtime verification; and diff checks. No production daemon was contacted.
+
+The required independent re-review has not yet accepted this wave. `P1-pi-tools-and-approvals` therefore remains partial and `mergeReady` remains false.
 
 ## Open blocking work
 

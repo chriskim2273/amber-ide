@@ -1340,7 +1340,7 @@ async function main(): Promise<void> {
         return valid
       }
       return dispatchAttachedBrokerAction(request.action, id, signal, stillAuthorized,
-        (command, actionSignal, validate) => tabBrowser.command(command.type === 'automation' ? { ...command, broker: { requestId: request.requestId, controller: request.amberSession } } : command.type === 'navigate' || command.type === 'stop' ? { ...command, broker: { controller: request.amberSession } } : command, actionSignal, validate))
+        (command, actionSignal, validate) => tabBrowser.command(command.type === 'automation' ? { ...command, broker: { requestId: request.requestId, controller: request.amberSession } } : command.type === 'navigate' || command.type === 'stop' ? { ...command, broker: { requestId: request.requestId, controller: request.amberSession } } : command, actionSignal, validate))
     }
     const runtime = process.env['XDG_RUNTIME_DIR'] ?? tmpdir()
     const socketPath = process.env['AMBER_BROWSER_HOST_SOCKET'] ?? join(runtime, 'amber-ide', 'browser-host.sock')
@@ -1456,14 +1456,15 @@ async function main(): Promise<void> {
     const sender = ctxFor(e)
     if (sender?.target.kind !== 'local' || !raw || typeof raw !== 'object') return { ok: false, error: 'BROWSER_HOST_UNAVAILABLE' }
     const request = raw as Record<string, unknown>
-    if (Object.keys(request).length !== 2 || !Object.hasOwn(request, 'workspace') || !Object.hasOwn(request, 'tab')) return { ok: false, error: 'INVALID_REQUEST' }
+    if (Object.keys(request).length !== 3 || !Object.hasOwn(request, 'workspace') || !Object.hasOwn(request, 'tab') || typeof request['collapsed'] !== 'boolean') return { ok: false, error: 'INVALID_REQUEST' }
     const loaded = await loadLayoutFile(layoutPath())
     if (!loaded.text) return { ok: false, error: 'NO_ACTIVE_TAB' }
     try {
       const context = resolveBrowserContext(parseLayout(loaded.text), request['workspace'], request['tab'])
-      if (tabBrowser && sender.activeBrowserId && sender.activeBrowserId !== context.browserId) await tabBrowser.command({ type: 'hide', id: sender.activeBrowserId }).catch(() => {})
+      if (tabBrowser && sender.activeBrowserId && sender.activeBrowserId !== context.browserId) { tabBrowser.surfaceHidden(sender.activeBrowserId); await tabBrowser.command({ type: 'hide', id: sender.activeBrowserId }).catch(() => {}) }
       sender.activeWorkspace = context.workspace; sender.activeTab = context.tab; sender.activeBrowserId = context.browserId
-      sender.activeBrowserExpanded = !!context.browserId && !parseLayout(loaded.text).workspaces[String(context.workspace)]?.tabs[String(context.tab)]?.browser?.collapsed
+      sender.activeBrowserExpanded = false
+      if (context.browserId && request['collapsed']) tabBrowser?.surfaceHidden(context.browserId)
       sender.browserContextGeneration += 1
       return { ok: true, ...context }
     } catch (error) { return { ok: false, error: error instanceof Error ? error.message : 'INVALID_REQUEST' } }
@@ -1552,12 +1553,15 @@ async function main(): Promise<void> {
       if (parsed.type === 'stopPi' && activeBrowser?.designatedPi) tabBrowserBroker?.cancelController(activeBrowser.designatedPi)
       const command = bindRendererBrowserCommand(sender.activeBrowserId, parsed)
       const expected = captureBrowserContext(sender)
+      if ((command.type === 'hide' || command.type === 'show') && expected.browserId) { sender.activeBrowserExpanded = false; if (command.type === 'hide') tabBrowser.surfaceHidden(expected.browserId) }
       const stillAssociated = async (): Promise<boolean> => {
         if (!browserContextMatches(sender, expected)) return false
         const latest = await loadLayoutFile(layoutPath())
         return !!latest.text && parseLayout(latest.text).workspaces[String(expected.workspace)]?.tabs[String(expected.tab)]?.browser?.id === expected.browserId
       }
-      return { ok: true, result: await tabBrowser.command(command, undefined, stillAssociated) }
+      const result = await tabBrowser.command(command, undefined, stillAssociated)
+      if (command.type === 'show' && browserContextMatches(sender, expected) && expected.browserId) sender.activeBrowserExpanded = true
+      return { ok: true, result }
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : 'INTERNAL_ERROR' }
     }

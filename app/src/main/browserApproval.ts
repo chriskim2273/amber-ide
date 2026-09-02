@@ -85,12 +85,15 @@ export class BrowserApprovalCoordinator {
       const timer = setTimeout(() => this.finish(approvalId, 'expired', new Error('APPROVAL_DENIED')), this.ttlMs); timer.unref()
       this.pending.set(approvalId, { proposal, digest, expiresAt, resolve, reject, timer, signal, abort })
       signal.addEventListener('abort', abort, { once: true })
+      if (signal.aborted || !this.visible(proposal.browserId)) { this.finish(approvalId, 'revoked', new Error(signal.aborted ? 'ACTION_CANCELLED' : 'APPROVAL_DENIED')); return }
       this.onEvent({ type: 'approval-request', browserId: proposal.browserId, approvalId, digest, controller: proposal.controller, origin: proposal.origin, category: proposal.category, targetLabel: proposal.targetLabel, argumentSummary: proposal.argumentSummary, expiresAt, canGrantOrigin: proposal.canGrantOrigin })
     })
   }
   resolve(browserId: string, approvalId: string, digest: string, decision: ApprovalDecision): boolean {
     const pending = this.pending.get(approvalId)
-    if (!pending || pending.proposal.browserId !== browserId || pending.digest !== digest || this.now() > pending.expiresAt || !this.visible(browserId)) return false
+    if (!pending || pending.proposal.browserId !== browserId || pending.digest !== digest) return false
+    if (this.now() > pending.expiresAt) { this.finish(approvalId, 'expired', new Error('APPROVAL_DENIED')); return false }
+    if (pending.signal.aborted || !this.visible(browserId)) { this.finish(approvalId, 'revoked', new Error('APPROVAL_DENIED')); return false }
     if (decision === 'allow-origin' && !pending.proposal.canGrantOrigin) return false
     if (decision === 'allow-origin') this.grants.add(this.grantKey(pending.proposal))
     this.finish(approvalId, decision, decision === 'reject' ? new Error('APPROVAL_DENIED') : undefined)
@@ -116,32 +119,47 @@ export interface BrowserDialogEvent {
   type: 'dialog-request' | 'dialog-resolved'; browserId: string; dialogId: string; digest: string; dialogType?: string; message?: string
   generation?: number; expiresAt?: number; decision?: 'accept' | 'reject' | 'expired' | 'revoked'; headless?: boolean
 }
-interface PendingDialog { browserId: string; digest: string; expiresAt: number; resolve: (decision: BrowserDialogDecision) => void; timer: NodeJS.Timeout }
+export interface BrowserDialogContext { browserId: string; pageIncarnation: string; generation: number; owner: string; signal: AbortSignal }
+interface PendingDialog extends BrowserDialogContext { digest: string; expiresAt: number; resolve: (decision: BrowserDialogDecision) => void; timer: NodeJS.Timeout; abort: () => void }
 export class BrowserDialogCoordinator {
   private readonly pending = new Map<string, PendingDialog>()
   constructor(private readonly now = Date.now, private readonly visible: (browserId: string) => boolean = () => false,
+    private readonly currentIdentity: (browserId: string) => { pageIncarnation: string; generation: number } | null = () => null,
     private readonly onEvent: (event: BrowserDialogEvent) => void = () => {}, private readonly ttlMs = 60_000, private readonly reveal: (browserId: string) => void = () => {}) {}
-  request(browserId: string, generation: number, dialogType: string, message: string): Promise<BrowserDialogDecision> {
+  request(context: BrowserDialogContext, dialogType: string, message: string): Promise<BrowserDialogDecision> {
+    const { browserId, pageIncarnation, generation, owner, signal } = context
     const dialogId = randomUUID(), expiresAt = this.now() + this.ttlMs
     const boundedType = ['alert', 'confirm', 'prompt', 'beforeunload'].includes(dialogType) ? dialogType : 'confirm'
     const boundedMessage = message.slice(0, 1024)
-    const digest = createHash('sha256').update(JSON.stringify({ browserId, generation, dialogType: boundedType, messageDigest: createHash('sha256').update(boundedMessage).digest('hex'), expiresAt })).digest('hex')
+    const digest = createHash('sha256').update(JSON.stringify({ browserId, pageIncarnation, generation, owner, dialogType: boundedType, messageDigest: createHash('sha256').update(boundedMessage).digest('hex'), expiresAt })).digest('hex')
     const event = { type: 'dialog-request' as const, browserId, dialogId, digest, dialogType: boundedType, message: boundedMessage, generation, expiresAt }
+    const identity = this.currentIdentity(browserId)
+    if (signal.aborted || !identity || identity.pageIncarnation !== pageIncarnation || identity.generation !== generation) return Promise.resolve({ accept: false })
     if (!this.visible(browserId)) { this.onEvent({ ...event, headless: true }); this.reveal(browserId); return Promise.resolve({ accept: false }) }
     if (this.pending.size >= 16) return Promise.resolve({ accept: false })
     return new Promise((resolve) => {
+      const abort = (): void => this.finish(dialogId, 'revoked', { accept: false })
       const timer = setTimeout(() => this.finish(dialogId, 'expired', { accept: false }), this.ttlMs); timer.unref()
-      this.pending.set(dialogId, { browserId, digest, expiresAt, resolve, timer }); this.onEvent(event)
+      this.pending.set(dialogId, { ...context, digest, expiresAt, resolve, timer, abort }); signal.addEventListener('abort', abort, { once: true })
+      const live = this.currentIdentity(browserId)
+      if (signal.aborted || !this.visible(browserId) || !live || live.pageIncarnation !== pageIncarnation || live.generation !== generation) { this.finish(dialogId, 'revoked', { accept: false }); return }
+      this.onEvent(event)
     })
   }
   resolve(browserId: string, dialogId: string, digest: string, accept: boolean, promptText?: string): boolean {
     const pending = this.pending.get(dialogId)
-    if (!pending || pending.browserId !== browserId || pending.digest !== digest || this.now() > pending.expiresAt || !this.visible(browserId)) return false
+    if (!pending || pending.browserId !== browserId || pending.digest !== digest) return false
+    if (this.now() > pending.expiresAt) { this.finish(dialogId, 'expired', { accept: false }); return false }
+    const identity = this.currentIdentity(browserId)
+    if (!this.visible(browserId) || pending.signal.aborted || !identity || identity.pageIncarnation !== pending.pageIncarnation || identity.generation !== pending.generation) {
+      this.finish(dialogId, 'revoked', { accept: false }); return false
+    }
     this.finish(dialogId, accept ? 'accept' : 'reject', { accept, ...(accept && promptText !== undefined ? { promptText: promptText.slice(0, 4096) } : {}) }); return true
   }
+  invalidateIdentity(browserId: string, pageIncarnation: string, generation: number): void { for (const [id, pending] of this.pending) if (pending.browserId === browserId && (pending.pageIncarnation !== pageIncarnation || pending.generation !== generation)) this.finish(id, 'revoked', { accept: false }) }
   clearBrowser(browserId: string): void { for (const [id, pending] of this.pending) if (pending.browserId === browserId) this.finish(id, 'revoked', { accept: false }) }
   private finish(dialogId: string, decision: 'accept' | 'reject' | 'expired' | 'revoked', value: BrowserDialogDecision): void {
     const pending = this.pending.get(dialogId); if (!pending) return
-    this.pending.delete(dialogId); clearTimeout(pending.timer); this.onEvent({ type: 'dialog-resolved', browserId: pending.browserId, dialogId, digest: pending.digest, decision }); pending.resolve(value)
+    this.pending.delete(dialogId); clearTimeout(pending.timer); pending.signal.removeEventListener('abort', pending.abort); this.onEvent({ type: 'dialog-resolved', browserId: pending.browserId, dialogId, digest: pending.digest, decision }); pending.resolve(value)
   }
 }

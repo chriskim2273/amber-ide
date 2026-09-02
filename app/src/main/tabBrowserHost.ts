@@ -28,7 +28,7 @@ export interface TabBrowserPageFactory {
   create(id: BrowserId, onUserInput: () => void, onPageEvent: (event: TabBrowserPageEvent) => void): TabBrowserPage
 }
 export interface BrowserRuntimeStatus extends BrowserRecord { pageIncarnation: string; generation: number; loading: boolean; capacityWaiting?: boolean }
-export type TabBrowserHostEvent = { type: 'capacity-wait'; id: BrowserId; waiting: boolean } | { type: 'runtime'; id: BrowserId; status: BrowserRuntimeStatus } | { type: 'dialog-request'; id: BrowserId; dialogType: string; message: string; generation: number; respond: (decision: { accept: boolean; promptText?: string }) => void }
+export type TabBrowserHostEvent = { type: 'capacity-wait'; id: BrowserId; waiting: boolean } | { type: 'runtime'; id: BrowserId; status: BrowserRuntimeStatus } | { type: 'dialog-request'; id: BrowserId; pageIncarnation: string; dialogType: string; message: string; generation: number; respond: (decision: { accept: boolean; promptText?: string }) => void }
 interface Runtime { page: TabBrowserPage; incarnation: string; generation: number; loading: boolean; automationNavigationPending: boolean; visible: boolean }
 export interface InteractionApprovalRequest { operation: BrowserInteraction; target: InteractionTargetMetadata; secondaryTarget?: InteractionTargetMetadata; classification: InteractionClassification; origin: string; pageIncarnation: string; generation: number }
 
@@ -91,7 +91,7 @@ export class TabBrowserHost {
       record.stateRevision += 1
     } else if (event.type === 'dialog') {
       runtime.generation += 1; runtime.page.automation?.invalidate()
-      this.onEvent({ type: 'dialog-request', id, dialogType: event.dialogType, message: event.message, generation: runtime.generation, respond: event.respond })
+      this.onEvent({ type: 'dialog-request', id, pageIncarnation: runtime.incarnation, dialogType: event.dialogType, message: event.message, generation: runtime.generation, respond: event.respond })
     } else {
       runtime.automationNavigationPending = false
       runtime.loading = false
@@ -157,6 +157,7 @@ export class TabBrowserHost {
   }
 
   hide(id: string): void { const record = this.record(id); const runtime = this.runtimes.get(record.id); runtime?.page.hide(); if (runtime) runtime.visible = false; this.capacity.protect(record.id, false) }
+  isVisible(id: string): boolean { return isOpaqueBrowserId(id) && this.runtimes.get(id)?.visible === true }
 
   setBounds(id: string, bounds: { x: number; y: number; width: number; height: number }): void {
     if (![bounds.x, bounds.y, bounds.width, bounds.height].every(Number.isFinite) || bounds.width < 1 || bounds.height < 1) throw new Error('INVALID_BOUNDS')

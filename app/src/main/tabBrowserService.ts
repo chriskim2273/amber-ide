@@ -16,9 +16,9 @@ export type TabBrowserCommand =
   | { type: 'show'; id: string; bounds: Rectangle }
   | { type: 'hide'; id: string }
   | { type: 'bounds'; id: string; bounds: Rectangle }
-  | { type: 'navigate'; id: string; url: string; pageIncarnation: string; expectedGeneration: number; broker?: { controller: string } }
+  | { type: 'navigate'; id: string; url: string; pageIncarnation: string; expectedGeneration: number; broker?: { requestId: string; controller: string } }
   | { type: 'status'; id: string }
-  | { type: 'stop'; id: string; pageIncarnation?: string; expectedGeneration?: number; broker?: { controller: string } }
+  | { type: 'stop'; id: string; pageIncarnation?: string; expectedGeneration?: number; broker?: { requestId: string; controller: string } }
   | { type: 'automation'; id: string; action: BrowserToolAction; broker?: { requestId: string; controller: string } }
   | { type: 'resolveApproval'; id: string; approvalId: string; digest: string; decision: ApprovalDecision }
   | { type: 'stopPi'; id: string }
@@ -78,11 +78,12 @@ export class TabBrowserService {
   private persistedState: BrowserStateFile
   private suppressPersist = false
   private currentWindow: BrowserWindow | null
-  private readonly activePi = new Map<string, Set<AbortController>>()
+  private readonly activePi = new Map<string, Set<{ controller: AbortController; owner: string }>>()
   private readonly revokedPi = new Set<string>()
   private readonly approvals: BrowserApprovalCoordinator
   private readonly dialogs: BrowserDialogCoordinator
   private readonly observedGeneration = new Map<string, number>()
+  private readonly latestPiActions = new Map<string, { type: 'pi-action'; browserId: string; controller: string; action: string; phase: 'started' | 'completed' | 'failed'; error?: string; at: number }>()
   private approvalSurfaceVisible: (browserId: string) => boolean = () => false
   private approvalSurfaceReveal: (browserId: string) => void = () => {}
 
@@ -94,8 +95,8 @@ export class TabBrowserService {
     window?: BrowserWindow,
   ) {
     this.persistedState = structuredClone(initialState); this.currentWindow = window ?? null
-    this.approvals = new BrowserApprovalCoordinator(Date.now, (id) => this.approvalSurfaceVisible(id), (event) => this.eventSink(event), 60_000, (id) => this.approvalSurfaceReveal(id))
-    this.dialogs = new BrowserDialogCoordinator(Date.now, (id) => this.approvalSurfaceVisible(id), (event) => this.eventSink(event), 60_000, (id) => this.approvalSurfaceReveal(id))
+    this.approvals = new BrowserApprovalCoordinator(Date.now, (id) => this.host.isVisible(id) && this.approvalSurfaceVisible(id), (event) => this.eventSink(event), 60_000, (id) => this.approvalSurfaceReveal(id))
+    this.dialogs = new BrowserDialogCoordinator(Date.now, (id) => this.host.isVisible(id) && this.approvalSurfaceVisible(id), (id) => { try { const status = this.host.status(id); return { pageIncarnation: status.pageIncarnation, generation: status.generation } } catch { return null } }, (event) => this.eventSink(event), 60_000, (id) => this.approvalSurfaceReveal(id))
   }
 
   static async create(root: string, window: BrowserWindow, store = new TabBrowserStateStore(root)): Promise<TabBrowserService> {
@@ -115,17 +116,24 @@ export class TabBrowserService {
 
   setWindow(window: BrowserWindow): void { this.currentWindow = window; this.pages.setWindow(window) }
   setApprovalSurface(visible: (browserId: string) => boolean, reveal: (browserId: string) => void): void { this.approvalSurfaceVisible = visible; this.approvalSurfaceReveal = reveal }
+  surfaceHidden(id: string): void {
+    this.approvals.invalidateBrowser(id); this.dialogs.clearBrowser(id)
+    for (const active of this.activePi.get(id) ?? []) active.controller.abort()
+  }
   setEventSink(sink: (event: unknown) => void): void { this.eventSink = sink }
   private handleHostEvent(event: unknown): void {
-    const runtime = event as { type?: unknown; id?: unknown; status?: { generation?: unknown; lifecycle?: unknown }; dialogType?: unknown; message?: unknown; generation?: unknown; respond?: (decision: { accept: boolean; promptText?: string }) => void }
-    if (runtime.type === 'dialog-request' && typeof runtime.id === 'string' && typeof runtime.dialogType === 'string' && typeof runtime.message === 'string' && typeof runtime.generation === 'number' && runtime.respond) {
+    const runtime = event as { type?: unknown; id?: unknown; status?: { pageIncarnation?: unknown; generation?: unknown; lifecycle?: unknown }; pageIncarnation?: unknown; dialogType?: unknown; message?: unknown; generation?: unknown; respond?: (decision: { accept: boolean; promptText?: string }) => void }
+    if (runtime.type === 'dialog-request' && typeof runtime.id === 'string' && typeof runtime.pageIncarnation === 'string' && typeof runtime.dialogType === 'string' && typeof runtime.message === 'string' && typeof runtime.generation === 'number' && runtime.respond) {
+      const active = [...(this.activePi.get(runtime.id) ?? [])].at(-1), fallback = new AbortController()
+      this.observedGeneration.set(runtime.id, runtime.generation)
       try { this.host.protectApproval(runtime.id, true) } catch { runtime.respond({ accept: false }); return }
-      void this.dialogs.request(runtime.id, runtime.generation, runtime.dialogType, runtime.message).then(runtime.respond, () => runtime.respond!({ accept: false })).finally(() => { try { this.host.protectApproval(runtime.id as string, false) } catch { /* page closed */ } })
+      void this.dialogs.request({ browserId: runtime.id, pageIncarnation: runtime.pageIncarnation, generation: runtime.generation, owner: active?.owner ?? 'user', signal: active?.controller.signal ?? fallback.signal }, runtime.dialogType, runtime.message).then(runtime.respond, () => runtime.respond!({ accept: false })).finally(() => { try { this.host.protectApproval(runtime.id as string, false) } catch { /* page closed */ } })
       return
     }
     if (runtime.type === 'runtime' && typeof runtime.id === 'string' && typeof runtime.status?.generation === 'number') {
       const previous = this.observedGeneration.get(runtime.id); this.observedGeneration.set(runtime.id, runtime.status.generation)
       if (previous !== undefined && previous !== runtime.status.generation) this.approvals.invalidateBrowser(runtime.id)
+      if (typeof runtime.status.pageIncarnation === 'string') this.dialogs.invalidateIdentity(runtime.id, runtime.status.pageIncarnation, runtime.status.generation)
       if (runtime.status.lifecycle === 'frozen') { this.approvals.clearBrowser(runtime.id); this.dialogs.clearBrowser(runtime.id) }
     }
     this.eventSink(event)
@@ -171,6 +179,7 @@ export class TabBrowserService {
     // Opens must reach the host concurrently so the global capacity FIFO sees
     // every contender. Observations and hide also cannot sit behind a wait.
     if (command.type === 'hide' || command.type === 'destroy') this.activationControllers.get(command.id)?.abort()
+    if (command.type === 'navigate' || command.type === 'stop') this.dialogs.clearBrowser(command.id)
     if (command.type === 'open' || command.type === 'status' || command.type === 'hide' || command.type === 'destroy' || command.type === 'resolveApproval' || command.type === 'resolveDialog' || command.type === 'stopPi') return this.runCommand(command, signal, validate)
     if (command.type === 'close' || command.type === 'share' || command.type === 'designate') return Promise.reject(new Error('ASSOCIATION_COMMAND_REQUIRES_MAIN'))
     const key = command.id
@@ -189,7 +198,9 @@ export class TabBrowserService {
 
   private piAction(id: string, controller: string, action: string, phase: 'started' | 'completed' | 'failed', error?: unknown): void {
     const raw = error instanceof Error ? error.message : 'INTERNAL_ERROR'
-    this.eventSink({ type: 'pi-action', browserId: id, controller, action, phase, ...(phase === 'failed' ? { error: /^[A-Z][A-Z0-9_]{1,63}$/.test(raw) ? raw : 'INTERNAL_ERROR' } : {}), at: Date.now() })
+    const event = { type: 'pi-action' as const, browserId: id, controller: controller.slice(0, 256), action: action.slice(0, 64), phase, ...(phase === 'failed' ? { error: /^[A-Z][A-Z0-9_]{1,63}$/.test(raw) ? raw : 'INTERNAL_ERROR' } : {}), at: Date.now() }
+    if (!this.latestPiActions.has(id) && this.latestPiActions.size >= 256) this.latestPiActions.delete(this.latestPiActions.keys().next().value as string)
+    this.latestPiActions.set(id, event); this.eventSink(event)
   }
   private async runCommand(command: TabBrowserCommand, signal?: AbortSignal, validate?: () => boolean | Promise<boolean>): Promise<unknown> {
     if (validate && !(await validate())) throw new Error('STALE_BROWSER_CONTEXT')
@@ -212,14 +223,18 @@ export class TabBrowserService {
         if (status.stateRevision !== before) await this.schedulePersist()
         return status
       }
-      case 'hide': this.host.hide(command.id); return this.host.status(command.id)
+      case 'hide': this.surfaceHidden(command.id); this.host.hide(command.id); return this.host.status(command.id)
       case 'bounds': this.host.setBounds(command.id, command.bounds); return this.host.status(command.id)
       case 'navigate': {
+        const activeOwner = command.broker ? { controller: new AbortController(), owner: `${command.broker.controller}\u0000${command.broker.requestId}` } : null
+        const upstreamAbort = (): void => activeOwner?.controller.abort()
+        if (activeOwner) { signal?.addEventListener('abort', upstreamAbort, { once: true }); if (signal?.aborted) activeOwner.controller.abort(); const set = this.activePi.get(command.id) ?? new Set<{ controller: AbortController; owner: string }>(); set.add(activeOwner); this.activePi.set(command.id, set) }
         if (command.broker) this.piAction(command.id, command.broker.controller, 'navigate', 'started')
-        try { const status = await this.host.navigate(command.id, command.url, command.pageIncarnation, command.expectedGeneration, signal); await this.schedulePersist(); if (command.broker) this.piAction(command.id, command.broker.controller, 'navigate', 'completed'); return status }
+        try { const status = await this.host.navigate(command.id, command.url, command.pageIncarnation, command.expectedGeneration, activeOwner?.controller.signal ?? signal); await this.schedulePersist(); if (command.broker) this.piAction(command.id, command.broker.controller, 'navigate', 'completed'); return status }
         catch (error) { if (command.broker) this.piAction(command.id, command.broker.controller, 'navigate', 'failed', error); throw error }
+        finally { signal?.removeEventListener('abort', upstreamAbort); const set = this.activePi.get(command.id); if (activeOwner) set?.delete(activeOwner); if (set?.size === 0) this.activePi.delete(command.id) }
       }
-      case 'status': return this.host.status(command.id)
+      case 'status': return { ...this.host.status(command.id), ...(this.latestPiActions.get(command.id) ? { lastAction: this.latestPiActions.get(command.id) } : {}) }
       case 'stop': {
         if (command.broker) this.piAction(command.id, command.broker.controller, 'stop', 'started')
         try { const status = this.host.stop(command.id, command.pageIncarnation, command.expectedGeneration); if (command.broker) this.piAction(command.id, command.broker.controller, 'stop', 'completed'); return status }
@@ -228,7 +243,8 @@ export class TabBrowserService {
       case 'automation': {
         const controller = new AbortController(), upstreamAbort = (): void => controller.abort()
         signal?.addEventListener('abort', upstreamAbort, { once: true }); if (signal?.aborted) controller.abort()
-        if (command.broker) { this.revokedPi.delete(command.id); const set = this.activePi.get(command.id) ?? new Set<AbortController>(); set.add(controller); this.activePi.set(command.id, set) }
+        const activeOwner = command.broker ? { controller, owner: `${command.broker.controller}\u0000${command.broker.requestId}` } : null
+        if (command.broker && activeOwner) { this.revokedPi.delete(command.id); const set = this.activePi.get(command.id) ?? new Set<{ controller: AbortController; owner: string }>(); set.add(activeOwner); this.activePi.set(command.id, set) }
         if (command.broker) this.piAction(command.id, command.broker.controller, command.action.type === 'interact' ? command.action.operation.kind : command.action.type, 'started')
         try {
           const result = await this.host.runAutomation(command.id, command.action, controller.signal, command.broker ? async (request, approvalSignal) => {
@@ -252,7 +268,7 @@ export class TabBrowserService {
           throw error
         } finally {
           signal?.removeEventListener('abort', upstreamAbort)
-          const set = this.activePi.get(command.id); set?.delete(controller); if (set?.size === 0) this.activePi.delete(command.id)
+          const set = this.activePi.get(command.id); if (activeOwner) set?.delete(activeOwner); if (set?.size === 0) this.activePi.delete(command.id)
         }
       }
       case 'resolveApproval': {
@@ -264,7 +280,7 @@ export class TabBrowserService {
         return this.host.status(command.id)
       }
       case 'stopPi': this.revokePi(command.id); return this.host.status(command.id)
-      case 'destroy': this.approvals.clearBrowser(command.id); this.dialogs.clearBrowser(command.id); this.host.close(command.id); await this.schedulePersist(); return { closed: true }
+      case 'destroy': this.approvals.clearBrowser(command.id); this.dialogs.clearBrowser(command.id); this.latestPiActions.delete(command.id); this.host.close(command.id); await this.schedulePersist(); return { closed: true }
       case 'close': case 'share': case 'designate': throw new Error('ASSOCIATION_COMMAND_REQUIRES_MAIN')
     }
   }
@@ -273,7 +289,7 @@ export class TabBrowserService {
     if (this.revokedPi.has(id)) return
     this.revokedPi.add(id); this.approvals.clearBrowser(id); this.dialogs.clearBrowser(id)
     try { this.host.revokePi(id) } catch { /* close may already have removed the record */ }
-    for (const controller of this.activePi.get(id) ?? []) controller.abort()
+    for (const active of this.activePi.get(id) ?? []) active.controller.abort()
     this.activePi.delete(id)
   }
 }

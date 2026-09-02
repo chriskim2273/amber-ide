@@ -129,6 +129,7 @@ export class BrowserAutomation {
   private readonly requests = new Map<string, { url: string; method: string; type: string; started: number; status?: number }>()
   private activeRequests = 0
   private lastNetworkActivity = Date.now()
+  private dialogBarrier: Promise<void> | null = null
   private disposed = false
   constructor(
     private readonly transport: BrowserDebuggerTransport,
@@ -165,8 +166,10 @@ export class BrowserAutomation {
     if (method === 'Page.javascriptDialogOpening') {
       const type = text(params['type'], 32), message = redactBrowserText(text(params['message'], 1024)).slice(0, 1024)
       const decision = this.controls.dialog?.({ type, message }) ?? Promise.reject(new Error('DIALOG_UNAVAILABLE'))
-      void decision.then((result) => this.transport.send('Page.handleJavaScriptDialog', { accept: result.accept, ...(result.accept && result.promptText !== undefined ? { promptText: result.promptText.slice(0, 4096) } : {}) }),
-        () => this.transport.send('Page.handleJavaScriptDialog', { accept: false })).catch(() => {})
+      const handling = decision.then((result) => this.transport.send('Page.handleJavaScriptDialog', { accept: result.accept, ...(result.accept && result.promptText !== undefined ? { promptText: result.promptText.slice(0, 4096) } : {}) }),
+        () => this.transport.send('Page.handleJavaScriptDialog', { accept: false })).then(() => {})
+      this.dialogBarrier = handling
+      void handling.catch(() => {}).finally(() => { if (this.dialogBarrier === handling) this.dialogBarrier = null })
       return
     }
     if (method === 'Runtime.consoleAPICalled') {
@@ -464,6 +467,11 @@ export class BrowserAutomation {
       }
       await mouse('mouseMoved', secondaryPoint, { button: 'left' }); await mouse('mouseReleased', secondaryPoint, { button: 'left', clickCount: 1 })
     } else throw new Error('TARGET_NOT_ACTIONABLE')
+    // CDP may deliver javascriptDialogOpening immediately after the Input
+    // command resolves. Keep the owning broker request alive through that task
+    // so disconnect/cancel remains the dialog's cancellation owner.
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    const dialogBarrier = this.dialogBarrier; if (dialogBarrier) await dialogBarrier
     ensure()
     return { dispatched: true, rollbackPossible: false }
   }

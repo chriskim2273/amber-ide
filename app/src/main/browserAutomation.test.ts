@@ -239,6 +239,30 @@ describe('browser automation', () => {
     await expect(automation.prepareInteraction(lease, { kind: 'click', target: input }, new AbortController().signal)).rejects.toThrow('STALE_GENERATION')
   })
 
+  it('keeps the dispatched interaction pending until its browser dialog is handled', async () => {
+    let decide!: (decision: { accept: boolean }) => void
+    const decision = new Promise<{ accept: boolean }>((resolve) => { decide = resolve })
+    class DialogInteractionDebugger extends FakeDebugger {
+      override async send(method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>> {
+        if (method === 'DOM.describeNode' && params?.['backendNodeId'] === 2) return { node: { nodeName: 'BUTTON', parentId: 101, backendNodeId: 2 } }
+        if (method === 'Accessibility.getPartialAXTree' && params?.['backendDOMNodeId'] === 2) return { nodes: [{ role: { value: 'button' }, name: { value: 'Submit' }, backendDOMNodeId: 2 }] }
+        if (method === 'DOM.pushNodesByBackendIdsToFrontend') return { nodeIds: [22] }
+        if (method === 'Input.dispatchMouseEvent' && params?.['type'] === 'mouseReleased') this.listeners.forEach((listener) => listener('Page.javascriptDialogOpening', { type: 'confirm', message: 'Continue?' }))
+        return super.send(method, params)
+      }
+    }
+    const transport = new DialogInteractionDebugger(), automation = new BrowserAutomation(transport, () => 'about:blank', () => false, {}, { dialog: () => decision })
+    const snapshot = await automation.snapshot(lease, { maxDepth: 20, maxNodes: 20, maxBytes: 256 * 1024 }, new AbortController().signal)
+    const prepared = await automation.prepareInteraction(lease, { kind: 'click', target: { snapshotId: snapshot.snapshotId, ref: 'n2' } }, new AbortController().signal)
+    let settled = false
+    const execution = automation.executeInteraction(prepared, new AbortController().signal).finally(() => { settled = true })
+    await vi.waitFor(() => expect(transport.calls).toContain('Input.dispatchMouseEvent'))
+    await new Promise((resolve) => setImmediate(resolve)); expect(settled).toBe(false)
+    decide({ accept: false })
+    await expect(execution).resolves.toMatchObject({ dispatched: true })
+    expect(transport.calls).toContain('Page.handleJavaScriptDialog')
+  })
+
   it('reports cancellation after dispatch as no-rollback truth', async () => {
     const controller = new AbortController()
     class CancellingDebugger extends FakeDebugger {

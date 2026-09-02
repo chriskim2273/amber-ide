@@ -4,6 +4,7 @@ import { formatLastPiAction, secondsRemaining } from './browserRailModel'
 interface BrowserStatus {
   id: string; safeRestoreUrl: string; pageIncarnation: string; generation: number
   lifecycle: 'live' | 'frozen'; loading: boolean; capacityWaiting?: boolean
+  lastAction?: { action: string; phase: string; error?: string }
 }
 type BrowserReply = { ok: true; result: BrowserStatus | { closed: true } } | { ok: false; error: string }
 
@@ -71,7 +72,10 @@ export function BrowserRail(props: {
       const bounds = { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.max(1, Math.round(rect.width)), height: Math.max(1, Math.round(rect.height)) }
       const reply = await command({ type: 'show', id: props.id, bounds })
       if (!stopped && reply.ok && 'id' in reply.result) {
-        setStatus(reply.result); if (!address) setAddress(reply.result.safeRestoreUrl === 'about:blank' ? '' : reply.result.safeRestoreUrl)
+        const currentReply = await command({ type: 'status', id: props.id })
+        const current = currentReply.ok && 'id' in currentReply.result ? currentReply.result : reply.result
+        if (current.lastAction) setLastAction(current.lastAction)
+        setStatus(current); if (!address) setAddress(current.safeRestoreUrl === 'about:blank' ? '' : current.safeRestoreUrl)
       }
       if (!stopped && !reply.ok) setError(reply.error)
     }
@@ -113,7 +117,7 @@ export function BrowserRail(props: {
           }} /> Pi
       </label>
       {props.sharedWithPi && <button className="btn" onClick={() => void command({ type: 'stopPi' })}>Stop Pi</button>}
-      <button className="icon-btn" aria-label="Collapse tab browser" onClick={() => props.onCollapsed(true)}>›</button>
+      <button className="icon-btn" aria-label="Collapse tab browser" onClick={() => { void command({ type: 'hide', id: props.id }).then((reply) => { if (reply.ok) props.onCollapsed(true); else setError(reply.error) }) }}>›</button>
       <button className="icon-btn" aria-label="Close tab browser" onClick={props.onClose}>×</button>
     </div>
     {status?.capacityWaiting && <div className="tab-browser-status" role="status">Waiting for browser capacity…</div>}

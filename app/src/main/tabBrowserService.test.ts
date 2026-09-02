@@ -100,7 +100,7 @@ describe('TabBrowserService dispatch authorization', () => {
     const host = { navigate: async () => ({ id, stateRevision: 1 }), snapshot: () => state }
     const Service = TabBrowserService as unknown as new (s: TabBrowserStateStore, p: { setWindow: () => void }, h: typeof host, i: typeof state) => TabBrowserService
     const service = new Service({ update: async () => state } as unknown as TabBrowserStateStore, { setWindow: () => {} }, host, state); service.setEventSink((event) => events.push(event as Record<string, unknown>))
-    await service.command({ type: 'navigate', id, url: 'https://example.test/?token=secret', pageIncarnation: 'page', expectedGeneration: 1, broker: { controller: 'amber-1-1-0-pi' } })
+    await service.command({ type: 'navigate', id, url: 'https://example.test/?token=secret', pageIncarnation: 'page', expectedGeneration: 1, broker: { requestId: 'navigate-1', controller: 'amber-1-1-0-pi' } })
     expect(events.map((event) => event['phase'])).toEqual(['started', 'completed']); expect(JSON.stringify(events)).not.toContain('secret')
   })
 
@@ -137,7 +137,7 @@ describe('TabBrowserService approvals and Stop Pi', () => {
           origin: 'https://example.test', pageIncarnation: 'page', generation: 1 }, signal)
         return { dispatched: true, rollbackPossible: false }
       },
-      protectApproval: (_id: string, value: boolean) => protectedValues.push(value), status: () => ({ id, stateRevision: 1 }), snapshot: () => state,
+      protectApproval: (_id: string, value: boolean) => protectedValues.push(value), isVisible: () => true, status: () => ({ id, stateRevision: 1 }), snapshot: () => state,
     }
     const window = { isDestroyed: () => false, isVisible: () => true, show: () => {}, focus: () => {} }
     const Service = TabBrowserService as unknown as new (s: TabBrowserStateStore, p: { setWindow: () => void }, h: typeof host, i: typeof state, w: typeof window) => TabBrowserService
@@ -156,26 +156,90 @@ describe('TabBrowserService approvals and Stop Pi', () => {
 
   it('fails immediately and requests exact-surface reveal for a collapsed or background browser', async () => {
     const state = emptyBrowserState(1), id = 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', reveal = vi.fn(), protectedValues: boolean[] = []
-    const host = { runAutomation: async (_id: string, action: { operation: unknown }, signal: AbortSignal, approve: (request: unknown, signal: AbortSignal) => Promise<void>) => approve({ operation: action.operation, target: { role: 'button', name: 'Delete', tag: 'button', type: 'button', fingerprint: 'fp' }, classification: { consequential: true, category: 'destructive', valueCategory: 'none', canGrantOrigin: false, argumentSummary: '' }, origin: 'https://example.test', pageIncarnation: 'page', generation: 1 }, signal), protectApproval: (_id: string, value: boolean) => protectedValues.push(value), status: () => ({ id, stateRevision: 1 }), snapshot: () => state }
+    const host = { runAutomation: async (_id: string, action: { operation: unknown }, signal: AbortSignal, approve: (request: unknown, signal: AbortSignal) => Promise<void>) => approve({ operation: action.operation, target: { role: 'button', name: 'Delete', tag: 'button', type: 'button', fingerprint: 'fp' }, classification: { consequential: true, category: 'destructive', valueCategory: 'none', canGrantOrigin: false, argumentSummary: '' }, origin: 'https://example.test', pageIncarnation: 'page', generation: 1 }, signal), protectApproval: (_id: string, value: boolean) => protectedValues.push(value), isVisible: () => true, status: () => ({ id, stateRevision: 1 }), snapshot: () => state }
     const Service = TabBrowserService as unknown as new (s: TabBrowserStateStore, p: { setWindow: () => void }, h: typeof host, i: typeof state) => TabBrowserService
     const service = new Service({ update: async () => state } as unknown as TabBrowserStateStore, { setWindow: () => {} }, host, state)
     service.setApprovalSurface(() => false, reveal)
     await expect(service.command({ type: 'automation', id, broker: { requestId: 'request-bg', controller: 'amber-1-1-0-pi' }, action: { type: 'interact', pageIncarnation: 'page', expectedGeneration: 1, operation: { kind: 'click', target: { snapshotId: 'snap', ref: 'n1' } } } })).rejects.toThrow('APPROVAL_REQUIRED')
     expect(reveal).toHaveBeenCalledWith(id); expect(protectedValues).toEqual([true, false])
+    service.setApprovalSurface(() => true, reveal); host.isVisible = () => false
+    await expect(service.command({ type: 'automation', id, broker: { requestId: 'request-hidden', controller: 'amber-1-1-0-pi' }, action: { type: 'interact', pageIncarnation: 'page', expectedGeneration: 1, operation: { kind: 'click', target: { snapshotId: 'snap', ref: 'n1' } } } })).rejects.toThrow('APPROVAL_REQUIRED')
+  })
+
+  it('collapse invalidates an already-visible approval and aborts its owning action', async () => {
+    const state = emptyBrowserState(1), id = 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', events: Array<Record<string, unknown>> = []
+    const host = {
+      runAutomation: async (_id: string, action: { operation: unknown }, signal: AbortSignal, approve: (request: unknown, signal: AbortSignal) => Promise<void>) => {
+        await approve({ operation: action.operation, target: { role: 'button', name: 'Delete', tag: 'button', type: 'button', fingerprint: 'fp' }, classification: { consequential: true, category: 'destructive', valueCategory: 'none', canGrantOrigin: false, argumentSummary: '' }, origin: 'https://example.test', pageIncarnation: 'page', generation: 1 }, signal)
+      }, protectApproval: () => {}, isVisible: () => true, hide: () => {}, status: () => ({ id, stateRevision: 1 }), snapshot: () => state,
+    }
+    const Service = TabBrowserService as unknown as new (s: TabBrowserStateStore, p: { setWindow: () => void }, h: typeof host, i: typeof state) => TabBrowserService
+    const service = new Service({ update: async () => state } as unknown as TabBrowserStateStore, { setWindow: () => {} }, host, state)
+    service.setApprovalSurface(() => true, () => {}); service.setEventSink((event) => events.push(event as Record<string, unknown>))
+    const action = service.command({ type: 'automation', id, broker: { requestId: 'request-collapse', controller: 'amber-1-1-0-pi' }, action: { type: 'interact', pageIncarnation: 'page', expectedGeneration: 1, operation: { kind: 'click', target: { snapshotId: 'snap', ref: 'n1' } } } })
+    await vi.waitFor(() => expect(events.some((event) => event['type'] === 'approval-request')).toBe(true))
+    await service.command({ type: 'hide', id })
+    await expect(action).rejects.toThrow('APPROVAL_DENIED')
+    expect(events.some((event) => event['type'] === 'approval-resolved')).toBe(true)
   })
 
   it('coordinates a visible dialog and keeps the native page occluded until its exact decision', async () => {
     const state = emptyBrowserState(1), id = 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', events: Array<Record<string, unknown>> = [], protectedValues: boolean[] = [], respond = vi.fn()
-    const host = { protectApproval: (_id: string, value: boolean) => protectedValues.push(value), status: () => ({ id, stateRevision: 1 }), snapshot: () => state }
+    const host = { protectApproval: (_id: string, value: boolean) => protectedValues.push(value), isVisible: () => true, status: () => ({ id, stateRevision: 1, pageIncarnation: 'page', generation: 2 }), snapshot: () => state }
     const Service = TabBrowserService as unknown as new (s: TabBrowserStateStore, p: { setWindow: () => void }, h: typeof host, i: typeof state) => TabBrowserService
     const service = new Service({ update: async () => state } as unknown as TabBrowserStateStore, { setWindow: () => {} }, host, state)
     service.setApprovalSurface(() => true, () => {}); service.setEventSink((event) => events.push(event as Record<string, unknown>))
-    ;(service as unknown as { handleHostEvent: (event: unknown) => void }).handleHostEvent({ type: 'dialog-request', id, dialogType: 'prompt', message: 'Value?', generation: 2, respond })
+    ;(service as unknown as { handleHostEvent: (event: unknown) => void }).handleHostEvent({ type: 'dialog-request', id, pageIncarnation: 'page', dialogType: 'prompt', message: 'Value?', generation: 2, respond })
     await vi.waitFor(() => expect(events.some((event) => event['type'] === 'dialog-request')).toBe(true))
     const request = events.find((event) => event['type'] === 'dialog-request')!
     await service.command({ type: 'resolveDialog', id, dialogId: String(request['dialogId']), digest: String(request['digest']), accept: true, promptText: 'answer' })
     await vi.waitFor(() => expect(respond).toHaveBeenCalledWith({ accept: true, promptText: 'answer' }))
     expect(protectedValues).toEqual([true, false])
+  })
+
+  it('binds a Pi dialog to the owning request cancellation signal', async () => {
+    const state = emptyBrowserState(1), id = 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', events: Array<Record<string, unknown>> = []
+    const host = { protectApproval: () => {}, isVisible: () => true, status: () => ({ id, stateRevision: 1, pageIncarnation: 'page', generation: 2 }), snapshot: () => state, runAutomation: async () => ({}) }
+    const Service = TabBrowserService as unknown as new (s: TabBrowserStateStore, p: { setWindow: () => void }, h: typeof host, i: typeof state) => TabBrowserService
+    const service = new Service({ update: async () => state } as unknown as TabBrowserStateStore, { setWindow: () => {} }, host, state)
+    service.setApprovalSurface(() => true, () => {}); service.setEventSink((event) => events.push(event as Record<string, unknown>))
+    const handle = (event: unknown): void => (service as unknown as { handleHostEvent: (value: unknown) => void }).handleHostEvent(event)
+    host.runAutomation = async () => new Promise((_resolve, reject) => handle({ type: 'dialog-request', id, pageIncarnation: 'page', dialogType: 'confirm', message: 'Continue?', generation: 2, respond: (decision: { accept: boolean }) => reject(new Error(decision.accept ? 'UNEXPECTED_ACCEPT' : 'DIALOG_DENIED')) }))
+    const owner = new AbortController()
+    const action = service.command({ type: 'automation', id, broker: { requestId: 'request-cancel', controller: 'amber-1-1-0-pi' }, action: { type: 'reload', pageIncarnation: 'page', expectedGeneration: 1, ignoreCache: false } }, owner.signal)
+    await vi.waitFor(() => expect(events.some((event) => event['type'] === 'dialog-request')).toBe(true))
+    owner.abort()
+    await expect(action).rejects.toThrow('DIALOG_DENIED')
+    expect(events.some((event) => event['type'] === 'dialog-resolved' && event['decision'] === 'revoked')).toBe(true)
+  })
+
+  it('invalidates a dialog when its page generation advances before resolution', async () => {
+    const state = emptyBrowserState(1), id = 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', events: Array<Record<string, unknown>> = [], respond = vi.fn()
+    let generation = 2
+    const host = { protectApproval: () => {}, isVisible: () => true, status: () => ({ id, stateRevision: 1, pageIncarnation: 'page', generation }), snapshot: () => state }
+    const Service = TabBrowserService as unknown as new (s: TabBrowserStateStore, p: { setWindow: () => void }, h: typeof host, i: typeof state) => TabBrowserService
+    const service = new Service({ update: async () => state } as unknown as TabBrowserStateStore, { setWindow: () => {} }, host, state)
+    service.setApprovalSurface(() => true, () => {}); service.setEventSink((event) => events.push(event as Record<string, unknown>))
+    const handle = (event: unknown): void => (service as unknown as { handleHostEvent: (value: unknown) => void }).handleHostEvent(event)
+    handle({ type: 'dialog-request', id, pageIncarnation: 'page', dialogType: 'confirm', message: 'Continue?', generation, respond })
+    await vi.waitFor(() => expect(events.some((event) => event['type'] === 'dialog-request')).toBe(true))
+    const request = events.find((event) => event['type'] === 'dialog-request')!
+    generation = 3; handle({ type: 'runtime', id, status: { pageIncarnation: 'page', generation, lifecycle: 'live' } })
+    await vi.waitFor(() => expect(respond).toHaveBeenCalledWith({ accept: false }))
+    await expect(service.command({ type: 'resolveDialog', id, dialogId: String(request['dialogId']), digest: String(request['digest']), accept: true })).rejects.toThrow('DIALOG_DENIED')
+  })
+
+  it('retains a bounded secret-safe latest Pi action for renderer remount status', async () => {
+    const state = emptyBrowserState(1), id = 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    const host = { runAutomation: async () => ({ ok: true }), status: (browserId: string) => ({ id: browserId, stateRevision: 1 }), snapshot: () => state }
+    const Service = TabBrowserService as unknown as new (s: TabBrowserStateStore, p: { setWindow: () => void }, h: typeof host, i: typeof state) => TabBrowserService
+    const service = new Service({ update: async () => state } as unknown as TabBrowserStateStore, { setWindow: () => {} }, host, state)
+    await service.command({ type: 'automation', id, broker: { requestId: 'request-remount', controller: 'amber-1-1-0-pi' }, action: { type: 'reload', pageIncarnation: 'page', expectedGeneration: 1, ignoreCache: false } })
+    await expect(service.command({ type: 'status', id })).resolves.toMatchObject({ lastAction: { browserId: id, controller: 'amber-1-1-0-pi', action: 'reload', phase: 'completed' } })
+    const internals = service as unknown as { piAction: (id: string, controller: string, action: string, phase: 'started') => void; latestPiActions: Map<string, unknown> }
+    for (let index = 0; index < 300; index++) internals.piAction(`browser-${index.toString(16).padStart(32, '0')}`, 'controller', 'status', 'started')
+    expect(internals.latestPiActions.size).toBe(256)
+    expect(JSON.stringify([...internals.latestPiActions.values()])).not.toContain('request-remount')
   })
 
   it('Stop Pi aborts active broker work and clears its approval', async () => {

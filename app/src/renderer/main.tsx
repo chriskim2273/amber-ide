@@ -817,8 +817,8 @@ function App(): JSX.Element {
   const tabKey = String(tab?.tab ?? activeTab)
   const tabBrowser = layout.workspaces[wsKey]?.tabs[tabKey]?.browser
   useEffect(() => {
-    browserContextReady.current = window.amber.setBrowserContext?.({ workspace: Number(wsKey), tab: Number(tabKey) }) ?? Promise.resolve({ ok: true })
-  }, [wsKey, tabKey, tabBrowser?.id])
+    browserContextReady.current = window.amber.setBrowserContext?.({ workspace: Number(wsKey), tab: Number(tabKey), collapsed: tabBrowser?.collapsed ?? true }) ?? Promise.resolve({ ok: true })
+  }, [wsKey, tabKey, tabBrowser?.id, tabBrowser?.collapsed])
   const storedTree = layout.workspaces[wsKey]?.tabs[tabKey]?.tree ?? null
   // Active-tab render inputs, via the shared deriveTab (same path the keep-alive
   // layer map uses below — no drift). allLive is the UNFILTERED name set (keeps
@@ -988,11 +988,11 @@ function App(): JSX.Element {
 
   const ensureBrowserContext = useCallback(async (): Promise<void> => {
     await browserContextReady.current.catch(() => {})
-    const pending = window.amber.setBrowserContext?.({ workspace: Number(wsKey), tab: Number(tabKey) }) ?? Promise.resolve({ ok: true })
+    const pending = window.amber.setBrowserContext?.({ workspace: Number(wsKey), tab: Number(tabKey), collapsed: tabBrowser?.collapsed ?? true }) ?? Promise.resolve({ ok: true })
     browserContextReady.current = pending
     const reply = await pending as { ok?: boolean; error?: string }
     if (!reply?.ok) throw new Error(reply?.error ?? 'STALE_BROWSER_CONTEXT')
-  }, [wsKey, tabKey])
+  }, [wsKey, tabKey, tabBrowser?.collapsed])
 
   const openTabBrowser = useCallback(async (): Promise<void> => {
     try { await ensureBrowserContext() } catch (error) { setNotice(error instanceof Error ? error.message : 'STALE_BROWSER_CONTEXT'); return }
