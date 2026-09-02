@@ -740,6 +740,7 @@ interface WindowCtx {
 /** Per-window state, keyed by webContents id so IPC can route by sender. */
 const windowCtxs = new Map<number, WindowCtx>()
 let reopenLocalWindow: (() => Promise<void>) | null = null
+let onLocalWindowHidden: ((browserId: string) => void) | null = null
 
 /** The window an IPC message came from. */
 function ctxFor(e: { sender: Electron.WebContents }): WindowCtx | undefined {
@@ -1160,6 +1161,7 @@ async function openWindow(target: WindowTarget): Promise<WindowCtx> {
     if (tabBrowserHostEnabled() && target.kind === 'local' && !quitting) {
       event.preventDefault()
       presentationSuspended = true
+      if (ctx.activeBrowserId) onLocalWindowHidden?.(ctx.activeBrowserId)
       child?.postMessage({ kind: 'suspend-panes' })
       win.hide()
     }
@@ -1201,6 +1203,7 @@ async function main(): Promise<void> {
       tabBrowserStateStore = new TabBrowserStateStore(stateRoot())
       await coordinateTabBrowserMigration(layoutPath(), tabBrowserStateStore)
       tabBrowser = await TabBrowserService.create(stateRoot(), win, tabBrowserStateStore)
+      onLocalWindowHidden = (id) => tabBrowser?.revokePi(id)
       tabBrowser.setApprovalSurface(
         (id) => hasExactApprovalSurface([...windowCtxs.values()].map((context) => ({ local: context.target.kind === 'local', destroyed: context.win.isDestroyed(), visible: context.win.isVisible(), browserId: context.activeBrowserId, expanded: context.activeBrowserExpanded })), id),
         (id) => {

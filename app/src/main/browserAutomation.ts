@@ -395,23 +395,24 @@ export class BrowserAutomation {
     const target = metadata ?? { role: 'document', name: '', tag: 'body', type: '', fingerprint: createHash('sha256').update('document').digest('hex') }
     return { lease: { ...lease }, operation, ...(primary ? { primary } : {}), ...(secondary ? { secondary } : {}), target, ...(secondaryCurrent ? { secondaryTarget: secondaryCurrent.metadata } : {}) }
   }
-  private async hitTest(entry: SnapshotEntry, point: { x: number; y: number }, signal: AbortSignal): Promise<void> {
+  private async hitTest(entry: SnapshotEntry, point: { x: number; y: number }, signal: AbortSignal): Promise<{ x: number; y: number }> {
     if (!entry.backendDOMNodeId || !Number.isFinite(point.x) || !Number.isFinite(point.y)) throw new Error('TARGET_NOT_ACTIONABLE')
     const metrics = boundedResponse(await this.transport.send('Page.getLayoutMetrics')); abort(signal)
     const viewport = (metrics['cssVisualViewport'] ?? metrics['cssLayoutViewport']) as Record<string, unknown> | undefined
     const width = typeof viewport?.['clientWidth'] === 'number' ? viewport['clientWidth'] : viewport?.['width']
     const height = typeof viewport?.['clientHeight'] === 'number' ? viewport['clientHeight'] : viewport?.['height']
     if (typeof width !== 'number' || typeof height !== 'number' || !Number.isFinite(width) || !Number.isFinite(height) || width < 1 || height < 1 || width > 16_384 || height > 16_384 || point.x < 0 || point.y < 0 || point.x >= width || point.y >= height) throw new Error('TARGET_NOT_ACTIONABLE')
-    const hit = boundedResponse(await this.transport.send('DOM.getNodeForLocation', { x: Math.floor(point.x), y: Math.floor(point.y), includeUserAgentShadowDOM: true, ignorePointerEventsNone: false })); abort(signal)
+    const exactPoint = { x: Math.floor(point.x), y: Math.floor(point.y) }
+    const hit = boundedResponse(await this.transport.send('DOM.getNodeForLocation', { ...exactPoint, includeUserAgentShadowDOM: true, ignorePointerEventsNone: false })); abort(signal)
     let backend = typeof hit['backendNodeId'] === 'number' ? hit['backendNodeId'] : undefined
     let nodeId = typeof hit['nodeId'] === 'number' ? hit['nodeId'] : undefined
     for (let depth = 0; depth < 32 && (backend !== undefined || nodeId !== undefined); depth++) {
-      if (backend === entry.backendDOMNodeId) return
+      if (backend === entry.backendDOMNodeId) return exactPoint
       const described = boundedResponse(await this.transport.send('DOM.describeNode', { ...(nodeId !== undefined ? { nodeId } : { backendNodeId: backend }), depth: 0, pierce: false })); abort(signal)
       const node = described['node'] as Record<string, unknown> | undefined
       if (!node) break
       backend = typeof node['backendNodeId'] === 'number' ? node['backendNodeId'] : undefined
-      if (backend === entry.backendDOMNodeId) return
+      if (backend === entry.backendDOMNodeId) return exactPoint
       nodeId = typeof node['parentId'] === 'number' ? node['parentId'] : undefined
       backend = undefined
     }
@@ -426,8 +427,8 @@ export class BrowserAutomation {
     const pointFor = async (entry: SnapshotEntry, expected: InteractionTargetMetadata): Promise<{ x: number; y: number; checked?: boolean }> => {
       const point = await this.actionable(entry, signal)
       if (point.metadata.fingerprint !== expected.fingerprint) throw new Error('STALE_GENERATION')
-      ensure(); await this.hitTest(entry, point, signal); ensure()
-      return point
+      ensure(); const exactPoint = await this.hitTest(entry, point, signal); ensure()
+      return { ...point, ...exactPoint }
     }
     const mouse = async (type: string, point: { x: number; y: number }, extra: Record<string, unknown> = {}): Promise<void> => { ensure(); dispatched = true; await this.transport.send('Input.dispatchMouseEvent', { type, x: point.x, y: point.y, ...extra }) }
     const key = async (type: 'keyDown' | 'keyUp', value: string, modifiers = 0): Promise<void> => { ensure(); dispatched = true; await this.transport.send('Input.dispatchKeyEvent', { type, key: value === 'Space' ? ' ' : value, modifiers }) }
