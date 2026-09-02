@@ -56,6 +56,7 @@ export class BrowserCapacity {
     return { freeze: victim }
   }
   waitingIds(): string[] { return this.queue.map((entry) => entry.id) }
+  cancel(id: string): void { const waiter = this.pending.get(id); if (waiter) this.remove(waiter, new Error('ACTION_CANCELLED')) }
   settleActivation(id: string): void { this.protectFor(id, 'activation', false) }
   activateQueued(id: string, now: number, signal?: AbortSignal, onWaiting?: (waiting: boolean) => void): Promise<{ freeze?: string }> {
     const immediate = this.activate(id, now)

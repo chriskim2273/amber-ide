@@ -23,7 +23,7 @@ export interface TabBrowserPageFactory {
   create(id: BrowserId, onUserInput: () => void, onPageEvent: (event: TabBrowserPageEvent) => void): TabBrowserPage
 }
 export interface BrowserRuntimeStatus extends BrowserRecord { pageIncarnation: string; generation: number; loading: boolean; capacityWaiting?: boolean }
-export type TabBrowserHostEvent = { type: 'capacity-wait'; id: BrowserId; waiting: boolean }
+export type TabBrowserHostEvent = { type: 'capacity-wait'; id: BrowserId; waiting: boolean } | { type: 'runtime'; id: BrowserId; status: BrowserRuntimeStatus }
 interface Runtime { page: TabBrowserPage; incarnation: string; generation: number; loading: boolean }
 
 export class TabBrowserHost {
@@ -54,7 +54,7 @@ export class TabBrowserHost {
     let runtime!: Runtime
     const page = this.pages.create(
       id,
-      () => { runtime.generation += 1; this.onStateChange() },
+      () => { runtime.generation += 1; this.onStateChange(); this.emitRuntime(id) },
       (event) => this.pageEvent(id, runtime, event),
     )
     runtime = { page, incarnation: randomUUID(), generation: 0, loading: false }
@@ -88,7 +88,11 @@ export class TabBrowserHost {
       record.restoreError = `Page crashed: ${event.reason}`.slice(0, 1024)
       record.stateRevision += 1
     }
-    this.onStateChange()
+    this.onStateChange(); this.emitRuntime(id)
+  }
+
+  private emitRuntime(id: BrowserId): void {
+    if (this.state.records[id]) this.onEvent({ type: 'runtime', id, status: this.status(id) })
   }
 
   async open(options: { visible: boolean }, signal?: AbortSignal): Promise<{ status: BrowserRuntimeStatus; page: TabBrowserPage }> {
@@ -190,14 +194,32 @@ export class TabBrowserHost {
     const activation = await this.capacity.activateQueued(record.id, this.now(), signal, (waiting) => this.capacityEvent(record.id, waiting))
     if (activation.freeze && isOpaqueBrowserId(activation.freeze)) this.freeze(activation.freeze)
     const runtime = this.makeRuntime(record.id)
-    this.capacity.settleActivation(record.id)
     record.lifecycle = 'live'; record.stateRevision += 1
-    if (record.safeRestoreUrl !== 'about:blank') await runtime.page.loadURL(record.safeRestoreUrl)
-    return this.status(record.id)
+    try {
+      if (record.safeRestoreUrl !== 'about:blank') await runtime.page.loadURL(record.safeRestoreUrl)
+      return this.status(record.id)
+    } finally { this.capacity.settleActivation(record.id) }
   }
 
   protectApproval(id: string, protectedValue: boolean): void {
     const record = this.record(id); this.capacity.protectFor(record.id, 'approval', protectedValue)
+  }
+
+  recoveryItems(): { index: number; workspace: number; tab: number; safeRestoreUrl: string }[] {
+    return this.state.migrationRecovery.map((item, index) => ({ index, ...item }))
+  }
+
+  deleteRecovery(index: number): void {
+    if (!Number.isSafeInteger(index) || index < 0 || index >= this.state.migrationRecovery.length) throw new Error('NO_RECOVERY_ITEM')
+    this.state.migrationRecovery.splice(index, 1); this.onStateChange()
+  }
+
+  attachRecovery(index: number, id: BrowserId): BrowserRuntimeStatus {
+    const item = this.state.migrationRecovery[index]
+    if (!item) throw new Error('NO_RECOVERY_ITEM')
+    const status = this.importFrozen(id, { mode: 'browse', safeRestoreUrl: item.safeRestoreUrl })
+    this.state.migrationRecovery.splice(index, 1); this.onStateChange()
+    return status
   }
 
   importWorkspace(entries: { id: BrowserId; browser: WsBrowser }[], recovery: { ws: number; tab: number; browser: WsBrowser }[]): BrowserRuntimeStatus[] {
@@ -223,6 +245,7 @@ export class TabBrowserHost {
 
   close(id: string): void {
     const record = this.record(id)
+    this.capacity.cancel(record.id)
     this.runtimes.get(record.id)?.page.destroy()
     this.runtimes.delete(record.id); this.capacity.markFrozen(record.id)
     delete this.state.records[record.id]

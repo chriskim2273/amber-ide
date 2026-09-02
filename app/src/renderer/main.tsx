@@ -5,7 +5,7 @@ import { BrowserRail } from './BrowserRail'
 import { Icon } from './Icon'
 import { PANE_KIND_OPTIONS, continuityView, machineWindowTitle, type SnapshotState } from './uiModel'
 import type { EditorApi } from './Editor'
-import { initialState, reduce, groupSessions, mergeEditors, tabDot, hasActivity, isAgentKind, type DaemonEvent } from './store'
+import { initialState, reduce, groupSessions, mergeBrowserRailTabs, mergeEditors, tabDot, hasActivity, isAgentKind, type DaemonEvent } from './store'
 import { ResourcePressureBanner } from './PressureBanners'
 import type { ControlMsg } from '../shared/proto'
 import { sessionRows } from './sessionRows'
@@ -37,7 +37,7 @@ import {
   type LayoutFile, type TabLayout, type LoadLayoutResult, type SaveLayoutResult,
 } from '../shared/layoutFile'
 import {
-  parseWorkspaceFile, serializeWorkspaceFile, assembleSave, planLoad,
+  parseWorkspaceFile, serializeWorkspaceFile, assembleSave, planLoad, requireWorkspaceBrowserSnapshots,
   type WorkspaceDoc, type SaveWorkspace, type LoadPlan,
 } from '../shared/workspaceFile'
 import { collectDumps, matchDumpError } from './dumps'
@@ -87,6 +87,8 @@ declare global {
       browserCommand: (command: unknown) => Promise<unknown>
       importWorkspaceBrowsers?: (entries: unknown) => Promise<unknown>
       snapshotWorkspaceBrowsers?: () => Promise<unknown>
+      browserRecovery?: (command: unknown) => Promise<unknown>
+      onTabBrowserEvent?: (cb: (event: unknown) => void) => (() => void)
       onBrowserAssociation: (cb: (association: unknown) => void) => void
       loadProductivity?: () => Promise<LoadProductivityResult>
       saveProductivity?: (text: string, version: string | null) => Promise<SaveProductivityResult>
@@ -311,6 +313,8 @@ function App(): JSX.Element {
   const [saveScopeOpen, setSaveScopeOpen] = useState(false)
   const [loadDoc, setLoadDoc] = useState<WorkspaceDoc | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
+  const [browserRecoveryOpen, setBrowserRecoveryOpen] = useState(false)
+  const [browserRecovery, setBrowserRecovery] = useState<Array<{ index: number; workspace: number; tab: number; safeRestoreUrl: string }>>([])
   type ProductivityOverlay = 'palette' | 'search' | 'recovery' | 'templates' | 'bookmarks' | 'presets' | 'checkpoints' | 'project'
   const [productivityOverlay, setProductivityOverlay] = useState<ProductivityOverlay | null>(null)
   const [productivity, setProductivity] = useState<ProductivityFile>(emptyProductivity)
@@ -607,26 +611,21 @@ function App(): JSX.Element {
     window.amber.onBrowserAssociation((value) => {
       if (typeof value !== 'object' || value === null) return
       const association = value as { ws?: unknown; tab?: unknown; browser?: unknown }
-      if (typeof association.ws !== 'number' || typeof association.tab !== 'number' || typeof association.browser !== 'object' || association.browser === null) return
-      const browser = association.browser as { id?: unknown; width?: unknown; collapsed?: unknown }
-      if (typeof browser.id !== 'string' || typeof browser.width !== 'number' || typeof browser.collapsed !== 'boolean') return
-      const browserLayout = { id: browser.id, width: browser.width, collapsed: browser.collapsed }
+      if (typeof association.ws !== 'number' || typeof association.tab !== 'number') return
+      const rawBrowser = association.browser
+      if (rawBrowser !== undefined && (typeof rawBrowser !== 'object' || rawBrowser === null)) return
+      const browser = rawBrowser as { id?: unknown; width?: unknown; collapsed?: unknown; designatedPi?: unknown; sharedWithPi?: unknown } | undefined
+      if (browser && (typeof browser.id !== 'string' || typeof browser.width !== 'number' || typeof browser.collapsed !== 'boolean')) return
+      const browserLayout = browser ? { id: browser.id as string, width: browser.width as number, collapsed: browser.collapsed as boolean,
+        ...(typeof browser.designatedPi === 'string' ? { designatedPi: browser.designatedPi } : {}), ...(typeof browser.sharedWithPi === 'boolean' ? { sharedWithPi: browser.sharedWithPi } : {}) } : undefined
       setLayout((current) => {
         const workspace = current.workspaces[String(association.ws)] ?? { activeTab: association.tab as number, tabs: {} }
         const previous = workspace.tabs[String(association.tab)] ?? { tree: null }
-        return {
-          ...current,
-          version: 2,
-          browserRevision: (current.browserRevision ?? 0) + 1,
-          workspaces: {
-            ...current.workspaces,
-            [String(association.ws)]: {
-              ...workspace,
-              activeTab: association.tab as number,
-              tabs: { ...workspace.tabs, [String(association.tab)]: { ...previous, browser: browserLayout } },
-            },
-          },
-        }
+        const nextTab = { ...previous, ...(browserLayout ? { browser: browserLayout } : {}) }
+        if (!browserLayout) delete nextTab.browser
+        return { ...current, version: 2, browserRevision: (current.browserRevision ?? 0) + 1,
+          workspaces: { ...current.workspaces, [String(association.ws)]: { ...workspace, activeTab: association.tab as number,
+            tabs: { ...workspace.tabs, [String(association.tab)]: nextTab } } } }
       })
       setActiveWs(association.ws); setActiveTab(association.tab)
     })
@@ -783,7 +782,7 @@ function App(): JSX.Element {
     })
   }
 
-  const workspaces = mergeEditors(groupSessions(state), layout.editors ?? {})
+  const workspaces = mergeBrowserRailTabs(mergeEditors(groupSessions(state), layout.editors ?? {}), layout.workspaces)
   const pocketAll = commandCenterModel({ workspaces, state, frozen: frozenSet })
   const needsAttention = pocketAll.groups.find((group) => group.id === 'needs-you')?.items ?? []
   const pocketModel = commandCenterModel({
@@ -960,17 +959,22 @@ function App(): JSX.Element {
     })
   }, [wsKey, tabKey, activeTab])
 
+  const refreshBrowserRecovery = useCallback(async (): Promise<void> => {
+    const reply = await window.amber.browserRecovery?.({ action: 'list' }) as { ok?: boolean; result?: Array<{ index: number; workspace: number; tab: number; safeRestoreUrl: string }>; error?: string } | undefined
+    if (!reply?.ok) { setNotice(reply?.error ?? 'Browser recovery unavailable'); return }
+    setBrowserRecovery(reply.result ?? []); setBrowserRecoveryOpen(true)
+  }, [])
+
   const openTabBrowser = useCallback(async (): Promise<void> => {
-    const reply = await window.amber.browserCommand({ type: 'open' }) as { ok: boolean; result?: { id: string }; error?: string }
-    if (reply.ok && reply.result) updateTabBrowser({ id: reply.result.id, width: 420, collapsed: false })
-    else setNotice(reply.error ?? 'Browser host unavailable')
-  }, [updateTabBrowser])
+    const reply = await window.amber.browserCommand({ type: 'open' }) as { ok: boolean; error?: string }
+    if (!reply.ok) setNotice(reply.error ?? 'Browser host unavailable')
+  }, [])
 
   const closeTabBrowser = useCallback(async (): Promise<void> => {
     if (!tabBrowser) return
-    await window.amber.browserCommand({ type: 'close', id: tabBrowser.id })
-    updateTabBrowser(undefined)
-  }, [tabBrowser, updateTabBrowser])
+    const reply = await window.amber.browserCommand({ type: 'close' }) as { ok: boolean; error?: string }
+    if (!reply.ok) setNotice(reply.error ?? 'Could not close tab browser')
+  }, [tabBrowser])
 
   const putTree = useCallback((next: Node | null) => {
     setLayout((l) => {
@@ -1410,7 +1414,7 @@ function App(): JSX.Element {
     const snapshotReply = window.amber.snapshotWorkspaceBrowsers
       ? await window.amber.snapshotWorkspaceBrowsers() as { ok?: boolean; result?: Record<string, { mode: 'preview' | 'browse'; safeRestoreUrl: string; viewport: { width: number; height: number } }> }
       : { ok: true, result: {} }
-    const browserSnapshots = snapshotReply.ok ? snapshotReply.result ?? {} : {}
+    const browserSnapshots = requireWorkspaceBrowserSnapshots(snapshotReply)
     return { doc: assembleSave(scope, saveModel(wsList, browserSnapshots), layoutRef.current, captured.dumps), stragglers: captured.stragglers }
   }
 
@@ -1418,12 +1422,14 @@ function App(): JSX.Element {
   // assemble the file from live grouping + sidecar + dumps, write via native dialog.
   const doSave = async (scope: 'one' | 'all'): Promise<void> => {
     setSaveScopeOpen(false)
-    const { doc, stragglers } = await captureWorkspace(scope, true)
-    const base = scope === 'one'
-      ? (layoutRef.current.workspaces[String(currentWs)]?.label ?? `workspace-${currentWs}`)
-      : 'workspaces'
-    const ok = await window.amber.saveWorkspaceFile(serializeWorkspaceFile(doc), `${base}.amberws`)
-    if (ok && stragglers.length > 0) setNotice(`Saved with empty history for ${stragglers.length} pane(s) whose capture timed out.`)
+    try {
+      const { doc, stragglers } = await captureWorkspace(scope, true)
+      const base = scope === 'one'
+        ? (layoutRef.current.workspaces[String(currentWs)]?.label ?? `workspace-${currentWs}`)
+        : 'workspaces'
+      const ok = await window.amber.saveWorkspaceFile(serializeWorkspaceFile(doc), `${base}.amberws`)
+      if (ok && stragglers.length > 0) setNotice(`Saved with empty history for ${stragglers.length} pane(s) whose capture timed out.`)
+    } catch (error) { setNotice(`Workspace save cancelled — ${error instanceof Error ? error.message : String(error)}.`) }
   }
 
   // Load step 1: pick + read + parse the file. Parse errors surface in the notice
@@ -1448,12 +1454,15 @@ function App(): JSX.Element {
     const killed: string[] = []
     const existingBrowserIds = new Set(Object.values(layoutRef.current.workspaces).flatMap((workspace) => Object.values(workspace.tabs).flatMap((tab) => tab.browser ? [tab.browser.id] : [])))
     const plan = planLoad(doc, { mode, currentWs, liveWs, mintId: makeId, existingBrowserIds })
-    if (plan.browserRails.length || plan.browserRecovery.length) {
-      if (!window.amber.importWorkspaceBrowsers) { setNotice('This Amber build cannot restore tab browsers.'); return }
-      const imported = await window.amber.importWorkspaceBrowsers({ entries: plan.browserRails.map(({ id, browser }) => ({ id, browser })), recovery: plan.browserRecovery }) as { ok?: boolean; error?: string }
-      if (!imported.ok) { setNotice(`Could not restore tab browsers — ${imported.error ?? 'unknown error'}.`); return }
-      if (plan.browserRecovery.length) setNotice(`${plan.browserRecovery.length} additional browser URL${plan.browserRecovery.length === 1 ? '' : 's'} saved for recovery.`)
-    }
+    if (!window.amber.importWorkspaceBrowsers) { setNotice('This Amber build cannot restore tab browsers.'); return }
+    const imported = await window.amber.importWorkspaceBrowsers({
+      mode, currentWs, workspaces: plan.workspaces,
+      imports: { entries: plan.browserRails.map(({ id, browser }) => ({ id, browser })), recovery: plan.browserRecovery },
+    }) as { ok?: boolean; error?: string; layout?: string; version?: string }
+    if (!imported.ok || !imported.layout) { setNotice(`Could not restore workspace — ${imported.error ?? 'unknown error'}.`); return }
+    versionRef.current = imported.version ?? versionRef.current
+    setLayout(parseLayout(imported.layout))
+    if (plan.browserRecovery.length) setNotice(`${plan.browserRecovery.length} additional browser URL${plan.browserRecovery.length === 1 ? '' : 's'} saved for recovery.`)
     if (mode === 'replace') {
       const cur = workspaces.find((w) => w.ws === currentWs)
       for (const t of cur?.tabs ?? []) for (const p of t.panes) {
@@ -1901,9 +1910,10 @@ function App(): JSX.Element {
           )}
         </div>
         {!mobile && remoteHost.length === 0 && !tabBrowser && (
-          <button className="btn btn-with-icon" onClick={() => void openTabBrowser()} aria-label="Open tab browser">
-            Browser
-          </button>
+          <button className="btn btn-with-icon" onClick={() => void openTabBrowser()} aria-label="Open tab browser">Browser</button>
+        )}
+        {!mobile && remoteHost.length === 0 && (
+          <button className="btn" onClick={() => void refreshBrowserRecovery()} aria-label="Browser recovery">Recovery</button>
         )}
         <div className="spacer" />
         {remoteHost.length > 0 && (
@@ -2155,7 +2165,10 @@ function App(): JSX.Element {
           {...(tabBrowser.designatedPi ? { designatedPi: tabBrowser.designatedPi } : {})}
           {...(tabBrowser.sharedWithPi !== undefined ? { sharedWithPi: tabBrowser.sharedWithPi } : {})}
           controllers={(tab?.panes ?? []).filter((pane) => pane.kind === 'pi').map((pane) => ({ name: pane.name, label: titles[pane.name] || pane.name }))}
-          onPolicy={(policy) => updateTabBrowser({ ...tabBrowser, ...policy })}
+          onPolicy={(policy) => {
+            if (policy.designatedPi !== tabBrowser.designatedPi) void window.amber.browserCommand({ type: 'designate', ...(policy.designatedPi ? { designatedPi: policy.designatedPi } : {}) })
+            else if (policy.sharedWithPi !== !!tabBrowser.sharedWithPi) void window.amber.browserCommand({ type: 'share', sharedWithPi: policy.sharedWithPi })
+          }}
           onWidth={(width) => updateTabBrowser({ ...tabBrowser, width })}
           onCollapsed={(collapsed) => updateTabBrowser({ ...tabBrowser, collapsed })}
           onClose={() => void closeTabBrowser()} />
@@ -2529,6 +2542,24 @@ function App(): JSX.Element {
                 <button className="btn btn-accent" onClick={() => void doSave('one')}>This workspace</button>
                 <button className="btn" onClick={() => void doSave('all')}>All workspaces</button>
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+      {browserRecoveryOpen && (
+        <div className="help-overlay" onClick={() => setBrowserRecoveryOpen(false)}>
+          <div className="help-card dialog-card" role="dialog" aria-modal="true" aria-label="Browser recovery" onClick={(event) => event.stopPropagation()}>
+            <div className="help-head"><span className="help-title">Browser recovery</span><button className="icon-btn" aria-label="close" onClick={() => setBrowserRecoveryOpen(false)}><Icon name="close" /></button></div>
+            <div className="dialog-body">
+              {browserRecovery.length === 0 ? <p className="dialog-text">No recoverable browser URLs.</p> : browserRecovery.map((item) => (
+                <div className="recovery-row" key={`${item.index}:${item.safeRestoreUrl}`}><code>{item.safeRestoreUrl}</code><span>ws {item.workspace} · tab {item.tab}</span>
+                  <div className="dialog-actions">
+                    <button className="btn" onClick={() => void window.amber.browserRecovery?.({ action: 'attach', index: item.index }).then(() => refreshBrowserRecovery())}>Attach here</button>
+                    <button className="btn" onClick={() => void window.amber.browserRecovery?.({ action: 'copy', index: item.index })}>Copy URL</button>
+                    <button className="btn danger-btn" onClick={() => void window.amber.browserRecovery?.({ action: 'delete', index: item.index }).then(() => refreshBrowserRecovery())}>Delete</button>
+                  </div>
+                </div>
+              ))}
             </div>
           </div>
         </div>

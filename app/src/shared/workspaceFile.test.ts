@@ -2,8 +2,16 @@ import { describe, it, expect } from 'vitest'
 import type { Node } from '../renderer/layout'
 import type { LayoutFile } from './layoutFile'
 import type { DaemonSessionKind } from './proto'
+import { mergeBrowserRailTabs } from '../renderer/store'
 
-import { assembleSave as _asm, planLoad as _pl, parseWorkspaceFile as _parse, serializeWorkspaceFile as _ser } from './workspaceFile'
+import { assembleSave as _asm, planLoad as _pl, parseWorkspaceFile as _parse, requireWorkspaceBrowserSnapshots, serializeWorkspaceFile as _ser } from './workspaceFile'
+
+describe('workspace browser snapshot boundary', () => {
+  it('aborts rather than writing a workspace with missing browser intent', () => {
+    expect(() => requireWorkspaceBrowserSnapshots({ ok: false })).toThrow('browser snapshot unavailable')
+    expect(requireWorkspaceBrowserSnapshots({ ok: true, result: {} })).toEqual({})
+  })
+})
 
 describe('editor panes in .amberws', () => {
   it('save emits an editor pane with its path, no scrollback and no contents', () => {
@@ -52,6 +60,17 @@ describe('editor panes in .amberws', () => {
 })
 
 describe('browser panes in .amberws', () => {
+  it('round-trips a browser-only tab through renderer projection, save, parse, and load plan', () => {
+    const id = 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    const sidecar: LayoutFile = { version: 2, activeWorkspace: 3, workspaces: { '3': { activeTab: 7, tabs: { '7': { tree: null, browser: { id, width: 510, collapsed: true } } } } } }
+    const projected = mergeBrowserRailTabs([], sidecar.workspaces)
+    expect(projected).toEqual([{ ws: 3, tabs: [{ tab: 7, panes: [] }] }])
+    const doc = _asm('one', [{ ws: 3, tabs: [{ tab: 7, panes: [], browser: { mode: 'preview', safeRestoreUrl: 'https://example.test/app?secret=x', width: 510, collapsed: true } }] }], sidecar, {})
+    const parsed = _parse(_ser(doc))
+    const plan = _pl(parsed, { mode: 'new', currentWs: 3, liveWs: [3], mintId: () => 'x', mintBrowserId: () => 'browser-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' })
+    expect(plan.workspaces['4']!.tabs['7']!.browser).toEqual({ id: 'browser-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', width: 510, collapsed: true })
+    expect(plan.browserRails[0]!.browser).toMatchObject({ mode: 'preview', safeRestoreUrl: 'https://example.test/app' })
+  })
   it('save emits a tab-owned v2 browser and no browser tree leaf', () => {
     const doc = _asm('one',
       [{ ws: 1, tabs: [{ tab: 1, panes: [{ name: 'browser-1-1-0-a', cwd: '', kind: 'browser', ord: 0, url: 'https://x.dev' }] }] }],

@@ -66,7 +66,7 @@ describe('TabBrowserHost', () => {
   })
 
   it('emits capacity-wait state and cancels a queued activation', async () => {
-    const events: { type: string; id: string; waiting: boolean }[] = []
+    const events: Array<{ type: string; id: string; waiting?: boolean; status?: unknown }> = []
     const host = new TabBrowserHost(emptyBrowserState(1), factory, Date.now, undefined, () => {}, (event) => events.push(event))
     const opened = []
     for (let i = 0; i < 4; i++) {
@@ -125,6 +125,20 @@ describe('TabBrowserHost', () => {
       { id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', browser: { mode: 'browse', safeRestoreUrl: 'about:blank' } },
     ], [])).toThrow('BROWSER_ID_COLLISION')
     expect(() => host.status('browser-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')).toThrow('NO_BROWSER_FOR_TAB')
+  })
+
+  it('lists, attaches, and deletes bounded recovery items', () => {
+    const state = emptyBrowserState(1)
+    state.migrationRecovery = [
+      { workspace: 1, tab: 2, safeRestoreUrl: 'https://one.test/' },
+      { workspace: 1, tab: 3, safeRestoreUrl: 'https://two.test/' },
+    ]
+    const host = new TabBrowserHost(state, factory)
+    expect(host.recoveryItems()).toHaveLength(2)
+    host.attachRecovery(0, 'browser-cccccccccccccccccccccccccccccccc')
+    expect(host.status('browser-cccccccccccccccccccccccccccccccc').safeRestoreUrl).toBe('https://one.test/')
+    host.deleteRecovery(0)
+    expect(host.recoveryItems()).toEqual([])
   })
 
   it('stops an active page load without closing the browser', async () => {

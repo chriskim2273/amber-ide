@@ -1,31 +1,16 @@
 import { describe, it, expect } from 'vitest'
-import { initialState, reduce, groupSessions, mergeBrowsers, isAgentKind, paneDot, tabDot, hasActivity, shouldHintTerminalFocus, shouldResumeMemoryParked, parkedOverlayText, resourcePressureMessage, type PaneModel, type WorkspaceModel } from './store'
+import { initialState, reduce, groupSessions, mergeBrowserRailTabs, isAgentKind, paneDot, tabDot, hasActivity, shouldHintTerminalFocus, shouldResumeMemoryParked, parkedOverlayText, resourcePressureMessage, type PaneModel, type WorkspaceModel } from './store'
 import type { SessionInfo } from '../shared/proto'
 
-describe('mergeBrowsers', () => {
-  it('injects a browser pane into an existing tab, sorted by ord', () => {
-    const ws: WorkspaceModel[] = [{ ws: 1, tabs: [{ tab: 1, panes: [
-      { name: 'amber-1-1-0-a', cwd: '/', kind: 'shell', alive: true, ord: 0, deadCode: null }] }] }]
-    const out = mergeBrowsers(ws, { 'browser-1-1-1-b': { ws: 1, tab: 1, ord: 1, url: 'https://x' } })
-    const panes = out[0]!.tabs[0]!.panes
-    expect(panes.map((p) => p.name)).toEqual(['amber-1-1-0-a', 'browser-1-1-1-b'])
-    expect(panes[1]!.kind).toBe('browser')
-    expect(panes[1]!.alive).toBe(true)
+describe('mergeBrowserRailTabs', () => {
+  it('unions browser-only layout workspaces and tabs without inventing panes', () => {
+    const out = mergeBrowserRailTabs([], { '2': { activeTab: 1, tabs: { '1': { tree: null, browser: { id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', width: 420, collapsed: false } } } } })
+    expect(out).toEqual([{ ws: 2, tabs: [{ tab: 1, panes: [] }] }])
   })
-  it('creates a ws/tab for a browser-only grouping', () => {
-    const out = mergeBrowsers([], { 'browser-2-1-0-c': { ws: 2, tab: 1, ord: 0, url: 'https://y' } })
-    expect(out[0]!.ws).toBe(2)
-    expect(out[0]!.tabs[0]!.panes[0]!.name).toBe('browser-2-1-0-c')
-  })
-  it('is a no-op with no browser entries', () => {
-    const ws: WorkspaceModel[] = [{ ws: 1, tabs: [] }]
-    expect(mergeBrowsers(ws, {})).toBe(ws)
-  })
-})
-
-describe('paneDot browser', () => {
-  it('is a browser dot', () => {
-    expect(paneDot('browser', undefined)).toEqual({ cls: 'browser', label: 'browser' })
+  it('retains daemon tabs and adds only missing rail tabs', () => {
+    const ws: WorkspaceModel[] = [{ ws: 1, tabs: [{ tab: 1, panes: [] }] }]
+    const out = mergeBrowserRailTabs(ws, { '1': { activeTab: 1, tabs: { '1': { tree: null }, '2': { tree: null, browser: { id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', width: 420, collapsed: false } } } } })
+    expect(out[0]!.tabs.map((tab) => tab.tab)).toEqual([1, 2])
   })
 })
 

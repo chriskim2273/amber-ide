@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { deriveActiveBrowserId, bindRendererBrowserCommand, removedBrowserIds } from './browserAssociationAuthority'
+import { browserAuthorityChanged, deriveActiveBrowserId, bindRendererBrowserCommand, removedBrowserIds } from './browserAssociationAuthority'
 import type { LayoutFile } from '../shared/layoutFile'
 
 const id = 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
@@ -24,6 +24,15 @@ describe('renderer browser association authority', () => {
       '1': { tree: null, browser: { id, width: 420, collapsed: false } },
     } } } }
     expect(removedBrowserIds(before, after)).toEqual([other])
+  })
+  it('detects structural association and sharing changes without trusting revisions or geometry', () => {
+    const changed = structuredClone(layout)
+    changed.workspaces['1']!.tabs['2']!.browser!.sharedWithPi = true
+    expect(browserAuthorityChanged(layout, changed)).toBe(true)
+    changed.workspaces['1']!.tabs['2']!.browser!.sharedWithPi = false
+    changed.workspaces['1']!.tabs['2']!.browser!.width = 700
+    changed.browserRevision = 99
+    expect(browserAuthorityChanged(layout, changed)).toBe(false)
   })
   it('fails closed without an active association', () => {
     expect(() => bindRendererBrowserCommand(null, { type: 'status', id: other })).toThrow('NO_BROWSER_FOR_TAB')

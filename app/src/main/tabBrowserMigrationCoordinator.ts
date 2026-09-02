@@ -19,19 +19,20 @@ export async function commitBrowserLayoutMutation(
   expectedLayoutVersion: string | null,
   saveLayout: LayoutSave = saveLayoutFile,
   transactionId: () => string = randomUUID,
+  mutateState: (state: BrowserStateFile) => BrowserStateFile = (state) => state,
 ): Promise<SaveLayoutResult> {
   return store.withLock(async (io) => {
     const state = await io.load()
     if (state.pendingTransaction) throw new Error('BROWSER_TRANSACTION_PENDING')
+    const staged = mutateState(state)
     const pending: BrowserStateFile = {
-      ...state, revision: state.revision + 1,
+      ...staged, revision: state.revision + 1,
       pendingTransaction: { id: transactionId(), kind: 'browser-association', expectedLayoutVersion, layoutText },
     }
     await io.save(pending)
     const saved = await saveLayout(layoutPath, layoutText, expectedLayoutVersion)
     if (!('ok' in saved)) {
-      const { pendingTransaction: _pending, ...rolledBack } = pending
-      await io.save({ ...rolledBack, revision: pending.revision + 1 })
+      await io.save({ ...state, revision: pending.revision + 1 })
       return saved
     }
     const { pendingTransaction: _pending, ...committed } = pending

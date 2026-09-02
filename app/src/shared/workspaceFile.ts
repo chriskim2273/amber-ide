@@ -234,6 +234,12 @@ export function treeFromPlaceholders(tree: Node | null, idToName: Record<string,
 // Narrow structural inputs (superset-compatible with store.ts's WorkspaceModel/
 // TabModel/PaneModel) so this module stays pure and never imports the renderer
 // store.
+export type WorkspaceBrowserSnapshots = Record<string, { mode: 'preview' | 'browse'; safeRestoreUrl: string; viewport: { width: number; height: number } }>
+export function requireWorkspaceBrowserSnapshots(reply: { ok?: boolean; result?: WorkspaceBrowserSnapshots }): WorkspaceBrowserSnapshots {
+  if (!reply.ok) throw new Error('browser snapshot unavailable')
+  return reply.result ?? {}
+}
+
 export interface SavePane { name: string; cwd: string; kind: string; ord: number; url?: string; path?: string | null }
 export interface SaveTab { tab: number; panes: SavePane[]; browser?: WsBrowser }
 export interface SaveWorkspace { ws: number; tabs: SaveTab[] }

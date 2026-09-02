@@ -20,6 +20,17 @@ export function BrowserRail(props: {
   const command = async (value: unknown): Promise<BrowserReply> => window.amber.browserCommand(value) as Promise<BrowserReply>
 
   useEffect(() => {
+    return window.amber.onTabBrowserEvent?.((value) => {
+      const event = value as { type?: unknown; id?: unknown; waiting?: unknown }
+      if (event.type === 'capacity-wait' && event.id === props.id && typeof event.waiting === 'boolean') {
+        setStatus((current) => current ? { ...current, ...(event.waiting ? { capacityWaiting: true } : { capacityWaiting: false }) } : current)
+      } else if (event.type === 'runtime' && event.id === props.id && typeof (event as { status?: unknown }).status === 'object') {
+        setStatus((event as { status: BrowserStatus }).status)
+      }
+    })
+  }, [props.id])
+
+  useEffect(() => {
     if (props.designatedPi && !props.controllers.some((controller) => controller.name === props.designatedPi)) {
       props.onPolicy({ sharedWithPi: false })
     }
@@ -46,12 +57,7 @@ export function BrowserRail(props: {
     const observer = new ResizeObserver(() => { void update() })
     observer.observe(element)
     window.addEventListener('resize', update)
-    const poll = window.setInterval(() => {
-      void command({ type: 'status', id: props.id }).then((reply) => {
-        if (!stopped && reply.ok && 'id' in reply.result) setStatus(reply.result)
-      })
-    }, 500)
-    return () => { stopped = true; window.clearInterval(poll); observer.disconnect(); window.removeEventListener('resize', update); void command({ type: 'hide', id: props.id }) }
+    return () => { stopped = true; observer.disconnect(); window.removeEventListener('resize', update); void command({ type: 'hide', id: props.id }) }
   }, [props.id, props.collapsed])
 
   const navigate = async (): Promise<void> => {

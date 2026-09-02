@@ -26,6 +26,9 @@ export class TabBrowserStateStore {
 
   load(): Promise<BrowserStateFile> { return this.withLock((io) => io.load()) }
   save(state: BrowserStateFile): Promise<void> { return this.withLock((io) => io.save(state)) }
+  update(mutator: (current: BrowserStateFile) => BrowserStateFile): Promise<void> {
+    return this.withLock(async (io) => { const current = await io.load(); await io.save(mutator(current)) })
+  }
 
   private async loadDirect(): Promise<BrowserStateFile> {
     try { return parseBrowserState(await readFile(this.path, 'utf8')) }

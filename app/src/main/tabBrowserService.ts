@@ -4,19 +4,37 @@ import { TabBrowserHost, type BrowserRuntimeStatus } from './tabBrowserHost'
 import { isOpaqueBrowserId, safeRestoreUrl, type BrowserId } from '../shared/tabBrowser'
 import type { WsBrowser } from '../shared/workspaceFile'
 import { TabBrowserStateStore } from './tabBrowserStateStore'
+import type { BrowserStateFile } from '../shared/tabBrowserState'
 
 export type TabBrowserCommand =
   | { type: 'open' }
+  | { type: 'close' }
+  | { type: 'share'; sharedWithPi: boolean }
+  | { type: 'designate'; designatedPi?: string }
   | { type: 'show'; id: string; bounds: Rectangle }
   | { type: 'hide'; id: string }
   | { type: 'bounds'; id: string; bounds: Rectangle }
   | { type: 'navigate'; id: string; url: string; pageIncarnation: string; expectedGeneration: number }
   | { type: 'status'; id: string }
   | { type: 'stop'; id: string }
-  | { type: 'close'; id: string }
+  | { type: 'destroy'; id: string }
+
+export interface WorkspaceBrowserImport { entries: { id: BrowserId; browser: WsBrowser }[]; recovery: { ws: number; tab: number; browser: WsBrowser }[] }
+
+export function stageWorkspaceBrowserState(state: BrowserStateFile, input: WorkspaceBrowserImport, now = Date.now()): BrowserStateFile {
+  const records = { ...state.records }
+  for (const { id, browser } of input.entries) {
+    if (records[id]) throw new Error('BROWSER_ID_COLLISION')
+    records[id] = { id, profileId: 'global', mode: browser.mode, safeRestoreUrl: safeRestoreUrl(browser.safeRestoreUrl), title: '',
+      viewport: browser.viewport ?? { width: 1280, height: 800 }, lifecycle: 'frozen', stateRevision: 1, lastUsedAt: now, lastFocusedAt: 0 }
+  }
+  if (state.migrationRecovery.length + input.recovery.length > 100) throw new Error('BROWSER_RECOVERY_LIMIT')
+  return { ...state, records, migrationRecovery: [...state.migrationRecovery, ...input.recovery.map((item) => ({ workspace: item.ws, tab: item.tab, safeRestoreUrl: safeRestoreUrl(item.browser.safeRestoreUrl) }))] }
+}
 
 export class TabBrowserService {
-  private commandQueue: Promise<void> = Promise.resolve()
+  private readonly browserQueues = new Map<string, Promise<void>>()
+  private eventSink: (event: unknown) => void = () => {}
   private persistQueue: Promise<void> = Promise.resolve()
 
   private constructor(
@@ -34,14 +52,15 @@ export class TabBrowserService {
     let service!: TabBrowserService
     const host = new TabBrowserHost(state, pages, Date.now, undefined, () => {
       void service.schedulePersist().catch((error) => console.error('tab browser state save failed', error))
-    })
+    }, (event) => service.eventSink(event))
     service = new TabBrowserService(store, pages, host)
     return service
   }
 
   setWindow(window: BrowserWindow): void { this.pages.setWindow(window) }
+  setEventSink(sink: (event: unknown) => void): void { this.eventSink = sink }
 
-  async importWorkspaceBrowsers(input: { entries: { id: BrowserId; browser: WsBrowser }[]; recovery: { ws: number; tab: number; browser: WsBrowser }[] }): Promise<void> {
+  async importWorkspaceBrowsers(input: WorkspaceBrowserImport): Promise<void> {
     const { entries, recovery } = input
     const ids = new Set<string>()
     for (const entry of entries) {
@@ -54,24 +73,36 @@ export class TabBrowserService {
   }
 
   workspaceSnapshot(): ReturnType<TabBrowserHost['workspaceSnapshot']> { return this.host.workspaceSnapshot() }
+  recoveryItems(): ReturnType<TabBrowserHost['recoveryItems']> { return this.host.recoveryItems() }
+  async deleteRecovery(index: number): Promise<void> { this.host.deleteRecovery(index); await this.schedulePersist() }
+  async attachRecovery(index: number, id: BrowserId): Promise<BrowserRuntimeStatus> { const status = this.host.attachRecovery(index, id); await this.schedulePersist(); return status }
 
   private schedulePersist(): Promise<void> {
-    const save = this.persistQueue.then(() => this.store.save(this.host.snapshot()))
+    const save = this.persistQueue.then(() => {
+      const runtime = this.host.snapshot()
+      return this.store.update((current) => ({
+        ...current,
+        revision: current.revision + 1,
+        profiles: runtime.profiles,
+        records: runtime.records,
+        migrationRecovery: runtime.migrationRecovery.length >= current.migrationRecovery.length ? runtime.migrationRecovery : current.migrationRecovery,
+      }))
+    })
     this.persistQueue = save.catch(() => {})
     return save
   }
 
-  async command(command: TabBrowserCommand, signal?: AbortSignal): Promise<BrowserRuntimeStatus | { closed: true }> {
-    // Observations and capacity-releasing commands must not sit behind an
-    // activation wait; otherwise four visible/protected pages can deadlock.
-    if (command.type === 'status' || command.type === 'hide' || command.type === 'close') return this.runCommand(command, signal)
-    let resolve!: (value: BrowserRuntimeStatus | { closed: true }) => void
-    let reject!: (reason: unknown) => void
-    const result = new Promise<BrowserRuntimeStatus | { closed: true }>((ok, fail) => { resolve = ok; reject = fail })
-    const run = this.commandQueue.then(async () => {
-      try { resolve(await this.runCommand(command, signal)) } catch (error) { reject(error) }
-    })
-    this.commandQueue = run.catch(() => {})
+  command(command: TabBrowserCommand, signal?: AbortSignal): Promise<BrowserRuntimeStatus | { closed: true }> {
+    // Opens must reach the host concurrently so the global capacity FIFO sees
+    // every contender. Observations and hide also cannot sit behind a wait.
+    if (command.type === 'open' || command.type === 'status' || command.type === 'hide' || command.type === 'destroy') return this.runCommand(command, signal)
+    if (command.type === 'close' || command.type === 'share' || command.type === 'designate') return Promise.reject(new Error('ASSOCIATION_COMMAND_REQUIRES_MAIN'))
+    const key = command.id
+    const prior = this.browserQueues.get(key) ?? Promise.resolve()
+    const result = prior.catch(() => {}).then(() => this.runCommand(command, signal))
+    const tail = result.then(() => {}, () => {})
+    this.browserQueues.set(key, tail)
+    void tail.finally(() => { if (this.browserQueues.get(key) === tail) this.browserQueues.delete(key) })
     return result
   }
 
@@ -95,7 +126,8 @@ export class TabBrowserService {
       }
       case 'status': return this.host.status(command.id)
       case 'stop': return this.host.stop(command.id)
-      case 'close': this.host.close(command.id); await this.schedulePersist(); return { closed: true }
+      case 'destroy': this.host.close(command.id); await this.schedulePersist(); return { closed: true }
+      case 'close': case 'share': case 'designate': throw new Error('ASSOCIATION_COMMAND_REQUIRES_MAIN')
     }
   }
 }
@@ -138,12 +170,17 @@ export function parseWorkspaceBrowserImports(value: unknown): { entries: { id: B
 export function parseTabBrowserCommand(value: unknown): TabBrowserCommand {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new Error('INVALID_REQUEST')
   const v = value as Record<string, unknown>
-  if (v['type'] === 'open') {
+  if (v['type'] === 'open' || v['type'] === 'close') {
     if (!exact(v, ['type'])) throw new Error('INVALID_REQUEST')
-    return { type: 'open' }
+    return { type: v['type'] }
+  }
+  if (v['type'] === 'share' && exact(v, ['type', 'sharedWithPi']) && typeof v['sharedWithPi'] === 'boolean') return { type: 'share', sharedWithPi: v['sharedWithPi'] }
+  if (v['type'] === 'designate' && (exact(v, ['type']) || exact(v, ['type', 'designatedPi']))) {
+    if (v['designatedPi'] !== undefined && (typeof v['designatedPi'] !== 'string' || v['designatedPi'].length > 256)) throw new Error('INVALID_REQUEST')
+    return { type: 'designate', ...(typeof v['designatedPi'] === 'string' ? { designatedPi: v['designatedPi'] } : {}) }
   }
   if (typeof v['id'] !== 'string' || !isOpaqueBrowserId(v['id'])) throw new Error('INVALID_REQUEST')
-  if (v['type'] === 'hide' || v['type'] === 'status' || v['type'] === 'stop' || v['type'] === 'close') {
+  if (v['type'] === 'hide' || v['type'] === 'status' || v['type'] === 'stop') {
     if (!exact(v, ['type', 'id'])) throw new Error('INVALID_REQUEST')
     return { type: v['type'], id: v['id'] }
   }

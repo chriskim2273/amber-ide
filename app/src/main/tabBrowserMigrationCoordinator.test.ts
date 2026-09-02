@@ -32,6 +32,16 @@ describe('coordinateTabBrowserMigration', () => {
     expect(state.pendingTransaction).toBeUndefined()
   })
 
+  it('rolls back staged browser resources when the layout CAS fails', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'amber-browser-rollback-')); dirs.push(dir)
+    const path = join(dir, 'ui-layout.json'); await saveLayoutFile(path, JSON.stringify({ version: 2, activeWorkspace: 1, workspaces: {} }), null)
+    const store = new TabBrowserStateStore(dir); const before = await store.load()
+    const result = await commitBrowserLayoutMutation(path, store, '{}', 'stale', undefined, () => 'tx', (state) => ({ ...state, migrationRecovery: [{ workspace: 1, tab: 1, safeRestoreUrl: 'https://staged.test/' }] }))
+    expect(result).toHaveProperty('conflict')
+    expect((await store.load()).migrationRecovery).toEqual(before.migrationRecovery)
+    expect((await store.load()).pendingTransaction).toBeUndefined()
+  })
+
   it('journals ordinary browser association mutations before the layout CAS', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'amber-browser-mutate-')); dirs.push(dir)
     const path = join(dir, 'ui-layout.json'); await saveLayoutFile(path, JSON.stringify({ version: 2, activeWorkspace: 1, browserRevision: 0, workspaces: {} }), null)

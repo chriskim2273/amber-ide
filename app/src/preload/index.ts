@@ -1,4 +1,4 @@
-import { ipcRenderer, contextBridge } from 'electron'
+import { ipcRenderer, contextBridge, type IpcRendererEvent } from 'electron'
 import type { LoadLayoutResult, SaveLayoutResult } from '../shared/layoutFile'
 import type { LoadProductivityResult, SaveProductivityResult } from '../shared/productivity'
 import type { CheckpointSummary } from '../shared/checkpoint'
@@ -61,6 +61,12 @@ contextBridge.exposeInMainWorld('amber', {
   browserCommand: (command: unknown): Promise<unknown> => ipcRenderer.invoke('browser:command', command),
   importWorkspaceBrowsers: (entries: unknown): Promise<unknown> => ipcRenderer.invoke('browser:import-workspace', entries),
   snapshotWorkspaceBrowsers: (): Promise<unknown> => ipcRenderer.invoke('browser:workspace-snapshot'),
+  browserRecovery: (command: unknown): Promise<unknown> => ipcRenderer.invoke('browser:recovery', command),
+  onTabBrowserEvent: (cb: (event: unknown) => void): (() => void) => {
+    const listener = (_event: IpcRendererEvent, value: unknown): void => cb(value)
+    ipcRenderer.on('tab-browser-event', listener)
+    return () => ipcRenderer.removeListener('tab-browser-event', listener)
+  },
   onBrowserAssociation: (cb: (association: unknown) => void): void => {
     ipcRenderer.on('tab-browser-association', (_event, association) => cb(association))
   },

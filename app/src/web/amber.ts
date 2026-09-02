@@ -510,6 +510,8 @@ export function createAmber(deps: AmberDeps): WebAmber {
     browserCommand: async (): Promise<unknown> => ({ ok: false, error: 'BROWSER_HOST_UNAVAILABLE' }),
     importWorkspaceBrowsers: async (): Promise<unknown> => ({ ok: false, error: 'BROWSER_HOST_UNAVAILABLE' }),
     snapshotWorkspaceBrowsers: async (): Promise<unknown> => ({ ok: true, result: {} }),
+    browserRecovery: async (): Promise<unknown> => ({ ok: false, error: 'BROWSER_HOST_UNAVAILABLE' }),
+    onTabBrowserEvent: (): (() => void) => () => {},
     onBrowserAssociation: (): void => {},
 
     // --- native browser API, not a stub (spec §3 "Clipboard" row) ----------
