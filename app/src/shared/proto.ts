@@ -52,6 +52,31 @@ export interface SessionInfo {
   claude_id?: string | undefined
 }
 
+/**
+ * One quota window as the provider reports it. `percent` is USED, 0..100 —
+ * the UI derives "remaining" (see shared/usageView.ts). Amber never computes a
+ * percentage of its own.
+ */
+export interface Gauge {
+  kind: string
+  label: string
+  percent: number
+  /** Unix seconds, or null when the provider omits it. */
+  resets_at: number | null
+  /** The window rolled since this sample: render as words, never the number. */
+  stale: boolean
+}
+
+/** One provider's quota snapshot. Anything but state 'ok' renders as words. */
+export interface ProviderUsage {
+  provider: string
+  plan: string | null
+  gauges: Gauge[]
+  updated: number
+  state: 'ok' | 'unavailable' | 'needs-auth' | 'error' | string
+  detail: string | null
+}
+
 export type ControlMsg =
   | { kind: 'Hello' }
   | { kind: 'ListSessions' }
@@ -90,6 +115,10 @@ export type ControlMsg =
   | { kind: 'Suspend'; name: string }
   | { kind: 'Resume'; name: string }
   | { kind: 'Resize'; name: string; cols: number; rows: number }
+  // Agent plan quota (design 2026-09-01). GetUsage is a request; the daemon
+  // answers from its 60 s poller cache with Usage.
+  | { kind: 'GetUsage' }
+  | { kind: 'Usage'; providers: ProviderUsage[] }
   // Aggregate memory budget (see shared/budget.ts for the display side).
   // `mb` is MiB; 0 = auto (half of physical RAM, capped by the service cap).
   | { kind: 'SetMemoryBudget'; mb: number }
@@ -180,6 +209,10 @@ function msgToJson(m: ControlMsg): unknown {
       return { Resume: { name: m.name } }
     case 'Resize':
       return { Resize: { name: m.name, cols: m.cols, rows: m.rows } }
+    case 'GetUsage':
+      return 'GetUsage'
+    case 'Usage':
+      return { Usage: { providers: m.providers } }
     case 'SetMemoryBudget':
       return { SetMemoryBudget: { mb: m.mb } }
     case 'GetMemoryBudget':
@@ -205,11 +238,40 @@ function msgToJson(m: ControlMsg): unknown {
   }
 }
 
+function decodeGauge(v: unknown): Gauge {
+  const o = (v ?? {}) as Record<string, unknown>
+  return {
+    kind: typeof o['kind'] === 'string' ? o['kind'] : '',
+    label: typeof o['label'] === 'string' ? o['label'] : '',
+    percent: typeof o['percent'] === 'number' ? o['percent'] : 0,
+    resets_at: typeof o['resets_at'] === 'number' ? o['resets_at'] : null,
+    stale: o['stale'] === true,
+  }
+}
+
+/**
+ * Tolerant by design: every field but `provider`/`state` is serde-defaulted on
+ * the Rust side, and the same decoder serves the web build's `/api/usage`
+ * body, which is JSON from a route rather than a typed frame.
+ */
+export function decodeProviderUsage(v: unknown): ProviderUsage {
+  const o = (v ?? {}) as Record<string, unknown>
+  return {
+    provider: typeof o['provider'] === 'string' ? o['provider'] : '',
+    plan: typeof o['plan'] === 'string' ? o['plan'] : null,
+    gauges: Array.isArray(o['gauges']) ? (o['gauges'] as unknown[]).map(decodeGauge) : [],
+    updated: typeof o['updated'] === 'number' ? o['updated'] : 0,
+    state: typeof o['state'] === 'string' ? o['state'] : 'unavailable',
+    detail: typeof o['detail'] === 'string' ? o['detail'] : null,
+  }
+}
+
 function jsonToMsg(v: unknown): ControlMsg | null {
   if (typeof v === 'string') {
     if (v === 'Hello' || v === 'ListSessions' || v === 'WatchSessions' ||
         v === 'ListSessionsDetailed' || v === 'Snapshot' || v === 'SnapshotOk' ||
-        v === 'ClearRecoveryEvents' || v === 'RecoveryEventsCleared') {
+        v === 'ClearRecoveryEvents' || v === 'RecoveryEventsCleared' ||
+        v === 'GetUsage') {
       return { kind: v }
     }
     return null
@@ -263,6 +325,10 @@ function jsonToMsg(v: unknown): ControlMsg | null {
       case 'Kill': return { kind: 'Kill', name: body['name'] as string }
       case 'Rename': return { kind: 'Rename', from: body['from'] as string, to: body['to'] as string }
       case 'Resize': return { kind: 'Resize', name: body['name'] as string, cols: body['cols'] as number, rows: body['rows'] as number }
+      case 'Usage': {
+        const raw = Array.isArray(body['providers']) ? (body['providers'] as unknown[]) : []
+        return { kind: 'Usage', providers: raw.map(decodeProviderUsage) }
+      }
       case 'SetMemoryBudget': return { kind: 'SetMemoryBudget', mb: (body['mb'] as number) ?? 0 }
       case 'GetMemoryBudget': return { kind: 'GetMemoryBudget' }
       case 'BudgetApplied':
