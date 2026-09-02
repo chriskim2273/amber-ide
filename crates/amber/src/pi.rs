@@ -52,7 +52,9 @@ async function browserRequest(action: unknown, signal?: AbortSignal) {
   const amberSession = process.env.AMBER_SESSION
   if (!amberSession) throw new Error("Amber browser tools are unavailable outside an Amber pane")
   const paths = browserPaths()
-  const token = (await readFile(paths.token, "utf8")).trim()
+  let token: string
+  try { token = (await readFile(paths.token, "utf8")).trim() }
+  catch { throw new Error("Amber browser host token is unavailable") }
   if (!/^[A-Za-z0-9_-]{43}$/.test(token)) throw new Error("Amber browser host token is invalid")
   if (signal?.aborted) throw new Error("Amber browser request cancelled")
   return await new Promise<unknown>((resolve, reject) => {
@@ -66,7 +68,7 @@ async function browserRequest(action: unknown, signal?: AbortSignal) {
     const timer = setTimeout(() => finish(new Error("Amber browser host timed out")), actionTimeout + 2000)
     const abort = () => finish(new Error("Amber browser request cancelled"))
     signal?.addEventListener("abort", abort, { once: true })
-    socket.on("error", (error) => finish(error))
+    socket.on("error", () => finish(new Error("Amber browser host is unavailable")))
     socket.on("connect", () => socket.write(encode({ token })))
     socket.on("data", (chunk) => {
       buffer = Buffer.concat([buffer, chunk])
