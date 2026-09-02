@@ -4,13 +4,15 @@ import { createBrowserId, isOpaqueBrowserId, safeRestoreUrl, type BrowserId } fr
 import type { WsBrowser } from '../shared/workspaceFile'
 import type { BrowserRecord, BrowserStateFile } from '../shared/tabBrowserState'
 import type { BrowserAutomation, BrowserBinaryAttachment } from './browserAutomation'
-import type { BrowserToolAction } from './browserToolProtocol'
+import type { BrowserInteraction, BrowserToolAction } from './browserToolProtocol'
+import { classifyInteraction, type InteractionClassification, type InteractionTargetMetadata } from './browserApproval'
 
 export type TabBrowserPageEvent =
   | { type: 'navigation-started' }
   | { type: 'navigation-committed'; url: string }
   | { type: 'loading-stopped' }
   | { type: 'title'; title: string }
+  | { type: 'dialog'; dialogType: string; message: string }
   | { type: 'crashed'; reason: string }
 
 export interface TabBrowserPage {
@@ -27,7 +29,8 @@ export interface TabBrowserPageFactory {
 }
 export interface BrowserRuntimeStatus extends BrowserRecord { pageIncarnation: string; generation: number; loading: boolean; capacityWaiting?: boolean }
 export type TabBrowserHostEvent = { type: 'capacity-wait'; id: BrowserId; waiting: boolean } | { type: 'runtime'; id: BrowserId; status: BrowserRuntimeStatus }
-interface Runtime { page: TabBrowserPage; incarnation: string; generation: number; loading: boolean; automationNavigationPending: boolean }
+interface Runtime { page: TabBrowserPage; incarnation: string; generation: number; loading: boolean; automationNavigationPending: boolean; visible: boolean }
+export interface InteractionApprovalRequest { operation: BrowserInteraction; target: InteractionTargetMetadata; classification: InteractionClassification; origin: string; pageIncarnation: string; generation: number }
 
 export class TabBrowserHost {
   private readonly capacity = new BrowserCapacity(4)
@@ -60,7 +63,7 @@ export class TabBrowserHost {
       () => { runtime.generation += 1; runtime.page.automation?.invalidate(); this.onStateChange(); this.emitRuntime(id) },
       (event) => this.pageEvent(id, runtime, event),
     )
-    runtime = { page, incarnation: randomUUID(), generation: 0, loading: false, automationNavigationPending: false }
+    runtime = { page, incarnation: randomUUID(), generation: 0, loading: false, automationNavigationPending: false, visible: false }
     this.runtimes.set(id, runtime)
     this.capacity.markLive(id, this.now())
     return runtime
@@ -86,6 +89,8 @@ export class TabBrowserHost {
     } else if (event.type === 'title') {
       record.title = event.title.slice(0, 512)
       record.stateRevision += 1
+    } else if (event.type === 'dialog') {
+      runtime.generation += 1; runtime.page.automation?.invalidate()
     } else {
       runtime.automationNavigationPending = false
       runtime.loading = false
@@ -123,9 +128,9 @@ export class TabBrowserHost {
     catch (error) { this.capacity.rollbackActivation(id); delete this.state.records[id]; this.onStateChange(); throw error }
     this.capacity.settleActivation(id)
     if (options.visible) {
-      for (const [otherId, other] of this.runtimes) if (otherId !== id) { other.page.hide(); this.capacity.protect(otherId, false) }
-      runtime.page.show(); this.capacity.protect(id, true)
-    } else runtime.page.hide()
+      for (const [otherId, other] of this.runtimes) if (otherId !== id) { other.page.hide(); other.visible = false; this.capacity.protect(otherId, false) }
+      runtime.page.show(); runtime.visible = true; this.capacity.protect(id, true)
+    } else { runtime.page.hide(); runtime.visible = false }
     return { status: this.status(id), page: runtime.page }
   }
 
@@ -144,13 +149,13 @@ export class TabBrowserHost {
     const record = this.record(id); const runtime = this.runtimes.get(record.id)
     if (!runtime) throw new Error('BROWSER_FROZEN')
     if (bounds) runtime.page.setBounds?.(bounds)
-    for (const [otherId, other] of this.runtimes) if (otherId !== record.id) { other.page.hide(); this.capacity.protect(otherId, false) }
-    runtime.page.show(); this.capacity.protect(record.id, true)
+    for (const [otherId, other] of this.runtimes) if (otherId !== record.id) { other.page.hide(); other.visible = false; this.capacity.protect(otherId, false) }
+    runtime.page.show(); runtime.visible = true; this.capacity.protect(record.id, true)
     record.lastFocusedAt = this.now(); this.capacity.touch(record.id, record.lastFocusedAt)
     return this.status(record.id)
   }
 
-  hide(id: string): void { const record = this.record(id); this.runtimes.get(record.id)?.page.hide(); this.capacity.protect(record.id, false) }
+  hide(id: string): void { const record = this.record(id); const runtime = this.runtimes.get(record.id); runtime?.page.hide(); if (runtime) runtime.visible = false; this.capacity.protect(record.id, false) }
 
   setBounds(id: string, bounds: { x: number; y: number; width: number; height: number }): void {
     if (![bounds.x, bounds.y, bounds.width, bounds.height].every(Number.isFinite) || bounds.width < 1 || bounds.height < 1) throw new Error('INVALID_BOUNDS')
@@ -183,7 +188,7 @@ export class TabBrowserHost {
     return this.status(record.id)
   }
 
-  async runAutomation(id: string, action: BrowserToolAction, signal: AbortSignal): Promise<unknown | BrowserBinaryAttachment> {
+  async runAutomation(id: string, action: BrowserToolAction, signal: AbortSignal, approve?: (request: InteractionApprovalRequest, signal: AbortSignal) => Promise<void>): Promise<unknown | BrowserBinaryAttachment> {
     const record = this.record(id)
     const runtime = this.runtimes.get(record.id)
     if (!runtime || !runtime.page.automation) throw new Error('BROWSER_FROZEN')
@@ -201,7 +206,18 @@ export class TabBrowserHost {
       else if (action.type === 'console') result = automation.consoleSince(action.cursor, action.levels, action.limit)
       else if (action.type === 'network') result = automation.networkSince(action.cursor, action.limit, action.failedOnly)
       else if (action.type === 'wait') result = await automation.wait(lease, action.condition, action.timeoutMs, signal, () => this.runtimes.get(record.id) === runtime && runtime.generation === action.expectedGeneration)
-      else if (action.type === 'reload' || action.type === 'history') {
+      else if (action.type === 'interact') {
+        const prepared = await automation.prepareInteraction(lease, action.operation, signal)
+        const classification = classifyInteraction(action.operation, prepared.target)
+        if (classification.consequential) {
+          if (!approve) throw new Error('APPROVAL_REQUIRED')
+          await approve({ operation: action.operation, target: prepared.target, classification, origin: new URL(record.safeRestoreUrl).origin, pageIncarnation: runtime.incarnation, generation: runtime.generation }, signal)
+        }
+        if (signal.aborted) throw new Error('ACTION_CANCELLED')
+        if (this.runtimes.get(record.id) !== runtime || runtime.incarnation !== action.pageIncarnation || runtime.generation !== action.expectedGeneration) throw new Error('STALE_GENERATION')
+        runtime.generation += 1; generationDelta = 1; automation.invalidate()
+        result = await automation.executeInteraction(prepared, signal, () => this.runtimes.get(record.id) === runtime && runtime.incarnation === action.pageIncarnation && runtime.generation === action.expectedGeneration + 1)
+      } else if (action.type === 'reload' || action.type === 'history') {
         runtime.automationNavigationPending = true
         try { result = action.type === 'reload' ? automation.reload(action.ignoreCache) : automation.history(action.direction) }
         catch (error) { runtime.automationNavigationPending = false; throw error }
@@ -257,8 +273,15 @@ export class TabBrowserHost {
     } finally { this.capacity.settleActivation(record.id) }
   }
 
+  revokePi(id: string): void {
+    const record = this.record(id), runtime = this.runtimes.get(record.id)
+    if (runtime) { runtime.generation += 1; runtime.page.automation?.invalidate(); this.emitRuntime(record.id) }
+  }
+
   protectApproval(id: string, protectedValue: boolean): void {
-    const record = this.record(id); this.capacity.protectFor(record.id, 'approval', protectedValue)
+    const record = this.record(id); const runtime = this.runtimes.get(record.id)
+    this.capacity.protectFor(record.id, 'approval', protectedValue)
+    if (runtime?.visible) { if (protectedValue) runtime.page.hide(); else runtime.page.show() }
   }
 
   recoveryItems(): { index: number; workspace: number; tab: number; safeRestoreUrl: string }[] {

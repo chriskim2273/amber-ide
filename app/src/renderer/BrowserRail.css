@@ -8,5 +8,7 @@
 .tab-browser-chrome select { max-width: 92px; height: 30px; background: var(--surface, #17171d); color: inherit; border: 1px solid var(--border); border-radius: 5px; }
 .tab-browser-share { display: inline-flex; align-items: center; gap: 3px; font-size: 11px; white-space: nowrap; }
 .tab-browser-error { flex: 0 0 auto; padding: 6px 8px; background: #7f1d1d; color: white; font-size: 12px; }
+.tab-browser-approval { position: absolute; z-index: 8; inset: 48px 12px auto 12px; padding: 14px; display: grid; gap: 8px; border: 1px solid var(--accent); border-radius: 8px; background: var(--surface, #17171d); box-shadow: 0 12px 40px #000a; font-size: 12px; }
+.tab-browser-approval-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .tab-browser-grip { position: absolute; z-index: 3; left: -4px; top: 0; bottom: 0; width: 8px; cursor: col-resize; }
 .tab-browser-grip:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }

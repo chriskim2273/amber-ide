@@ -1,6 +1,6 @@
 import { createServer, type Server, type Socket } from 'node:net'
 import { mkdir, open, readFile, unlink, lstat } from 'node:fs/promises'
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { dirname } from 'node:path'
 import type { LayoutFile } from '../shared/layoutFile'
 import type { TabBrowserCommand } from './tabBrowserService'
@@ -86,8 +86,12 @@ export async function dispatchAttachedBrokerAction(
   try {
     let result: unknown
     try { result = await dispatch(command, controller.signal, checkAuthority) }
-    catch (error) { if (revoked) throw new Error('STALE_BROWSER_CONTEXT'); throw error }
-    if (!(await checkAuthority())) { revoked = true; controller.abort(); throw new Error('STALE_BROWSER_CONTEXT') }
+    catch (error) {
+      if (revoked && error instanceof Error && error.message.endsWith('_NO_ROLLBACK')) throw error
+      if (revoked) throw new Error('STALE_BROWSER_CONTEXT')
+      throw error
+    }
+    if (!(await checkAuthority())) { revoked = true; controller.abort(); throw new Error(action.type === 'interact' ? 'STALE_BROWSER_CONTEXT_NO_ROLLBACK' : 'STALE_BROWSER_CONTEXT') }
     return result
   } finally {
     clearInterval(timer); signal.removeEventListener('abort', abortFromCaller)
@@ -115,6 +119,9 @@ function frame(value: unknown): Buffer {
 function binaryFrameHeader(value: Buffer): Buffer {
   if (value.length > MAX_BINARY_FRAME) throw new Error('REQUEST_LIMIT')
   const out = Buffer.allocUnsafe(4); out.writeUInt32BE(value.length); return out
+}
+export function brokerRequestDigest(request: Pick<BrokerRequest, 'sequence' | 'amberSession' | 'action'>): string {
+  return createHash('sha256').update(JSON.stringify({ sequence: request.sequence, amberSession: request.amberSession, action: request.action })).digest('hex')
 }
 export function safeBrokerError(error: unknown): string {
   const raw = error instanceof Error ? error.message : 'INTERNAL_ERROR'
@@ -153,6 +160,7 @@ export class TabBrowserBrokerServer {
   private readonly results = new Map<string, { digest: string; promise: Promise<unknown> }>()
   private readonly queues = new Map<string, Promise<void>>()
   private readonly queueDepth = new Map<string, number>()
+  private readonly activeRequests = new Map<AbortController, string>()
   constructor(
     private readonly socketPath: string,
     private readonly tokenPath: string,
@@ -206,7 +214,7 @@ export class TabBrowserBrokerServer {
             }
             const request = parseBrokerRequest(value); requestId = request.requestId
             cacheKey = `${request.clientInstanceId}:${request.requestId}`
-            const digest = JSON.stringify({ sequence: request.sequence, amberSession: request.amberSession, action: request.action })
+            const digest = brokerRequestDigest(request)
             const cached = this.results.get(cacheKey)
             let result: unknown
             if (cached) {
@@ -218,11 +226,13 @@ export class TabBrowserBrokerServer {
               if (request.sequence <= previousSequence) throw new Error('ACTION_CANCELLED')
               this.highWater.set(request.clientInstanceId, request.sequence)
               if (this.highWater.size > 1024) this.highWater.delete(this.highWater.keys().next().value!)
-              const controller = new AbortController(); active.add(controller)
+              const key = request.amberSession, depth = this.queueDepth.get(key) ?? 0
+              if (depth >= 16) throw new Error('REQUEST_LIMIT')
+              const controller = new AbortController(); active.add(controller); this.activeRequests.set(controller, request.amberSession)
               let operationBarrier: Promise<void> = Promise.resolve()
               const execute = async (): Promise<unknown> => {
-                if (controller.signal.aborted) throw new Error('ACTION_CANCELLED')
-                if (this.inFlight >= 32) throw new Error('REQUEST_LIMIT')
+                if (controller.signal.aborted) { active.delete(controller); this.activeRequests.delete(controller); throw new Error('ACTION_CANCELLED') }
+                if (this.inFlight >= 32) { active.delete(controller); this.activeRequests.delete(controller); throw new Error('REQUEST_LIMIT') }
                 this.inFlight += 1
                 try {
                   const timeoutMs = this.options.requestTimeoutMs ?? (request.action.type === 'wait' ? Math.min(121_000, request.action.timeoutMs + 1_000) : 30_000)
@@ -234,10 +244,8 @@ export class TabBrowserBrokerServer {
                   try { return await Promise.race([operation, timeout]) }
                   catch (error) { if (error instanceof Error && error.message === 'ACTION_TIMEOUT') controller.abort(); throw error }
                   finally { if (timer) clearTimeout(timer); socket.setTimeout(idleTimeoutMs) }
-                } finally { active.delete(controller); this.inFlight -= 1 }
+                } finally { active.delete(controller); this.activeRequests.delete(controller); this.inFlight -= 1 }
               }
-              const key = request.amberSession, depth = this.queueDepth.get(key) ?? 0
-              if (depth >= 16) throw new Error('REQUEST_LIMIT')
               this.queueDepth.set(key, depth + 1)
               const prior = this.queues.get(key) ?? Promise.resolve()
               const promise = prior.catch(() => {}).then(execute)
@@ -269,6 +277,9 @@ export class TabBrowserBrokerServer {
         })
       }
     })
+  }
+  cancelController(amberSession: string): void {
+    for (const [controller, session] of this.activeRequests) if (session === amberSession) controller.abort()
   }
   async close(): Promise<void> {
     for (const socket of this.sockets) socket.destroy()

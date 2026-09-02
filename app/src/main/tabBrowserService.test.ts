@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -17,6 +17,8 @@ describe('parseTabBrowserCommand', () => {
     expect(parseTabBrowserCommand({ type: 'share', sharedWithPi: true })).toEqual({ type: 'share', sharedWithPi: true })
     expect(parseTabBrowserCommand({ type: 'designate', designatedPi: 'amber-1-1-0-pi' })).toEqual({ type: 'designate', designatedPi: 'amber-1-1-0-pi' })
     expect(parseTabBrowserCommand({ type: 'show', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', bounds: { x: 1, y: 2, width: 3, height: 4 } })).toEqual({ type: 'show', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', bounds: { x: 1, y: 2, width: 3, height: 4 } })
+    expect(parseTabBrowserCommand({ type: 'stopPi' }).type).toBe('stopPi')
+    expect(parseTabBrowserCommand({ type: 'resolveApproval', approvalId: 'a', digest: 'a'.repeat(64), decision: 'approve-once' }).type).toBe('resolveApproval')
   })
   it('rejects generic methods, unknown keys, invalid ids, and unsafe geometry', () => {
     expect(() => parseTabBrowserCommand({ type: 'cdp', method: 'Runtime.evaluate' })).toThrow('INVALID_REQUEST')
@@ -111,6 +113,43 @@ describe('TabBrowserService dispatch authorization', () => {
     expect(Object.keys(disk.records)).toHaveLength(4)
     const subsequent = await service.command({ type: 'open' }, undefined, () => true)
     expect(subsequent).toHaveProperty('id')
+  })
+})
+
+describe('TabBrowserService approvals and Stop Pi', () => {
+  it('occludes while awaiting an exact approval and never emits a credential value', async () => {
+    const state = emptyBrowserState(1), events: Array<Record<string, unknown>> = [], protectedValues: boolean[] = []
+    const id = 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    const host = {
+      runAutomation: async (_id: string, action: { operation: unknown }, signal: AbortSignal, approve: (request: unknown, signal: AbortSignal) => Promise<void>) => {
+        await approve({ operation: action.operation, target: { role: 'textbox', name: 'Password', tag: 'input', type: 'password', fingerprint: 'fp' },
+          classification: { consequential: true, category: 'credential', valueCategory: 'credential', canGrantOrigin: false, argumentSummary: '[credential value omitted]' },
+          origin: 'https://example.test', pageIncarnation: 'page', generation: 1 }, signal)
+        return { dispatched: true, rollbackPossible: false }
+      },
+      protectApproval: (_id: string, value: boolean) => protectedValues.push(value), status: () => ({ id, stateRevision: 1 }), snapshot: () => state,
+    }
+    const window = { isDestroyed: () => false, isVisible: () => true, show: () => {}, focus: () => {} }
+    const Service = TabBrowserService as unknown as new (s: TabBrowserStateStore, p: { setWindow: () => void }, h: typeof host, i: typeof state, w: typeof window) => TabBrowserService
+    const service = new Service({ update: async () => state } as unknown as TabBrowserStateStore, { setWindow: () => {} }, host, state, window)
+    service.setEventSink((event) => events.push(event as Record<string, unknown>))
+    const pending = service.command({ type: 'automation', id, broker: { requestId: 'request-1', controller: 'amber-1-1-0-pi' }, action: { type: 'interact', pageIncarnation: 'page', expectedGeneration: 1, operation: { kind: 'fill', target: { snapshotId: 'snap', ref: 'n1' }, text: 'super-secret' } } })
+    await vi.waitFor(() => expect(events.some((event) => event['type'] === 'approval-request')).toBe(true))
+    const request = events.find((event) => event['type'] === 'approval-request')!
+    expect(JSON.stringify(request)).not.toContain('super-secret')
+    await service.command({ type: 'resolveApproval', id, approvalId: String(request['approvalId']), digest: String(request['digest']), decision: 'approve-once' })
+    await expect(pending).resolves.toMatchObject({ dispatched: true, rollbackPossible: false })
+    expect(protectedValues).toEqual([true, false])
+  })
+
+  it('Stop Pi aborts active broker work and clears its approval', async () => {
+    const state = emptyBrowserState(1), id = 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'; let aborted = false; let started = false
+    const host = { runAutomation: async (_id: string, _action: unknown, signal: AbortSignal) => new Promise((_resolve, reject) => { started = true; signal.addEventListener('abort', () => { aborted = true; reject(new Error('ACTION_CANCELLED')) }, { once: true }) }), status: () => ({ id, stateRevision: 1 }), snapshot: () => state }
+    const Service = TabBrowserService as unknown as new (s: TabBrowserStateStore, p: { setWindow: () => void }, h: typeof host, i: typeof state) => TabBrowserService
+    const service = new Service({ update: async () => state } as unknown as TabBrowserStateStore, { setWindow: () => {} }, host, state)
+    const active = service.command({ type: 'automation', id, broker: { requestId: 'request-1', controller: 'amber-1-1-0-pi' }, action: { type: 'console', pageIncarnation: 'page', expectedGeneration: 1, limit: 10 } })
+    await vi.waitFor(() => expect(started).toBe(true)); await service.command({ type: 'stopPi', id })
+    await expect(active).rejects.toThrow('ACTION_CANCELLED'); expect(aborted).toBe(true)
   })
 })
 

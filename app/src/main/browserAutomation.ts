@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto'
-import type { BrowserElementRef, BrowserViewport, ConsoleLevel, FindQuery, SnapshotLimits, WaitCondition } from './browserToolProtocol'
+import type { BrowserElementRef, BrowserInteraction, BrowserTarget, BrowserViewport, ConsoleLevel, FindQuery, SnapshotLimits, WaitCondition } from './browserToolProtocol'
+import type { InteractionTargetMetadata } from './browserApproval'
 
 const SCREENSHOT_MAX_BYTES = 10 * 1024 * 1024
 const SCREENSHOT_MAX_DIMENSION = 4096
@@ -23,6 +24,7 @@ export interface BrowserAutomationOptions { ringItems?: number; ringBytes?: numb
 export interface BrowserAutomationControls {
   reload?(ignoreCache: boolean): boolean | void
   history?(direction: 'back' | 'forward'): boolean | void
+  dialog?(dialog: { type: string; message: string }): void
 }
 export interface AccessibilityNodeResult { ref: string; depth: number; role: string; name: string; disabled?: boolean; focused?: boolean }
 export interface SnapshotResult { snapshotId: string; url: string; nodes: AccessibilityNodeResult[]; truncated: boolean }
@@ -33,8 +35,9 @@ type AXNode = {
   role?: { value?: unknown }; name?: { value?: unknown }; value?: { value?: unknown }
   properties?: Array<{ name?: string; value?: { value?: unknown } }>
 }
-type SnapshotEntry = AccessibilityNodeResult & { backendDOMNodeId?: number }
+type SnapshotEntry = AccessibilityNodeResult & { backendDOMNodeId?: number; metadata: InteractionTargetMetadata }
 interface SnapshotCache { lease: BrowserAutomationLease; snapshotId: string; entries: Map<string, SnapshotEntry>; nodes: AccessibilityNodeResult[] }
+export interface PreparedBrowserInteraction { lease: BrowserAutomationLease; operation: BrowserInteraction; primary?: SnapshotEntry; secondary?: SnapshotEntry; target: InteractionTargetMetadata }
 interface RingEntry { cursor: number; bytes: number; value: Record<string, unknown> }
 
 class BoundedRing {
@@ -87,6 +90,19 @@ function abort(signal: AbortSignal): void { if (signal.aborted) throw new Error(
 function property(node: AXNode, name: string): boolean | undefined {
   const value = node.properties?.find((item) => item.name === name)?.value?.value
   return typeof value === 'boolean' ? value : undefined
+}
+function domAttributes(node: Record<string, unknown> | undefined): Record<string, string> {
+  const raw = Array.isArray(node?.['attributes']) ? node!['attributes'] as unknown[] : [], out: Record<string, string> = {}
+  for (let index = 0; index + 1 < raw.length; index += 2) {
+    const key = text(raw[index], 64).toLocaleLowerCase()
+    if (['type', 'autocomplete', 'formaction', 'formmethod'].includes(key)) out[key] = text(raw[index + 1], 1024)
+  }
+  return out
+}
+function targetMetadata(node: AXNode, domNode: Record<string, unknown> | undefined, role: string, name: string, backendDOMNodeId: number | undefined): InteractionTargetMetadata {
+  const attributes = domAttributes(domNode), tag = text(domNode?.['nodeName'], 128).toLocaleLowerCase(), type = attributes['type'] ?? ''
+  const basis = { role, name, tag, type, backendDOMNodeId: backendDOMNodeId ?? 0, autocomplete: attributes['autocomplete'] ?? '', formAction: attributes['formaction'] ?? '', formMethod: attributes['formmethod'] ?? '' }
+  return { role, name, tag, type, fingerprint: createHash('sha256').update(JSON.stringify(basis)).digest('hex'), ...(basis.autocomplete ? { autocomplete: basis.autocomplete } : {}), ...(basis.formAction ? { formAction: basis.formAction } : {}), ...(basis.formMethod ? { formMethod: basis.formMethod } : {}) }
 }
 function sameLease(a: BrowserAutomationLease, b: BrowserAutomationLease): boolean {
   return a.browserId === b.browserId && a.pageIncarnation === b.pageIncarnation && a.generation === b.generation
@@ -142,6 +158,11 @@ export class BrowserAutomation {
   }
   private onMessage(method: string, params: Record<string, unknown>): void {
     if (this.disposed) return
+    if (method === 'Page.javascriptDialogOpening') {
+      const type = text(params['type'], 32), message = redactBrowserText(text(params['message'], 1024)).slice(0, 1024)
+      void this.transport.send('Page.handleJavaScriptDialog', { accept: false }).catch(() => {})
+      this.controls.dialog?.({ type, message }); return
+    }
     if (method === 'Runtime.consoleAPICalled') {
       const args = Array.isArray(params['args']) ? params['args'] as Array<Record<string, unknown>> : []
       const message = args.map((arg) => redactBrowserText(text(arg['value'] ?? arg['description'], 2048))).join(' ').slice(0, 8192)
@@ -241,7 +262,7 @@ export class BrowserAutomation {
           const estimated = Buffer.byteLength(JSON.stringify(publicNode)) + 1
           if (nodes.length >= limits.maxNodes || used + estimated > limits.maxBytes) { truncated = true; break outer }
           if (identity) seenAXNodes.add(identity)
-          entries.set(ref, { ...publicNode, ...(backendDOMNodeId === undefined ? {} : { backendDOMNodeId }) }); nodes.push(publicNode); used += estimated
+          entries.set(ref, { ...publicNode, ...(backendDOMNodeId === undefined ? {} : { backendDOMNodeId }), metadata: targetMetadata(node, domNode, role, name, backendDOMNodeId) }); nodes.push(publicNode); used += estimated
         }
       }
       if (scanned < resultCount) truncated = true
@@ -301,6 +322,92 @@ export class BrowserAutomation {
     let box: Record<string, number> | undefined
     try { const result = await this.transport.send('DOM.getBoxModel', { backendNodeId: entry.backendDOMNodeId }); const border = (result['model'] as Record<string, unknown> | undefined)?.['border']; if (Array.isArray(border) && border.length === 8 && border.every((n) => typeof n === 'number')) box = { x: Math.min(...border as number[]), y: Math.min((border as number[])[1]!, (border as number[])[3]!, (border as number[])[5]!, (border as number[])[7]!), width: Math.max(...border as number[]) - Math.min(...border as number[]), height: Math.max((border as number[])[1]!, (border as number[])[3]!, (border as number[])[5]!, (border as number[])[7]!) - Math.min((border as number[])[1]!, (border as number[])[3]!, (border as number[])[5]!, (border as number[])[7]!) } } catch { /* detached nodes have no box */ }
     return { snapshotId: target.snapshotId, ref: target.ref, tag: text(node?.['nodeName'], 128).toLocaleLowerCase(), role: entry.role, name: entry.name, attributes, computedStyle, ancestry, ...(box ? { box } : {}) }
+  }
+  private resolveTarget(lease: BrowserAutomationLease, target: BrowserTarget): SnapshotEntry {
+    const cache = this.snapshotCache
+    if (!cache || !sameLease(cache.lease, lease) || cache.snapshotId !== target.snapshotId) throw new Error('STALE_GENERATION')
+    if ('ref' in target) return this.resolve(lease, target)
+    const matches = [...cache.entries.values()].filter((entry) => entry.role.toLocaleLowerCase() === target.role.toLocaleLowerCase() && (target.name === undefined || entry.name === target.name))
+    if (matches.length === 0) throw new Error('TARGET_NOT_FOUND')
+    if (matches.length !== 1) throw new Error('TARGET_AMBIGUOUS')
+    return matches[0]!
+  }
+  private async actionable(entry: SnapshotEntry, signal: AbortSignal): Promise<{ x: number; y: number; checked?: boolean }> {
+    abort(signal)
+    if (!entry.backendDOMNodeId) throw new Error('UNSUPPORTED_PAGE')
+    const described = await this.transport.send('DOM.describeNode', { backendNodeId: entry.backendDOMNodeId, depth: 0, pierce: false }); abort(signal)
+    const domNode = described['node'] as Record<string, unknown> | undefined
+    const partial = await this.transport.send('Accessibility.getPartialAXTree', { backendDOMNodeId: entry.backendDOMNodeId, fetchRelatives: false }); abort(signal)
+    const node = Array.isArray(partial['nodes']) ? (partial['nodes'] as AXNode[]).find((candidate) => !candidate.ignored) : undefined
+    if (!node || property(node, 'disabled') === true) throw new Error('TARGET_NOT_ACTIONABLE')
+    const role = text(node.role?.value, 256), name = redactBrowserText(text(node.name?.value, 4096))
+    const current = targetMetadata(node, domNode, role, name, entry.backendDOMNodeId)
+    if (current.fingerprint !== entry.metadata.fingerprint) throw new Error('STALE_GENERATION')
+    const pushed = await this.transport.send('DOM.pushNodesByBackendIdsToFrontend', { backendNodeIds: [entry.backendDOMNodeId] }); abort(signal)
+    const nodeId = Array.isArray(pushed['nodeIds']) && typeof pushed['nodeIds'][0] === 'number' ? pushed['nodeIds'][0] : undefined
+    if (!nodeId) throw new Error('TARGET_NOT_ACTIONABLE')
+    const styles = await this.transport.send('CSS.getComputedStyleForNode', { nodeId }); abort(signal)
+    const style = new Map((Array.isArray(styles['computedStyle']) ? styles['computedStyle'] as Array<Record<string, unknown>> : []).map((item) => [text(item['name'], 64), text(item['value'], 128)]))
+    if (style.get('display') === 'none' || style.get('visibility') === 'hidden' || style.get('pointer-events') === 'none' || Number(style.get('opacity') ?? '1') <= 0) throw new Error('TARGET_NOT_ACTIONABLE')
+    const box = await this.transport.send('DOM.getBoxModel', { backendNodeId: entry.backendDOMNodeId }); abort(signal)
+    const border = (box['model'] as Record<string, unknown> | undefined)?.['border']
+    if (!Array.isArray(border) || border.length !== 8 || !border.every((value) => typeof value === 'number' && Number.isFinite(value))) throw new Error('TARGET_NOT_ACTIONABLE')
+    const xs = [border[0], border[2], border[4], border[6]] as number[], ys = [border[1], border[3], border[5], border[7]] as number[]
+    const width = Math.max(...xs) - Math.min(...xs), height = Math.max(...ys) - Math.min(...ys)
+    if (width < 1 || height < 1 || width > 16_384 || height > 16_384) throw new Error('TARGET_NOT_ACTIONABLE')
+    const checked = property(node, 'checked')
+    return { x: Math.min(...xs) + width / 2, y: Math.min(...ys) + height / 2, ...(checked === undefined ? {} : { checked }) }
+  }
+  async prepareInteraction(lease: BrowserAutomationLease, operation: BrowserInteraction, signal: AbortSignal): Promise<PreparedBrowserInteraction> {
+    abort(signal); await this.ensureAttached(); abort(signal)
+    const primaryTarget = operation.kind === 'drag' ? operation.source : ('target' in operation ? operation.target : undefined)
+    const primary = primaryTarget ? this.resolveTarget(lease, primaryTarget) : undefined
+    const secondary = operation.kind === 'drag' ? this.resolveTarget(lease, operation.target) : undefined
+    if (primary) await this.actionable(primary, signal)
+    if (secondary) await this.actionable(secondary, signal)
+    const metadata = primary?.metadata
+    if ((operation.kind === 'fill' || operation.kind === 'type') && (!metadata || (!['textbox', 'searchbox', 'combobox'].includes(metadata.role.toLocaleLowerCase()) && !['input', 'textarea'].includes(metadata.tag)) || metadata.type === 'file')) throw new Error('TARGET_NOT_ACTIONABLE')
+    if (operation.kind === 'select' && (!metadata || (!['combobox', 'listbox'].includes(metadata.role.toLocaleLowerCase()) && metadata.tag !== 'select'))) throw new Error('TARGET_NOT_ACTIONABLE')
+    if ((operation.kind === 'check' || operation.kind === 'uncheck') && (!metadata || !['checkbox', 'switch', 'radio'].includes(metadata.role.toLocaleLowerCase()))) throw new Error('TARGET_NOT_ACTIONABLE')
+    if (operation.kind === 'uncheck' && metadata?.role.toLocaleLowerCase() === 'radio') throw new Error('TARGET_NOT_ACTIONABLE')
+    const target = metadata ?? { role: 'document', name: '', tag: 'body', type: '', fingerprint: createHash('sha256').update('document').digest('hex') }
+    return { lease: { ...lease }, operation, ...(primary ? { primary } : {}), ...(secondary ? { secondary } : {}), target }
+  }
+  async executeInteraction(prepared: PreparedBrowserInteraction, signal: AbortSignal, stillCurrent: () => boolean = () => true): Promise<{ dispatched: true; rollbackPossible: false }> {
+    const primaryPoint = prepared.primary ? await this.actionable(prepared.primary, signal) : undefined
+    const secondaryPoint = prepared.secondary ? await this.actionable(prepared.secondary, signal) : undefined
+    let dispatched = false
+    const ensure = (): void => {
+      if (signal.aborted) throw new Error(dispatched ? 'ACTION_CANCELLED_NO_ROLLBACK' : 'ACTION_CANCELLED')
+      if (!stillCurrent()) throw new Error(dispatched ? 'STALE_GENERATION_NO_ROLLBACK' : 'STALE_GENERATION')
+    }
+    const mouse = async (type: string, point: { x: number; y: number }, extra: Record<string, unknown> = {}): Promise<void> => { ensure(); dispatched = true; await this.transport.send('Input.dispatchMouseEvent', { type, x: point.x, y: point.y, ...extra }) }
+    const key = async (type: 'keyDown' | 'keyUp', value: string, modifiers = 0): Promise<void> => { ensure(); dispatched = true; await this.transport.send('Input.dispatchKeyEvent', { type, key: value === 'Space' ? ' ' : value, modifiers }) }
+    const click = async (point: { x: number; y: number }, count = 1): Promise<void> => { await mouse('mousePressed', point, { button: 'left', clickCount: count }); await mouse('mouseReleased', point, { button: 'left', clickCount: count }) }
+    const operation = prepared.operation
+    if ((operation.kind === 'click' || operation.kind === 'doubleClick') && primaryPoint) await click(primaryPoint, operation.kind === 'doubleClick' ? 2 : 1)
+    else if (operation.kind === 'hover' && primaryPoint) await mouse('mouseMoved', primaryPoint)
+    else if ((operation.kind === 'fill' || operation.kind === 'type') && primaryPoint) {
+      await click(primaryPoint)
+      if (operation.kind === 'fill') { const modifier = process.platform === 'darwin' ? 4 : 2; await key('keyDown', 'a', modifier); await key('keyUp', 'a', modifier) }
+      ensure(); dispatched = true; await this.transport.send('Input.insertText', { text: operation.text })
+    } else if (operation.kind === 'press') {
+      if (primaryPoint) await click(primaryPoint)
+      await key('keyDown', operation.key); await key('keyUp', operation.key)
+    } else if (operation.kind === 'select' && primaryPoint) {
+      if (operation.values.length !== 1) throw new Error('UNSUPPORTED_PAGE')
+      await click(primaryPoint); ensure(); dispatched = true; await this.transport.send('Input.insertText', { text: operation.values[0] }); await key('keyDown', 'Enter'); await key('keyUp', 'Enter')
+    } else if ((operation.kind === 'check' || operation.kind === 'uncheck') && primaryPoint) {
+      const desired = operation.kind === 'check'
+      if (primaryPoint.checked === undefined) throw new Error('TARGET_NOT_ACTIONABLE')
+      if (primaryPoint.checked !== desired) await click(primaryPoint)
+    } else if (operation.kind === 'scroll') {
+      const point = primaryPoint ?? { x: 1, y: 1 }; await mouse('mouseWheel', point, { deltaX: operation.deltaX, deltaY: operation.deltaY })
+    } else if (operation.kind === 'drag' && primaryPoint && secondaryPoint) {
+      await mouse('mouseMoved', primaryPoint); await mouse('mousePressed', primaryPoint, { button: 'left', clickCount: 1 }); await mouse('mouseMoved', secondaryPoint, { button: 'left' }); await mouse('mouseReleased', secondaryPoint, { button: 'left', clickCount: 1 })
+    } else throw new Error('TARGET_NOT_ACTIONABLE')
+    ensure()
+    return { dispatched: true, rollbackPossible: false }
   }
   async screenshot(lease: BrowserAutomationLease, target: BrowserElementRef | undefined, fullPage: boolean, signal: AbortSignal): Promise<BrowserBinaryAttachment> {
     abort(signal); await this.ensureAttached(); let clip: { x: number; y: number; width: number; height: number; scale: number } | undefined

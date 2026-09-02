@@ -17,6 +17,7 @@ export function BrowserRail(props: {
   const [status, setStatus] = useState<BrowserStatus | null>(null)
   const [address, setAddress] = useState('')
   const [error, setError] = useState('')
+  const [approval, setApproval] = useState<null | { approvalId: string; digest: string; controller: string; origin: string; category: string; targetLabel: string; argumentSummary: string; expiresAt: number; canGrantOrigin: boolean }>(null)
 
   const command = async (value: unknown): Promise<BrowserReply> => {
     await props.ensureContext()
@@ -25,12 +26,15 @@ export function BrowserRail(props: {
 
   useEffect(() => {
     return window.amber.onTabBrowserEvent?.((value) => {
-      const event = value as { type?: unknown; id?: unknown; waiting?: unknown }
+      const event = value as { type?: unknown; id?: unknown; waiting?: unknown; browserId?: unknown; headless?: unknown; [key: string]: unknown }
       if (event.type === 'capacity-wait' && event.id === props.id && typeof event.waiting === 'boolean') {
         setStatus((current) => current ? { ...current, ...(event.waiting ? { capacityWaiting: true } : { capacityWaiting: false }) } : current)
       } else if (event.type === 'runtime' && event.id === props.id && typeof (event as { status?: unknown }).status === 'object') {
         setStatus((event as { status: BrowserStatus }).status)
-      }
+      } else if (event.type === 'approval-request' && event.browserId === props.id && event.headless !== true) {
+        const candidate = event as typeof event & { approvalId: string; digest: string; controller: string; origin: string; category: string; targetLabel: string; argumentSummary: string; expiresAt: number; canGrantOrigin: boolean }
+        setApproval(candidate)
+      } else if (event.type === 'approval-resolved' && event.browserId === props.id) setApproval(null)
     })
   }, [props.id])
 
@@ -94,11 +98,25 @@ export function BrowserRail(props: {
             props.onPolicy({ ...(props.designatedPi ? { designatedPi: props.designatedPi } : {}), sharedWithPi: event.target.checked })
           }} /> Pi
       </label>
+      {props.sharedWithPi && <button className="btn" onClick={() => void command({ type: 'stopPi' })}>Stop Pi</button>}
       <button className="icon-btn" aria-label="Collapse tab browser" onClick={() => props.onCollapsed(true)}>›</button>
       <button className="icon-btn" aria-label="Close tab browser" onClick={props.onClose}>×</button>
     </div>
     {status?.capacityWaiting && <div className="tab-browser-status" role="status">Waiting for browser capacity…</div>}
     {error && <div className="tab-browser-error" role="alert">{error}</div>}
+    {approval && <div className="tab-browser-approval" role="alertdialog" aria-modal="true" aria-label="Pi browser action approval">
+      <strong>Pi requests a consequential browser action</strong>
+      <div>{approval.category} · {approval.origin}</div>
+      <div>Controller: {approval.controller}</div>
+      <div>Expires in {Math.max(0, Math.ceil((approval.expiresAt - Date.now()) / 1000))}s · dispatch not started</div>
+      <div>Target (untrusted browser content): {approval.targetLabel || 'page'}</div>
+      {approval.argumentSummary && <div>Value: {approval.argumentSummary}</div>}
+      <div className="tab-browser-approval-actions">
+        <button className="btn" onClick={() => void command({ type: 'resolveApproval', approvalId: approval.approvalId, digest: approval.digest, decision: 'approve-once' })}>Approve once</button>
+        {approval.canGrantOrigin && <button className="btn" onClick={() => void command({ type: 'resolveApproval', approvalId: approval.approvalId, digest: approval.digest, decision: 'allow-origin' })}>Allow this confirmation for origin</button>}
+        <button className="btn" onClick={() => void command({ type: 'resolveApproval', approvalId: approval.approvalId, digest: approval.digest, decision: 'reject' })}>Reject</button>
+      </div>
+    </div>}
     <div ref={host} className="tab-browser-page-slot" />
     <div className="tab-browser-grip" role="separator" aria-orientation="vertical" aria-label="Resize browser rail"
       onPointerDown={(event) => {

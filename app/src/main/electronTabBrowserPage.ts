@@ -41,6 +41,7 @@ export class ElectronTabBrowserPage implements TabBrowserPage {
         if (direction === 'forward' && history.canGoForward()) { history.goForward(); return true }
         return false
       },
+      dialog: (dialog) => onPageEvent({ type: 'dialog', dialogType: dialog.type, message: dialog.message }),
     })
     // Attach to this WebContents only; there is no remote-debugging endpoint
     // and therefore no target enumeration or cross-page control surface.

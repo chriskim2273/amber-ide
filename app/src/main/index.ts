@@ -1232,14 +1232,18 @@ async function main(): Promise<void> {
     browserDaemonWatcher = new BrowserDaemonWatcher(new Connection(socket))
     browserDaemonWatcher.start()
     const currentBrokerLayout = async (request: BrokerRequest): Promise<ReturnType<typeof parseLayout>> => {
-      const controller = browserDaemonWatcher?.controller(request.amberSession)
-      if (!controller) throw new Error('DAEMON_STATE_STALE')
-      if (!isEligiblePiController(controller)) throw new Error('NOT_DESIGNATED_CONTROLLER')
       const loaded = await loadLayoutFile(layoutPath())
       const current = loaded.text ? parseLayout(loaded.text) : null
       if (!current) throw new Error('NO_BROWSER_FOR_TAB')
       if (current.readOnly) throw new Error('UNSUPPORTED_LAYOUT_VERSION')
-      authorizeBrowserRequest(current, request.amberSession, request.action.type === 'open')
+      const location = /^amber-(\d+)-(\d+)-/.exec(request.amberSession)
+      const associatedBrowser = location ? current.workspaces[location[1]!]?.tabs[location[2]!]?.browser : undefined
+      const associatedId = associatedBrowser?.designatedPi === request.amberSession ? associatedBrowser.id : undefined
+      const controller = browserDaemonWatcher?.controller(request.amberSession)
+      if (!controller) { if (associatedId) tabBrowser.revokePi(associatedId); throw new Error('DAEMON_STATE_STALE') }
+      if (!isEligiblePiController(controller)) { if (associatedId) tabBrowser.revokePi(associatedId); throw new Error('NOT_DESIGNATED_CONTROLLER') }
+      try { authorizeBrowserRequest(current, request.amberSession, request.action.type === 'open') }
+      catch (error) { if (associatedId) tabBrowser.revokePi(associatedId); throw error }
       return current
     }
     const handleBroker = async (request: BrokerRequest, signal: AbortSignal): Promise<unknown> => {
@@ -1301,14 +1305,17 @@ async function main(): Promise<void> {
       const authorized = authorizeBrowserRequest(current, request.amberSession)
       const id = authorized.browserId!
       const stillAuthorized = async (): Promise<boolean> => {
+        let valid = false
         const latestController = browserDaemonWatcher?.controller(request.amberSession)
-        if (!isEligiblePiController(latestController)) return false
-        const latest = await loadLayoutFile(layoutPath())
-        if (!latest.text) return false
-        try { return authorizeBrowserRequest(parseLayout(latest.text), request.amberSession).browserId === id } catch { return false }
+        if (isEligiblePiController(latestController)) {
+          const latest = await loadLayoutFile(layoutPath())
+          if (latest.text) try { valid = authorizeBrowserRequest(parseLayout(latest.text), request.amberSession).browserId === id } catch { valid = false }
+        }
+        if (!valid) tabBrowser.revokePi(id)
+        return valid
       }
       return dispatchAttachedBrokerAction(request.action, id, signal, stillAuthorized,
-        (command, actionSignal, validate) => tabBrowser.command(command, actionSignal, validate))
+        (command, actionSignal, validate) => tabBrowser.command(command.type === 'automation' ? { ...command, broker: { requestId: request.requestId, controller: request.amberSession } } : command, actionSignal, validate))
     }
     const runtime = process.env['XDG_RUNTIME_DIR'] ?? tmpdir()
     const socketPath = process.env['AMBER_BROWSER_HOST_SOCKET'] ?? join(runtime, 'amber-ide', 'browser-host.sock')
@@ -1504,6 +1511,7 @@ async function main(): Promise<void> {
           finally { await tabBrowser.command({ type: 'destroy', id: openedId }).catch(() => {}) }
           throw new Error('STALE_BROWSER_CONTEXT')
         }
+        if (previous.browser && (parsed.type === 'close' || parsed.type === 'designate' || (parsed.type === 'share' && !parsed.sharedWithPi))) tabBrowser.revokePi(previous.browser.id)
         if (parsed.type === 'close' && previous.browser) await tabBrowser.command({ type: 'destroy', id: previous.browser.id })
         setBrowserForCurrentContext(sender, expectedContext, browser?.id ?? null)
         sender.win.webContents.send('tab-browser-association', { ws: expectedContext.workspace, tab: expectedContext.tab, ...(browser ? { browser } : {}) })
@@ -1511,8 +1519,10 @@ async function main(): Promise<void> {
       }
       const loaded = await loadLayoutFile(layoutPath())
       if (!loaded.text || sender.activeWorkspace === null || sender.activeTab === null) throw new Error('NO_ACTIVE_TAB')
-      const associated = parseLayout(loaded.text).workspaces[String(sender.activeWorkspace)]?.tabs[String(sender.activeTab)]?.browser?.id ?? null
+      const activeBrowser = parseLayout(loaded.text).workspaces[String(sender.activeWorkspace)]?.tabs[String(sender.activeTab)]?.browser
+      const associated = activeBrowser?.id ?? null
       if (associated !== sender.activeBrowserId) throw new Error('STALE_BROWSER_CONTEXT')
+      if (parsed.type === 'stopPi' && activeBrowser?.designatedPi) tabBrowserBroker?.cancelController(activeBrowser.designatedPi)
       const command = bindRendererBrowserCommand(sender.activeBrowserId, parsed)
       const expected = captureBrowserContext(sender)
       const stillAssociated = async (): Promise<boolean> => {

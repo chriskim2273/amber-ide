@@ -17,6 +17,18 @@ describe('browser tool protocol', () => {
     expect(parseBrowserToolAction({ type: 'setViewport', ...page, viewport: { width: 390, height: 844, deviceScaleFactor: 2 } }).type).toBe('setViewport')
   })
 
+  it('parses every bounded semantic interaction with snapshot refs or role/name locators', () => {
+    const ref = { snapshotId: 'snap-1', ref: 'n2' }, locator = { snapshotId: 'snap-1', role: 'button', name: 'Save' }
+    for (const operation of [
+      { kind: 'click', target: ref }, { kind: 'doubleClick', target: locator }, { kind: 'hover', target: ref },
+      { kind: 'fill', target: ref, text: 'hello' }, { kind: 'type', target: locator, text: 'world' },
+      { kind: 'press', target: ref, key: 'Enter' }, { kind: 'press', key: 'Escape' },
+      { kind: 'select', target: ref, values: ['one'] }, { kind: 'check', target: ref }, { kind: 'uncheck', target: ref },
+      { kind: 'scroll', target: ref, deltaX: 0, deltaY: 500 }, { kind: 'scroll', deltaX: -20, deltaY: 20 },
+      { kind: 'drag', source: ref, target: locator },
+    ]) expect(parseBrowserToolAction({ type: 'interact', ...page, operation })).toMatchObject({ type: 'interact', operation })
+  })
+
   it('rejects raw debugger/script/storage/header surfaces and every unbounded field', () => {
     for (const action of [
       { type: 'cdp', method: 'Runtime.evaluate' }, { type: 'evaluate', script: 'document.cookie' },
@@ -30,6 +42,11 @@ describe('browser tool protocol', () => {
       { type: 'screenshot', ...page, path: '/tmp/leak.png' },
       { type: 'console', ...page, levels: new Array(20).fill('error') },
       { type: 'console', ...page, cursor: '9999999999999999' },
+      { type: 'interact', ...page, operation: { kind: 'fill', target: { snapshotId: 's', ref: 'n1' }, text: 'x'.repeat(8193) } },
+      { type: 'interact', ...page, operation: { kind: 'press', key: 'Control+Alt+Delete' } },
+      { type: 'interact', ...page, operation: { kind: 'select', target: { snapshotId: 's', ref: 'n1' }, values: ['one', 'two'] } },
+      { type: 'interact', ...page, operation: { kind: 'scroll', deltaX: 0, deltaY: 10001 } },
+      { type: 'interact', ...page, operation: { kind: 'click', target: { snapshotId: 's', role: 'button', css: '#x' } } },
     ]) expect(() => parseBrowserToolAction(action)).toThrow('INVALID_REQUEST')
   })
 

@@ -65,6 +65,48 @@ describe('TabBrowserHost', () => {
     expect(snapshot).toHaveBeenCalledWith(expect.objectContaining({ browserId: opened.status.id, pageIncarnation: opened.status.pageIncarnation }), action.limits, expect.any(AbortSignal))
   })
 
+  it('approves consequential interactions while occluded and increments generation before irreversible dispatch', async () => {
+    let host!: TabBrowserHost, release!: () => void
+    const target = { role: 'button', name: 'Delete account', tag: 'button', type: 'submit', fingerprint: 'fp' }
+    const prepareInteraction = vi.fn(async (_lease, operation) => ({ lease: _lease, operation, primary: { metadata: target }, target }))
+    const executeInteraction = vi.fn(async () => {
+      expect(host.status(opened.status.id).generation).toBe(1)
+      return { dispatched: true as const, rollbackPossible: false as const }
+    })
+    const automation = { prepareInteraction, executeInteraction, invalidate: vi.fn() } as unknown as BrowserAutomation
+    const page = Object.assign(new FakePage(), { automation })
+    host = new TabBrowserHost(emptyBrowserState(1), { create: () => page })
+    const opened = await host.open({ visible: true })
+    const action = { type: 'interact' as const, pageIncarnation: opened.status.pageIncarnation, expectedGeneration: 0,
+      operation: { kind: 'click' as const, target: { snapshotId: 'snap', ref: 'n1' } } }
+    const approval = vi.fn(async () => { expect(page.visible).toBe(true); await new Promise<void>((resolve) => { release = resolve }) })
+    const pending = host.runAutomation(opened.status.id, action, new AbortController().signal, approval)
+    await vi.waitFor(() => expect(approval).toHaveBeenCalledWith(expect.objectContaining({ classification: expect.objectContaining({ category: 'destructive' }) }), expect.any(AbortSignal)))
+    // Service-level approval protection detaches the native view; Host itself
+    // keeps the adapter contract independent of renderer presentation.
+    release(); const result = await pending as { generation: number; rollbackPossible: false }
+    expect(result).toMatchObject({ generation: 1, rollbackPossible: false })
+    expect(executeInteraction).toHaveBeenCalledOnce()
+  })
+
+  it('fails consequential interactions closed when no approval coordinator is present', async () => {
+    const target = { role: 'textbox', name: 'Password', tag: 'input', type: 'password', fingerprint: 'secret-target' }
+    const automation = { prepareInteraction: vi.fn(async (_lease, operation) => ({ lease: _lease, operation, primary: { metadata: target }, target })), executeInteraction: vi.fn(), invalidate: vi.fn() } as unknown as BrowserAutomation
+    const host = new TabBrowserHost(emptyBrowserState(1), { create: () => Object.assign(new FakePage(), { automation }) })
+    const opened = await host.open({ visible: true })
+    await expect(host.runAutomation(opened.status.id, { type: 'interact', pageIncarnation: opened.status.pageIncarnation, expectedGeneration: 0,
+      operation: { kind: 'fill', target: { snapshotId: 'snap', ref: 'n1' }, text: 'do-not-return-me' } }, new AbortController().signal)).rejects.toThrow('APPROVAL_REQUIRED')
+    expect(automation.executeInteraction).not.toHaveBeenCalled()
+    expect(host.status(opened.status.id).generation).toBe(0)
+  })
+
+  it('invalidates snapshots and generation immediately on Share revoke or Stop Pi', async () => {
+    const invalidate = vi.fn(), automation = { invalidate } as unknown as BrowserAutomation
+    const host = new TabBrowserHost(emptyBrowserState(1), { create: () => Object.assign(new FakePage(), { automation }) })
+    const opened = await host.open({ visible: true }); host.revokePi(opened.status.id)
+    expect(host.status(opened.status.id).generation).toBe(1); expect(invalidate).toHaveBeenCalledOnce()
+  })
+
   it('counts synchronous and asynchronous reload navigation events exactly once', async () => {
     for (const timing of ['synchronous', 'asynchronous'] as const) {
       let emit!: (event: TabBrowserPageEvent) => void

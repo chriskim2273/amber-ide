@@ -1,9 +1,9 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { connect } from 'node:net'
-import { authorizeBrowserRequest, dispatchAttachedBrokerAction, isEligiblePiController, parseBrokerRequest, safeBrokerError, TabBrowserBrokerServer } from './tabBrowserBroker'
+import { authorizeBrowserRequest, brokerRequestDigest, dispatchAttachedBrokerAction, isEligiblePiController, parseBrokerRequest, safeBrokerError, TabBrowserBrokerServer } from './tabBrowserBroker'
 import type { LayoutFile } from '../shared/layoutFile'
 
 const cleanup: string[] = []
@@ -42,6 +42,11 @@ describe('tab browser broker boundary', () => {
     await expect((calls[0]?.[2] as () => Promise<boolean>)()).resolves.toBe(true)
   })
 
+  it('hashes replay identity without retaining credential plaintext', () => {
+    const digest = brokerRequestDigest({ sequence: 1, amberSession: 'amber-1-2-0-pane', action: { type: 'interact', pageIncarnation: 'page', expectedGeneration: 1, operation: { kind: 'fill', target: { snapshotId: 'snap', ref: 'n1' }, text: 'super-secret' } } })
+    expect(digest).toMatch(/^[a-f0-9]{64}$/); expect(digest).not.toContain('super-secret')
+  })
+
   it('maps implementation errors to a stable code without leaking diagnostic canaries', () => {
     expect(safeBrokerError(new Error('ACTION_TIMEOUT'))).toBe('ACTION_TIMEOUT')
     expect(safeBrokerError(new Error('Authorization: Bearer secret /home/user/file'))).toBe('INTERNAL_ERROR')
@@ -61,6 +66,12 @@ describe('tab browser broker boundary', () => {
     authority[revokedKey as keyof typeof authority] = false
     release()
     await expect(request).rejects.toThrow('STALE_BROWSER_CONTEXT')
+  })
+
+  it('reports that a completed interaction cannot be rolled back when authority changes before return', async () => {
+    const action = { type: 'interact' as const, pageIncarnation: 'page', expectedGeneration: 1, operation: { kind: 'click' as const, target: { snapshotId: 'snap', ref: 'n1' } } }
+    await expect(dispatchAttachedBrokerAction(action, 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', new AbortController().signal,
+      () => false, async () => ({ dispatched: true, rollbackPossible: false }))).rejects.toThrow('STALE_BROWSER_CONTEXT_NO_ROLLBACK')
   })
 
   it('aborts active cancellable work when controller authority is revoked', async () => {
@@ -187,6 +198,23 @@ describe('tab browser broker boundary', () => {
     await new Promise((resolve) => setTimeout(resolve, 20))
     expect(aborted).toBe(true)
     await server.close()
+  })
+
+  it('Stop Pi aborts active work for exactly the designated controller', async () => {
+    if (process.platform === 'win32') return
+    const dir = await mkdtemp(join(tmpdir(), 'amber-browser-broker-')); cleanup.push(dir)
+    const socketPath = join(dir, 'broker.sock'); const tokenPath = join(dir, 'token'); let started = false; let aborted = false
+    const server = new TabBrowserBrokerServer(socketPath, tokenPath, async (_request, signal) => new Promise((_resolve, reject) => {
+      started = true; signal.addEventListener('abort', () => { aborted = true; reject(new Error('ACTION_CANCELLED')) }, { once: true })
+    }))
+    await server.start(); const token = (await readFile(tokenPath, 'utf8')).trim()
+    const encode = (value: unknown): Buffer => { const body = Buffer.from(JSON.stringify(value)); const out = Buffer.alloc(body.length + 4); out.writeUInt32BE(body.length); body.copy(out, 4); return out }
+    const socket = connect(socketPath); socket.on('error', () => {})
+    await new Promise<void>((resolve) => { socket.on('connect', () => socket.write(encode({ token }))); socket.once('data', () => { socket.write(encode({ version: 1, clientInstanceId: 'client-stop', sequence: 1, requestId: 'stop-pi', amberSession: 'amber-1-2-0-pane', action: { type: 'status' } })); resolve() }) })
+    await vi.waitFor(() => expect(started).toBe(true))
+    server.cancelController('amber-9-9-9-other'); expect(aborted).toBe(false)
+    server.cancelController('amber-1-2-0-pane'); await vi.waitFor(() => expect(aborted).toBe(true))
+    socket.destroy(); await server.close()
   })
 
   it('replays identical results but rejects changed payloads and evicted sequences', async () => {

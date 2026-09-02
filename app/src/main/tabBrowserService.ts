@@ -6,6 +6,7 @@ import type { WsBrowser } from '../shared/workspaceFile'
 import { TabBrowserStateStore } from './tabBrowserStateStore'
 import type { BrowserStateFile } from '../shared/tabBrowserState'
 import type { BrowserToolAction } from './browserToolProtocol'
+import { BrowserApprovalCoordinator, interactionValueDigest, type ApprovalDecision } from './browserApproval'
 
 export type TabBrowserCommand =
   | { type: 'open' }
@@ -18,7 +19,9 @@ export type TabBrowserCommand =
   | { type: 'navigate'; id: string; url: string; pageIncarnation: string; expectedGeneration: number }
   | { type: 'status'; id: string }
   | { type: 'stop'; id: string; pageIncarnation?: string; expectedGeneration?: number }
-  | { type: 'automation'; id: string; action: BrowserToolAction }
+  | { type: 'automation'; id: string; action: BrowserToolAction; broker?: { requestId: string; controller: string } }
+  | { type: 'resolveApproval'; id: string; approvalId: string; digest: string; decision: ApprovalDecision }
+  | { type: 'stopPi'; id: string }
   | { type: 'destroy'; id: string }
 
 export interface WorkspaceBrowserImport { entries: { id: BrowserId; browser: WsBrowser }[]; recovery: { ws: number; tab: number; browser: WsBrowser }[] }
@@ -73,13 +76,22 @@ export class TabBrowserService {
   private persistQueue: Promise<void> = Promise.resolve()
   private persistedState: BrowserStateFile
   private suppressPersist = false
+  private currentWindow: BrowserWindow | null
+  private readonly activePi = new Map<string, Set<AbortController>>()
+  private readonly revokedPi = new Set<string>()
+  private readonly approvals: BrowserApprovalCoordinator
+  private readonly observedGeneration = new Map<string, number>()
 
   private constructor(
     private readonly store: TabBrowserStateStore,
     private readonly pages: ElectronTabBrowserPageFactory,
     private readonly host: TabBrowserHost,
     initialState: BrowserStateFile,
-  ) { this.persistedState = structuredClone(initialState) }
+    window?: BrowserWindow,
+  ) {
+    this.persistedState = structuredClone(initialState); this.currentWindow = window ?? null
+    this.approvals = new BrowserApprovalCoordinator(Date.now, () => !!this.currentWindow && !this.currentWindow.isDestroyed() && this.currentWindow.isVisible(), (event) => this.eventSink(event), 30_000, () => { if (this.currentWindow && !this.currentWindow.isDestroyed()) { this.currentWindow.show(); this.currentWindow.focus() } })
+  }
 
   static async create(root: string, window: BrowserWindow, store = new TabBrowserStateStore(root)): Promise<TabBrowserService> {
     const state = await store.load()
@@ -91,13 +103,21 @@ export class TabBrowserService {
     let service!: TabBrowserService
     const host = new TabBrowserHost(state, pages, Date.now, undefined, () => {
       void service.schedulePersist().catch((error) => console.error('tab browser state save failed', error))
-    }, (event) => service.eventSink(event))
-    service = new TabBrowserService(store, pages, host, persistedState)
+    }, (event) => service.handleHostEvent(event))
+    service = new TabBrowserService(store, pages, host, persistedState, window)
     return service
   }
 
-  setWindow(window: BrowserWindow): void { this.pages.setWindow(window) }
+  setWindow(window: BrowserWindow): void { this.currentWindow = window; this.pages.setWindow(window) }
   setEventSink(sink: (event: unknown) => void): void { this.eventSink = sink }
+  private handleHostEvent(event: unknown): void {
+    const runtime = event as { type?: unknown; id?: unknown; status?: { generation?: unknown } }
+    if (runtime.type === 'runtime' && typeof runtime.id === 'string' && typeof runtime.status?.generation === 'number') {
+      const previous = this.observedGeneration.get(runtime.id); this.observedGeneration.set(runtime.id, runtime.status.generation)
+      if (previous !== undefined && previous !== runtime.status.generation) this.approvals.invalidateBrowser(runtime.id)
+    }
+    this.eventSink(event)
+  }
 
   async importWorkspaceBrowsers(input: WorkspaceBrowserImport): Promise<void> {
     const { entries, recovery } = input
@@ -139,7 +159,7 @@ export class TabBrowserService {
     // Opens must reach the host concurrently so the global capacity FIFO sees
     // every contender. Observations and hide also cannot sit behind a wait.
     if (command.type === 'hide' || command.type === 'destroy') this.activationControllers.get(command.id)?.abort()
-    if (command.type === 'open' || command.type === 'status' || command.type === 'hide' || command.type === 'destroy') return this.runCommand(command, signal, validate)
+    if (command.type === 'open' || command.type === 'status' || command.type === 'hide' || command.type === 'destroy' || command.type === 'resolveApproval' || command.type === 'stopPi') return this.runCommand(command, signal, validate)
     if (command.type === 'close' || command.type === 'share' || command.type === 'designate') return Promise.reject(new Error('ASSOCIATION_COMMAND_REQUIRES_MAIN'))
     const key = command.id
     const prior = this.browserQueues.get(key) ?? Promise.resolve()
@@ -185,13 +205,46 @@ export class TabBrowserService {
       case 'status': return this.host.status(command.id)
       case 'stop': return this.host.stop(command.id, command.pageIncarnation, command.expectedGeneration)
       case 'automation': {
-        const result = await this.host.runAutomation(command.id, command.action, signal ?? new AbortController().signal)
-        if (command.action.type === 'setViewport') await this.schedulePersist()
-        return result
+        const controller = new AbortController(), upstreamAbort = (): void => controller.abort()
+        signal?.addEventListener('abort', upstreamAbort, { once: true }); if (signal?.aborted) controller.abort()
+        if (command.broker) { this.revokedPi.delete(command.id); const set = this.activePi.get(command.id) ?? new Set<AbortController>(); set.add(controller); this.activePi.set(command.id, set) }
+        try {
+          const result = await this.host.runAutomation(command.id, command.action, controller.signal, command.broker ? async (request, approvalSignal) => {
+            const classification = request.classification
+            if (!classification.consequential) return
+            this.observedGeneration.set(command.id, request.generation)
+            this.host.protectApproval(command.id, true)
+            try {
+              await this.approvals.request({ requestId: command.broker!.requestId, controller: command.broker!.controller, browserId: command.id,
+                pageIncarnation: request.pageIncarnation, generation: request.generation, origin: request.origin, action: request.operation.kind,
+                targetFingerprint: request.target.fingerprint, valueCategory: classification.valueCategory, valueDigest: interactionValueDigest(request.operation),
+                category: classification.category as Exclude<typeof classification.category, 'benign'>, canGrantOrigin: classification.canGrantOrigin,
+                targetLabel: `${request.target.role} ${request.target.name}`.trim().slice(0, 512), argumentSummary: classification.argumentSummary }, approvalSignal)
+            } finally { try { this.host.protectApproval(command.id, false) } catch { /* record may close while approval is pending */ } }
+          } : undefined)
+          if (command.action.type === 'setViewport') await this.schedulePersist()
+          return result
+        } finally {
+          signal?.removeEventListener('abort', upstreamAbort)
+          const set = this.activePi.get(command.id); set?.delete(controller); if (set?.size === 0) this.activePi.delete(command.id)
+        }
       }
+      case 'resolveApproval': {
+        if (!this.approvals.resolve(command.id, command.approvalId, command.digest, command.decision)) throw new Error('APPROVAL_DENIED')
+        return this.host.status(command.id)
+      }
+      case 'stopPi': this.revokePi(command.id); return this.host.status(command.id)
       case 'destroy': this.host.close(command.id); await this.schedulePersist(); return { closed: true }
       case 'close': case 'share': case 'designate': throw new Error('ASSOCIATION_COMMAND_REQUIRES_MAIN')
     }
+  }
+
+  revokePi(id: string): void {
+    if (this.revokedPi.has(id)) return
+    this.revokedPi.add(id); this.approvals.clearBrowser(id)
+    try { this.host.revokePi(id) } catch { /* close may already have removed the record */ }
+    for (const controller of this.activePi.get(id) ?? []) controller.abort()
+    this.activePi.delete(id)
   }
 }
 
@@ -207,6 +260,9 @@ export function parseTabBrowserCommand(value: unknown): TabBrowserCommand {
     return { type: v['type'] }
   }
   if (v['type'] === 'share' && exact(v, ['type', 'sharedWithPi']) && typeof v['sharedWithPi'] === 'boolean') return { type: 'share', sharedWithPi: v['sharedWithPi'] }
+  if (v['type'] === 'resolveApproval' && exact(v, ['type', 'approvalId', 'digest', 'decision']) && typeof v['approvalId'] === 'string' && v['approvalId'].length <= 128
+      && typeof v['digest'] === 'string' && /^[a-f0-9]{64}$/.test(v['digest']) && (v['decision'] === 'approve-once' || v['decision'] === 'reject' || v['decision'] === 'allow-origin')) return { type: 'resolveApproval', id: '' as never, approvalId: v['approvalId'], digest: v['digest'], decision: v['decision'] }
+  if (v['type'] === 'stopPi' && exact(v, ['type'])) return { type: 'stopPi', id: '' as never }
   if (v['type'] === 'designate' && (exact(v, ['type']) || exact(v, ['type', 'designatedPi']))) {
     if (v['designatedPi'] !== undefined && (typeof v['designatedPi'] !== 'string' || v['designatedPi'].length > 256)) throw new Error('INVALID_REQUEST')
     return { type: 'designate', ...(typeof v['designatedPi'] === 'string' ? { designatedPi: v['designatedPi'] } : {}) }

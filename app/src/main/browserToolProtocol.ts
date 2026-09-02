@@ -1,5 +1,14 @@
 export interface BrowserPageLease { pageIncarnation: string; expectedGeneration: number }
 export interface BrowserElementRef { snapshotId: string; ref: string }
+export interface BrowserRoleLocator { snapshotId: string; role: string; name?: string }
+export type BrowserTarget = BrowserElementRef | BrowserRoleLocator
+export type BrowserInteraction =
+  | { kind: 'click' | 'doubleClick' | 'hover' | 'check' | 'uncheck'; target: BrowserTarget }
+  | { kind: 'fill' | 'type'; target: BrowserTarget; text: string }
+  | { kind: 'press'; target?: BrowserTarget; key: string }
+  | { kind: 'select'; target: BrowserTarget; values: string[] }
+  | { kind: 'scroll'; target?: BrowserTarget; deltaX: number; deltaY: number }
+  | { kind: 'drag'; source: BrowserTarget; target: BrowserTarget }
 export interface SnapshotLimits { maxDepth: number; maxNodes: number; maxBytes: number }
 export interface FindQuery { text?: string; regex?: string; role?: string; name?: string; limit: number }
 export type ConsoleLevel = 'log' | 'info' | 'warning' | 'error'
@@ -21,6 +30,7 @@ export type BrowserToolAction =
   | ({ type: 'console'; cursor?: string; levels?: ConsoleLevel[]; limit: number } & BrowserPageLease)
   | ({ type: 'network'; cursor?: string; limit: number; failedOnly: boolean } & BrowserPageLease)
   | ({ type: 'setViewport'; viewport: BrowserViewport } & BrowserPageLease)
+  | ({ type: 'interact'; operation: BrowserInteraction } & BrowserPageLease)
 
 function record(value: unknown): Record<string, unknown> | null {
   return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : null
@@ -45,6 +55,25 @@ function elementRef(value: unknown): BrowserElementRef {
   const target = record(value)
   if (!target || !exact(target, ['snapshotId', 'ref']) || !boundedString(target['snapshotId'], 128) || !boundedString(target['ref'], 64)) throw new Error('INVALID_REQUEST')
   return { snapshotId: target['snapshotId'], ref: target['ref'] }
+}
+function browserTarget(value: unknown): BrowserTarget {
+  const target = record(value)
+  if (!target) throw new Error('INVALID_REQUEST')
+  if ('ref' in target) return elementRef(target)
+  if (!exact(target, ['snapshotId', 'role', 'name'], ['snapshotId', 'role']) || !boundedString(target['snapshotId'], 128) || !boundedString(target['role'], 128)
+      || (target['name'] !== undefined && !boundedString(target['name'], 1024))) throw new Error('INVALID_REQUEST')
+  return { snapshotId: target['snapshotId'], role: target['role'], ...(target['name'] === undefined ? {} : { name: target['name'] }) }
+}
+function interaction(value: unknown): BrowserInteraction {
+  const operation = record(value)
+  if (!operation || !boundedString(operation['kind'], 32)) throw new Error('INVALID_REQUEST')
+  if (['click', 'doubleClick', 'hover', 'check', 'uncheck'].includes(operation['kind']) && exact(operation, ['kind', 'target'])) return { kind: operation['kind'] as 'click', target: browserTarget(operation['target']) }
+  if ((operation['kind'] === 'fill' || operation['kind'] === 'type') && exact(operation, ['kind', 'target', 'text']) && boundedString(operation['text'], 8192, true)) return { kind: operation['kind'], target: browserTarget(operation['target']), text: operation['text'] }
+  if (operation['kind'] === 'press' && exact(operation, ['kind', 'target', 'key'], ['kind', 'key']) && boundedString(operation['key'], 64) && /^(?:Enter|Tab|Escape|Backspace|Delete|Space|Arrow(?:Up|Down|Left|Right)|Home|End|Page(?:Up|Down)|[A-Za-z0-9])$/.test(operation['key'])) return { kind: 'press', ...(operation['target'] === undefined ? {} : { target: browserTarget(operation['target']) }), key: operation['key'] }
+  if (operation['kind'] === 'select' && exact(operation, ['kind', 'target', 'values']) && Array.isArray(operation['values']) && operation['values'].length === 1 && operation['values'].every((item) => boundedString(item, 256))) return { kind: 'select', target: browserTarget(operation['target']), values: operation['values'] as string[] }
+  if (operation['kind'] === 'scroll' && exact(operation, ['kind', 'target', 'deltaX', 'deltaY'], ['kind', 'deltaX', 'deltaY']) && boundedInt(operation['deltaX'], -10_000, 10_000) && boundedInt(operation['deltaY'], -10_000, 10_000)) return { kind: 'scroll', ...(operation['target'] === undefined ? {} : { target: browserTarget(operation['target']) }), deltaX: operation['deltaX'], deltaY: operation['deltaY'] }
+  if (operation['kind'] === 'drag' && exact(operation, ['kind', 'source', 'target'])) return { kind: 'drag', source: browserTarget(operation['source']), target: browserTarget(operation['target']) }
+  throw new Error('INVALID_REQUEST')
 }
 function waitCondition(value: unknown): WaitCondition {
   const condition = record(value)
@@ -114,6 +143,7 @@ export function parseBrowserToolAction(value: unknown): BrowserToolAction {
     const limit = action['limit'] ?? 100; if (!boundedInt(limit, 1, 200)) throw new Error('INVALID_REQUEST')
     return { type: 'network', ...lease, ...(action['cursor'] === undefined ? {} : { cursor: String(action['cursor']) }), limit, failedOnly: action['failedOnly'] === true }
   }
+  if (action['type'] === 'interact' && exact(action, [...BASE, 'operation'])) return { type: 'interact', ...lease, operation: interaction(action['operation']) }
   if (action['type'] === 'setViewport' && exact(action, [...BASE, 'viewport'])) {
     const viewport = record(action['viewport'])
     if (!viewport || !exact(viewport, ['width', 'height', 'deviceScaleFactor', 'mobile'], ['width', 'height']) || !boundedInt(viewport['width'], 200, 4096) || !boundedInt(viewport['height'], 200, 4096)
@@ -125,5 +155,5 @@ export function parseBrowserToolAction(value: unknown): BrowserToolAction {
 }
 
 export function isBrowserToolMutation(action: BrowserToolAction): boolean {
-  return action.type === 'reload' || action.type === 'history' || action.type === 'setViewport'
+  return action.type === 'reload' || action.type === 'history' || action.type === 'setViewport' || action.type === 'interact'
 }

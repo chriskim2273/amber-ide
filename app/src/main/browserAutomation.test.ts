@@ -1,5 +1,6 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { BrowserAutomation, redactBrowserText, sanitizeBrowserUrl, type BrowserDebuggerTransport } from './browserAutomation'
+import type { BrowserInteraction } from './browserToolProtocol'
 
 class FakeDebugger implements BrowserDebuggerTransport {
   attached = false
@@ -181,6 +182,61 @@ describe('browser automation', () => {
     expect(JSON.stringify(result)).not.toContain('secret')
   })
 
+  it('revalidates actionability and semantic fingerprints before fixed Input-domain interactions', async () => {
+    class InteractionDebugger extends FakeDebugger {
+      changed = false
+      override async send(method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>> {
+        this.calls.push(method)
+        if (method === 'DOM.getDocument') return { root: { nodeId: 300, nodeName: '#document' } }
+        if (method === 'DOM.performSearch') return { searchId: 'interaction', resultCount: 4 }
+        if (method === 'DOM.getSearchResults') return { nodeIds: [301, 302, 303, 304] }
+        if (method === 'DOM.describeNode') { const id = params?.['nodeId'] ?? params?.['backendNodeId']; return { node: { nodeName: id === 302 ? 'BUTTON' : id === 304 ? 'SELECT' : 'INPUT', parentId: 300, backendNodeId: id, attributes: ['type', id === 302 ? 'button' : id === 303 ? 'checkbox' : 'text'] } } }
+        if (method === 'Accessibility.getPartialAXTree') {
+          const id = params?.['nodeId'] ?? params?.['backendDOMNodeId']; const button = id === 302, checkbox = id === 303, select = id === 304
+          return { nodes: [{ nodeId: `ax-${id}`, role: { value: button ? 'button' : checkbox ? 'checkbox' : select ? 'combobox' : 'textbox' }, name: { value: this.changed ? 'Changed' : button ? 'Drop target' : checkbox ? 'Remember me' : select ? 'Country' : 'Search' }, backendDOMNodeId: id, properties: [{ name: 'checked', value: { value: false } }] }] }
+        }
+        if (method === 'DOM.pushNodesByBackendIdsToFrontend') return { nodeIds: [42] }
+        if (method === 'CSS.getComputedStyleForNode') return { computedStyle: [{ name: 'display', value: 'block' }, { name: 'visibility', value: 'visible' }, { name: 'opacity', value: '1' }, { name: 'pointer-events', value: 'auto' }] }
+        if (method === 'DOM.getBoxModel') { const id = params?.['backendNodeId']; const x = id === 302 ? 100 : id === 303 ? 200 : id === 304 ? 300 : 0; return { model: { border: [x, 0, x + 80, 0, x + 80, 20, x, 20] } } }
+        return {}
+      }
+    }
+    const transport = new InteractionDebugger(), automation = new BrowserAutomation(transport, () => 'https://example.test/form', () => false)
+    const snapshot = await automation.snapshot(lease, { maxDepth: 20, maxNodes: 20, maxBytes: 256 * 1024 }, new AbortController().signal)
+    const input = { snapshotId: snapshot.snapshotId, role: 'textbox', name: 'Search' }, button = { snapshotId: snapshot.snapshotId, ref: 'n2' }, checkbox = { snapshotId: snapshot.snapshotId, ref: 'n3' }, select = { snapshotId: snapshot.snapshotId, ref: 'n4' }
+    for (const operation of [
+      { kind: 'click', target: input }, { kind: 'doubleClick', target: input }, { kind: 'hover', target: input },
+      { kind: 'fill', target: input, text: 'hello' }, { kind: 'type', target: input, text: 'x' }, { kind: 'press', target: input, key: 'Enter' },
+      { kind: 'select', target: select, values: ['Canada'] }, { kind: 'check', target: checkbox }, { kind: 'uncheck', target: checkbox },
+      { kind: 'scroll', target: input, deltaX: 0, deltaY: 10 }, { kind: 'drag', source: input, target: button },
+    ] as BrowserInteraction[]) {
+      const prepared = await automation.prepareInteraction(lease, operation, new AbortController().signal)
+      await expect(automation.executeInteraction(prepared, new AbortController().signal)).resolves.toEqual({ dispatched: true, rollbackPossible: false })
+    }
+    expect(transport.calls).toContain('Input.dispatchMouseEvent')
+    expect(transport.calls).toContain('Input.dispatchKeyEvent')
+    expect(transport.calls).toContain('Input.insertText')
+    transport.changed = true
+    await expect(automation.prepareInteraction(lease, { kind: 'click', target: input }, new AbortController().signal)).rejects.toThrow('STALE_GENERATION')
+  })
+
+  it('reports cancellation after dispatch as no-rollback truth', async () => {
+    const controller = new AbortController()
+    class CancellingDebugger extends FakeDebugger {
+      override async send(method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>> {
+        if (method === 'DOM.describeNode' && params?.['backendNodeId'] === 2) return { node: { nodeName: 'BUTTON', parentId: 101, backendNodeId: 2 } }
+        if (method === 'Accessibility.getPartialAXTree' && params?.['backendDOMNodeId'] === 2) return { nodes: [{ role: { value: 'button' }, name: { value: 'Submit' }, backendDOMNodeId: 2 }] }
+        if (method === 'DOM.pushNodesByBackendIdsToFrontend') return { nodeIds: [22] }
+        if (method === 'Input.dispatchMouseEvent') { controller.abort(); return {} }
+        return super.send(method, params)
+      }
+    }
+    const transport = new CancellingDebugger(), automation = new BrowserAutomation(transport, () => 'about:blank', () => false)
+    const snapshot = await automation.snapshot(lease, { maxDepth: 20, maxNodes: 20, maxBytes: 256 * 1024 }, new AbortController().signal)
+    const prepared = await automation.prepareInteraction(lease, { kind: 'click', target: { snapshotId: snapshot.snapshotId, ref: 'n2' } }, new AbortController().signal)
+    await expect(automation.executeInteraction(prepared, controller.signal)).rejects.toThrow('ACTION_CANCELLED_NO_ROLLBACK')
+  })
+
   it('returns screenshot bytes in memory and rejects oversized captures', async () => {
     const transport = new FakeDebugger()
     const automation = new BrowserAutomation(transport, () => 'about:blank', () => false)
@@ -239,6 +295,16 @@ describe('browser automation', () => {
     await tiny.ensureAttached()
     tinyTransport.listeners.at(-1)!('Runtime.consoleAPICalled', { type: 'log', args: [{ value: 'x'.repeat(1000) }] })
     expect(tiny.consoleSince('0', undefined, 20)).toMatchObject({ dropped: 1, items: [] })
+  })
+
+  it('dismisses page dialogs fail-closed and reports only bounded redacted metadata', async () => {
+    const transport = new FakeDebugger(), dialog = vi.fn()
+    const automation = new BrowserAutomation(transport, () => 'about:blank', () => false, {}, { dialog })
+    await automation.ensureAttached()
+    transport.listeners[0]!('Page.javascriptDialogOpening', { type: 'confirm', message: `token=secret ${'x'.repeat(5000)}` })
+    await vi.waitFor(() => expect(transport.calls).toContain('Page.handleJavaScriptDialog'))
+    expect(dialog).toHaveBeenCalledWith({ type: 'confirm', message: expect.not.stringContaining('secret') })
+    expect((dialog.mock.calls[0]?.[0] as { message: string }).message.length).toBeLessThanOrEqual(1024)
   })
 
   it('uses only a fixed allowlist of debugger methods and supports cancellation', async () => {
