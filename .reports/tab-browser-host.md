@@ -105,7 +105,22 @@ Screenshots cross the local broker as a JSON metadata frame followed by a bounde
 
 Phase A deliberately does not implement element interaction or approvals. `.reports/tab-browser-host-remaining.json` therefore marks `P1-pi-tools-and-approvals` partial, not complete, and `mergeReady` remains false.
 
-Phase-A automated evidence: 812 app tests passed with one intentional real-daemon skip; focused browser tests passed 50/50; strict app typecheck, Electron build, hosted-web build, and workspace warnings-as-errors clippy passed; Pi extension installer tests passed 18/18 under the focused Cargo filter. Final independent review remains required after the tranche commit.
+Phase-A automated evidence before independent review: 812 app tests passed with one intentional real-daemon skip; focused browser tests passed 50/50; strict app typecheck, Electron build, hosted-web build, and workspace warnings-as-errors clippy passed; Pi extension installer tests passed 18/18 under the focused Cargo filter.
+
+## Independent Phase-A review — failed, remediation paused
+
+The independent gate failed with six valid findings. At the user-requested pause checkpoint, only the currently active atomic fix was completed: snapshots no longer call `Accessibility.getFullAXTree`; they traverse fixed `//*` search results in 32-node pages and request one partial AX node at a time, stopping before map insertion at scan, raw-input, node, and output-byte budgets. Hostile million-node and 600 KB accessible-name fixtures prove bounded accumulation. The same checkpoint validates encoded PNG dimensions (not only caller clip dimensions), preflights viewport/content geometry, and rejects target-plus-full-page ambiguity.
+
+Checkpoint-only validation passed: 12 focused automation/protocol tests, strict app typecheck, generated Pi-extension TypeScript extraction/typecheck, and diff whitespace check. The full suite/build/clippy gates above were **not rerun after this checkpoint**. No production daemon was contacted.
+
+Still open from the failed review, in required order on resume:
+
+1. Revalidate Share/designation/controller/association after every async operation before returning; abort and suppress active screenshot/wait/navigation work on revocation/controller loss, with race tests.
+2. Establish one generation owner for reload/back/forward, with production-shaped synchronous/asynchronous `did-start-navigation` and no-history tests.
+3. Label every model-visible page-derived text/image as fixed untrusted browser content, preserving the label through truncation and binary image transport.
+4. Correct ring dropped/gap accounting and add cursor-gap tests.
+5. Automate exact generated Pi-extension extraction, install, compile, and runtime load against the supported Pi/TypeBox API (the checkpoint compile command is not sufficient acceptance evidence).
+6. Rerun full gates and send the remediation commit through independent re-review.
 
 ## Open blocking work
 
