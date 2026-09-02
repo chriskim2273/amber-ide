@@ -41,6 +41,9 @@ contextBridge.exposeInMainWorld('amber', {
   // Memory budget: view (`getMemoryBudget`) / change (`setMemoryBudget`, MiB;
   // 0 = auto). The `BudgetApplied` reply arrives via onDaemonEvent.
   getMemoryBudget: () => ipcRenderer.send('daemon-command', { cmd: 'getMemoryBudget' }),
+  // Agent plan quota (design 2026-09-01). The `Usage` reply arrives via
+  // onDaemonEvent, like BudgetApplied — this is a request, not a promise.
+  getUsage: () => ipcRenderer.send('daemon-command', { cmd: 'getUsage' }),
   setMemoryBudget: (mb: number) => ipcRenderer.send('daemon-command', { cmd: 'setMemoryBudget', mb }),
   // Flush daemon-owned session metadata + scrollback now. Confirmation arrives
   // as SnapshotOk through onDaemonEvent; the renderer never infers success.

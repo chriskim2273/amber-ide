@@ -73,6 +73,9 @@ declare global {
       // Memory budget view/change; the BudgetApplied reply arrives via
       // onDaemonEvent. mb is MiB, 0 = auto.
       getMemoryBudget: () => void
+      // Agent plan quota; the `Usage` reply arrives via onDaemonEvent. Optional
+      // because the web build answers it over an authenticated HTTP route.
+      getUsage?: () => void
       setMemoryBudget: (mb: number) => void
       // Desktop-only capability. The browser client's security whitelist does
       // not expose Snapshot, so its bridge intentionally omits this method.
