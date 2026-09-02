@@ -16,6 +16,8 @@
 
 use amber_core::proto::{Gauge, ProviderUsage};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// What the collectors need from an external command. Deliberately NOT
 /// `std::process::Output`: its `ExitStatus` can only be constructed through a
@@ -355,6 +357,88 @@ pub fn codex_usage(now: i64) -> ProviderUsage {
     }
 }
 
+/// How often the daemon refreshes. A 5h window moves ~0.33%/min at full burn,
+/// so 60 s is already finer than the number's own resolution — and it is one
+/// HTTPS request per minute against the user's own account.
+pub const POLL_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Grok exposes no quota anywhere: no `x-ratelimit` header string and no usage
+/// endpoint in its binary, no token or limit data in `~/.grok/logs`, and its
+/// sessions are an FTS sqlite index. Its `rate_limit` string is a hook/error
+/// EVENT name, not a gauge. This row exists so the UI says that out loud
+/// instead of omitting a kind the user runs. Amber does NOT scrape grok's pane
+/// output for a limit banner — inferring state from TUI bytes is the
+/// antipattern the Pocket pass already ruled out.
+pub fn grok_usage(now: i64) -> ProviderUsage {
+    unavailable("grok", "grok exposes no quota data", now)
+}
+
+/// One snapshot per provider, always in this order, always all three rows.
+pub fn collect_all(now: i64, run: &Runner) -> Vec<ProviderUsage> {
+    vec![
+        claude_usage_with(None, now, run),
+        codex_usage(now),
+        grok_usage(now),
+    ]
+}
+
+/// The real runner: spawn `curl`.
+pub fn curl_runner() -> Box<Runner> {
+    Box::new(|args: &[&str]| {
+        let out = std::process::Command::new("curl").args(args).output()?;
+        Ok(RunOutput {
+            ok: out.status.success(),
+            status: out.status.to_string(),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        })
+    })
+}
+
+/// The daemon's cached snapshot. A `GetUsage` handler clones this and replies —
+/// it never fetches, so a control frame can never wait on curl or on disk.
+#[derive(Debug, Default)]
+pub struct UsageCache {
+    inner: Mutex<Vec<ProviderUsage>>,
+}
+
+impl UsageCache {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn snapshot(&self) -> Vec<ProviderUsage> {
+        self.inner
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn store(&self, rows: Vec<ProviderUsage>) {
+        if let Ok(mut guard) = self.inner.lock() {
+            *guard = rows;
+        }
+    }
+}
+
+/// Unix seconds now.
+pub fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Start the poller. Its own thread — never a connection read thread.
+pub fn start(cache: Arc<UsageCache>) {
+    std::thread::spawn(move || {
+        let run = curl_runner();
+        loop {
+            cache.store(collect_all(now_secs(), run.as_ref()));
+            std::thread::sleep(POLL_INTERVAL);
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -605,5 +689,42 @@ mod tests {
         }
         assert_eq!(rollout_files(&sessions).len(), MAX_ROLLOUT_FILES);
         assert_eq!(codex_usage_in(&sessions, 0).state, "unavailable");
+    }
+
+    #[test]
+    fn grok_is_unavailable_by_construction() {
+        let g = grok_usage(0);
+        assert_eq!(g.provider, "grok");
+        assert_eq!(g.state, "unavailable");
+        assert!(g.gauges.is_empty());
+        assert_eq!(g.detail.as_deref(), Some("grok exposes no quota data"));
+    }
+
+    #[test]
+    fn collect_all_returns_one_row_per_provider_in_order() {
+        let rows = collect_all(0, &ok_runner("{}"));
+        let names: Vec<&str> = rows.iter().map(|r| r.provider.as_str()).collect();
+        assert_eq!(names, vec!["claude", "codex", "grok"]);
+    }
+
+    #[test]
+    fn one_providers_failure_never_blanks_the_others() {
+        // A runner that always fails stands in for a dead network.
+        let boom = |_a: &[&str]| Err(std::io::Error::other("no network"));
+        let rows = collect_all(0, &boom);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].provider, "claude");
+        assert!(rows[0].state == "error" || rows[0].state == "unavailable");
+        assert_eq!(rows[2].state, "unavailable"); // grok row still present
+    }
+
+    #[test]
+    fn the_cache_hands_back_what_was_stored() {
+        let cache = UsageCache::new();
+        assert!(cache.snapshot().is_empty());
+        cache.store(vec![grok_usage(7)]);
+        let snap = cache.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].updated, 7);
     }
 }
