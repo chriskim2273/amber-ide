@@ -12,7 +12,7 @@ export type TabBrowserPageEvent =
   | { type: 'navigation-committed'; url: string }
   | { type: 'loading-stopped' }
   | { type: 'title'; title: string }
-  | { type: 'dialog'; dialogType: string; message: string }
+  | { type: 'dialog'; dialogType: string; message: string; respond: (decision: { accept: boolean; promptText?: string }) => void }
   | { type: 'crashed'; reason: string }
 
 export interface TabBrowserPage {
@@ -28,9 +28,9 @@ export interface TabBrowserPageFactory {
   create(id: BrowserId, onUserInput: () => void, onPageEvent: (event: TabBrowserPageEvent) => void): TabBrowserPage
 }
 export interface BrowserRuntimeStatus extends BrowserRecord { pageIncarnation: string; generation: number; loading: boolean; capacityWaiting?: boolean }
-export type TabBrowserHostEvent = { type: 'capacity-wait'; id: BrowserId; waiting: boolean } | { type: 'runtime'; id: BrowserId; status: BrowserRuntimeStatus }
+export type TabBrowserHostEvent = { type: 'capacity-wait'; id: BrowserId; waiting: boolean } | { type: 'runtime'; id: BrowserId; status: BrowserRuntimeStatus } | { type: 'dialog-request'; id: BrowserId; dialogType: string; message: string; generation: number; respond: (decision: { accept: boolean; promptText?: string }) => void }
 interface Runtime { page: TabBrowserPage; incarnation: string; generation: number; loading: boolean; automationNavigationPending: boolean; visible: boolean }
-export interface InteractionApprovalRequest { operation: BrowserInteraction; target: InteractionTargetMetadata; classification: InteractionClassification; origin: string; pageIncarnation: string; generation: number }
+export interface InteractionApprovalRequest { operation: BrowserInteraction; target: InteractionTargetMetadata; secondaryTarget?: InteractionTargetMetadata; classification: InteractionClassification; origin: string; pageIncarnation: string; generation: number }
 
 export class TabBrowserHost {
   private readonly capacity = new BrowserCapacity(4)
@@ -91,6 +91,7 @@ export class TabBrowserHost {
       record.stateRevision += 1
     } else if (event.type === 'dialog') {
       runtime.generation += 1; runtime.page.automation?.invalidate()
+      this.onEvent({ type: 'dialog-request', id, dialogType: event.dialogType, message: event.message, generation: runtime.generation, respond: event.respond })
     } else {
       runtime.automationNavigationPending = false
       runtime.loading = false
@@ -208,10 +209,10 @@ export class TabBrowserHost {
       else if (action.type === 'wait') result = await automation.wait(lease, action.condition, action.timeoutMs, signal, () => this.runtimes.get(record.id) === runtime && runtime.generation === action.expectedGeneration)
       else if (action.type === 'interact') {
         const prepared = await automation.prepareInteraction(lease, action.operation, signal)
-        const classification = classifyInteraction(action.operation, prepared.target)
+        const classification = classifyInteraction(action.operation, prepared.target, prepared.secondaryTarget)
         if (classification.consequential) {
           if (!approve) throw new Error('APPROVAL_REQUIRED')
-          await approve({ operation: action.operation, target: prepared.target, classification, origin: new URL(record.safeRestoreUrl).origin, pageIncarnation: runtime.incarnation, generation: runtime.generation }, signal)
+          await approve({ operation: action.operation, target: prepared.target, ...(prepared.secondaryTarget ? { secondaryTarget: prepared.secondaryTarget } : {}), classification, origin: new URL(record.safeRestoreUrl).origin, pageIncarnation: runtime.incarnation, generation: runtime.generation }, signal)
         }
         if (signal.aborted) throw new Error('ACTION_CANCELLED')
         if (this.runtimes.get(record.id) !== runtime || runtime.incarnation !== action.pageIncarnation || runtime.generation !== action.expectedGeneration) throw new Error('STALE_GENERATION')

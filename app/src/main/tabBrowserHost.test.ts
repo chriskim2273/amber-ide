@@ -39,6 +39,15 @@ describe('TabBrowserHost', () => {
     expect(host.status(opened.status.id).safeRestoreUrl).toBe('https://example.test/a')
   })
 
+  it('projects a dialog with an exact response channel and invalidates page generation', async () => {
+    const events: unknown[] = [], host = new TabBrowserHost(emptyBrowserState(1), factory, Date.now, undefined, () => {}, (event) => events.push(event))
+    const opened = await host.open({ visible: true }); const respond = vi.fn()
+    pageEvents.get(opened.status.id)!({ type: 'dialog', dialogType: 'confirm', message: 'Continue?', respond })
+    const event = events.find((candidate) => (candidate as { type?: string }).type === 'dialog-request')
+    expect(event).toMatchObject({ type: 'dialog-request', id: opened.status.id, dialogType: 'confirm', message: 'Continue?', generation: 1, respond })
+    expect(host.status(opened.status.id).generation).toBe(1)
+  })
+
   it('rejects stale mutations, including after physical user input', async () => {
     const host = new TabBrowserHost(emptyBrowserState(1), factory)
     const opened = await host.open({ visible: true })
@@ -98,6 +107,12 @@ describe('TabBrowserHost', () => {
       operation: { kind: 'fill', target: { snapshotId: 'snap', ref: 'n1' }, text: 'do-not-return-me' } }, new AbortController().signal)).rejects.toThrow('APPROVAL_REQUIRED')
     expect(automation.executeInteraction).not.toHaveBeenCalled()
     expect(host.status(opened.status.id).generation).toBe(0)
+  })
+
+  it('physically detaches the native page while an approval or dialog surface is visible', async () => {
+    const host = new TabBrowserHost(emptyBrowserState(1), factory), opened = await host.open({ visible: true }), page = opened.page as FakePage
+    expect(page.visible).toBe(true); host.protectApproval(opened.status.id, true); expect(page.visible).toBe(false)
+    host.protectApproval(opened.status.id, false); expect(page.visible).toBe(true)
   })
 
   it('invalidates snapshots and generation immediately on Share revoke or Stop Pi', async () => {

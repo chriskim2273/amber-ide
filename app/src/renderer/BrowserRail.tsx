@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { formatLastPiAction, secondsRemaining } from './browserRailModel'
 
 interface BrowserStatus {
   id: string; safeRestoreUrl: string; pageIncarnation: string; generation: number
@@ -18,6 +19,10 @@ export function BrowserRail(props: {
   const [address, setAddress] = useState('')
   const [error, setError] = useState('')
   const [approval, setApproval] = useState<null | { approvalId: string; digest: string; controller: string; origin: string; category: string; targetLabel: string; argumentSummary: string; expiresAt: number; canGrantOrigin: boolean }>(null)
+  const [dialog, setDialog] = useState<null | { dialogId: string; digest: string; dialogType: string; message: string; expiresAt: number }>(null)
+  const [promptText, setPromptText] = useState('')
+  const [lastAction, setLastAction] = useState<null | { action: string; phase: string; error?: string }>(null)
+  const [clock, setClock] = useState(Date.now())
 
   const command = async (value: unknown): Promise<BrowserReply> => {
     await props.ensureContext()
@@ -35,8 +40,17 @@ export function BrowserRail(props: {
         const candidate = event as typeof event & { approvalId: string; digest: string; controller: string; origin: string; category: string; targetLabel: string; argumentSummary: string; expiresAt: number; canGrantOrigin: boolean }
         setApproval(candidate)
       } else if (event.type === 'approval-resolved' && event.browserId === props.id) setApproval(null)
+      else if (event.type === 'dialog-request' && event.browserId === props.id && event.headless !== true) { const candidate = event as typeof event & { dialogId: string; digest: string; dialogType: string; message: string; expiresAt: number }; setPromptText(''); setDialog(candidate) }
+      else if (event.type === 'dialog-resolved' && event.browserId === props.id) { setDialog(null); setPromptText('') }
+      else if (event.type === 'pi-action' && event.browserId === props.id && typeof event.action === 'string' && typeof event.phase === 'string') setLastAction({ action: event.action, phase: event.phase, ...(typeof event.error === 'string' ? { error: event.error } : {}) })
     })
   }, [props.id])
+
+  useEffect(() => {
+    if (!approval && !dialog) return
+    setClock(Date.now()); const timer = window.setInterval(() => setClock(Date.now()), 250)
+    return () => window.clearInterval(timer)
+  }, [approval, dialog])
 
   useEffect(() => {
     if (props.designatedPi && !props.controllers.some((controller) => controller.name === props.designatedPi)) {
@@ -103,18 +117,29 @@ export function BrowserRail(props: {
       <button className="icon-btn" aria-label="Close tab browser" onClick={props.onClose}>×</button>
     </div>
     {status?.capacityWaiting && <div className="tab-browser-status" role="status">Waiting for browser capacity…</div>}
+    {lastAction && <div className="tab-browser-status" role="status">{formatLastPiAction(lastAction)}</div>}
     {error && <div className="tab-browser-error" role="alert">{error}</div>}
     {approval && <div className="tab-browser-approval" role="alertdialog" aria-modal="true" aria-label="Pi browser action approval">
       <strong>Pi requests a consequential browser action</strong>
       <div>{approval.category} · {approval.origin}</div>
       <div>Controller: {approval.controller}</div>
-      <div>Expires in {Math.max(0, Math.ceil((approval.expiresAt - Date.now()) / 1000))}s · dispatch not started</div>
+      <div>Expires in {secondsRemaining(approval.expiresAt, clock)}s · dispatch not started</div>
       <div>Target (untrusted browser content): {approval.targetLabel || 'page'}</div>
       {approval.argumentSummary && <div>Value: {approval.argumentSummary}</div>}
       <div className="tab-browser-approval-actions">
         <button className="btn" onClick={() => void command({ type: 'resolveApproval', approvalId: approval.approvalId, digest: approval.digest, decision: 'approve-once' })}>Approve once</button>
         {approval.canGrantOrigin && <button className="btn" onClick={() => void command({ type: 'resolveApproval', approvalId: approval.approvalId, digest: approval.digest, decision: 'allow-origin' })}>Allow this confirmation for origin</button>}
         <button className="btn" onClick={() => void command({ type: 'resolveApproval', approvalId: approval.approvalId, digest: approval.digest, decision: 'reject' })}>Reject</button>
+      </div>
+    </div>}
+    {dialog && <div className="tab-browser-approval tab-browser-dialog" role="alertdialog" aria-modal="true" aria-label="Browser dialog">
+      <strong>{dialog.dialogType === 'beforeunload' ? 'Page asks to leave' : `Page ${dialog.dialogType}`}</strong>
+      <div>Message (untrusted browser content): {dialog.message}</div>
+      <div>Expires in {secondsRemaining(dialog.expiresAt, clock)}s</div>
+      {dialog.dialogType === 'prompt' && <input aria-label="Browser prompt response" value={promptText} maxLength={4096} onChange={(event) => setPromptText(event.target.value)} />}
+      <div className="tab-browser-approval-actions">
+        <button className="btn" onClick={() => void command({ type: 'resolveDialog', dialogId: dialog.dialogId, digest: dialog.digest, accept: true, ...(dialog.dialogType === 'prompt' ? { promptText } : {}) })}>{dialog.dialogType === 'beforeunload' ? 'Leave' : 'Accept'}</button>
+        <button className="btn" onClick={() => void command({ type: 'resolveDialog', dialogId: dialog.dialogId, digest: dialog.digest, accept: false })}>{dialog.dialogType === 'beforeunload' ? 'Stay' : 'Reject'}</button>
       </div>
     </div>}
     <div ref={host} className="tab-browser-page-slot" />

@@ -10,8 +10,8 @@ export function hardenBrowserSession(browserSession: Session): void {
   hardenedSessions.add(browserSession)
   browserSession.setPermissionCheckHandler(() => false)
   browserSession.setPermissionRequestHandler((_contents, _permission, callback) => callback(false))
-  // Downloads are consequential and no approval coordinator exists on this
-  // narrow first surface, so fail closed rather than writing silently.
+  // File writes stay outside the semantic tool surface. Even an approved
+  // page click cannot turn into an unbounded filesystem download.
   browserSession.on('will-download', (event) => event.preventDefault())
 }
 
@@ -41,7 +41,7 @@ export class ElectronTabBrowserPage implements TabBrowserPage {
         if (direction === 'forward' && history.canGoForward()) { history.goForward(); return true }
         return false
       },
-      dialog: (dialog) => onPageEvent({ type: 'dialog', dialogType: dialog.type, message: dialog.message }),
+      dialog: (dialog) => new Promise((resolve) => onPageEvent({ type: 'dialog', dialogType: dialog.type, message: dialog.message, respond: resolve })),
     })
     // Attach to this WebContents only; there is no remote-debugging endpoint
     // and therefore no target enumeration or cross-page control surface.

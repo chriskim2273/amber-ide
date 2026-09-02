@@ -3,6 +3,11 @@ import type { LayoutFile } from '../shared/layoutFile'
 export interface ActiveBrowserContext { workspace: number; tab: number; browserId: string | null }
 export interface BrowserContextState { activeWorkspace: number | null; activeTab: number | null; activeBrowserId: string | null; browserContextGeneration: number }
 export interface BrowserContextLease { workspace: number; tab: number; browserId: string | null; generation: number }
+export interface ApprovalSurfaceState { browserId: string | null; expanded: boolean; visible: boolean; destroyed: boolean; local: boolean }
+
+export function hasExactApprovalSurface(states: ApprovalSurfaceState[], browserId: string): boolean {
+  return states.some((state) => state.local && !state.destroyed && state.visible && state.expanded && state.browserId === browserId)
+}
 
 export function captureBrowserContext(state: BrowserContextState): BrowserContextLease {
   if (state.activeWorkspace === null || state.activeTab === null) throw new Error('NO_ACTIVE_TAB')

@@ -318,9 +318,20 @@ function App(): JSX.Element {
   const [browserRecoveryOpen, setBrowserRecoveryOpen] = useState(false)
   const [browserRecovery, setBrowserRecovery] = useState<Array<{ index: number; workspace: number; tab: number; safeRestoreUrl: string }>>([])
   useEffect(() => window.amber.onTabBrowserEvent?.((value) => {
-    const event = value as { type?: unknown; waiting?: unknown }
+    const event = value as { type?: unknown; waiting?: unknown; browserId?: unknown; workspace?: unknown; tab?: unknown; browser?: unknown }
     if (event.type === 'capacity-wait' && event.waiting === true) setNotice('Waiting for browser capacity…')
     else if (event.type === 'capacity-wait' && event.waiting === false) setNotice((current) => current === 'Waiting for browser capacity…' ? null : current)
+    else if (event.type === 'approval-reveal' && typeof event.browserId === 'string' && typeof event.workspace === 'number' && typeof event.tab === 'number' && event.browser && typeof event.browser === 'object') {
+      const browser = event.browser as NonNullable<LayoutFile['workspaces'][string]['tabs'][string]['browser']>
+      if (browser.id !== event.browserId) return
+      setLayout((current) => {
+        const workspace = current.workspaces[String(event.workspace)] ?? { activeTab: event.tab as number, tabs: {} }
+        const previous = workspace.tabs[String(event.tab)] ?? { tree: null }
+        return { ...current, activeWorkspace: event.workspace as number, version: 2, browserRevision: (current.browserRevision ?? 0) + 1,
+          workspaces: { ...current.workspaces, [String(event.workspace)]: { ...workspace, activeTab: event.tab as number, tabs: { ...workspace.tabs, [String(event.tab)]: { ...previous, browser } } } } }
+      })
+      setActiveWs(event.workspace); setActiveTab(event.tab)
+    }
   }), [])
   type ProductivityOverlay = 'palette' | 'search' | 'recovery' | 'templates' | 'bookmarks' | 'presets' | 'checkpoints' | 'project'
   const [productivityOverlay, setProductivityOverlay] = useState<ProductivityOverlay | null>(null)

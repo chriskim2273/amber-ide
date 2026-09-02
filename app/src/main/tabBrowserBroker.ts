@@ -149,7 +149,7 @@ async function tokenFile(path: string): Promise<string> {
   return token
 }
 
-export interface TabBrowserBrokerOptions { requestTimeoutMs?: number; socketTimeoutMs?: number; authorizeReplay?: (request: BrokerRequest) => boolean | Promise<boolean> }
+export interface TabBrowserBrokerOptions { requestTimeoutMs?: number; socketTimeoutMs?: number; resultTtlMs?: number; maxClientIdentities?: number; now?: () => number; authorizeReplay?: (request: BrokerRequest) => boolean | Promise<boolean> }
 
 export class TabBrowserBrokerServer {
   private server: Server | null = null
@@ -157,7 +157,7 @@ export class TabBrowserBrokerServer {
   private inFlight = 0
   private readonly sockets = new Set<Socket>()
   private readonly highWater = new Map<string, number>()
-  private readonly results = new Map<string, { digest: string; promise: Promise<unknown> }>()
+  private readonly results = new Map<string, { digest: string; promise: Promise<unknown>; acceptedAt: number }>()
   private readonly queues = new Map<string, Promise<void>>()
   private readonly queueDepth = new Map<string, number>()
   private readonly activeRequests = new Map<AbortController, string>()
@@ -214,6 +214,8 @@ export class TabBrowserBrokerServer {
             }
             const request = parseBrokerRequest(value); requestId = request.requestId
             cacheKey = `${request.clientInstanceId}:${request.requestId}`
+            const now = this.options.now ?? Date.now, resultTtl = this.options.resultTtlMs ?? 5 * 60_000
+            for (const [key, entry] of this.results) if (now() - entry.acceptedAt >= resultTtl) this.results.delete(key)
             const digest = brokerRequestDigest(request)
             const cached = this.results.get(cacheKey)
             let result: unknown
@@ -222,10 +224,11 @@ export class TabBrowserBrokerServer {
               if (this.options.authorizeReplay && !(await this.options.authorizeReplay(request))) throw new Error('STALE_BROWSER_CONTEXT')
               result = await cached.promise
             } else {
+              const knownClient = this.highWater.has(request.clientInstanceId)
               const previousSequence = this.highWater.get(request.clientInstanceId) ?? 0
               if (request.sequence <= previousSequence) throw new Error('ACTION_CANCELLED')
+              if (!knownClient && this.highWater.size >= (this.options.maxClientIdentities ?? 1024)) throw new Error('REQUEST_LIMIT')
               this.highWater.set(request.clientInstanceId, request.sequence)
-              if (this.highWater.size > 1024) this.highWater.delete(this.highWater.keys().next().value!)
               const key = request.amberSession, depth = this.queueDepth.get(key) ?? 0
               if (depth >= 16) throw new Error('REQUEST_LIMIT')
               const controller = new AbortController(); active.add(controller); this.activeRequests.set(controller, request.amberSession)
@@ -258,7 +261,7 @@ export class TabBrowserBrokerServer {
                 if (remaining <= 0) this.queueDepth.delete(key); else this.queueDepth.set(key, remaining)
                 if (this.queues.get(key) === tail) this.queues.delete(key)
               })
-              this.results.set(cacheKey, { digest, promise })
+              this.results.set(cacheKey, { digest, promise, acceptedAt: now() })
               if (this.results.size > 256) this.results.delete(this.results.keys().next().value!)
               result = await promise
             }

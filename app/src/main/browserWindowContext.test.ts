@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { browserContextMatches, captureBrowserContext, resolveBrowserContext, setBrowserForCurrentContext, type BrowserContextState } from './browserWindowContext'
+import { browserContextMatches, captureBrowserContext, hasExactApprovalSurface, resolveBrowserContext, setBrowserForCurrentContext, type BrowserContextState } from './browserWindowContext'
 
 const layout = { version: 2, activeWorkspace: 1, workspaces: {
   '1': { activeTab: 1, tabs: { '1': { tree: null } } },
@@ -17,6 +17,12 @@ describe('resolveBrowserContext', () => {
     expect(browserContextMatches(state, lease)).toBe(false)
     expect(setBrowserForCurrentContext(state, lease, 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')).toBe(false)
     expect(state.activeBrowserId).toBe('browser-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')
+  })
+
+  it('requires the exact owning browser to be visible and expanded for approvals', () => {
+    const exact = { local: true, destroyed: false, visible: true, expanded: true, browserId: 'browser-a' }
+    expect(hasExactApprovalSurface([exact], 'browser-a')).toBe(true)
+    for (const changed of [{ visible: false }, { expanded: false }, { destroyed: true }, { local: false }, { browserId: 'browser-b' }]) expect(hasExactApprovalSurface([{ ...exact, ...changed }], 'browser-a')).toBe(false)
   })
 
   it('rejects coordinates that main cannot resolve', () => {

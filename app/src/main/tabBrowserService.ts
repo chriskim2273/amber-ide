@@ -6,7 +6,7 @@ import type { WsBrowser } from '../shared/workspaceFile'
 import { TabBrowserStateStore } from './tabBrowserStateStore'
 import type { BrowserStateFile } from '../shared/tabBrowserState'
 import type { BrowserToolAction } from './browserToolProtocol'
-import { BrowserApprovalCoordinator, interactionValueDigest, type ApprovalDecision } from './browserApproval'
+import { BrowserApprovalCoordinator, BrowserDialogCoordinator, interactionTargetDigest, interactionValueDigest, type ApprovalDecision } from './browserApproval'
 
 export type TabBrowserCommand =
   | { type: 'open' }
@@ -16,12 +16,13 @@ export type TabBrowserCommand =
   | { type: 'show'; id: string; bounds: Rectangle }
   | { type: 'hide'; id: string }
   | { type: 'bounds'; id: string; bounds: Rectangle }
-  | { type: 'navigate'; id: string; url: string; pageIncarnation: string; expectedGeneration: number }
+  | { type: 'navigate'; id: string; url: string; pageIncarnation: string; expectedGeneration: number; broker?: { controller: string } }
   | { type: 'status'; id: string }
-  | { type: 'stop'; id: string; pageIncarnation?: string; expectedGeneration?: number }
+  | { type: 'stop'; id: string; pageIncarnation?: string; expectedGeneration?: number; broker?: { controller: string } }
   | { type: 'automation'; id: string; action: BrowserToolAction; broker?: { requestId: string; controller: string } }
   | { type: 'resolveApproval'; id: string; approvalId: string; digest: string; decision: ApprovalDecision }
   | { type: 'stopPi'; id: string }
+  | { type: 'resolveDialog'; id: string; dialogId: string; digest: string; accept: boolean; promptText?: string }
   | { type: 'destroy'; id: string }
 
 export interface WorkspaceBrowserImport { entries: { id: BrowserId; browser: WsBrowser }[]; recovery: { ws: number; tab: number; browser: WsBrowser }[] }
@@ -80,7 +81,10 @@ export class TabBrowserService {
   private readonly activePi = new Map<string, Set<AbortController>>()
   private readonly revokedPi = new Set<string>()
   private readonly approvals: BrowserApprovalCoordinator
+  private readonly dialogs: BrowserDialogCoordinator
   private readonly observedGeneration = new Map<string, number>()
+  private approvalSurfaceVisible: (browserId: string) => boolean = () => false
+  private approvalSurfaceReveal: (browserId: string) => void = () => {}
 
   private constructor(
     private readonly store: TabBrowserStateStore,
@@ -90,7 +94,8 @@ export class TabBrowserService {
     window?: BrowserWindow,
   ) {
     this.persistedState = structuredClone(initialState); this.currentWindow = window ?? null
-    this.approvals = new BrowserApprovalCoordinator(Date.now, () => !!this.currentWindow && !this.currentWindow.isDestroyed() && this.currentWindow.isVisible(), (event) => this.eventSink(event), 30_000, () => { if (this.currentWindow && !this.currentWindow.isDestroyed()) { this.currentWindow.show(); this.currentWindow.focus() } })
+    this.approvals = new BrowserApprovalCoordinator(Date.now, (id) => this.approvalSurfaceVisible(id), (event) => this.eventSink(event), 60_000, (id) => this.approvalSurfaceReveal(id))
+    this.dialogs = new BrowserDialogCoordinator(Date.now, (id) => this.approvalSurfaceVisible(id), (event) => this.eventSink(event), 60_000, (id) => this.approvalSurfaceReveal(id))
   }
 
   static async create(root: string, window: BrowserWindow, store = new TabBrowserStateStore(root)): Promise<TabBrowserService> {
@@ -109,12 +114,19 @@ export class TabBrowserService {
   }
 
   setWindow(window: BrowserWindow): void { this.currentWindow = window; this.pages.setWindow(window) }
+  setApprovalSurface(visible: (browserId: string) => boolean, reveal: (browserId: string) => void): void { this.approvalSurfaceVisible = visible; this.approvalSurfaceReveal = reveal }
   setEventSink(sink: (event: unknown) => void): void { this.eventSink = sink }
   private handleHostEvent(event: unknown): void {
-    const runtime = event as { type?: unknown; id?: unknown; status?: { generation?: unknown } }
+    const runtime = event as { type?: unknown; id?: unknown; status?: { generation?: unknown; lifecycle?: unknown }; dialogType?: unknown; message?: unknown; generation?: unknown; respond?: (decision: { accept: boolean; promptText?: string }) => void }
+    if (runtime.type === 'dialog-request' && typeof runtime.id === 'string' && typeof runtime.dialogType === 'string' && typeof runtime.message === 'string' && typeof runtime.generation === 'number' && runtime.respond) {
+      try { this.host.protectApproval(runtime.id, true) } catch { runtime.respond({ accept: false }); return }
+      void this.dialogs.request(runtime.id, runtime.generation, runtime.dialogType, runtime.message).then(runtime.respond, () => runtime.respond!({ accept: false })).finally(() => { try { this.host.protectApproval(runtime.id as string, false) } catch { /* page closed */ } })
+      return
+    }
     if (runtime.type === 'runtime' && typeof runtime.id === 'string' && typeof runtime.status?.generation === 'number') {
       const previous = this.observedGeneration.get(runtime.id); this.observedGeneration.set(runtime.id, runtime.status.generation)
       if (previous !== undefined && previous !== runtime.status.generation) this.approvals.invalidateBrowser(runtime.id)
+      if (runtime.status.lifecycle === 'frozen') { this.approvals.clearBrowser(runtime.id); this.dialogs.clearBrowser(runtime.id) }
     }
     this.eventSink(event)
   }
@@ -159,7 +171,7 @@ export class TabBrowserService {
     // Opens must reach the host concurrently so the global capacity FIFO sees
     // every contender. Observations and hide also cannot sit behind a wait.
     if (command.type === 'hide' || command.type === 'destroy') this.activationControllers.get(command.id)?.abort()
-    if (command.type === 'open' || command.type === 'status' || command.type === 'hide' || command.type === 'destroy' || command.type === 'resolveApproval' || command.type === 'stopPi') return this.runCommand(command, signal, validate)
+    if (command.type === 'open' || command.type === 'status' || command.type === 'hide' || command.type === 'destroy' || command.type === 'resolveApproval' || command.type === 'resolveDialog' || command.type === 'stopPi') return this.runCommand(command, signal, validate)
     if (command.type === 'close' || command.type === 'share' || command.type === 'designate') return Promise.reject(new Error('ASSOCIATION_COMMAND_REQUIRES_MAIN'))
     const key = command.id
     const prior = this.browserQueues.get(key) ?? Promise.resolve()
@@ -175,6 +187,10 @@ export class TabBrowserService {
     return result
   }
 
+  private piAction(id: string, controller: string, action: string, phase: 'started' | 'completed' | 'failed', error?: unknown): void {
+    const raw = error instanceof Error ? error.message : 'INTERNAL_ERROR'
+    this.eventSink({ type: 'pi-action', browserId: id, controller, action, phase, ...(phase === 'failed' ? { error: /^[A-Z][A-Z0-9_]{1,63}$/.test(raw) ? raw : 'INTERNAL_ERROR' } : {}), at: Date.now() })
+  }
   private async runCommand(command: TabBrowserCommand, signal?: AbortSignal, validate?: () => boolean | Promise<boolean>): Promise<unknown> {
     if (validate && !(await validate())) throw new Error('STALE_BROWSER_CONTEXT')
     if (signal?.aborted) throw new Error('ACTION_CANCELLED')
@@ -199,15 +215,21 @@ export class TabBrowserService {
       case 'hide': this.host.hide(command.id); return this.host.status(command.id)
       case 'bounds': this.host.setBounds(command.id, command.bounds); return this.host.status(command.id)
       case 'navigate': {
-        const status = await this.host.navigate(command.id, command.url, command.pageIncarnation, command.expectedGeneration, signal)
-        await this.schedulePersist(); return status
+        if (command.broker) this.piAction(command.id, command.broker.controller, 'navigate', 'started')
+        try { const status = await this.host.navigate(command.id, command.url, command.pageIncarnation, command.expectedGeneration, signal); await this.schedulePersist(); if (command.broker) this.piAction(command.id, command.broker.controller, 'navigate', 'completed'); return status }
+        catch (error) { if (command.broker) this.piAction(command.id, command.broker.controller, 'navigate', 'failed', error); throw error }
       }
       case 'status': return this.host.status(command.id)
-      case 'stop': return this.host.stop(command.id, command.pageIncarnation, command.expectedGeneration)
+      case 'stop': {
+        if (command.broker) this.piAction(command.id, command.broker.controller, 'stop', 'started')
+        try { const status = this.host.stop(command.id, command.pageIncarnation, command.expectedGeneration); if (command.broker) this.piAction(command.id, command.broker.controller, 'stop', 'completed'); return status }
+        catch (error) { if (command.broker) this.piAction(command.id, command.broker.controller, 'stop', 'failed', error); throw error }
+      }
       case 'automation': {
         const controller = new AbortController(), upstreamAbort = (): void => controller.abort()
         signal?.addEventListener('abort', upstreamAbort, { once: true }); if (signal?.aborted) controller.abort()
         if (command.broker) { this.revokedPi.delete(command.id); const set = this.activePi.get(command.id) ?? new Set<AbortController>(); set.add(controller); this.activePi.set(command.id, set) }
+        if (command.broker) this.piAction(command.id, command.broker.controller, command.action.type === 'interact' ? command.action.operation.kind : command.action.type, 'started')
         try {
           const result = await this.host.runAutomation(command.id, command.action, controller.signal, command.broker ? async (request, approvalSignal) => {
             const classification = request.classification
@@ -217,13 +239,17 @@ export class TabBrowserService {
             try {
               await this.approvals.request({ requestId: command.broker!.requestId, controller: command.broker!.controller, browserId: command.id,
                 pageIncarnation: request.pageIncarnation, generation: request.generation, origin: request.origin, action: request.operation.kind,
-                targetFingerprint: request.target.fingerprint, valueCategory: classification.valueCategory, valueDigest: interactionValueDigest(request.operation),
+                targetFingerprint: interactionTargetDigest(request.target, request.secondaryTarget), valueCategory: classification.valueCategory, valueDigest: interactionValueDigest(request.operation),
                 category: classification.category as Exclude<typeof classification.category, 'benign'>, canGrantOrigin: classification.canGrantOrigin,
-                targetLabel: `${request.target.role} ${request.target.name}`.trim().slice(0, 512), argumentSummary: classification.argumentSummary }, approvalSignal)
+                targetLabel: [request.target, request.secondaryTarget].filter((target): target is NonNullable<typeof target> => !!target).map((target) => `${target.role} ${target.name}`.trim()).join(' → ').slice(0, 512), argumentSummary: classification.argumentSummary }, approvalSignal)
             } finally { try { this.host.protectApproval(command.id, false) } catch { /* record may close while approval is pending */ } }
           } : undefined)
           if (command.action.type === 'setViewport') await this.schedulePersist()
+          if (command.broker) this.piAction(command.id, command.broker.controller, command.action.type === 'interact' ? command.action.operation.kind : command.action.type, 'completed')
           return result
+        } catch (error) {
+          if (command.broker) this.piAction(command.id, command.broker.controller, command.action.type === 'interact' ? command.action.operation.kind : command.action.type, 'failed', error)
+          throw error
         } finally {
           signal?.removeEventListener('abort', upstreamAbort)
           const set = this.activePi.get(command.id); set?.delete(controller); if (set?.size === 0) this.activePi.delete(command.id)
@@ -233,15 +259,19 @@ export class TabBrowserService {
         if (!this.approvals.resolve(command.id, command.approvalId, command.digest, command.decision)) throw new Error('APPROVAL_DENIED')
         return this.host.status(command.id)
       }
+      case 'resolveDialog': {
+        if (!this.dialogs.resolve(command.id, command.dialogId, command.digest, command.accept, command.promptText)) throw new Error('DIALOG_DENIED')
+        return this.host.status(command.id)
+      }
       case 'stopPi': this.revokePi(command.id); return this.host.status(command.id)
-      case 'destroy': this.host.close(command.id); await this.schedulePersist(); return { closed: true }
+      case 'destroy': this.approvals.clearBrowser(command.id); this.dialogs.clearBrowser(command.id); this.host.close(command.id); await this.schedulePersist(); return { closed: true }
       case 'close': case 'share': case 'designate': throw new Error('ASSOCIATION_COMMAND_REQUIRES_MAIN')
     }
   }
 
   revokePi(id: string): void {
     if (this.revokedPi.has(id)) return
-    this.revokedPi.add(id); this.approvals.clearBrowser(id)
+    this.revokedPi.add(id); this.approvals.clearBrowser(id); this.dialogs.clearBrowser(id)
     try { this.host.revokePi(id) } catch { /* close may already have removed the record */ }
     for (const controller of this.activePi.get(id) ?? []) controller.abort()
     this.activePi.delete(id)
@@ -263,6 +293,11 @@ export function parseTabBrowserCommand(value: unknown): TabBrowserCommand {
   if (v['type'] === 'resolveApproval' && exact(v, ['type', 'approvalId', 'digest', 'decision']) && typeof v['approvalId'] === 'string' && v['approvalId'].length <= 128
       && typeof v['digest'] === 'string' && /^[a-f0-9]{64}$/.test(v['digest']) && (v['decision'] === 'approve-once' || v['decision'] === 'reject' || v['decision'] === 'allow-origin')) return { type: 'resolveApproval', id: '' as never, approvalId: v['approvalId'], digest: v['digest'], decision: v['decision'] }
   if (v['type'] === 'stopPi' && exact(v, ['type'])) return { type: 'stopPi', id: '' as never }
+  if (v['type'] === 'resolveDialog' && (exact(v, ['type', 'dialogId', 'digest', 'accept']) || exact(v, ['type', 'dialogId', 'digest', 'accept', 'promptText']))
+      && typeof v['dialogId'] === 'string' && v['dialogId'].length >= 1 && v['dialogId'].length <= 128 && typeof v['digest'] === 'string' && /^[a-f0-9]{64}$/.test(v['digest'])
+      && typeof v['accept'] === 'boolean' && (v['promptText'] === undefined || typeof v['promptText'] === 'string' && v['promptText'].length <= 4096)) {
+    return { type: 'resolveDialog', id: '' as never, dialogId: v['dialogId'], digest: v['digest'], accept: v['accept'], ...(typeof v['promptText'] === 'string' ? { promptText: v['promptText'] } : {}) }
+  }
   if (v['type'] === 'designate' && (exact(v, ['type']) || exact(v, ['type', 'designatedPi']))) {
     if (v['designatedPi'] !== undefined && (typeof v['designatedPi'] !== 'string' || v['designatedPi'].length > 256)) throw new Error('INVALID_REQUEST')
     return { type: 'designate', ...(typeof v['designatedPi'] === 'string' ? { designatedPi: v['designatedPi'] } : {}) }

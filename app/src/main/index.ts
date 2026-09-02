@@ -82,7 +82,7 @@ import { bindRendererBrowserCommand, browserAuthorityChanged } from './browserAs
 import { emptyLayout, parseLayout, serializeLayout, type LayoutFile } from '../shared/layoutFile'
 import { parseWorkspaceFile } from '../shared/workspaceFile'
 import { commitPreparedWorkspaceImport, prepareWorkspaceImport } from './workspaceImport'
-import { browserContextMatches, captureBrowserContext, resolveBrowserContext, setBrowserForCurrentContext } from './browserWindowContext'
+import { browserContextMatches, captureBrowserContext, hasExactApprovalSurface, resolveBrowserContext, setBrowserForCurrentContext } from './browserWindowContext'
 import { createBrowserId } from '../shared/tabBrowser'
 import clientPath from '../client/index?modulePath'
 
@@ -731,6 +731,7 @@ interface WindowCtx {
   child: () => Electron.UtilityProcess | null
   resumeClient: () => void
   activeBrowserId: string | null
+  activeBrowserExpanded: boolean
   activeWorkspace: number | null
   activeTab: number | null
   browserContextGeneration: number
@@ -749,7 +750,9 @@ function setWindowContextFromLayout(ctx: WindowCtx, layout: LayoutFile): void {
   const workspace = layout.workspaces[String(layout.activeWorkspace)]
   ctx.activeWorkspace = layout.activeWorkspace
   ctx.activeTab = workspace?.activeTab ?? null
-  ctx.activeBrowserId = workspace?.tabs[String(workspace.activeTab)]?.browser?.id ?? null
+  const browser = workspace?.tabs[String(workspace.activeTab)]?.browser
+  ctx.activeBrowserId = browser?.id ?? null
+  ctx.activeBrowserExpanded = !!browser && !browser.collapsed
   ctx.browserContextGeneration += 1
 }
 
@@ -1141,6 +1144,7 @@ async function openWindow(target: WindowTarget): Promise<WindowCtx> {
     controlPort: () => controlPort,
     child: () => child,
     activeBrowserId: null,
+    activeBrowserExpanded: false,
     activeWorkspace: null,
     activeTab: null,
     browserContextGeneration: 0,
@@ -1197,6 +1201,24 @@ async function main(): Promise<void> {
       tabBrowserStateStore = new TabBrowserStateStore(stateRoot())
       await coordinateTabBrowserMigration(layoutPath(), tabBrowserStateStore)
       tabBrowser = await TabBrowserService.create(stateRoot(), win, tabBrowserStateStore)
+      tabBrowser.setApprovalSurface(
+        (id) => hasExactApprovalSurface([...windowCtxs.values()].map((context) => ({ local: context.target.kind === 'local', destroyed: context.win.isDestroyed(), visible: context.win.isVisible(), browserId: context.activeBrowserId, expanded: context.activeBrowserExpanded })), id),
+        (id) => {
+          void (async () => {
+            const loaded = await loadLayoutFile(layoutPath()); if (!loaded.text) return
+            const layout = parseLayout(loaded.text)
+            for (const [ws, workspace] of Object.entries(layout.workspaces)) for (const [tab, tabLayout] of Object.entries(workspace.tabs)) {
+              if (tabLayout.browser?.id !== id) continue
+              await reopenLocalWindow?.()
+              const context = [...windowCtxs.values()].find((candidate) => candidate.target.kind === 'local' && !candidate.win.isDestroyed())
+              if (!context) return
+              context.win.show(); context.win.focus()
+              context.win.webContents.send('tab-browser-event', { type: 'approval-reveal', browserId: id, workspace: Number(ws), tab: Number(tab), browser: { ...tabLayout.browser, collapsed: false } })
+              return
+            }
+          })().catch(() => {})
+        },
+      )
       tabBrowser.setEventSink((event) => {
         for (const context of windowCtxs.values()) if (context.target.kind === 'local' && !context.win.isDestroyed()) context.win.webContents.send('tab-browser-event', event)
       })
@@ -1315,7 +1337,7 @@ async function main(): Promise<void> {
         return valid
       }
       return dispatchAttachedBrokerAction(request.action, id, signal, stillAuthorized,
-        (command, actionSignal, validate) => tabBrowser.command(command.type === 'automation' ? { ...command, broker: { requestId: request.requestId, controller: request.amberSession } } : command, actionSignal, validate))
+        (command, actionSignal, validate) => tabBrowser.command(command.type === 'automation' ? { ...command, broker: { requestId: request.requestId, controller: request.amberSession } } : command.type === 'navigate' || command.type === 'stop' ? { ...command, broker: { controller: request.amberSession } } : command, actionSignal, validate))
     }
     const runtime = process.env['XDG_RUNTIME_DIR'] ?? tmpdir()
     const socketPath = process.env['AMBER_BROWSER_HOST_SOCKET'] ?? join(runtime, 'amber-ide', 'browser-host.sock')
@@ -1437,7 +1459,9 @@ async function main(): Promise<void> {
     try {
       const context = resolveBrowserContext(parseLayout(loaded.text), request['workspace'], request['tab'])
       if (tabBrowser && sender.activeBrowserId && sender.activeBrowserId !== context.browserId) await tabBrowser.command({ type: 'hide', id: sender.activeBrowserId }).catch(() => {})
-      sender.activeWorkspace = context.workspace; sender.activeTab = context.tab; sender.activeBrowserId = context.browserId; sender.browserContextGeneration += 1
+      sender.activeWorkspace = context.workspace; sender.activeTab = context.tab; sender.activeBrowserId = context.browserId
+      sender.activeBrowserExpanded = !!context.browserId && !parseLayout(loaded.text).workspaces[String(context.workspace)]?.tabs[String(context.tab)]?.browser?.collapsed
+      sender.browserContextGeneration += 1
       return { ok: true, ...context }
     } catch (error) { return { ok: false, error: error instanceof Error ? error.message : 'INVALID_REQUEST' } }
   })

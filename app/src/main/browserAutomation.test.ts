@@ -33,7 +33,8 @@ class FakeDebugger implements BrowserDebuggerTransport {
       const png = Buffer.alloc(24); Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(png); png.write('IHDR', 12, 'ascii'); png.writeUInt32BE(800, 16); png.writeUInt32BE(600, 20)
       return { data: png.toString('base64') }
     }
-    if (method === 'Page.getLayoutMetrics') return { cssContentSize: { x: 0, y: 0, width: 800, height: 600 } }
+    if (method === 'Page.getLayoutMetrics') return { cssContentSize: { x: 0, y: 0, width: 800, height: 600 }, cssVisualViewport: { clientWidth: 800, clientHeight: 600 } }
+    if (method === 'DOM.getNodeForLocation') return { backendNodeId: 2 }
     return {}
   }
 }
@@ -185,19 +186,25 @@ describe('browser automation', () => {
   it('revalidates actionability and semantic fingerprints before fixed Input-domain interactions', async () => {
     class InteractionDebugger extends FakeDebugger {
       changed = false
+      occluded = false
+      offscreen = false
+      descendantHit = false
+      formChanged = false
       override async send(method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>> {
         this.calls.push(method)
         if (method === 'DOM.getDocument') return { root: { nodeId: 300, nodeName: '#document' } }
         if (method === 'DOM.performSearch') return { searchId: 'interaction', resultCount: 4 }
         if (method === 'DOM.getSearchResults') return { nodeIds: [301, 302, 303, 304] }
-        if (method === 'DOM.describeNode') { const id = params?.['nodeId'] ?? params?.['backendNodeId']; return { node: { nodeName: id === 302 ? 'BUTTON' : id === 304 ? 'SELECT' : 'INPUT', parentId: 300, backendNodeId: id, attributes: ['type', id === 302 ? 'button' : id === 303 ? 'checkbox' : 'text'] } } }
+        if (method === 'DOM.describeNode') { const id = params?.['nodeId'] ?? params?.['backendNodeId']; if (id === 300) return { node: { nodeName: 'FORM', backendNodeId: 300, attributes: ['action', this.formChanged ? '/profile/delete' : '/profile/save', 'method', 'post'] } }; if (id === 999) return { node: { nodeName: 'SPAN', parentId: 777, backendNodeId: 999 } }; if (id === 777) return { node: { nodeName: 'INPUT', parentId: 300, backendNodeId: 301, attributes: ['type', 'text'] } }; return { node: { nodeName: id === 302 ? 'BUTTON' : id === 304 ? 'SELECT' : 'INPUT', parentId: 300, backendNodeId: id, attributes: ['type', id === 302 ? 'button' : id === 303 ? 'checkbox' : 'text'] } } }
         if (method === 'Accessibility.getPartialAXTree') {
           const id = params?.['nodeId'] ?? params?.['backendDOMNodeId']; const button = id === 302, checkbox = id === 303, select = id === 304
           return { nodes: [{ nodeId: `ax-${id}`, role: { value: button ? 'button' : checkbox ? 'checkbox' : select ? 'combobox' : 'textbox' }, name: { value: this.changed ? 'Changed' : button ? 'Drop target' : checkbox ? 'Remember me' : select ? 'Country' : 'Search' }, backendDOMNodeId: id, properties: [{ name: 'checked', value: { value: false } }] }] }
         }
         if (method === 'DOM.pushNodesByBackendIdsToFrontend') return { nodeIds: [42] }
         if (method === 'CSS.getComputedStyleForNode') return { computedStyle: [{ name: 'display', value: 'block' }, { name: 'visibility', value: 'visible' }, { name: 'opacity', value: '1' }, { name: 'pointer-events', value: 'auto' }] }
-        if (method === 'DOM.getBoxModel') { const id = params?.['backendNodeId']; const x = id === 302 ? 100 : id === 303 ? 200 : id === 304 ? 300 : 0; return { model: { border: [x, 0, x + 80, 0, x + 80, 20, x, 20] } } }
+        if (method === 'DOM.getBoxModel') { const id = params?.['backendNodeId']; const x = this.offscreen ? 900 : id === 302 ? 100 : id === 303 ? 200 : id === 304 ? 300 : 0; return { model: { border: [x, 0, x + 80, 0, x + 80, 20, x, 20] } } }
+        if (method === 'Page.getLayoutMetrics') return { cssVisualViewport: { clientWidth: 800, clientHeight: 600 } }
+        if (method === 'DOM.getNodeForLocation') { const x = Number(params?.['x']); return { backendNodeId: this.occluded ? 998 : this.descendantHit ? 999 : x >= 300 ? 304 : x >= 200 ? 303 : x >= 100 ? 302 : 301 } }
         return {}
       }
     }
@@ -211,12 +218,24 @@ describe('browser automation', () => {
       { kind: 'scroll', target: input, deltaX: 0, deltaY: 10 }, { kind: 'drag', source: input, target: button },
     ] as BrowserInteraction[]) {
       const prepared = await automation.prepareInteraction(lease, operation, new AbortController().signal)
+      expect(prepared.target).toMatchObject({ formAction: '/profile/save', formMethod: 'post' })
       await expect(automation.executeInteraction(prepared, new AbortController().signal)).resolves.toEqual({ dispatched: true, rollbackPossible: false })
     }
     expect(transport.calls).toContain('Input.dispatchMouseEvent')
     expect(transport.calls).toContain('Input.dispatchKeyEvent')
     expect(transport.calls).toContain('Input.insertText')
-    transport.changed = true
+    transport.descendantHit = true
+    await expect(automation.executeInteraction(await automation.prepareInteraction(lease, { kind: 'click', target: input }, new AbortController().signal), new AbortController().signal)).resolves.toMatchObject({ dispatched: true })
+    transport.descendantHit = false; transport.occluded = true
+    const prepared = await automation.prepareInteraction(lease, { kind: 'click', target: input }, new AbortController().signal)
+    const dispatches = transport.calls.filter((call) => call === 'Input.dispatchMouseEvent').length
+    await expect(automation.executeInteraction(prepared, new AbortController().signal)).rejects.toThrow('TARGET_OCCLUDED')
+    expect(transport.calls.filter((call) => call === 'Input.dispatchMouseEvent')).toHaveLength(dispatches)
+    transport.occluded = false; transport.offscreen = true
+    await expect(automation.executeInteraction(prepared, new AbortController().signal)).rejects.toThrow('TARGET_NOT_ACTIONABLE')
+    transport.offscreen = false; transport.formChanged = true
+    await expect(automation.executeInteraction(prepared, new AbortController().signal)).rejects.toThrow('STALE_GENERATION')
+    transport.formChanged = false; transport.changed = true
     await expect(automation.prepareInteraction(lease, { kind: 'click', target: input }, new AbortController().signal)).rejects.toThrow('STALE_GENERATION')
   })
 
@@ -297,13 +316,16 @@ describe('browser automation', () => {
     expect(tiny.consoleSince('0', undefined, 20)).toMatchObject({ dropped: 1, items: [] })
   })
 
-  it('dismisses page dialogs fail-closed and reports only bounded redacted metadata', async () => {
-    const transport = new FakeDebugger(), dialog = vi.fn()
+  it('waits for a browser-scoped dialog decision and reports only bounded redacted metadata', async () => {
+    let handled: Record<string, unknown> | undefined
+    class DialogDebugger extends FakeDebugger { override async send(method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>> { if (method === 'Page.handleJavaScriptDialog') handled = params; return super.send(method, params) } }
+    const transport = new DialogDebugger(), dialog = vi.fn(async (_dialog: { type: string; message: string }) => ({ accept: true, promptText: 'bounded response' }))
     const automation = new BrowserAutomation(transport, () => 'about:blank', () => false, {}, { dialog })
     await automation.ensureAttached()
     transport.listeners[0]!('Page.javascriptDialogOpening', { type: 'confirm', message: `token=secret ${'x'.repeat(5000)}` })
     await vi.waitFor(() => expect(transport.calls).toContain('Page.handleJavaScriptDialog'))
     expect(dialog).toHaveBeenCalledWith({ type: 'confirm', message: expect.not.stringContaining('secret') })
+    expect(handled).toEqual({ accept: true, promptText: 'bounded response' })
     expect((dialog.mock.calls[0]?.[0] as { message: string }).message.length).toBeLessThanOrEqual(1024)
   })
 

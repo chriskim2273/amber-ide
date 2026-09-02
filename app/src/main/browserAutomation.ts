@@ -24,7 +24,7 @@ export interface BrowserAutomationOptions { ringItems?: number; ringBytes?: numb
 export interface BrowserAutomationControls {
   reload?(ignoreCache: boolean): boolean | void
   history?(direction: 'back' | 'forward'): boolean | void
-  dialog?(dialog: { type: string; message: string }): void
+  dialog?(dialog: { type: string; message: string }): Promise<{ accept: boolean; promptText?: string }>
 }
 export interface AccessibilityNodeResult { ref: string; depth: number; role: string; name: string; disabled?: boolean; focused?: boolean }
 export interface SnapshotResult { snapshotId: string; url: string; nodes: AccessibilityNodeResult[]; truncated: boolean }
@@ -37,7 +37,7 @@ type AXNode = {
 }
 type SnapshotEntry = AccessibilityNodeResult & { backendDOMNodeId?: number; metadata: InteractionTargetMetadata }
 interface SnapshotCache { lease: BrowserAutomationLease; snapshotId: string; entries: Map<string, SnapshotEntry>; nodes: AccessibilityNodeResult[] }
-export interface PreparedBrowserInteraction { lease: BrowserAutomationLease; operation: BrowserInteraction; primary?: SnapshotEntry; secondary?: SnapshotEntry; target: InteractionTargetMetadata }
+export interface PreparedBrowserInteraction { lease: BrowserAutomationLease; operation: BrowserInteraction; primary?: SnapshotEntry; secondary?: SnapshotEntry; target: InteractionTargetMetadata; secondaryTarget?: InteractionTargetMetadata }
 interface RingEntry { cursor: number; bytes: number; value: Record<string, unknown> }
 
 class BoundedRing {
@@ -86,6 +86,10 @@ export function redactBrowserText(input: string): string {
     .replace(/https?:\/\/[^\s]+/gi, (url) => sanitizeBrowserUrl(url))
 }
 function text(value: unknown, max = 4096): string { return typeof value === 'string' ? value.slice(0, max) : '' }
+function boundedResponse(value: Record<string, unknown>, maxBytes = 64 * 1024): Record<string, unknown> {
+  if (Buffer.byteLength(JSON.stringify(value)) > maxBytes) throw new Error('REQUEST_LIMIT')
+  return value
+}
 function abort(signal: AbortSignal): void { if (signal.aborted) throw new Error('ACTION_CANCELLED') }
 function property(node: AXNode, name: string): boolean | undefined {
   const value = node.properties?.find((item) => item.name === name)?.value?.value
@@ -95,13 +99,13 @@ function domAttributes(node: Record<string, unknown> | undefined): Record<string
   const raw = Array.isArray(node?.['attributes']) ? node!['attributes'] as unknown[] : [], out: Record<string, string> = {}
   for (let index = 0; index + 1 < raw.length; index += 2) {
     const key = text(raw[index], 64).toLocaleLowerCase()
-    if (['type', 'autocomplete', 'formaction', 'formmethod'].includes(key)) out[key] = text(raw[index + 1], 1024)
+    if (['type', 'autocomplete', 'formaction', 'formmethod', 'action', 'method'].includes(key)) out[key] = text(raw[index + 1], 1024)
   }
   return out
 }
-function targetMetadata(node: AXNode, domNode: Record<string, unknown> | undefined, role: string, name: string, backendDOMNodeId: number | undefined): InteractionTargetMetadata {
+function targetMetadata(node: AXNode, domNode: Record<string, unknown> | undefined, role: string, name: string, backendDOMNodeId: number | undefined, form?: { action?: string; method?: string }): InteractionTargetMetadata {
   const attributes = domAttributes(domNode), tag = text(domNode?.['nodeName'], 128).toLocaleLowerCase(), type = attributes['type'] ?? ''
-  const basis = { role, name, tag, type, backendDOMNodeId: backendDOMNodeId ?? 0, autocomplete: attributes['autocomplete'] ?? '', formAction: attributes['formaction'] ?? '', formMethod: attributes['formmethod'] ?? '' }
+  const basis = { role, name, tag, type, backendDOMNodeId: backendDOMNodeId ?? 0, autocomplete: attributes['autocomplete'] ?? '', formAction: attributes['formaction'] ?? form?.action ?? '', formMethod: attributes['formmethod'] ?? form?.method ?? '' }
   return { role, name, tag, type, fingerprint: createHash('sha256').update(JSON.stringify(basis)).digest('hex'), ...(basis.autocomplete ? { autocomplete: basis.autocomplete } : {}), ...(basis.formAction ? { formAction: basis.formAction } : {}), ...(basis.formMethod ? { formMethod: basis.formMethod } : {}) }
 }
 function sameLease(a: BrowserAutomationLease, b: BrowserAutomationLease): boolean {
@@ -160,8 +164,10 @@ export class BrowserAutomation {
     if (this.disposed) return
     if (method === 'Page.javascriptDialogOpening') {
       const type = text(params['type'], 32), message = redactBrowserText(text(params['message'], 1024)).slice(0, 1024)
-      void this.transport.send('Page.handleJavaScriptDialog', { accept: false }).catch(() => {})
-      this.controls.dialog?.({ type, message }); return
+      const decision = this.controls.dialog?.({ type, message }) ?? Promise.reject(new Error('DIALOG_UNAVAILABLE'))
+      void decision.then((result) => this.transport.send('Page.handleJavaScriptDialog', { accept: result.accept, ...(result.accept && result.promptText !== undefined ? { promptText: result.promptText.slice(0, 4096) } : {}) }),
+        () => this.transport.send('Page.handleJavaScriptDialog', { accept: false })).catch(() => {})
+      return
     }
     if (method === 'Runtime.consoleAPICalled') {
       const args = Array.isArray(params['args']) ? params['args'] as Array<Record<string, unknown>> : []
@@ -332,59 +338,102 @@ export class BrowserAutomation {
     if (matches.length !== 1) throw new Error('TARGET_AMBIGUOUS')
     return matches[0]!
   }
-  private async actionable(entry: SnapshotEntry, signal: AbortSignal): Promise<{ x: number; y: number; checked?: boolean }> {
+  private async formSemantics(domNode: Record<string, unknown> | undefined, signal: AbortSignal): Promise<{ action?: string; method?: string }> {
+    let parentId = typeof domNode?.['parentId'] === 'number' ? domNode['parentId'] : undefined
+    for (let depth = 0; parentId !== undefined && depth < 8; depth++) {
+      abort(signal)
+      const described = boundedResponse(await this.transport.send('DOM.describeNode', { nodeId: parentId, depth: 0, pierce: false })); abort(signal)
+      const parent = described['node'] as Record<string, unknown> | undefined
+      if (!parent) break
+      if (text(parent['nodeName'], 32).toLocaleLowerCase() === 'form') {
+        const attributes = domAttributes(parent)
+        return { ...(attributes['formaction'] || attributes['action'] ? { action: attributes['formaction'] ?? attributes['action'] } : {}), ...(attributes['formmethod'] || attributes['method'] ? { method: attributes['formmethod'] ?? attributes['method'] } : {}) }
+      }
+      parentId = typeof parent['parentId'] === 'number' ? parent['parentId'] : undefined
+    }
+    return {}
+  }
+  private async actionable(entry: SnapshotEntry, signal: AbortSignal): Promise<{ x: number; y: number; checked?: boolean; metadata: InteractionTargetMetadata }> {
     abort(signal)
     if (!entry.backendDOMNodeId) throw new Error('UNSUPPORTED_PAGE')
-    const described = await this.transport.send('DOM.describeNode', { backendNodeId: entry.backendDOMNodeId, depth: 0, pierce: false }); abort(signal)
+    const described = boundedResponse(await this.transport.send('DOM.describeNode', { backendNodeId: entry.backendDOMNodeId, depth: 0, pierce: false })); abort(signal)
     const domNode = described['node'] as Record<string, unknown> | undefined
-    const partial = await this.transport.send('Accessibility.getPartialAXTree', { backendDOMNodeId: entry.backendDOMNodeId, fetchRelatives: false }); abort(signal)
+    const partial = boundedResponse(await this.transport.send('Accessibility.getPartialAXTree', { backendDOMNodeId: entry.backendDOMNodeId, fetchRelatives: false })); abort(signal)
     const node = Array.isArray(partial['nodes']) ? (partial['nodes'] as AXNode[]).find((candidate) => !candidate.ignored) : undefined
     if (!node || property(node, 'disabled') === true) throw new Error('TARGET_NOT_ACTIONABLE')
     const role = text(node.role?.value, 256), name = redactBrowserText(text(node.name?.value, 4096))
-    const current = targetMetadata(node, domNode, role, name, entry.backendDOMNodeId)
-    if (current.fingerprint !== entry.metadata.fingerprint) throw new Error('STALE_GENERATION')
+    const base = targetMetadata(node, domNode, role, name, entry.backendDOMNodeId)
+    if (base.fingerprint !== entry.metadata.fingerprint) throw new Error('STALE_GENERATION')
+    const current = targetMetadata(node, domNode, role, name, entry.backendDOMNodeId, await this.formSemantics(domNode, signal))
     const pushed = await this.transport.send('DOM.pushNodesByBackendIdsToFrontend', { backendNodeIds: [entry.backendDOMNodeId] }); abort(signal)
     const nodeId = Array.isArray(pushed['nodeIds']) && typeof pushed['nodeIds'][0] === 'number' ? pushed['nodeIds'][0] : undefined
     if (!nodeId) throw new Error('TARGET_NOT_ACTIONABLE')
-    const styles = await this.transport.send('CSS.getComputedStyleForNode', { nodeId }); abort(signal)
+    const styles = boundedResponse(await this.transport.send('CSS.getComputedStyleForNode', { nodeId })); abort(signal)
     const style = new Map((Array.isArray(styles['computedStyle']) ? styles['computedStyle'] as Array<Record<string, unknown>> : []).map((item) => [text(item['name'], 64), text(item['value'], 128)]))
     if (style.get('display') === 'none' || style.get('visibility') === 'hidden' || style.get('pointer-events') === 'none' || Number(style.get('opacity') ?? '1') <= 0) throw new Error('TARGET_NOT_ACTIONABLE')
-    const box = await this.transport.send('DOM.getBoxModel', { backendNodeId: entry.backendDOMNodeId }); abort(signal)
+    const box = boundedResponse(await this.transport.send('DOM.getBoxModel', { backendNodeId: entry.backendDOMNodeId })); abort(signal)
     const border = (box['model'] as Record<string, unknown> | undefined)?.['border']
     if (!Array.isArray(border) || border.length !== 8 || !border.every((value) => typeof value === 'number' && Number.isFinite(value))) throw new Error('TARGET_NOT_ACTIONABLE')
     const xs = [border[0], border[2], border[4], border[6]] as number[], ys = [border[1], border[3], border[5], border[7]] as number[]
     const width = Math.max(...xs) - Math.min(...xs), height = Math.max(...ys) - Math.min(...ys)
     if (width < 1 || height < 1 || width > 16_384 || height > 16_384) throw new Error('TARGET_NOT_ACTIONABLE')
     const checked = property(node, 'checked')
-    return { x: Math.min(...xs) + width / 2, y: Math.min(...ys) + height / 2, ...(checked === undefined ? {} : { checked }) }
+    return { x: Math.min(...xs) + width / 2, y: Math.min(...ys) + height / 2, ...(checked === undefined ? {} : { checked }), metadata: current }
   }
   async prepareInteraction(lease: BrowserAutomationLease, operation: BrowserInteraction, signal: AbortSignal): Promise<PreparedBrowserInteraction> {
     abort(signal); await this.ensureAttached(); abort(signal)
     const primaryTarget = operation.kind === 'drag' ? operation.source : ('target' in operation ? operation.target : undefined)
     const primary = primaryTarget ? this.resolveTarget(lease, primaryTarget) : undefined
     const secondary = operation.kind === 'drag' ? this.resolveTarget(lease, operation.target) : undefined
-    if (primary) await this.actionable(primary, signal)
-    if (secondary) await this.actionable(secondary, signal)
-    const metadata = primary?.metadata
+    const primaryCurrent = primary ? await this.actionable(primary, signal) : undefined
+    const secondaryCurrent = secondary ? await this.actionable(secondary, signal) : undefined
+    const metadata = primaryCurrent?.metadata
     if ((operation.kind === 'fill' || operation.kind === 'type') && (!metadata || (!['textbox', 'searchbox', 'combobox'].includes(metadata.role.toLocaleLowerCase()) && !['input', 'textarea'].includes(metadata.tag)) || metadata.type === 'file')) throw new Error('TARGET_NOT_ACTIONABLE')
     if (operation.kind === 'select' && (!metadata || (!['combobox', 'listbox'].includes(metadata.role.toLocaleLowerCase()) && metadata.tag !== 'select'))) throw new Error('TARGET_NOT_ACTIONABLE')
     if ((operation.kind === 'check' || operation.kind === 'uncheck') && (!metadata || !['checkbox', 'switch', 'radio'].includes(metadata.role.toLocaleLowerCase()))) throw new Error('TARGET_NOT_ACTIONABLE')
     if (operation.kind === 'uncheck' && metadata?.role.toLocaleLowerCase() === 'radio') throw new Error('TARGET_NOT_ACTIONABLE')
     const target = metadata ?? { role: 'document', name: '', tag: 'body', type: '', fingerprint: createHash('sha256').update('document').digest('hex') }
-    return { lease: { ...lease }, operation, ...(primary ? { primary } : {}), ...(secondary ? { secondary } : {}), target }
+    return { lease: { ...lease }, operation, ...(primary ? { primary } : {}), ...(secondary ? { secondary } : {}), target, ...(secondaryCurrent ? { secondaryTarget: secondaryCurrent.metadata } : {}) }
+  }
+  private async hitTest(entry: SnapshotEntry, point: { x: number; y: number }, signal: AbortSignal): Promise<void> {
+    if (!entry.backendDOMNodeId || !Number.isFinite(point.x) || !Number.isFinite(point.y)) throw new Error('TARGET_NOT_ACTIONABLE')
+    const metrics = boundedResponse(await this.transport.send('Page.getLayoutMetrics')); abort(signal)
+    const viewport = (metrics['cssVisualViewport'] ?? metrics['cssLayoutViewport']) as Record<string, unknown> | undefined
+    const width = typeof viewport?.['clientWidth'] === 'number' ? viewport['clientWidth'] : viewport?.['width']
+    const height = typeof viewport?.['clientHeight'] === 'number' ? viewport['clientHeight'] : viewport?.['height']
+    if (typeof width !== 'number' || typeof height !== 'number' || !Number.isFinite(width) || !Number.isFinite(height) || width < 1 || height < 1 || width > 16_384 || height > 16_384 || point.x < 0 || point.y < 0 || point.x >= width || point.y >= height) throw new Error('TARGET_NOT_ACTIONABLE')
+    const hit = boundedResponse(await this.transport.send('DOM.getNodeForLocation', { x: Math.floor(point.x), y: Math.floor(point.y), includeUserAgentShadowDOM: true, ignorePointerEventsNone: false })); abort(signal)
+    let backend = typeof hit['backendNodeId'] === 'number' ? hit['backendNodeId'] : undefined
+    let nodeId = typeof hit['nodeId'] === 'number' ? hit['nodeId'] : undefined
+    for (let depth = 0; depth < 32 && (backend !== undefined || nodeId !== undefined); depth++) {
+      if (backend === entry.backendDOMNodeId) return
+      const described = boundedResponse(await this.transport.send('DOM.describeNode', { ...(nodeId !== undefined ? { nodeId } : { backendNodeId: backend }), depth: 0, pierce: false })); abort(signal)
+      const node = described['node'] as Record<string, unknown> | undefined
+      if (!node) break
+      backend = typeof node['backendNodeId'] === 'number' ? node['backendNodeId'] : undefined
+      if (backend === entry.backendDOMNodeId) return
+      nodeId = typeof node['parentId'] === 'number' ? node['parentId'] : undefined
+      backend = undefined
+    }
+    throw new Error('TARGET_OCCLUDED')
   }
   async executeInteraction(prepared: PreparedBrowserInteraction, signal: AbortSignal, stillCurrent: () => boolean = () => true): Promise<{ dispatched: true; rollbackPossible: false }> {
-    const primaryPoint = prepared.primary ? await this.actionable(prepared.primary, signal) : undefined
-    const secondaryPoint = prepared.secondary ? await this.actionable(prepared.secondary, signal) : undefined
     let dispatched = false
     const ensure = (): void => {
       if (signal.aborted) throw new Error(dispatched ? 'ACTION_CANCELLED_NO_ROLLBACK' : 'ACTION_CANCELLED')
       if (!stillCurrent()) throw new Error(dispatched ? 'STALE_GENERATION_NO_ROLLBACK' : 'STALE_GENERATION')
     }
+    const pointFor = async (entry: SnapshotEntry, expected: InteractionTargetMetadata): Promise<{ x: number; y: number; checked?: boolean }> => {
+      const point = await this.actionable(entry, signal)
+      if (point.metadata.fingerprint !== expected.fingerprint) throw new Error('STALE_GENERATION')
+      ensure(); await this.hitTest(entry, point, signal); ensure()
+      return point
+    }
     const mouse = async (type: string, point: { x: number; y: number }, extra: Record<string, unknown> = {}): Promise<void> => { ensure(); dispatched = true; await this.transport.send('Input.dispatchMouseEvent', { type, x: point.x, y: point.y, ...extra }) }
     const key = async (type: 'keyDown' | 'keyUp', value: string, modifiers = 0): Promise<void> => { ensure(); dispatched = true; await this.transport.send('Input.dispatchKeyEvent', { type, key: value === 'Space' ? ' ' : value, modifiers }) }
     const click = async (point: { x: number; y: number }, count = 1): Promise<void> => { await mouse('mousePressed', point, { button: 'left', clickCount: count }); await mouse('mouseReleased', point, { button: 'left', clickCount: count }) }
     const operation = prepared.operation
+    const primaryPoint = prepared.primary ? await pointFor(prepared.primary, prepared.target) : undefined
     if ((operation.kind === 'click' || operation.kind === 'doubleClick') && primaryPoint) await click(primaryPoint, operation.kind === 'doubleClick' ? 2 : 1)
     else if (operation.kind === 'hover' && primaryPoint) await mouse('mouseMoved', primaryPoint)
     else if ((operation.kind === 'fill' || operation.kind === 'type') && primaryPoint) {
@@ -403,8 +452,16 @@ export class BrowserAutomation {
       if (primaryPoint.checked !== desired) await click(primaryPoint)
     } else if (operation.kind === 'scroll') {
       const point = primaryPoint ?? { x: 1, y: 1 }; await mouse('mouseWheel', point, { deltaX: operation.deltaX, deltaY: operation.deltaY })
-    } else if (operation.kind === 'drag' && primaryPoint && secondaryPoint) {
-      await mouse('mouseMoved', primaryPoint); await mouse('mousePressed', primaryPoint, { button: 'left', clickCount: 1 }); await mouse('mouseMoved', secondaryPoint, { button: 'left' }); await mouse('mouseReleased', secondaryPoint, { button: 'left', clickCount: 1 })
+    } else if (operation.kind === 'drag' && primaryPoint && prepared.secondary && prepared.secondaryTarget) {
+      await mouse('mouseMoved', primaryPoint); await mouse('mousePressed', primaryPoint, { button: 'left', clickCount: 1 })
+      let secondaryPoint: { x: number; y: number }
+      try { secondaryPoint = await pointFor(prepared.secondary, prepared.secondaryTarget) }
+      catch (error) {
+        await this.transport.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: primaryPoint.x, y: primaryPoint.y, button: 'left', clickCount: 1 }).catch(() => {})
+        const code = error instanceof Error && /^[A-Z][A-Z0-9_]{1,63}$/.test(error.message) ? error.message : 'INTERNAL_ERROR'
+        throw new Error(code.endsWith('_NO_ROLLBACK') ? code : `${code}_NO_ROLLBACK`)
+      }
+      await mouse('mouseMoved', secondaryPoint, { button: 'left' }); await mouse('mouseReleased', secondaryPoint, { button: 'left', clickCount: 1 })
     } else throw new Error('TARGET_NOT_ACTIONABLE')
     ensure()
     return { dispatched: true, rollbackPossible: false }
