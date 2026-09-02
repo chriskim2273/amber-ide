@@ -166,12 +166,29 @@ export function focusCandidates(
   return rects.filter((r) => r.paneId === fromId || !frozen.has(r.paneId))
 }
 
+// Rebuild a tree with only live, first-seen pane ids. The layout sidecar can
+// receive a duplicate leaf after a conflicting layout edit; rendering that tree
+// mounts two visual panels for one session. Preserve the first placement and
+// collapse any empty split branches so reconciliation repairs the sidecar.
+function pruneToLiveUnique(tree: Node, live: Set<string>, seen: Set<string>): Node | null {
+  if (tree.kind === 'leaf') {
+    if (!live.has(tree.paneId) || seen.has(tree.paneId)) return null
+    seen.add(tree.paneId)
+    return tree
+  }
+  const a = pruneToLiveUnique(tree.a, live, seen)
+  const b = pruneToLiveUnique(tree.b, live, seen)
+  if (a === null) return b
+  if (b === null) return a
+  return { ...tree, a, b }
+}
+
 export function reconcile(tree: Node | null, liveIds: string[]): Node | null {
-  const live = new Set(liveIds)
-  let pruned = tree
-  if (pruned) for (const id of leaves(pruned)) if (!live.has(id)) pruned = pruned ? removeLeaf(pruned, id) : null
+  const uniqueLiveIds = [...new Set(liveIds)]
+  const live = new Set(uniqueLiveIds)
+  let pruned = tree ? pruneToLiveUnique(tree, live, new Set()) : null
   const present = new Set(pruned ? leaves(pruned) : [])
-  const missing = liveIds.filter((id) => !present.has(id))
+  const missing = uniqueLiveIds.filter((id) => !present.has(id))
   for (const id of missing) {
     pruned = pruned === null
       ? { kind: 'leaf', paneId: id }

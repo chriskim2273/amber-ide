@@ -45,6 +45,20 @@ describe('layout', () => {
     expect(reconcile(null, ['x'])).toEqual(leaf('x'))
   })
 
+  it('removes duplicate persisted leaves so one session renders in one pane', () => {
+    const duplicated: Node = {
+      kind: 'split', dir: 'h', ratio: 0.5,
+      a: leaf('a'),
+      b: { kind: 'split', dir: 'v', ratio: 0.5, a: leaf('a'), b: leaf('b') },
+    }
+    // Keep the first placement and collapse the duplicate branch. Duplicate
+    // React keys otherwise render two panels attached to the same session.
+    expect(reconcile(duplicated, ['a', 'b'])).toEqual({
+      kind: 'split', dir: 'h', ratio: 0.5, a: leaf('a'), b: leaf('b'),
+    })
+    expect(leaves(reconcile(null, ['a', 'a'])!)).toEqual(['a'])
+  })
+
   // Fix 4: close is one-way. onClose only requests the kill; the leaf must
   // survive reconcile until the daemon confirms removal (id leaves liveIds).
   it('close-then-confirm: leaf stays until the daemon prunes the session', () => {
