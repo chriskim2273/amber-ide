@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { connect } from 'node:net'
-import { authorizeBrowserRequest, dispatchAttachedBrokerAction, isEligiblePiController, parseBrokerRequest, TabBrowserBrokerServer } from './tabBrowserBroker'
+import { authorizeBrowserRequest, dispatchAttachedBrokerAction, isEligiblePiController, parseBrokerRequest, safeBrokerError, TabBrowserBrokerServer } from './tabBrowserBroker'
 import type { LayoutFile } from '../shared/layoutFile'
 
 const cleanup: string[] = []
@@ -15,19 +15,36 @@ describe('tab browser broker boundary', () => {
   it('forwards stop cancellation and fresh authorization to the service queue', async () => {
     const controller = new AbortController(); const validator = () => false
     let captured: unknown[] = []
-    await dispatchAttachedBrokerAction({ type: 'stop' }, 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', controller.signal, validator,
+    await dispatchAttachedBrokerAction({ type: 'stop', pageIncarnation: 'page', expectedGeneration: 2 }, 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', controller.signal, validator,
       async (...args) => { captured = args; return {} })
-    expect(captured[0]).toEqual({ type: 'stop', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' })
+    expect(captured[0]).toEqual({ type: 'stop', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', pageIncarnation: 'page', expectedGeneration: 2 })
     expect(captured[1]).toBe(controller.signal)
     expect(captured[2]).toBe(validator)
   })
 
   it('strictly parses bounded typed requests', () => {
     expect(parseBrokerRequest({ version: 1, clientInstanceId: 'client-01', sequence: 1, requestId: 'r1', amberSession: 'amber-1-2-0-pane', action: { type: 'status' } }).action).toEqual({ type: 'status' })
+    expect(parseBrokerRequest({ version: 1, clientInstanceId: 'client-01', sequence: 2, requestId: 'r2', amberSession: 'amber-1-2-0-pane', action: { type: 'snapshot', pageIncarnation: 'page', expectedGeneration: 1 } }).action).toMatchObject({ type: 'snapshot', limits: { maxNodes: 2000 } })
     expect(() => parseBrokerRequest({ version: 1, clientInstanceId: 'client-01', sequence: 1, requestId: 'r1', amberSession: 'amber-1-2-0-pane', action: { type: 'cdp' } })).toThrow('INVALID_REQUEST')
+    expect(() => parseBrokerRequest({ version: 1, clientInstanceId: 'client-01', sequence: 1, requestId: 'r1', amberSession: 'amber-1-2-0-pane', action: { type: 'stop' } })).toThrow('INVALID_REQUEST')
     expect(() => parseBrokerRequest({ version: 1, clientInstanceId: 'client-01', sequence: 1, requestId: 'r1', amberSession: '', action: { type: 'status' } })).toThrow('INVALID_REQUEST')
     expect(() => parseBrokerRequest({ version: 1, clientInstanceId: 'client-01', sequence: 1, requestId: 'r1', amberSession: 'amber-1-2-0-pane', action: { type: 'navigate', url: 'https://example.test', pageIncarnation: 'x'.repeat(257), expectedGeneration: 0 } })).toThrow('INVALID_REQUEST')
   })
+  it('forwards every observation/navigation tool through cancellation and dispatch-time authorization', async () => {
+    const signal = new AbortController().signal; const validate = () => true; const calls: unknown[][] = []
+    const action = { type: 'snapshot' as const, pageIncarnation: 'page', expectedGeneration: 1, limits: { maxDepth: 20, maxNodes: 2000, maxBytes: 262144 } }
+    await dispatchAttachedBrokerAction(action, 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', signal, validate, async (...args) => { calls.push(args); return {} })
+    expect(calls).toHaveLength(1)
+    expect(calls[0]?.[0]).toEqual({ type: 'automation', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', action })
+    expect(calls[0]?.[1]).toBe(signal)
+    expect(calls[0]?.[2]).toBe(validate)
+  })
+
+  it('maps implementation errors to a stable code without leaking diagnostic canaries', () => {
+    expect(safeBrokerError(new Error('ACTION_TIMEOUT'))).toBe('ACTION_TIMEOUT')
+    expect(safeBrokerError(new Error('Authorization: Bearer secret /home/user/file'))).toBe('INTERNAL_ERROR')
+  })
+
   it('rejects dead and shell-fallback Pi controllers', () => {
     expect(isEligiblePiController({ kind: 'pi', alive: true, runState: 'claude' })).toBe(true)
     expect(isEligiblePiController({ kind: 'pi', alive: false, runState: 'claude' })).toBe(false)
@@ -78,6 +95,43 @@ describe('tab browser broker boundary', () => {
     await server.close()
   })
 
+  it('transports screenshot attachments as a raw binary frame, never a path or JSON byte array', async () => {
+    if (process.platform === 'win32') return
+    const dir = await mkdtemp(join(tmpdir(), 'amber-browser-broker-')); cleanup.push(dir)
+    const socketPath = join(dir, 'broker.sock'); const tokenPath = join(dir, 'token'); const image = Buffer.from([0x89, 0x50, 0x4e, 0x47])
+    const server = new TabBrowserBrokerServer(socketPath, tokenPath, async () => ({ mediaType: 'image/png' as const, data: image, width: 1, height: 1 }))
+    await server.start(); const token = (await readFile(tokenPath, 'utf8')).trim()
+    const encode = (value: unknown): Buffer => { const body = Buffer.from(JSON.stringify(value)); const out = Buffer.alloc(body.length + 4); out.writeUInt32BE(body.length); body.copy(out, 4); return out }
+    const received = await new Promise<{ meta: Record<string, unknown>; bytes: Buffer }>((resolve, reject) => {
+      const socket = connect(socketPath); let buffer = Buffer.alloc(0); let authenticated = false; let meta: Record<string, unknown> | undefined
+      socket.on('error', reject); socket.on('connect', () => socket.write(encode({ token })))
+      socket.on('data', (chunk) => {
+        buffer = Buffer.concat([buffer, chunk])
+        while (buffer.length >= 4 && buffer.length >= buffer.readUInt32BE(0) + 4) {
+          const size = buffer.readUInt32BE(0); const body = Buffer.from(buffer.subarray(4, 4 + size)); buffer = buffer.subarray(4 + size)
+          if (!authenticated) { authenticated = true; socket.write(encode({ version: 1, clientInstanceId: 'client-image', sequence: 1, requestId: 'shot', amberSession: 'amber-1-2-0-pane', action: { type: 'status' } })); continue }
+          if (!meta) { meta = JSON.parse(body.toString()) as Record<string, unknown>; continue }
+          socket.end(); resolve({ meta, bytes: body })
+        }
+      })
+    })
+    expect(received.bytes).toEqual(image)
+    expect(received.meta).toMatchObject({ ok: true, result: { mediaType: 'image/png', attachment: { encoding: 'binary-frame', byteLength: 4 } } })
+    expect(JSON.stringify(received.meta)).not.toMatch(/path|"data"/)
+    const replay = await new Promise<Record<string, unknown>>((resolve, reject) => {
+      const socket = connect(socketPath); let buffer = Buffer.alloc(0); let authenticated = false
+      socket.on('error', reject); socket.on('connect', () => socket.write(encode({ token })))
+      socket.on('data', (chunk) => {
+        buffer = Buffer.concat([buffer, chunk]); if (buffer.length < 4 || buffer.length < buffer.readUInt32BE(0) + 4) return
+        const size = buffer.readUInt32BE(0); const value = JSON.parse(buffer.subarray(4, 4 + size).toString()) as Record<string, unknown>; buffer = buffer.subarray(4 + size)
+        if (!authenticated) { authenticated = true; socket.write(encode({ version: 1, clientInstanceId: 'client-image', sequence: 1, requestId: 'shot', amberSession: 'amber-1-2-0-pane', action: { type: 'status' } })); return }
+        socket.end(); resolve(value)
+      })
+    })
+    expect(replay).toMatchObject({ ok: false, error: 'ACTION_CANCELLED' })
+    await server.close()
+  })
+
   it('aborts in-flight work when its client disconnects', async () => {
     if (process.platform === 'win32') return
     const dir = await mkdtemp(join(tmpdir(), 'amber-browser-broker-')); cleanup.push(dir)
@@ -114,7 +168,7 @@ describe('tab browser broker boundary', () => {
     const requests = [
       { ...base, sequence: 2, requestId: 'same', action: { type: 'status' } },
       { ...base, sequence: 2, requestId: 'same', action: { type: 'status' } },
-      { ...base, sequence: 2, requestId: 'same', action: { type: 'stop' } },
+      { ...base, sequence: 2, requestId: 'same', action: { type: 'stop', pageIncarnation: 'page', expectedGeneration: 1 } },
       { ...base, sequence: 1, requestId: 'old', action: { type: 'status' } },
     ]
     const replies = await new Promise<Record<string, unknown>[]>((resolve, reject) => {
@@ -156,7 +210,7 @@ describe('tab browser broker boundary', () => {
         while (buffer.length >= 4 && buffer.length >= buffer.readUInt32BE(0) + 4) {
           const size = buffer.readUInt32BE(0); values.push(JSON.parse(buffer.subarray(4, 4 + size).toString())); buffer = buffer.subarray(4 + size)
           if (values.length === 1) socket.write(Buffer.concat([
-            encode({ version: 1, clientInstanceId: 'client-fifo', sequence: 1, requestId: 'mutation', amberSession: 'amber-1-2-0-pane', action: { type: 'stop' } }),
+            encode({ version: 1, clientInstanceId: 'client-fifo', sequence: 1, requestId: 'mutation', amberSession: 'amber-1-2-0-pane', action: { type: 'stop', pageIncarnation: 'page', expectedGeneration: 1 } }),
             encode({ version: 1, clientInstanceId: 'client-fifo', sequence: 2, requestId: 'observation', amberSession: 'amber-1-2-0-pane', action: { type: 'status' } }),
           ]))
           if (values.length === 3) { socket.end(); resolve(values) }

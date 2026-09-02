@@ -5,6 +5,7 @@ import { isOpaqueBrowserId, safeRestoreUrl, type BrowserId } from '../shared/tab
 import type { WsBrowser } from '../shared/workspaceFile'
 import { TabBrowserStateStore } from './tabBrowserStateStore'
 import type { BrowserStateFile } from '../shared/tabBrowserState'
+import type { BrowserToolAction } from './browserToolProtocol'
 
 export type TabBrowserCommand =
   | { type: 'open' }
@@ -16,7 +17,8 @@ export type TabBrowserCommand =
   | { type: 'bounds'; id: string; bounds: Rectangle }
   | { type: 'navigate'; id: string; url: string; pageIncarnation: string; expectedGeneration: number }
   | { type: 'status'; id: string }
-  | { type: 'stop'; id: string }
+  | { type: 'stop'; id: string; pageIncarnation?: string; expectedGeneration?: number }
+  | { type: 'automation'; id: string; action: BrowserToolAction }
   | { type: 'destroy'; id: string }
 
 export interface WorkspaceBrowserImport { entries: { id: BrowserId; browser: WsBrowser }[]; recovery: { ws: number; tab: number; browser: WsBrowser }[] }
@@ -130,7 +132,10 @@ export class TabBrowserService {
     return save
   }
 
-  command(command: TabBrowserCommand, signal?: AbortSignal, validate?: () => boolean | Promise<boolean>): Promise<BrowserRuntimeStatus | { closed: true }> {
+  command(command: Exclude<TabBrowserCommand, { type: 'automation' }>, signal?: AbortSignal, validate?: () => boolean | Promise<boolean>): Promise<BrowserRuntimeStatus | { closed: true }>
+  command(command: Extract<TabBrowserCommand, { type: 'automation' }>, signal?: AbortSignal, validate?: () => boolean | Promise<boolean>): Promise<unknown>
+  command(command: TabBrowserCommand, signal?: AbortSignal, validate?: () => boolean | Promise<boolean>): Promise<unknown>
+  command(command: TabBrowserCommand, signal?: AbortSignal, validate?: () => boolean | Promise<boolean>): Promise<unknown> {
     // Opens must reach the host concurrently so the global capacity FIFO sees
     // every contender. Observations and hide also cannot sit behind a wait.
     if (command.type === 'hide' || command.type === 'destroy') this.activationControllers.get(command.id)?.abort()
@@ -150,7 +155,7 @@ export class TabBrowserService {
     return result
   }
 
-  private async runCommand(command: TabBrowserCommand, signal?: AbortSignal, validate?: () => boolean | Promise<boolean>): Promise<BrowserRuntimeStatus | { closed: true }> {
+  private async runCommand(command: TabBrowserCommand, signal?: AbortSignal, validate?: () => boolean | Promise<boolean>): Promise<unknown> {
     if (validate && !(await validate())) throw new Error('STALE_BROWSER_CONTEXT')
     if (signal?.aborted) throw new Error('ACTION_CANCELLED')
     switch (command.type) {
@@ -178,7 +183,12 @@ export class TabBrowserService {
         await this.schedulePersist(); return status
       }
       case 'status': return this.host.status(command.id)
-      case 'stop': return this.host.stop(command.id)
+      case 'stop': return this.host.stop(command.id, command.pageIncarnation, command.expectedGeneration)
+      case 'automation': {
+        const result = await this.host.runAutomation(command.id, command.action, signal ?? new AbortController().signal)
+        if (command.action.type === 'setViewport') await this.schedulePersist()
+        return result
+      }
       case 'destroy': this.host.close(command.id); await this.schedulePersist(); return { closed: true }
       case 'close': case 'share': case 'designate': throw new Error('ASSOCIATION_COMMAND_REQUIRES_MAIN')
     }

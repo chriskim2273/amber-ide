@@ -2,6 +2,7 @@ import { WebContentsView, session, type BrowserWindow, type Rectangle, type Sess
 import { browserWebPreferences, isAllowedBrowserUrl } from './tabBrowserPolicy'
 import type { BrowserId } from '../shared/tabBrowser'
 import type { TabBrowserPage, TabBrowserPageEvent, TabBrowserPageFactory } from './tabBrowserHost'
+import { BrowserAutomation, type BrowserDebuggerTransport } from './browserAutomation'
 
 const hardenedSessions = new WeakSet<Session>()
 export function hardenBrowserSession(browserSession: Session): void {
@@ -16,6 +17,7 @@ export function hardenBrowserSession(browserSession: Session): void {
 
 export class ElectronTabBrowserPage implements TabBrowserPage {
   readonly view: WebContentsView
+  readonly automation: BrowserAutomation
   private attached = false
   private disposing = false
   private bounds: Rectangle = { x: 0, y: 0, width: 1, height: 1 }
@@ -23,7 +25,26 @@ export class ElectronTabBrowserPage implements TabBrowserPage {
     const browserSession = session.fromPartition(partition)
     hardenBrowserSession(browserSession)
     this.view = new WebContentsView({ webPreferences: browserWebPreferences(partition) })
-    this.view.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+    const contents = this.view.webContents
+    const debuggerTransport: BrowserDebuggerTransport = {
+      isAttached: () => contents.debugger.isAttached(),
+      attach: (version) => { contents.debugger.attach(version) },
+      detach: () => { contents.debugger.detach() },
+      send: async (method, params) => (await contents.debugger.sendCommand(method, params)) as Record<string, unknown>,
+      onMessage: (listener) => { contents.debugger.on('message', (_event, method, params) => listener(method, (params ?? {}) as Record<string, unknown>)) },
+    }
+    this.automation = new BrowserAutomation(debuggerTransport, () => contents.getURL(), () => contents.isLoading(), {}, {
+      reload: (ignoreCache) => { if (ignoreCache) contents.reloadIgnoringCache(); else contents.reload() },
+      history: (direction) => {
+        const history = contents.navigationHistory
+        if (direction === 'back' && history.canGoBack()) history.goBack()
+        if (direction === 'forward' && history.canGoForward()) history.goForward()
+      },
+    })
+    // Attach to this WebContents only; there is no remote-debugging endpoint
+    // and therefore no target enumeration or cross-page control surface.
+    void this.automation.ensureAttached().catch(() => {})
+    contents.setWindowOpenHandler(() => ({ action: 'deny' }))
     this.view.webContents.on('will-navigate', (event, url) => { if (!isAllowedBrowserUrl(url)) event.preventDefault() })
     this.view.webContents.on('will-redirect', (event, url) => { if (!isAllowedBrowserUrl(url)) event.preventDefault() })
     this.view.webContents.on('will-frame-navigate', (event) => { if (!isAllowedBrowserUrl(event.url)) event.preventDefault() })
@@ -52,7 +73,7 @@ export class ElectronTabBrowserPage implements TabBrowserPage {
   hide(): void {
     if (this.attached) { this.window.contentView.removeChildView(this.view); this.attached = false }
   }
-  destroy(): void { this.disposing = true; this.hide(); if (!this.view.webContents.isDestroyed()) this.view.webContents.close(); this.onDestroy() }
+  destroy(): void { this.disposing = true; this.automation.dispose(); this.hide(); if (!this.view.webContents.isDestroyed()) this.view.webContents.close(); this.onDestroy() }
 }
 
 export class ElectronTabBrowserPageFactory implements TabBrowserPageFactory {

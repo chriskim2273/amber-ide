@@ -1,6 +1,7 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { TabBrowserHost, type TabBrowserPage, type TabBrowserPageEvent, type TabBrowserPageFactory } from './tabBrowserHost'
 import { emptyBrowserState } from '../shared/tabBrowserState'
+import type { BrowserAutomation } from './browserAutomation'
 
 class FakePage implements TabBrowserPage {
   url = 'about:blank'; destroyed = false; visible = false; stopped = false
@@ -42,8 +43,26 @@ describe('TabBrowserHost', () => {
     const host = new TabBrowserHost(emptyBrowserState(1), factory)
     const opened = await host.open({ visible: true })
     await expect(host.navigate(opened.status.id, 'https://example.test', 'stale', 0)).rejects.toThrow('STALE_GENERATION')
+    expect(() => host.stop(opened.status.id, 'stale', 0)).toThrow('STALE_GENERATION')
     userInputs.get(opened.status.id)!()
     await expect(host.navigate(opened.status.id, 'https://example.test', opened.status.pageIncarnation, opened.status.generation)).rejects.toThrow('STALE_GENERATION')
+  })
+
+  it('binds automation to browser/incarnation/generation and rejects a result invalidated during dispatch', async () => {
+    let release!: () => void
+    const snapshot = vi.fn(async () => { await new Promise<void>((resolve) => { release = resolve }); return { snapshotId: 'snap', nodes: [], truncated: false, url: 'about:blank' } })
+    const automation = { snapshot, invalidate: vi.fn() } as unknown as BrowserAutomation
+    let input!: () => void
+    const localFactory: TabBrowserPageFactory = { create: (_id, onUserInput) => { input = onUserInput; return Object.assign(new FakePage(), { automation }) } }
+    const host = new TabBrowserHost(emptyBrowserState(1), localFactory)
+    const opened = await host.open({ visible: true })
+    const action = { type: 'snapshot' as const, pageIncarnation: opened.status.pageIncarnation, expectedGeneration: opened.status.generation, limits: { maxDepth: 20, maxNodes: 2000, maxBytes: 262144 } }
+    const pending = host.runAutomation(opened.status.id, action, new AbortController().signal)
+    await vi.waitFor(() => expect(snapshot).toHaveBeenCalled())
+    input()
+    release()
+    await expect(pending).rejects.toThrow('STALE_GENERATION')
+    expect(snapshot).toHaveBeenCalledWith(expect.objectContaining({ browserId: opened.status.id, pageIncarnation: opened.status.pageIncarnation }), action.limits, expect.any(AbortSignal))
   })
 
   it('does not choose the visible renderer as the LRU victim', async () => {

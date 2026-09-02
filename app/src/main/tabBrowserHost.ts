@@ -3,6 +3,8 @@ import { BrowserCapacity } from './tabBrowserPolicy'
 import { createBrowserId, isOpaqueBrowserId, safeRestoreUrl, type BrowserId } from '../shared/tabBrowser'
 import type { WsBrowser } from '../shared/workspaceFile'
 import type { BrowserRecord, BrowserStateFile } from '../shared/tabBrowserState'
+import type { BrowserAutomation, BrowserBinaryAttachment } from './browserAutomation'
+import type { BrowserToolAction } from './browserToolProtocol'
 
 export type TabBrowserPageEvent =
   | { type: 'navigation-started' }
@@ -17,6 +19,7 @@ export interface TabBrowserPage {
   hide(): void
   stop(): void
   setBounds?(bounds: { x: number; y: number; width: number; height: number }): void
+  automation?: BrowserAutomation
   destroy(): void
 }
 export interface TabBrowserPageFactory {
@@ -54,7 +57,7 @@ export class TabBrowserHost {
     let runtime!: Runtime
     const page = this.pages.create(
       id,
-      () => { runtime.generation += 1; this.onStateChange(); this.emitRuntime(id) },
+      () => { runtime.generation += 1; runtime.page.automation?.invalidate(); this.onStateChange(); this.emitRuntime(id) },
       (event) => this.pageEvent(id, runtime, event),
     )
     runtime = { page, incarnation: randomUUID(), generation: 0, loading: false }
@@ -68,6 +71,7 @@ export class TabBrowserHost {
     const record = this.record(id)
     if (event.type === 'navigation-started') {
       if (!runtime.loading) runtime.generation += 1
+      runtime.page.automation?.invalidate()
       runtime.loading = true
     } else if (event.type === 'navigation-committed') {
       runtime.loading = false
@@ -175,10 +179,43 @@ export class TabBrowserHost {
     return this.status(record.id)
   }
 
-  stop(id: string): BrowserRuntimeStatus {
+  async runAutomation(id: string, action: BrowserToolAction, signal: AbortSignal): Promise<unknown | BrowserBinaryAttachment> {
+    const record = this.record(id)
+    const runtime = this.runtimes.get(record.id)
+    if (!runtime || !runtime.page.automation) throw new Error('BROWSER_FROZEN')
+    if (runtime.incarnation !== action.pageIncarnation || runtime.generation !== action.expectedGeneration) throw new Error('STALE_GENERATION')
+    if (signal.aborted) throw new Error('ACTION_CANCELLED')
+    const automation = runtime.page.automation
+    const lease = { browserId: record.id, pageIncarnation: runtime.incarnation, generation: runtime.generation }
+    let result: unknown
+    this.capacity.protectFor(record.id, 'operation', true)
+    try {
+      if (action.type === 'snapshot') result = await automation.snapshot(lease, action.limits, signal)
+      else if (action.type === 'find') result = automation.find(lease, action.snapshotId, action.query)
+      else if (action.type === 'inspect') result = await automation.inspect(lease, action.target, signal)
+      else if (action.type === 'screenshot') result = await automation.screenshot(lease, action.target, action.fullPage, signal)
+      else if (action.type === 'console') result = automation.consoleSince(action.cursor, action.levels, action.limit)
+      else if (action.type === 'network') result = automation.networkSince(action.cursor, action.limit, action.failedOnly)
+      else if (action.type === 'wait') result = await automation.wait(lease, action.condition, action.timeoutMs, signal, () => this.runtimes.get(record.id) === runtime && runtime.generation === action.expectedGeneration)
+      else if (action.type === 'reload') { result = automation.reload(action.ignoreCache); runtime.generation += 1 }
+      else if (action.type === 'history') { result = automation.history(action.direction); runtime.generation += 1 }
+      else { result = await automation.setViewport(action.viewport, signal); runtime.generation += 1; record.viewport = { width: action.viewport.width, height: action.viewport.height }; record.stateRevision += 1 }
+    } finally { this.capacity.protectFor(record.id, 'operation', false) }
+    if (signal.aborted) throw new Error('ACTION_CANCELLED')
+    const isMutation = action.type === 'reload' || action.type === 'history' || action.type === 'setViewport'
+    const expectedAfter = action.expectedGeneration + (isMutation ? 1 : 0)
+    if (this.runtimes.get(record.id) !== runtime || runtime.incarnation !== action.pageIncarnation || runtime.generation !== expectedAfter) throw new Error('STALE_GENERATION')
+    this.onStateChange(); this.emitRuntime(record.id)
+    const context = { browserId: record.id, pageIncarnation: runtime.incarnation, generation: runtime.generation }
+    if (typeof result === 'object' && result !== null) return { ...result, ...context }
+    return { value: result, ...context }
+  }
+
+  stop(id: string, incarnation?: string, generation?: number): BrowserRuntimeStatus {
     const record = this.record(id)
     const runtime = this.runtimes.get(record.id)
     if (!runtime) throw new Error('BROWSER_FROZEN')
+    if (incarnation !== undefined && (runtime.incarnation !== incarnation || runtime.generation !== generation)) throw new Error('STALE_GENERATION')
     runtime.page.stop()
     runtime.loading = false
     runtime.generation += 1

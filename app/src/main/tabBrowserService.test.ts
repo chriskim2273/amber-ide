@@ -52,6 +52,19 @@ describe('TabBrowserService dispatch authorization', () => {
     expect(calls).toBe(1)
   })
 
+  it('revalidates a queued observation immediately before debugger dispatch', async () => {
+    const state = emptyBrowserState(1); let release!: () => void; let automationCalls = 0
+    const blocked = new Promise<void>((resolve) => { release = resolve })
+    const host = { navigate: async () => { await blocked; return { id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', stateRevision: 1 } }, runAutomation: async () => { automationCalls += 1; return {} }, snapshot: () => state }
+    const Service = TabBrowserService as unknown as new (s: TabBrowserStateStore, p: { setWindow: () => void }, h: typeof host, i: typeof state) => TabBrowserService
+    const service = new Service({ update: async () => state } as unknown as TabBrowserStateStore, { setWindow: () => {} }, host, state)
+    const first = service.command({ type: 'navigate', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', url: 'https://example.test/', pageIncarnation: 'page', expectedGeneration: 1 })
+    const queued = service.command({ type: 'automation', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', action: { type: 'console', pageIncarnation: 'page', expectedGeneration: 1, limit: 10 } }, undefined, () => false)
+    release(); await first
+    await expect(queued).rejects.toThrow('STALE_BROWSER_CONTEXT')
+    expect(automationCalls).toBe(0)
+  })
+
   it('rejects a queued stop after authorization is lost without stopping the page', async () => {
     const state = emptyBrowserState(1); let release!: () => void; let stopped = 0
     const blocked = new Promise<void>((resolve) => { release = resolve })
