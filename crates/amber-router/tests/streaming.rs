@@ -1,11 +1,11 @@
 mod support;
 use support::mock_provider::{MockProvider, Reply};
 
-use serde_json::json;
-use router_core::config::Config;
 use amber_router::routes::build_router;
 use amber_router::sse::first_frame_is_error;
 use amber_router::state::AppState;
+use router_core::config::Config;
+use serde_json::json;
 
 #[test]
 fn error_frames_are_detected_and_normal_frames_are_not() {
@@ -42,6 +42,90 @@ fn cfg_for(urls: &[(&str, &str)]) -> Config {
         &|_| None,
     )
     .unwrap()
+}
+
+#[tokio::test]
+async fn http_400_fails_over_to_next_provider() {
+    let bad = MockProvider::start(vec![Reply::Status {
+        code: 400,
+        body: "model not found here".into(),
+        retry_after: None,
+    }]);
+    let good = MockProvider::start(vec![Reply::SseOk {
+        frames: vec![
+            r#"{"choices":[{"delta":{"content":"hi"}}]}"#.into(),
+            "[DONE]".into(),
+        ],
+    }]);
+
+    let base = serve(cfg_for(&[
+        ("bad", &bad.base_url()),
+        ("good", &good.base_url()),
+    ]))
+    .await;
+    let r = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({ "model": "smart", "messages": [], "stream": true }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(r.status(), 200);
+    let body = r.text().await.unwrap();
+    assert!(
+        body.contains("hi"),
+        "a lone HTTP 400 must walk to the next provider"
+    );
+    assert_eq!(bad.hits(), 1);
+    assert_eq!(good.hits(), 1);
+}
+
+#[tokio::test]
+async fn three_consecutive_http_400s_stop_the_stream_chain() {
+    let a = MockProvider::start(vec![Reply::Status {
+        code: 400,
+        body: r#"{"error":{"message":"context too long a"}}"#.into(),
+        retry_after: None,
+    }]);
+    let b = MockProvider::start(vec![Reply::Status {
+        code: 400,
+        body: r#"{"error":{"message":"context too long b"}}"#.into(),
+        retry_after: None,
+    }]);
+    let c = MockProvider::start(vec![Reply::Status {
+        code: 400,
+        body: r#"{"error":{"message":"context too long c"}}"#.into(),
+        retry_after: None,
+    }]);
+    let d = MockProvider::start(vec![Reply::SseOk {
+        frames: vec![
+            r#"{"choices":[{"delta":{"content":"hi"}}]}"#.into(),
+            "[DONE]".into(),
+        ],
+    }]);
+
+    let base = serve(cfg_for(&[
+        ("a", &a.base_url()),
+        ("b", &b.base_url()),
+        ("c", &c.base_url()),
+        ("d", &d.base_url()),
+    ]))
+    .await;
+    let r = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({ "model": "smart", "messages": [], "stream": true }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(r.status(), 400);
+    let body = r.text().await.unwrap();
+    assert!(
+        body.contains("context too long a"),
+        "return the first of the consecutive 400s, got {body}"
+    );
+    assert!(!body.contains("hi"), "healthy tail must not be committed");
+    assert_eq!(d.hits(), 0, "fourth provider must never be tried");
 }
 
 #[tokio::test]

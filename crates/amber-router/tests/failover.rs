@@ -1,10 +1,10 @@
 mod support;
 use support::mock_provider::{MockProvider, Reply};
 
-use serde_json::json;
-use router_core::config::Config;
 use amber_router::proxy::{proxy_once, ProxyError};
 use amber_router::state::AppState;
+use router_core::config::Config;
+use serde_json::json;
 
 fn cfg_for(urls: &[(&str, &str)]) -> Config {
     let providers: String = urls
@@ -63,10 +63,10 @@ async fn falls_over_in_chain_order_and_succeeds() {
 }
 
 #[tokio::test]
-async fn bad_request_does_not_cascade() {
+async fn bad_request_fails_over_to_next_provider() {
     let p1 = MockProvider::start(vec![Reply::Status {
         code: 400,
-        body: "context too long".into(),
+        body: "model not found here".into(),
         retry_after: None,
     }]);
     let p2 = MockProvider::start(vec![Reply::Ok { body: ok_body() }]);
@@ -74,12 +74,100 @@ async fn bad_request_does_not_cascade() {
     let state = AppState::new(cfg_for(&[("a", &p1.base_url()), ("b", &p2.base_url())]));
     let out = proxy_once(&state, "smart", json!({ "model": "smart", "messages": [] }))
         .await
-        .expect("400 is returned, not an error");
+        .expect("a lone 400 must walk to the next provider");
+
+    assert_eq!(out.status, 200);
+    assert_eq!(out.attempts.len(), 2);
+    assert_eq!(out.attempts[0].outcome, "fatal");
+    assert_eq!(out.attempts[0].status, Some(400));
+    assert_eq!(p1.hits(), 1);
+    assert_eq!(p2.hits(), 1);
+}
+
+#[tokio::test]
+async fn three_consecutive_bad_requests_stop_the_chain() {
+    let p1 = MockProvider::start(vec![Reply::Status {
+        code: 400,
+        body: "context too long a".into(),
+        retry_after: None,
+    }]);
+    let p2 = MockProvider::start(vec![Reply::Status {
+        code: 400,
+        body: "context too long b".into(),
+        retry_after: None,
+    }]);
+    let p3 = MockProvider::start(vec![Reply::Status {
+        code: 400,
+        body: "context too long c".into(),
+        retry_after: None,
+    }]);
+    let p4 = MockProvider::start(vec![Reply::Ok { body: ok_body() }]);
+
+    let state = AppState::new(cfg_for(&[
+        ("a", &p1.base_url()),
+        ("b", &p2.base_url()),
+        ("c", &p3.base_url()),
+        ("d", &p4.base_url()),
+    ]));
+    let out = proxy_once(&state, "smart", json!({ "model": "smart", "messages": [] }))
+        .await
+        .expect("three consecutive 400s are returned, not an exhaustion error");
 
     assert_eq!(out.status, 400);
-    assert_eq!(out.attempts.len(), 1);
-    assert_eq!(p2.hits(), 0, "second provider must never be tried");
-    assert!(String::from_utf8_lossy(&out.body).contains("context too long"));
+    assert_eq!(out.attempts.len(), 3, "must not try a fourth provider");
+    assert_eq!(p4.hits(), 0, "fourth provider must never be tried");
+    assert!(
+        String::from_utf8_lossy(&out.body).contains("context too long a"),
+        "return the first of the consecutive 400s, not the last"
+    );
+}
+
+#[tokio::test]
+async fn interrupting_error_resets_consecutive_bad_requests() {
+    // Two 400s, then a 500, then two more 400s: without a reset the fifth
+    // attempt would trip the limit and skip the healthy tail.
+    let a = MockProvider::start(vec![Reply::Status {
+        code: 400,
+        body: "a".into(),
+        retry_after: None,
+    }]);
+    let b = MockProvider::start(vec![Reply::Status {
+        code: 400,
+        body: "b".into(),
+        retry_after: None,
+    }]);
+    let c = MockProvider::start(vec![Reply::Status {
+        code: 500,
+        body: "c".into(),
+        retry_after: None,
+    }]);
+    let d = MockProvider::start(vec![Reply::Status {
+        code: 400,
+        body: "d".into(),
+        retry_after: None,
+    }]);
+    let e = MockProvider::start(vec![Reply::Status {
+        code: 400,
+        body: "e".into(),
+        retry_after: None,
+    }]);
+    let f = MockProvider::start(vec![Reply::Ok { body: ok_body() }]);
+
+    let state = AppState::new(cfg_for(&[
+        ("a", &a.base_url()),
+        ("b", &b.base_url()),
+        ("c", &c.base_url()),
+        ("d", &d.base_url()),
+        ("e", &e.base_url()),
+        ("f", &f.base_url()),
+    ]));
+    let out = proxy_once(&state, "smart", json!({ "model": "smart", "messages": [] }))
+        .await
+        .expect("a 500 between 400s must reset the consecutive counter");
+
+    assert_eq!(out.status, 200);
+    assert_eq!(out.attempts.len(), 6);
+    assert_eq!(f.hits(), 1);
 }
 
 #[tokio::test]

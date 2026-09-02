@@ -5,7 +5,8 @@ use axum::http::header;
 use axum::response::Response;
 use serde_json::Value;
 
-use router_core::taxonomy::{classify_status, Verdict};
+use router_core::registry::Endpoint;
+use router_core::taxonomy::{classify_status, client_error_stops_chain, Verdict};
 
 use crate::selector::AcquireError;
 use crate::sse::{gate_stream, into_body_stream, GateFailure};
@@ -59,6 +60,14 @@ fn most_informative(attempts: &[Attempt], errors: &[Option<(u16, Vec<u8>)>]) -> 
         .unwrap_or((502, b"router: all endpoints exhausted".to_vec()))
 }
 
+fn remaining_endpoints(chain: &[Endpoint], tried: &[Endpoint]) -> Vec<Endpoint> {
+    chain
+        .iter()
+        .filter(|e| !tried.contains(e))
+        .cloned()
+        .collect()
+}
+
 pub async fn proxy_once(
     state: &AppState,
     alias: &str,
@@ -88,14 +97,41 @@ pub async fn proxy_once(
     // Index-aligned with `attempts`: the (status, body) when one exists, used to
     // pick the most informative error on exhaustion.
     let mut errors: Vec<Option<(u16, Vec<u8>)>> = Vec::new();
+    // `acquire` always prefers the first live key, so a 400 that does not
+    // cool the key would otherwise retry the same endpoint forever. Skip
+    // endpoints already tried on this request.
+    let mut tried: Vec<Endpoint> = Vec::new();
+    let mut consecutive_client_errors: usize = 0;
+    let mut first_client_error: Option<(u16, Vec<u8>, String)> = None;
 
     loop {
-        let lease = match state.selector.acquire(&chain, deadline).await {
+        let remaining = remaining_endpoints(&chain, &tried);
+        if remaining.is_empty() {
+            if let Some((status, body, content_type)) = first_client_error {
+                return Ok(ProxyOutcome {
+                    status,
+                    body,
+                    content_type,
+                    attempts,
+                });
+            }
+            let (status, body) = most_informative(&attempts, &errors);
+            return Err(ProxyError::Exhausted(attempts, status, body));
+        }
+
+        let lease = match state.selector.acquire(&remaining, deadline).await {
             Ok(l) => l,
             Err(AcquireError::AllDead) => return Err(ProxyError::AllDead(attempts)),
             Err(AcquireError::Timeout) => {
                 return if attempts.is_empty() {
                     Err(ProxyError::Timeout(attempts))
+                } else if let Some((status, body, content_type)) = first_client_error {
+                    Ok(ProxyOutcome {
+                        status,
+                        body,
+                        content_type,
+                        attempts,
+                    })
                 } else {
                     let (status, body) = most_informative(&attempts, &errors);
                     Err(ProxyError::Exhausted(attempts, status, body))
@@ -104,6 +140,7 @@ pub async fn proxy_once(
         };
 
         let endpoint = lease.endpoint.clone();
+        tried.push(endpoint.clone());
         let provider = state.registry.provider(endpoint.provider_idx);
         let label = state.registry.key_label(&endpoint);
         let url = chat_completions_url(&provider.base_url);
@@ -145,6 +182,8 @@ pub async fn proxy_once(
                     .selector
                     .report_cooldown(&endpoint, None, format!("{outcome}: {e}"));
                 errors.push(None);
+                consecutive_client_errors = 0;
+                first_client_error = None;
                 drop(lease);
 
                 if attempts.len() >= chain.len() {
@@ -167,6 +206,8 @@ pub async fn proxy_once(
                     "timeout waiting for headers".into(),
                 );
                 errors.push(None);
+                consecutive_client_errors = 0;
+                first_client_error = None;
                 drop(lease);
 
                 if attempts.len() >= chain.len() {
@@ -217,6 +258,8 @@ pub async fn proxy_once(
                         .selector
                         .report_cooldown(&endpoint, None, format!("{outcome}: {e}"));
                     errors.push(None);
+                    consecutive_client_errors = 0;
+                    first_client_error = None;
                     drop(lease);
                     if attempts.len() >= chain.len() {
                         let (status, body) = most_informative(&attempts, &errors);
@@ -236,6 +279,8 @@ pub async fn proxy_once(
                         .selector
                         .report_cooldown(&endpoint, None, "timeout reading body".into());
                     errors.push(None);
+                    consecutive_client_errors = 0;
+                    first_client_error = None;
                     drop(lease);
                     if attempts.len() >= chain.len() {
                         let (status, body) = most_informative(&attempts, &errors);
@@ -283,20 +328,32 @@ pub async fn proxy_once(
         match verdict {
             Verdict::Success => unreachable!(),
             Verdict::Fatal => {
-                // A 400 is the client's fault, not the provider's: it fails
-                // identically on every endpoint, so do not cool the key down
-                // and do not walk the chain. report_success is the only
-                // method that counts the request without penalizing the key.
+                // Do not cool the key: a 400 is not a provider-health signal.
+                // Walk the remaining chain so a provider-specific 400 can fail
+                // over; stop after consecutive Fatals so a real client error
+                // does not burn the whole list.
+                consecutive_client_errors += 1;
+                if first_client_error.is_none() {
+                    first_client_error = Some((status, resp_body.clone(), content_type.clone()));
+                }
                 state.selector.report_success(&endpoint);
+                errors.push(Some((status, resp_body)));
                 drop(lease);
-                return Ok(ProxyOutcome {
-                    status,
-                    body: resp_body,
-                    content_type,
-                    attempts,
-                });
+                if client_error_stops_chain(consecutive_client_errors) {
+                    let (status, body, content_type) =
+                        first_client_error.take().expect("Fatal streak has a body");
+                    return Ok(ProxyOutcome {
+                        status,
+                        body,
+                        content_type,
+                        attempts,
+                    });
+                }
+                continue;
             }
             Verdict::DeadKey => {
+                consecutive_client_errors = 0;
+                first_client_error = None;
                 state
                     .selector
                     .report_dead(&endpoint, format!("HTTP {status}"));
@@ -304,6 +361,8 @@ pub async fn proxy_once(
                 drop(lease);
             }
             Verdict::CoolDown { retry_after } => {
+                consecutive_client_errors = 0;
+                first_client_error = None;
                 state
                     .selector
                     .report_cooldown(&endpoint, retry_after, format!("HTTP {status}"));
@@ -351,14 +410,28 @@ pub async fn proxy_stream(
     let mut attempts: Vec<Attempt> = Vec::new();
     // Index-aligned with `attempts`, including mixed transport+HTTP, same as `proxy_once`.
     let mut errors: Vec<Option<(u16, Vec<u8>)>> = Vec::new();
+    let mut tried: Vec<Endpoint> = Vec::new();
+    let mut consecutive_client_errors: usize = 0;
+    let mut first_client_error: Option<(u16, Vec<u8>)> = None;
 
     loop {
-        let lease = match state.selector.acquire(&chain, deadline).await {
+        let remaining = remaining_endpoints(&chain, &tried);
+        if remaining.is_empty() {
+            if let Some((status, body)) = first_client_error {
+                return Err(ProxyError::Exhausted(attempts, status, body));
+            }
+            let (status, body) = most_informative(&attempts, &errors);
+            return Err(ProxyError::Exhausted(attempts, status, body));
+        }
+
+        let lease = match state.selector.acquire(&remaining, deadline).await {
             Ok(l) => l,
             Err(AcquireError::AllDead) => return Err(ProxyError::AllDead(attempts)),
             Err(AcquireError::Timeout) => {
                 return if attempts.is_empty() {
                     Err(ProxyError::Timeout(attempts))
+                } else if let Some((status, body)) = first_client_error {
+                    Err(ProxyError::Exhausted(attempts, status, body))
                 } else {
                     let (status, body) = most_informative(&attempts, &errors);
                     Err(ProxyError::Exhausted(attempts, status, body))
@@ -367,6 +440,7 @@ pub async fn proxy_stream(
         };
 
         let endpoint = lease.endpoint.clone();
+        tried.push(endpoint.clone());
         let provider = state.registry.provider(endpoint.provider_idx);
         let label = state.registry.key_label(&endpoint);
         let url = chat_completions_url(&provider.base_url);
@@ -406,6 +480,8 @@ pub async fn proxy_stream(
                     .selector
                     .report_cooldown(&endpoint, None, e.to_string());
                 errors.push(None);
+                consecutive_client_errors = 0;
+                first_client_error = None;
                 drop(lease);
                 if attempts.len() >= chain.len() {
                     let (status, body) = most_informative(&attempts, &errors);
@@ -427,6 +503,8 @@ pub async fn proxy_stream(
                     "timeout waiting for headers".into(),
                 );
                 errors.push(None);
+                consecutive_client_errors = 0;
+                first_client_error = None;
                 drop(lease);
                 if attempts.len() >= chain.len() {
                     let (status, body) = most_informative(&attempts, &errors);
@@ -461,15 +539,30 @@ pub async fn proxy_stream(
             match verdict {
                 Verdict::Success => unreachable!("non-success filtered above"),
                 Verdict::Fatal => {
-                    // A 400 is the client's fault, not the provider's.
+                    consecutive_client_errors += 1;
+                    if first_client_error.is_none() {
+                        first_client_error = Some((status, bytes.clone()));
+                    }
                     state.selector.report_success(&endpoint);
+                    errors.push(Some((status, bytes)));
                     drop(lease);
-                    return Err(ProxyError::Exhausted(attempts, status, bytes));
+                    if client_error_stops_chain(consecutive_client_errors) {
+                        let (status, body) =
+                            first_client_error.take().expect("Fatal streak has a body");
+                        return Err(ProxyError::Exhausted(attempts, status, body));
+                    }
+                    continue;
                 }
-                Verdict::DeadKey => state
-                    .selector
-                    .report_dead(&endpoint, format!("HTTP {status}")),
+                Verdict::DeadKey => {
+                    consecutive_client_errors = 0;
+                    first_client_error = None;
+                    state
+                        .selector
+                        .report_dead(&endpoint, format!("HTTP {status}"))
+                }
                 Verdict::CoolDown { retry_after } => {
+                    consecutive_client_errors = 0;
+                    first_client_error = None;
                     state
                         .selector
                         .report_cooldown(&endpoint, retry_after, format!("HTTP {status}"))
@@ -543,6 +636,8 @@ pub async fn proxy_stream(
                     .selector
                     .report_cooldown(&endpoint, None, outcome.to_string());
                 errors.push(Some((502, body_text.into_bytes())));
+                consecutive_client_errors = 0;
+                first_client_error = None;
                 drop(lease);
                 if attempts.len() >= chain.len() {
                     let (s, b) = most_informative(&attempts, &errors);

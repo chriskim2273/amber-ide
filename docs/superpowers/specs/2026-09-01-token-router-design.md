@@ -264,7 +264,7 @@ Modified: root `Cargo.toml` (workspace member), `crates/amber/src/main.rs`
 ## Verification
 
 - **Rust unit/integration:** the vendored suites must pass unchanged
-  (failover order, 400-no-cascade, 401-kills-key, SSE gate pre-commit failover,
+  (failover order, 400-walks-until-three-consecutive, 401-kills-key, SSE gate pre-commit failover,
   keep-alives not resetting the gate). New tests for config write-back
   round-trip, slot reorder, key masking, and `routerctl` render/argv.
 - **Gates:** `cargo clippy --workspace --all-targets -D warnings`, full Rust
