@@ -39,6 +39,7 @@ pub mod search;
 pub mod supervisor;
 pub mod tailscale;
 pub mod transport;
+pub mod usage;
 pub mod watchers;
 pub mod web;
 pub mod webctl;
