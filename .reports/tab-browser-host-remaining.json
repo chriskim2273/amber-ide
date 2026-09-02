@@ -55,7 +55,7 @@
       "id": "P1-pi-tools-and-approvals",
       "severity": "important",
       "status": "partial",
-      "work": "Phase A is implemented but failed independent review and is paused mid-remediation. The checkpoint replaces full AX-tree materialization with 32-id incremental DOM search plus one-node partial AX reads under hard scan/input/output budgets, and tightens encoded screenshot bounds. Still open from review: post-operation authority revalidation and active revoke aborts; one generation owner for reload/history; fixed untrusted-content labels; ring gap/drop accounting; generated Pi extension install/compile/load automation. Product remainder: semantic interactions, consequential classifier, approval digest/UI, and revoke/Stop Pi semantics."
+      "work": "Phase-A observation/navigation is implemented and all six valid independent-review findings are remediated: incremental bounded AX traversal, post-operation authority revalidation with active aborts and replay reauthorization, single Host-owned reload/history generation, fixed untrusted-content labeling for text and binary images, cursor-relative ring gap accounting, and exact generated Pi extension install/compile/production-loader/runtime verification. Full /tmp-only gates are green. Independent re-review is pending, so acceptance remains blocked. Product remainder: semantic interactions, consequential classifier, approval digest/UI, and complete revoke/Stop Pi semantics."
     },
     {
       "id": "P1-workspace-contract",

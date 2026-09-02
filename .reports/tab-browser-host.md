@@ -107,20 +107,21 @@ Phase A deliberately does not implement element interaction or approvals. `.repo
 
 Phase-A automated evidence before independent review: 812 app tests passed with one intentional real-daemon skip; focused browser tests passed 50/50; strict app typecheck, Electron build, hosted-web build, and workspace warnings-as-errors clippy passed; Pi extension installer tests passed 18/18 under the focused Cargo filter.
 
-## Independent Phase-A review — failed, remediation paused
+## Independent Phase-A review — remediation complete, re-review pending
 
-The independent gate failed with six valid findings. At the user-requested pause checkpoint, only the currently active atomic fix was completed: snapshots no longer call `Accessibility.getFullAXTree`; they traverse fixed `//*` search results in 32-node pages and request one partial AX node at a time, stopping before map insertion at scan, raw-input, node, and output-byte budgets. Hostile million-node and 600 KB accessible-name fixtures prove bounded accumulation. The same checkpoint validates encoded PNG dimensions (not only caller clip dimensions), preflights viewport/content geometry, and rejects target-plus-full-page ambiguity.
+The independent gate failed with six valid findings. The first remediation replaced `Accessibility.getFullAXTree` with fixed `//*` DOM search pages of 32 IDs and one-node partial AX reads, stopping before snapshot-map insertion at scan, raw-input, node, and output-byte budgets. Hostile million-node and 600 KB accessible-name fixtures prove bounded accumulation. Encoded PNG dimensions are validated independently of caller clip dimensions, viewport/content geometry is preflighted, and target-plus-full-page ambiguity is rejected.
 
-Checkpoint-only validation passed: 12 focused automation/protocol tests, strict app typecheck, generated Pi-extension TypeScript extraction/typecheck, and diff whitespace check. The full suite/build/clippy gates above were **not rerun after this checkpoint**. No production daemon was contacted.
+The five ordered follow-up findings are now remediated:
 
-Still open from the failed review, in required order on resume:
+1. Every asynchronous attached broker action revalidates Share, designation, live Pi controller, association, incarnation, and generation after completion. A 100 ms authority poll aborts in-flight work when authority disappears, replay-cache responses also reauthorize, and stale results are suppressed as `STALE_BROWSER_CONTEXT`. Race tests cover Share-off, designation change, association replacement, controller loss, and active cancellation.
+2. BrowserHost owns reload/back/forward generation changes. A pending-navigation marker consumes the corresponding synchronous or asynchronous production navigation-start event, while rejected/no-history back and forward operations do not advance generation. Commit, load-stop, and crash clear stale markers.
+3. Every Pi model-visible browser result starts with a fixed `UNTRUSTED BROWSER CONTENT` warning. Text truncation preserves that prefix within the 2,000-line/50,000-byte envelope, and screenshot metadata plus typed Pi image results carry the fixed `untrusted-browser-content` classification.
+4. Console/network rings now compute loss from the requested cursor against the currently retained cursor range, without double-counting historical evictions. Oversized rejected entries still consume a cursor position; tests cover retained, stale, future, and oversized-entry gaps. Cursor parsing also rejects values beyond JavaScript's safe integer range.
+5. `npm run test:pi-browser-extension` installs the exact extension from the newly built Amber binary into a private temporary Pi agent root, proves idempotent byte identity, compiles it against the supported Pi/TypeBox/Node modules, loads it through Pi's production extension loader, verifies all 15 registered tools, and executes labeled text and binary-image tool results through a temporary framed Unix-socket broker.
 
-1. Revalidate Share/designation/controller/association after every async operation before returning; abort and suppress active screenshot/wait/navigation work on revocation/controller loss, with race tests.
-2. Establish one generation owner for reload/back/forward, with production-shaped synchronous/asynchronous `did-start-navigation` and no-history tests.
-3. Label every model-visible page-derived text/image as fixed untrusted browser content, preserving the label through truncation and binary image transport.
-4. Correct ring dropped/gap accounting and add cursor-gap tests.
-5. Automate exact generated Pi-extension extraction, install, compile, and runtime load against the supported Pi/TypeBox API (the checkpoint compile command is not sufficient acceptance evidence).
-6. Rerun full gates and send the remediation commit through independent re-review.
+Post-remediation full `/tmp`-only gates passed: app 821 tests with one intentional real-daemon skip; strict typecheck; Electron and hosted-web production builds; Rust all-target workspace tests 781 passed with one intentional delegated-cgroup ignore; workspace all-target warnings-as-errors clippy; exact generated Pi extension install/compile/runtime-load; and `git diff --check`. Build output stayed under `/tmp/amber-tab-browser-validation`. No production daemon was contacted.
+
+Phase A now stops for a new independent review. It is not accepted or merge-ready until that review passes; semantic interaction and approvals remain product work outside this remediation.
 
 ## Open blocking work
 
