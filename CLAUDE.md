@@ -1499,11 +1499,12 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   a disabled slot losing its model, Pi's object-vs-string models, the legacy
   id migration, `has_key` never reaching the UI, a save sending camelCase,
   `rotate-token` claiming a restart that did not happen, and the non-atomic
-  config write. **Still open: the static-musl release is UNVERIFIED** —
-  `amber-router` links `ring`, which needs a musl C toolchain, and this box has
-  no `musl-gcc` (`musl-tools` not installed); `scripts/dist.sh` exports
-  `CC_x86_64_unknown_linux_musl` when present and `app/scripts/dist.sh` asserts
-  both artifacts are static, but neither has been run. Also unrun: the
+  config write. **The static-musl release is now VERIFIED** (2026-09-01, see the usage
+  entry below): `musl-tools` was installed, `scripts/dist.sh`'s Linux path was
+  fixed to build `amber-router` at all (it only ever built `--bin amber`, so
+  `app/scripts/dist.sh` always failed its "expected distributable amber-router"
+  assertion — the AppImage was unbuildable on Linux, not merely unverified),
+  and both binaries now come out `static-pie linked` and get bundled. Also unrun: the
   macOS/Windows unit paths (rendered + unit-tested only), `enable`/`disable`
   against a real systemd, and the Windows CI binary assertion, which now needs
   to cover three binaries and newly exercises `ring` on MSVC. Hosted `/app`
@@ -1568,9 +1569,33 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   as words, `needs-auth` surfaced without touching the real credential and left
   codex unaffected, zero token strings in any output, and `/api/usage` 401 → 204
   → 200 across the cookie boundary. **A running daemon must be restarted to
-  answer `GetUsage`** (an older one replies `Error`, which the pill renders as
-  unknown, never as zero); `amber web` likewise. Still open: real-phone and
-  macOS/Windows verification.
+  answer `GetUsage`.** An older one does NOT reply `Error` (an early draft of
+  this entry said so and was wrong): its strict decoder rejects the unknown
+  variant BEFORE the match, so the connection's forward-compat path
+  log-and-skips and nothing comes back at all — measured on the live 2026-08
+  daemon, which logs a ~1 KB `skipping undecodable control frame` line per poll
+  until it is restarted. The pill stays hidden (never a zero), `/api/usage`
+  serves `{"providers":[]}`, and the CLI times out at 5 s and now names the
+  cause instead of just saying "timed out". Still open: real-phone and
+  macOS/Windows verification, and a live render of the pill (the deployed
+  bundle contains it; it cannot paint until the daemon restarts).
+
+- [x] Deploy tooling fixes (2026-09-01, found while deploying the above) — two
+  bugs that made a deploy LOOK successful. (a) `scripts/relaunch-app-linux.sh`
+  stopped processes whose argv[0] basename is `amber-ide-app`, but
+  electron-builder names the executable **`amber-ide`** — so the stop-loop
+  matched nothing, the replacement it launched lost Electron's single-instance
+  race and exited, the OLD client kept running, and the script printed
+  `==> launched …`. Observed live: after a "successful" relaunch the mounted
+  AppImage still carried the previous bundle. Now matches both names via
+  `is_amber_main`, with a regression test that starts a real binary under each
+  name (a `#!`-script's `/proc` cmdline starts with the INTERPRETER, so a fake
+  built that way would pass against the broken script) — mutation-checked: the
+  test exits 1 against the pre-fix script. (b) `scripts/dist.sh`'s `build_linux`
+  never built `amber-router`, so `app/scripts/dist.sh` could not bundle it; it
+  now builds both binaries and resolves the musl C compiler `ring` needs
+  (`x86_64-linux-musl-gcc` or `musl-gcc`), failing with an actionable message
+  rather than cc-rs's "failed to find tool".
 
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**
