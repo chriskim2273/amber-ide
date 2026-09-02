@@ -243,6 +243,118 @@ pub fn claude_usage_with(dir: Option<&Path>, now: i64, run: &Runner) -> Provider
     }
 }
 
+/// Bounds on the rollout walk: a large `~/.codex` must never turn a 60 s poll
+/// into a disk storm.
+const MAX_ROLLOUT_FILES: usize = 200;
+const MAX_ROLLOUT_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Every `rollout-*.jsonl` under `dir`, newest mtime first, capped.
+fn rollout_files(dir: &Path) -> Vec<PathBuf> {
+    let mut found: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_dir() {
+                stack.push(path);
+            } else if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("rollout-") && n.ends_with(".jsonl"))
+            {
+                let when = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+                found.push((when, path));
+            }
+        }
+    }
+    found.sort_by(|a, b| b.0.cmp(&a.0));
+    found.truncate(MAX_ROLLOUT_FILES);
+    found.into_iter().map(|(_, p)| p).collect()
+}
+
+/// The tail of a file, capped — a rollout's newest records are at the end.
+fn tail_of(path: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    if len > MAX_ROLLOUT_BYTES {
+        f.seek(SeekFrom::End(-(MAX_ROLLOUT_BYTES as i64))).ok()?;
+    }
+    let mut buf = Vec::new();
+    f.take(MAX_ROLLOUT_BYTES).read_to_end(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// The newest non-null `rate_limits` object across codex's rollout logs.
+///
+/// "Newest non-null RECORD", not "newest file": the most recent rollout very
+/// often carries `"rate_limits":null` on every line (observed live), so a
+/// newest-file rule reports nothing at all.
+fn newest_rate_limits(sessions_dir: &Path) -> Option<serde_json::Value> {
+    for path in rollout_files(sessions_dir) {
+        let Some(text) = tail_of(&path) else { continue };
+        for line in text.lines().rev() {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let rl = v
+                .pointer("/payload/info/rate_limits")
+                .or_else(|| v.pointer("/info/rate_limits"));
+            if let Some(rl) = rl.filter(|rl| !rl.is_null()) {
+                return Some(rl.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Codex quota from a specific `sessions/` directory (the testable form).
+pub fn codex_usage_in(sessions_dir: &Path, now: i64) -> ProviderUsage {
+    let Some(rl) = newest_rate_limits(sessions_dir) else {
+        return unavailable("codex", "no codex usage recorded yet", now);
+    };
+    let mut gauges = Vec::new();
+    for (key, group, label) in [
+        ("primary", "session", "5h window"),
+        ("secondary", "weekly", "weekly"),
+    ] {
+        let Some(block) = rl.get(key).filter(|b| !b.is_null()) else {
+            continue;
+        };
+        let Some(percent) = block.get("used_percent").and_then(serde_json::Value::as_f64) else {
+            continue;
+        };
+        let resets = block.get("resets_at").and_then(serde_json::Value::as_i64);
+        gauges.push(gauge(group, label, percent, resets, now));
+    }
+    if gauges.is_empty() {
+        return unavailable("codex", "no codex usage recorded yet", now);
+    }
+    ProviderUsage {
+        provider: "codex".into(),
+        plan: rl
+            .get("plan_type")
+            .and_then(|p| p.as_str())
+            .map(str::to_string),
+        gauges,
+        updated: now.max(0) as u64,
+        state: "ok".into(),
+        detail: None,
+    }
+}
+
+/// Codex quota from `$CODEX_HOME/sessions` (default `~/.codex/sessions`).
+pub fn codex_usage(now: i64) -> ProviderUsage {
+    match crate::codex::codex_home() {
+        Some(home) => codex_usage_in(&home.join("sessions"), now),
+        None => unavailable("codex", "no codex home directory", now),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,5 +498,112 @@ mod tests {
         // A non-UTC offset must be normalized, not ignored.
         assert_eq!(rfc3339_to_unix("2026-09-02T08:00:00+02:00"), Some(1_788_328_800));
         assert_eq!(rfc3339_to_unix("nonsense"), None);
+    }
+
+    fn write_rollout(dir: &Path, name: &str, lines: &[&str]) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let p = dir.join(name);
+        std::fs::write(&p, lines.join("\n")).unwrap();
+        p
+    }
+
+    /// A `token_count` line with a populated rate_limits block.
+    fn rl_line(primary: f64, p_reset: i64, secondary: f64, s_reset: i64) -> String {
+        format!(
+            r#"{{"type":"event_msg","payload":{{"type":"token_count","info":{{"rate_limits":{{"limit_id":"codex_bengalfox","primary":{{"used_percent":{primary},"window_minutes":300,"resets_at":{p_reset}}},"secondary":{{"used_percent":{secondary},"window_minutes":10080,"resets_at":{s_reset}}},"plan_type":"pro"}}}}}}}}"#
+        )
+    }
+
+    const NULL_LINE: &str =
+        r#"{"type":"event_msg","payload":{"type":"token_count","info":{"rate_limits":null}}}"#;
+
+    /// Make `newer` strictly newer than `older` by mtime, portably.
+    fn set_newer(newer: &Path, older: &Path) {
+        let older_mtime = std::fs::metadata(older).unwrap().modified().unwrap();
+        loop {
+            let content = std::fs::read(newer).unwrap();
+            std::fs::write(newer, &content).unwrap();
+            if std::fs::metadata(newer).unwrap().modified().unwrap() > older_mtime {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn reads_the_newest_non_null_rate_limits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        let old = write_rollout(
+            &sessions.join("2026/09/01"),
+            "rollout-a.jsonl",
+            &[NULL_LINE, &rl_line(10.0, 2_000_000_000, 3.0, 2_000_600_000)],
+        );
+        // The NEWEST file carries only nulls — the observed live shape. Picking
+        // "newest file" instead of "newest non-null record" reports nothing.
+        let new = write_rollout(
+            &sessions.join("2026/09/02"),
+            "rollout-b.jsonl",
+            &[NULL_LINE, NULL_LINE],
+        );
+        set_newer(&new, &old);
+
+        let u = codex_usage_in(&sessions, 1_000_000_000);
+        assert_eq!(u.state, "ok");
+        assert_eq!(u.plan.as_deref(), Some("pro"));
+        assert_eq!(u.gauges.len(), 2);
+        assert_eq!(u.gauges[0].label, "5h window");
+        assert_eq!(u.gauges[0].percent, 10.0);
+        assert_eq!(u.gauges[1].label, "weekly");
+        assert_eq!(u.gauges[1].percent, 3.0);
+    }
+
+    #[test]
+    fn a_passed_reset_marks_the_gauge_stale() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        write_rollout(
+            &sessions.join("2026/09/01"),
+            "rollout-a.jsonl",
+            &[&rl_line(88.0, 1_000, 4.0, 2_000_600_000)],
+        );
+        let u = codex_usage_in(&sessions, 1_000_000_000);
+        assert!(u.gauges[0].stale, "5h window rolled long ago");
+        assert!(!u.gauges[1].stale);
+    }
+
+    #[test]
+    fn an_empty_tree_is_unavailable_not_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let u = codex_usage_in(&tmp.path().join("sessions"), 0);
+        assert_eq!(u.state, "unavailable");
+        assert!(u.gauges.is_empty(), "absence must never render as 0% used");
+    }
+
+    #[test]
+    fn all_null_records_are_unavailable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        write_rollout(
+            &sessions.join("2026/09/01"),
+            "rollout-a.jsonl",
+            &[NULL_LINE, NULL_LINE],
+        );
+        assert_eq!(codex_usage_in(&sessions, 0).state, "unavailable");
+    }
+
+    #[test]
+    fn the_walk_is_bounded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        for i in 0..(MAX_ROLLOUT_FILES + 50) {
+            write_rollout(
+                &sessions.join("2026/09/01"),
+                &format!("rollout-{i}.jsonl"),
+                &[NULL_LINE],
+            );
+        }
+        assert_eq!(rollout_files(&sessions).len(), MAX_ROLLOUT_FILES);
+        assert_eq!(codex_usage_in(&sessions, 0).state, "unavailable");
     }
 }
