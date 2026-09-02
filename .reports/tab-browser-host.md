@@ -141,7 +141,18 @@ The installed Amber-owned Pi extension is version 4 and registers 26 tools throu
 
 Phase-B `/tmp` gates: 838 app tests passed with one intentional real-daemon skip; focused Phase-B browser tests passed 76/76 before the full run; strict typecheck, Electron production build, hosted-web production build, 779 Rust tests with one intentional delegated-cgroup ignore, workspace all-target warnings-as-errors clippy, exact generated extension verification, and diff checks passed. No production daemon was contacted.
 
-Phase B now stops for independent review. `P1-pi-tools-and-approvals` remains partial and `mergeReady` remains false until that review passes and the external package/platform gates are complete.
+The first independent Phase-B review failed with valid P1/P2 findings. Commit `896ba3a` remediates them:
+
+- every pointer-bearing interaction recomputes actionability, geometry, and fingerprint, checks a bounded visual viewport, and uses bounded `DOM.getNodeForLocation` immediately before dispatch; only the exact target or a descendant reached through a 32-node parent walk is accepted, while overlays and off-viewport centers fail closed;
+- drag source and destination have independent current fingerprints, both enter the approval digest, and both are revalidated; bounded ancestor-form action/method metadata and conservative button/destination semantics classify drag-to-delete, JavaScript-style role buttons, send/save/submit, and destructive destinations;
+- approval availability is tied to an exact visible, expanded, local window context for the owning browser; collapsed/background requests trigger a main-derived workspace/tab/browser reveal and fail immediately so Pi must retry only after that surface is renderable; resolution and temporary grants also recheck that exact surface, and the native view is physically detached while an approval is visible;
+- alert/confirm/prompt/beforeunload now use a browser-scoped 60-second dialog coordinator with exact digests, bounded/redacted message metadata, bounded prompt responses, visible UI, expiry, revoke/close/crash cancellation, headless fail-closed behavior, and native-view occlusion; approved actions no longer cause unconditional dialog denial;
+- broker high-water identities are retained for the host epoch, unseen identities are refused once the 1,024-client bound is reached, and result cache entries carry acceptance timestamps with five-minute expiry while sequence tombstones continue preventing re-execution;
+- approvals use the required 60-second lifetime with a 250 ms live countdown, and Pi actions emit secret-free started/completed/failed lifecycle events plus last-action rail status for semantic, navigation, and stop actions.
+
+Post-remediation `/tmp` gates: 850 app tests passed with one intentional real-daemon skip; focused review tests passed 87/87; strict typecheck, Electron and hosted-web production builds, 779 Rust tests with one intentional delegated-cgroup ignore, workspace all-target warnings-as-errors clippy, generated Pi extension install/compile/production-loader verification, and diff checks passed. No production daemon was contacted.
+
+Phase B now stops for independent re-review. `P1-pi-tools-and-approvals` remains partial and `mergeReady` remains false until that review passes and the external package/platform gates are complete.
 
 ## Open blocking work
 
