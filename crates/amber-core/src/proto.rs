@@ -130,7 +130,47 @@ pub enum ResourcePressureCause {
     Memory,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// One quota window a provider reports about itself.
+///
+/// `percent` is **used**, 0..=100, exactly as the provider states it. The UI
+/// derives "remaining"; amber never computes a percentage of its own (a number
+/// divided by a guessed plan limit would be this feature wearing a mask — see
+/// the 2026-09-01 usage design's "No derived percentages" rule).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Gauge {
+    /// The provider's own window identity: "session" (5h) | "weekly" | other.
+    pub kind: String,
+    /// Short human label: "5h window", "weekly".
+    pub label: String,
+    pub percent: f64,
+    /// Unix seconds this window resets. `None` when the provider omits it.
+    #[serde(default)]
+    pub resets_at: Option<i64>,
+    /// `resets_at` is in the past: the window has rolled since this sample was
+    /// written, so `percent` describes a window that no longer exists. The UI
+    /// must render this as "rolled", never as a number.
+    #[serde(default)]
+    pub stale: bool,
+}
+
+/// One provider's quota snapshot. `state` is `"ok" | "unavailable" |
+/// "needs-auth" | "error"`; anything but `"ok"` renders as words, not numbers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProviderUsage {
+    pub provider: String,
+    #[serde(default)]
+    pub plan: Option<String>,
+    #[serde(default)]
+    pub gauges: Vec<Gauge>,
+    /// Unix seconds of this sample.
+    #[serde(default)]
+    pub updated: u64,
+    pub state: String,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ControlMsg {
     Hello,
     ListSessions,
@@ -336,6 +376,15 @@ pub enum ControlMsg {
         #[serde(default)]
         session_high_kb: u64,
     },
+    /// Client -> daemon: report each agent provider's plan-quota snapshot.
+    /// Answered from the daemon's 60 s poller cache — NEVER a live fetch on the
+    /// connection read thread, behind which every multiplexed control frame
+    /// would queue (the backlog head-of-line lesson).
+    GetUsage,
+    /// Daemon -> client: the cached quota snapshot, one entry per provider.
+    /// Never broadcast to watchers — a once-a-minute payload has no business on
+    /// the bounded lifecycle queue; this is a poll reply only.
+    Usage { providers: Vec<ProviderUsage> },
     SessionList { names: Vec<String> },
     Created { name: String },
     Killed { name: String },
@@ -343,7 +392,7 @@ pub enum ControlMsg {
     Error { msg: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Frame {
     Control(ControlMsg),
     Data { session: String, bytes: Vec<u8> },
@@ -1171,5 +1220,45 @@ mod tests {
             d.feed(std::slice::from_ref(b));
         }
         assert_eq!(d.next_frame().unwrap(), Some(f));
+    }
+
+    #[test]
+    fn usage_control_roundtrips() {
+        let msg = ControlMsg::Usage {
+            providers: vec![ProviderUsage {
+                provider: "claude".into(),
+                plan: Some("pro".into()),
+                gauges: vec![Gauge {
+                    kind: "session".into(),
+                    label: "5h window".into(),
+                    percent: 15.0,
+                    resets_at: Some(1_788_321_600),
+                    stale: false,
+                }],
+                updated: 1_788_300_000,
+                state: "ok".into(),
+                detail: None,
+            }],
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ControlMsg>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn get_usage_is_a_unit_variant_on_the_wire() {
+        // Unit variants serialize as a bare string; the TS decoder relies on it.
+        assert_eq!(serde_json::to_string(&ControlMsg::GetUsage).unwrap(), "\"GetUsage\"");
+    }
+
+    #[test]
+    fn provider_usage_tolerates_a_minimal_peer_payload() {
+        // Every optional field defaults, so a leaner/older sender still decodes.
+        let p: ProviderUsage =
+            serde_json::from_str(r#"{"provider":"grok","state":"unavailable"}"#).unwrap();
+        assert_eq!(p.provider, "grok");
+        assert!(p.gauges.is_empty());
+        assert_eq!(p.plan, None);
+        assert_eq!(p.detail, None);
+        assert_eq!(p.updated, 0);
     }
 }
