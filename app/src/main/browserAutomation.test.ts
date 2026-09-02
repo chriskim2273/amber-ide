@@ -12,12 +12,18 @@ class FakeDebugger implements BrowserDebuggerTransport {
   onMessage(listener: (method: string, params: Record<string, unknown>) => void): void { this.listeners.push(listener) }
   async send(method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>> {
     this.calls.push(method)
-    if (method === 'Accessibility.getFullAXTree') return { nodes: [
-      { nodeId: 'root', role: { value: 'RootWebArea' }, name: { value: 'Demo' }, backendDOMNodeId: 1 },
-      { nodeId: 'child', parentId: 'root', role: { value: 'button' }, name: { value: 'Submit' }, backendDOMNodeId: 2 },
-      { nodeId: 'secret', parentId: 'root', role: { value: 'textbox' }, name: { value: 'Password' }, value: { value: 'hunter2' }, backendDOMNodeId: 3 },
-    ] }
+    if (method === 'DOM.performSearch') return { searchId: 'search-1', resultCount: 3 }
+    if (method === 'DOM.getSearchResults') return { nodeIds: [101, 102, 103].slice(params?.['fromIndex'] as number, params?.['toIndex'] as number) }
+    if (method === 'Accessibility.getPartialAXTree') {
+      const nodeId = params?.['nodeId']
+      if (nodeId === 101) return { nodes: [{ role: { value: 'RootWebArea' }, name: { value: 'Demo' }, backendDOMNodeId: 1 }] }
+      if (nodeId === 102) return { nodes: [{ role: { value: 'button' }, name: { value: 'Submit' }, backendDOMNodeId: 2 }] }
+      return { nodes: [{ role: { value: 'textbox' }, name: { value: 'Password' }, value: { value: 'hunter2' }, backendDOMNodeId: 3 }] }
+    }
     if (method === 'DOM.pushNodesByBackendIdsToFrontend') return { nodeIds: [22] }
+    if (method === 'DOM.describeNode' && params?.['nodeId'] === 101) return { node: { nodeName: 'HTML', backendNodeId: 1 } }
+    if (method === 'DOM.describeNode' && params?.['nodeId'] === 102) return { node: { nodeName: 'BUTTON', parentId: 101, backendNodeId: 2 } }
+    if (method === 'DOM.describeNode' && params?.['nodeId'] === 103) return { node: { nodeName: 'INPUT', parentId: 101, backendNodeId: 3 } }
     if (method === 'DOM.describeNode' && params?.['nodeId'] === 10) return { node: { nodeName: 'DIV', attributes: ['id', 'container', 'data-secret', 'never'] } }
     if (method === 'DOM.describeNode') return { node: { nodeName: 'BUTTON', parentId: 10, attributes: ['id', 'submit', 'value', 'secret', 'aria-label', 'Submit'] } }
     if (method === 'CSS.getComputedStyleForNode') return { computedStyle: [{ name: 'display', value: 'block' }, { name: 'background-image', value: 'url(https://secret.test/token)' }] }
@@ -44,6 +50,36 @@ describe('browser automation', () => {
     expect(snapshot.nodes[1]).toMatchObject({ role: 'button', name: 'Submit' })
     expect(snapshot.nodes[1]?.ref).toMatch(/^n\d+$/)
     expect(JSON.stringify(snapshot)).not.toContain('hunter2')
+  })
+
+  it('never materializes a hostile full AX tree and stops incremental traversal at hard budgets', async () => {
+    class HostileWideDebugger extends FakeDebugger {
+      override async send(method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>> {
+        if (method === 'DOM.performSearch') { this.calls.push(method); return { searchId: 'wide', resultCount: 1_000_000 } }
+        if (method === 'DOM.getSearchResults') { this.calls.push(method); return { nodeIds: Array.from({ length: 32 }, (_, index) => index + 1) } }
+        if (method === 'DOM.describeNode') { this.calls.push(method); return { node: { nodeName: 'DIV', backendNodeId: params?.['nodeId'] } } }
+        if (method === 'Accessibility.getPartialAXTree') { this.calls.push(method); return { nodes: [{ role: { value: 'button' }, name: { value: 'wide' }, backendDOMNodeId: params?.['nodeId'] }] } }
+        return super.send(method, params)
+      }
+    }
+    const transport = new HostileWideDebugger()
+    const automation = new BrowserAutomation(transport, () => 'about:blank', () => false)
+    const snapshot = await automation.snapshot(lease, { maxDepth: 20, maxNodes: 2, maxBytes: 4096 }, new AbortController().signal)
+    expect(snapshot.nodes).toHaveLength(2)
+    expect(snapshot.truncated).toBe(true)
+    expect(transport.calls).not.toContain('Accessibility.getFullAXTree')
+    expect(transport.calls.filter((method) => method === 'Accessibility.getPartialAXTree')).toHaveLength(2)
+
+    class HostileTextDebugger extends HostileWideDebugger {
+      override async send(method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>> {
+        if (method === 'Accessibility.getPartialAXTree') { this.calls.push(method); return { nodes: [{ role: { value: 'button' }, name: { value: 'x'.repeat(600_000) } }] } }
+        return super.send(method, params)
+      }
+    }
+    const textAutomation = new BrowserAutomation(new HostileTextDebugger(), () => 'about:blank', () => false)
+    const textSnapshot = await textAutomation.snapshot(lease, { maxDepth: 20, maxNodes: 2, maxBytes: 4096 }, new AbortController().signal)
+    expect(textSnapshot.nodes).toEqual([])
+    expect(textSnapshot.truncated).toBe(true)
   })
 
   it('fails closed on references from another snapshot, generation, incarnation, or browser', async () => {
@@ -73,9 +109,9 @@ describe('browser automation', () => {
     expect(image.data.subarray(0, 8)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
     expect(image).toMatchObject({ width: 800, height: 600 })
     expect(image).not.toHaveProperty('path')
-    transport.send = async () => { const png = Buffer.alloc(24); Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(png); png.write('IHDR', 12, 'ascii'); png.writeUInt32BE(4097, 16); png.writeUInt32BE(600, 20); return { data: png.toString('base64') } }
+    transport.send = async (method) => { if (method === 'Page.getLayoutMetrics') return { cssVisualViewport: { clientWidth: 800, clientHeight: 600 } }; const png = Buffer.alloc(24); Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(png); png.write('IHDR', 12, 'ascii'); png.writeUInt32BE(4097, 16); png.writeUInt32BE(600, 20); return { data: png.toString('base64') } }
     await expect(automation.screenshot(lease, undefined, false, new AbortController().signal)).rejects.toThrow('REQUEST_LIMIT')
-    transport.send = async () => ({ data: Buffer.alloc(10 * 1024 * 1024 + 1).toString('base64') })
+    transport.send = async (method) => method === 'Page.getLayoutMetrics' ? { cssVisualViewport: { clientWidth: 800, clientHeight: 600 } } : { data: Buffer.alloc(10 * 1024 * 1024 + 1).toString('base64') }
     await expect(automation.screenshot(lease, undefined, false, new AbortController().signal)).rejects.toThrow('REQUEST_LIMIT')
   })
 

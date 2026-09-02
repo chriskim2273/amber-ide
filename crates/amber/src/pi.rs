@@ -200,6 +200,7 @@ export default function (pi: ExtensionAPI) {
     async execute(_id, params, signal) {
       const { snapshotId, ref, ...rest } = params
       if ((snapshotId && !ref) || (ref && !snapshotId)) throw new Error("snapshotId and ref must be supplied together")
+      if (snapshotId && rest.fullPage) throw new Error("fullPage cannot be combined with an element reference")
       return result(await browserRequest({ type: "screenshot", ...rest, ...(snapshotId ? { target: { snapshotId, ref } } : {}) }, signal))
     },
   })

@@ -184,24 +184,52 @@ export class BrowserAutomation {
   }
   async snapshot(lease: BrowserAutomationLease, limits: SnapshotLimits, signal: AbortSignal): Promise<SnapshotResult> {
     abort(signal); await this.ensureAttached(); abort(signal)
-    const response = await this.transport.send('Accessibility.getFullAXTree', { depth: limits.maxDepth }); abort(signal)
-    const raw = Array.isArray(response['nodes']) ? response['nodes'] as AXNode[] : []
-    const byId = new Map(raw.flatMap((node) => node.nodeId ? [[node.nodeId, node] as const] : []))
-    const depthOf = (node: AXNode): number => { let depth = 0, parent = node.parentId; const seen = new Set<string>(); while (parent && depth <= limits.maxDepth) { if (seen.has(parent)) break; seen.add(parent); depth += 1; parent = byId.get(parent)?.parentId } return depth }
+    // CDP's getFullAXTree materializes an attacker-controlled tree before a
+    // caller can apply limits. Search DOM node ids in small pages, then ask for
+    // one node's partial AX projection at a time. No response is accumulated
+    // into the snapshot until it fits the hard input and output budgets.
+    const search = await this.transport.send('DOM.performSearch', { query: '//*', includeUserAgentShadowDOM: false }); abort(signal)
+    const searchId = text(search['searchId'], 256), resultCount = typeof search['resultCount'] === 'number' && Number.isSafeInteger(search['resultCount']) ? Math.max(0, search['resultCount']) : 0
+    if (!searchId) throw new Error('UNSUPPORTED_PAGE')
     const snapshotId = randomBytes(12).toString('base64url'), entries = new Map<string, SnapshotEntry>(), nodes: AccessibilityNodeResult[] = []
-    let used = 512 + Buffer.byteLength(sanitizeBrowserUrl(this.currentUrl())), truncated = false
-    for (const node of raw) {
-      if (node.ignored) continue
-      const depth = depthOf(node); if (depth > limits.maxDepth) { truncated = true; continue }
-      const role = text(node.role?.value, 256), name = redactBrowserText(text(node.name?.value, 4096))
-      const ref = `n${nodes.length + 1}`
-      const disabled = property(node, 'disabled'), focused = property(node, 'focused')
-      const publicNode: AccessibilityNodeResult = { ref, depth, role, name, ...(disabled === undefined ? {} : { disabled }), ...(focused === undefined ? {} : { focused }) }
-      const estimated = Buffer.byteLength(JSON.stringify(publicNode)) + 1
-      if (nodes.length >= limits.maxNodes || used + estimated > limits.maxBytes) { truncated = true; break }
-      const entry: SnapshotEntry = { ...publicNode, ...(node.backendDOMNodeId === undefined ? {} : { backendDOMNodeId: node.backendDOMNodeId }) }
-      entries.set(ref, entry); nodes.push(publicNode); used += estimated
-    }
+    const depthByNodeId = new Map<number, number>()
+    let used = 512 + Buffer.byteLength(sanitizeBrowserUrl(this.currentUrl())), inputBytes = Buffer.byteLength(JSON.stringify(search)), scanned = 0, truncated = false
+    const inputLimit = Math.min(512 * 1024, Math.max(16 * 1024, limits.maxBytes * 2))
+    try {
+      outer: for (let start = 0; start < resultCount && scanned < limits.maxNodes; start += 32) {
+        abort(signal)
+        const page = await this.transport.send('DOM.getSearchResults', { searchId, fromIndex: start, toIndex: Math.min(resultCount, start + 32) }); abort(signal)
+        inputBytes += Buffer.byteLength(JSON.stringify(page))
+        if (inputBytes > inputLimit) { truncated = true; break }
+        const nodeIds = Array.isArray(page['nodeIds']) ? page['nodeIds'].filter((id): id is number => typeof id === 'number').slice(0, 32) : []
+        for (const nodeId of nodeIds) {
+          if (scanned >= limits.maxNodes) { truncated = true; break outer }
+          scanned += 1; abort(signal)
+          const described = await this.transport.send('DOM.describeNode', { nodeId, depth: 0, pierce: false }); abort(signal)
+          inputBytes += Buffer.byteLength(JSON.stringify(described))
+          if (inputBytes > inputLimit) { truncated = true; break outer }
+          const domNode = described['node'] as Record<string, unknown> | undefined
+          const parentId = typeof domNode?.['parentId'] === 'number' ? domNode['parentId'] : undefined
+          const depth = parentId === undefined ? 0 : (depthByNodeId.get(parentId) ?? -1) + 1
+          depthByNodeId.set(nodeId, depth)
+          if (depth > limits.maxDepth) { truncated = true; continue }
+          const partial = await this.transport.send('Accessibility.getPartialAXTree', { nodeId, fetchRelatives: false }); abort(signal)
+          inputBytes += Buffer.byteLength(JSON.stringify(partial))
+          if (inputBytes > inputLimit) { truncated = true; break outer }
+          const candidates = Array.isArray(partial['nodes']) ? partial['nodes'] as AXNode[] : []
+          const node = candidates.find((candidate) => !candidate.ignored)
+          if (!node) continue
+          const role = text(node.role?.value, 256), name = redactBrowserText(text(node.name?.value, 4096)), ref = `n${nodes.length + 1}`
+          const disabled = property(node, 'disabled'), focused = property(node, 'focused')
+          const publicNode: AccessibilityNodeResult = { ref, depth, role, name, ...(disabled === undefined ? {} : { disabled }), ...(focused === undefined ? {} : { focused }) }
+          const estimated = Buffer.byteLength(JSON.stringify(publicNode)) + 1
+          if (nodes.length >= limits.maxNodes || used + estimated > limits.maxBytes) { truncated = true; break outer }
+          const backendDOMNodeId = typeof node.backendDOMNodeId === 'number' ? node.backendDOMNodeId : (typeof domNode?.['backendNodeId'] === 'number' ? domNode['backendNodeId'] : undefined)
+          entries.set(ref, { ...publicNode, ...(backendDOMNodeId === undefined ? {} : { backendDOMNodeId }) }); nodes.push(publicNode); used += estimated
+        }
+      }
+      if (scanned < resultCount) truncated = true
+    } finally { await this.transport.send('DOM.discardSearchResults', { searchId }).catch(() => {}) }
     this.snapshotCache = { lease: { ...lease }, snapshotId, entries, nodes }
     return { snapshotId, url: sanitizeBrowserUrl(this.currentUrl()), nodes, truncated }
   }
@@ -261,7 +289,14 @@ export class BrowserAutomation {
   async screenshot(lease: BrowserAutomationLease, target: BrowserElementRef | undefined, fullPage: boolean, signal: AbortSignal): Promise<BrowserBinaryAttachment> {
     abort(signal); await this.ensureAttached(); let clip: { x: number; y: number; width: number; height: number; scale: number } | undefined
     if (target) { const entry = this.resolve(lease, target); if (!entry.backendDOMNodeId) throw new Error('UNSUPPORTED_PAGE'); const box = await this.transport.send('DOM.getBoxModel', { backendNodeId: entry.backendDOMNodeId }); const border = (box['model'] as Record<string, unknown> | undefined)?.['border'] as number[] | undefined; if (!border || border.length !== 8) throw new Error('UNSUPPORTED_PAGE'); clip = { x: Math.min(border[0]!, border[2]!, border[4]!, border[6]!), y: Math.min(border[1]!, border[3]!, border[5]!, border[7]!), width: Math.max(border[0]!, border[2]!, border[4]!, border[6]!) - Math.min(border[0]!, border[2]!, border[4]!, border[6]!), height: Math.max(border[1]!, border[3]!, border[5]!, border[7]!) - Math.min(border[1]!, border[3]!, border[5]!, border[7]!), scale: 1 } }
-    else if (fullPage) { const metrics = await this.transport.send('Page.getLayoutMetrics'); const size = metrics['cssContentSize'] as Record<string, unknown> | undefined; if (!size || typeof size['width'] !== 'number' || typeof size['height'] !== 'number' || size['width'] > SCREENSHOT_MAX_DIMENSION || size['height'] > SCREENSHOT_MAX_DIMENSION) throw new Error('REQUEST_LIMIT'); clip = { x: 0, y: 0, width: size['width'], height: size['height'], scale: 1 } }
+    else {
+      const metrics = await this.transport.send('Page.getLayoutMetrics')
+      const size = (fullPage ? metrics['cssContentSize'] : (metrics['cssVisualViewport'] ?? metrics['cssLayoutViewport'] ?? metrics['cssContentSize'])) as Record<string, unknown> | undefined
+      const width = typeof size?.['clientWidth'] === 'number' ? size['clientWidth'] : size?.['width']
+      const height = typeof size?.['clientHeight'] === 'number' ? size['clientHeight'] : size?.['height']
+      if (typeof width !== 'number' || typeof height !== 'number' || width < 1 || height < 1 || width > SCREENSHOT_MAX_DIMENSION || height > SCREENSHOT_MAX_DIMENSION) throw new Error('REQUEST_LIMIT')
+      if (fullPage) clip = { x: 0, y: 0, width, height, scale: 1 }
+    }
     if (clip && (clip.width < 1 || clip.height < 1 || clip.width > SCREENSHOT_MAX_DIMENSION || clip.height > SCREENSHOT_MAX_DIMENSION)) throw new Error('REQUEST_LIMIT')
     const result = await this.transport.send('Page.captureScreenshot', { format: 'png', fromSurface: true, captureBeyondViewport: fullPage, ...(clip ? { clip } : {}) }); abort(signal)
     if (typeof result['data'] !== 'string') throw new Error('INTERNAL_ERROR')

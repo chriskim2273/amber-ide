@@ -95,6 +95,7 @@ export function parseBrowserToolAction(value: unknown): BrowserToolAction {
   if (action['type'] === 'inspect' && exact(action, [...BASE, 'target'])) return { type: 'inspect', ...lease, target: elementRef(action['target']) }
   if (action['type'] === 'screenshot' && exact(action, [...BASE, 'target', 'fullPage'], BASE)) {
     if (action['fullPage'] !== undefined && typeof action['fullPage'] !== 'boolean') throw new Error('INVALID_REQUEST')
+    if (action['target'] !== undefined && action['fullPage'] === true) throw new Error('INVALID_REQUEST')
     return { type: 'screenshot', ...lease, ...(action['target'] === undefined ? {} : { target: elementRef(action['target']) }), fullPage: action['fullPage'] === true }
   }
   if (action['type'] === 'console' && exact(action, [...BASE, 'cursor', 'levels', 'limit'], BASE)) {
