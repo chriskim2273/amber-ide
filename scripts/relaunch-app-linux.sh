@@ -74,10 +74,21 @@ if [[ "${AMBER_RELAUNCH_DRY_RUN:-0}" == 1 ]]; then exit 0; fi
 # Stop only AppImage main processes. Chromium children include --type= and are
 # reaped with their parent; dev Electron binaries are named `electron` and are
 # deliberately untouched.
+#
+# The packaged executable is `amber-ide` (electron-builder's default from the
+# package name); `amber-ide-app` is kept for older packages. Matching the wrong
+# name is not a loud failure — the loop simply finds nothing, the replacement
+# loses Electron's single-instance race, and the OLD client keeps running while
+# this script reports success. That is exactly what happened on 2026-09-01.
+is_amber_main() {
+  local base="${1##*/}"
+  [[ "$base" == amber-ide || "$base" == amber-ide-app ]]
+}
+
 for cmdline in /proc/[0-9]*/cmdline; do
   [[ -r "$cmdline" ]] || continue
   mapfile -d '' -t argv < "$cmdline" || true
-  [[ ${#argv[@]} -gt 0 && "${argv[0]##*/}" == amber-ide-app ]] || continue
+  [[ ${#argv[@]} -gt 0 ]] && is_amber_main "${argv[0]}" || continue
   child=false
   for arg in "${argv[@]:1}"; do
     if [[ "$arg" == --type=* ]]; then child=true; break; fi
@@ -92,7 +103,7 @@ for _ in $(seq 1 100); do
   for cmdline in /proc/[0-9]*/cmdline; do
     [[ -r "$cmdline" ]] || continue
     mapfile -d '' -t argv < "$cmdline" || true
-    [[ ${#argv[@]} -gt 0 && "${argv[0]##*/}" == amber-ide-app ]] || continue
+    [[ ${#argv[@]} -gt 0 ]] && is_amber_main "${argv[0]}" || continue
     child=false
     for arg in "${argv[@]:1}"; do [[ "$arg" == --type=* ]] && child=true; done
     [[ "$child" == true ]] || alive=true
