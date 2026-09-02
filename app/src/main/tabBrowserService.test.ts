@@ -28,6 +28,63 @@ describe('parseTabBrowserCommand', () => {
   })
 })
 
+describe('TabBrowserService dispatch authorization', () => {
+  it('rejects an already-live show after the sender context switches', async () => {
+    const state = emptyBrowserState(1); let shown = false; let thawed = false
+    const host = { status: () => ({ id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', stateRevision: 1 }), thaw: async () => { thawed = true }, show: () => { shown = true; return { id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', stateRevision: 1 } }, snapshot: () => state }
+    const Service = TabBrowserService as unknown as new (s: TabBrowserStateStore, p: { setWindow: () => void }, h: typeof host, i: typeof state) => TabBrowserService
+    const service = new Service({ update: async () => state } as unknown as TabBrowserStateStore, { setWindow: () => {} }, host, state)
+    await expect(service.command({ type: 'show', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', bounds: { x: 0, y: 0, width: 100, height: 100 } }, undefined, () => false)).rejects.toThrow('STALE_BROWSER_CONTEXT')
+    expect({ thawed, shown }).toEqual({ thawed: false, shown: false })
+  })
+
+  it('revalidates a navigate after it waits behind another serialized command', async () => {
+    const state = emptyBrowserState(1); let release!: () => void; let calls = 0; let current = true
+    const blocked = new Promise<void>((resolve) => { release = resolve })
+    const host = { navigate: async () => { calls += 1; if (calls === 1) await blocked; return { id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', stateRevision: calls } }, snapshot: () => state }
+    const Service = TabBrowserService as unknown as new (s: TabBrowserStateStore, p: { setWindow: () => void }, h: typeof host, i: typeof state) => TabBrowserService
+    const service = new Service({ update: async () => state } as unknown as TabBrowserStateStore, { setWindow: () => {} }, host, state)
+    const command = { type: 'navigate' as const, id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', url: 'https://example.test/', pageIncarnation: 'page', expectedGeneration: 1 }
+    const first = service.command(command)
+    const queued = service.command(command, undefined, () => current)
+    current = false; release(); await first
+    await expect(queued).rejects.toThrow('STALE_BROWSER_CONTEXT')
+    expect(calls).toBe(1)
+  })
+
+  it('revalidates queued bounds at dispatch rather than at enqueue', async () => {
+    const state = emptyBrowserState(1); let release!: () => void; let boundsCalls = 0
+    const blocked = new Promise<void>((resolve) => { release = resolve })
+    const host = { navigate: async () => { await blocked; return { id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', stateRevision: 1 } }, setBounds: () => { boundsCalls += 1 }, status: () => ({ id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', stateRevision: 1 }), snapshot: () => state }
+    const Service = TabBrowserService as unknown as new (s: TabBrowserStateStore, p: { setWindow: () => void }, h: typeof host, i: typeof state) => TabBrowserService
+    const service = new Service({ update: async () => state } as unknown as TabBrowserStateStore, { setWindow: () => {} }, host, state)
+    const first = service.command({ type: 'navigate', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', url: 'https://example.test/', pageIncarnation: 'page', expectedGeneration: 1 })
+    const queued = service.command({ type: 'bounds', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', bounds: { x: 0, y: 0, width: 100, height: 100 } }, undefined, () => false)
+    release(); await first
+    await expect(queued).rejects.toThrow('STALE_BROWSER_CONTEXT')
+    expect(boundsCalls).toBe(0)
+  })
+
+  it('revalidates a capacity-waiting open and removes its provisional record after a context switch', async () => {
+    let disk = emptyBrowserState(1)
+    const store = { update: async (mutate: (state: BrowserStateFile) => BrowserStateFile) => { disk = mutate(disk); return disk } } as unknown as TabBrowserStateStore
+    const pageFactory = { create: () => ({ loadURL: async () => {}, show: () => {}, hide: () => {}, stop: () => {}, destroy: () => {} }) }
+    let service!: TabBrowserService
+    const host = new TabBrowserHost(disk, pageFactory, Date.now, undefined, () => { void (service as unknown as { schedulePersist: () => Promise<void> }).schedulePersist() })
+    const Service = TabBrowserService as unknown as new (s: TabBrowserStateStore, p: { setWindow: () => void }, h: TabBrowserHost, i: BrowserStateFile) => TabBrowserService
+    service = new Service(store, { setWindow: () => {} }, host, disk)
+    const ids: string[] = []
+    for (let i = 0; i < 4; i++) { const opened = await service.command({ type: 'open' }); if ('id' in opened) { ids.push(opened.id); host.protectApproval(opened.id, true) } }
+    let current = true
+    const waiting = service.command({ type: 'open' }, undefined, () => current)
+    await Promise.resolve(); current = false; host.protectApproval(ids[0]!, false)
+    await expect(waiting).rejects.toThrow('STALE_BROWSER_CONTEXT')
+    await (service as unknown as { schedulePersist: () => Promise<void> }).schedulePersist()
+    expect(Object.keys(host.snapshot().records)).toHaveLength(4)
+    expect(Object.keys(disk.records)).toHaveLength(4)
+  })
+})
+
 describe('TabBrowserService activation cancellation', () => {
   it('hide cancels a queued show before it can attach', async () => {
     const state = emptyBrowserState(1); const store = { update: async () => state } as unknown as TabBrowserStateStore

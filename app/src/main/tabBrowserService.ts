@@ -151,9 +151,10 @@ export class TabBrowserService {
   }
 
   private async runCommand(command: TabBrowserCommand, signal?: AbortSignal, validate?: () => boolean | Promise<boolean>): Promise<BrowserRuntimeStatus | { closed: true }> {
+    if (validate && !(await validate())) throw new Error('STALE_BROWSER_CONTEXT')
     switch (command.type) {
       case 'open': {
-        const opened = await this.host.open({ visible: true }, signal); await this.schedulePersist(); return opened.status
+        const opened = await this.host.open({ visible: true }, signal, validate); await this.schedulePersist(); return opened.status
       }
       case 'show': {
         const before = this.host.status(command.id).stateRevision

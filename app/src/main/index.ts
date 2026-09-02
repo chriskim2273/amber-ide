@@ -82,7 +82,7 @@ import { bindRendererBrowserCommand, browserAuthorityChanged } from './browserAs
 import { emptyLayout, parseLayout, serializeLayout, type LayoutFile } from '../shared/layoutFile'
 import { parseWorkspaceFile } from '../shared/workspaceFile'
 import { commitPreparedWorkspaceImport, prepareWorkspaceImport } from './workspaceImport'
-import { resolveBrowserContext } from './browserWindowContext'
+import { browserContextMatches, captureBrowserContext, resolveBrowserContext, setBrowserForCurrentContext } from './browserWindowContext'
 import { createBrowserId } from '../shared/tabBrowser'
 import clientPath from '../client/index?modulePath'
 
@@ -733,6 +733,7 @@ interface WindowCtx {
   activeBrowserId: string | null
   activeWorkspace: number | null
   activeTab: number | null
+  browserContextGeneration: number
 }
 
 /** Per-window state, keyed by webContents id so IPC can route by sender. */
@@ -749,6 +750,7 @@ function setWindowContextFromLayout(ctx: WindowCtx, layout: LayoutFile): void {
   ctx.activeWorkspace = layout.activeWorkspace
   ctx.activeTab = workspace?.activeTab ?? null
   ctx.activeBrowserId = workspace?.tabs[String(workspace.activeTab)]?.browser?.id ?? null
+  ctx.browserContextGeneration += 1
 }
 
 /** A live ssh tunnel backing one remote window. */
@@ -1141,6 +1143,7 @@ async function openWindow(target: WindowTarget): Promise<WindowCtx> {
     activeBrowserId: null,
     activeWorkspace: null,
     activeTab: null,
+    browserContextGeneration: 0,
     resumeClient: () => {
       if (!presentationSuspended) return
       presentationSuspended = false
@@ -1201,6 +1204,21 @@ async function main(): Promise<void> {
       console.error('tab browser migration failed; browser host remains unavailable', error)
     }
   }
+  const rollbackOpenedBrowser = async (workspaceNumber: number, tabNumber: number, id: string): Promise<void> => {
+    if (!tabBrowserStateStore) throw new Error('BROWSER_HOST_UNAVAILABLE')
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const loaded = await loadLayoutFile(layoutPath())
+      if (!loaded.text) return
+      const current = parseLayout(loaded.text); const workspace = current.workspaces[String(workspaceNumber)]; const tab = workspace?.tabs[String(tabNumber)]
+      if (!workspace || tab?.browser?.id !== id) return
+      const cleanTab = { ...tab }; delete cleanTab.browser
+      const next = { ...current, browserRevision: (current.browserRevision ?? 0) + 1, workspaces: { ...current.workspaces, [workspaceNumber]: { ...workspace, tabs: { ...workspace.tabs, [tabNumber]: cleanTab } } } }
+      const saved = await commitBrowserLayoutMutation(layoutPath(), tabBrowserStateStore, serializeLayout(next), loaded.version)
+      if ('ok' in saved) return
+    }
+    throw new Error('LAYOUT_CONFLICT')
+  }
+
   reopenLocalWindow = async (): Promise<void> => {
     const existing = [...windowCtxs.values()].find((candidate) => candidate.target.kind === 'local' && !candidate.win.isDestroyed())
     if (existing) { existing.resumeClient(); existing.win.show(); existing.win.focus(); return }
@@ -1224,15 +1242,28 @@ async function main(): Promise<void> {
       if (request.action.type === 'open') {
         const location = authorizeBrowserRequest(current, request.amberSession, true)
         if (!location.browserId) {
-          const opened = await tabBrowser.command({ type: 'open' })
+          const stillOpenTarget = async (): Promise<boolean> => {
+            const latestController = browserDaemonWatcher?.controller(request.amberSession)
+            if (!isEligiblePiController(latestController)) return false
+            const latest = await loadLayoutFile(layoutPath())
+            if (!latest.text) return false
+            try {
+              const candidate = authorizeBrowserRequest(parseLayout(latest.text), request.amberSession, true)
+              return candidate.ws === location.ws && candidate.tab === location.tab && !candidate.browserId
+            } catch { return false }
+          }
+          const opened = await tabBrowser.command({ type: 'open' }, signal, stillOpenTarget)
           if (!('id' in opened)) throw new Error('INTERNAL_ERROR')
-          const workspace = current.workspaces[String(location.ws)]!
+          const latestLoaded = await loadLayoutFile(layoutPath())
+          if (!latestLoaded.text || !(await stillOpenTarget())) { await tabBrowser.command({ type: 'destroy', id: opened.id }).catch(() => {}); throw new Error('STALE_BROWSER_CONTEXT') }
+          const latestCurrent = parseLayout(latestLoaded.text)
+          const workspace = latestCurrent.workspaces[String(location.ws)]!
           const previous = workspace.tabs[String(location.tab)]!
           const browser = { id: opened.id, width: 420, collapsed: false }
-          const next = { ...current, version: 2, browserRevision: (current.browserRevision ?? 0) + 1,
-            workspaces: { ...current.workspaces, [location.ws]: { ...workspace, tabs: { ...workspace.tabs, [location.tab]: { ...previous, browser } } } } }
+          const next = { ...latestCurrent, version: 2, browserRevision: (latestCurrent.browserRevision ?? 0) + 1,
+            workspaces: { ...latestCurrent.workspaces, [location.ws]: { ...workspace, tabs: { ...workspace.tabs, [location.tab]: { ...previous, browser } } } } }
           const saved = tabBrowserStateStore
-            ? await commitBrowserLayoutMutation(layoutPath(), tabBrowserStateStore, serializeLayout(next), loaded.version)
+            ? await commitBrowserLayoutMutation(layoutPath(), tabBrowserStateStore, serializeLayout(next), latestLoaded.version)
             : { error: 'BROWSER_HOST_UNAVAILABLE' as const }
           if (!('ok' in saved)) {
             // The record was persisted before the association CAS. Roll it
@@ -1240,6 +1271,19 @@ async function main(): Promise<void> {
             // live renderers for every retry.
             await tabBrowser.command({ type: 'destroy', id: opened.id }).catch(() => {})
             throw new Error('LAYOUT_CONFLICT')
+          }
+          const stillAssociatedToController = async (): Promise<boolean> => {
+            const latestController = browserDaemonWatcher?.controller(request.amberSession)
+            if (!isEligiblePiController(latestController)) return false
+            const latest = await loadLayoutFile(layoutPath())
+            if (!latest.text) return false
+            const candidate = parseLayout(latest.text).workspaces[String(location.ws)]?.tabs[String(location.tab)]?.browser
+            return candidate?.id === opened.id
+          }
+          if (!(await stillAssociatedToController())) {
+            try { await rollbackOpenedBrowser(location.ws, location.tab, opened.id) }
+            finally { await tabBrowser.command({ type: 'destroy', id: opened.id }).catch(() => {}) }
+            throw new Error('STALE_BROWSER_CONTEXT')
           }
           await reopenLocalWindow?.()
           for (const candidate of windowCtxs.values()) if (candidate.target.kind === 'local' && !candidate.win.isDestroyed()) {
@@ -1253,7 +1297,14 @@ async function main(): Promise<void> {
       const id = authorized.browserId!
       if (request.action.type === 'status') return tabBrowser.command({ type: 'status', id })
       if (request.action.type === 'stop') return tabBrowser.command({ type: 'stop', id })
-      return tabBrowser.command({ type: 'navigate', id, url: request.action.url, pageIncarnation: request.action.pageIncarnation, expectedGeneration: request.action.expectedGeneration }, signal)
+      const stillAuthorized = async (): Promise<boolean> => {
+        const latestController = browserDaemonWatcher?.controller(request.amberSession)
+        if (!isEligiblePiController(latestController)) return false
+        const latest = await loadLayoutFile(layoutPath())
+        if (!latest.text) return false
+        try { return authorizeBrowserRequest(parseLayout(latest.text), request.amberSession).browserId === id } catch { return false }
+      }
+      return tabBrowser.command({ type: 'navigate', id, url: request.action.url, pageIncarnation: request.action.pageIncarnation, expectedGeneration: request.action.expectedGeneration }, signal, stillAuthorized)
     }
     const runtime = process.env['XDG_RUNTIME_DIR'] ?? tmpdir()
     const socketPath = process.env['AMBER_BROWSER_HOST_SOCKET'] ?? join(runtime, 'amber-ide', 'browser-host.sock')
@@ -1373,7 +1424,7 @@ async function main(): Promise<void> {
     try {
       const context = resolveBrowserContext(parseLayout(loaded.text), request['workspace'], request['tab'])
       if (tabBrowser && sender.activeBrowserId && sender.activeBrowserId !== context.browserId) await tabBrowser.command({ type: 'hide', id: sender.activeBrowserId }).catch(() => {})
-      sender.activeWorkspace = context.workspace; sender.activeTab = context.tab; sender.activeBrowserId = context.browserId
+      sender.activeWorkspace = context.workspace; sender.activeTab = context.tab; sender.activeBrowserId = context.browserId; sender.browserContextGeneration += 1
       return { ok: true, ...context }
     } catch (error) { return { ok: false, error: error instanceof Error ? error.message : 'INVALID_REQUEST' } }
   })
@@ -1393,13 +1444,29 @@ async function main(): Promise<void> {
         const tabKey = String(sender.activeTab)
         const previous = workspace?.tabs[tabKey]
         if (!workspace || !previous) throw new Error('NO_BROWSER_FOR_TAB')
+        const expectedContext = { ...captureBrowserContext(sender), browserId: previous.browser?.id ?? null }
+        const contextMatches = (): boolean => browserContextMatches(sender, expectedContext)
+        const stillAssociated = async (expectedBrowserId: string | null): Promise<boolean> => {
+          if (!contextMatches()) return false
+          const latest = await loadLayoutFile(layoutPath())
+          if (!latest.text) return false
+          return (parseLayout(latest.text).workspaces[String(expectedContext.workspace)]?.tabs[String(expectedContext.tab)]?.browser?.id ?? null) === expectedBrowserId
+        }
+        let workingLoaded = loaded; let workingCurrent = current; let workingWorkspace = workspace; let workingPrevious = previous
         let openedId: string | null = null
         let browser = previous.browser
         if (parsed.type === 'open') {
           if (browser) return { ok: true, result: await tabBrowser.command({ type: 'status', id: browser.id }) }
-          const opened = await tabBrowser.command({ type: 'open' })
+          const opened = await tabBrowser.command({ type: 'open' }, undefined, () => stillAssociated(null))
           if (!('id' in opened)) throw new Error('INTERNAL_ERROR')
-          openedId = opened.id; browser = { id: opened.id, width: 420, collapsed: false }
+          openedId = opened.id
+          if (!(await stillAssociated(null))) { await tabBrowser.command({ type: 'destroy', id: opened.id }).catch(() => {}); throw new Error('STALE_BROWSER_CONTEXT') }
+          workingLoaded = await loadLayoutFile(layoutPath())
+          if (!workingLoaded.text) { await tabBrowser.command({ type: 'destroy', id: opened.id }).catch(() => {}); throw new Error('STALE_BROWSER_CONTEXT') }
+          workingCurrent = parseLayout(workingLoaded.text)
+          workingWorkspace = workingCurrent.workspaces[wsKey]!
+          workingPrevious = workingWorkspace.tabs[tabKey]!
+          browser = { id: opened.id, width: 420, collapsed: false }
         } else {
           if (!browser) throw new Error('NO_BROWSER_FOR_TAB')
           if (parsed.type === 'close') browser = undefined
@@ -1417,18 +1484,23 @@ async function main(): Promise<void> {
             browser = parsed.designatedPi ? { ...base, designatedPi: parsed.designatedPi, sharedWithPi: false } : { ...base, sharedWithPi: false }
           }
         }
-        const nextTab = { ...previous, ...(browser ? { browser } : {}) }
+        const nextTab = { ...workingPrevious, ...(browser ? { browser } : {}) }
         if (!browser) delete nextTab.browser
-        const next = { ...current, version: 2, browserRevision: (current.browserRevision ?? 0) + 1,
-          workspaces: { ...current.workspaces, [wsKey]: { ...workspace, tabs: { ...workspace.tabs, [tabKey]: nextTab } } } }
-        const saved = await commitBrowserLayoutMutation(layoutPath(), tabBrowserStateStore, serializeLayout(next), loaded.version)
+        const next = { ...workingCurrent, version: 2, browserRevision: (workingCurrent.browserRevision ?? 0) + 1,
+          workspaces: { ...workingCurrent.workspaces, [wsKey]: { ...workingWorkspace, tabs: { ...workingWorkspace.tabs, [tabKey]: nextTab } } } }
+        const saved = await commitBrowserLayoutMutation(layoutPath(), tabBrowserStateStore, serializeLayout(next), workingLoaded.version)
         if (!('ok' in saved)) {
           if (openedId) await tabBrowser.command({ type: 'destroy', id: openedId }).catch(() => {})
           throw new Error('error' in saved ? saved.error : 'LAYOUT_CONFLICT')
         }
+        if (openedId && !contextMatches()) {
+          try { await rollbackOpenedBrowser(expectedContext.workspace, expectedContext.tab, openedId) }
+          finally { await tabBrowser.command({ type: 'destroy', id: openedId }).catch(() => {}) }
+          throw new Error('STALE_BROWSER_CONTEXT')
+        }
         if (parsed.type === 'close' && previous.browser) await tabBrowser.command({ type: 'destroy', id: previous.browser.id })
-        sender.activeBrowserId = browser?.id ?? null
-        sender.win.webContents.send('tab-browser-association', { ws: sender.activeWorkspace, tab: sender.activeTab, ...(browser ? { browser } : {}) })
+        setBrowserForCurrentContext(sender, expectedContext, browser?.id ?? null)
+        sender.win.webContents.send('tab-browser-association', { ws: expectedContext.workspace, tab: expectedContext.tab, ...(browser ? { browser } : {}) })
         return { ok: true, result: parsed.type === 'close' ? { closed: true } : browser ? await tabBrowser.command({ type: 'status', id: browser.id }) : { closed: true } }
       }
       const loaded = await loadLayoutFile(layoutPath())
@@ -1436,9 +1508,9 @@ async function main(): Promise<void> {
       const associated = parseLayout(loaded.text).workspaces[String(sender.activeWorkspace)]?.tabs[String(sender.activeTab)]?.browser?.id ?? null
       if (associated !== sender.activeBrowserId) throw new Error('STALE_BROWSER_CONTEXT')
       const command = bindRendererBrowserCommand(sender.activeBrowserId, parsed)
-      const expected = { workspace: sender.activeWorkspace, tab: sender.activeTab, browserId: sender.activeBrowserId }
+      const expected = captureBrowserContext(sender)
       const stillAssociated = async (): Promise<boolean> => {
-        if (sender.activeWorkspace !== expected.workspace || sender.activeTab !== expected.tab || sender.activeBrowserId !== expected.browserId) return false
+        if (!browserContextMatches(sender, expected)) return false
         const latest = await loadLayoutFile(layoutPath())
         return !!latest.text && parseLayout(latest.text).workspaces[String(expected.workspace)]?.tabs[String(expected.tab)]?.browser?.id === expected.browserId
       }

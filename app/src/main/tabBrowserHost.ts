@@ -95,7 +95,7 @@ export class TabBrowserHost {
     if (this.state.records[id]) this.onEvent({ type: 'runtime', id, status: this.status(id) })
   }
 
-  async open(options: { visible: boolean }, signal?: AbortSignal): Promise<{ status: BrowserRuntimeStatus; page: TabBrowserPage }> {
+  async open(options: { visible: boolean }, signal?: AbortSignal, validate?: () => boolean | Promise<boolean>): Promise<{ status: BrowserRuntimeStatus; page: TabBrowserPage }> {
     const id = createBrowserId(this.randomBytes)
     const at = this.now()
     this.state.records[id] = {
@@ -104,8 +104,11 @@ export class TabBrowserHost {
       lastUsedAt: at, lastFocusedAt: options.visible ? at : 0,
     }
     let activation: { freeze?: string }
-    try { activation = await this.capacity.activateQueued(id, at, signal, (waiting) => this.capacityEvent(id, waiting)) }
-    catch (error) { delete this.state.records[id]; throw error }
+    try {
+      activation = await this.capacity.activateQueued(id, at, signal, (waiting) => this.capacityEvent(id, waiting))
+      if (validate && !(await validate())) throw new Error('STALE_BROWSER_CONTEXT')
+      if (signal?.aborted) throw new Error('ACTION_CANCELLED')
+    } catch (error) { this.capacity.settleActivation(id); delete this.state.records[id]; this.onStateChange(); throw error }
     if (activation.freeze && isOpaqueBrowserId(activation.freeze)) this.freeze(activation.freeze)
     const runtime = this.makeRuntime(id)
     this.capacity.settleActivation(id)
