@@ -58,4 +58,40 @@ output="$(PATH="$TMP/bin:$PATH" HOME="$TMP/home" FAKE_STATE="$TMP" AMBER_RELAUNC
 [[ "$output" == *'desktop input preflight passed'* ]]
 [[ "$output" != *'stale IBus address'* ]]
 
+# A running client must actually be stopped. The executable electron-builder
+# produces is `amber-ide`; the stop-loop matched only `amber-ide-app`, so it
+# found nothing, launched a replacement that lost Electron's single-instance
+# race, and reported success while the OLD client kept running (2026-09-01).
+# Both names must be recognised.
+for exe_name in amber-ide amber-ide-app; do
+  rm -rf "$TMP/fakeapp"
+  mkdir -p "$TMP/fakeapp"
+  # A REAL binary, not a #!-script: a script's /proc cmdline starts with the
+  # interpreter, so argv[0] would be `bash` and the test would pass against a
+  # broken script for the wrong reason.
+  cp "$(command -v sleep)" "$TMP/fakeapp/$exe_name"
+  "$TMP/fakeapp/$exe_name" 30 & victim=$!
+  # Wait for /proc to show the real argv (exec has to have happened).
+  for _ in $(seq 1 50); do
+    [[ -r "/proc/$victim/cmdline" ]] && grep -qa "$exe_name" "/proc/$victim/cmdline" && break
+    sleep 0.05
+  done
+
+  PATH="$TMP/bin:$PATH" HOME="$TMP/home" FAKE_STATE="$TMP" \
+    bash "$ROOT/scripts/relaunch-app-linux.sh" "$TMP/app.AppImage" >/dev/null
+
+  # The script TERMs it and waits; it must be gone.
+  gone=false
+  for _ in $(seq 1 50); do
+    kill -0 "$victim" 2>/dev/null || { gone=true; break; }
+    sleep 0.05
+  done
+  if [[ "$gone" != true ]]; then
+    kill -9 "$victim" 2>/dev/null || true
+    echo "relaunch-app-linux: FAIL — a running '$exe_name' was not stopped" >&2
+    exit 1
+  fi
+  wait "$victim" 2>/dev/null || true
+done
+
 echo 'relaunch-app-linux: PASS'

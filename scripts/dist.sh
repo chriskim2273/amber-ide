@@ -11,9 +11,28 @@ mkdir -p "$OUT"
 build_linux() {
     local target=x86_64-unknown-linux-musl
     rustup target add "$target"
-    cargo build --release --target "$target" --bin amber
+    # `amber-router` links `ring`, which compiles C: cc-rs needs a musl C
+    # toolchain by name. Point it at whichever of the two Debian spellings is
+    # installed (musl-tools ships both) and fail with an actionable message
+    # rather than cc-rs's "failed to find tool".
+    if [ -z "${CC_x86_64_unknown_linux_musl:-}" ]; then
+        if command -v x86_64-linux-musl-gcc >/dev/null 2>&1; then
+            export CC_x86_64_unknown_linux_musl=x86_64-linux-musl-gcc
+        elif command -v musl-gcc >/dev/null 2>&1; then
+            export CC_x86_64_unknown_linux_musl=musl-gcc
+        else
+            echo "error: no musl C toolchain (need musl-tools: musl-gcc / x86_64-linux-musl-gcc)" >&2
+            echo "       install it, or set CC_x86_64_unknown_linux_musl yourself" >&2
+            exit 2
+        fi
+    fi
+    # Both shipped Linux binaries, from the same target: the app packager
+    # asserts a static amber AND a static amber-router before bundling.
+    cargo build --release --target "$target" --bin amber --bin amber-router
     cp "$ROOT/target/$target/release/amber" "$OUT/amber-linux-x86_64"
+    cp "$ROOT/target/$target/release/amber-router" "$OUT/amber-router-linux-x86_64"
     echo "dist: $OUT/amber-linux-x86_64 (static)"
+    echo "dist: $OUT/amber-router-linux-x86_64 (static, local proxy)"
     # aarch64 static: needs the musl-cross linker; uncomment when set up.
     # rustup target add aarch64-unknown-linux-musl
     # cargo build --release --target aarch64-unknown-linux-musl --bin amber
