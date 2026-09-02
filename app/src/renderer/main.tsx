@@ -1827,6 +1827,7 @@ function App(): JSX.Element {
           tabLabels={pocketTabLabels}
           titles={titles}
           home={home}
+          usage={usage}
           onWorkspace={choosePocketWorkspace}
           onOpen={openPocketItem}
           onActions={setPocketAction}

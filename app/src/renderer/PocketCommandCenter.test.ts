@@ -1,9 +1,10 @@
 import { createElement } from 'react'
 import { describe, expect, it, vi } from 'vitest'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { PocketCommandCenter, PocketFocusHeader, pocketSessionTitle } from './PocketCommandCenter'
+import { PocketCommandCenter, usageLine, PocketFocusHeader, pocketSessionTitle } from './PocketCommandCenter'
 import type { CommandCenterModel } from './commandCenter'
 import type { PaneModel } from './store'
+import type { ProviderUsage } from '../shared/proto'
 
 const pane: PaneModel = {
   name: 'amber-2-3-0-api', cwd: '/home/u/api', kind: 'pi', alive: true,
@@ -38,6 +39,7 @@ function render(overrides: Partial<Parameters<typeof PocketCommandCenter>[0]> = 
     tabLabels: { '2:3': 'release' },
     titles: { 'amber-2-3-0-api': 'api-refactor' },
     home: '/home/u',
+    usage: [],
     onWorkspace: () => {},
     onOpen: () => {},
     onActions: () => {},
@@ -128,5 +130,24 @@ describe('PocketCommandCenter', () => {
     expect(onOpen).not.toHaveBeenCalled()
     expect(onMosaic).not.toHaveBeenCalled()
     expect(onDesktop).not.toHaveBeenCalled()
+  })
+})
+
+describe('usageLine', () => {
+  const row = (over: Partial<ProviderUsage> = {}): ProviderUsage => ({
+    provider: 'claude', plan: 'pro', gauges: [], updated: 0, state: 'ok', detail: null, ...over,
+  })
+
+  it('shows a compact line for the tightest live gauge', () => {
+    expect(usageLine([
+      row({ gauges: [{ kind: 'session', label: '5h window', percent: 15, resets_at: null, stale: false }] }),
+    ])).toBe('claude 85% left')
+  })
+
+  it('shows nothing when no provider reports a gauge', () => {
+    expect(usageLine([
+      row({ provider: 'grok', state: 'unavailable', plan: null, detail: 'grok exposes no quota data' }),
+    ])).toBeNull()
+    expect(usageLine([])).toBeNull()
   })
 })

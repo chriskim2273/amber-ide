@@ -38,6 +38,7 @@
 // forwards, it does not validate.
 
 import type { LoadLayoutResult, SaveLayoutResult, LayoutVersion } from '../shared/layoutFile'
+import { decodeProviderUsage } from '../shared/proto'
 import type { WebStatus } from '../shared/webStatus'
 import type { RouterSlot, RouterStatus } from '../shared/routerStatus'
 import { parseRouterStatus } from '../shared/routerStatus'
@@ -418,6 +419,9 @@ export interface AmberDeps {
   // Cookie-gated `/api/router/*` on `amber web`. Injected so this file stays
   // fetch-free; `install.ts` supplies the real wrappers.
   routerApi: RouterApi
+  // Cookie-gated `GET /api/usage`. Returns the raw body; the shim decodes it
+  // with the same tolerant decoder the control wire uses.
+  usageApi: () => Promise<unknown>
 }
 
 export interface RouterApi {
@@ -546,6 +550,25 @@ export function createAmber(deps: AmberDeps): WebAmber {
     // browser whitelist, so there is nothing honest to send.
     getMemoryBudget: notImplemented('getMemoryBudget'),
     setMemoryBudget: notImplemented('setMemoryBudget'),
+
+    // Agent plan quota (design 2026-09-01 §3). Rides an authenticated HTTP
+    // route rather than the pane socket — the browser control whitelist is
+    // deliberately not widened — and the reply is pushed into the SAME daemon
+    // event stream the desktop uses, so the renderer needs no host branch.
+    getUsage: (): void => {
+      void deps
+        .usageApi()
+        .then((body) => {
+          const raw = (body as { providers?: unknown } | null)?.providers
+          const providers = Array.isArray(raw) ? raw.map(decodeProviderUsage) : []
+          dispatch({ frame: { type: 'control', msg: { kind: 'Usage', providers } } })
+        })
+        .catch(() => {
+          // A failed poll leaves the last snapshot in place; the next tick
+          // retries. Never dispatch an empty list on failure — that would read
+          // as "no quota" rather than "not fetched".
+        })
+    },
 
     // --- remote access (spec 2026-08-22 §9) --------------------------------
     // The browser IS the remote client; it has no service to manage and no

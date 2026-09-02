@@ -234,6 +234,7 @@ describe('PaneLink', () => {
       softwareGl: false,
       layoutGet: () => Promise.resolve({ text: null, version: null }),
       layoutSave: () => Promise.resolve({ ok: true, version: null }),
+      usageApi: () => Promise.resolve({ providers: [] }),
       routerApi: {
         status: async () => '{}',
         action: async () => ({ ok: false }),
@@ -334,6 +335,7 @@ describe('createAmber', () => {
       softwareGl: false,
       layoutGet: () => Promise.resolve({ text: null, version: null }),
       layoutSave: () => Promise.resolve({ ok: true, version: null }),
+      usageApi: () => Promise.resolve({ providers: [] }),
       routerApi: silentRouterApi(),
       ...overrides,
     }
@@ -470,6 +472,7 @@ describe('createAmber', () => {
 
   it('routerStatus is managed so the hosted desktop view shows the pill', async () => {
     const amber = createAmber(deps({
+      usageApi: () => Promise.resolve({ providers: [] }),
       routerApi: {
         status: async () => JSON.stringify({
           managed: true,
@@ -500,6 +503,7 @@ describe('createAmber', () => {
   it('routerAction and saveSlots go through the injected API', async () => {
     const calls: unknown[] = []
     const amber = createAmber(deps({
+      usageApi: () => Promise.resolve({ providers: [] }),
       routerApi: {
         status: async () => '{}',
         action: async (action) => { calls.push(['action', action]); return { ok: true } },
