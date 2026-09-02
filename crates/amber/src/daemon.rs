@@ -42,11 +42,21 @@ type Subscriptions = Vec<(String, Arc<PtySession>, u64)>;
 pub struct Daemon {
     manager: Arc<SessionManager>,
     watchers: Arc<crate::watchers::Watchers>,
+    /// Agent plan-quota snapshot, filled by [`crate::usage::start`]. Defaults
+    /// to an empty cache so every existing `Daemon::new` call site (and every
+    /// test) compiles unchanged and answers `GetUsage` with an empty list.
+    usage: Arc<crate::usage::UsageCache>,
 }
 
 impl Daemon {
     pub fn new(manager: Arc<SessionManager>, watchers: Arc<crate::watchers::Watchers>) -> Self {
-        Daemon { manager, watchers }
+        Daemon { manager, watchers, usage: crate::usage::UsageCache::new() }
+    }
+
+    /// Attach the usage poller's cache (the daemon's only quota source).
+    pub fn with_usage(mut self, cache: Arc<crate::usage::UsageCache>) -> Self {
+        self.usage = cache;
+        self
     }
 
     /// Accept loop. Runs until the listener itself errors (e.g. the socket
@@ -58,8 +68,9 @@ impl Daemon {
                 Ok(stream) => {
                     let manager = Arc::clone(&self.manager);
                     let watchers = Arc::clone(&self.watchers);
+                    let usage = Arc::clone(&self.usage);
                     thread::spawn(move || {
-                        if let Err(e) = handle_connection(manager, watchers, stream) {
+                        if let Err(e) = handle_connection(manager, watchers, usage, stream) {
                             eprintln!("amber daemon: connection error: {e}");
                         }
                     });
@@ -71,7 +82,12 @@ impl Daemon {
 
     #[cfg(test)]
     pub fn serve_one_for_test(&self, stream: LocalStream) -> anyhow::Result<()> {
-        handle_connection(Arc::clone(&self.manager), Arc::clone(&self.watchers), stream)
+        handle_connection(
+            Arc::clone(&self.manager),
+            Arc::clone(&self.watchers),
+            Arc::clone(&self.usage),
+            stream,
+        )
     }
 }
 
@@ -210,6 +226,7 @@ fn suppress_backlog(raw_client: bool, kind: Option<SessionKind>) -> bool {
 fn handle_connection(
     manager: Arc<SessionManager>,
     watchers: Arc<crate::watchers::Watchers>,
+    usage: Arc<crate::usage::UsageCache>,
     stream: LocalStream,
 ) -> anyhow::Result<()> {
     let (read_half, writer) = stream.into_split()?;
@@ -222,6 +239,7 @@ fn handle_connection(
     let result = connection_loop(
         &manager,
         &watchers,
+        &usage,
         &writer,
         read_half,
         &mut subscriptions,
@@ -238,6 +256,7 @@ fn handle_connection(
 fn connection_loop(
     manager: &Arc<SessionManager>,
     watchers: &Arc<crate::watchers::Watchers>,
+    usage: &Arc<crate::usage::UsageCache>,
     writer: &SharedWriter,
     mut read_half: LocalReader,
     subscriptions: &mut Subscriptions,
@@ -250,7 +269,7 @@ fn connection_loop(
         while let Some(decoded) = decoder.next_decoded()? {
             match decoded {
                 Decoded::Frame(frame) => {
-                    handle_frame(manager, watchers, writer, frame, subscriptions, search_epoch)
+                    handle_frame(manager, watchers, usage, writer, frame, subscriptions, search_epoch)
                 }
                 // Forward-compat: a control body this build can't decode (e.g. a
                 // newer client's new message). Framing is length-prefixed and the
@@ -273,13 +292,16 @@ fn connection_loop(
 fn handle_frame(
     manager: &Arc<SessionManager>,
     watchers: &Arc<crate::watchers::Watchers>,
+    usage: &Arc<crate::usage::UsageCache>,
     writer: &SharedWriter,
     frame: Frame,
     subscriptions: &mut Subscriptions,
     search_epoch: &Arc<AtomicU64>,
 ) {
     match frame {
-        Frame::Control(msg) => handle_control(manager, watchers, writer, msg, subscriptions, search_epoch),
+        Frame::Control(msg) => {
+            handle_control(manager, watchers, usage, writer, msg, subscriptions, search_epoch)
+        }
         Frame::Data { session, bytes } => {
             // Input from the client: forward to the child's stdin. A stale
             // session name is not fatal to the connection — log and carry on.
@@ -297,6 +319,7 @@ fn handle_frame(
 fn handle_control(
     manager: &Arc<SessionManager>,
     watchers: &Arc<crate::watchers::Watchers>,
+    usage: &Arc<crate::usage::UsageCache>,
     writer: &SharedWriter,
     msg: ControlMsg,
     subscriptions: &mut Subscriptions,
@@ -785,8 +808,16 @@ fn handle_control(
             );
             let _ = write_frame(writer, &Frame::Control(ControlMsg::Created { name: to }));
         }
-        // Hello and daemon->client-only variants: no-op. Well-formed but
-        // meaningless here; ignore rather than tear down the connection.
+        ControlMsg::GetUsage => {
+            // Cache read only. A live fetch here would put curl and a directory
+            // walk on the connection read thread, behind which every
+            // multiplexed control frame would queue (the backlog HOL lesson).
+            let providers = usage.snapshot();
+            let _ = write_frame(writer, &Frame::Control(ControlMsg::Usage { providers }));
+        }
+        // Hello and daemon->client-only variants (`Usage` included): no-op.
+        // Well-formed but meaningless here; ignore rather than tear down the
+        // connection.
         _ => {}
     }
 }

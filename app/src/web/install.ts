@@ -223,6 +223,11 @@ export function installAmber(home: string): void {
     layoutGet,
     layoutSave,
     routerApi: routerApi(),
+    usageApi: async () => {
+      const r = await fetch('/api/usage', { credentials: 'same-origin' })
+      if (!r.ok) throw new Error(`HTTP ${r.status}`)
+      return r.json()
+    },
   })
   window.amber = amber
 

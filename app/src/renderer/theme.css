@@ -1533,3 +1533,36 @@ input:focus-visible {
 }
 /* Its own section, like the remote dialog's — never beside "Load log". */
 .router-danger { border-top: 1px solid var(--border-strong); padding-top: var(--sp-2); }
+
+/* ---- agent plan usage (design 2026-09-01 §4) --------------------------- */
+/* Reuses .web-pill's shape and the dialog shell; only the gauge rows are new.
+   Tones reuse the pill's own dot colours rather than inventing literals. */
+.web-pill-warning .web-dot { background: #d29922; }
+.web-pill-danger .web-dot { background: #f85149; }
+.web-pill-normal .web-dot { background: #3fb950; }
+
+.usage-dialog { width: min(560px, calc(100vw - 2 * var(--sp-4))); }
+.usage-row { margin-bottom: var(--sp-3); }
+.usage-provider { font-weight: 600; margin-bottom: 4px; }
+.usage-plan { color: var(--text-dim); font-weight: 400; }
+.usage-line {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-bottom: 3px;
+  font-variant-numeric: tabular-nums;
+}
+.usage-label { min-width: 6.5em; color: var(--text-dim); }
+.usage-bar,
+.usage-bar-gap {
+  flex: 0 0 120px;
+  height: 8px;
+  border-radius: 4px;
+  overflow: hidden;
+}
+.usage-bar { background: var(--surface-2); border: 1px solid var(--border); }
+.usage-bar > span { display: block; height: 100%; background: #3fb950; }
+.usage-bar-warning > span { background: #d29922; }
+.usage-bar-danger > span { background: #f85149; }
+.usage-muted,
+.usage-empty { color: var(--text-dim); }

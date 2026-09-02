@@ -388,4 +388,64 @@ describe('proto', () => {
     expect(d.next()).toEqual(b)
     expect(d.next()).toBeNull()
   })
+
+  it('encodes GetUsage as a bare string, matching serde unit variants', () => {
+    const request: Frame = { type: 'control', msg: { kind: 'GetUsage' } }
+    expect(roundtrip(request)).toEqual(request)
+    expect(new TextDecoder().decode(encode(request).slice(5))).toBe('"GetUsage"')
+  })
+
+  it('decodes a Usage reply with all fields', () => {
+    expect(
+      decodeControlJson(
+        JSON.stringify({
+          Usage: {
+            providers: [
+              {
+                provider: 'claude',
+                plan: 'pro',
+                gauges: [
+                  { kind: 'session', label: '5h window', percent: 15, resets_at: 1788328800, stale: false },
+                ],
+                updated: 1788300000,
+                state: 'ok',
+                detail: null,
+              },
+            ],
+          },
+        }),
+      ),
+    ).toEqual({
+      type: 'control',
+      msg: {
+        kind: 'Usage',
+        providers: [
+          {
+            provider: 'claude',
+            plan: 'pro',
+            gauges: [
+              { kind: 'session', label: '5h window', percent: 15, resets_at: 1788328800, stale: false },
+            ],
+            updated: 1788300000,
+            state: 'ok',
+            detail: null,
+          },
+        ],
+      },
+    })
+  })
+
+  it('tolerates a Usage row that omits every optional field', () => {
+    expect(
+      decodeControlJson(JSON.stringify({ Usage: { providers: [{ provider: 'grok', state: 'unavailable' }] } })),
+    ).toEqual({
+      type: 'control',
+      msg: {
+        kind: 'Usage',
+        providers: [
+          { provider: 'grok', plan: null, gauges: [], updated: 0, state: 'unavailable', detail: null },
+        ],
+      },
+    })
+  })
 })

@@ -15,11 +15,14 @@ import { PocketNewSessionSheet, PocketSessionSheet, type PocketSessionKind } fro
 import { deriveTab, shortCwd } from './tabView'
 import { RemoteAccess } from './RemoteAccess'
 import { RouterPanel } from './RouterPanel'
+import { UsagePanel } from './UsagePanel'
 import { Drawer } from './Drawer'
 import { applyViewportMode, desktopControlSize, isMobileMode, useMobile, type MobileViewMode } from './mobile'
 import type { WebStatus } from '../shared/webStatus'
 import type { RouterSlot, RouterStatus } from '../shared/routerStatus'
 import { routerDot } from '../shared/routerStatus'
+import type { ProviderUsage } from '../shared/proto'
+import { pillLabel, tightest, tone as usageTone } from '../shared/usageView'
 import {
   emptyProductivity, parseProductivity, serializeProductivity, mutateProductivity, replayProductivity,
   type LoadProductivityResult, type SaveProductivityResult, type ProductivityFile,
@@ -73,6 +76,9 @@ declare global {
       // Memory budget view/change; the BudgetApplied reply arrives via
       // onDaemonEvent. mb is MiB, 0 = auto.
       getMemoryBudget: () => void
+      // Agent plan quota; the `Usage` reply arrives via onDaemonEvent. Optional
+      // because the web build answers it over an authenticated HTTP route.
+      getUsage?: () => void
       setMemoryBudget: (mb: number) => void
       // Desktop-only capability. The browser client's security whitelist does
       // not expose Snapshot, so its bridge intentionally omits this method.
@@ -354,6 +360,10 @@ function App(): JSX.Element {
   // Memory-budget dialog: the daemon's last BudgetApplied truth, the raw text
   // in the input, and a local parse error. The daemon owns the truth; this is
   // only a form over SetMemoryBudget/GetMemoryBudget.
+  // Agent plan quota. The daemon owns the truth (it polls the providers on its
+  // own 60 s thread); this is only the last `Usage` reply plus the open flag.
+  const [usageOpen, setUsageOpen] = useState(false)
+  const [usage, setUsage] = useState<ProviderUsage[]>([])
   const [budgetOpen, setBudgetOpen] = useState(false)
   const [budget, setBudget] = useState<BudgetView | null>(null)
   const [budgetInput, setBudgetInput] = useState('')
@@ -555,6 +565,12 @@ function App(): JSX.Element {
       // layout save, connection health, or the periodic-snapshot guarantee.
       if (bf?.type === 'control' && bf.msg?.kind === 'SnapshotOk') {
         setSnapshotState({ kind: 'confirmed', at: Date.now() })
+        return
+      }
+      // Quota replies feed the pill and dialog directly (local state — the
+      // daemon remains the only authority; it is what talks to the providers).
+      if (bf?.type === 'control' && bf.msg?.kind === 'Usage') {
+        setUsage((bf.msg as ControlMsg & { kind: 'Usage' }).providers)
         return
       }
       // Budget replies feed the memory dialog directly (local state — not
@@ -1632,6 +1648,19 @@ function App(): JSX.Element {
     }
   }, [routerOpen])
 
+  // Agent plan quota. The pill polls at the daemon's own 60 s refresh — asking
+  // faster only re-reads the same cache; the open dialog polls at 15 s so a
+  // deliberate check feels live. The reply rides onDaemonEvent as `Usage`.
+  useEffect(() => {
+    const ask = (): void => window.amber?.getUsage?.()
+    ask()
+    const t = setInterval(ask, usageOpen ? 15_000 : 60_000)
+    return () => clearInterval(t)
+  }, [usageOpen])
+
+  // null hides the pill outright: a dead badge over a feature that cannot work
+  // here is the mistake the web build's permanently-red remote pill made.
+  const usagePill = pillLabel(usage)
   const routerManaged = routerStatus === null || routerStatus.managed
   // Green only when it is actually routing somewhere.
   const routerTone = routerDot(
@@ -1798,6 +1827,7 @@ function App(): JSX.Element {
           tabLabels={pocketTabLabels}
           titles={titles}
           home={home}
+          usage={usage}
           onWorkspace={choosePocketWorkspace}
           onOpen={openPocketItem}
           onActions={setPocketAction}
@@ -1932,6 +1962,13 @@ function App(): JSX.Element {
           aria-label={`Remote access: ${webDot}`}
           onClick={() => setRemoteOpen(true)}>
           <span className="web-dot" /> remote
+        </button>}
+        {usagePill !== null && <button
+          className={`btn web-pill usage-pill web-pill-${usageTone(tightest(usage)?.gauge.percent ?? 0)}`}
+          title="Agent plan usage — how much of each plan is left"
+          aria-label={`Agent plan usage: ${usagePill}`}
+          onClick={() => setUsageOpen(true)}>
+          <span className="web-dot" /> {usagePill}
         </button>}
         {routerManaged && <button
           className={`btn web-pill router-pill web-pill-${routerTone}`}
@@ -2551,6 +2588,9 @@ function App(): JSX.Element {
           onClose={() => setRouterOpen(false)}
           onRefresh={() => { void window.amber.routerStatus().then(setRouterStatus) }}
         />
+      )}
+      {usageOpen && (
+        <UsagePanel rows={usage} now={Math.floor(Date.now() / 1000)} onClose={() => setUsageOpen(false)} />
       )}
       {productivityOverlay === 'palette' && <CommandPalette entries={paletteEntries} onClose={() => setProductivityOverlay(null)} />}
       {productivityOverlay === 'search' && <GlobalSearchDialog results={searchResults} loading={searchLoading} error={searchError}

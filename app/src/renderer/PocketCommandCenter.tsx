@@ -1,4 +1,6 @@
 import type { CommandCenterItem, CommandCenterModel } from './commandCenter'
+import type { ProviderUsage } from '../shared/proto'
+import { remaining, tightest } from '../shared/usageView'
 import { shortCwd } from './tabView'
 import './PocketCommandCenter.css'
 
@@ -18,6 +20,8 @@ export interface PocketCommandCenterProps {
   tabLabels: Record<string, string>
   titles: Record<string, string>
   home: string
+  /** Agent plan quota, as the daemon last reported it. May be empty. */
+  usage: ProviderUsage[]
   onWorkspace: (workspace: number | null) => void
   onOpen: (item: CommandCenterItem) => void
   onActions: (item: CommandCenterItem) => void
@@ -75,6 +79,15 @@ export function PocketNav({ active, onSessions, onMosaic, onDesktop, onNew }: {
   )
 }
 
+/**
+ * "claude 85% left" — the tightest LIVE gauge across providers, or null when no
+ * provider reports one. Null hides the row rather than showing a dead label.
+ */
+export function usageLine(rows: ProviderUsage[]): string | null {
+  const best = tightest(rows)
+  return best ? `${best.row.provider} ${Math.round(remaining(best.gauge))}% left` : null
+}
+
 export function PocketFocusHeader({
   title,
   machineName,
@@ -116,6 +129,7 @@ export function PocketCommandCenter({
   tabLabels,
   titles,
   home,
+  usage,
   onWorkspace,
   onOpen,
   onActions,
@@ -136,6 +150,10 @@ export function PocketCommandCenter({
         </span>
         <span className="pocket-session-count">{model.count} session{model.count === 1 ? '' : 's'}</span>
       </header>
+
+      {usageLine(usage) !== null && (
+        <div className="pocket-usage" aria-label="Agent plan usage">{usageLine(usage)}</div>
+      )}
 
       <div className="pocket-workspaces" role="group" aria-label="Workspace filter">
         <button type="button" className={activeWorkspace === null ? 'active' : ''}

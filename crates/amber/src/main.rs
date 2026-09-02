@@ -10,7 +10,7 @@ use amber::attach;
 use amber::claude;
 use amber::supervisor;
 use amber::transport::{self, LocalStream};
-use amber_core::proto::{self, ControlMsg, Decoder, Frame};
+use amber_core::proto::{self, ControlMsg, Decoder, Frame, ProviderUsage};
 use amber_core::state::StateStore;
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -185,6 +185,13 @@ enum CtlAction {
     Doctor {
         #[arg(long)]
         root: Option<PathBuf>,
+    },
+    /// Report each agent provider's plan quota (5h window and weekly).
+    Usage {
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        socket: Option<PathBuf>,
     },
     /// Report whether the daemon is reachable and how many sessions it holds.
     Status {
@@ -369,6 +376,7 @@ fn main() -> anyhow::Result<()> {
         Command::Ctl { action } => match action {
             CtlAction::Doctor { root } => run_doctor(root),
             CtlAction::Status { socket } => run_status(&resolve_socket(socket)?),
+            CtlAction::Usage { json, socket } => run_usage(json, &resolve_socket(socket)?),
             CtlAction::Budget { set, systemd, socket } => {
                 run_budget(set.as_deref(), systemd, &resolve_socket(socket)?)
             }
@@ -543,6 +551,92 @@ fn read_daemon_reply_chunk(
 }
 
 /// Connect to the daemon and report liveness + session count.
+/// "in 4h 12m" / "in 6d" / "" when unknown.
+fn until(resets_at: Option<i64>, now: i64) -> String {
+    let Some(at) = resets_at else {
+        return String::new();
+    };
+    let secs = at - now;
+    if secs <= 0 {
+        return String::new();
+    }
+    if secs >= 86_400 {
+        format!("in {}d", secs / 86_400)
+    } else {
+        format!("in {}h {}m", secs / 3_600, (secs % 3_600) / 60)
+    }
+}
+
+/// Human table. Remaining is the headline — it is the number the user asked
+/// for. A non-`ok` provider prints its reason; it never prints a number, and
+/// neither does a stale window (the one it measured no longer exists).
+fn format_usage(rows: &[ProviderUsage], now: i64) -> String {
+    let mut out = String::new();
+    for row in rows {
+        let plan = row
+            .plan
+            .as_deref()
+            .map(|p| format!(" · {p}"))
+            .unwrap_or_default();
+        if row.state != "ok" {
+            let why = row.detail.as_deref().unwrap_or(row.state.as_str());
+            out.push_str(&format!("{}{plan}: {why}\n", row.provider));
+            continue;
+        }
+        out.push_str(&format!("{}{plan}\n", row.provider));
+        for g in &row.gauges {
+            if g.stale {
+                out.push_str(&format!(
+                    "  {:<12} window rolled — reopen {}\n",
+                    g.label, row.provider
+                ));
+                continue;
+            }
+            let left = (100.0 - g.percent).clamp(0.0, 100.0);
+            out.push_str(&format!(
+                "  {:<12} {left:.0}% left   {}\n",
+                g.label,
+                until(g.resets_at, now)
+            ));
+        }
+    }
+    out
+}
+
+/// Ask the daemon for its cached quota snapshot and print it.
+fn run_usage(json: bool, socket: &Path) -> anyhow::Result<()> {
+    let mut stream = transport::connect(socket)
+        .map_err(|e| anyhow::anyhow!("daemon unreachable at {}: {e}", socket.display()))?;
+    stream.write_all(&proto::encode(&Frame::Control(ControlMsg::GetUsage)))?;
+    let mut decoder = Decoder::new();
+    let mut buf = [0u8; 8192];
+    let deadline = std::time::Instant::now() + DAEMON_REPLY_TIMEOUT;
+    let rows = loop {
+        match decoder.next_frame()? {
+            Some(Frame::Control(ControlMsg::Usage { providers })) => break providers,
+            // An older daemon does not know GetUsage and replies Error.
+            Some(Frame::Control(ControlMsg::Error { msg })) => anyhow::bail!("{msg}"),
+            Some(_) => continue,
+            None => {
+                let n = read_daemon_reply_chunk(&mut stream, &mut buf, deadline)?;
+                if n == 0 {
+                    anyhow::bail!(
+                        "daemon closed the connection before replying \
+                         (restart it to pick up usage support)"
+                    );
+                }
+                decoder.feed(&buf[..n]);
+            }
+        }
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+    } else {
+        print!("{}", format_usage(&rows, amber::usage::now_secs()));
+    }
+    Ok(())
+}
+
 fn run_status(socket: &Path) -> anyhow::Result<()> {
     match transport::connect(socket) {
         Ok(mut stream) => {
@@ -2107,5 +2201,77 @@ mod tests {
         assert_eq!(ls_status(&info("claude", true, Some("claude"))), "");
         assert_eq!(ls_status(&info("claude", true, Some("suspended"))), "  (suspended)");
         assert_eq!(ls_status(&info("grok", true, Some("shell-fallback"))), "  (shell-fallback)");
+    }
+
+    use amber_core::proto::Gauge;
+
+    fn usage_gauge(label: &str, percent: f64, resets_at: Option<i64>, stale: bool) -> Gauge {
+        Gauge {
+            kind: "session".into(),
+            label: label.into(),
+            percent,
+            resets_at,
+            stale,
+        }
+    }
+
+    #[test]
+    fn format_usage_shows_remaining_and_names_absent_sources() {
+        let rows = vec![
+            ProviderUsage {
+                provider: "claude".into(),
+                plan: Some("pro".into()),
+                gauges: vec![usage_gauge("5h window", 15.0, Some(3_600), false)],
+                updated: 0,
+                state: "ok".into(),
+                detail: None,
+            },
+            ProviderUsage {
+                provider: "grok".into(),
+                plan: None,
+                gauges: vec![],
+                updated: 0,
+                state: "unavailable".into(),
+                detail: Some("grok exposes no quota data".into()),
+            },
+        ];
+        let out = format_usage(&rows, 0);
+        assert!(out.contains("claude"));
+        assert!(out.contains("85% left"), "remaining, not used: {out}");
+        assert!(out.contains("1h 0m"), "reset countdown missing: {out}");
+        assert!(out.contains("grok exposes no quota data"));
+        assert!(
+            !out.contains("0%"),
+            "an absent source must not render as a number: {out}"
+        );
+    }
+
+    #[test]
+    fn format_usage_renders_a_rolled_window_as_words() {
+        let rows = vec![ProviderUsage {
+            provider: "codex".into(),
+            plan: None,
+            gauges: vec![usage_gauge("5h window", 88.0, Some(10), true)],
+            updated: 0,
+            state: "ok".into(),
+            detail: None,
+        }];
+        let out = format_usage(&rows, 1_000);
+        assert!(out.contains("rolled"), "{out}");
+        assert!(!out.contains("88"), "a stale number must not be shown: {out}");
+    }
+
+    #[test]
+    fn format_usage_states_needs_auth_as_an_action() {
+        let rows = vec![ProviderUsage {
+            provider: "claude".into(),
+            plan: None,
+            gauges: vec![],
+            updated: 0,
+            state: "needs-auth".into(),
+            detail: Some("claude token expired — run claude to refresh".into()),
+        }];
+        let out = format_usage(&rows, 0);
+        assert!(out.contains("run claude to refresh"), "{out}");
     }
 }
