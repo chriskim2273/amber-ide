@@ -22,7 +22,10 @@ class FakeDebugger implements BrowserDebuggerTransport {
     if (method === 'DOM.describeNode') return { node: { nodeName: 'BUTTON', parentId: 10, attributes: ['id', 'submit', 'value', 'secret', 'aria-label', 'Submit'] } }
     if (method === 'CSS.getComputedStyleForNode') return { computedStyle: [{ name: 'display', value: 'block' }, { name: 'background-image', value: 'url(https://secret.test/token)' }] }
     if (method === 'DOM.getBoxModel') return { model: { border: [0, 0, 100, 0, 100, 20, 0, 20] } }
-    if (method === 'Page.captureScreenshot') return { data: Buffer.from('png').toString('base64') }
+    if (method === 'Page.captureScreenshot') {
+      const png = Buffer.alloc(24); Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(png); png.write('IHDR', 12, 'ascii'); png.writeUInt32BE(800, 16); png.writeUInt32BE(600, 20)
+      return { data: png.toString('base64') }
+    }
     if (method === 'Page.getLayoutMetrics') return { cssContentSize: { x: 0, y: 0, width: 800, height: 600 } }
     return {}
   }
@@ -67,8 +70,11 @@ describe('browser automation', () => {
     const transport = new FakeDebugger()
     const automation = new BrowserAutomation(transport, () => 'about:blank', () => false)
     const image = await automation.screenshot(lease, undefined, false, new AbortController().signal)
-    expect(image.data).toEqual(Buffer.from('png'))
+    expect(image.data.subarray(0, 8)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
+    expect(image).toMatchObject({ width: 800, height: 600 })
     expect(image).not.toHaveProperty('path')
+    transport.send = async () => { const png = Buffer.alloc(24); Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(png); png.write('IHDR', 12, 'ascii'); png.writeUInt32BE(4097, 16); png.writeUInt32BE(600, 20); return { data: png.toString('base64') } }
+    await expect(automation.screenshot(lease, undefined, false, new AbortController().signal)).rejects.toThrow('REQUEST_LIMIT')
     transport.send = async () => ({ data: Buffer.alloc(10 * 1024 * 1024 + 1).toString('base64') })
     await expect(automation.screenshot(lease, undefined, false, new AbortController().signal)).rejects.toThrow('REQUEST_LIMIT')
   })

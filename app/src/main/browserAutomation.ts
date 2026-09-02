@@ -25,7 +25,7 @@ export interface SnapshotResult { snapshotId: string; url: string; nodes: Access
 export interface BrowserBinaryAttachment { mediaType: 'image/png'; data: Buffer; width?: number; height?: number; browserId?: string; pageIncarnation?: string; generation?: number }
 
 type AXNode = {
-  nodeId?: string; parentId?: string; backendDOMNodeId?: number
+  nodeId?: string; parentId?: string; backendDOMNodeId?: number; ignored?: boolean
   role?: { value?: unknown }; name?: { value?: unknown }; value?: { value?: unknown }
   properties?: Array<{ name?: string; value?: { value?: unknown } }>
 }
@@ -86,6 +86,12 @@ function property(node: AXNode, name: string): boolean | undefined {
 }
 function sameLease(a: BrowserAutomationLease, b: BrowserAutomationLease): boolean {
   return a.browserId === b.browserId && a.pageIncarnation === b.pageIncarnation && a.generation === b.generation
+}
+function pngDimensions(data: Buffer): { width: number; height: number } | null {
+  const signature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+  if (data.length < 24 || !data.subarray(0, 8).equals(signature) || data.toString('ascii', 12, 16) !== 'IHDR') return null
+  const width = data.readUInt32BE(16), height = data.readUInt32BE(20)
+  return width > 0 && height > 0 ? { width, height } : null
 }
 
 export class BrowserAutomation {
@@ -185,6 +191,7 @@ export class BrowserAutomation {
     const snapshotId = randomBytes(12).toString('base64url'), entries = new Map<string, SnapshotEntry>(), nodes: AccessibilityNodeResult[] = []
     let used = 512 + Buffer.byteLength(sanitizeBrowserUrl(this.currentUrl())), truncated = false
     for (const node of raw) {
+      if (node.ignored) continue
       const depth = depthOf(node); if (depth > limits.maxDepth) { truncated = true; continue }
       const role = text(node.role?.value, 256), name = redactBrowserText(text(node.name?.value, 4096))
       const ref = `n${nodes.length + 1}`
@@ -259,7 +266,10 @@ export class BrowserAutomation {
     const result = await this.transport.send('Page.captureScreenshot', { format: 'png', fromSurface: true, captureBeyondViewport: fullPage, ...(clip ? { clip } : {}) }); abort(signal)
     if (typeof result['data'] !== 'string') throw new Error('INTERNAL_ERROR')
     const data = Buffer.from(result['data'], 'base64'); if (data.length > SCREENSHOT_MAX_BYTES) throw new Error('REQUEST_LIMIT')
-    return { mediaType: 'image/png', data, ...(clip ? { width: Math.round(clip.width), height: Math.round(clip.height) } : {}) }
+    const dimensions = pngDimensions(data)
+    if (!dimensions) throw new Error('INTERNAL_ERROR')
+    if (dimensions.width > SCREENSHOT_MAX_DIMENSION || dimensions.height > SCREENSHOT_MAX_DIMENSION) throw new Error('REQUEST_LIMIT')
+    return { mediaType: 'image/png', data, ...dimensions }
   }
   consoleSince(cursor: string | undefined, levels: ConsoleLevel[] | undefined, limit: number): { cursor: string; items: Record<string, unknown>[]; dropped: number; truncated: boolean } { const wanted = levels ? new Set(levels) : null; return this.consoleRing.since(cursor, limit, wanted ? (entry) => wanted.has(entry['level'] as ConsoleLevel) : undefined) }
   networkSince(cursor: string | undefined, limit: number, failedOnly: boolean): { cursor: string; items: Record<string, unknown>[]; dropped: number; truncated: boolean } { return this.networkRing.since(cursor, limit, failedOnly ? (entry) => entry['failed'] === true : undefined) }
