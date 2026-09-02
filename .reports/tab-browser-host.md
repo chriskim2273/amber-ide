@@ -141,7 +141,7 @@ The installed Amber-owned Pi extension is version 4 and registers 26 tools throu
 
 Phase-B `/tmp` gates: 838 app tests passed with one intentional real-daemon skip; focused Phase-B browser tests passed 76/76 before the full run; strict typecheck, Electron production build, hosted-web production build, 779 Rust tests with one intentional delegated-cgroup ignore, workspace all-target warnings-as-errors clippy, exact generated extension verification, and diff checks passed. No production daemon was contacted.
 
-The first independent Phase-B review failed with valid P1/P2 findings. Commit `896ba3a` remediates them:
+The first independent Phase-B review failed with valid P1/P2 findings. Commits `896ba3a` and `d5eed37` remediate them:
 
 - every pointer-bearing interaction recomputes actionability, geometry, and fingerprint, checks a bounded visual viewport, and uses bounded `DOM.getNodeForLocation` immediately before dispatch; only the exact target or a descendant reached through a 32-node parent walk is accepted, while overlays and off-viewport centers fail closed;
 - drag source and destination have independent current fingerprints, both enter the approval digest, and both are revalidated; bounded ancestor-form action/method metadata and conservative button/destination semantics classify drag-to-delete, JavaScript-style role buttons, send/save/submit, and destructive destinations;
