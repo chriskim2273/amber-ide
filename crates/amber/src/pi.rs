@@ -18,7 +18,7 @@ pub enum PiStart {
 const EXTENSION_FILE: &str = "amber-hook.ts";
 
 /// The Pi extension amber installs to record session ids for exact resume.
-const EXTENSION_TS: &str = r#"// amber-owned-extension:v2
+const EXTENSION_TS: &str = r#"// amber-owned-extension:v3
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
 import { Type } from "typebox"
 import { spawn } from "node:child_process"
@@ -48,18 +48,22 @@ const browserClientInstanceId = `${process.pid}-${Date.now()}-${Math.random().to
 let browserSequence = 0
 
 async function browserRequest(action: unknown, signal?: AbortSignal) {
+  if (signal?.aborted) throw new Error("Amber browser request cancelled")
   const amberSession = process.env.AMBER_SESSION
   if (!amberSession) throw new Error("Amber browser tools are unavailable outside an Amber pane")
   const paths = browserPaths()
   const token = (await readFile(paths.token, "utf8")).trim()
+  if (!/^[A-Za-z0-9_-]{43}$/.test(token)) throw new Error("Amber browser host token is invalid")
+  if (signal?.aborted) throw new Error("Amber browser request cancelled")
   return await new Promise<unknown>((resolve, reject) => {
     const socket = connect(paths.socket)
-    let buffer = Buffer.alloc(0), authenticated = false, settled = false
+    let buffer = Buffer.alloc(0), authenticated = false, settled = false, pendingBinary: any = null
     const finish = (error?: Error, value?: unknown) => {
-      if (settled) return; settled = true; clearTimeout(timer); socket.destroy()
+      if (settled) return; settled = true; clearTimeout(timer); signal?.removeEventListener("abort", abort); socket.destroy()
       if (error) reject(error); else resolve(value)
     }
-    const timer = setTimeout(() => finish(new Error("Amber browser host timed out")), 8000)
+    const actionTimeout = typeof (action as any)?.timeoutMs === "number" ? Math.min(120000, Math.max(100, (action as any).timeoutMs)) : 30000
+    const timer = setTimeout(() => finish(new Error("Amber browser host timed out")), actionTimeout + 2000)
     const abort = () => finish(new Error("Amber browser request cancelled"))
     signal?.addEventListener("abort", abort, { once: true })
     socket.on("error", (error) => finish(error))
@@ -68,9 +72,15 @@ async function browserRequest(action: unknown, signal?: AbortSignal) {
       buffer = Buffer.concat([buffer, chunk])
       while (buffer.length >= 4) {
         const length = buffer.readUInt32BE(0)
-        if (length > 256 * 1024) return finish(new Error("Amber browser host sent an oversized reply"))
+        const limit = pendingBinary ? 10 * 1024 * 1024 : 1024 * 1024
+        if (length > limit) return finish(new Error("Amber browser host sent an oversized reply"))
         if (buffer.length < length + 4) return
         const body = buffer.subarray(4, length + 4); buffer = buffer.subarray(length + 4)
+        if (pendingBinary) {
+          if (length !== pendingBinary.attachment.byteLength) return finish(new Error("Amber browser host sent an invalid image attachment"))
+          const value = { ...pendingBinary, __image: body.toString("base64") }; delete value.attachment
+          return finish(undefined, value)
+        }
         let reply: any
         try { reply = JSON.parse(body.toString("utf8")) } catch { return finish(new Error("Amber browser host sent invalid JSON")) }
         if (!authenticated) {
@@ -80,15 +90,32 @@ async function browserRequest(action: unknown, signal?: AbortSignal) {
           continue
         }
         if (!reply?.ok) return finish(new Error(String(reply?.error || "Amber browser request failed")))
+        if (reply.result?.attachment?.encoding === "binary-frame") { pendingBinary = reply.result; continue }
         finish(undefined, reply.result)
       }
     })
   })
 }
 
-function result(value: unknown) {
-  const text = JSON.stringify(value, null, 2)
-  return { content: [{ type: "text" as const, text: text.length > 50000 ? text.slice(0, 50000) + "\\n…truncated" : text }], details: {} }
+function boundedResultText(value: unknown) {
+  const lines = (JSON.stringify(value, null, 2) ?? "null").split("\n")
+  let suffix = ""
+  if (lines.length > 2000) { lines.length = 2000; suffix = "\n…truncated" }
+  const encoded = Buffer.from(lines.join("\n") + suffix)
+  return encoded.length <= 50000 ? encoded.toString("utf8") : encoded.subarray(0, 49970).toString("utf8") + "\n…truncated"
+}
+
+function result(value: any) {
+  if (value?.__image && value?.mediaType === "image/png") {
+    const { __image, ...metadata } = value
+    return { content: [{ type: "text" as const, text: JSON.stringify(metadata) }, { type: "image" as const, data: __image, mimeType: "image/png" }], details: {} }
+  }
+  return { content: [{ type: "text" as const, text: boundedResultText(value) }], details: {} }
+}
+
+const pageLease = {
+  pageIncarnation: Type.String({ minLength: 1, maxLength: 256 }),
+  expectedGeneration: Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
 }
 
 export default function (pi: ExtensionAPI) {
@@ -120,13 +147,108 @@ export default function (pi: ExtensionAPI) {
     name: "browser_navigate", label: "Navigate browser",
     description: "Navigate the shared tab browser when its page generation is still current.",
     parameters: Type.Object({
-      url: Type.String({ maxLength: 8192 }),
-      pageIncarnation: Type.String({ maxLength: 128 }),
-      expectedGeneration: Type.Number({ minimum: 0 }),
+      url: Type.String({ maxLength: 8192 }), ...pageLease,
     }, { additionalProperties: false }),
     async execute(_id, params, signal) {
       return result(await browserRequest({ type: "navigate", url: params.url, pageIncarnation: params.pageIncarnation, expectedGeneration: params.expectedGeneration }, signal))
     },
+  })
+  pi.registerTool({
+    name: "browser_stop", label: "Stop browser loading",
+    description: "Stop the current page load with page-incarnation and generation checks.",
+    parameters: Type.Object({ ...pageLease }, { additionalProperties: false }),
+    async execute(_id, params, signal) { return result(await browserRequest({ type: "stop", ...params }, signal)) },
+  })
+  pi.registerTool({
+    name: "browser_snapshot", label: "Snapshot browser accessibility",
+    description: "Capture a bounded accessibility-first tree. References are valid only for this page incarnation, generation, and snapshot.",
+    parameters: Type.Object({ ...pageLease, limits: Type.Optional(Type.Object({
+      maxDepth: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
+      maxNodes: Type.Optional(Type.Integer({ minimum: 1, maximum: 2000 })),
+      maxBytes: Type.Optional(Type.Integer({ minimum: 1024, maximum: 262144 })),
+    }, { additionalProperties: false })) }, { additionalProperties: false }),
+    async execute(_id, params, signal) { return result(await browserRequest({ type: "snapshot", ...params }, signal)) },
+  })
+  pi.registerTool({
+    name: "browser_find", label: "Find in browser snapshot",
+    description: "Find bounded role/name/text matches in one current accessibility snapshot.",
+    parameters: Type.Object({ ...pageLease, snapshotId: Type.String({ minLength: 1, maxLength: 128 }), query: Type.Object({
+      text: Type.Optional(Type.String({ minLength: 1, maxLength: 4096 })),
+      regex: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
+      role: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
+      name: Type.Optional(Type.String({ minLength: 1, maxLength: 4096 })),
+      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })),
+    }, { additionalProperties: false }) }, { additionalProperties: false }),
+    async execute(_id, params, signal) { return result(await browserRequest({ type: "find", ...params }, signal)) },
+  })
+  pi.registerTool({
+    name: "browser_inspect", label: "Inspect browser element",
+    description: "Inspect allowlisted DOM attributes and geometry for a current snapshot reference; form values and secrets are excluded.",
+    parameters: Type.Object({ ...pageLease, snapshotId: Type.String({ minLength: 1, maxLength: 128 }), ref: Type.String({ minLength: 1, maxLength: 64 }) }, { additionalProperties: false }),
+    async execute(_id, params, signal) { const { snapshotId, ref, ...lease } = params; return result(await browserRequest({ type: "inspect", ...lease, target: { snapshotId, ref } }, signal)) },
+  })
+  pi.registerTool({
+    name: "browser_screenshot", label: "Screenshot browser",
+    description: "Capture a bounded in-memory PNG. The image may contain secrets visibly present on the shared page.",
+    parameters: Type.Object({ ...pageLease,
+      snapshotId: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
+      ref: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })),
+      fullPage: Type.Optional(Type.Boolean()),
+    }, { additionalProperties: false }),
+    async execute(_id, params, signal) {
+      const { snapshotId, ref, ...rest } = params
+      if ((snapshotId && !ref) || (ref && !snapshotId)) throw new Error("snapshotId and ref must be supplied together")
+      return result(await browserRequest({ type: "screenshot", ...rest, ...(snapshotId ? { target: { snapshotId, ref } } : {}) }, signal))
+    },
+  })
+  pi.registerTool({
+    name: "browser_console", label: "Read browser console",
+    description: "Read a bounded redacted console summary since a cursor; no page evaluation is available.",
+    parameters: Type.Object({ ...pageLease,
+      cursor: Type.Optional(Type.String({ pattern: "^[0-9]{1,16}$" })),
+      levels: Type.Optional(Type.Array(Type.Union([Type.Literal("log"), Type.Literal("info"), Type.Literal("warning"), Type.Literal("error")]), { maxItems: 4 })),
+      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })),
+    }, { additionalProperties: false }),
+    async execute(_id, params, signal) { return result(await browserRequest({ type: "console", ...params }, signal)) },
+  })
+  pi.registerTool({
+    name: "browser_network", label: "Read browser network summary",
+    description: "Read bounded request metadata with credentials, query strings, fragments, headers, and bodies excluded.",
+    parameters: Type.Object({ ...pageLease,
+      cursor: Type.Optional(Type.String({ pattern: "^[0-9]{1,16}$" })),
+      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })),
+      failedOnly: Type.Optional(Type.Boolean()),
+    }, { additionalProperties: false }),
+    async execute(_id, params, signal) { return result(await browserRequest({ type: "network", ...params }, signal)) },
+  })
+  pi.registerTool({
+    name: "browser_wait", label: "Wait for browser",
+    description: "Wait up to 120 seconds for a bounded URL, text, role, or network-idle condition.",
+    parameters: Type.Object({ ...pageLease, timeoutMs: Type.Optional(Type.Integer({ minimum: 100, maximum: 120000 })), condition: Type.Union([
+      Type.Object({ kind: Type.Literal("url"), value: Type.String({ minLength: 1, maxLength: 8192 }) }, { additionalProperties: false }),
+      Type.Object({ kind: Type.Literal("text"), value: Type.String({ minLength: 1, maxLength: 4096 }) }, { additionalProperties: false }),
+      Type.Object({ kind: Type.Literal("role"), value: Type.String({ minLength: 1, maxLength: 256 }), name: Type.Optional(Type.String({ minLength: 1, maxLength: 4096 })) }, { additionalProperties: false }),
+      Type.Object({ kind: Type.Literal("networkIdle") }, { additionalProperties: false }),
+    ]) }, { additionalProperties: false }),
+    async execute(_id, params, signal) { return result(await browserRequest({ type: "wait", ...params }, signal)) },
+  })
+  pi.registerTool({
+    name: "browser_reload", label: "Reload browser",
+    description: "Reload the current page, optionally bypassing cache, with generation checks.",
+    parameters: Type.Object({ ...pageLease, ignoreCache: Type.Optional(Type.Boolean()) }, { additionalProperties: false }),
+    async execute(_id, params, signal) { return result(await browserRequest({ type: "reload", ...params }, signal)) },
+  })
+  for (const [name, direction] of [["browser_back", "back"], ["browser_forward", "forward"]] as const) pi.registerTool({
+    name, label: direction === "back" ? "Browser back" : "Browser forward",
+    description: `Move ${direction} in this shared browser's history with generation checks.`,
+    parameters: Type.Object({ ...pageLease }, { additionalProperties: false }),
+    async execute(_id, params, signal) { return result(await browserRequest({ type: "history", direction, ...params }, signal)) },
+  })
+  pi.registerTool({
+    name: "browser_set_viewport", label: "Set browser viewport",
+    description: "Set a bounded emulated viewport for responsive development.",
+    parameters: Type.Object({ ...pageLease, width: Type.Integer({ minimum: 200, maximum: 4096 }), height: Type.Integer({ minimum: 200, maximum: 4096 }), deviceScaleFactor: Type.Optional(Type.Number({ minimum: 0.5, maximum: 4 })), mobile: Type.Optional(Type.Boolean()) }, { additionalProperties: false }),
+    async execute(_id, params, signal) { const { width, height, deviceScaleFactor, mobile, ...lease } = params; return result(await browserRequest({ type: "setViewport", ...lease, viewport: { width, height, ...(deviceScaleFactor === undefined ? {} : { deviceScaleFactor }), ...(mobile === undefined ? {} : { mobile }) } }, signal)) },
   })
 }
 "#;
@@ -210,6 +332,13 @@ pub fn ensure_global_pi_extension() {
     }
 }
 
+fn is_owned_extension_source(source: &str) -> bool {
+    matches!(
+        source.lines().next(),
+        Some("// amber-owned-extension:v2" | "// amber-owned-extension:v3")
+    )
+}
+
 /// Testable core of [`install_global_pi_extension`]. Returns the owned file
 /// only after it exists unchanged or has been atomically installed/refreshed.
 pub fn install_extension_in(dir: &Path) -> anyhow::Result<PathBuf> {
@@ -219,6 +348,7 @@ pub fn install_extension_in(dir: &Path) -> anyhow::Result<PathBuf> {
     match fs::read_to_string(&path) {
         Ok(existing) if existing == EXTENSION_TS => return Ok(path),
         Ok(existing) if existing == LEGACY_EXTENSION_TS => {}
+        Ok(existing) if is_owned_extension_source(&existing) => {}
         Ok(_) => {
             anyhow::bail!(
                 "refusing to replace modified/unowned Pi extension {}",
@@ -318,6 +448,7 @@ mod tests {
         let path = extensions.join("amber-hook.ts");
         let first = fs::read_to_string(&path).unwrap();
         assert_eq!(first, EXTENSION_TS);
+        assert!(first.starts_with("// amber-owned-extension:v3\n"));
         assert!(first.contains("ExtensionAPI"));
         assert!(first.contains("@earendil-works/pi-coding-agent"));
         assert!(first.contains("session_start"));
@@ -329,13 +460,50 @@ mod tests {
         assert!(first.contains("browser_open"));
         assert!(first.contains("browser_status"));
         assert!(first.contains("browser_navigate"));
+        for tool in [
+            "browser_stop",
+            "browser_snapshot",
+            "browser_find",
+            "browser_inspect",
+            "browser_screenshot",
+            "browser_console",
+            "browser_network",
+            "browser_wait",
+            "browser_reload",
+            "browser_back",
+            "browser_forward",
+            "browser_set_viewport",
+        ] {
+            assert!(first.contains(tool), "missing installed Pi tool {tool}");
+        }
+        assert!(first.contains("binary-frame"));
+        assert!(first.contains("type: \"image\" as const"));
         assert!(first.contains("browser-host-token"));
         assert!(first.contains("clientInstanceId: browserClientInstanceId"));
         assert!(first.contains("sequence: ++browserSequence"));
         assert!(!first.contains("Runtime.evaluate"));
+        assert!(!first.contains("Network.getResponseBody"));
+        assert!(!first.contains("document.cookie"));
+        assert!(!first.contains("sendCommand"));
 
         install_extension_in(&extensions).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), first);
+    }
+
+    #[test]
+    fn extension_installer_repairs_a_marker_owned_prior_browser_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let extensions = dir.path().join("extensions");
+        fs::create_dir_all(&extensions).unwrap();
+        let owned = extensions.join("amber-hook.ts");
+        fs::write(
+            &owned,
+            "// amber-owned-extension:v2\n// locally drifted old Amber payload\n",
+        )
+        .unwrap();
+
+        install_extension_in(&extensions).unwrap();
+        assert_eq!(fs::read_to_string(owned).unwrap(), EXTENSION_TS);
     }
 
     #[test]
@@ -374,6 +542,19 @@ mod tests {
             fs::read_to_string(path).unwrap(),
             "// user-owned extension\n"
         );
+    }
+
+    #[test]
+    fn extension_installer_refuses_a_future_owned_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let extensions = dir.path().join("extensions");
+        fs::create_dir_all(&extensions).unwrap();
+        let path = extensions.join(EXTENSION_FILE);
+        let future = "// amber-owned-extension:v4\n// future payload\n";
+        fs::write(&path, future).unwrap();
+
+        assert!(install_extension_in(&extensions).is_err());
+        assert_eq!(fs::read_to_string(path).unwrap(), future);
     }
 
     #[test]

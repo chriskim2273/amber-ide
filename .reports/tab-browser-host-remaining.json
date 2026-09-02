@@ -54,8 +54,8 @@
     {
       "id": "P1-pi-tools-and-approvals",
       "severity": "important",
-      "status": "open",
-      "work": "Implement bounded snapshot/find/inspect/screenshot/console/network/wait/history/reload/interaction/viewport tools and the consequential-action classifier, exact approval digest, visible approval coordinator, revoke/Stop Pi semantics, redaction canaries, and binary image transport."
+      "status": "partial",
+      "work": "Phase A observation/navigation substrate is implemented: strict bounded snapshot/find/inspect/screenshot/console/network/wait/history/reload/viewport actions, generation-scoped references, dispatch-time authority, debugger target confinement, redaction/omission canaries, raw binary image frames, and installed Pi schemas. Still required: semantic interaction tools plus the consequential-action classifier, exact approval digest, visible approval coordinator, and revoke/Stop Pi semantics."
     },
     {
       "id": "P1-workspace-contract",

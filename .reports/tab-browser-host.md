@@ -5,7 +5,7 @@ Branch: `feat/tab-browser-host`
 
 ## Result
 
-This branch implements and Linux-validates the durable main-owned tab-browser foundation, rail UI, persistence, capacity policy, and the initial authenticated Pi control path. It does **not** satisfy the full approved product acceptance contract yet. In particular, the broad bounded browser-development tool set, screenshot attachment transport, approval coordinator, workspace v2 round-trip, deployed-reader upgrade proof, packaged-artifact gate, and macOS manual gate remain open. Those omissions must block merge of the complete feature.
+This branch implements and Linux-validates the durable main-owned tab-browser foundation, rail UI, persistence, capacity policy, and the authenticated Pi observation/navigation substrate. It does **not** satisfy the full approved product acceptance contract yet. In particular, semantic interaction tools, the approval coordinator, deployed-reader upgrade proof, packaged-artifact gate, and macOS manual gate remain open. Those omissions must block merge of the complete feature.
 
 ## Implemented
 
@@ -20,7 +20,7 @@ This branch implements and Linux-validates the durable main-owned tab-browser fo
 - Legacy browser-pane creation was removed from the picker while transitional legacy renderer/workspace code remains available.
 - Rust mosaic parsing accepts layout v2 and structurally ignores browser-private metadata.
 - A private, framed, authenticated Unix-socket broker applies strict frame/connection limits, request shape validation, current daemon membership/kind checks, same-tab designation/share authorization, and first-use `open` solicitation semantics.
-- The installed Amber-owned Pi extension registers bounded `browser_open`, `browser_status`, and `browser_navigate` tools, uses no raw CDP API, and refuses to overwrite modified/unowned extension files.
+- The installed Amber-owned Pi extension registers bounded lifecycle/navigation, accessibility snapshot/find/inspect, in-memory screenshot, console/network, wait, history/reload, and viewport tools; it uses no raw CDP API and refuses to overwrite modified/unowned extension files.
 - Web-host shims fail explicitly; they do not pretend browser-host support exists.
 
 ## Linux evidence
@@ -97,17 +97,24 @@ A subsequent final-gate fix slice also closes three concrete bypasses: `.amberws
 - Full Rust all-target run reached 436/437 library tests, with unrelated pre-existing timing test `manager::tests::automatic_pressure_suspend_rechecks_liveness_under_the_transition_lock` failing once with `ESRCH`; immediate isolated rerun passed. This is recorded as a flaky full gate, not claimed green.
 - All commands used `/tmp/amber-ide-tab-browser-host` and `/tmp/amber-tab-browser-validation`; no production daemon command was issued.
 
+## Pi observation/navigation substrate (phase A)
+
+The selected `webContents.debugger` adapter is now production-wired behind a narrow typed interface. Its command set is fixed: accessibility-tree capture, allowlisted DOM description/box geometry, screenshot, emulated viewport, and console/network event domains. It exposes no generic debugger method, runtime evaluation, response body, cookie, storage, request-header, or filesystem-path capability. Snapshot references are opaque and scoped to browser ID, page incarnation, generation, and snapshot ID; every queued action revalidates daemon/layout authority immediately before service dispatch, and Host rejects stale results after asynchronous work. Snapshot, text, node, ring, wait, viewport, frame, and image bounds follow the design limits. Console/network output removes URL credentials/query/fragment and common credential canaries, while the report still treats page-rendered text and pixels as potentially sensitive.
+
+Screenshots cross the local broker as a JSON metadata frame followed by a bounded raw binary frame. The Pi extension converts those bytes only at its typed image-result boundary; no screenshot path or JSON numeric byte array exists. The installed extension schemas cover status/open/navigate, snapshot/find/inspect/screenshot, console/network, wait, reload/back/forward, and viewport. Focused security tests pin unknown-key rejection, safe regex restrictions, scoped-reference staleness, attribute allowlisting, binary framing, cancellation, FIFO ordering, dispatch-time authority, and absence of generic sensitive automation methods.
+
+Phase A deliberately does not implement element interaction or approvals. `.reports/tab-browser-host-remaining.json` therefore marks `P1-pi-tools-and-approvals` partial, not complete, and `mergeReady` remains false.
+
+Phase-A automated evidence: 811 app tests passed with one intentional real-daemon skip; focused browser tests passed 49/49; strict app typecheck, Electron build, hosted-web build, and workspace warnings-as-errors clippy passed; Pi extension installer tests passed 18/18 under the focused Cargo filter. Final independent review remains required after the tranche commit.
+
 ## Open blocking work
 
-1. Add the complete typed Pi tool surface required by the design (bounded observation, semantic interaction, wait/assert, binary screenshot attachment) without exposing unrestricted raw CDP/Playwright or filesystem screenshot paths.
-2. Add the consequential-action classifier and user approval coordinator with exact action/origin/target previews, expiry, and stale-generation rejection.
-3. Complete workspace `.amberws` v2 save/load for tab rails and define/verify collision-safe import semantics.
-4. Wire and live-prove recognized legacy browser-leaf migration, including browser-only tabs and non-promoted URL recovery.
-5. Prove the Rust layout-v2 reader through the real upgrade/deployment channel before enabling v2 writes by default.
-6. Validate the real packaged artifact and all bundled binaries; static-musl packaging is unavailable on this box because no musl C compiler is installed.
-7. Complete the explicit macOS native-view geometry, focus, IME, lifecycle, profile, and packaging manual gate. No macOS claim is made.
-8. Resolve the inconclusive Linux physical-input packaged smoke.
-9. Expand process-lifecycle and broker end-to-end tests around daemon reconnect races, orphan durable records after sidecar CAS conflict, and Pi cancellation during in-flight page work.
+1. Add semantic interaction tools behind the consequential-action classifier and visible approval coordinator, including exact action/origin/target digests, expiry, stale-generation rejection, and revoke/Stop Pi semantics.
+2. Prove the Rust layout-v2 reader through the real upgrade/deployment channel before enabling v2 writes by default.
+3. Validate the real packaged artifact and all bundled binaries; static-musl packaging is unavailable on this box because no musl C compiler is installed.
+4. Complete the explicit macOS native-view geometry, focus, IME, lifecycle, profile, and packaging manual gate. No macOS claim is made.
+5. Resolve the inconclusive Linux physical-input packaged smoke and run production-path Electron evidence for the new debugger adapter against the approved hostile fixture.
+6. Expand process-lifecycle and broker end-to-end tests around daemon reconnect races, orphan durable records after sidecar CAS conflict, and exact Pi cancellation during in-flight page work.
 
 ## Isolation and cleanup
 
