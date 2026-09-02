@@ -22,6 +22,12 @@ use serde_json::{json, Map, Value};
 pub const PROVIDER: &str = "amber-router";
 /// Where the inbound token lives, relative to the amber state root.
 pub const TOKEN_FILE: &str = "router-token";
+/// Conservative shared window advertised to Pi: the smallest advertised
+/// context among current auto-chain slots (Workbuddy `hy3` at 192k).
+pub const CONTEXT_WINDOW: u64 = 192_000;
+/// Conservative completion cap advertised to Pi: the smallest advertised
+/// max output among current auto-chain slots (`big-pickle` at 32k).
+pub const MAX_TOKENS: u64 = 32_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PiState {
@@ -85,8 +91,8 @@ pub fn provider_entry(root: &Path, port: u16, models: &[String]) -> Value {
                     format!("amber router · {id}")
                 },
                 "input": ["text"],
-                "contextWindow": 128_000,
-                "maxTokens": 16_000,
+                "contextWindow": CONTEXT_WINDOW,
+                "maxTokens": MAX_TOKENS,
             })
         })
         .collect();
@@ -251,6 +257,16 @@ mod tests {
         }
         assert_eq!(models[0]["id"], json!("auto"));
         assert_eq!(models[1]["id"], json!("groq"));
+        assert_eq!(
+            models[0]["contextWindow"],
+            json!(CONTEXT_WINDOW),
+            "shared window is the tightest auto-chain slot (Workbuddy Hy3)"
+        );
+        assert_eq!(
+            models[0]["maxTokens"],
+            json!(MAX_TOKENS),
+            "shared completion cap is the tightest auto-chain slot (Big Pickle)"
+        );
     }
 
     #[test]
