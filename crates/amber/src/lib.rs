@@ -161,7 +161,12 @@ pub fn daemon_main(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Re
     }
 
     eprintln!("amber daemon: listening on {}", socket_path.display());
-    let daemon = daemon::Daemon::new(Arc::clone(&manager), Arc::clone(&watchers));
+    // Agent plan quota: its own 60 s thread, never a connection read thread.
+    let usage_cache = usage::UsageCache::new();
+    usage::start(Arc::clone(&usage_cache));
+
+    let daemon = daemon::Daemon::new(Arc::clone(&manager), Arc::clone(&watchers))
+        .with_usage(Arc::clone(&usage_cache));
     daemon.serve(listener)
 }
 
