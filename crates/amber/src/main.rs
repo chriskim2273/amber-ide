@@ -618,7 +618,19 @@ fn run_usage(json: bool, socket: &Path) -> anyhow::Result<()> {
             Some(Frame::Control(ControlMsg::Error { msg })) => anyhow::bail!("{msg}"),
             Some(_) => continue,
             None => {
-                let n = read_daemon_reply_chunk(&mut stream, &mut buf, deadline)?;
+                // A daemon that predates `GetUsage` does not reply at all: its
+                // decoder rejects the unknown variant and the connection's
+                // forward-compat path log-and-skips it (verified live against
+                // the running 2026-08 daemon). So SILENCE, not an `Error`, is
+                // the old-daemon signal, and the timeout has to say so — the
+                // bare "timed out" reads as a broken daemon.
+                let n = read_daemon_reply_chunk(&mut stream, &mut buf, deadline).map_err(|e| {
+                    anyhow::anyhow!(
+                        "{e}\nthis daemon predates usage reporting — restart it \
+                         (`systemctl --user restart amber`, or the app's \
+                         \"Restart amber daemon\")"
+                    )
+                })?;
                 if n == 0 {
                     anyhow::bail!(
                         "daemon closed the connection before replying \

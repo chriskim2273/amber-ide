@@ -95,9 +95,12 @@ route the server owns.
 
 ## Not verified here
 
-- **The desktop pill and dialog in a live GUI.** Component behaviour is covered
-  by `usagePanel.test.ts` / `usageView.test.ts`, and the bundle builds, but the
-  rendered toolbar was checked only after deployment to the real app.
+- **The desktop pill and dialog rendering.** Component behaviour is covered by
+  `usagePanel.test.ts` / `usageView.test.ts`, and the deployed AppImage's
+  `app.asar` was confirmed to contain the new code (`Plan usage`, `usage-pill`).
+  It has NOT been seen to paint: the machine's daemon still predates `GetUsage`,
+  so the pill is correctly hidden. First render happens on the next
+  `systemctl --user restart amber`.
 - **A real phone** over the tailnet (needs the user's device); the Pocket row is
   unit-tested and the payload it reads was verified over HTTP.
 - **macOS / Windows.** The collectors are portable std code (the `RunOutput`
@@ -108,9 +111,29 @@ route the server owns.
 
 ## Notes for the next reader
 
-- A running daemon must be **restarted** to answer `GetUsage`; an older one
-  replies `Error`, which the CLI surfaces as a message and the pill renders as
-  "unknown" (it hides rather than showing a zero).
+- A running daemon must be **restarted** to answer `GetUsage`. An older one
+  does not reply at all — its strict decoder rejects the unknown variant before
+  the match and the forward-compat path log-and-skips it, logging a ~1 KB
+  `skipping undecodable control frame` line per poll (measured live). The pill
+  stays hidden, `/api/usage` serves an empty list, and the CLI times out at 5 s
+  naming the cause:
+
+  ```
+  Error: timed out waiting for the daemon's reply
+  this daemon predates usage reporting — restart it (`systemctl --user restart amber`, …)
+  ```
 - `amber web` must likewise be restarted before `/api/usage` exists.
 - The claude token is read per poll, passed only as a `curl` argv element, and
   never logged, persisted, or placed in any frame or HTTP body.
+
+## Deployment (2026-09-01)
+
+Installed: `~/.local/bin/amber` (static-pie musl), `amber-web.service` restarted
+on it, and `~/Applications/amber-ide.AppImage` rebuilt and relaunched — the
+running mount now carries the new bundle (`resources/bin/amber` 4,027,296 bytes;
+`app.asar` contains `Plan usage` / `usage-pill`). The daemon restart was left to
+the user: this Claude session runs inside pane `amber-1-6-1-mtjebe3gb`, and
+restarting `amber.service` kills every pane's child.
+
+Two deploy-tooling bugs were found and fixed in the process — see the
+2026-09-01 "Deploy tooling fixes" entry in CLAUDE.md.
