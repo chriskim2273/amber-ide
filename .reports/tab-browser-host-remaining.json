@@ -55,7 +55,7 @@
       "id": "P1-pi-tools-and-approvals",
       "severity": "important",
       "status": "partial",
-      "work": "Phase-A observation/navigation is implemented and all six valid independent-review findings are remediated: incremental bounded AX traversal, post-operation authority revalidation with active aborts and replay reauthorization, single Host-owned reload/history generation, fixed untrusted-content labeling for text and binary images, cursor-relative ring gap accounting, and exact generated Pi extension install/compile/production-loader/runtime verification. Full /tmp-only gates are green. Independent re-review is pending, so acceptance remains blocked. Product remainder: semantic interactions, consequential classifier, approval digest/UI, and complete revoke/Stop Pi semantics."
+      "work": "Phase-A observation/navigation is implemented and every current independent-review finding is remediated. The re-review P1 now includes ordinary DOM text/StaticText through a fixed XPath union without full AX materialization: frontend node IDs are established by bounded DOM.getDocument(depth:0), candidates remain paged 32 at a time with one-node partial AX reads, script/style/noscript/template and whitespace-only text are excluded, ignored hidden text is dropped, AX identities are bounded-hash deduplicated, and all scan/depth/input/output budgets remain enforced. Production-shaped snapshot/wait plus hostile wide/deep/text/root tests and full /tmp gates are green. Final reviewer confirmation is pending, so acceptance remains blocked. Product remainder: semantic interactions, consequential classifier, approval digest/UI, and complete revoke/Stop Pi semantics."
     },
     {
       "id": "P1-workspace-contract",

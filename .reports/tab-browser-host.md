@@ -121,7 +121,13 @@ The five ordered follow-up findings are now remediated:
 
 Post-remediation full `/tmp`-only gates passed: app 821 tests with one intentional real-daemon skip; strict typecheck; Electron and hosted-web production builds; Rust all-target workspace tests 781 passed with one intentional delegated-cgroup ignore; workspace all-target warnings-as-errors clippy; exact generated Pi extension install/compile/runtime-load; and `git diff --check`. Build output stayed under `/tmp/amber-tab-browser-validation`. No production daemon was contacted.
 
-Phase A now stops for a new independent review. It is not accepted or merge-ready until that review passes; semantic interaction and approvals remain product work outside this remediation.
+The first Phase-A re-review found one additional P1: the bounded XPath only selected elements, so ordinary DOM text whose accessibility projection is `StaticText` could be absent. The remediation keeps incremental traversal and adds text nodes through a fixed XPath union. It excludes whitespace-only nodes and script/style/noscript/template subtrees before search results are returned; CSS-, `hidden`-, and ARIA-hidden text is discarded through the ignored AX projection. `DOM.getDocument(depth:0)` now establishes valid frontend node IDs before search (a real Electron 43 probe otherwise returned zero IDs). Each text/element candidate still uses one `DOM.describeNode` and one `Accessibility.getPartialAXTree(fetchRelatives:false)` call, with the same scan/depth/input/output limits. AX identities are SHA-256-deduplicated without retaining attacker-sized IDs, and references remain sequential snapshot-scoped opaque IDs.
+
+The production-shaped regression projects `<p>Ready</p>` as one `StaticText` node, proves `browser_wait` text succeeds, suppresses hidden text and duplicate AX nodes, and asserts the XPath exclusions. Hostile million-wide, over-depth, 600 KB partial-AX, and 600 KB document-root fixtures pin scan, depth, input, and output bounds. A no-daemon Electron 43/CDP probe under Xvfb confirmed the fixed XPath returns the real `P` plus `#text → StaticText "Ready"`, excludes script/style and whitespace text from search, and marks hidden/form text ignored.
+
+Post-P1 full `/tmp` gates passed: app 822 tests with one intentional real-daemon skip; strict typecheck; Electron and hosted-web builds; Rust all-target workspace tests 781 passed with one intentional delegated-cgroup ignore; warnings-as-errors workspace clippy; exact Pi extension install/compile/production-loader/runtime verification; and diff checks. No production daemon was contacted.
+
+Phase A now stops for final independent reviewer confirmation. It is not accepted or merge-ready until that review passes; semantic interaction and approvals remain product work outside this remediation.
 
 ## Open blocking work
 
