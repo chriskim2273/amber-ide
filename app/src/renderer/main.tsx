@@ -315,6 +315,11 @@ function App(): JSX.Element {
   const [notice, setNotice] = useState<string | null>(null)
   const [browserRecoveryOpen, setBrowserRecoveryOpen] = useState(false)
   const [browserRecovery, setBrowserRecovery] = useState<Array<{ index: number; workspace: number; tab: number; safeRestoreUrl: string }>>([])
+  useEffect(() => window.amber.onTabBrowserEvent?.((value) => {
+    const event = value as { type?: unknown; waiting?: unknown }
+    if (event.type === 'capacity-wait' && event.waiting === true) setNotice('Waiting for browser capacity…')
+    else if (event.type === 'capacity-wait' && event.waiting === false) setNotice((current) => current === 'Waiting for browser capacity…' ? null : current)
+  }), [])
   type ProductivityOverlay = 'palette' | 'search' | 'recovery' | 'templates' | 'bookmarks' | 'presets' | 'checkpoints' | 'project'
   const [productivityOverlay, setProductivityOverlay] = useState<ProductivityOverlay | null>(null)
   const [productivity, setProductivity] = useState<ProductivityFile>(emptyProductivity)
@@ -1411,8 +1416,11 @@ function App(): JSX.Element {
       (n, cb) => { dumpResolvers.current.set(n, cb) },
       (n) => { dumpResolvers.current.delete(n) },
     )
-    const snapshotReply = window.amber.snapshotWorkspaceBrowsers
-      ? await window.amber.snapshotWorkspaceBrowsers() as { ok?: boolean; result?: Record<string, { mode: 'preview' | 'browse'; safeRestoreUrl: string; viewport: { width: number; height: number } }> }
+    const hasBrowserRails = wsList.some((workspace) => workspace.tabs.some((tab) => !!layoutRef.current.workspaces[String(workspace.ws)]?.tabs[String(tab.tab)]?.browser))
+    const snapshotReply = hasBrowserRails
+      ? window.amber.snapshotWorkspaceBrowsers
+        ? await window.amber.snapshotWorkspaceBrowsers() as { ok?: boolean; result?: Record<string, { mode: 'preview' | 'browse'; safeRestoreUrl: string; viewport: { width: number; height: number } }> }
+        : { ok: false }
       : { ok: true, result: {} }
     const browserSnapshots = requireWorkspaceBrowserSnapshots(snapshotReply)
     return { doc: assembleSave(scope, saveModel(wsList, browserSnapshots), layoutRef.current, captured.dumps), stragglers: captured.stragglers }
