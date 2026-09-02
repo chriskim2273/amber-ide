@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { connect } from 'node:net'
-import { authorizeBrowserRequest, isEligiblePiController, parseBrokerRequest, TabBrowserBrokerServer } from './tabBrowserBroker'
+import { authorizeBrowserRequest, dispatchAttachedBrokerAction, isEligiblePiController, parseBrokerRequest, TabBrowserBrokerServer } from './tabBrowserBroker'
 import type { LayoutFile } from '../shared/layoutFile'
 
 const cleanup: string[] = []
@@ -12,6 +12,16 @@ afterEach(async () => { for (const path of cleanup.splice(0)) await rm(path, { r
 const layout: LayoutFile = { version: 2, activeWorkspace: 1, workspaces: { '1': { activeTab: 1, tabs: { '2': { tree: null, browser: { id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', width: 420, collapsed: false, designatedPi: 'amber-1-2-0-pane', sharedWithPi: true } } } } } }
 
 describe('tab browser broker boundary', () => {
+  it('forwards stop cancellation and fresh authorization to the service queue', async () => {
+    const controller = new AbortController(); const validator = () => false
+    let captured: unknown[] = []
+    await dispatchAttachedBrokerAction({ type: 'stop' }, 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', controller.signal, validator,
+      async (...args) => { captured = args; return {} })
+    expect(captured[0]).toEqual({ type: 'stop', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' })
+    expect(captured[1]).toBe(controller.signal)
+    expect(captured[2]).toBe(validator)
+  })
+
   it('strictly parses bounded typed requests', () => {
     expect(parseBrokerRequest({ version: 1, clientInstanceId: 'client-01', sequence: 1, requestId: 'r1', amberSession: 'amber-1-2-0-pane', action: { type: 'status' } }).action).toEqual({ type: 'status' })
     expect(() => parseBrokerRequest({ version: 1, clientInstanceId: 'client-01', sequence: 1, requestId: 'r1', amberSession: 'amber-1-2-0-pane', action: { type: 'cdp' } })).toThrow('INVALID_REQUEST')

@@ -73,7 +73,7 @@ import {
 } from './routerService'
 import { inspectLinuxInputMethod, repairLinuxInputMethod, resolveLinuxInputEnvironment } from './inputMethod'
 import { TabBrowserService, parseTabBrowserCommand, stageWorkspaceBrowserState } from './tabBrowserService'
-import { TabBrowserBrokerServer, authorizeBrowserRequest, isEligiblePiController, type BrokerRequest } from './tabBrowserBroker'
+import { TabBrowserBrokerServer, authorizeBrowserRequest, dispatchAttachedBrokerAction, isEligiblePiController, type BrokerRequest } from './tabBrowserBroker'
 import { BrowserDaemonWatcher } from './browserDaemonWatcher'
 import { Connection } from '../client/connection'
 import { TabBrowserStateStore } from './tabBrowserStateStore'
@@ -1295,8 +1295,6 @@ async function main(): Promise<void> {
       }
       const authorized = authorizeBrowserRequest(current, request.amberSession)
       const id = authorized.browserId!
-      if (request.action.type === 'status') return tabBrowser.command({ type: 'status', id })
-      if (request.action.type === 'stop') return tabBrowser.command({ type: 'stop', id })
       const stillAuthorized = async (): Promise<boolean> => {
         const latestController = browserDaemonWatcher?.controller(request.amberSession)
         if (!isEligiblePiController(latestController)) return false
@@ -1304,7 +1302,8 @@ async function main(): Promise<void> {
         if (!latest.text) return false
         try { return authorizeBrowserRequest(parseLayout(latest.text), request.amberSession).browserId === id } catch { return false }
       }
-      return tabBrowser.command({ type: 'navigate', id, url: request.action.url, pageIncarnation: request.action.pageIncarnation, expectedGeneration: request.action.expectedGeneration }, signal, stillAuthorized)
+      return dispatchAttachedBrokerAction(request.action, id, signal, stillAuthorized,
+        (command, actionSignal, validate) => tabBrowser.command(command, actionSignal, validate))
     }
     const runtime = process.env['XDG_RUNTIME_DIR'] ?? tmpdir()
     const socketPath = process.env['AMBER_BROWSER_HOST_SOCKET'] ?? join(runtime, 'amber-ide', 'browser-host.sock')

@@ -152,9 +152,17 @@ export class TabBrowserService {
 
   private async runCommand(command: TabBrowserCommand, signal?: AbortSignal, validate?: () => boolean | Promise<boolean>): Promise<BrowserRuntimeStatus | { closed: true }> {
     if (validate && !(await validate())) throw new Error('STALE_BROWSER_CONTEXT')
+    if (signal?.aborted) throw new Error('ACTION_CANCELLED')
     switch (command.type) {
       case 'open': {
-        const opened = await this.host.open({ visible: true }, signal, validate); await this.schedulePersist(); return opened.status
+        try {
+          const opened = await this.host.open({ visible: true }, signal, validate); await this.schedulePersist(); return opened.status
+        } catch (error) {
+          // Capacity waiting can persist a provisional record through host events.
+          // Do not reject until the compensating deletion is durable.
+          await this.schedulePersist()
+          throw error
+        }
       }
       case 'show': {
         const before = this.host.status(command.id).stateRevision

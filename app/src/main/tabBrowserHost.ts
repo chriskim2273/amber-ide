@@ -108,9 +108,11 @@ export class TabBrowserHost {
       activation = await this.capacity.activateQueued(id, at, signal, (waiting) => this.capacityEvent(id, waiting))
       if (validate && !(await validate())) throw new Error('STALE_BROWSER_CONTEXT')
       if (signal?.aborted) throw new Error('ACTION_CANCELLED')
-    } catch (error) { this.capacity.settleActivation(id); delete this.state.records[id]; this.onStateChange(); throw error }
-    if (activation.freeze && isOpaqueBrowserId(activation.freeze)) this.freeze(activation.freeze)
-    const runtime = this.makeRuntime(id)
+    } catch (error) { this.capacity.rollbackActivation(id); delete this.state.records[id]; this.onStateChange(); throw error }
+    if (activation.freeze && isOpaqueBrowserId(activation.freeze)) { this.capacity.markAdmissionVictimFrozen(id); this.freeze(activation.freeze) }
+    let runtime: Runtime
+    try { runtime = this.makeRuntime(id) }
+    catch (error) { this.capacity.rollbackActivation(id); delete this.state.records[id]; this.onStateChange(); throw error }
     this.capacity.settleActivation(id)
     if (options.visible) {
       for (const [otherId, other] of this.runtimes) if (otherId !== id) { other.page.hide(); this.capacity.protect(otherId, false) }
@@ -197,12 +199,13 @@ export class TabBrowserHost {
     const activation = await this.capacity.activateQueued(record.id, this.now(), signal, (waiting) => this.capacityEvent(record.id, waiting))
     if (validate) {
       let valid = false
-      try { valid = await validate() } catch (error) { this.capacity.settleActivation(record.id); throw error }
-      if (!valid) { this.capacity.settleActivation(record.id); throw new Error('STALE_BROWSER_CONTEXT') }
+      try { valid = await validate() } catch (error) { this.capacity.rollbackActivation(record.id); throw error }
+      if (!valid) { this.capacity.rollbackActivation(record.id); throw new Error('STALE_BROWSER_CONTEXT') }
     }
-    if (signal?.aborted) { this.capacity.settleActivation(record.id); throw new Error('ACTION_CANCELLED') }
-    if (activation.freeze && isOpaqueBrowserId(activation.freeze)) this.freeze(activation.freeze)
-    const runtime = this.makeRuntime(record.id)
+    if (signal?.aborted) { this.capacity.rollbackActivation(record.id); throw new Error('ACTION_CANCELLED') }
+    if (activation.freeze && isOpaqueBrowserId(activation.freeze)) { this.capacity.markAdmissionVictimFrozen(record.id); this.freeze(activation.freeze) }
+    let runtime: Runtime
+    try { runtime = this.makeRuntime(record.id) } catch (error) { this.capacity.rollbackActivation(record.id); this.onStateChange(); throw error }
     record.lifecycle = 'live'; record.stateRevision += 1
     try {
       if (record.safeRestoreUrl !== 'about:blank') await runtime.page.loadURL(record.safeRestoreUrl)
@@ -259,6 +262,9 @@ export class TabBrowserHost {
     this.runtimes.delete(record.id); this.capacity.markFrozen(record.id)
     delete this.state.records[record.id]
   }
+
+  /** Current renderer-capacity membership; used to prove admission compensation. */
+  liveIds(): string[] { return this.capacity.liveIds() }
 
   workspaceSnapshot(): Record<string, { mode: 'preview' | 'browse'; safeRestoreUrl: string; viewport: { width: number; height: number } }> {
     const out: Record<string, { mode: 'preview' | 'browse'; safeRestoreUrl: string; viewport: { width: number; height: number } }> = {}

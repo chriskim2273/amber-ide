@@ -3,6 +3,7 @@ import { mkdir, open, readFile, unlink, lstat } from 'node:fs/promises'
 import { randomBytes } from 'node:crypto'
 import { dirname } from 'node:path'
 import type { LayoutFile } from '../shared/layoutFile'
+import type { TabBrowserCommand } from './tabBrowserService'
 
 export type BrokerAction =
   | { type: 'open' }
@@ -44,6 +45,19 @@ function paneLocation(name: string): { ws: number; tab: number } | null {
   const match = /^amber-(\d+)-(\d+)-(\d+)-[A-Za-z0-9]+$/.exec(name)
   if (!match) return null
   return { ws: Number(match[1]), tab: Number(match[2]) }
+}
+
+export function dispatchAttachedBrokerAction(
+  action: BrokerAction,
+  id: string,
+  signal: AbortSignal,
+  stillAuthorized: () => boolean | Promise<boolean>,
+  dispatch: (command: TabBrowserCommand, signal?: AbortSignal, validate?: () => boolean | Promise<boolean>) => Promise<unknown>,
+): Promise<unknown> {
+  if (action.type === 'status') return dispatch({ type: 'status', id })
+  if (action.type === 'stop') return dispatch({ type: 'stop', id }, signal, stillAuthorized)
+  if (action.type === 'navigate') return dispatch({ type: 'navigate', id, url: action.url, pageIncarnation: action.pageIncarnation, expectedGeneration: action.expectedGeneration }, signal, stillAuthorized)
+  return Promise.reject(new Error('INVALID_REQUEST'))
 }
 
 export function authorizeBrowserRequest(layout: LayoutFile, amberSession: string, solicitation = false): { ws: number; tab: number; browserId?: string } {

@@ -44,6 +44,23 @@ describe('four-live capacity', () => {
     c.protectFor('b', 'approval', false)
     await expect(second).resolves.toEqual({ freeze: 'b' })
   })
+  it('atomically rolls back a selected victim, but never revives one already frozen', async () => {
+    const selected = new BrowserCapacity(2)
+    selected.markLive('a', 1); selected.markLive('b', 2)
+    await expect(selected.activateQueued('c', 3)).resolves.toEqual({ freeze: 'a' })
+    expect(selected.liveIds()).toEqual(['b', 'c'])
+    selected.rollbackActivation('c')
+    expect(selected.liveIds()).toEqual(['b', 'a'])
+    await expect(selected.activateQueued('d', 4)).resolves.toEqual({ freeze: 'a' })
+
+    const frozen = new BrowserCapacity(1)
+    frozen.markLive('a', 1)
+    await expect(frozen.activateQueued('c', 2)).resolves.toEqual({ freeze: 'a' })
+    frozen.markAdmissionVictimFrozen('c'); frozen.markFrozen('a')
+    frozen.rollbackActivation('c')
+    expect(frozen.liveIds()).toEqual([])
+  })
+
   it('bounds the activation queue, joins one browser, cancels, and times out deterministically', async () => {
     vi.useFakeTimers()
     const c = new BrowserCapacity(1, 10_000, 2)

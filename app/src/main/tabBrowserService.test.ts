@@ -52,6 +52,20 @@ describe('TabBrowserService dispatch authorization', () => {
     expect(calls).toBe(1)
   })
 
+  it('rejects a queued stop after authorization is lost without stopping the page', async () => {
+    const state = emptyBrowserState(1); let release!: () => void; let stopped = 0
+    const blocked = new Promise<void>((resolve) => { release = resolve })
+    const host = { navigate: async () => { await blocked; return { id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', stateRevision: 1 } }, stop: () => { stopped += 1; return { id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', stateRevision: 2 } }, snapshot: () => state }
+    const Service = TabBrowserService as unknown as new (s: TabBrowserStateStore, p: { setWindow: () => void }, h: typeof host, i: typeof state) => TabBrowserService
+    const service = new Service({ update: async () => state } as unknown as TabBrowserStateStore, { setWindow: () => {} }, host, state)
+    const first = service.command({ type: 'navigate', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', url: 'https://example.test/', pageIncarnation: 'page', expectedGeneration: 1 })
+    const controller = new AbortController()
+    const queued = service.command({ type: 'stop', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' }, controller.signal, () => false)
+    release(); await first
+    await expect(queued).rejects.toThrow('STALE_BROWSER_CONTEXT')
+    expect(stopped).toBe(0)
+  })
+
   it('revalidates queued bounds at dispatch rather than at enqueue', async () => {
     const state = emptyBrowserState(1); let release!: () => void; let boundsCalls = 0
     const blocked = new Promise<void>((resolve) => { release = resolve })
@@ -79,9 +93,11 @@ describe('TabBrowserService dispatch authorization', () => {
     const waiting = service.command({ type: 'open' }, undefined, () => current)
     await Promise.resolve(); current = false; host.protectApproval(ids[0]!, false)
     await expect(waiting).rejects.toThrow('STALE_BROWSER_CONTEXT')
-    await (service as unknown as { schedulePersist: () => Promise<void> }).schedulePersist()
+    expect(host.liveIds().sort()).toEqual([...ids].sort())
     expect(Object.keys(host.snapshot().records)).toHaveLength(4)
     expect(Object.keys(disk.records)).toHaveLength(4)
+    const subsequent = await service.command({ type: 'open' }, undefined, () => true)
+    expect(subsequent).toHaveProperty('id')
   })
 })
 
