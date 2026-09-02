@@ -92,6 +92,7 @@ export class BrowserAutomation {
   private attachedByUs = false
   private listenerInstalled = false
   private domainsEnabled = false
+  private setupPromise: Promise<void> | null = null
   private snapshotCache: SnapshotCache | null = null
   private readonly consoleRing: BoundedRing
   private readonly networkRing: BoundedRing
@@ -114,7 +115,14 @@ export class BrowserAutomation {
     this.disposed = true; this.snapshotCache = null; this.requests.clear(); this.activeRequests = 0
     if (this.attachedByUs && this.transport.isAttached()) { try { this.transport.detach?.() } catch { /* page teardown is best-effort */ } }
   }
-  async ensureAttached(): Promise<void> {
+  ensureAttached(): Promise<void> {
+    if (this.setupPromise) return this.setupPromise
+    const setup = this.attachAndEnable()
+    this.setupPromise = setup
+    void setup.then(() => { if (this.setupPromise === setup) this.setupPromise = null }, () => { if (this.setupPromise === setup) this.setupPromise = null })
+    return setup
+  }
+  private async attachAndEnable(): Promise<void> {
     if (this.disposed) throw new Error('PAGE_CLOSED')
     let newlyAttached = false
     if (!this.transport.isAttached()) { await this.transport.attach('1.3'); if (this.disposed) { this.transport.detach?.(); throw new Error('PAGE_CLOSED') }; this.attachedByUs = true; newlyAttached = true; this.domainsEnabled = false }

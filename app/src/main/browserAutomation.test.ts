@@ -5,7 +5,8 @@ class FakeDebugger implements BrowserDebuggerTransport {
   attached = false
   listeners: Array<(method: string, params: Record<string, unknown>) => void> = []
   calls: string[] = []
-  async attach(): Promise<void> { this.attached = true }
+  attachCalls = 0
+  async attach(): Promise<void> { this.attachCalls += 1; this.attached = true }
   detach(): void { this.attached = false }
   isAttached(): boolean { return this.attached }
   onMessage(listener: (method: string, params: Record<string, unknown>) => void): void { this.listeners.push(listener) }
@@ -90,6 +91,14 @@ describe('browser automation', () => {
     const network = automation.networkSince(undefined, 20, false)
     expect(JSON.stringify(network)).toContain('https://example.test/a')
     expect(JSON.stringify(network)).not.toMatch(/user:pass|token=|Authorization|never/)
+  })
+
+  it('coalesces concurrent debugger setup onto one target-scoped attachment', async () => {
+    const transport = new FakeDebugger()
+    const automation = new BrowserAutomation(transport, () => 'about:blank', () => false)
+    await Promise.all([automation.ensureAttached(), automation.ensureAttached()])
+    expect(transport.attachCalls).toBe(1)
+    expect(transport.listeners).toHaveLength(1)
   })
 
   it('uses only a fixed allowlist of debugger methods and supports cancellation', async () => {
