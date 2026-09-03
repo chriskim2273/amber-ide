@@ -356,6 +356,27 @@ describe('TabBrowserHost', () => {
     expect(host.snapshot().records[opened.status.id]?.previewOrigins).toBeUndefined()
   })
 
+  it.each(['close', 'crash'] as const)('does not resurrect an admission victim after deferred validation and %s', async (failure) => {
+    let now = 0
+    const host = new TabBrowserHost(emptyBrowserState(1), factory, () => ++now)
+    const initial = [] as Array<{ id: string }>
+    for (let index = 0; index < 4; index++) initial.push((await host.open({ visible: false })).status)
+    const victim = initial[0]!.id
+    let resolveValidation!: (valid: boolean) => void
+    const pending = host.open({ visible: false }, undefined, () => new Promise<boolean>((resolve) => { resolveValidation = resolve }))
+    await vi.waitFor(() => expect(resolveValidation).toBeTypeOf('function'))
+    if (failure === 'close') host.close(victim)
+    else pageEvents.get(victim)!({ type: 'crashed', reason: 'simulated crash' })
+    resolveValidation(false)
+    await expect(pending).rejects.toThrow('STALE_BROWSER_CONTEXT')
+    const expected = initial.slice(1).map((entry) => entry.id).sort()
+    expect(host.liveIds().sort()).toEqual(expected)
+    const next = (await host.open({ visible: false })).status.id
+    expect(host.liveIds().sort()).toEqual([...expected, next].sort())
+    if (failure === 'close') expect(() => host.status(victim)).toThrow('NO_BROWSER_FOR_TAB')
+    else expect(host.status(victim).lifecycle).toBe('frozen')
+  })
+
   it('stops an active page load without closing the browser', async () => {
     const host = new TabBrowserHost(emptyBrowserState(1), factory)
     const opened = await host.open({ visible: true })

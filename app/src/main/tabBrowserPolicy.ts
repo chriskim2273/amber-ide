@@ -70,7 +70,14 @@ export class BrowserCapacity {
   private readonly admissions = new Map<string, CapacityAdmission>()
   constructor(private readonly maxLive = 4, private readonly waitMs = 10_000, private readonly maxQueue = 8) {}
   markLive(id: string, lastUsedAt: number): void { this.live.set(id, { lastUsedAt, protections: this.live.get(id)?.protections ?? new Set() }) }
-  markFrozen(id: string): void { this.live.delete(id); this.drain() }
+  markFrozen(id: string): void {
+    this.live.delete(id)
+    // Admission is allowed to defer validation while the selected victim is
+    // being frozen. If the victim closes or crashes in that window, rollback
+    // must not turn its old capacity entry into a phantom renderer.
+    for (const admission of this.admissions.values()) if (admission.victim?.id === id) admission.victimFrozen = true
+    this.drain()
+  }
   protect(id: string, protectedValue: boolean): void { this.protectFor(id, 'visible', protectedValue) }
   protectFor(id: string, reason: 'visible' | 'operation' | 'approval' | 'activation', protectedValue: boolean): void {
     const value = this.live.get(id)
