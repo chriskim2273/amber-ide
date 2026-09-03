@@ -11,9 +11,13 @@ class FakeConnection implements MetadataConnection {
   connect(): void {}
   send(frame: Frame): void { this.sent.push(frame) }
   close(): void { this.closed = true }
-  emit(event: 'open'|'close', value?: never): void
-  emit(event: 'frame', value: Frame): void
-  emit(event: 'open'|'close'|'frame', value?: Frame): void { for (const cb of this.callbacks[event]) cb(value) }
+  emit(event: 'open'|'close', epoch?: number): void
+  emit(event: 'frame', value: Frame, epoch?: number): void
+  emit(event: 'open'|'close'|'frame', value?: Frame | number, epoch?: number): void {
+    const frame = typeof value === 'number' ? undefined : value
+    const eventEpoch = typeof value === 'number' ? value : epoch
+    for (const cb of this.callbacks[event]) event === 'frame' ? cb(frame, eventEpoch) : cb(eventEpoch)
+  }
 }
 
 const sessions = (items: unknown[]): Frame => ({ type: 'control', msg: { kind: 'Sessions', sessions: items as never[] } })
@@ -67,5 +71,30 @@ describe('BrowserDaemonWatcher', () => {
     expect(connection.sent.at(-1)).toEqual({ type: 'control', msg: { kind: 'ListSessionsDetailed' } })
     watcher.close(); expect(connection.closed).toBe(true)
     vi.useRealTimers()
+  })
+
+  it('ignores old socket events after a newer connection epoch takes over', () => {
+    const connection = new FakeConnection(); const watcher = new BrowserDaemonWatcher(connection)
+    watcher.start(); connection.emit('open', 1)
+    connection.emit('frame', sessions([{ name: 'old', cwd: '/', kind: 'pi', alive: true }]), 1)
+    expect(watcher.controller('old')).toBeDefined()
+    connection.emit('open', 2)
+    connection.emit('frame', sessions([{ name: 'stale', cwd: '/', kind: 'pi', alive: true }]), 1)
+    connection.emit('close', 1)
+    expect(watcher.controller('stale')).toBeUndefined()
+    connection.emit('frame', sessions([{ name: 'new', cwd: '/', kind: 'pi', alive: true }]), 2)
+    expect(watcher.controller('new')).toBeDefined()
+    expect(watcher.controller('old')).toBeUndefined()
+  })
+
+  it('cannot restore readiness or authority from callbacks delivered after close', async () => {
+    const connection = new FakeConnection(); const watcher = new BrowserDaemonWatcher(connection)
+    watcher.start(); connection.emit('open', 7)
+    const ready = watcher.waitForFresh(1000)
+    watcher.close()
+    connection.emit('open', 7)
+    connection.emit('frame', sessions([{ name: 'late', cwd: '/', kind: 'pi', alive: true }]), 7)
+    await expect(ready).resolves.toBe(false)
+    expect(watcher.controller('late')).toBeUndefined()
   })
 })

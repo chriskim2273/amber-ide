@@ -2,8 +2,9 @@ import type { Frame, SessionInfo } from '../shared/proto'
 import type { ControllerSession } from './tabBrowserBroker'
 
 export interface MetadataConnection {
-  on(event: 'frame', cb: (frame: Frame) => void): void
-  on(event: 'open' | 'close', cb: () => void): void
+  /** The epoch is the socket generation allocated by the production Connection. */
+  on(event: 'frame', cb: (frame: Frame, epoch?: number) => void): void
+  on(event: 'open' | 'close', cb: (epoch?: number) => void): void
   connect(): void
   send(frame: Frame): void
   close(): void
@@ -19,6 +20,7 @@ export class BrowserDaemonWatcher {
   private readonly freshWaiters = new Set<(ready: boolean) => void>()
   private started = false
   private closed = false
+  private activeEpoch = 0
 
   constructor(
     private readonly connection: MetadataConnection,
@@ -26,22 +28,36 @@ export class BrowserDaemonWatcher {
     private readonly freshnessMs = 5_000,
     private readonly pollMs = 2_000,
   ) {
-    connection.on('open', () => this.onOpen())
-    connection.on('close', () => this.onClose())
-    connection.on('frame', (frame) => this.onFrame(frame))
+    connection.on('open', (epoch) => this.onOpen(epoch))
+    connection.on('close', (epoch) => this.onClose(epoch))
+    connection.on('frame', (frame, epoch) => this.onFrame(frame, epoch))
   }
 
-  start(): void { this.started = true; this.closed = false; this.connection.connect() }
+  start(): void {
+    if (this.started || this.closed) return
+    this.started = true; this.connection.connect()
+  }
 
-  private onOpen(): void {
-    this.connected = true; this.hasFullList = false; this.sessions.clear()
+  private onOpen(epoch?: number): void {
+    if (this.closed) return
+    const nextEpoch = epoch ?? this.activeEpoch + 1
+    if (nextEpoch < this.activeEpoch) return
+    this.activeEpoch = nextEpoch
+    this.connected = true; this.hasFullList = false; this.fullListAt = 0; this.sessions.clear()
     this.connection.send({ type: 'control', msg: { kind: 'WatchSessions' } })
     this.connection.send({ type: 'control', msg: { kind: 'ListSessionsDetailed' } })
     if (this.timer) clearInterval(this.timer)
-    this.timer = setInterval(() => this.connection.send({ type: 'control', msg: { kind: 'ListSessionsDetailed' } }), this.pollMs)
+    const sourceEpoch = this.activeEpoch
+    this.timer = setInterval(() => {
+      if (!this.closed && this.connected && this.activeEpoch === sourceEpoch) this.connection.send({ type: 'control', msg: { kind: 'ListSessionsDetailed' } })
+    }, this.pollMs)
   }
 
-  private onClose(): void {
+  private onClose(epoch?: number): void {
+    if (this.closed) return
+    const sourceEpoch = epoch ?? this.activeEpoch
+    if (sourceEpoch < this.activeEpoch) return
+    this.activeEpoch = sourceEpoch
     this.connected = false; this.hasFullList = false; this.fullListAt = 0; this.sessions.clear()
     if (this.timer) clearInterval(this.timer)
     this.timer = null
@@ -54,8 +70,8 @@ export class BrowserDaemonWatcher {
     })
   }
 
-  private onFrame(frame: Frame): void {
-    if (frame.type !== 'control') return
+  private onFrame(frame: Frame, epoch?: number): void {
+    if (this.closed || !this.connected || (epoch !== undefined && epoch !== this.activeEpoch) || frame.type !== 'control') return
     if (frame.msg.kind === 'Sessions') {
       this.sessions.clear(); for (const info of frame.msg.sessions) this.set(info)
       this.hasFullList = true; this.fullListAt = this.now()
@@ -80,12 +96,15 @@ export class BrowserDaemonWatcher {
   }
 
   controller(name: string): ControllerSession | undefined {
-    if (!this.connected || !this.hasFullList || this.now() - this.fullListAt > this.freshnessMs) return undefined
+    if (this.closed || !this.connected || !this.hasFullList || this.now() - this.fullListAt > this.freshnessMs) return undefined
     return this.sessions.get(name)
   }
 
   close(): void {
-    this.closed = true; this.onClose()
+    if (this.closed) return
+    this.closed = true; this.connected = false; this.hasFullList = false; this.fullListAt = 0; this.sessions.clear()
+    if (this.timer) clearInterval(this.timer)
+    this.timer = null
     for (const resolve of this.freshWaiters) resolve(false)
     this.freshWaiters.clear(); this.connection.close()
   }
