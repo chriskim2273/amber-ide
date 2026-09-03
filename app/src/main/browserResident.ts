@@ -187,24 +187,34 @@ export async function clearBrowserHostInhibit(root: string): Promise<void> {
 export interface BrowserHostQuitDeps {
   writeInhibit: () => Promise<void>
   beginDrain: () => void
-  flushAndDestroy: () => Promise<void>
+  flushAndDestroy: (signal: AbortSignal) => Promise<void>
   closeBroker: () => Promise<void>
   closeWatcher: () => void
   closeWindows: () => void
 }
 
 export async function coordinateBrowserHostQuit(deps: BrowserHostQuitDeps, timeoutMs = 5_000): Promise<{ ok: true } | { ok: false; error: 'QUIT_DRAIN_TIMEOUT' | 'QUIT_DRAIN_FAILED' }> {
+  let flushController: AbortController | undefined
   try {
     await deps.writeInhibit()
     deps.beginDrain()
+    flushController = new AbortController()
     let timer: NodeJS.Timeout | undefined
-    const timeout = new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error('QUIT_DRAIN_TIMEOUT')), timeoutMs) })
-    try { await Promise.race([deps.flushAndDestroy(), timeout]) } finally { if (timer) clearTimeout(timer) }
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        flushController?.abort()
+        reject(new Error('QUIT_DRAIN_TIMEOUT'))
+      }, timeoutMs)
+    })
+    try { await Promise.race([deps.flushAndDestroy(flushController.signal), timeout]) }
+    catch (error) { flushController.abort(); throw error }
+    finally { if (timer) clearTimeout(timer) }
     await deps.closeBroker()
     deps.closeWatcher()
     deps.closeWindows()
     return { ok: true }
   } catch (error) {
+    flushController?.abort()
     return { ok: false, error: error instanceof Error && error.message === 'QUIT_DRAIN_TIMEOUT' ? 'QUIT_DRAIN_TIMEOUT' : 'QUIT_DRAIN_FAILED' }
   }
 }

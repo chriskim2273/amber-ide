@@ -396,6 +396,23 @@ export class TabBrowserHost {
     return status
   }
 
+  /** Reconcile the host with a browser-association transaction already committed to disk. */
+  syncCommittedBrowser(recoveryId: RecoveryId, committed: BrowserRecord): BrowserRuntimeStatus {
+    if (!isOpaqueBrowserId(committed.id)) throw new Error('BROWSER_ID_COLLISION')
+    const current = this.state.records[committed.id]
+    if (current && (current.profileId !== committed.profileId || current.mode !== committed.mode || current.safeRestoreUrl !== committed.safeRestoreUrl
+      || current.viewport.width !== committed.viewport.width || current.viewport.height !== committed.viewport.height)) throw new Error('BROWSER_ID_COLLISION')
+    let changed = false
+    if (!current) {
+      const record = structuredClone(committed); record.lifecycle = 'frozen'
+      this.state.records[record.id] = record; changed = true
+    }
+    const recoveryIndex = this.state.migrationRecovery.findIndex((item) => item.id === recoveryId)
+    if (recoveryIndex >= 0) { this.state.migrationRecovery.splice(recoveryIndex, 1); changed = true }
+    if (changed) this.onStateChange()
+    return this.status(committed.id)
+  }
+
   importWorkspace(entries: { id: BrowserId; browser: WsBrowser }[], recovery: { id: RecoveryId; ws: number; tab: number; browser: WsBrowser }[]): BrowserRuntimeStatus[] {
     if (entries.some((entry) => this.state.records[entry.id])) throw new Error('BROWSER_ID_COLLISION')
     if (this.state.migrationRecovery.length + recovery.length > 100) throw new Error('BROWSER_RECOVERY_LIMIT')

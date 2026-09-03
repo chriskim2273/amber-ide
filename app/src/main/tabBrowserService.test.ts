@@ -86,6 +86,26 @@ describe('TabBrowserService dispatch authorization', () => {
     service.cancelDrain()
   })
 
+  it('cancels a timed-out flush before late completion can freeze pages, then permits a later quit', async () => {
+    const state = emptyBrowserState(1); let release!: () => void; let navigateCalls = 0; let freezes = 0
+    const host = {
+      navigate: async () => { navigateCalls += 1; return new Promise((resolve) => { release = () => resolve({ id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' }) }) },
+      snapshot: () => state, pendingLoadCount: () => 0, liveIds: () => [], freezeAll: () => { freezes += 1 },
+    }
+    const Service = TabBrowserService as unknown as new (s: TabBrowserStateStore, p: { setWindow: () => void }, h: typeof host, i: typeof state) => TabBrowserService
+    const service = new Service({ load: async () => state, update: async () => state } as unknown as TabBrowserStateStore, { setWindow: () => {} }, host, state)
+    const pending = service.command({ type: 'navigate', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', url: 'https://example.test/', pageIncarnation: 'page', expectedGeneration: 1 })
+    await vi.waitFor(() => expect(navigateCalls).toBe(1))
+    service.beginDrain()
+    const controller = new AbortController(); const flush = service.flushAndDestroy(controller.signal)
+    controller.abort()
+    await expect(flush).rejects.toThrow('ACTION_CANCELLED')
+    expect(freezes).toBe(0)
+    release(); await pending
+    service.cancelDrain(); service.beginDrain(); await service.flushAndDestroy()
+    expect(freezes).toBe(1)
+  })
+
   it('coalesces high-rate host status changes into a bounded renderer update', async () => {
     vi.useFakeTimers()
     try {
@@ -404,6 +424,50 @@ describe('TabBrowserService activation cancellation', () => {
 })
 
 describe('TabBrowserService recovery persistence', () => {
+  it('serializes recovery cleanup and syncs an already-committed attach after a racing delete', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'amber-recovery-attach-race-')); dirs.push(dir)
+    const store = new TabBrowserStateStore(dir)
+    const recoveryId = 'recovery-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' as const
+    const browserId = 'browser-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' as const
+    const initial: BrowserStateFile = { ...emptyBrowserState(1), migrationRecovery: [{ id: recoveryId, workspace: 1, tab: 2, safeRestoreUrl: 'https://recover.test/' }] }
+    const committed: BrowserStateFile = { ...initial, migrationRecovery: [], records: {
+      [browserId]: { id: browserId, profileId: 'global', mode: 'browse', safeRestoreUrl: 'https://recover.test/', title: '', viewport: { width: 1280, height: 800 }, lifecycle: 'frozen', stateRevision: 1, lastUsedAt: 1, lastFocusedAt: 0 },
+    } }
+    await store.save(committed)
+    let service!: TabBrowserService
+    const host = new TabBrowserHost(initial, { create: () => { throw new Error('not used') } }, Date.now, undefined,
+      () => { void (service as unknown as { schedulePersist: () => Promise<void> }).schedulePersist() })
+    const Service = TabBrowserService as unknown as new (s: TabBrowserStateStore, p: { setWindow: () => void }, h: TabBrowserHost, i: typeof initial) => TabBrowserService
+    service = new Service(store, { setWindow: () => {} }, host, initial)
+    const deleting = service.deleteRecovery(recoveryId)
+    const attaching = service.attachRecoveryCommitted(recoveryId, browserId)
+    await expect(deleting).resolves.toBeUndefined()
+    await expect(attaching).resolves.toMatchObject({ id: browserId, lifecycle: 'frozen' })
+    expect(host.status(browserId)).toMatchObject({ safeRestoreUrl: 'https://recover.test/' })
+  })
+
+  it('keeps recovery cleanup queued until committed host synchronization finishes', async () => {
+    const recoveryId = 'recovery-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' as const
+    const browserId = 'browser-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' as const
+    const state: BrowserStateFile = { ...emptyBrowserState(1), migrationRecovery: [{ id: recoveryId, workspace: 1, tab: 2, safeRestoreUrl: 'https://recover.test/' }] }
+    let releaseLoad!: () => void; let loadStarted!: () => void; let deletes = 0
+    const loadGate = new Promise<void>((resolve) => { releaseLoad = resolve }); const loaded = new Promise<void>((resolve) => { loadStarted = resolve })
+    const store = { load: async () => { loadStarted(); await loadGate; return state }, update: async () => {} } as unknown as TabBrowserStateStore
+    const status = { id: browserId, lifecycle: 'frozen', stateRevision: 1 } as unknown as ReturnType<TabBrowserHost['status']>
+    const host = { attachRecovery: () => status, deleteRecovery: () => { deletes += 1 }, snapshot: () => state }
+    const Service = TabBrowserService as unknown as new (s: TabBrowserStateStore, p: { setWindow: () => void }, h: typeof host, i: typeof state) => TabBrowserService
+    const service = new Service(store, { setWindow: () => {} }, host, state)
+    const attaching = service.attachRecoveryCommitted(recoveryId, browserId)
+    await loaded
+    const deleting = service.deleteRecovery(recoveryId)
+    await Promise.resolve()
+    expect(deletes).toBe(0)
+    releaseLoad()
+    await attaching
+    await deleting
+    expect(deletes).toBe(1)
+  })
+
   it('survives a service restart after deleting a recovery item', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'amber-recovery-delete-')); dirs.push(dir)
     const store = new TabBrowserStateStore(dir)

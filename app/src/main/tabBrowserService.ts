@@ -87,6 +87,7 @@ export function applyBrowserRuntimeDelta(current: BrowserStateFile, previous: Br
 
 export class TabBrowserService {
   private readonly browserQueues = new Map<string, Promise<void>>()
+  private recoveryQueue: Promise<void> = Promise.resolve()
   private readonly activationControllers = new Map<string, AbortController>()
   private eventSink: (event: unknown) => void = () => {}
   private persistQueue: Promise<void> = Promise.resolve()
@@ -100,6 +101,7 @@ export class TabBrowserService {
   private readonly observedGeneration = new Map<string, number>()
   private readonly latestPiActions = new Map<string, { type: 'pi-action'; browserId: string; controller: string; action: string; phase: 'started' | 'completed' | 'failed'; error?: string; at: number }>()
   private readonly pendingRuntimeEvents = new Map<string, unknown>()
+  private drainGeneration = 0
   private runtimeFlush: NodeJS.Timeout | null = null
   private approvalSurfaceVisible: (browserId: string) => boolean = () => false
   private approvalSurfaceReveal: (browserId: string) => void = () => {}
@@ -203,16 +205,35 @@ export class TabBrowserService {
 
   workspaceSnapshot(): ReturnType<TabBrowserHost['workspaceSnapshot']> { return this.host.workspaceSnapshot() }
   recoveryItems(): ReturnType<TabBrowserHost['recoveryItems']> { return this.host.recoveryItems() }
+  private enqueueRecovery<T>(work: () => Promise<T>): Promise<T> {
+    const result = this.recoveryQueue.then(work)
+    this.recoveryQueue = result.then(() => {}, () => {})
+    return result
+  }
   deleteRecovery(id: RecoveryId): Promise<void> {
-    return this.operations.run('recovery', async (signal) => { this.operations.assertDispatch(signal); this.host.deleteRecovery(id); await this.schedulePersist() })
+    return this.operations.run('recovery', (signal) => this.enqueueRecovery(async () => {
+      this.operations.assertDispatch(signal); this.host.deleteRecovery(id); await this.schedulePersist()
+    }))
   }
   attachRecovery(id: RecoveryId, browserId: BrowserId): Promise<BrowserRuntimeStatus> {
-    return this.operations.run('recovery', async (signal) => { this.operations.assertDispatch(signal); return this.attachRecoveryCommitted(id, browserId) })
+    return this.operations.run('recovery', (signal) => this.enqueueRecovery(async () => {
+      this.operations.assertDispatch(signal); return this.attachRecoveryCommittedUnsafe(id, browserId)
+    }))
   }
-  async attachRecoveryCommitted(id: RecoveryId, browserId: BrowserId): Promise<BrowserRuntimeStatus> {
+  attachRecoveryCommitted(id: RecoveryId, browserId: BrowserId): Promise<BrowserRuntimeStatus> {
+    return this.enqueueRecovery(() => this.attachRecoveryCommittedUnsafe(id, browserId))
+  }
+  private async attachRecoveryCommittedUnsafe(id: RecoveryId, browserId: BrowserId): Promise<BrowserRuntimeStatus> {
     this.suppressPersist = true
-    try { return this.host.attachRecovery(id, browserId) }
-    finally {
+    try {
+      try { return this.host.attachRecovery(id, browserId) }
+      catch (error) {
+        if (!(error instanceof Error) || error.message !== 'NO_RECOVERY_ITEM') throw error
+        const committed = (await this.store.load()).records[browserId]
+        if (!committed) throw error
+        return this.host.syncCommittedBrowser(id, committed)
+      }
+    } finally {
       this.suppressPersist = false
       const loaded = await this.store.load(); this.persistedState = structuredClone(loaded)
     }
@@ -378,21 +399,40 @@ export class TabBrowserService {
 
   beginDrain(): void {
     if (this.draining) return
-    this.draining = true
+    this.draining = true; this.drainGeneration += 1
     this.operations.beginDrain()
     for (const controller of this.activationControllers.values()) controller.abort()
     this.approvals.clearAll(); this.dialogs.clearAll()
     for (const id of Object.keys(this.host.snapshot().records)) this.revokePi(id)
   }
 
-  cancelDrain(): void { this.draining = false; this.operations.cancelDrain() }
+  cancelDrain(): void {
+    if (!this.draining) return
+    this.draining = false; this.drainGeneration += 1; this.operations.cancelDrain()
+  }
 
-  async flushAndDestroy(): Promise<void> {
-    await this.operations.waitForEmpty()
-    await Promise.allSettled([...this.browserQueues.values()])
+  private async waitForDrain<T>(work: Promise<T>, signal: AbortSignal | undefined, generation: number): Promise<T> {
+    if (signal?.aborted || generation !== this.drainGeneration) throw new Error('ACTION_CANCELLED')
+    let abort: (() => void) | undefined
+    const cancelled = signal ? new Promise<never>((_resolve, reject) => {
+      abort = () => reject(new Error('ACTION_CANCELLED'))
+      signal.addEventListener('abort', abort, { once: true })
+    }) : null
+    try {
+      const result = cancelled ? await Promise.race([work, cancelled]) : await work
+      if (signal?.aborted || generation !== this.drainGeneration) throw new Error('ACTION_CANCELLED')
+      return result
+    } finally { if (abort) signal?.removeEventListener('abort', abort) }
+  }
+
+  async flushAndDestroy(signal?: AbortSignal): Promise<void> {
+    const generation = this.drainGeneration
+    await this.waitForDrain(this.operations.waitForEmpty(), signal, generation)
+    await this.waitForDrain(Promise.allSettled([...this.browserQueues.values()]), signal, generation)
     this.host.freezeAll()
-    await this.schedulePersist()
-    await this.persistQueue
+    await this.waitForDrain(this.schedulePersist(), signal, generation)
+    await this.waitForDrain(this.persistQueue, signal, generation)
+    if (signal?.aborted || generation !== this.drainGeneration) throw new Error('ACTION_CANCELLED')
     if (this.runtimeFlush) { clearTimeout(this.runtimeFlush); this.runtimeFlush = null }
     this.pendingRuntimeEvents.clear()
   }

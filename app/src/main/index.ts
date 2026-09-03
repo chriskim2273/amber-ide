@@ -1410,7 +1410,7 @@ async function main(): Promise<void> {
     const result = await coordinateBrowserHostQuit({
       writeInhibit: () => writeBrowserHostInhibit(stateRoot()),
       beginDrain: () => tabBrowser?.beginDrain(),
-      flushAndDestroy: () => tabBrowser?.flushAndDestroy() ?? Promise.resolve(),
+      flushAndDestroy: (signal) => tabBrowser?.flushAndDestroy(signal) ?? Promise.resolve(),
       closeBroker: () => tabBrowserBroker?.close() ?? Promise.resolve(),
       closeWatcher: () => { browserDaemonWatcher?.close(); browserDaemonWatcher = null },
       closeWindows: () => {

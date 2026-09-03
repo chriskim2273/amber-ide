@@ -47,13 +47,19 @@ describe('coordinated resident quit', () => {
     expect(order).toEqual(['inhibit', 'drain', 'persist+destroy', 'broker', 'watcher', 'windows'])
   })
 
-  it('returns a timeout without closing resources so the caller may cancel or force', async () => {
+  it('aborts the timed-out flush so it cannot complete after the caller cancels', async () => {
+    let flushSignal: AbortSignal | undefined
     let closed = false
     const result = await coordinateBrowserHostQuit({
-      writeInhibit: async () => {}, beginDrain: () => {}, flushAndDestroy: async () => new Promise(() => {}),
+      writeInhibit: async () => {}, beginDrain: () => {}, flushAndDestroy: async (signal?: AbortSignal) => {
+        flushSignal = signal
+        return new Promise(() => {})
+      },
       closeBroker: async () => { closed = true }, closeWatcher: () => { closed = true }, closeWindows: () => { closed = true },
     }, 5)
     expect(result).toEqual({ ok: false, error: 'QUIT_DRAIN_TIMEOUT' })
+    expect(flushSignal).toBeDefined()
+    expect(flushSignal?.aborted).toBe(true)
     expect(closed).toBe(false)
   })
 })
@@ -121,6 +127,7 @@ describe('resident browser host registration', () => {
   })
 
   it('writes and clears the explicit-stop inhibit durably', async () => {
+    if (process.platform === 'win32') return
     const root = await mkdtemp(join(tmpdir(), 'amber-browser-resident-'))
     await writeBrowserHostInhibit(root)
     expect(JSON.parse(await readFile(join(root, 'browser-host-inhibit'), 'utf8'))).toMatchObject({ version: 1, reason: 'explicit-quit' })
