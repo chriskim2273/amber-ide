@@ -54,8 +54,8 @@
     {
       "id": "P1-pi-tools-and-approvals",
       "severity": "important",
-      "status": "partial",
-      "work": "Phase A and Phase B implementation are complete. The latest independent re-review failures are remediated: collapsed/expanded authority is acknowledged by main only after an exact associated Host show and every hide/collapse/tab switch invalidates invisible work; approvals require both exact WindowCtx ownership and Host runtime visibility; dialogs bind browser incarnation, generation, request owner and cancellation signal and are invalidated by disconnect/cancel/stop/navigation/generation/revocation/surface loss; and the resident main service retains a bounded secret-safe latest Pi action that status replays across background activity and renderer remounts. Race tests cover hidden/collapsed approvals, cancellation-owned dialogs, stale dialog identity, and last-action replay/bounds. Focused and full /tmp gates are green, generated Pi extension v4 still passes exact production-loader checks, and no production daemon was contacted. The required independent re-review and external live/package/platform evidence remain pending, so this item stays partial and mergeReady stays false."
+      "status": "completed",
+      "work": "Phase A and Phase B are implemented and independently accepted. Reviewer run 44ad20dd-20fa-48a6-a244-d964d09a11a1 reported no issues and a PASS merge verdict after verifying exact collapse/show/hide/reveal authority, identity- and owner-bound dialogs, bounded last-action retention, pointer confinement, conservative classification and dual-target digests, replay tombstones, approval lifecycle, and strict Pi tool schemas. Generated Pi extension v4 still passes exact production-loader checks. External package/platform gates remain separate blockers, so mergeReady stays false."
     },
     {
       "id": "P1-workspace-contract",
@@ -73,7 +73,7 @@
       "id": "P1-rail-product-states",
       "severity": "important",
       "status": "partial",
-      "work": "Add host event subscription (no polling), raw current URL in user-only chrome, back/forward/reload/mode/viewport, activity/restore/capacity/approval/recovery states, keyboard divider and native-view overlay occlusion."
+      "work": "Implementation is complete and awaits independent review: authoritative main-owned runtime events are coalesced to one bounded latest update per browser; the local renderer alone receives the bounded raw current URL while broker status retains only the sanitized restore URL; the rail now provides back/forward/reload, explicit Preview/Browse metadata, fixed/custom/responsive viewport controls, native-page focus entry/exit, accessible pointer/keyboard resize, terminal-zoom and narrow-window collapse, and explicit SSH-window unavailability. It renders security/loading/focus/frozen/thaw/capacity/restore/diagnostic/Pi-action/approval/dialog/recovery state, and detaches the native view for rail menus plus visible Amber overlays. App 868 tests passed with one intentional real-daemon skip, strict typecheck and Electron/web builds passed; Rust 781 tests passed with one intentional delegated-cgroup ignore, all-target warnings-as-errors clippy and generated Pi extension verification passed. No production daemon was contacted."
     },
     {
       "id": "GATE-deployed-reader",

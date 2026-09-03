@@ -293,6 +293,24 @@ describe('browser automation', () => {
     await expect(automation.screenshot(lease, undefined, false, new AbortController().signal)).rejects.toThrow('REQUEST_LIMIT')
   })
 
+  it('batches diagnostics events instead of emitting one update per console/network event', async () => {
+    vi.useFakeTimers()
+    try {
+      const transport = new FakeDebugger(), diagnostics = vi.fn()
+      const automation = new BrowserAutomation(transport, () => 'about:blank', () => false, {}, { onDiagnostics: diagnostics })
+      await automation.ensureAttached()
+      const emit = transport.listeners[0]!
+      for (let index = 0; index < 20; index++) emit('Runtime.consoleAPICalled', { type: 'warning', args: [{ value: `warning ${index}` }] })
+      emit('Network.requestWillBeSent', { requestId: 'failed', request: { url: 'https://example.test', method: 'GET' }, type: 'XHR' })
+      emit('Network.loadingFailed', { requestId: 'failed', errorText: 'failed' })
+      expect(diagnostics).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(250)
+      expect(diagnostics).toHaveBeenCalledOnce()
+      expect(diagnostics).toHaveBeenCalledWith({ consoleIssues: 20, networkFailures: 1 })
+      automation.dispose()
+    } finally { vi.useRealTimers() }
+  })
+
   it('bounds and redacts console/network rings with cursor loss reporting', async () => {
     const transport = new FakeDebugger()
     const automation = new BrowserAutomation(transport, () => 'about:blank', () => false, { ringItems: 2, ringBytes: 1024 })

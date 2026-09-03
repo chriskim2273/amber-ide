@@ -129,7 +129,7 @@ Post-P1 full `/tmp` gates passed: app 822 tests with one intentional real-daemon
 
 Phase A's final finding was remediated before Phase B began.
 
-## Pi semantic interactions and approvals (phase B; independent review pending)
+## Pi semantic interactions and approvals (phase B; independently accepted)
 
 Phase B adds typed click, double-click, hover, fill, type, press, single-value native select, check, uncheck, scroll, and drag operations. Targets are either opaque snapshot references or bounded exact role/name locators. Every operation resolves to one current target, compares the current semantic fingerprint, rejects hidden/disabled/non-actionable or operation-incompatible nodes, and dispatches only fixed DOM/CSS/Accessibility/Input commands. There is still no raw CDP method, arbitrary JavaScript, response-body, cookie/storage, unrestricted-header, file-upload path, or filesystem screenshot surface.
 
@@ -152,9 +152,9 @@ The first independent Phase-B review failed with valid P1/P2 findings. Commits `
 
 Post-remediation `/tmp` gates: 850 app tests passed with one intentional real-daemon skip; focused review tests passed 87/87; strict typecheck, Electron and hosted-web production builds, 779 Rust tests with one intentional delegated-cgroup ignore, workspace all-target warnings-as-errors clippy, generated Pi extension install/compile/production-loader verification, and diff checks passed. No production daemon was contacted.
 
-Phase B now stops for independent re-review. `P1-pi-tools-and-approvals` remains partial and `mergeReady` remains false until that review passes and the external package/platform gates are complete.
+The first independent review correctly failed this wave and led to the remediation below. Final acceptance is recorded after the second remediation.
 
-## Second Phase-B re-review remediation (2026-09-02; re-review pending)
+## Second Phase-B re-review remediation and acceptance (2026-09-02)
 
 The next independent review found three additional integration failures. This remediation closes them without weakening the merge gate:
 
@@ -164,11 +164,21 @@ The next independent review found three additional integration failures. This re
 
 Race coverage now includes host-hidden approval refusal, collapse while an approval is pending, dialog owner cancellation, stale-generation dialog resolution, and bounded last-action replay after remount. Post-remediation `/tmp` gates passed: 857 app tests with one intentional real-daemon skip; focused browser review tests 94/94; strict typecheck; Electron and hosted-web production builds; 779 Rust tests with one intentional delegated-cgroup ignore; warnings-as-errors workspace clippy; exact generated Pi extension install/compile/production-loader/runtime verification; and diff checks. No production daemon was contacted.
 
-The required independent re-review has not yet accepted this wave. `P1-pi-tools-and-approvals` therefore remains partial and `mergeReady` remains false.
+Independent reviewer run `44ad20dd-20fa-48a6-a244-d964d09a11a1` accepted commit `4bb2adf` with **No issues found** and a **PASS** merge verdict for Phase B. The review explicitly verified collapse/show/hide/reveal authority, dialog ownership and invalidation, resident last-action retention, pointer confinement, conservative classification and dual-endpoint digests, replay high-water tombstones, approvals, and strict Pi schemas. `P1-pi-tools-and-approvals` is therefore completed. Repository merge readiness remains false because the separate external reader/package/platform gates remain open.
+
+## Rail product states (2026-09-02; independent review pending)
+
+The rail now consumes the main-owned Host runtime stream rather than issuing status polls. Runtime updates are authoritative and coalesced through a 256-browser latest-value map on a 16 ms cadence; console warnings/errors and network failures are independently accumulated with hard 10,000 counters and emitted at most every 250 ms, preventing a React update per network event. The local renderer event and direct local command paths carry a bounded raw current URL for the user-visible address bar. Broker status, navigation, and stop results explicitly strip that raw URL and retain only `safeRestoreUrl`, which removes credentials, query, and fragment.
+
+User chrome adds back, forward, reload/stop, explicit Preview/Browse metadata, fixed desktop/tablet/phone presets, strict custom viewport bounds, and a responsive-to-rail mode. Viewport metadata persists and is reapplied when a frozen page is recreated. Focus is explicit: “Focus page” enters the native view, focused state is visible without relying only on color, and Ctrl/Cmd+Shift+B returns focus to Amber chrome from the page. The current page title and security level are visible, while loading, focus, capacity wait, frozen/reloaded state, restore error, console/network issue counts, Share status, and the authoritative latest Pi action are exposed through a restrained live region.
+
+Collapse, terminal zoom, narrow windows, tab/background changes, viewport menus, and visible Amber dialog/menu/overlay surfaces detach the native `WebContentsView`; expansion reattaches only after main receives exact current geometry. The divider supports pointer capture and Left/Right/Home/End keyboard sizing with bounded width and ARIA separator/value metadata. Collapsed and terminal-zoom states remain visibly labeled. SSH remote windows do not create local browser state and instead show explicit copy that browser rails are local-only and remote streaming is unavailable. Recovery is a first-class rail action into the existing recovery surface; approval/dialog cards retain their 60-second countdown, untrusted-content labels, and native-view occlusion.
+
+Focused rail/host/service/automation coverage passed 69/69, including server-rendered accessibility contracts, raw-local/redacted-broker URL separation, command parser bounds, diagnostics batching, Host focus/mode/thaw projection, and runtime event coalescing. Full `/tmp` gates passed: app 868 tests with one intentional real-daemon skip; strict typecheck; Electron and hosted-web production builds; Rust 781 tests with one intentional delegated-cgroup ignore; warnings-as-errors all-target workspace clippy; exact generated Pi extension install/compile/production-loader/runtime verification; JSON validation and diff checks. No production daemon was contacted. `P1-rail-product-states` remains partial only until its required independent review; `mergeReady` remains false.
 
 ## Open blocking work
 
-1. Obtain independent Phase-B review of semantic interactions, approval digests/UI, secret handling, and revoke/Stop Pi races; remediate every valid finding before changing P1 status.
+1. Obtain independent review of the completed rail product-state implementation and remediate every valid finding before changing its P1 status.
 2. Prove the Rust layout-v2 reader through the real upgrade/deployment channel before enabling v2 writes by default.
 3. Validate the real packaged artifact and all bundled binaries; static-musl packaging is unavailable on this box because no musl C compiler is installed.
 4. Complete the explicit macOS native-view geometry, focus, IME, lifecycle, profile, and packaging manual gate. No macOS claim is made.

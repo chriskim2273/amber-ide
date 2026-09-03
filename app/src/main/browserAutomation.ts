@@ -25,6 +25,7 @@ export interface BrowserAutomationControls {
   reload?(ignoreCache: boolean): boolean | void
   history?(direction: 'back' | 'forward'): boolean | void
   dialog?(dialog: { type: string; message: string }): Promise<{ accept: boolean; promptText?: string }>
+  onDiagnostics?(diagnostics: { consoleIssues: number; networkFailures: number }): void
 }
 export interface AccessibilityNodeResult { ref: string; depth: number; role: string; name: string; disabled?: boolean; focused?: boolean }
 export interface SnapshotResult { snapshotId: string; url: string; nodes: AccessibilityNodeResult[]; truncated: boolean }
@@ -130,6 +131,9 @@ export class BrowserAutomation {
   private activeRequests = 0
   private lastNetworkActivity = Date.now()
   private dialogBarrier: Promise<void> | null = null
+  private diagnosticsTimer: NodeJS.Timeout | null = null
+  private consoleIssues = 0
+  private networkFailures = 0
   private disposed = false
   constructor(
     private readonly transport: BrowserDebuggerTransport,
@@ -144,6 +148,7 @@ export class BrowserAutomation {
   invalidate(): void { this.snapshotCache = null }
   dispose(): void {
     this.disposed = true; this.snapshotCache = null; this.requests.clear(); this.activeRequests = 0
+    if (this.diagnosticsTimer) clearTimeout(this.diagnosticsTimer); this.diagnosticsTimer = null
     if (this.attachedByUs && this.transport.isAttached()) { try { this.transport.detach?.() } catch { /* page teardown is best-effort */ } }
   }
   ensureAttached(): Promise<void> {
@@ -161,6 +166,14 @@ export class BrowserAutomation {
     if (!this.listenerInstalled) { this.listenerInstalled = true; this.transport.onMessage((method, params) => this.onMessage(method, params)) }
     if (newlyAttached || !this.domainsEnabled) { for (const method of ENABLE_METHODS) await this.transport.send(method); this.domainsEnabled = true }
   }
+  private scheduleDiagnostics(): void {
+    if (!this.controls.onDiagnostics || this.diagnosticsTimer || this.disposed) return
+    this.diagnosticsTimer = setTimeout(() => {
+      this.diagnosticsTimer = null
+      if (!this.disposed) this.controls.onDiagnostics?.({ consoleIssues: this.consoleIssues, networkFailures: this.networkFailures })
+    }, 250)
+    this.diagnosticsTimer.unref()
+  }
   private onMessage(method: string, params: Record<string, unknown>): void {
     if (this.disposed) return
     if (method === 'Page.javascriptDialogOpening') {
@@ -177,11 +190,13 @@ export class BrowserAutomation {
       const message = args.map((arg) => redactBrowserText(text(arg['value'] ?? arg['description'], 2048))).join(' ').slice(0, 8192)
       const rawLevel = params['type']; const level: ConsoleLevel = rawLevel === 'error' ? 'error' : rawLevel === 'warning' ? 'warning' : rawLevel === 'info' ? 'info' : 'log'
       this.consoleRing.push({ level, message, timestamp: typeof params['timestamp'] === 'number' ? params['timestamp'] : Date.now() })
+      if (level === 'error' || level === 'warning') { this.consoleIssues = Math.min(10_000, this.consoleIssues + 1); this.scheduleDiagnostics() }
       return
     }
     if (method === 'Runtime.exceptionThrown') {
       const details = params['exceptionDetails'] as Record<string, unknown> | undefined
       this.consoleRing.push({ level: 'error', message: redactBrowserText(text(details?.['text'] ?? 'Uncaught exception')), timestamp: Date.now() })
+      this.consoleIssues = Math.min(10_000, this.consoleIssues + 1); this.scheduleDiagnostics()
       return
     }
     if (method === 'Network.requestWillBeSent') {
@@ -206,6 +221,7 @@ export class BrowserAutomation {
       if (!pending) return
       const status = pending.status ?? 0
       this.networkRing.push({ url: pending.url, method: pending.method, type: pending.type, status, failed: status >= 400, durationMs: Date.now() - pending.started })
+      if (status >= 400) { this.networkFailures = Math.min(10_000, this.networkFailures + 1); this.scheduleDiagnostics() }
       this.requests.delete(id); this.activeRequests = Math.max(0, this.activeRequests - 1); this.lastNetworkActivity = Date.now()
       return
     }
@@ -213,6 +229,7 @@ export class BrowserAutomation {
       const id = text(params['requestId'], 256); const pending = this.requests.get(id)
       if (!pending) return
       this.networkRing.push({ url: pending.url, method: pending.method, type: pending.type, status: 0, failed: true, error: redactBrowserText(text(params['errorText'], 512)), durationMs: Date.now() - pending.started })
+      this.networkFailures = Math.min(10_000, this.networkFailures + 1); this.scheduleDiagnostics()
       this.requests.delete(id); this.activeRequests = Math.max(0, this.activeRequests - 1); this.lastNetworkActivity = Date.now()
     }
   }

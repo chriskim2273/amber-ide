@@ -16,6 +16,11 @@ export type TabBrowserCommand =
   | { type: 'show'; id: string; bounds: Rectangle }
   | { type: 'hide'; id: string }
   | { type: 'bounds'; id: string; bounds: Rectangle }
+  | { type: 'reload'; id: string; pageIncarnation: string; expectedGeneration: number }
+  | { type: 'history'; id: string; direction: 'back' | 'forward'; pageIncarnation: string; expectedGeneration: number }
+  | { type: 'mode'; id: string; mode: 'preview' | 'browse' }
+  | { type: 'viewport'; id: string; pageIncarnation: string; expectedGeneration: number; width: number; height: number }
+  | { type: 'focusPage' | 'focusChrome'; id: string }
   | { type: 'navigate'; id: string; url: string; pageIncarnation: string; expectedGeneration: number; broker?: { requestId: string; controller: string } }
   | { type: 'status'; id: string }
   | { type: 'stop'; id: string; pageIncarnation?: string; expectedGeneration?: number; broker?: { requestId: string; controller: string } }
@@ -84,6 +89,8 @@ export class TabBrowserService {
   private readonly dialogs: BrowserDialogCoordinator
   private readonly observedGeneration = new Map<string, number>()
   private readonly latestPiActions = new Map<string, { type: 'pi-action'; browserId: string; controller: string; action: string; phase: 'started' | 'completed' | 'failed'; error?: string; at: number }>()
+  private readonly pendingRuntimeEvents = new Map<string, unknown>()
+  private runtimeFlush: NodeJS.Timeout | null = null
   private approvalSurfaceVisible: (browserId: string) => boolean = () => false
   private approvalSurfaceReveal: (browserId: string) => void = () => {}
 
@@ -121,6 +128,17 @@ export class TabBrowserService {
     for (const active of this.activePi.get(id) ?? []) active.controller.abort()
   }
   setEventSink(sink: (event: unknown) => void): void { this.eventSink = sink }
+  private queueRuntimeEvent(id: string, event: unknown): void {
+    if (!this.pendingRuntimeEvents.has(id) && this.pendingRuntimeEvents.size >= 256) this.pendingRuntimeEvents.delete(this.pendingRuntimeEvents.keys().next().value as string)
+    this.pendingRuntimeEvents.set(id, event)
+    if (this.runtimeFlush) return
+    this.runtimeFlush = setTimeout(() => {
+      this.runtimeFlush = null
+      const pending = [...this.pendingRuntimeEvents.values()]; this.pendingRuntimeEvents.clear()
+      for (const value of pending) this.eventSink(value)
+    }, 16)
+    this.runtimeFlush.unref()
+  }
   private handleHostEvent(event: unknown): void {
     const runtime = event as { type?: unknown; id?: unknown; status?: { pageIncarnation?: unknown; generation?: unknown; lifecycle?: unknown }; pageIncarnation?: unknown; dialogType?: unknown; message?: unknown; generation?: unknown; respond?: (decision: { accept: boolean; promptText?: string }) => void }
     if (runtime.type === 'dialog-request' && typeof runtime.id === 'string' && typeof runtime.pageIncarnation === 'string' && typeof runtime.dialogType === 'string' && typeof runtime.message === 'string' && typeof runtime.generation === 'number' && runtime.respond) {
@@ -135,6 +153,7 @@ export class TabBrowserService {
       if (previous !== undefined && previous !== runtime.status.generation) this.approvals.invalidateBrowser(runtime.id)
       if (typeof runtime.status.pageIncarnation === 'string') this.dialogs.invalidateIdentity(runtime.id, runtime.status.pageIncarnation, runtime.status.generation)
       if (runtime.status.lifecycle === 'frozen') { this.approvals.clearBrowser(runtime.id); this.dialogs.clearBrowser(runtime.id) }
+      this.queueRuntimeEvent(runtime.id, { ...runtime, status: this.withLatestAction(runtime.id, runtime.status as Record<string, unknown>) }); return
     }
     this.eventSink(event)
   }
@@ -196,6 +215,13 @@ export class TabBrowserService {
     return result
   }
 
+  private withLatestAction<T extends object>(id: string, status: T): T & { lastAction?: unknown } {
+    const lastAction = this.latestPiActions.get(id); return { ...status, ...(lastAction ? { lastAction } : {}) }
+  }
+  private brokerStatus(id: string, input?: Record<string, unknown>): Record<string, unknown> {
+    const { currentUrl: _privateCurrentUrl, ...status } = this.withLatestAction(id, input ?? this.host.status(id) as unknown as Record<string, unknown>)
+    return status
+  }
   private piAction(id: string, controller: string, action: string, phase: 'started' | 'completed' | 'failed', error?: unknown): void {
     const raw = error instanceof Error ? error.message : 'INTERNAL_ERROR'
     const event = { type: 'pi-action' as const, browserId: id, controller: controller.slice(0, 256), action: action.slice(0, 64), phase, ...(phase === 'failed' ? { error: /^[A-Z][A-Z0-9_]{1,63}$/.test(raw) ? raw : 'INTERNAL_ERROR' } : {}), at: Date.now() }
@@ -208,7 +234,7 @@ export class TabBrowserService {
     switch (command.type) {
       case 'open': {
         try {
-          const opened = await this.host.open({ visible: true }, signal, validate); await this.schedulePersist(); return opened.status
+          const opened = await this.host.open({ visible: true }, signal, validate); await this.schedulePersist(); return this.withLatestAction(opened.status.id, opened.status)
         } catch (error) {
           // Capacity waiting can persist a provisional record through host events.
           // Do not reject until the compensating deletion is durable.
@@ -221,23 +247,36 @@ export class TabBrowserService {
         await this.host.thaw(command.id, signal, validate)
         const status = this.host.show(command.id, command.bounds)
         if (status.stateRevision !== before) await this.schedulePersist()
-        return status
+        return this.withLatestAction(command.id, status)
       }
       case 'hide': this.surfaceHidden(command.id); this.host.hide(command.id); return this.host.status(command.id)
-      case 'bounds': this.host.setBounds(command.id, command.bounds); return this.host.status(command.id)
+      case 'bounds': this.host.setBounds(command.id, command.bounds); return this.withLatestAction(command.id, this.host.status(command.id))
+      case 'reload': case 'history': case 'viewport': {
+        const action: BrowserToolAction = command.type === 'reload'
+          ? { type: 'reload', pageIncarnation: command.pageIncarnation, expectedGeneration: command.expectedGeneration, ignoreCache: false }
+          : command.type === 'history'
+            ? { type: 'history', direction: command.direction, pageIncarnation: command.pageIncarnation, expectedGeneration: command.expectedGeneration }
+            : { type: 'setViewport', viewport: { width: command.width, height: command.height }, pageIncarnation: command.pageIncarnation, expectedGeneration: command.expectedGeneration }
+        await this.host.runAutomation(command.id, action, signal ?? new AbortController().signal)
+        if (command.type === 'viewport') await this.schedulePersist()
+        return this.withLatestAction(command.id, this.host.status(command.id))
+      }
+      case 'mode': { const status = this.host.setMode(command.id, command.mode); await this.schedulePersist(); return this.withLatestAction(command.id, status) }
+      case 'focusPage': return this.withLatestAction(command.id, this.host.focusPage(command.id))
+      case 'focusChrome': return this.withLatestAction(command.id, this.host.focusChrome(command.id))
       case 'navigate': {
         const activeOwner = command.broker ? { controller: new AbortController(), owner: `${command.broker.controller}\u0000${command.broker.requestId}` } : null
         const upstreamAbort = (): void => activeOwner?.controller.abort()
         if (activeOwner) { signal?.addEventListener('abort', upstreamAbort, { once: true }); if (signal?.aborted) activeOwner.controller.abort(); const set = this.activePi.get(command.id) ?? new Set<{ controller: AbortController; owner: string }>(); set.add(activeOwner); this.activePi.set(command.id, set) }
         if (command.broker) this.piAction(command.id, command.broker.controller, 'navigate', 'started')
-        try { const status = await this.host.navigate(command.id, command.url, command.pageIncarnation, command.expectedGeneration, activeOwner?.controller.signal ?? signal); await this.schedulePersist(); if (command.broker) this.piAction(command.id, command.broker.controller, 'navigate', 'completed'); return status }
+        try { const status = await this.host.navigate(command.id, command.url, command.pageIncarnation, command.expectedGeneration, activeOwner?.controller.signal ?? signal); await this.schedulePersist(); if (command.broker) this.piAction(command.id, command.broker.controller, 'navigate', 'completed'); return command.broker ? this.brokerStatus(command.id, status as unknown as Record<string, unknown>) : this.withLatestAction(command.id, status) }
         catch (error) { if (command.broker) this.piAction(command.id, command.broker.controller, 'navigate', 'failed', error); throw error }
         finally { signal?.removeEventListener('abort', upstreamAbort); const set = this.activePi.get(command.id); if (activeOwner) set?.delete(activeOwner); if (set?.size === 0) this.activePi.delete(command.id) }
       }
-      case 'status': return { ...this.host.status(command.id), ...(this.latestPiActions.get(command.id) ? { lastAction: this.latestPiActions.get(command.id) } : {}) }
+      case 'status': return this.brokerStatus(command.id)
       case 'stop': {
         if (command.broker) this.piAction(command.id, command.broker.controller, 'stop', 'started')
-        try { const status = this.host.stop(command.id, command.pageIncarnation, command.expectedGeneration); if (command.broker) this.piAction(command.id, command.broker.controller, 'stop', 'completed'); return status }
+        try { const status = this.host.stop(command.id, command.pageIncarnation, command.expectedGeneration); if (command.broker) this.piAction(command.id, command.broker.controller, 'stop', 'completed'); return command.broker ? this.brokerStatus(command.id, status as unknown as Record<string, unknown>) : this.withLatestAction(command.id, status) }
         catch (error) { if (command.broker) this.piAction(command.id, command.broker.controller, 'stop', 'failed', error); throw error }
       }
       case 'automation': {
@@ -319,7 +358,7 @@ export function parseTabBrowserCommand(value: unknown): TabBrowserCommand {
     return { type: 'designate', ...(typeof v['designatedPi'] === 'string' ? { designatedPi: v['designatedPi'] } : {}) }
   }
   if (typeof v['id'] !== 'string' || !isOpaqueBrowserId(v['id'])) throw new Error('INVALID_REQUEST')
-  if (v['type'] === 'hide' || v['type'] === 'status' || v['type'] === 'stop') {
+  if (v['type'] === 'hide' || v['type'] === 'status' || v['type'] === 'stop' || v['type'] === 'focusPage' || v['type'] === 'focusChrome') {
     if (!exact(v, ['type', 'id'])) throw new Error('INVALID_REQUEST')
     return { type: v['type'], id: v['id'] }
   }
@@ -333,6 +372,21 @@ export function parseTabBrowserCommand(value: unknown): TabBrowserCommand {
     if (Math.abs(x!) > 100_000 || Math.abs(y!) > 100_000 || width! < 1 || height! < 1 || width! > 16_384 || height! > 16_384) throw new Error('INVALID_REQUEST')
     return { type: v['type'], id: v['id'], bounds: { x: x!, y: y!, width: width!, height: height! } }
   }
+  if ((v['type'] === 'reload' || v['type'] === 'history')
+      && exact(v, v['type'] === 'history' ? ['type', 'id', 'direction', 'pageIncarnation', 'expectedGeneration'] : ['type', 'id', 'pageIncarnation', 'expectedGeneration'])
+      && (v['type'] !== 'history' || v['direction'] === 'back' || v['direction'] === 'forward')
+      && typeof v['pageIncarnation'] === 'string' && v['pageIncarnation'].length >= 1 && v['pageIncarnation'].length <= 128
+      && typeof v['expectedGeneration'] === 'number' && Number.isSafeInteger(v['expectedGeneration']) && v['expectedGeneration'] >= 0) {
+    return v['type'] === 'reload'
+      ? { type: 'reload', id: v['id'], pageIncarnation: v['pageIncarnation'], expectedGeneration: v['expectedGeneration'] }
+      : { type: 'history', id: v['id'], direction: v['direction'] as 'back' | 'forward', pageIncarnation: v['pageIncarnation'], expectedGeneration: v['expectedGeneration'] }
+  }
+  if (v['type'] === 'mode' && exact(v, ['type', 'id', 'mode']) && (v['mode'] === 'preview' || v['mode'] === 'browse')) return { type: 'mode', id: v['id'], mode: v['mode'] }
+  if (v['type'] === 'viewport' && exact(v, ['type', 'id', 'pageIncarnation', 'expectedGeneration', 'width', 'height'])
+      && typeof v['pageIncarnation'] === 'string' && v['pageIncarnation'].length >= 1 && v['pageIncarnation'].length <= 128
+      && typeof v['expectedGeneration'] === 'number' && Number.isSafeInteger(v['expectedGeneration']) && v['expectedGeneration'] >= 0
+      && typeof v['width'] === 'number' && Number.isSafeInteger(v['width']) && v['width'] >= 200 && v['width'] <= 4096
+      && typeof v['height'] === 'number' && Number.isSafeInteger(v['height']) && v['height'] >= 200 && v['height'] <= 4096) return { type: 'viewport', id: v['id'], pageIncarnation: v['pageIncarnation'], expectedGeneration: v['expectedGeneration'], width: v['width'], height: v['height'] }
   if (v['type'] === 'navigate' && exact(v, ['type', 'id', 'url', 'pageIncarnation', 'expectedGeneration'])
       && typeof v['url'] === 'string' && v['url'].length <= 8192 && typeof v['pageIncarnation'] === 'string' && v['pageIncarnation'].length <= 128
       && typeof v['expectedGeneration'] === 'number' && Number.isSafeInteger(v['expectedGeneration']) && v['expectedGeneration'] >= 0) {

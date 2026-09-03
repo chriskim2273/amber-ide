@@ -39,6 +39,23 @@ describe('TabBrowserHost', () => {
     expect(host.status(opened.status.id).safeRestoreUrl).toBe('https://example.test/a')
   })
 
+  it('projects bounded user-only URL, focus, diagnostics, mode, and thaw state through host events', async () => {
+    const events: unknown[] = [], host = new TabBrowserHost(emptyBrowserState(1), factory, Date.now, undefined, () => {}, (event) => events.push(event))
+    const opened = await host.open({ visible: true })
+    pageEvents.get(opened.status.id)!({ type: 'navigation-committed', url: 'https://example.test/private?token=secret#part' })
+    pageEvents.get(opened.status.id)!({ type: 'focus', focused: true })
+    pageEvents.get(opened.status.id)!({ type: 'diagnostics', consoleIssues: 3, networkFailures: 2 })
+    host.setMode(opened.status.id, 'preview')
+    expect(host.status(opened.status.id)).toMatchObject({
+      currentUrl: 'https://example.test/private?token=secret#part', safeRestoreUrl: 'https://example.test/private',
+      focused: true, diagnostics: { consoleIssues: 3, networkFailures: 2 }, mode: 'preview', visible: true,
+    })
+    expect(events.filter((event) => (event as { type?: string }).type === 'runtime').length).toBeGreaterThanOrEqual(3)
+    host.freeze(opened.status.id)
+    const thawed = await host.thaw(opened.status.id)
+    expect(thawed).toMatchObject({ lifecycle: 'live', restoredAfterFreeze: true, currentUrl: 'https://example.test/private' })
+  })
+
   it('projects a dialog with an exact response channel and invalidates page generation', async () => {
     const events: unknown[] = [], host = new TabBrowserHost(emptyBrowserState(1), factory, Date.now, undefined, () => {}, (event) => events.push(event))
     const opened = await host.open({ visible: true }); const respond = vi.fn()

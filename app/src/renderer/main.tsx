@@ -214,6 +214,20 @@ function RenameInput({ initial, onCommit, onCancel }:
   )
 }
 
+function useExternalBrowserOcclusion(): boolean {
+  const [occluded, setOccluded] = useState(false)
+  useEffect(() => {
+    const update = (): void => {
+      const candidates = document.querySelectorAll('[role="dialog"], [role="alertdialog"], [role="menu"], .help-overlay')
+      setOccluded([...candidates].some((element) => element instanceof HTMLElement && !element.closest('.tab-browser-rail') && !element.hidden
+        && getComputedStyle(element).display !== 'none' && getComputedStyle(element).visibility !== 'hidden' && element.getClientRects().length > 0))
+    }
+    update(); const observer = new MutationObserver(update); observer.observe(document.body, { childList: true, subtree: true })
+    return () => observer.disconnect()
+  }, [])
+  return occluded
+}
+
 function App(): JSX.Element {
   const bridgeReady = typeof window.amber?.onDaemonEvent === 'function'
   const [state, dispatch] = useReducer(reduce, undefined, initialState)
@@ -429,6 +443,7 @@ function App(): JSX.Element {
   // written to the layout sidecar. Cleared when the tab's pane set changes
   // structurally (split/close/move), so it can't outlive its pane.
   const [zoom, setZoom] = useState<Record<string, string>>({})
+  const browserUiOccluded = useExternalBrowserOcclusion()
   const [focusRequest, setFocusRequest] = useState<{ paneId: string; seq: number } | null>(null)
   const focusRequestSeq = useRef(0)
   const layoutRef = useRef(layout)
@@ -2194,6 +2209,7 @@ function App(): JSX.Element {
       </div>
       {tabBrowser && !mobile && remoteHost.length === 0 && (
         <BrowserRail id={tabBrowser.id} width={tabBrowser.width} collapsed={tabBrowser.collapsed}
+          temporarilyHidden={!!zoom[`${wsKey}:${tabKey}`]} occluded={browserUiOccluded}
           {...(tabBrowser.designatedPi ? { designatedPi: tabBrowser.designatedPi } : {})}
           {...(tabBrowser.sharedWithPi !== undefined ? { sharedWithPi: tabBrowser.sharedWithPi } : {})}
           controllers={(tab?.panes ?? []).filter((pane) => pane.kind === 'pi').map((pane) => ({ name: pane.name, label: titles[pane.name] || pane.name }))}
@@ -2204,8 +2220,12 @@ function App(): JSX.Element {
           ensureContext={ensureBrowserContext}
           onWidth={(width) => updateTabBrowser({ ...tabBrowser, width })}
           onCollapsed={(collapsed) => updateTabBrowser({ ...tabBrowser, collapsed })}
+          onRecovery={() => void refreshBrowserRecovery()}
           onClose={() => void closeTabBrowser()} />
       )}
+      {tabBrowser && !mobile && remoteHost.length > 0 && <aside className="tab-browser-remote-unavailable" role="note" aria-label="Browser unavailable in SSH window">
+        Browser rails are available only in local Amber windows. Open this workspace locally to use its browser; remote browser streaming is not enabled.
+      </aside>}
       </div>
       {pocketMosaicActive && (
         <PocketNav

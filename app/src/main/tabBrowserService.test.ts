@@ -17,6 +17,11 @@ describe('parseTabBrowserCommand', () => {
     expect(parseTabBrowserCommand({ type: 'share', sharedWithPi: true })).toEqual({ type: 'share', sharedWithPi: true })
     expect(parseTabBrowserCommand({ type: 'designate', designatedPi: 'amber-1-1-0-pi' })).toEqual({ type: 'designate', designatedPi: 'amber-1-1-0-pi' })
     expect(parseTabBrowserCommand({ type: 'show', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', bounds: { x: 1, y: 2, width: 3, height: 4 } })).toEqual({ type: 'show', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', bounds: { x: 1, y: 2, width: 3, height: 4 } })
+    expect(parseTabBrowserCommand({ type: 'reload', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', pageIncarnation: 'page', expectedGeneration: 2 })).toMatchObject({ type: 'reload', expectedGeneration: 2 })
+    expect(parseTabBrowserCommand({ type: 'history', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', direction: 'back', pageIncarnation: 'page', expectedGeneration: 2 })).toMatchObject({ type: 'history', direction: 'back' })
+    expect(parseTabBrowserCommand({ type: 'mode', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', mode: 'preview' })).toMatchObject({ type: 'mode', mode: 'preview' })
+    expect(parseTabBrowserCommand({ type: 'viewport', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', pageIncarnation: 'page', expectedGeneration: 2, width: 390, height: 844 })).toMatchObject({ type: 'viewport', width: 390, height: 844 })
+    expect(parseTabBrowserCommand({ type: 'focusPage', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' })).toMatchObject({ type: 'focusPage' })
     expect(parseTabBrowserCommand({ type: 'stopPi' }).type).toBe('stopPi')
     expect(parseTabBrowserCommand({ type: 'resolveApproval', approvalId: 'a', digest: 'a'.repeat(64), decision: 'approve-once' }).type).toBe('resolveApproval')
     expect(parseTabBrowserCommand({ type: 'resolveDialog', dialogId: 'd', digest: 'b'.repeat(64), accept: true, promptText: 'ok' }).type).toBe('resolveDialog')
@@ -28,10 +33,29 @@ describe('parseTabBrowserCommand', () => {
     expect(() => parseTabBrowserCommand({ type: 'status', id: 'browser-a' })).toThrow('INVALID_REQUEST')
     expect(() => parseTabBrowserCommand({ type: 'bounds', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', bounds: { x: 0, y: 0, width: NaN, height: 2 } })).toThrow('INVALID_REQUEST')
     expect(() => parseTabBrowserCommand({ type: 'bounds', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', bounds: { x: 0, y: 0, width: 100_000, height: 2 } })).toThrow('INVALID_REQUEST')
+    expect(() => parseTabBrowserCommand({ type: 'viewport', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', pageIncarnation: 'page', expectedGeneration: 2, width: 1, height: 844 })).toThrow('INVALID_REQUEST')
+    expect(() => parseTabBrowserCommand({ type: 'mode', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', mode: 'unsafe' })).toThrow('INVALID_REQUEST')
   })
 })
 
 describe('TabBrowserService dispatch authorization', () => {
+  it('coalesces high-rate host status changes into a bounded renderer update', async () => {
+    vi.useFakeTimers()
+    try {
+      const state = emptyBrowserState(1), sink = vi.fn()
+      const host = { snapshot: () => state }
+      const Service = TabBrowserService as unknown as new (s: TabBrowserStateStore, p: { setWindow: () => void }, h: typeof host, i: typeof state) => TabBrowserService
+      const service = new Service({ update: async () => state } as unknown as TabBrowserStateStore, { setWindow: () => {} }, host, state)
+      service.setEventSink(sink)
+      const internal = service as unknown as { handleHostEvent(event: unknown): void }
+      for (let generation = 0; generation < 40; generation++) internal.handleHostEvent({ type: 'runtime', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', status: { generation, pageIncarnation: 'page', lifecycle: 'live' } })
+      expect(sink).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(16)
+      expect(sink).toHaveBeenCalledOnce()
+      expect(sink.mock.calls[0]?.[0]).toMatchObject({ status: { generation: 39 } })
+    } finally { vi.useRealTimers() }
+  })
+
   it('rejects an already-live show after the sender context switches', async () => {
     const state = emptyBrowserState(1); let shown = false; let thawed = false
     const host = { status: () => ({ id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', stateRevision: 1 }), thaw: async () => { thawed = true }, show: () => { shown = true; return { id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', stateRevision: 1 } }, snapshot: () => state }
@@ -227,6 +251,20 @@ describe('TabBrowserService approvals and Stop Pi', () => {
     generation = 3; handle({ type: 'runtime', id, status: { pageIncarnation: 'page', generation, lifecycle: 'live' } })
     await vi.waitFor(() => expect(respond).toHaveBeenCalledWith({ accept: false }))
     await expect(service.command({ type: 'resolveDialog', id, dialogId: String(request['dialogId']), digest: String(request['digest']), accept: true })).rejects.toThrow('DIALOG_DENIED')
+  })
+
+  it('keeps raw current URL in renderer events while redacting broker status results', async () => {
+    const state = emptyBrowserState(1), id = 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', events: Array<Record<string, unknown>> = []
+    const raw = 'https://example.test/private?token=secret#part'
+    const host = { isVisible: () => true, status: () => ({ id, currentUrl: raw, safeRestoreUrl: 'https://example.test/private', stateRevision: 1 }), snapshot: () => state }
+    const Service = TabBrowserService as unknown as new (s: TabBrowserStateStore, p: { setWindow: () => void }, h: typeof host, i: typeof state) => TabBrowserService
+    const service = new Service({ update: async () => state } as unknown as TabBrowserStateStore, { setWindow: () => {} }, host, state)
+    service.setEventSink((event) => events.push(event as Record<string, unknown>))
+    ;(service as unknown as { handleHostEvent: (event: unknown) => void }).handleHostEvent({ type: 'runtime', id, status: host.status() })
+    await vi.waitFor(() => expect(JSON.stringify(events)).toContain(raw))
+    const result = await service.command({ type: 'status', id })
+    expect(JSON.stringify(result)).not.toContain('token=secret')
+    expect(result).toMatchObject({ safeRestoreUrl: 'https://example.test/private' })
   })
 
   it('retains a bounded secret-safe latest Pi action for renderer remount status', async () => {

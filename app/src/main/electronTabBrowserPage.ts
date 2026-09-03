@@ -42,6 +42,7 @@ export class ElectronTabBrowserPage implements TabBrowserPage {
         return false
       },
       dialog: (dialog) => new Promise((resolve) => onPageEvent({ type: 'dialog', dialogType: dialog.type, message: dialog.message, respond: resolve })),
+      onDiagnostics: (diagnostics) => onPageEvent({ type: 'diagnostics', ...diagnostics }),
     })
     // Attach to this WebContents only; there is no remote-debugging endpoint
     // and therefore no target enumeration or cross-page control surface.
@@ -50,12 +51,17 @@ export class ElectronTabBrowserPage implements TabBrowserPage {
     this.view.webContents.on('will-navigate', (event, url) => { if (!isAllowedBrowserUrl(url)) event.preventDefault() })
     this.view.webContents.on('will-redirect', (event, url) => { if (!isAllowedBrowserUrl(url)) event.preventDefault() })
     this.view.webContents.on('will-frame-navigate', (event) => { if (!isAllowedBrowserUrl(event.url)) event.preventDefault() })
-    this.view.webContents.on('before-input-event', onUserInput)
+    this.view.webContents.on('before-input-event', (event, input) => {
+      if ((input.control || input.meta) && input.shift && input.key.toLowerCase() === 'b') { event.preventDefault(); this.blur(); onPageEvent({ type: 'focus', focused: false }); return }
+      onUserInput()
+    })
     this.view.webContents.on('before-mouse-event', onUserInput)
     this.view.webContents.on('did-start-navigation', (_event, _url, _inPlace, isMainFrame) => { if (isMainFrame) onPageEvent({ type: 'navigation-started' }) })
     this.view.webContents.on('did-navigate', (_event, url) => onPageEvent({ type: 'navigation-committed', url }))
     this.view.webContents.on('did-stop-loading', () => onPageEvent({ type: 'loading-stopped' }))
     this.view.webContents.on('page-title-updated', (_event, title) => onPageEvent({ type: 'title', title }))
+    this.view.webContents.on('focus', () => onPageEvent({ type: 'focus', focused: true }))
+    this.view.webContents.on('blur', () => onPageEvent({ type: 'focus', focused: false }))
     this.view.webContents.on('render-process-gone', (_event, details) => { if (!this.disposing) onPageEvent({ type: 'crashed', reason: details.reason }) })
   }
   async loadURL(url: string): Promise<void> {
@@ -63,6 +69,8 @@ export class ElectronTabBrowserPage implements TabBrowserPage {
     await this.view.webContents.loadURL(url)
   }
   stop(): void { this.view.webContents.stop() }
+  focus(): void { this.view.webContents.focus() }
+  blur(): void { this.window.webContents.focus() }
   setWindow(window: BrowserWindow): void {
     if (window === this.window) return
     this.hide(); this.window = window
