@@ -140,6 +140,10 @@ describe('Pi panes in .amberws', () => {
   })
 })
 import {
+  WORKSPACE_FILE_MAX_BYTES,
+  WORKSPACE_MAX_PANES_PER_TAB,
+  WORKSPACE_MAX_TREE_DEPTH,
+  WORKSPACE_SCROLLBACK_MAX_CHARS,
   WORKSPACE_VERSION,
   parseWorkspaceFile,
   serializeWorkspaceFile,
@@ -222,6 +226,19 @@ describe('parse validation', () => {
   it('throws when a tree is a malformed Node', () => {
     const doc = { version: 1, scope: 'one', workspaces: [{ tabs: [{ tab: 1, tree: { kind: 'bogus' }, panes: [] }] }] }
     expect(() => parseWorkspaceFile(JSON.stringify(doc))).toThrow()
+  })
+  it('rejects bounded hostile files before planning or base64 decode', () => {
+    expect(() => parseWorkspaceFile('x'.repeat(WORKSPACE_FILE_MAX_BYTES + 1))).toThrow('WORKSPACE_FILE_LIMIT')
+    const pane = { id: 'p', kind: 'shell', cwd: '', ord: 0, scrollback: '' }
+    const tooWide = { version: 1, scope: 'one', workspaces: [{ tabs: [{ tab: 1, tree: null, panes: Array.from({ length: WORKSPACE_MAX_PANES_PER_TAB + 1 }, (_, i) => ({ ...pane, id: `p${i}` })) }] }] }
+    expect(() => parseWorkspaceFile(JSON.stringify(tooWide))).toThrow('WORKSPACE_PANE_LIMIT')
+    const tooDeep: Record<string, unknown> = { kind: 'leaf', paneId: 'p' }
+    let node: Record<string, unknown> = tooDeep
+    for (let i = 0; i < WORKSPACE_MAX_TREE_DEPTH + 1; i++) node = { kind: 'split', dir: 'h', ratio: 0.5, a: node, b: { kind: 'leaf', paneId: 'q' } }
+    const deep = { version: 1, scope: 'one', workspaces: [{ tabs: [{ tab: 1, tree: node, panes: [] }] }] }
+    expect(() => parseWorkspaceFile(JSON.stringify(deep))).toThrow('WORKSPACE_TREE_LIMIT')
+    const longDump = { version: 1, scope: 'one', workspaces: [{ tabs: [{ tab: 1, tree: null, panes: [{ ...pane, scrollback: 'A'.repeat(WORKSPACE_SCROLLBACK_MAX_CHARS + 4) }] }] }] }
+    expect(() => parseWorkspaceFile(JSON.stringify(longDump))).toThrow('WORKSPACE_SCROLLBACK_LIMIT')
   })
 })
 

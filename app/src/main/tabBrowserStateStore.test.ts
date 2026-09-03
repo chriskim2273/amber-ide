@@ -3,7 +3,7 @@ import { lstat, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { TabBrowserStateStore } from './tabBrowserStateStore'
-import { emptyBrowserState } from '../shared/tabBrowserState'
+import { BROWSER_RECOVERY_MAX, emptyBrowserState } from '../shared/tabBrowserState'
 import { TabBrowserHost, type TabBrowserPageFactory } from './tabBrowserHost'
 import type { BrowserAutomation } from './browserAutomation'
 
@@ -64,6 +64,18 @@ describe('TabBrowserStateStore', () => {
     expect(await readFile(join(dir, 'browser-state.json'), 'utf8')).toContain('pendingTransaction')
     release(); await journal; await staleHost
     expect((await store.load()).pendingTransaction).toBeUndefined()
+  })
+
+  it('preserves recovery overflow for migration preflight instead of dropping URLs', async () => {
+    const store = new TabBrowserStateStore(dir)
+    const recovery = Array.from({ length: BROWSER_RECOVERY_MAX + 1 }, (_, index) => ({
+      id: `recovery-${index.toString(16).padStart(32, '0')}` as `recovery-${string}`,
+      workspace: 1, tab: index + 1, safeRestoreUrl: `https://recovery.test/${index}`,
+    }))
+    await writeFile(join(dir, 'browser-state.json'), JSON.stringify({ ...emptyBrowserState(1), migrationRecovery: recovery }))
+    const loaded = await store.load()
+    expect(loaded.migrationRecovery).toHaveLength(BROWSER_RECOVERY_MAX + 1)
+    expect(loaded.migrationRecovery.at(-1)?.safeRestoreUrl).toBe(`https://recovery.test/${BROWSER_RECOVERY_MAX}`)
   })
 
   it('returns an empty state when the file is malformed', async () => {

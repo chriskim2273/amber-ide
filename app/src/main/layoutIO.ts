@@ -10,7 +10,26 @@ import { readFile, rename, mkdir, open, lstat, unlink } from 'node:fs/promises'
 import type { FileHandle } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import { dirname } from 'node:path'
+import { layoutUtf8ByteLength, LAYOUT_FILE_MAX_BYTES } from '../shared/layoutFile'
 import type { LoadLayoutResult, SaveLayoutResult } from '../shared/layoutFile'
+
+async function readBoundedText(path: string, maxBytes: number): Promise<string> {
+  const handle = await open(path, 'r')
+  try {
+    const metadata = await handle.stat()
+    if (!metadata.isFile()) throw new Error('LAYOUT_NOT_REGULAR')
+    if (metadata.size > maxBytes) throw new Error('LAYOUT_FILE_LIMIT')
+    const buffer = Buffer.alloc(Math.min(maxBytes + 1, Math.max(1, metadata.size + 1)))
+    let offset = 0
+    while (offset < buffer.length) {
+      const result = await handle.read(buffer, offset, buffer.length - offset, offset)
+      if (result.bytesRead === 0) break
+      offset += result.bytesRead
+    }
+    if (offset > maxBytes) throw new Error('LAYOUT_FILE_LIMIT')
+    return buffer.subarray(0, offset).toString('utf8')
+  } finally { await handle.close().catch(() => {}) }
+}
 
 async function rejectSymlink(p: string): Promise<void> {
   const stat = await lstat(p).catch((error: NodeJS.ErrnoException) => {
@@ -79,10 +98,16 @@ async function atomicWrite(p: string, text: string): Promise<void> {
  * when the file doesn't exist yet. Never throws. */
 export async function loadLayoutFile(path: string): Promise<LoadLayoutResult> {
   try {
-    const text = await readFile(path, 'utf8')
+    const stat = await lstat(path)
+    if (stat.isSymbolicLink()) return { text: null, version: null, error: 'LAYOUT_SYMLINK' }
+    if (!stat.isFile()) return { text: null, version: null, error: 'LAYOUT_NOT_REGULAR' }
+    if (stat.size > LAYOUT_FILE_MAX_BYTES) return { text: null, version: null, error: 'LAYOUT_FILE_LIMIT' }
+    const text = await readBoundedText(path, LAYOUT_FILE_MAX_BYTES)
+    if (layoutUtf8ByteLength(text, LAYOUT_FILE_MAX_BYTES) > LAYOUT_FILE_MAX_BYTES) return { text: null, version: null, error: 'LAYOUT_FILE_LIMIT' }
     return { text, version: text }
-  } catch {
-    return { text: null, version: null }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { text: null, version: null }
+    return { text: null, version: null, error: error instanceof Error ? error.message : String(error) }
   }
 }
 
@@ -110,6 +135,7 @@ export async function saveLayoutFile(
 ): Promise<SaveLayoutResult> {
   let lock: Awaited<ReturnType<typeof acquireLock>> | null = null
   try {
+    if (layoutUtf8ByteLength(text, LAYOUT_FILE_MAX_BYTES) > LAYOUT_FILE_MAX_BYTES) return { error: 'LAYOUT_FILE_LIMIT' }
     await mkdir(dirname(path), { recursive: true, mode: 0o700 })
     lock = await acquireLock(`${path}.lock`)
     const current = await readFile(path, 'utf8').catch(() => null)

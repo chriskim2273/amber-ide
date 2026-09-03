@@ -381,14 +381,14 @@ describe('tab browser broker boundary', () => {
     await server.close()
   })
 
-  it('bounds request execution time and rejects replayed request ids', async () => {
+  it('bounds request execution time and releases following queued work', async () => {
     if (process.platform === 'win32') return
     const dir = await mkdtemp(join(tmpdir(), 'amber-browser-broker-')); cleanup.push(dir)
     const socketPath = join(dir, 'broker.sock'); const tokenPath = join(dir, 'token')
     const server = new TabBrowserBrokerServer(socketPath, tokenPath, async (request) => {
-      if (request.requestId === 'slow') await new Promise(() => {})
+      if (request.requestId.startsWith('slow')) await new Promise(() => {})
       return { action: request.action.type }
-    }, { requestTimeoutMs: 20 })
+    }, { requestTimeoutMs: 20, operationBarrierTimeoutMs: 20 })
     await server.start()
     const token = (await readFile(tokenPath, 'utf8')).trim()
     const encode = (value: unknown): Buffer => { const body = Buffer.from(JSON.stringify(value)); const out = Buffer.alloc(body.length + 4); out.writeUInt32BE(body.length); body.copy(out, 4); return out }
@@ -401,14 +401,16 @@ describe('tab browser broker boundary', () => {
         while (buffer.length >= 4 && buffer.length >= buffer.readUInt32BE(0) + 4) {
           const size = buffer.readUInt32BE(0); values.push(JSON.parse(buffer.subarray(4, 4 + size).toString()) as Record<string, unknown>); buffer = buffer.subarray(4 + size)
           if (values.length === 1) socket.write(Buffer.concat([
-            encode({ version: 1, clientInstanceId: 'client-01', sequence: 1, requestId: 'slow', amberSession: 'amber-1-2-0-pane', action: { type: 'status' } }),
-            encode({ version: 1, clientInstanceId: 'client-01', sequence: 1, requestId: 'slow', amberSession: 'amber-1-2-0-pane', action: { type: 'status' } }),
+            encode({ version: 1, clientInstanceId: 'client-01', sequence: 1, requestId: 'slow-one', amberSession: 'amber-1-2-0-pane', action: { type: 'status' } }),
+            encode({ version: 1, clientInstanceId: 'client-01', sequence: 2, requestId: 'slow-two', amberSession: 'amber-1-2-0-pane', action: { type: 'status' } }),
+            encode({ version: 1, clientInstanceId: 'client-01', sequence: 3, requestId: 'after-timeout', amberSession: 'amber-1-2-0-pane', action: { type: 'status' } }),
           ]))
-          if (values.length === 3) { socket.end(); resolve(values) }
+          if (values.length === 4) { socket.end(); resolve(values) }
         }
       })
     })
-    expect(replies.slice(1).map((reply) => reply['error'])).toEqual(['ACTION_TIMEOUT', 'ACTION_TIMEOUT'])
+    expect(replies.slice(1, 3).map((reply) => reply['error'])).toEqual(['ACTION_TIMEOUT', 'ACTION_TIMEOUT'])
+    expect(replies[3]).toMatchObject({ ok: true, result: { action: 'status' } })
     await server.close()
   })
 })

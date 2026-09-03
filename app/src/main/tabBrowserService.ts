@@ -4,7 +4,7 @@ import { TabBrowserHost, type BrowserRuntimeStatus } from './tabBrowserHost'
 import { isOpaqueBrowserId, safeRestoreUrl, type BrowserId } from '../shared/tabBrowser'
 import type { WsBrowser } from '../shared/workspaceFile'
 import { TabBrowserStateStore } from './tabBrowserStateStore'
-import { isRecoveryId, type BrowserStateFile, type RecoveryId } from '../shared/tabBrowserState'
+import { BROWSER_RECOVERY_MAX, isRecoveryId, type BrowserStateFile, type RecoveryId } from '../shared/tabBrowserState'
 import type { BrowserToolAction } from './browserToolProtocol'
 import { parseBrowserViewport } from '../shared/browserViewport'
 import { BrowserApprovalCoordinator, BrowserDialogCoordinator, interactionTargetDigest, interactionValueDigest, type ApprovalDecision } from './browserApproval'
@@ -45,7 +45,7 @@ export function stageWorkspaceBrowserState(state: BrowserStateFile, input: Works
     records[id] = { id, profileId: 'global', mode: browser.mode, safeRestoreUrl: restoreUrl, title: '',
       viewport, ...(previewOrigins ? { previewOrigins } : {}), lifecycle: 'frozen', stateRevision: 1, lastUsedAt: now, lastFocusedAt: 0 }
   }
-  if (state.migrationRecovery.length + input.recovery.length > 100) throw new Error('BROWSER_RECOVERY_LIMIT')
+  if (state.migrationRecovery.length + input.recovery.length > BROWSER_RECOVERY_MAX) throw new Error('BROWSER_RECOVERY_LIMIT')
   const recoveryIds = new Set(state.migrationRecovery.map((item) => item.id))
   const migrationRecovery = input.recovery.map((item) => {
     if (!isRecoveryId(item.id) || recoveryIds.has(item.id)) throw new Error('BROWSER_RECOVERY_ID_COLLISION')

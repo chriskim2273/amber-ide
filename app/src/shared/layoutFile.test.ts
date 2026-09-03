@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { emptyLayout, parseLayout, serializeLayout, orderTabs, moveTab, pushRecent, mergeLayout, LAYOUT_VERSION, type LayoutFile } from './layoutFile'
+import { emptyLayout, parseLayout, serializeLayout, orderTabs, moveTab, pushRecent, mergeLayout, LAYOUT_FILE_MAX_BYTES, LAYOUT_MAX_MAP_ENTRIES, LAYOUT_MAX_TREE_DEPTH, LAYOUT_VERSION, type LayoutFile } from './layoutFile'
 
 describe('layout v2 tab browser compatibility', () => {
   it('reads tab browser metadata without reintroducing browser leaves', () => {
@@ -132,6 +132,14 @@ describe('layoutFile', () => {
   })
   it('falls back read-only on version mismatch', () => {
     expect(parseLayout(JSON.stringify({ version: LAYOUT_VERSION + 99, workspaces: {} }))).toEqual({ ...emptyLayout(), readOnly: true })
+  })
+  it('bounds hostile sidecar bytes, maps, and split depth', () => {
+    expect(parseLayout('x'.repeat(LAYOUT_FILE_MAX_BYTES + 1))).toEqual(emptyLayout())
+    const maps = Object.fromEntries(Array.from({ length: LAYOUT_MAX_MAP_ENTRIES + 1 }, (_, i) => [`k${i}`, { note: '' }]))
+    expect(parseLayout(JSON.stringify({ version: 1, activeWorkspace: 1, workspaces: {}, frozen: maps }))).toEqual(emptyLayout())
+    let tree: Record<string, unknown> = { kind: 'leaf', paneId: 'p' }
+    for (let i = 0; i < LAYOUT_MAX_TREE_DEPTH + 1; i++) tree = { kind: 'split', dir: 'h', ratio: 0.5, a: tree, b: { kind: 'leaf', paneId: 'q' } }
+    expect(parseLayout(JSON.stringify({ version: 1, activeWorkspace: 1, workspaces: { '1': { tabs: { '1': { tree } } } } }))).toEqual(emptyLayout())
   })
   it('round-trips ws label, tab label, and tabOrder', () => {
     const l = emptyLayout()

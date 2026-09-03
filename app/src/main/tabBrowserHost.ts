@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { BrowserCapacity, navigationPolicyAllows, selectPreviewOrigin } from './tabBrowserPolicy'
 import { createBrowserId, isOpaqueBrowserId, safeRestoreUrl, type BrowserId } from '../shared/tabBrowser'
-import { isRecoveryId, type RecoveryId } from '../shared/tabBrowserState'
+import { BROWSER_RECOVERY_MAX, isRecoveryId, type RecoveryId } from '../shared/tabBrowserState'
 import type { WsBrowser } from '../shared/workspaceFile'
 import type { BrowserRecord, BrowserStateFile } from '../shared/tabBrowserState'
 import { parseBrowserViewport } from '../shared/browserViewport'
@@ -415,7 +415,7 @@ export class TabBrowserHost {
 
   importWorkspace(entries: { id: BrowserId; browser: WsBrowser }[], recovery: { id: RecoveryId; ws: number; tab: number; browser: WsBrowser }[]): BrowserRuntimeStatus[] {
     if (entries.some((entry) => this.state.records[entry.id])) throw new Error('BROWSER_ID_COLLISION')
-    if (this.state.migrationRecovery.length + recovery.length > 100) throw new Error('BROWSER_RECOVERY_LIMIT')
+    if (this.state.migrationRecovery.length + recovery.length > BROWSER_RECOVERY_MAX) throw new Error('BROWSER_RECOVERY_LIMIT')
     const recoveryIds = new Set(this.state.migrationRecovery.map((item) => item.id))
     for (const item of recovery) {
       if (!isRecoveryId(item.id) || recoveryIds.has(item.id)) throw new Error('BROWSER_RECOVERY_ID_COLLISION')

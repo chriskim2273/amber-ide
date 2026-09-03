@@ -3,6 +3,17 @@ import { clampStoredRailWidth } from './browserRail'
 
 export const LAYOUT_VERSION = 1
 export const TAB_BROWSER_LAYOUT_VERSION = 2
+
+// The sidecar is normally only a few KB, but it is also read by the resident
+// main process and by the Rust web client. Bound both the file and its object
+// graph before any recursive renderer helper can see it.
+export const LAYOUT_FILE_MAX_BYTES = 8 * 1024 * 1024
+export const LAYOUT_MAX_WORKSPACES = 256
+export const LAYOUT_MAX_TABS_PER_WORKSPACE = 1024
+export const LAYOUT_MAX_MAP_ENTRIES = 4096
+export const LAYOUT_MAX_TREE_DEPTH = 64
+export const LAYOUT_MAX_TREE_NODES = 4096
+export const LAYOUT_MAX_STRING_BYTES = 16 * 1024
 export interface BrowserRailLayout { id: string; width: number; collapsed: boolean; designatedPi?: string; sharedWithPi?: boolean }
 // `label` is app-owned display metadata ONLY (never touches daemon session
 // names). All added fields are OPTIONAL — old sidecars parse fine (missing →
@@ -49,13 +60,42 @@ export interface LayoutFile {
 
 // Shape-guard the frozen map (Task 4 lesson): reject a non-object/array top
 // level → undefined; drop non-object entries; coerce a non-string note away.
+export function layoutUtf8ByteLength(value: string, stopAfter = Number.MAX_SAFE_INTEGER): number {
+  let bytes = 0
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i)
+    if (code <= 0x7f) bytes += 1
+    else if (code <= 0x7ff) bytes += 2
+    else if (code >= 0xd800 && code <= 0xdbff && i + 1 < value.length
+      && value.charCodeAt(i + 1) >= 0xdc00 && value.charCodeAt(i + 1) <= 0xdfff) { bytes += 4; i += 1 }
+    else bytes += 3
+    if (bytes > stopAfter) return bytes
+  }
+  return bytes
+}
+function utf8Bytes(value: string): number { return layoutUtf8ByteLength(value) }
+function layoutString(value: string, limit = LAYOUT_MAX_STRING_BYTES): string {
+  if (utf8Bytes(value) > limit) throw new Error('LAYOUT_STRING_LIMIT')
+  return value
+}
+function safeMapKey(value: string): string {
+  if (value === '__proto__' || value === 'constructor' || value === 'prototype') throw new Error('LAYOUT_MAP_KEY')
+  return value
+}
+function mapEntries(value: object, code: string, max = LAYOUT_MAX_MAP_ENTRIES): [string, unknown][] {
+  const entries = Object.entries(value)
+  if (entries.length > max) throw new Error(code)
+  return entries
+}
+
 function parseFrozen(v: unknown): Record<string, FrozenEntry> | undefined {
   if (typeof v !== 'object' || v === null || Array.isArray(v)) return undefined
   const out: Record<string, FrozenEntry> = {}
-  for (const [name, entry] of Object.entries(v)) {
+  for (const [rawName, entry] of mapEntries(v, 'LAYOUT_MAP_LIMIT')) {
+    const name = safeMapKey(layoutString(rawName))
     if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) continue
     const note = (entry as { note?: unknown }).note
-    out[name] = typeof note === 'string' ? { note } : {}
+    out[name] = typeof note === 'string' ? { note: layoutString(note) } : {}
   }
   return out
 }
@@ -66,12 +106,13 @@ function parseFrozen(v: unknown): Record<string, FrozenEntry> | undefined {
 function parseBrowsers(v: unknown): Record<string, BrowserEntry> | undefined {
   if (typeof v !== 'object' || v === null || Array.isArray(v)) return undefined
   const out: Record<string, BrowserEntry> = {}
-  for (const [name, e] of Object.entries(v)) {
+  for (const [rawName, e] of mapEntries(v, 'LAYOUT_MAP_LIMIT')) {
+    const name = safeMapKey(layoutString(rawName))
     if (typeof e !== 'object' || e === null || Array.isArray(e)) continue
     const { ws, tab, ord, url } = e as Record<string, unknown>
     if (typeof ws === 'number' && typeof tab === 'number' && typeof ord === 'number' && typeof url === 'string'
         && Number.isFinite(ws) && Number.isFinite(tab) && Number.isFinite(ord)) {
-      out[name] = { ws, tab, ord, url }
+      out[name] = { ws, tab, ord, url: layoutString(url) }
     }
   }
   return out
@@ -84,14 +125,15 @@ function parseBrowsers(v: unknown): Record<string, BrowserEntry> | undefined {
 function parseEditors(v: unknown): Record<string, EditorEntry> | undefined {
   if (typeof v !== 'object' || v === null || Array.isArray(v)) return undefined
   const out: Record<string, EditorEntry> = {}
-  for (const [name, e] of Object.entries(v)) {
+  for (const [rawName, e] of mapEntries(v, 'LAYOUT_MAP_LIMIT')) {
+    const name = safeMapKey(layoutString(rawName))
     if (typeof e !== 'object' || e === null || Array.isArray(e)) continue
     const { ws, tab, ord, path, view, outline, wrap } = e as Record<string, unknown>
     if (typeof ws !== 'number' || typeof tab !== 'number' || typeof ord !== 'number') continue
     if (!Number.isFinite(ws) || !Number.isFinite(tab) || !Number.isFinite(ord)) continue
     if (typeof path !== 'string' && path !== null) continue
     out[name] = {
-      ws, tab, ord, path,
+      ws, tab, ord, path: typeof path === 'string' ? layoutString(path) : path,
       ...(view === 'code' || view === 'split' || view === 'preview' ? { view } : {}),
       ...(typeof outline === 'boolean' ? { outline } : {}),
       ...(typeof wrap === 'boolean' ? { wrap } : {}),
@@ -104,7 +146,16 @@ function parseEditors(v: unknown): Record<string, EditorEntry> | undefined {
 // hand-edited sidecar can't grow the list without bound.
 function parseRecentFiles(v: unknown): string[] | undefined {
   if (!Array.isArray(v)) return undefined
-  return [...new Set(v.filter((p): p is string => typeof p === 'string'))].slice(0, RECENT_FILES_MAX)
+  if (v.length > LAYOUT_MAX_MAP_ENTRIES) throw new Error('LAYOUT_ARRAY_LIMIT')
+  const out: string[] = []
+  const seen = new Set<string>()
+  for (const candidate of v) {
+    if (typeof candidate !== 'string' || seen.has(candidate)) continue
+    seen.add(candidate)
+    out.push(layoutString(candidate))
+    if (out.length === RECENT_FILES_MAX) break
+  }
+  return out
 }
 
 // Add a path to the recents list (most-recent-first, deduped, capped).
@@ -122,36 +173,68 @@ function parseBrowserRail(v: unknown): BrowserRailLayout | undefined {
   if (typeof v['width'] !== 'number' || !Number.isFinite(v['width']) || typeof v['collapsed'] !== 'boolean') return undefined
   return {
     id: v['id'], width: clampStoredRailWidth(v['width']), collapsed: v['collapsed'],
-    ...(typeof v['designatedPi'] === 'string' ? { designatedPi: v['designatedPi'] } : {}),
+    ...(typeof v['designatedPi'] === 'string' ? { designatedPi: layoutString(v['designatedPi']) } : {}),
     ...(typeof v['sharedWithPi'] === 'boolean' ? { sharedWithPi: v['sharedWithPi'] } : {}),
   }
 }
 
-function parseTabs(v: unknown): Record<string, TabLayout> {
+interface LayoutParseBudget { treeNodes: number }
+
+// Validate tree shape iteratively. Returning the original JSON object is safe
+// after this pass because every object is JSON-created and every child has
+// already passed the bounded shape checks.
+function parseTree(v: unknown, budget: LayoutParseBudget): Node | null | false {
+  if (v === null) return null
+  if (!isPlainObj(v)) return false
+  const stack: Array<{ value: unknown; depth: number }> = [{ value: v, depth: 1 }]
+  while (stack.length > 0) {
+    const current = stack.pop()!
+    if (++budget.treeNodes > LAYOUT_MAX_TREE_NODES || current.depth > LAYOUT_MAX_TREE_DEPTH) return false
+    if (!isPlainObj(current.value)) return false
+    if (current.value['kind'] === 'leaf') {
+      if (typeof current.value['paneId'] !== 'string' || utf8Bytes(current.value['paneId']) > LAYOUT_MAX_STRING_BYTES
+        || current.value['paneId'] === '__proto__' || current.value['paneId'] === 'constructor' || current.value['paneId'] === 'prototype') return false
+      continue
+    }
+    if (current.value['kind'] !== 'split' || (current.value['dir'] !== 'h' && current.value['dir'] !== 'v')
+      || typeof current.value['ratio'] !== 'number' || !Number.isFinite(current.value['ratio'])
+      || current.value['ratio'] < 0 || current.value['ratio'] > 1 || !('a' in current.value) || !('b' in current.value)) return false
+    stack.push({ value: current.value['b'], depth: current.depth + 1 }, { value: current.value['a'], depth: current.depth + 1 })
+  }
+  return v as Node
+}
+
+function parseTabs(v: unknown, budget: LayoutParseBudget): Record<string, TabLayout> {
   if (!isPlainObj(v)) return {}
   const out: Record<string, TabLayout> = {}
-  for (const [key, value] of Object.entries(v)) {
+  for (const [rawKey, value] of mapEntries(v, 'LAYOUT_TAB_LIMIT', LAYOUT_MAX_TABS_PER_WORKSPACE)) {
+    const key = safeMapKey(layoutString(rawKey))
     if (!isPlainObj(value)) continue
+    const rawTree = value['tree']
+    const tree = rawTree === undefined ? null : parseTree(rawTree, budget)
+    if (tree === false) throw new Error('LAYOUT_TREE_LIMIT')
     const browser = parseBrowserRail(value['browser'])
     out[key] = {
-      tree: (value['tree'] ?? null) as Node | null,
-      ...(typeof value['label'] === 'string' ? { label: value['label'] } : {}),
+      tree,
+      ...(typeof value['label'] === 'string' ? { label: layoutString(value['label']) } : {}),
       ...(browser ? { browser } : {}),
     }
   }
   return out
 }
 
-function parseWorkspaces(v: unknown): Record<string, WsLayout> {
+function parseWorkspaces(v: unknown, budget: LayoutParseBudget): Record<string, WsLayout> {
   if (typeof v !== 'object' || v === null || Array.isArray(v)) return {}
   const out: Record<string, WsLayout> = {}
-  for (const [k, ws] of Object.entries(v)) {
+  for (const [rawKey, ws] of mapEntries(v, 'LAYOUT_WORKSPACE_LIMIT', LAYOUT_MAX_WORKSPACES)) {
+    const k = safeMapKey(layoutString(rawKey))
     if (typeof ws !== 'object' || ws === null || Array.isArray(ws)) continue
     const w = ws as Partial<WsLayout> & { label?: unknown; tabOrder?: unknown }
+    if (Array.isArray(w.tabOrder) && w.tabOrder.length > LAYOUT_MAX_TABS_PER_WORKSPACE) throw new Error('LAYOUT_TAB_LIMIT')
     out[k] = {
       activeTab: typeof w.activeTab === 'number' ? w.activeTab : 1,
-      tabs: parseTabs(w.tabs),
-      ...(typeof w.label === 'string' ? { label: w.label } : {}),
+      tabs: parseTabs(w.tabs, budget),
+      ...(typeof w.label === 'string' ? { label: layoutString(w.label) } : {}),
       ...(Array.isArray(w.tabOrder)
         ? { tabOrder: w.tabOrder.filter((n): n is number => typeof n === 'number' && Number.isFinite(n)) }
         : {}),
@@ -202,7 +285,7 @@ export function emptyLayout(): LayoutFile {
 // Node-side IO and `crates/amber/src/layout_cas.rs`'s Rust IO) never need to
 // agree on an algorithm — only on the wire shape below.
 export type LayoutVersion = string | null
-export interface LoadLayoutResult { text: string | null; version: LayoutVersion }
+export interface LoadLayoutResult { text: string | null; version: LayoutVersion; error?: string }
 export type SaveLayoutResult =
   | { ok: true; version: LayoutVersion }
   | { conflict: true; text: string | null; version: LayoutVersion }
@@ -278,16 +361,18 @@ export function mergeLayout(base: LayoutFile, local: LayoutFile, remote: LayoutF
 }
 
 export function parseLayout(text: string): LayoutFile {
+  if (layoutUtf8ByteLength(text, LAYOUT_FILE_MAX_BYTES) > LAYOUT_FILE_MAX_BYTES) return emptyLayout()
   try {
     const v = JSON.parse(text) as Partial<LayoutFile>
     if (v.version !== LAYOUT_VERSION && v.version !== TAB_BROWSER_LAYOUT_VERSION) {
       return { ...emptyLayout(), readOnly: true }
     }
-    if (typeof v.workspaces !== 'object' || v.workspaces === null) return emptyLayout()
+    if (typeof v.workspaces !== 'object' || v.workspaces === null || Array.isArray(v.workspaces)) return emptyLayout()
+    const budget: LayoutParseBudget = { treeNodes: 0 }
     return {
       version: v.version,
       activeWorkspace: typeof v.activeWorkspace === 'number' ? v.activeWorkspace : 1,
-      workspaces: parseWorkspaces(v.workspaces),
+      workspaces: parseWorkspaces(v.workspaces, budget),
       // Conditional spread so a missing fontSize stays absent (not `undefined`)
       // under exactOptionalPropertyTypes.
       ...(typeof v.fontSize === 'number' ? { fontSize: v.fontSize } : {}),

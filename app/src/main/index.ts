@@ -6,7 +6,7 @@ import { basename, dirname, join, resolve as resolvePathJoin, isAbsolute } from 
 import { homedir, hostname, release as osRelease, tmpdir } from 'node:os'
 import { spawn, execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { readFile, writeFile, rename, mkdir, copyFile, chmod, rm, stat, mkdtemp } from 'node:fs/promises'
+import { readFile, writeFile, rename, mkdir, copyFile, chmod, rm, stat, lstat, open, mkdtemp } from 'node:fs/promises'
 import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
 import { resolveSocketPath } from '../shared/socketPath'
 import { HANDOFF_FILE_MAX, parseHandoff } from '../shared/handoff'
@@ -79,8 +79,8 @@ import { Connection } from '../client/connection'
 import { TabBrowserStateStore } from './tabBrowserStateStore'
 import { commitBrowserLayoutMutation, coordinateTabBrowserMigration } from './tabBrowserMigrationCoordinator'
 import { bindRendererBrowserCommand, browserAuthorityChanged } from './browserAssociationAuthority'
-import { emptyLayout, parseLayout, serializeLayout, type LayoutFile } from '../shared/layoutFile'
-import { parseWorkspaceFile } from '../shared/workspaceFile'
+import { emptyLayout, layoutUtf8ByteLength, LAYOUT_FILE_MAX_BYTES, parseLayout, serializeLayout, type LayoutFile } from '../shared/layoutFile'
+import { assertWorkspaceFileBytes, parseWorkspaceFile, WORKSPACE_FILE_MAX_BYTES } from '../shared/workspaceFile'
 import { commitPreparedWorkspaceImport, prepareWorkspaceImport } from './workspaceImport'
 import { browserContextMatches, captureBrowserContext, hasExactApprovalSurface, resolveBrowserContext, setBrowserForCurrentContext } from './browserWindowContext'
 import { createBrowserId } from '../shared/tabBrowser'
@@ -104,6 +104,24 @@ import clientPath from '../client/index?modulePath'
 const CLIENT_STABLE_MS = 5000
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
+
+async function readBoundedTextFile(path: string, maxBytes: number, limitCode: string): Promise<string> {
+  const handle = await open(path, 'r')
+  try {
+    const metadata = await handle.stat()
+    if (!metadata.isFile()) throw new Error('WORKSPACE_NOT_REGULAR')
+    if (metadata.size > maxBytes) throw new Error(limitCode)
+    const buffer = Buffer.alloc(Math.min(maxBytes + 1, Math.max(1, metadata.size + 1)))
+    let offset = 0
+    while (offset < buffer.length) {
+      const result = await handle.read(buffer, offset, buffer.length - offset, offset)
+      if (result.bytesRead === 0) break
+      offset += result.bytesRead
+    }
+    if (offset > maxBytes) throw new Error(limitCode)
+    return buffer.subarray(0, offset).toString('utf8')
+  } finally { await handle.close().catch(() => {}) }
+}
 
 function stateRoot(): string {
   if (process.platform === 'win32') {
@@ -262,7 +280,7 @@ async function preflightLinuxInputMethod(): Promise<boolean> {
 
   if (choice.response === 1) return true
   if (choice.response !== 0) {
-    app.quit()
+    quitDuringStartup()
     return false
   }
 
@@ -294,7 +312,7 @@ async function preflightLinuxInputMethod(): Promise<boolean> {
     noLink: true,
   })
   if (failure.response === 0) return true
-  app.quit()
+  quitDuringStartup()
   return false
 }
 
@@ -765,6 +783,16 @@ let allowFinalQuit = false
 let explicitQuitInProgress = false
 let requestExplicitQuit: (() => Promise<void>) | null = null
 const residentIntents = new ResidentIntentLatch()
+
+// Startup can fail before the resident quit coordinator is installed (input
+// method preflight, daemon boot, migration, or window creation). In that phase
+// there is no browser state to drain, so bypass the resident before-quit gate;
+// routing this through requestQuit would otherwise leave the app alive forever
+// with a latched intent and no handler.
+function quitDuringStartup(): void {
+  allowFinalQuit = true
+  app.quit()
+}
 
 /** The window an IPC message came from. */
 function ctxFor(e: { sender: Electron.WebContents }): WindowCtx | undefined {
@@ -1390,6 +1418,14 @@ async function main(): Promise<void> {
     const socketPath = browserHostSocketPath(process.env, process.platform, process.getuid?.() ?? -1, tmpdir())
     tabBrowserBroker = new TabBrowserBrokerServer(socketPath, join(stateRoot(), 'browser-host-token'), handleBroker, {
       authorizeReplay: async (request) => { try { await currentBrokerLayout(request); return true } catch { return false } },
+      // Serialize by the authorized browser, or by its tab while the one
+      // first-use solicitation has no browser id yet. Request ids are replay
+      // keys only; they must never decide mutation ordering.
+      queueKey: async (request) => {
+        const current = await currentBrokerLayout(request)
+        const location = authorizeBrowserRequest(current, request.amberSession, request.action.type === 'open')
+        return location.browserId ? `browser:${location.browserId}` : `tab:${location.ws}:${location.tab}`
+      },
       operations: browserOperations,
     })
     await tabBrowserBroker.start()
@@ -1900,10 +1936,13 @@ async function main(): Promise<void> {
   })
   ipcMain.handle('layout-save', async (e, text: string, version: string | null) => {
     if (ctxFor(e)?.target.kind === 'remote') return { ok: true, version: null }
+    if (typeof text !== 'string' || layoutUtf8ByteLength(text, LAYOUT_FILE_MAX_BYTES) > LAYOUT_FILE_MAX_BYTES) return { error: 'LAYOUT_FILE_LIMIT' }
     const current = await loadLayoutFile(layoutPath())
+    if (current.error) return { error: current.error }
     if (current.text && parseLayout(current.text).readOnly) return { error: 'layout belongs to a newer Amber version' }
     const currentLayout = current.text ? parseLayout(current.text) : null
     const nextLayout = parseLayout(text)
+    if (nextLayout.readOnly) return { error: 'layout belongs to a newer Amber version' }
     if (browserAuthorityChanged(currentLayout ?? emptyLayout(), nextLayout)) return { error: 'browser association is main-owned' }
     return saveLayoutFile(layoutPath(), text, version)
   })
@@ -1973,6 +2012,8 @@ async function main(): Promise<void> {
   // Portable workspace file: native save dialog + atomic write (layout-save
   // precedent). Returns true on write, false on cancel.
   ipcMain.handle('workspace-save-file', async (_e, json: string, suggestedName: string) => {
+    if (typeof json !== 'string') throw new Error('WORKSPACE_REQUEST_INVALID')
+    assertWorkspaceFileBytes(json)
     const r = await dialog.showSaveDialog(win, {
       defaultPath: suggestedName,
       filters: [{ name: 'amber workspace', extensions: ['amberws'] }],
@@ -1981,8 +2022,8 @@ async function main(): Promise<void> {
     // showSaveDialog does not reliably append the filter extension on Linux —
     // add it so the open filter finds the file later.
     const p = r.filePath.endsWith('.amberws') ? r.filePath : r.filePath + '.amberws'
-    const tmp = p + '.tmp'
-    await writeFile(tmp, json)
+    const tmp = `${p}.${process.pid}.${randomUUID()}.tmp`
+    await writeFile(tmp, json, { mode: 0o600 })
     await rename(tmp, p)
     return true
   })
@@ -1993,7 +2034,13 @@ async function main(): Promise<void> {
       filters: [{ name: 'amber workspace', extensions: ['amberws'] }, { name: 'All files', extensions: ['*'] }],
     })
     if (r.canceled || r.filePaths.length === 0 || !r.filePaths[0]) return null
-    return readFile(r.filePaths[0], 'utf8')
+    const selected = r.filePaths[0]
+    const metadata = await lstat(selected)
+    if (metadata.isSymbolicLink() || !metadata.isFile()) throw new Error('WORKSPACE_NOT_REGULAR')
+    if (metadata.size > WORKSPACE_FILE_MAX_BYTES) throw new Error('WORKSPACE_FILE_LIMIT')
+    const text = await readBoundedTextFile(selected, WORKSPACE_FILE_MAX_BYTES, 'WORKSPACE_FILE_LIMIT')
+    assertWorkspaceFileBytes(text)
+    return text
   })
 
   // ---- editor pane file IO (spec §4). Thin wrappers; the guards, the atomic
@@ -2055,7 +2102,7 @@ app.on('before-quit', (event) => {
 // window; arbitrary argv never reaches a shell or a replacement window.
 const launchActivation = activationRequest(process.argv)
 if (!app.requestSingleInstanceLock(launchActivation)) {
-  app.quit()
+  quitDuringStartup()
 } else {
   app.on('second-instance', (_event, _argv, _cwd, additionalData) => {
     if (parseActivationRequest(additionalData) !== null) residentIntents.requestActivation()
@@ -2063,7 +2110,7 @@ if (!app.requestSingleInstanceLock(launchActivation)) {
   app.on('activate', () => { residentIntents.requestActivation() })
   app.whenReady().then(main).catch((e) => {
     console.error(e)
-    app.quit()
+    quitDuringStartup()
   })
 }
 // Without the browser host, preserve the existing close-means-exit behavior.

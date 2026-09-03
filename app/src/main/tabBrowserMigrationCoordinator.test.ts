@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { loadLayoutFile, saveLayoutFile } from './layoutIO'
@@ -18,6 +18,54 @@ describe('coordinateTabBrowserMigration', () => {
   it('collects only unassociated records older than the orphan grace', () => {
     expect(collectBrowserOrphans({ keep: 20, young: 21, old: 1 }, new Set(['keep']), 30, 10)).toEqual(['old'])
   })
+  it('creates a private timestamped v1 backup before committing migration', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'amber-browser-backup-')); dirs.push(dir)
+    const path = join(dir, 'ui-layout.json'); const source = legacy(); await saveLayoutFile(path, source, null)
+    await coordinateTabBrowserMigration(path, new TabBrowserStateStore(dir), () => new Uint8Array(16).fill(3), () => 'tx-backup')
+    const backups = (await readdir(dir)).filter((name) => name.startsWith('ui-layout.json.v1.') && name.endsWith('.bak'))
+    expect(backups).toHaveLength(1)
+    expect(await readFile(join(dir, backups[0]! as string), 'utf8')).toBe(source)
+    if (process.platform !== 'win32') expect((await stat(join(dir, backups[0]! as string))).mode & 0o077).toBe(0)
+  })
+
+  it('leaves both stores untouched when the v1 backup cannot be committed', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'amber-browser-backup-fail-')); dirs.push(dir)
+    const path = join(dir, 'ui-layout.json'); const source = legacy(); await saveLayoutFile(path, source, null)
+    const store = new TabBrowserStateStore(dir)
+    await expect(coordinateTabBrowserMigration(path, store, () => new Uint8Array(16).fill(6), () => 'tx-backup-fail', undefined,
+      async () => { throw new Error('BACKUP_FAILED') })).rejects.toThrow('BACKUP_FAILED')
+    expect((await loadLayoutFile(path)).text).toBe(source)
+    expect((await store.load()).pendingTransaction).toBeUndefined()
+    expect((await readdir(dir)).filter((name) => name.includes('.v1.'))).toHaveLength(0)
+  })
+
+  it('fails recovery overflow before backup or either v2/state write', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'amber-browser-recovery-overflow-')); dirs.push(dir)
+    const path = join(dir, 'ui-layout.json')
+    const browsers = Object.fromEntries(Array.from({ length: 102 }, (_, ord) => [`browser-1-1-${ord}-old${ord}`, { ws: 1, tab: 1, ord, url: `https://example.test/${ord}` }]))
+    const source = JSON.stringify({ version: 1, activeWorkspace: 1, workspaces: { '1': { activeTab: 1, tabs: { '1': { tree: null } } } }, browsers })
+    await saveLayoutFile(path, source, null)
+    const store = new TabBrowserStateStore(dir)
+    await expect(coordinateTabBrowserMigration(path, store, undefined, () => 'tx-overflow')).rejects.toThrow('BROWSER_RECOVERY_LIMIT')
+    expect((await loadLayoutFile(path)).text).toBe(source)
+    const unchanged = await store.load()
+    expect(unchanged.records).toEqual({})
+    expect(unchanged.migrationRecovery).toEqual([])
+    expect(unchanged.pendingTransaction).toBeUndefined()
+    expect((await readdir(dir)).filter((name) => name.includes('.v1.'))).toHaveLength(0)
+  })
+
+  it('refuses a future-version pending transaction without rewriting it', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'amber-browser-future-pending-')); dirs.push(dir)
+    const path = join(dir, 'ui-layout.json'); const source = JSON.stringify({ version: 2, activeWorkspace: 1, workspaces: {} }); await saveLayoutFile(path, source, null)
+    const store = new TabBrowserStateStore(dir); const before = await store.load()
+    const future = JSON.stringify({ version: 99, activeWorkspace: 1, workspaces: { secret: {} }, sentinel: 'keep-me' })
+    await store.save({ ...before, pendingTransaction: { id: 'future', kind: 'browser-association', expectedLayoutVersion: source, layoutText: future } })
+    await expect(coordinateTabBrowserMigration(path, store)).rejects.toThrow('UNSUPPORTED_LAYOUT_VERSION')
+    expect((await loadLayoutFile(path)).text).toBe(source)
+    expect((await store.load()).pendingTransaction?.layoutText).toBe(future)
+  })
+
   it('commits legacy layout and browser intent through a recoverable journal', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'amber-browser-migrate-')); dirs.push(dir)
     const path = join(dir, 'ui-layout.json'); await saveLayoutFile(path, legacy(), null)

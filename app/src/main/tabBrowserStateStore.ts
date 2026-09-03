@@ -1,7 +1,26 @@
-import { mkdir, open, readFile, rename, unlink } from 'node:fs/promises'
+import { mkdir, open, rename, unlink } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
 import { emptyBrowserState, parseBrowserState, type BrowserStateFile } from '../shared/tabBrowserState'
+
+const BROWSER_STATE_MAX_BYTES = 8 * 1024 * 1024
+
+async function readBoundedState(path: string): Promise<string> {
+  const handle = await open(path, 'r')
+  try {
+    const metadata = await handle.stat()
+    if (!metadata.isFile() || metadata.size > BROWSER_STATE_MAX_BYTES) throw new Error('BROWSER_STATE_LIMIT')
+    const buffer = Buffer.alloc(Math.min(BROWSER_STATE_MAX_BYTES + 1, Math.max(1, metadata.size + 1)))
+    let offset = 0
+    while (offset < buffer.length) {
+      const result = await handle.read(buffer, offset, buffer.length - offset, offset)
+      if (result.bytesRead === 0) break
+      offset += result.bytesRead
+    }
+    if (offset > BROWSER_STATE_MAX_BYTES) throw new Error('BROWSER_STATE_LIMIT')
+    return buffer.subarray(0, offset).toString('utf8')
+  } finally { await handle.close().catch(() => {}) }
+}
 
 export interface BrowserStateLockedIo {
   load(): Promise<BrowserStateFile>
@@ -31,7 +50,7 @@ export class TabBrowserStateStore {
   }
 
   private async loadDirect(): Promise<BrowserStateFile> {
-    try { return parseBrowserState(await readFile(this.path, 'utf8')) }
+    try { return parseBrowserState(await readBoundedState(this.path)) }
     catch { return emptyBrowserState() }
   }
 

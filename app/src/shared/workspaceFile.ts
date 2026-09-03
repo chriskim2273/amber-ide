@@ -11,6 +11,50 @@ import { MAX_RAIL_WIDTH, MIN_RAIL_WIDTH } from './browserRail'
 // per-pane scrollback, versioned. Tree leaves are file-local placeholders
 // (`p0`, `p1`…) — session names are minted fresh on load.
 export const WORKSPACE_VERSION = 2
+
+// Portable workspace files can contain daemon scrollback, so the parser must
+// reject hostile input before it allocates the object graph or decodes any
+// base64. These are intentionally exported: the Electron main process uses
+// the same byte boundary before a native file read/write, and tests can pin the
+// accepted maximums without duplicating policy values.
+export const WORKSPACE_FILE_MAX_BYTES = 32 * 1024 * 1024
+export const WORKSPACE_MAX_WORKSPACES = 32
+export const WORKSPACE_MAX_TABS_PER_WORKSPACE = 256
+export const WORKSPACE_MAX_PANES_PER_TAB = 256
+export const WORKSPACE_MAX_TOTAL_PANES = 4096
+export const WORKSPACE_MAX_MAP_ENTRIES = 1024
+export const WORKSPACE_MAX_TREE_DEPTH = 64
+export const WORKSPACE_MAX_TREE_NODES = 4096
+export const WORKSPACE_MAX_STRING_BYTES = 16 * 1024
+export const WORKSPACE_MAX_PATH_BYTES = 4096
+export const WORKSPACE_MAX_URL_BYTES = 8192
+export const WORKSPACE_MAX_NOTE_BYTES = 4096
+export const WORKSPACE_SCROLLBACK_MAX_BYTES = 2 * 1024 * 1024
+export const WORKSPACE_TOTAL_SCROLLBACK_MAX_BYTES = 16 * 1024 * 1024
+export const WORKSPACE_MAX_RECOVERY_ITEMS = 100
+// Four base64 characters encode three bytes. Permit the normal padded form and
+// the final partial quantum, with one extra quantum for harmless padding.
+export const WORKSPACE_SCROLLBACK_MAX_CHARS = Math.ceil(WORKSPACE_SCROLLBACK_MAX_BYTES / 3) * 4
+export const WORKSPACE_TOTAL_SCROLLBACK_MAX_CHARS = Math.ceil(WORKSPACE_TOTAL_SCROLLBACK_MAX_BYTES / 3) * 4
+
+export function utf8ByteLength(value: string, stopAfter = Number.MAX_SAFE_INTEGER): number {
+  let bytes = 0
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i)
+    if (code <= 0x7f) bytes += 1
+    else if (code <= 0x7ff) bytes += 2
+    else if (code >= 0xd800 && code <= 0xdbff && i + 1 < value.length
+      && value.charCodeAt(i + 1) >= 0xdc00 && value.charCodeAt(i + 1) <= 0xdfff) { bytes += 4; i += 1 }
+    else bytes += 3
+    if (bytes > stopAfter) return bytes
+  }
+  return bytes
+}
+
+export function assertWorkspaceFileBytes(text: string): void {
+  if (utf8ByteLength(text, WORKSPACE_FILE_MAX_BYTES) > WORKSPACE_FILE_MAX_BYTES) throw new Error('WORKSPACE_FILE_LIMIT')
+}
+
 export type AppLocalPaneKind = 'browser' | 'editor'
 export type WorkspacePaneKind = DaemonSessionKind | AppLocalPaneKind
 
@@ -59,6 +103,7 @@ export interface WorkspaceDoc {
 
 // ---- base64 (no Node Buffer — works in renderer + vitest node env) ----------
 function toBase64(bytes: Uint8Array): string {
+  if (bytes.byteLength > WORKSPACE_SCROLLBACK_MAX_BYTES) throw new Error('WORKSPACE_SCROLLBACK_LIMIT')
   let bin = ''
   const CHUNK = 0x8000 // chunk the fromCharCode spread so a 2 MiB dump can't overflow the arg stack
   for (let i = 0; i < bytes.length; i += CHUNK) {
@@ -67,80 +112,117 @@ function toBase64(bytes: Uint8Array): string {
   return btoa(bin)
 }
 function fromBase64(b64: string): Uint8Array {
-  const bin = atob(b64)
+  if (b64.length > WORKSPACE_SCROLLBACK_MAX_CHARS) throw new Error('WORKSPACE_SCROLLBACK_LIMIT')
+  let bin: string
+  try { bin = atob(b64) } catch { throw new Error('WORKSPACE_SCROLLBACK_INVALID') }
+  if (bin.length > WORKSPACE_SCROLLBACK_MAX_BYTES) throw new Error('WORKSPACE_SCROLLBACK_LIMIT')
   const out = new Uint8Array(bin.length)
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i)
   return out
 }
 
-// ---- parse (throw on structural breakage, drop malformed optionals) ---------
-function isNode(v: unknown): v is Node {
-  if (typeof v !== 'object' || v === null) return false
-  const n = v as { kind?: unknown }
-  if (n.kind === 'leaf') return typeof (v as { paneId?: unknown }).paneId === 'string'
-  if (n.kind === 'split') {
-    const s = v as { dir?: unknown; ratio?: unknown; a?: unknown; b?: unknown }
-    return (s.dir === 'h' || s.dir === 'v') && typeof s.ratio === 'number' && Number.isFinite(s.ratio) && isNode(s.a) && isNode(s.b)
-  }
-  return false
+interface ParseBudget { panes: number; scrollbackChars: number; treeNodes: number; recovery: number }
+function utf8Bytes(value: string): number { return utf8ByteLength(value) }
+function boundedString(value: unknown, limit: number, code: string): string {
+  if (typeof value !== 'string') fail(code)
+  if (utf8Bytes(value) > limit) fail(code)
+  return value
 }
-
+function safeMapKey(value: string, code: string): string {
+  if (value === '__proto__' || value === 'constructor' || value === 'prototype') fail(code)
+  return value
+}
 function fail(msg: string): never {
-  throw new Error(`invalid workspace file: ${msg}`)
+  throw new Error(msg)
 }
 
-function parsePane(v: unknown): WsPane {
-  if (typeof v !== 'object' || v === null || Array.isArray(v)) fail('pane is not an object')
+// Validate without recursive calls. A malicious split chain must not consume
+// the JS call stack before the depth/node limits reject it.
+function isNode(v: unknown, budget: ParseBudget): v is Node {
+  if (v === null) return true
+  if (typeof v !== 'object' || Array.isArray(v)) return false
+  const stack: Array<{ value: unknown; depth: number }> = [{ value: v, depth: 1 }]
+  while (stack.length > 0) {
+    const current = stack.pop()!
+    if (++budget.treeNodes > WORKSPACE_MAX_TREE_NODES || current.depth > WORKSPACE_MAX_TREE_DEPTH) return false
+    if (typeof current.value !== 'object' || current.value === null || Array.isArray(current.value)) return false
+    const node = current.value as Record<string, unknown>
+    if (node['kind'] === 'leaf') {
+      if (typeof node['paneId'] !== 'string' || utf8Bytes(node['paneId']) > WORKSPACE_MAX_STRING_BYTES
+        || node['paneId'] === '__proto__' || node['paneId'] === 'constructor' || node['paneId'] === 'prototype') return false
+      continue
+    }
+    if (node['kind'] !== 'split' || (node['dir'] !== 'h' && node['dir'] !== 'v') || typeof node['ratio'] !== 'number'
+      || !Number.isFinite(node['ratio']) || node['ratio'] < 0 || node['ratio'] > 1 || !('a' in node) || !('b' in node)) return false
+    stack.push({ value: node['b'], depth: current.depth + 1 }, { value: node['a'], depth: current.depth + 1 })
+  }
+  return true
+}
+
+function parsePane(v: unknown, budget: ParseBudget): WsPane {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) fail('WORKSPACE_PANE_SHAPE')
   const p = v as Record<string, unknown>
-  if (typeof p['id'] !== 'string') fail('pane.id must be a string')
+  const id = safeMapKey(boundedString(p['id'], WORKSPACE_MAX_STRING_BYTES, 'WORKSPACE_PANE_STRING_LIMIT'), 'WORKSPACE_PANE_KEY')
   const kind = p['kind']
-  if (typeof kind !== 'string' || !isWorkspacePaneKind(kind)) fail('pane.kind is unsupported')
-  if (typeof p['cwd'] !== 'string') fail('pane.cwd must be a string')
-  if (typeof p['ord'] !== 'number' || !Number.isFinite(p['ord'])) fail('pane.ord must be a number')
-  if (typeof p['scrollback'] !== 'string') fail('pane.scrollback must be a string')
+  if (typeof kind !== 'string' || !isWorkspacePaneKind(kind)) fail('WORKSPACE_PANE_KIND: pane.kind is unsupported')
+  const cwd = boundedString(p['cwd'], WORKSPACE_MAX_PATH_BYTES, 'WORKSPACE_PATH_LIMIT')
+  if (typeof p['ord'] !== 'number' || !Number.isFinite(p['ord'])) fail('WORKSPACE_PANE_ORD')
+  const scrollback = boundedString(p['scrollback'], WORKSPACE_SCROLLBACK_MAX_CHARS, 'WORKSPACE_SCROLLBACK_LIMIT')
+  budget.panes += 1
+  if (budget.panes > WORKSPACE_MAX_TOTAL_PANES) fail('WORKSPACE_PANE_LIMIT')
+  budget.scrollbackChars += scrollback.length
+  if (budget.scrollbackChars > WORKSPACE_TOTAL_SCROLLBACK_MAX_CHARS) fail('WORKSPACE_SCROLLBACK_LIMIT')
+  if (scrollback !== '' && !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u.test(scrollback)) fail('WORKSPACE_SCROLLBACK_INVALID')
+  const frozenNote = typeof p['frozenNote'] === 'string'
+    ? boundedString(p['frozenNote'], WORKSPACE_MAX_NOTE_BYTES, 'WORKSPACE_NOTE_LIMIT') : undefined
+  const url = kind === 'browser' && typeof p['url'] === 'string'
+    ? safeRestoreUrl(boundedString(p['url'], WORKSPACE_MAX_URL_BYTES, 'WORKSPACE_URL_LIMIT')) : undefined
+  const path = 'path' in p
+    ? (p['path'] === null ? null : typeof p['path'] === 'string' ? boundedString(p['path'], WORKSPACE_MAX_PATH_BYTES, 'WORKSPACE_PATH_LIMIT') : null)
+    : undefined
   return {
-    id: p['id'],
+    id,
     kind,
-    cwd: p['cwd'],
+    cwd,
     ord: p['ord'],
-    scrollback: p['scrollback'],
-    // frozenNote is optional; drop it unless a string ('' is valid = frozen, no note).
-    ...(typeof p['frozenNote'] === 'string' ? { frozenNote: p['frozenNote'] } : {}),
-    ...(kind === 'browser' && typeof p['url'] === 'string' ? { url: safeRestoreUrl(p['url']) } : {}),
-    // `path` is string | null; anything else (incl. missing) loads as a scratch
-    // buffer rather than failing the whole file.
-    ...('path' in p ? { path: typeof p['path'] === 'string' ? p['path'] : null } : {}),
+    scrollback,
+    ...(frozenNote !== undefined ? { frozenNote } : {}),
+    ...(url !== undefined ? { url } : {}),
+    ...(path !== undefined ? { path } : {}),
   }
 }
 
 function parseWsBrowser(v: unknown): WsBrowser {
-  if (typeof v !== 'object' || v === null || Array.isArray(v)) fail('tab.browser must be an object')
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) fail('WORKSPACE_BROWSER_SHAPE')
   const b = v as Record<string, unknown>
-  if (b['mode'] !== 'preview' && b['mode'] !== 'browse') fail('browser.mode is unsupported')
-  if (typeof b['safeRestoreUrl'] !== 'string') fail('browser.safeRestoreUrl must be a string')
+  if (b['mode'] !== 'preview' && b['mode'] !== 'browse') fail('WORKSPACE_BROWSER_MODE')
+  const safeUrl = boundedString(b['safeRestoreUrl'], WORKSPACE_MAX_URL_BYTES, 'WORKSPACE_URL_LIMIT')
   const viewport = b['viewport'] === undefined ? undefined : parseBrowserViewport(b['viewport'])
-  if (b['viewport'] !== undefined && !viewport) fail('browser.viewport is invalid')
+  if (b['viewport'] !== undefined && !viewport) fail('WORKSPACE_BROWSER_VIEWPORT: browser viewport is invalid')
   const width = b['width']
-  if (width !== undefined && (typeof width !== 'number' || !Number.isSafeInteger(width) || width < MIN_RAIL_WIDTH || width > MAX_RAIL_WIDTH)) fail('browser.width is invalid')
+  if (width !== undefined && (typeof width !== 'number' || !Number.isSafeInteger(width) || width < MIN_RAIL_WIDTH || width > MAX_RAIL_WIDTH)) fail('WORKSPACE_BROWSER_WIDTH')
   return {
-    mode: b['mode'], safeRestoreUrl: safeRestoreUrl(b['safeRestoreUrl']),
+    mode: b['mode'], safeRestoreUrl: safeRestoreUrl(safeUrl),
     ...(viewport ? { viewport } : {}),
     ...(typeof b['collapsed'] === 'boolean' ? { collapsed: b['collapsed'] } : {}), ...(typeof width === 'number' ? { width } : {}),
   }
 }
 
-function parseTab(v: unknown, version: 1 | 2): WsTab {
-  if (typeof v !== 'object' || v === null || Array.isArray(v)) fail('tab is not an object')
+function parseTab(v: unknown, version: 1 | 2, budget: ParseBudget): WsTab {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) fail('WORKSPACE_TAB_SHAPE')
   const t = v as Record<string, unknown>
-  if (typeof t['tab'] !== 'number' || !Number.isFinite(t['tab'])) fail('tab.tab must be a number')
-  if (!Array.isArray(t['panes'])) fail('tab.panes must be an array')
+  if (typeof t['tab'] !== 'number' || !Number.isFinite(t['tab'])) fail('WORKSPACE_TAB_NUMBER')
+  if (!Array.isArray(t['panes'])) fail('WORKSPACE_PANE_ARRAY')
+  if (t['panes'].length > WORKSPACE_MAX_PANES_PER_TAB) fail('WORKSPACE_PANE_LIMIT')
   const tree = t['tree']
-  if (tree !== null && tree !== undefined && !isNode(tree)) fail('tab.tree is a malformed layout node')
-  const parsedPanes = t['panes'].map(parsePane)
+  if (tree !== null && tree !== undefined && !isNode(tree, budget)) fail('WORKSPACE_TREE_LIMIT')
+  const parsedPanes = t['panes'].map((pane) => parsePane(pane, budget))
   if (version === 2 && parsedPanes.some((pane) => pane.kind === 'browser')) fail('v2 browser must be tab-owned')
   const ids = new Set<string>()
   for (const pane of parsedPanes) { if (ids.has(pane.id)) fail('duplicate pane placeholder'); ids.add(pane.id) }
   const browserPanes = version === 1 ? parsedPanes.filter((pane) => pane.kind === 'browser').sort((a, b) => a.ord - b.ord || a.id.localeCompare(b.id)) : []
+  budget.recovery += Math.max(0, browserPanes.length - 1)
+  if (budget.recovery > WORKSPACE_MAX_RECOVERY_ITEMS) fail('WORKSPACE_RECOVERY_LIMIT')
   const panes = version === 1 ? parsedPanes.filter((pane) => pane.kind !== 'browser') : parsedPanes
   const browserIds = new Set(browserPanes.map((pane) => pane.id))
   const removeBrowsers = (node: Node | null): Node | null => {
@@ -158,50 +240,61 @@ function parseTab(v: unknown, version: 1 | 2): WsTab {
   const legacyBrowsers = browserPanes.map((pane) => ({ mode: 'browse' as const, safeRestoreUrl: safeRestoreUrl(pane.url ?? '') }))
   return {
     tab: t['tab'], tree: cleanTree, panes,
-    ...(typeof t['label'] === 'string' ? { label: t['label'] } : {}),
+    ...(typeof t['label'] === 'string' ? { label: boundedString(t['label'], WORKSPACE_MAX_STRING_BYTES, 'WORKSPACE_STRING_LIMIT') } : {}),
     ...(version === 2 && t['browser'] !== undefined ? { browser: parseWsBrowser(t['browser']) } : {}),
     ...(legacyBrowsers[0] ? { browser: legacyBrowsers[0] } : {}),
     ...(legacyBrowsers.length > 1 ? { browserRecovery: legacyBrowsers.slice(1) } : {}),
   }
 }
 
-function parseWorkspace(v: unknown, version: 1 | 2): WsWorkspace {
-  if (typeof v !== 'object' || v === null || Array.isArray(v)) fail('workspace is not an object')
+function parseWorkspace(v: unknown, version: 1 | 2, budget: ParseBudget): WsWorkspace {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) fail('WORKSPACE_WORKSPACE_SHAPE')
   const w = v as Record<string, unknown>
-  if (!Array.isArray(w['tabs'])) fail('workspace.tabs must be an array')
+  if (!Array.isArray(w['tabs'])) fail('WORKSPACE_TAB_ARRAY')
+  if (w['tabs'].length > WORKSPACE_MAX_TABS_PER_WORKSPACE) fail('WORKSPACE_TAB_LIMIT')
+  const label = typeof w['label'] === 'string' ? boundedString(w['label'], WORKSPACE_MAX_STRING_BYTES, 'WORKSPACE_STRING_LIMIT') : undefined
+  if (Array.isArray(w['tabOrder']) && w['tabOrder'].length > WORKSPACE_MAX_TABS_PER_WORKSPACE) fail('WORKSPACE_TAB_ORDER_LIMIT')
+  const tabOrder = Array.isArray(w['tabOrder'])
+    ? w['tabOrder'].filter((n): n is number => typeof n === 'number' && Number.isFinite(n))
+    : undefined
   return {
-    tabs: w['tabs'].map((tab) => parseTab(tab, version)),
-    ...(typeof w['label'] === 'string' ? { label: w['label'] } : {}),
-    ...(Array.isArray(w['tabOrder'])
-      ? { tabOrder: w['tabOrder'].filter((n): n is number => typeof n === 'number' && Number.isFinite(n)) }
-      : {}),
+    tabs: w['tabs'].map((tab) => parseTab(tab, version, budget)),
+    ...(label !== undefined ? { label } : {}),
+    ...(tabOrder ? { tabOrder } : {}),
   }
 }
 
 export function parseWorkspaceFile(text: string): WorkspaceDoc {
+  assertWorkspaceFileBytes(text)
   let raw: unknown
   try {
     raw = JSON.parse(text)
   } catch {
-    fail('not valid JSON')
+    fail('WORKSPACE_JSON_INVALID')
   }
-  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) fail('top level is not an object')
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) fail('WORKSPACE_TOP_LEVEL')
   const d = raw as Record<string, unknown>
-  if (d['version'] !== 1 && d['version'] !== WORKSPACE_VERSION) throw new Error('unsupported version')
-  if (d['scope'] !== 'one' && d['scope'] !== 'all') fail('scope must be "one" or "all"')
-  if (!Array.isArray(d['workspaces'])) fail('workspaces must be an array')
+  // Check the version before touching any collection. A future file is opaque
+  // data, not an empty document that may later be rewritten by a save path.
+  if (d['version'] !== 1 && d['version'] !== WORKSPACE_VERSION) throw new Error('WORKSPACE_UNSUPPORTED_VERSION: unsupported version')
+  if (d['scope'] !== 'one' && d['scope'] !== 'all') fail('WORKSPACE_SCOPE')
+  if (!Array.isArray(d['workspaces'])) fail('WORKSPACE_WORKSPACE_ARRAY: workspaces must be an array')
+  if (d['workspaces'].length > WORKSPACE_MAX_WORKSPACES) fail('WORKSPACE_WORKSPACE_LIMIT')
+  const budget: ParseBudget = { panes: 0, scrollbackChars: 0, treeNodes: 0, recovery: 0 }
   return {
     version: WORKSPACE_VERSION,
     scope: d['scope'],
-    workspaces: d['workspaces'].map((workspace) => parseWorkspace(workspace, d['version'] as 1 | 2)),
+    workspaces: d['workspaces'].map((workspace) => parseWorkspace(workspace, d['version'] as 1 | 2, budget)),
   }
 }
 
 export function serializeWorkspaceFile(doc: WorkspaceDoc): string {
-  return JSON.stringify({
+  const text = JSON.stringify({
     version: WORKSPACE_VERSION, scope: doc.scope,
     workspaces: doc.workspaces.map((workspace) => ({ ...workspace, tabs: workspace.tabs.map(({ browserRecovery: _recovery, ...tab }) => tab) })),
   })
+  assertWorkspaceFileBytes(text)
+  return text
 }
 
 // ---- placeholder tree rewrites (pure, both directions) ----------------------
@@ -212,7 +305,7 @@ export function serializeWorkspaceFile(doc: WorkspaceDoc): string {
 function rewriteLeaves(tree: Node | null, map: Record<string, string>): Node | null {
   if (tree === null) return null
   if (tree.kind === 'leaf') {
-    const mapped = map[tree.paneId]
+    const mapped = Object.hasOwn(map, tree.paneId) ? map[tree.paneId] : undefined
     return mapped === undefined ? null : { kind: 'leaf', paneId: mapped }
   }
   const a = rewriteLeaves(tree.a, map)
@@ -322,6 +415,7 @@ export function buildLoadPlan(doc: WorkspaceDoc, opts: LoadOptions): LoadPlan {
   const workspaces: Record<string, WsLayout> = {}
   const frozen: Record<string, FrozenEntry> = {}
   const scrollback: Record<string, Uint8Array> = {}
+  let totalScrollbackBytes = 0
   const editors: Record<string, EditorEntry> = {}
   const browserRails: BrowserLoadIntent[] = []
   const browserRecovery: BrowserRecoveryIntent[] = []
@@ -357,7 +451,12 @@ export function buildLoadPlan(doc: WorkspaceDoc, opts: LoadOptions): LoadPlan {
         idToName[pane.id] = name
         creates.push({ name, cwd: pane.cwd, kind: pane.kind })
         if (pane.frozenNote !== undefined) frozen[name] = pane.frozenNote === '' ? {} : { note: pane.frozenNote }
-        if (pane.scrollback !== '') scrollback[name] = fromBase64(pane.scrollback)
+        if (pane.scrollback !== '') {
+          const bytes = fromBase64(pane.scrollback)
+          totalScrollbackBytes += bytes.byteLength
+          if (totalScrollbackBytes > WORKSPACE_TOTAL_SCROLLBACK_MAX_BYTES) throw new Error('WORKSPACE_SCROLLBACK_LIMIT')
+          scrollback[name] = bytes
+        }
       }
       // A saved null tree stays null — the renderer reconciles it to equal
       // splits at mount (core rule #3: grouping reconstructable from names).

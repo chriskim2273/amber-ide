@@ -1484,7 +1484,11 @@ function App(): JSX.Element {
   // Load step 1: pick + read + parse the file. Parse errors surface in the notice
   // banner; a valid file opens the new-vs-replace mode dialog.
   const doLoad = async (): Promise<void> => {
-    const text = await window.amber.openWorkspaceFile()
+    let text: string | null
+    try { text = await window.amber.openWorkspaceFile() } catch (e) {
+      setNotice(`Could not load workspace — ${(e as Error).message}.`)
+      return
+    }
     if (text === null) return
     let doc: WorkspaceDoc
     try { doc = parseWorkspaceFile(text) } catch (e) {

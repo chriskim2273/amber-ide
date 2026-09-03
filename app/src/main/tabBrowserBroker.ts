@@ -163,7 +163,20 @@ async function tokenFile(path: string): Promise<string> {
   return token
 }
 
-export interface TabBrowserBrokerOptions { requestTimeoutMs?: number; socketTimeoutMs?: number; resultTtlMs?: number; maxClientIdentities?: number; now?: () => number; authorizeReplay?: (request: BrokerRequest) => boolean | Promise<boolean>; operations?: BrowserOperationRegistry }
+export interface TabBrowserBrokerOptions {
+  requestTimeoutMs?: number
+  socketTimeoutMs?: number
+  /** Grace for an adapter that ignored AbortSignal before its queue is released. */
+  operationBarrierTimeoutMs?: number
+  resultTtlMs?: number
+  maxClientIdentities?: number
+  now?: () => number
+  authorizeReplay?: (request: BrokerRequest) => boolean | Promise<boolean>
+  /** Resolve the FIFO identity only after the request is authenticated and
+   * authorized. A request id is never a queue key. */
+  queueKey?: (request: BrokerRequest) => string | Promise<string>
+  operations?: BrowserOperationRegistry
+}
 
 async function rejectLiveSocket(path: string): Promise<void> {
   let metadata
@@ -177,6 +190,43 @@ async function rejectLiveSocket(path: string): Promise<void> {
   })
   if (live) throw new Error('BROWSER_HOST_ALREADY_RUNNING')
   await unlink(path)
+}
+
+function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(new Error('ACTION_CANCELLED'))
+  let onAbort: (() => void) | undefined
+  const cancelled = new Promise<never>((_resolve, reject) => {
+    onAbort = () => reject(new Error('ACTION_CANCELLED'))
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
+  return Promise.race([promise, cancelled]).finally(() => {
+    if (onAbort) signal.removeEventListener('abort', onAbort)
+  })
+}
+
+function boundedBarrier(promise: Promise<void>, releaseSignal: AbortSignal, timeoutMs: number): Promise<void> {
+  // Healthy operations keep strict FIFO for their whole duration. The grace
+  // timer starts only after cancellation/timeout, so a slow-but-cooperating
+  // navigation cannot be overtaken by the next request.
+  return new Promise<void>((resolve) => {
+    let timer: NodeJS.Timeout | undefined
+    let finished = false
+    const finish = (): void => {
+      if (finished) return
+      finished = true
+      if (timer) clearTimeout(timer)
+      releaseSignal.removeEventListener('abort', release)
+      resolve()
+    }
+    const release = (): void => {
+      if (finished || timer) return
+      if (timeoutMs <= 0) { finish(); return }
+      timer = setTimeout(finish, timeoutMs); timer.unref()
+    }
+    promise.then(finish, finish)
+    releaseSignal.addEventListener('abort', release, { once: true })
+    if (releaseSignal.aborted) release()
+  })
 }
 
 export class TabBrowserBrokerServer {
@@ -211,6 +261,7 @@ export class TabBrowserBrokerServer {
   private accept(socket: Socket, token: string): void {
     let authenticated = false; let buffer = Buffer.alloc(0); let chain = Promise.resolve(); let queued = 0
     const active = new Set<AbortController>()
+    const connectionResults = new Set<string>()
     const safeWrite = (value: unknown): void => { if (!socket.destroyed && socket.writable) socket.write(frame(value)) }
     const safeWriteResult = (requestId: string, result: unknown): void => {
       if (binaryAttachment(result)) {
@@ -220,7 +271,12 @@ export class TabBrowserBrokerServer {
     }
     const idleTimeoutMs = this.options.socketTimeoutMs ?? 10_000
     socket.on('error', () => {})
-    socket.once('close', () => { for (const controller of active) controller.abort(); active.clear() })
+    socket.once('close', () => {
+      for (const controller of active) controller.abort()
+      active.clear()
+      for (const key of connectionResults) this.results.delete(key)
+      connectionResults.clear()
+    })
     socket.setTimeout(idleTimeoutMs, () => socket.destroy())
     socket.on('data', (chunk: Buffer) => {
       if (buffer.length + chunk.length > MAX_FRAME * 17) { socket.destroy(); return }
@@ -255,8 +311,16 @@ export class TabBrowserBrokerServer {
               void guarded.then((result) => {
                 safeWriteResult(request.requestId, result)
                 if (binaryAttachment(result) && cacheKey) this.results.delete(cacheKey)
-              }, (error) => safeWrite({ version: 1, requestId: request.requestId, ok: false, error: safeBrokerError(error) }))
-                .finally(() => { queued -= 1 })
+              }, (error) => {
+                const code = safeBrokerError(error)
+                // A cancelled/timed-out action did not produce a replayable
+                // result. Keeping its promise in the five-minute cache would
+                // retain request/controller closures and make a retry replay a
+                // cancellation forever.
+                if ((code === 'ACTION_CANCELLED' || code === 'ACTION_TIMEOUT' || code === 'BROWSER_HOST_SHUTTING_DOWN') && cacheKey) this.results.delete(cacheKey)
+                safeWrite({ version: 1, requestId: request.requestId, ok: false, error: code })
+              })
+                .finally(() => { queued -= 1; if (cacheKey) connectionResults.delete(cacheKey) })
             }
             if (cached) {
               if (cached.digest !== digest) throw new Error('INVALID_REQUEST')
@@ -291,9 +355,13 @@ export class TabBrowserBrokerServer {
               if (request.sequence <= previousSequence) throw new Error('ACTION_CANCELLED')
               if (!knownClient && this.highWater.size >= (this.options.maxClientIdentities ?? 1024)) throw new Error('REQUEST_LIMIT')
               this.highWater.set(request.clientInstanceId, request.sequence)
-              const key = request.amberSession, depth = this.queueDepth.get(key) ?? 0
+              const key = this.options.queueKey ? await this.options.queueKey(request) : `session:${request.amberSession}`
+              if (key.length < 1 || key.length > 512) throw new Error('INVALID_REQUEST')
+              const depth = this.queueDepth.get(key) ?? 0
               if (depth >= 16) throw new Error('REQUEST_LIMIT')
               const controller = new AbortController(); active.add(controller); this.activeRequests.set(controller, request.amberSession)
+              const unregister = (): void => { active.delete(controller); this.activeRequests.delete(controller) }
+              controller.signal.addEventListener('abort', unregister, { once: true })
               let operationBarrier: Promise<void> = Promise.resolve()
               const execute = async (): Promise<unknown> => {
                 if (controller.signal.aborted) { active.delete(controller); this.activeRequests.delete(controller); throw new Error('ACTION_CANCELLED') }
@@ -304,16 +372,33 @@ export class TabBrowserBrokerServer {
                   socket.setTimeout(Math.max(idleTimeoutMs, timeoutMs + 2_000))
                   let timer: NodeJS.Timeout | undefined
                   const timeout = new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error('ACTION_TIMEOUT')), timeoutMs) })
-                  const operation = this.handle(request, controller.signal)
-                  operationBarrier = operation.then(() => {}, () => {})
-                  try { return await Promise.race([operation, timeout]) }
-                  catch (error) { if (error instanceof Error && error.message === 'ACTION_TIMEOUT') controller.abort(); throw error }
-                  finally { if (timer) clearTimeout(timer); socket.setTimeout(idleTimeoutMs) }
-                } finally { active.delete(controller); this.activeRequests.delete(controller); this.inFlight -= 1 }
+                  const executionController = new AbortController()
+                  const releaseController = new AbortController()
+                  const relayAbort = (): void => { executionController.abort(); releaseController.abort() }
+                  controller.signal.addEventListener('abort', relayAbort, { once: true })
+                  const operation = this.handle(request, executionController.signal)
+                  const rawBarrier = operation.then(() => {}, () => {})
+                  operationBarrier = boundedBarrier(rawBarrier, releaseController.signal, this.options.operationBarrierTimeoutMs ?? 1_000)
+                  let cancelExecution: (() => void) | undefined
+                  const cancelled = new Promise<never>((_resolve, reject) => {
+                    cancelExecution = () => reject(new Error('ACTION_CANCELLED'))
+                    controller.signal.addEventListener('abort', cancelExecution, { once: true })
+                  })
+                  try { return await Promise.race([operation, timeout, cancelled]) }
+                  catch (error) {
+                    if (error instanceof Error && error.message === 'ACTION_TIMEOUT') { executionController.abort(); releaseController.abort() }
+                    throw error
+                  }
+                  finally {
+                    controller.signal.removeEventListener('abort', relayAbort)
+                    if (cancelExecution) controller.signal.removeEventListener('abort', cancelExecution)
+                    if (timer) clearTimeout(timer); socket.setTimeout(idleTimeoutMs)
+                  }
+                } finally { unregister(); this.inFlight -= 1 }
               }
               this.queueDepth.set(key, depth + 1)
               const prior = this.queues.get(key) ?? Promise.resolve()
-              const promise = this.options.operations
+              const scheduled = this.options.operations
                 ? this.options.operations.run('broker', async (signal) => {
                     const abortOwned = (): void => controller.abort()
                     signal.addEventListener('abort', abortOwned, { once: true })
@@ -321,9 +406,14 @@ export class TabBrowserBrokerServer {
                     finally { signal.removeEventListener('abort', abortOwned) }
                   }, controller.signal)
                 : prior.catch(() => {}).then(execute)
+              // The client-facing promise must settle on cancellation even if
+              // it is still waiting behind an older request. The queue tail is
+              // separate and remains FIFO until that older work reaches the
+              // bounded adapter barrier.
+              const promise = depth > 0 ? abortable(scheduled, controller.signal) : scheduled
               // A timed-out client gets its error immediately, but following
               // work cannot overtake the still-unwinding operation.
-              const tail = promise.then(() => {}, () => {}).then(() => operationBarrier)
+              const tail = scheduled.then(() => {}, () => {}).then(() => operationBarrier)
               this.queues.set(key, tail)
               void tail.finally(() => {
                 const remaining = (this.queueDepth.get(key) ?? 1) - 1
@@ -331,6 +421,7 @@ export class TabBrowserBrokerServer {
                 if (this.queues.get(key) === tail) this.queues.delete(key)
               })
               this.results.set(cacheKey, { digest, promise, acceptedAt: now() })
+              connectionResults.add(cacheKey)
               if (this.results.size > 256) this.results.delete(this.results.keys().next().value!)
               deferReply(promise, controller.signal); return
             }
@@ -351,6 +442,12 @@ export class TabBrowserBrokerServer {
   async close(): Promise<void> {
     for (const socket of this.sockets) socket.destroy()
     if (this.server) await new Promise<void>((resolve) => this.server!.close(() => resolve()))
-    this.server = null; await unlink(this.socketPath).catch(() => {})
+    this.server = null
+    // Socket close aborts each request, but the queue tails may still be
+    // waiting for an adapter that ignored cancellation. Drop all registries
+    // owned by this server now; bounded tails are only for ordering and must
+    // not keep a closed broker alive.
+    this.queues.clear(); this.queueDepth.clear(); this.results.clear(); this.highWater.clear(); this.activeRequests.clear()
+    await unlink(this.socketPath).catch(() => {})
   }
 }

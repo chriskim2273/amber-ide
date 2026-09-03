@@ -133,7 +133,11 @@ export function parseBrowserState(text: string): BrowserStateFile {
     }
     const migrationRecovery: MigrationRecoveryItem[] = []; const recoveryIds = new Set<RecoveryId>()
     if (Array.isArray(raw['migrationRecovery'])) {
-      for (const [sourceIndex, value] of raw['migrationRecovery'].slice(0, BROWSER_RECOVERY_MAX).entries()) {
+      // Do not truncate recovery URLs at the presentation bound. A legacy
+      // file with more than BROWSER_RECOVERY_MAX entries is handled by the
+      // migration preflight, which fails before any rewrite; parsing it here
+      // must preserve every durable item so a user can recover/delete them.
+      for (const [sourceIndex, value] of raw['migrationRecovery'].entries()) {
         const item = object(value)
         if (!item || !finite(item['workspace']) || !finite(item['tab']) || typeof item['safeRestoreUrl'] !== 'string') continue
         const workspace = item['workspace'], tab = item['tab'], restoreUrl = safeRestoreUrl(item['safeRestoreUrl'])
