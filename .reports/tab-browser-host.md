@@ -1,11 +1,11 @@
 # Tab browser host implementation report
 
-Date: 2026-09-01
+Date: 2026-09-03
 Branch: `feat/tab-browser-host`
 
 ## Result
 
-This branch implements and Linux-validates the durable main-owned tab-browser foundation, rail UI, persistence, capacity policy, and authenticated Pi observation, navigation, and approval-gated semantic interaction substrate. It does **not** satisfy the full approved product acceptance contract yet. Independent Phase-B re-review, deployed-reader upgrade proof, packaged-artifact gates, and macOS manual gates remain open. Those omissions must block merge of the complete feature.
+This branch implements and Linux-validates the durable main-owned tab-browser foundation, rail UI, persistence, capacity policy, and authenticated Pi observation, navigation, and approval-gated semantic interaction substrate. It does **not** satisfy the full approved product acceptance contract yet. Independent Phase-B re-review, deployed-reader upgrade proof, packaged-artifact gates, and macOS manual gates remain open. Those omissions must block merge of the complete feature. `mergeReady: false`.
 
 ## Implemented
 
@@ -211,11 +211,24 @@ Launcher state and explicit-stop inhibit writes now use fsynced atomic private f
 
 Post-remediation evidence from this isolated `/tmp` worktree: app **908 passed / 1 intentional real-daemon skip**; Rust workspace **788 passed / 1 intentional delegated-cgroup ignore**; warnings-as-errors workspace clippy; strict TypeScript typecheck; Electron and hosted-web production builds; focused resident/browser suites; isolated `ctl browser-host`; generated Pi v6 installation, compilation, production loading, cold-start recovery, labels/bounds, and all 26 registered tools; `git diff --check`; report JSON parse. Full `cargo fmt --all -- --check` remains red on the repository's documented broad pre-existing formatter drift (720 diff hunks), so no bulk reformat was applied. No production daemon was contacted. Packaged Linux resident/physical-input and macOS lifecycle remain external gates; this P1 awaits independent code review.
 
+### Six accepted resident-lifecycle findings (2026-09-03; implementation complete, independent re-review pending)
+
+This pass used tests first and narrow conventional commits to close the accepted resident-lifecycle findings without changing the daemon protocol or widening browser authority:
+
+1. **Broker drain replay:** cached broker results now register as broker operations, re-check drain/abort state before waiting and immediately before writing, and cannot replay page data after resident Quit begins. The regression covers a cached request retried after `beginDrain`.
+2. **Watcher epochs:** the utility `Connection` assigns each socket a monotonically increasing epoch and drops stale data/open/close/error callbacks. `BrowserDaemonWatcher` requires a fresh full list for the active epoch and ignores callbacks from older sockets or after close.
+3. **Capacity rollback:** a selected victim is marked unavailable when its page closes or crashes during deferred admission validation. Rollback removes the candidate without inventing a live renderer for that victim; close and crash races are covered.
+4. **Recovery TOCTOU:** migration recovery entries receive stable opaque IDs (legacy records are deterministically upgraded), and list/copy/delete/attach plus runtime-delta merging address those IDs rather than mutable array indexes. Duplicate URL deletion and persistence fixtures cover the identity boundary.
+5. **AppImage replacement:** the stable pathname is replaced with one atomic rename after a fsynced staged copy; a rollback copy remains until launcher registration succeeds, and cleanup failure cannot undo an already committed pathname. Registration failure and pre-commit interruption are tested.
+6. **Windows enable:** `amber ctl browser-host enable` rejects with `BROWSER_HOST_UNSUPPORTED` before reading or mutating the inhibit marker on unsupported platforms.
+
+Validation from `/tmp/amber-tab-browser-validation` on this branch: app **916 passed / 1 intentional real-daemon skip** (`npm test`), strict typecheck, Electron build, and hosted-web build; Rust workspace **789 passed / 1 intentional delegated-cgroup ignore** (`cargo test --workspace --all-targets`), warnings-as-errors workspace clippy, and isolated browser-host CLI coverage. `cargo fmt --all -- --check` remains red only for the repository's documented pre-existing formatter drift; no bulk reformat was applied. The focused resident/browser suites passed after the final changes. `npm run lint` remains unavailable because this repository has the documented ESLint 9 flat-config gap. The `/tmp` `npm run dist` attempt built a static `amber` but stopped before packaging because the Linux root dist script does not produce the required `amber-router-linux-x86_64`; no packaged artifact claim is made. No production daemon or profile was contacted. Independent resident re-review and the existing deployed-reader, packaged Linux/macOS, and manual platform gates remain open, so `mergeReady` stays false.
+
 ## Open blocking work
 
 1. Obtain independent review of the resident lifecycle/launcher/Quit implementation and remediate every valid finding before changing its P1 status.
 2. Prove the Rust layout-v2 reader through the real upgrade/deployment channel before enabling v2 writes by default.
-3. Validate the real packaged artifact and all bundled binaries; static-musl packaging is unavailable on this box because no musl C compiler is installed.
+3. Validate the real packaged artifact and all bundled binaries; the local musl toolchain built `amber`, but the packaging chain currently stops because Linux dist does not produce the required static `amber-router` artifact.
 4. Complete the explicit macOS native-view geometry, focus, IME, lifecycle, profile, and packaging manual gate. No macOS claim is made.
 5. Resolve the inconclusive Linux physical-input packaged smoke and run production-path Electron evidence for the semantic adapter and visible approval UI against approved hostile fixtures.
 6. Expand process-lifecycle and broker end-to-end tests around daemon reconnect races and orphan durable records after sidecar CAS conflict.
