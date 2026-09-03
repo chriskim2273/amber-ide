@@ -145,7 +145,13 @@ export async function installStableAppImage(source: string, destination: string,
     await rename(temporary, destination); newInstalled = true
     await syncDirectory(parent)
     await register()
-    if (backupReady) { await rm(backup, { force: true }); backupReady = false; await syncDirectory(parent) }
+    if (backupReady) {
+      // Registration has committed the new executable. Failure to clean the
+      // private rollback copy must not undo that committed launcher pathname.
+      await rm(backup, { force: true }).catch(() => {})
+      backupReady = false
+      await syncDirectory(parent).catch(() => {})
+    }
   } catch (error) {
     if (newInstalled) {
       await rm(destination, { force: true }).catch(() => {})
