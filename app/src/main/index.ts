@@ -6,7 +6,7 @@ import { basename, dirname, join, resolve as resolvePathJoin, isAbsolute } from 
 import { homedir, hostname, release as osRelease, tmpdir } from 'node:os'
 import { spawn, execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { readFile, writeFile, rename, mkdir, copyFile, chmod, realpath, rm, stat, mkdtemp } from 'node:fs/promises'
+import { readFile, writeFile, rename, mkdir, copyFile, chmod, rm, stat, mkdtemp } from 'node:fs/promises'
 import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
 import { resolveSocketPath } from '../shared/socketPath'
 import { HANDOFF_FILE_MAX, parseHandoff } from '../shared/handoff'
@@ -84,12 +84,16 @@ import { parseWorkspaceFile } from '../shared/workspaceFile'
 import { commitPreparedWorkspaceImport, prepareWorkspaceImport } from './workspaceImport'
 import { browserContextMatches, captureBrowserContext, hasExactApprovalSurface, resolveBrowserContext, setBrowserForCurrentContext } from './browserWindowContext'
 import { createBrowserId } from '../shared/tabBrowser'
+import { BrowserOperationRegistry } from './browserOperationRegistry'
+import { browserHostSocketPath } from './browserHostPaths'
 import {
   activationRequest,
   clearBrowserHostInhibit,
   coordinateBrowserHostQuit,
+  installStableAppImage,
   parseActivationRequest,
   registerBrowserHostLauncher,
+  ResidentIntentLatch,
   writeBrowserHostInhibit,
 } from './browserResident'
 import clientPath from '../client/index?modulePath'
@@ -632,16 +636,14 @@ async function installDesktopShortcut(win: BrowserWindow): Promise<void> {
     const appImage = process.env['APPIMAGE'] ?? ''
     const stable = stableAppImagePath(home)
 
-    // Self-copy guard: skip the copy when already running from the stable path.
-    const [src, dst] = await Promise.all([
-      realpath(appImage),
-      realpath(stable).catch(() => ''),
-    ])
-    if (src !== dst) {
-      await mkdir(dirname(stable), { recursive: true })
-      await copyFile(appImage, stable)
-    }
-    await chmod(stable, 0o755)
+    await installStableAppImage(appImage, stable, async () => {
+      if (!tabBrowserHostEnabled()) return
+      await registerBrowserHostLauncher(stateRoot(), {
+        platform: process.platform, executable: stable,
+        installGeneration: `${app.getVersion()}:${process.versions.electron}`,
+        uid: process.getuid?.(),
+      })
+    })
 
     const icon = iconInstallPath(home)
     await mkdir(dirname(icon), { recursive: true })
@@ -655,14 +657,6 @@ async function installDesktopShortcut(win: BrowserWindow): Promise<void> {
     await spawnOk('gtk-update-icon-cache', [
       join(home, '.local', 'share', 'icons', 'hicolor'),
     ]).catch(() => {})
-    if (tabBrowserHostEnabled()) {
-      await registerBrowserHostLauncher(stateRoot(), {
-        platform: process.platform, executable: stable,
-        installGeneration: `${app.getVersion()}:${process.versions.electron}`,
-        uid: process.getuid?.(),
-      })
-    }
-
     await dialog.showMessageBox(win, {
       type: 'info',
       buttons: ['OK'],
@@ -769,6 +763,7 @@ let residentTray: Tray | null = null
 let allowFinalQuit = false
 let explicitQuitInProgress = false
 let requestExplicitQuit: (() => Promise<void>) | null = null
+const residentIntents = new ResidentIntentLatch()
 
 /** The window an IPC message came from. */
 function ctxFor(e: { sender: Electron.WebContents }): WindowCtx | undefined {
@@ -1237,11 +1232,14 @@ async function main(): Promise<void> {
   const tabBrowserSupported = tabBrowserHostEnabled()
   let tabBrowser: TabBrowserService | null = null
   let tabBrowserStateStore: TabBrowserStateStore | null = null
+  const browserOperations = new BrowserOperationRegistry()
+  const rendererBrowserOperation = <T>(kind: 'association' | 'workspace-import' | 'recovery', work: (signal: AbortSignal) => Promise<T>): Promise<T | { ok: false; error: string }> =>
+    browserOperations.run(kind, work).catch((error) => ({ ok: false, error: error instanceof Error ? error.message : 'INTERNAL_ERROR' }))
   if (tabBrowserSupported) {
     try {
       tabBrowserStateStore = new TabBrowserStateStore(stateRoot())
       await coordinateTabBrowserMigration(layoutPath(), tabBrowserStateStore)
-      tabBrowser = await TabBrowserService.create(stateRoot(), win, tabBrowserStateStore)
+      tabBrowser = await TabBrowserService.create(stateRoot(), win, tabBrowserStateStore, browserOperations)
       onLocalWindowHidden = () => tabBrowser?.windowHidden()
       tabBrowser.setApprovalSurface(
         (id) => hasExactApprovalSurface([...windowCtxs.values()].map((context) => ({ local: context.target.kind === 'local', destroyed: context.win.isDestroyed(), visible: context.win.isVisible(), browserId: context.activeBrowserId, expanded: context.activeBrowserExpanded })), id),
@@ -1296,6 +1294,7 @@ async function main(): Promise<void> {
   if (tabBrowser) {
     browserDaemonWatcher = new BrowserDaemonWatcher(new Connection(socket))
     browserDaemonWatcher.start()
+    if (!(await browserDaemonWatcher.waitForFresh(5_000))) throw new Error('DAEMON_STATE_STALE')
     const currentBrokerLayout = async (request: BrokerRequest): Promise<ReturnType<typeof parseLayout>> => {
       const loaded = await loadLayoutFile(layoutPath())
       const current = loaded.text ? parseLayout(loaded.text) : null
@@ -1311,8 +1310,10 @@ async function main(): Promise<void> {
       catch (error) { if (associatedId) tabBrowser.revokePi(associatedId); throw error }
       return current
     }
-    const handleBroker = async (request: BrokerRequest, signal: AbortSignal): Promise<unknown> => {
+    const handleBrokerInner = async (request: BrokerRequest, signal: AbortSignal): Promise<unknown> => {
+      browserOperations.assertDispatch(signal)
       const current = await currentBrokerLayout(request)
+      browserOperations.assertDispatch(signal)
       if (request.action.type === 'open') {
         const location = authorizeBrowserRequest(current, request.amberSession, true)
         if (!location.browserId) {
@@ -1329,13 +1330,14 @@ async function main(): Promise<void> {
           const opened = await tabBrowser.command({ type: 'open' }, signal, stillOpenTarget)
           if (!('id' in opened)) throw new Error('INTERNAL_ERROR')
           const latestLoaded = await loadLayoutFile(layoutPath())
-          if (!latestLoaded.text || !(await stillOpenTarget())) { await tabBrowser.command({ type: 'destroy', id: opened.id }).catch(() => {}); throw new Error('STALE_BROWSER_CONTEXT') }
+          if (!latestLoaded.text || !(await stillOpenTarget())) { await tabBrowser.destroyForAssociation(opened.id).catch(() => {}); throw new Error('STALE_BROWSER_CONTEXT') }
           const latestCurrent = parseLayout(latestLoaded.text)
           const workspace = latestCurrent.workspaces[String(location.ws)]!
           const previous = workspace.tabs[String(location.tab)]!
           const browser = { id: opened.id, width: 420, collapsed: false }
           const next = { ...latestCurrent, version: 2, browserRevision: (latestCurrent.browserRevision ?? 0) + 1,
             workspaces: { ...latestCurrent.workspaces, [location.ws]: { ...workspace, tabs: { ...workspace.tabs, [location.tab]: { ...previous, browser } } } } }
+          browserOperations.assertDispatch(signal)
           const saved = tabBrowserStateStore
             ? await commitBrowserLayoutMutation(layoutPath(), tabBrowserStateStore, serializeLayout(next), latestLoaded.version)
             : { error: 'BROWSER_HOST_UNAVAILABLE' as const }
@@ -1343,7 +1345,7 @@ async function main(): Promise<void> {
             // The record was persisted before the association CAS. Roll it
             // back immediately so a conflict cannot accumulate unreachable
             // live renderers for every retry.
-            await tabBrowser.command({ type: 'destroy', id: opened.id }).catch(() => {})
+            await tabBrowser.destroyForAssociation(opened.id).catch(() => {})
             throw new Error('LAYOUT_CONFLICT')
           }
           const stillAssociatedToController = async (): Promise<boolean> => {
@@ -1356,7 +1358,7 @@ async function main(): Promise<void> {
           }
           if (!(await stillAssociatedToController())) {
             try { await rollbackOpenedBrowser(location.ws, location.tab, opened.id) }
-            finally { await tabBrowser.command({ type: 'destroy', id: opened.id }).catch(() => {}) }
+            finally { await tabBrowser.destroyForAssociation(opened.id).catch(() => {}) }
             throw new Error('STALE_BROWSER_CONTEXT')
           }
           await reopenLocalWindow?.()
@@ -1382,10 +1384,12 @@ async function main(): Promise<void> {
       return dispatchAttachedBrokerAction(request.action, id, signal, stillAuthorized,
         (command, actionSignal, validate) => tabBrowser.command(command.type === 'automation' ? { ...command, broker: { requestId: request.requestId, controller: request.amberSession } } : command.type === 'navigate' || command.type === 'stop' ? { ...command, broker: { requestId: request.requestId, controller: request.amberSession } } : command, actionSignal, validate))
     }
-    const runtime = process.env['XDG_RUNTIME_DIR'] ?? tmpdir()
-    const socketPath = process.env['AMBER_BROWSER_HOST_SOCKET'] ?? join(runtime, 'amber-ide', 'browser-host.sock')
+    const handleBroker = (request: BrokerRequest, signal: AbortSignal): Promise<unknown> =>
+      browserOperations.run('broker', (ownedSignal) => handleBrokerInner(request, ownedSignal), signal)
+    const socketPath = browserHostSocketPath(process.env, process.platform, process.getuid?.() ?? -1, tmpdir())
     tabBrowserBroker = new TabBrowserBrokerServer(socketPath, join(stateRoot(), 'browser-host-token'), handleBroker, {
       authorizeReplay: async (request) => { try { await currentBrokerLayout(request); return true } catch { return false } },
+      operations: browserOperations,
     })
     await tabBrowserBroker.start()
   }
@@ -1398,7 +1402,7 @@ async function main(): Promise<void> {
       const choice = await dialog.showMessageBox({
         type: 'warning', buttons: ['Cancel', 'Quit anyway'], defaultId: 0, cancelId: 0,
         title: 'Quit Amber IDE?', message: 'Browser work is still active.',
-        detail: `${work.piActions} Pi action(s), ${work.approvals} approval(s), ${work.dialogs} dialog(s), ${work.pageLoads} page load(s), and ${work.queued} queued operation(s) will be cancelled. The amber daemon and terminal sessions will keep running.`,
+        detail: `${work.operations} browser operation(s), ${work.piActions} Pi action(s), ${work.approvals} approval(s), ${work.dialogs} dialog(s), and ${work.pageLoads} page load(s) will be cancelled. The amber daemon and terminal sessions will keep running.`,
       })
       if (choice.response !== 1) { explicitQuitInProgress = false; return }
     }
@@ -1432,6 +1436,9 @@ async function main(): Promise<void> {
     allowFinalQuit = true
     app.exit(1)
   }
+
+  residentIntents.install({ activate: async () => { await reopenLocalWindow?.() }, quit: async () => { await requestExplicitQuit?.() } })
+  await residentIntents.consume()
 
   if (tabBrowserSupported && process.platform === 'linux' && !residentTray) {
     try {
@@ -1478,7 +1485,8 @@ async function main(): Promise<void> {
     ctxFor(e)?.child()?.postMessage({ kind: 'pane-close', session })
   })
 
-  ipcMain.handle('browser:recovery', async (e, raw: unknown) => {
+  ipcMain.handle('browser:recovery', (e, raw: unknown) => rendererBrowserOperation('recovery', async (signal) => {
+    browserOperations.assertDispatch(signal)
     const sender = ctxFor(e)
     if (!tabBrowser || !tabBrowserStateStore || sender?.target.kind !== 'local') return { ok: false, error: 'BROWSER_HOST_UNAVAILABLE' }
     try {
@@ -1506,6 +1514,7 @@ async function main(): Promise<void> {
       const id = createBrowserId(); const browser = { id, width: 420, collapsed: false }
       const next = { ...current, version: 2, browserRevision: (current.browserRevision ?? 0) + 1,
         workspaces: { ...current.workspaces, [wsKey]: { ...workspace, tabs: { ...workspace.tabs, [tabKey]: { ...previous, browser } } } } }
+      browserOperations.assertDispatch(signal)
       const saved = await commitBrowserLayoutMutation(layoutPath(), tabBrowserStateStore, serializeLayout(next), loaded.version, undefined, undefined, (state) => {
         const recovery = state.migrationRecovery[request['index'] as number]
         if (!recovery) throw new Error('NO_RECOVERY_ITEM')
@@ -1513,11 +1522,11 @@ async function main(): Promise<void> {
         return stageWorkspaceBrowserState(without, { entries: [{ id, browser: { mode: 'browse', safeRestoreUrl: recovery.safeRestoreUrl } }], recovery: [] })
       })
       if (!('ok' in saved)) throw new Error('error' in saved ? saved.error : 'LAYOUT_CONFLICT')
-      await tabBrowser.attachRecovery(request['index'], id)
+      await tabBrowser.attachRecoveryCommitted(request['index'], id)
       sender.activeBrowserId = id; sender.win.webContents.send('tab-browser-association', { ws: sender.activeWorkspace, tab: sender.activeTab, browser })
       return { ok: true }
     } catch (error) { return { ok: false, error: error instanceof Error ? error.message : 'INTERNAL_ERROR' } }
-  })
+  }))
 
   ipcMain.handle('browser:workspace-snapshot', async (e) => {
     const sender = ctxFor(e)
@@ -1527,7 +1536,8 @@ async function main(): Promise<void> {
     } catch (error) { return { ok: false, error: error instanceof Error ? error.message : 'INTERNAL_ERROR' } }
   })
 
-  ipcMain.handle('browser:import-workspace', async (e, raw: unknown) => {
+  ipcMain.handle('browser:import-workspace', (e, raw: unknown) => rendererBrowserOperation('workspace-import', async (signal) => {
+    browserOperations.assertDispatch(signal)
     const sender = ctxFor(e)
     if (sender?.target.kind !== 'local') return { ok: false, error: 'BROWSER_HOST_UNAVAILABLE' }
     try {
@@ -1540,13 +1550,15 @@ async function main(): Promise<void> {
       const current = loaded.text ? parseLayout(loaded.text) : emptyLayout()
       const state = tabBrowserStateStore ? await tabBrowserStateStore.load() : null
       const prepared = prepareWorkspaceImport({ current, browserState: state, doc, mode: request['mode'], activeWorkspace: sender.activeWorkspace, mintId: () => randomUUID().replaceAll('-', '') })
+      browserOperations.assertDispatch(signal)
       const committed = await commitPreparedWorkspaceImport({ prepared, layoutPath: layoutPath(), expectedLayoutVersion: loaded.version, browserStore: tabBrowserStateStore, browserHost: tabBrowser })
       setWindowContextFromLayout(sender, prepared.next)
       return { ok: true, layout: serializeLayout(prepared.next), version: committed.version, plan: prepared.plan }
     } catch (error) { return { ok: false, error: error instanceof Error ? error.message : 'INTERNAL_ERROR' } }
-  })
+  }))
 
-  ipcMain.handle('browser:set-context', async (e, raw: unknown) => {
+  ipcMain.handle('browser:set-context', (e, raw: unknown) => rendererBrowserOperation('association', async (signal) => {
+    browserOperations.assertDispatch(signal)
     const sender = ctxFor(e)
     if (sender?.target.kind !== 'local' || !raw || typeof raw !== 'object') return { ok: false, error: 'BROWSER_HOST_UNAVAILABLE' }
     const request = raw as Record<string, unknown>
@@ -1556,15 +1568,17 @@ async function main(): Promise<void> {
     try {
       const context = resolveBrowserContext(parseLayout(loaded.text), request['workspace'], request['tab'])
       if (tabBrowser && sender.activeBrowserId && sender.activeBrowserId !== context.browserId) { tabBrowser.surfaceHidden(sender.activeBrowserId); await tabBrowser.command({ type: 'hide', id: sender.activeBrowserId }).catch(() => {}) }
+      browserOperations.assertDispatch(signal)
       sender.activeWorkspace = context.workspace; sender.activeTab = context.tab; sender.activeBrowserId = context.browserId
       sender.activeBrowserExpanded = false
       if (context.browserId && request['collapsed']) tabBrowser?.surfaceHidden(context.browserId)
       sender.browserContextGeneration += 1
       return { ok: true, ...context }
     } catch (error) { return { ok: false, error: error instanceof Error ? error.message : 'INVALID_REQUEST' } }
-  })
+  }))
 
-  ipcMain.handle('browser:command', async (e, raw: unknown) => {
+  ipcMain.handle('browser:command', (e, raw: unknown) => rendererBrowserOperation('association', async (signal) => {
+    browserOperations.assertDispatch(signal)
     const sender = ctxFor(e)
     if (!tabBrowser || !tabBrowserStateStore || sender?.target.kind !== 'local') return { ok: false, error: 'BROWSER_HOST_UNAVAILABLE' }
     try {
@@ -1595,9 +1609,9 @@ async function main(): Promise<void> {
           const opened = await tabBrowser.command({ type: 'open' }, undefined, () => stillAssociated(null))
           if (!('id' in opened)) throw new Error('INTERNAL_ERROR')
           openedId = opened.id
-          if (!(await stillAssociated(null))) { await tabBrowser.command({ type: 'destroy', id: opened.id }).catch(() => {}); throw new Error('STALE_BROWSER_CONTEXT') }
+          if (!(await stillAssociated(null))) { await tabBrowser.destroyForAssociation(opened.id).catch(() => {}); throw new Error('STALE_BROWSER_CONTEXT') }
           workingLoaded = await loadLayoutFile(layoutPath())
-          if (!workingLoaded.text) { await tabBrowser.command({ type: 'destroy', id: opened.id }).catch(() => {}); throw new Error('STALE_BROWSER_CONTEXT') }
+          if (!workingLoaded.text) { await tabBrowser.destroyForAssociation(opened.id).catch(() => {}); throw new Error('STALE_BROWSER_CONTEXT') }
           workingCurrent = parseLayout(workingLoaded.text)
           workingWorkspace = workingCurrent.workspaces[wsKey]!
           workingPrevious = workingWorkspace.tabs[tabKey]!
@@ -1623,18 +1637,19 @@ async function main(): Promise<void> {
         if (!browser) delete nextTab.browser
         const next = { ...workingCurrent, version: 2, browserRevision: (workingCurrent.browserRevision ?? 0) + 1,
           workspaces: { ...workingCurrent.workspaces, [wsKey]: { ...workingWorkspace, tabs: { ...workingWorkspace.tabs, [tabKey]: nextTab } } } }
+        browserOperations.assertDispatch(signal)
         const saved = await commitBrowserLayoutMutation(layoutPath(), tabBrowserStateStore, serializeLayout(next), workingLoaded.version)
         if (!('ok' in saved)) {
-          if (openedId) await tabBrowser.command({ type: 'destroy', id: openedId }).catch(() => {})
+          if (openedId) await tabBrowser.destroyForAssociation(openedId).catch(() => {})
           throw new Error('error' in saved ? saved.error : 'LAYOUT_CONFLICT')
         }
         if (openedId && !contextMatches()) {
           try { await rollbackOpenedBrowser(expectedContext.workspace, expectedContext.tab, openedId) }
-          finally { await tabBrowser.command({ type: 'destroy', id: openedId }).catch(() => {}) }
+          finally { await tabBrowser.destroyForAssociation(openedId).catch(() => {}) }
           throw new Error('STALE_BROWSER_CONTEXT')
         }
         if (previous.browser && (parsed.type === 'close' || parsed.type === 'designate' || (parsed.type === 'share' && !parsed.sharedWithPi))) tabBrowser.revokePi(previous.browser.id)
-        if (parsed.type === 'close' && previous.browser) await tabBrowser.command({ type: 'destroy', id: previous.browser.id })
+        if (parsed.type === 'close' && previous.browser) await tabBrowser.destroyForAssociation(previous.browser.id)
         setBrowserForCurrentContext(sender, expectedContext, browser?.id ?? null)
         sender.win.webContents.send('tab-browser-association', { ws: expectedContext.workspace, tab: expectedContext.tab, ...(browser ? { browser } : {}) })
         return { ok: true, result: parsed.type === 'close' ? { closed: true } : browser ? await tabBrowser.command({ type: 'status', id: browser.id }) : { closed: true } }
@@ -1653,13 +1668,13 @@ async function main(): Promise<void> {
         const latest = await loadLayoutFile(layoutPath())
         return !!latest.text && parseLayout(latest.text).workspaces[String(expected.workspace)]?.tabs[String(expected.tab)]?.browser?.id === expected.browserId
       }
-      const result = await tabBrowser.command(command, undefined, stillAssociated)
+      const result = await tabBrowser.command(command, signal, stillAssociated)
       if (command.type === 'show' && browserContextMatches(sender, expected) && expected.browserId) sender.activeBrowserExpanded = true
       return { ok: true, result }
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : 'INTERNAL_ERROR' }
     }
-  })
+  }))
 
   // Resolve a terminal selection to an EXISTING absolute path so the pane's
   // floating "Open" button only shows for real files/dirs. Relative selections
@@ -2026,9 +2041,10 @@ async function main(): Promise<void> {
 }
 
 app.on('before-quit', (event) => {
-  if (tabBrowserHostEnabled() && !allowFinalQuit && requestExplicitQuit) {
+  if (tabBrowserHostEnabled() && !allowFinalQuit) {
     event.preventDefault()
-    void requestExplicitQuit()
+    if (requestExplicitQuit) void requestExplicitQuit()
+    else residentIntents.requestQuit()
     return
   }
   killTunnels()
@@ -2042,9 +2058,9 @@ if (!app.requestSingleInstanceLock(launchActivation)) {
   app.quit()
 } else {
   app.on('second-instance', (_event, _argv, _cwd, additionalData) => {
-    if (parseActivationRequest(additionalData) !== null) void reopenLocalWindow?.()
+    if (parseActivationRequest(additionalData) !== null) residentIntents.requestActivation()
   })
-  app.on('activate', () => { void reopenLocalWindow?.() })
+  app.on('activate', () => { residentIntents.requestActivation() })
   app.whenReady().then(main).catch((e) => {
     console.error(e)
     app.quit()

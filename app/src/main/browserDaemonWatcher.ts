@@ -16,6 +16,9 @@ export class BrowserDaemonWatcher {
   private hasFullList = false
   private fullListAt = 0
   private timer: ReturnType<typeof setInterval> | null = null
+  private readonly freshWaiters = new Set<(ready: boolean) => void>()
+  private started = false
+  private closed = false
 
   constructor(
     private readonly connection: MetadataConnection,
@@ -28,7 +31,7 @@ export class BrowserDaemonWatcher {
     connection.on('frame', (frame) => this.onFrame(frame))
   }
 
-  start(): void { this.connection.connect() }
+  start(): void { this.started = true; this.closed = false; this.connection.connect() }
 
   private onOpen(): void {
     this.connected = true; this.hasFullList = false; this.sessions.clear()
@@ -55,7 +58,9 @@ export class BrowserDaemonWatcher {
     if (frame.type !== 'control') return
     if (frame.msg.kind === 'Sessions') {
       this.sessions.clear(); for (const info of frame.msg.sessions) this.set(info)
-      this.hasFullList = true; this.fullListAt = this.now(); return
+      this.hasFullList = true; this.fullListAt = this.now()
+      for (const resolve of this.freshWaiters) resolve(true)
+      this.freshWaiters.clear(); return
     }
     if (frame.msg.kind === 'SessionsChanged' && this.hasFullList) {
       for (const info of frame.msg.added) this.set(info)
@@ -63,10 +68,25 @@ export class BrowserDaemonWatcher {
     }
   }
 
+  waitForFresh(timeoutMs: number): Promise<boolean> {
+    if (this.connected && this.hasFullList && this.now() - this.fullListAt <= this.freshnessMs) return Promise.resolve(true)
+    if (!this.started || this.closed) return Promise.resolve(false)
+    return new Promise((resolve) => {
+      let settled = false
+      const finish = (ready: boolean): void => { if (settled) return; settled = true; clearTimeout(timer); this.freshWaiters.delete(finish); resolve(ready) }
+      const timer = setTimeout(() => finish(false), timeoutMs)
+      this.freshWaiters.add(finish)
+    })
+  }
+
   controller(name: string): ControllerSession | undefined {
     if (!this.connected || !this.hasFullList || this.now() - this.fullListAt > this.freshnessMs) return undefined
     return this.sessions.get(name)
   }
 
-  close(): void { this.onClose(); this.connection.close() }
+  close(): void {
+    this.closed = true; this.onClose()
+    for (const resolve of this.freshWaiters) resolve(false)
+    this.freshWaiters.clear(); this.connection.close()
+  }
 }

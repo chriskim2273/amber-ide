@@ -50,6 +50,26 @@ describe('workspace browser staging contracts', () => {
 })
 
 describe('TabBrowserService dispatch authorization', () => {
+  it('registers queued commands before dispatch and aborts them all during drain', async () => {
+    const state = emptyBrowserState(1); let calls = 0
+    const host = {
+      navigate: async (_id: string, _url: string, _page: string, _generation: number, signal: AbortSignal) => {
+        calls += 1
+        return new Promise((_resolve, reject) => signal.addEventListener('abort', () => reject(new Error('ACTION_CANCELLED')), { once: true }))
+      },
+      snapshot: () => state, pendingLoadCount: () => 0, liveIds: () => [], freezeAll: () => {},
+    }
+    const Service = TabBrowserService as unknown as new (s: TabBrowserStateStore, p: { setWindow: () => void }, h: typeof host, i: typeof state) => TabBrowserService
+    const service = new Service({ update: async () => state } as unknown as TabBrowserStateStore, { setWindow: () => {} }, host, state)
+    const command = { type: 'navigate' as const, id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', url: 'https://example.test', pageIncarnation: 'page', expectedGeneration: 1 }
+    const first = service.command(command); const queued = service.command(command)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(service.pendingWork().operations).toBe(2)
+    service.beginDrain(); await service.flushAndDestroy()
+    await expect(first).rejects.toThrow('ACTION_CANCELLED'); await expect(queued).rejects.toThrow(/ACTION_CANCELLED|BROWSER_HOST_SHUTTING_DOWN/)
+    expect(calls).toBe(1)
+  })
+
   it('rejects new commands during quit and freezes before the final durable save', async () => {
     const state = emptyBrowserState(1), order: string[] = []
     const host = {

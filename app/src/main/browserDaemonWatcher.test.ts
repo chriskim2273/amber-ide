@@ -42,6 +42,22 @@ describe('BrowserDaemonWatcher', () => {
     expect(watcher.controller('other')).toBeUndefined()
   })
 
+  it('does not report startup readiness until this connection epoch receives a full list', async () => {
+    vi.useFakeTimers()
+    try {
+      const connection = new FakeConnection(); const watcher = new BrowserDaemonWatcher(connection)
+      watcher.start()
+      const ready = watcher.waitForFresh(1000)
+      connection.emit('open')
+      let settled = false; void ready.then(() => { settled = true })
+      await vi.advanceTimersByTimeAsync(500); expect(settled).toBe(false)
+      connection.emit('frame', sessions([]))
+      await expect(ready).resolves.toBe(true)
+      watcher.close()
+      await expect(watcher.waitForFresh(10)).resolves.toBe(false)
+    } finally { vi.useRealTimers() }
+  })
+
   it('polls only metadata and closes cleanly', () => {
     vi.useFakeTimers()
     const connection = new FakeConnection(); const watcher = new BrowserDaemonWatcher(connection, Date.now, 5000, 2000)

@@ -1,11 +1,13 @@
 import { connect, createServer, type Server, type Socket } from 'node:net'
-import { mkdir, open, readFile, unlink, lstat } from 'node:fs/promises'
-import { createHash, randomBytes } from 'node:crypto'
+import { open, readFile, rename, unlink, lstat } from 'node:fs/promises'
+import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { dirname } from 'node:path'
 import type { LayoutFile } from '../shared/layoutFile'
 import type { TabBrowserCommand } from './tabBrowserService'
 import { parseBrowserToolAction, type BrowserToolAction } from './browserToolProtocol'
 import type { BrowserBinaryAttachment } from './browserAutomation'
+import { ensurePrivateRuntimeDirectory } from './browserHostPaths'
+import type { BrowserOperationRegistry } from './browserOperationRegistry'
 
 export type BrokerAction =
   | { type: 'open' }
@@ -132,24 +134,36 @@ function binaryAttachment(value: unknown): value is BrowserBinaryAttachment {
   return !!candidate && candidate.mediaType === 'image/png' && Buffer.isBuffer(candidate.data)
 }
 
+async function syncDirectory(path: string): Promise<void> {
+  const handle = await open(path, 'r')
+  try { await handle.sync() } finally { await handle.close() }
+}
+
 async function tokenFile(path: string): Promise<string> {
+  const parent = dirname(path), uid = process.getuid?.() ?? -1
+  await ensurePrivateRuntimeDirectory(parent, uid)
   try {
-    const stat = await lstat(path)
-    if (stat.isSymbolicLink() || !stat.isFile() || (process.platform !== 'win32' && (stat.mode & 0o077) !== 0)) throw new Error('invalid browser host token file')
+    const metadata = await lstat(path)
+    if (metadata.isSymbolicLink() || !metadata.isFile() || metadata.uid !== uid || (metadata.mode & 0o077) !== 0) throw new Error('invalid browser host token file')
     const token = (await readFile(path, 'utf8')).trim()
     if (/^[A-Za-z0-9_-]{43}$/.test(token)) return token
-    throw new Error('invalid browser host token')
+    const quarantine = `${path}.invalid`
+    await unlink(quarantine).catch((error: NodeJS.ErrnoException) => { if (error.code !== 'ENOENT') throw error })
+    await rename(path, quarantine)
+    await syncDirectory(parent)
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
   }
-  await mkdir(dirname(path), { recursive: true, mode: 0o700 })
   const token = randomBytes(32).toString('base64url')
-  const handle = await open(path, 'wx', 0o600)
+  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`
+  const handle = await open(temporary, 'wx', 0o600)
   try { await handle.writeFile(`${token}\n`); await handle.sync() } finally { await handle.close() }
+  await rename(temporary, path)
+  await syncDirectory(parent)
   return token
 }
 
-export interface TabBrowserBrokerOptions { requestTimeoutMs?: number; socketTimeoutMs?: number; resultTtlMs?: number; maxClientIdentities?: number; now?: () => number; authorizeReplay?: (request: BrokerRequest) => boolean | Promise<boolean> }
+export interface TabBrowserBrokerOptions { requestTimeoutMs?: number; socketTimeoutMs?: number; resultTtlMs?: number; maxClientIdentities?: number; now?: () => number; authorizeReplay?: (request: BrokerRequest) => boolean | Promise<boolean>; operations?: BrowserOperationRegistry }
 
 async function rejectLiveSocket(path: string): Promise<void> {
   let metadata
@@ -183,8 +197,9 @@ export class TabBrowserBrokerServer {
   ) {}
   async start(): Promise<void> {
     if (process.platform === 'win32') throw new Error('BROWSER_HOST_UNAVAILABLE')
+    const uid = process.getuid?.() ?? -1
+    await ensurePrivateRuntimeDirectory(dirname(this.socketPath), uid)
     const token = await tokenFile(this.tokenPath)
-    await mkdir(dirname(this.socketPath), { recursive: true, mode: 0o700 })
     await rejectLiveSocket(this.socketPath)
     this.server = createServer((socket) => {
       if (this.connections >= 8) { socket.destroy(); return }
@@ -218,7 +233,7 @@ export class TabBrowserBrokerServer {
         queued += 1
         if (queued > 16) { safeWrite({ ok: false, error: 'REQUEST_LIMIT' }); socket.destroySoon(); return }
         chain = chain.then(async () => {
-          let requestId: string | undefined, cacheKey: string | undefined
+          let requestId: string | undefined, cacheKey: string | undefined, completionDeferred = false
           try {
             const value: unknown = JSON.parse(body.toString('utf8'))
             if (!authenticated) {
@@ -232,11 +247,18 @@ export class TabBrowserBrokerServer {
             for (const [key, entry] of this.results) if (now() - entry.acceptedAt >= resultTtl) this.results.delete(key)
             const digest = brokerRequestDigest(request)
             const cached = this.results.get(cacheKey)
-            let result: unknown
+            const deferReply = (promise: Promise<unknown>): void => {
+              completionDeferred = true
+              void promise.then((result) => {
+                safeWriteResult(request.requestId, result)
+                if (binaryAttachment(result) && cacheKey) this.results.delete(cacheKey)
+              }, (error) => safeWrite({ version: 1, requestId: request.requestId, ok: false, error: safeBrokerError(error) }))
+                .finally(() => { queued -= 1 })
+            }
             if (cached) {
               if (cached.digest !== digest) throw new Error('INVALID_REQUEST')
               if (this.options.authorizeReplay && !(await this.options.authorizeReplay(request))) throw new Error('STALE_BROWSER_CONTEXT')
-              result = await cached.promise
+              deferReply(cached.promise); return
             } else {
               const knownClient = this.highWater.has(request.clientInstanceId)
               const previousSequence = this.highWater.get(request.clientInstanceId) ?? 0
@@ -265,7 +287,14 @@ export class TabBrowserBrokerServer {
               }
               this.queueDepth.set(key, depth + 1)
               const prior = this.queues.get(key) ?? Promise.resolve()
-              const promise = prior.catch(() => {}).then(execute)
+              const promise = this.options.operations
+                ? this.options.operations.run('broker', async (signal) => {
+                    const abortOwned = (): void => controller.abort()
+                    signal.addEventListener('abort', abortOwned, { once: true })
+                    try { await prior.catch(() => {}); this.options.operations!.assertDispatch(signal); return await execute() }
+                    finally { signal.removeEventListener('abort', abortOwned) }
+                  }, controller.signal)
+                : prior.catch(() => {}).then(execute)
               // A timed-out client gets its error immediately, but following
               // work cannot overtake the still-unwinding operation.
               const tail = promise.then(() => {}, () => {}).then(() => operationBarrier)
@@ -277,20 +306,15 @@ export class TabBrowserBrokerServer {
               })
               this.results.set(cacheKey, { digest, promise, acceptedAt: now() })
               if (this.results.size > 256) this.results.delete(this.results.keys().next().value!)
-              result = await promise
+              deferReply(promise); return
             }
-            safeWriteResult(request.requestId, result)
-            // Binary attachments are ephemeral and can be 10 MiB each. Keep
-            // only concurrent duplicate joining; release immediately after
-            // delivery so the 256-entry replay cache cannot pin gigabytes.
-            if (binaryAttachment(result) && cacheKey) this.results.delete(cacheKey)
           } catch (error) {
             // Only stable error codes cross into Pi. Debugger/Node exception
             // text can contain URLs, local paths, headers, or page content.
             const message = safeBrokerError(error)
             safeWrite({ ...(requestId ? { version: 1, requestId } : {}), ok: false, error: message })
             if (!authenticated || (message === 'INVALID_REQUEST' && !requestId)) socket.destroySoon()
-          } finally { queued -= 1 }
+          } finally { if (!completionDeferred) queued -= 1 }
         })
       }
     })

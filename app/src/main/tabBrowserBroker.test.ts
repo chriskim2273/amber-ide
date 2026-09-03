@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { connect } from 'node:net'
 import { authorizeBrowserRequest, brokerRequestDigest, dispatchAttachedBrokerAction, isEligiblePiController, parseBrokerRequest, safeBrokerError, TabBrowserBrokerServer } from './tabBrowserBroker'
 import type { LayoutFile } from '../shared/layoutFile'
+import { BrowserOperationRegistry } from './browserOperationRegistry'
 
 const cleanup: string[] = []
 afterEach(async () => { for (const path of cleanup.splice(0)) await rm(path, { recursive: true, force: true }) })
@@ -116,6 +117,19 @@ describe('tab browser broker boundary', () => {
       const socket = connect(socketPath); socket.once('connect', () => { socket.destroy(); resolve() }); socket.once('error', reject)
     })).resolves.toBeUndefined()
     await first.close()
+  })
+
+  it('quarantines a corrupt private regular token and atomically rotates it', async () => {
+    if (process.platform === 'win32') return
+    const dir = await mkdtemp(join(tmpdir(), 'amber-browser-broker-')); cleanup.push(dir)
+    const tokenPath = join(dir, 'token'); await writeFile(tokenPath, 'corrupt\n', { mode: 0o600 })
+    await writeFile(`${tokenPath}.crash.tmp`, 'partial', { mode: 0o600 })
+    const server = new TabBrowserBrokerServer(join(dir, 'broker.sock'), tokenPath, async () => ({}))
+    await server.start()
+    expect((await readFile(tokenPath, 'utf8')).trim()).toMatch(/^[A-Za-z0-9_-]{43}$/)
+    expect((await stat(tokenPath)).mode & 0o077).toBe(0)
+    expect((await readdir(dir)).some((name) => name === 'token.invalid')).toBe(true)
+    await server.close()
   })
 
   it('rejects a symlink token file', async () => {
@@ -283,6 +297,27 @@ describe('tab browser broker boundary', () => {
     expect(calls).toBe(1)
     expect(replayChecks).toBe(1)
     await server.close()
+  })
+
+  it('registers queued broker work before dispatch so drain aborts and empties the whole queue', async () => {
+    if (process.platform === 'win32') return
+    const dir = await mkdtemp(join(tmpdir(), 'amber-browser-broker-')); cleanup.push(dir)
+    const socketPath = join(dir, 'broker.sock'), tokenPath = join(dir, 'token'), operations = new BrowserOperationRegistry()
+    const server = new TabBrowserBrokerServer(socketPath, tokenPath, async (_request, signal) => new Promise((_resolve, reject) => signal.addEventListener('abort', () => reject(new Error('ACTION_CANCELLED')), { once: true })), { operations })
+    await server.start(); const token = (await readFile(tokenPath, 'utf8')).trim()
+    const encode = (value: unknown): Buffer => { const body = Buffer.from(JSON.stringify(value)); const out = Buffer.alloc(body.length + 4); out.writeUInt32BE(body.length); body.copy(out, 4); return out }
+    const socket = connect(socketPath); socket.on('error', () => {})
+    await new Promise<void>((resolve) => socket.once('connect', resolve)); socket.write(encode({ token }))
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    socket.write(Buffer.concat([
+      encode({ version: 1, clientInstanceId: 'drain-client', sequence: 1, requestId: 'one', amberSession: 'amber-1-2-0-pane', action: { type: 'status' } }),
+      encode({ version: 1, clientInstanceId: 'drain-client', sequence: 2, requestId: 'two', amberSession: 'amber-1-2-0-pane', action: { type: 'status' } }),
+    ]))
+    for (let attempt = 0; attempt < 20 && operations.summary().total !== 2; attempt++) await new Promise((resolve) => setTimeout(resolve, 5))
+    expect(operations.summary()).toMatchObject({ broker: 2, total: 2 })
+    operations.beginDrain(); await operations.waitForEmpty()
+    expect(operations.summary().total).toBe(0)
+    socket.destroy(); await server.close()
   })
 
   it('serializes mutations and following observations for one browser key', async () => {

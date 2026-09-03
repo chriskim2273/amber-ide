@@ -18,22 +18,49 @@ pub enum PiStart {
 const EXTENSION_FILE: &str = "amber-hook.ts";
 
 /// The Pi extension amber installs to record session ids for exact resume.
-const EXTENSION_TS: &str = r#"// amber-owned-extension:v5
+const EXTENSION_TS: &str = r#"// amber-owned-extension:v6
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
 import { Type } from "typebox"
 import { spawn } from "node:child_process"
 import { connect } from "node:net"
-import { readFile } from "node:fs/promises"
-import { join } from "node:path"
+import { lstat, readFile } from "node:fs/promises"
+import { dirname, join } from "node:path"
 import { tmpdir } from "node:os"
 
 function browserPaths() {
   const state = process.env.AMBER_STATE_DIR
   if (!state) throw new Error("Amber browser tools require a supervised Pi pane")
-  const runtime = process.env.XDG_RUNTIME_DIR || tmpdir()
+  const uid = process.getuid?.()
+  if (uid === undefined) throw new Error("Amber browser host is unsupported on Windows")
+  const runtime = process.env.XDG_RUNTIME_DIR ? join(process.env.XDG_RUNTIME_DIR, "amber-ide") : join(tmpdir(), `amber-ide-${uid}`)
   return {
     token: join(state, "browser-host-token"),
-    socket: process.env.AMBER_BROWSER_HOST_SOCKET || join(runtime, "amber-ide", "browser-host.sock"),
+    socket: process.env.AMBER_BROWSER_HOST_SOCKET || join(runtime, "browser-host.sock"),
+    state, uid,
+  }
+}
+
+async function validatePrivateDirectory(path: string, uid: number) {
+  const metadata = await lstat(path)
+  if (metadata.isSymbolicLink() || !metadata.isDirectory() || metadata.uid !== uid || (metadata.mode & 0o777) !== 0o700) throw new Error("Amber browser host runtime directory is unsafe")
+}
+
+async function readBrowserToken(paths: { token: string, state: string, uid: number }) {
+  await validatePrivateDirectory(paths.state, paths.uid)
+  const metadata = await lstat(paths.token)
+  if (metadata.isSymbolicLink() || !metadata.isFile() || metadata.uid !== paths.uid || (metadata.mode & 0o077) !== 0) throw new Error("Amber browser host token is unsafe")
+  return (await readFile(paths.token, "utf8")).trim()
+}
+
+async function validateBrowserPaths(paths: { token: string, socket: string, state: string, uid: number }) {
+  await validatePrivateDirectory(paths.state, paths.uid)
+  try {
+    await validatePrivateDirectory(dirname(paths.socket), paths.uid)
+    const endpoint = await lstat(paths.socket)
+    if (endpoint.isSymbolicLink() || !endpoint.isSocket() || endpoint.uid !== paths.uid) throw new Error("Amber browser host socket is unsafe")
+  } catch (error: any) {
+    if (error?.code === "ENOENT") throw new Error("Amber browser host is unavailable")
+    throw error
   }
 }
 
@@ -64,7 +91,8 @@ async function ensureBrowserHost(signal?: AbortSignal) {
   })
 }
 
-async function sendBrowserRequest(paths: { token: string, socket: string }, token: string, amberSession: string, action: unknown, signal?: AbortSignal) {
+async function sendBrowserRequest(paths: { token: string, socket: string, state: string, uid: number }, token: string, amberSession: string, action: unknown, signal?: AbortSignal) {
+  await validateBrowserPaths(paths)
   return await new Promise<unknown>((resolve, reject) => {
     const socket = connect(paths.socket)
     let buffer = Buffer.alloc(0), authenticated = false, settled = false, pendingBinary: any = null
@@ -113,8 +141,12 @@ async function browserRequest(action: unknown, signal?: AbortSignal) {
   if (!amberSession) throw new Error("Amber browser tools are unavailable outside an Amber pane")
   const paths = browserPaths()
   let token: string
-  try { token = (await readFile(paths.token, "utf8")).trim() }
-  catch { await ensureBrowserHost(signal); try { token = (await readFile(paths.token, "utf8")).trim() } catch { throw new Error("Amber browser host token is unavailable") } }
+  try { token = await readBrowserToken(paths) }
+  catch (error: any) {
+    if (error?.code !== "ENOENT") throw error
+    await ensureBrowserHost(signal)
+    try { await validateBrowserPaths(paths); token = await readBrowserToken(paths) } catch { throw new Error("Amber browser host token is unavailable") }
+  }
   if (!/^[A-Za-z0-9_-]{43}$/.test(token)) throw new Error("Amber browser host token is invalid")
   try { return await sendBrowserRequest(paths, token, amberSession, action, signal) }
   catch (error) {
@@ -403,7 +435,7 @@ pub fn ensure_global_pi_extension() {
 fn is_owned_extension_source(source: &str) -> bool {
     matches!(
         source.lines().next(),
-        Some("// amber-owned-extension:v2" | "// amber-owned-extension:v3" | "// amber-owned-extension:v4" | "// amber-owned-extension:v5")
+        Some("// amber-owned-extension:v2" | "// amber-owned-extension:v3" | "// amber-owned-extension:v4" | "// amber-owned-extension:v5" | "// amber-owned-extension:v6")
     )
 }
 
@@ -516,7 +548,9 @@ mod tests {
         let path = extensions.join("amber-hook.ts");
         let first = fs::read_to_string(&path).unwrap();
         assert_eq!(first, EXTENSION_TS);
-        assert!(first.starts_with("// amber-owned-extension:v5\n"));
+        assert!(first.starts_with("// amber-owned-extension:v6\n"));
+        assert!(first.contains("amber-ide-${uid}"));
+        assert!(first.contains("metadata.isSymbolicLink()"));
         assert!(first.contains("[\"ctl\", \"browser-host\", \"ensure\", \"--root\", state]"));
         assert!(first.contains("shell: false"));
         assert!(first.contains("ExtensionAPI"));
@@ -632,7 +666,7 @@ mod tests {
         let extensions = dir.path().join("extensions");
         fs::create_dir_all(&extensions).unwrap();
         let path = extensions.join(EXTENSION_FILE);
-        let future = "// amber-owned-extension:v6\n// future payload\n";
+        let future = "// amber-owned-extension:v7\n// future payload\n";
         fs::write(&path, future).unwrap();
 
         assert!(install_extension_in(&extensions).is_err());

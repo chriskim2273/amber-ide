@@ -22,7 +22,7 @@ export async function commitPreparedWorkspaceImport(input: {
   layoutPath: string
   expectedLayoutVersion: string | null
   browserStore: TabBrowserStateStore | null
-  browserHost: { importWorkspaceBrowsers: (input: WorkspaceBrowserImport) => Promise<void>; command: (command: { type: 'destroy'; id: string }) => Promise<unknown> } | null
+  browserHost: { importWorkspaceBrowsersCommitted: (input: WorkspaceBrowserImport) => Promise<void>; destroyForAssociation: (id: string) => Promise<void> } | null
 }): Promise<{ version: string | null }> {
   const { prepared } = input
   let saved
@@ -38,8 +38,8 @@ export async function commitPreparedWorkspaceImport(input: {
   } else saved = await saveLayoutFile(input.layoutPath, serializeLayout(prepared.next), input.expectedLayoutVersion)
   if (!('ok' in saved)) throw new Error('error' in saved ? saved.error : 'LAYOUT_CONFLICT')
   if (prepared.needsBrowserHost && input.browserHost) {
-    await input.browserHost.importWorkspaceBrowsers(prepared.browsers)
-    for (const id of prepared.removedBrowserIds) await input.browserHost.command({ type: 'destroy', id }).catch(() => {})
+    await input.browserHost.importWorkspaceBrowsersCommitted(prepared.browsers)
+    for (const id of prepared.removedBrowserIds) await input.browserHost.destroyForAssociation(id).catch(() => {})
   }
   return { version: saved.version }
 }

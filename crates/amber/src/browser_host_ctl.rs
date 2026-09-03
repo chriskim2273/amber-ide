@@ -64,10 +64,36 @@ pub fn current_uid() -> Option<u32> {
     None
 }
 
+#[cfg(unix)]
+fn private_directory(path: &Path) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let Ok(metadata) = fs::symlink_metadata(path) else { return false };
+    metadata.file_type().is_dir()
+        && !metadata.file_type().is_symlink()
+        && metadata.uid() == unsafe { libc::geteuid() }
+        && metadata.permissions().mode() & 0o777 == 0o700
+}
+
+#[cfg(unix)]
+fn private_file(path: &Path) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let Ok(metadata) = fs::symlink_metadata(path) else { return false };
+    metadata.file_type().is_file()
+        && !metadata.file_type().is_symlink()
+        && metadata.uid() == unsafe { libc::geteuid() }
+        && metadata.permissions().mode() & 0o077 == 0
+}
+
 fn socket_ready(root: &Path, socket: &Path) -> bool {
     #[cfg(unix)]
     {
-        let Ok(token) = fs::read_to_string(root.join("browser-host-token")) else {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        let token_path = root.join("browser-host-token");
+        let Some(socket_parent) = socket.parent() else { return false };
+        if !private_directory(root) || !private_directory(socket_parent) || !private_file(&token_path) { return false; }
+        let Ok(endpoint) = fs::symlink_metadata(socket) else { return false };
+        if endpoint.file_type().is_symlink() || !endpoint.file_type().is_socket() || endpoint.uid() != unsafe { libc::geteuid() } { return false; }
+        let Ok(token) = fs::read_to_string(token_path) else {
             return false;
         };
         let token = token.trim();
@@ -118,9 +144,45 @@ fn socket_ready(root: &Path, socket: &Path) -> bool {
     }
 }
 
+#[cfg(unix)]
+fn validate_executable_path(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let uid = unsafe { libc::geteuid() };
+    let metadata = fs::metadata(path)?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 || metadata.permissions().mode() & 0o022 != 0 {
+        bail!("registered app must be a regular executable and not group/world-writable");
+    }
+    if metadata.uid() != uid && metadata.uid() != 0 {
+        bail!("registered app must be owned by the current user or trusted root");
+    }
+    let mut parent = path.parent();
+    while let Some(directory) = parent {
+        let value = fs::symlink_metadata(directory)?;
+        if value.file_type().is_symlink() || !value.is_dir() || (value.uid() != uid && value.uid() != 0) {
+            bail!("registered app has an unsafe parent directory");
+        }
+        let mode = value.permissions().mode() & 0o777;
+        if mode & 0o022 != 0 { bail!("registered app has a group/world-writable parent directory"); }
+        if value.uid() == uid && mode == 0o700 { break; }
+        parent = directory.parent();
+    }
+    let text = path.to_string_lossy();
+    if platform_name() == "darwin" && !text.contains(".app/Contents/MacOS/") {
+        bail!("registered macOS app must be inside an app bundle");
+    }
+    if platform_name() == "linux" && text.contains(".app/Contents/MacOS/") {
+        bail!("registered Linux app has a macOS bundle path");
+    }
+    Ok(())
+}
+
 pub fn load_launcher(root: &Path) -> anyhow::Result<LauncherRecord> {
     if platform_name() == "unsupported" {
         bail!("BROWSER_HOST_UNSUPPORTED: browser host launching is not supported on Windows");
+    }
+    #[cfg(unix)]
+    if !private_directory(root) {
+        bail!("browser host state directory must be current-user owned mode 0700 and not a symlink");
     }
     let path = root.join(LAUNCHER_FILE);
     let metadata = fs::symlink_metadata(&path).with_context(|| {
@@ -152,10 +214,8 @@ pub fn load_launcher(root: &Path) -> anyhow::Result<LauncherRecord> {
     {
         bail!("browser host launcher registration is invalid");
     }
-    if let Some(owner) = record.owner_uid {
-        if current_uid() != Some(owner) {
-            bail!("browser host launcher registration belongs to another user");
-        }
+    if record.owner_uid.is_none() || record.owner_uid != current_uid() {
+        bail!("browser host launcher registration belongs to another user or lacks owner identity");
     }
     let configured = PathBuf::from(&record.executable);
     if !configured.is_absolute() || record.executable.len() > 4096 {
@@ -167,17 +227,8 @@ pub fn load_launcher(root: &Path) -> anyhow::Result<LauncherRecord> {
     if canonical != configured || record.executable.contains("/.mount_") {
         bail!("registered app path is stale or ephemeral; open the installed Amber app once");
     }
-    let executable = fs::metadata(&canonical)?;
-    if !executable.is_file() {
-        bail!("registered app is not a regular file");
-    }
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if executable.permissions().mode() & 0o111 == 0 {
-            bail!("registered app is not executable");
-        }
-    }
+    validate_executable_path(&canonical)?;
     Ok(record)
 }
 
@@ -221,8 +272,15 @@ pub fn status(root: &Path, socket: &Path) -> HostStatus {
 }
 
 pub fn enable(root: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    if !private_directory(root) {
+        bail!("browser host state directory must be current-user owned mode 0700 and not a symlink");
+    }
     match fs::remove_file(root.join(INHIBIT_FILE)) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            fs::File::open(root)?.sync_all()?;
+            Ok(())
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
     }
@@ -281,6 +339,11 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
+    fn secure_root(path: &Path) {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[cfg(unix)]
     fn executable(path: &Path) {
         fs::write(path, "#!/bin/sh\n").unwrap();
         #[cfg(unix)]
@@ -311,6 +374,7 @@ mod tests {
     #[test]
     fn validates_private_owned_registration_and_separate_argv() {
         let dir = tempfile::tempdir().unwrap();
+        secure_root(dir.path());
         let exe = dir.path().join("Amber IDE");
         executable(&exe);
         write_record(dir.path(), &exe);
@@ -326,8 +390,23 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn rejects_writable_executable_and_parent_paths() {
+        let dir = tempfile::tempdir().unwrap(); secure_root(dir.path());
+        let executable_path = dir.path().join("amber"); executable(&executable_path); write_record(dir.path(), &executable_path);
+        fs::set_permissions(&executable_path, fs::Permissions::from_mode(0o722)).unwrap();
+        assert!(load_launcher(dir.path()).unwrap_err().to_string().contains("group/world-writable"));
+
+        let unsafe_parent = dir.path().join("unsafe"); fs::create_dir(&unsafe_parent).unwrap();
+        fs::set_permissions(&unsafe_parent, fs::Permissions::from_mode(0o777)).unwrap();
+        let nested = unsafe_parent.join("amber"); executable(&nested); write_record(dir.path(), &nested);
+        assert!(load_launcher(dir.path()).unwrap_err().to_string().contains("writable parent"));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn rejects_inhibit_stale_paths_and_unsafe_registration_permissions() {
         let dir = tempfile::tempdir().unwrap();
+        secure_root(dir.path());
         fs::write(dir.path().join(INHIBIT_FILE), "stopped").unwrap();
         assert_eq!(
             status(dir.path(), Path::new("missing.sock")).state,
@@ -335,7 +414,7 @@ mod tests {
         );
         fs::remove_file(dir.path().join(INHIBIT_FILE)).unwrap();
         let launcher = dir.path().join(LAUNCHER_FILE);
-        fs::write(&launcher, format!(r#"{{"version":1,"executable":"/missing","args":["--browser-host"],"installGeneration":"x","platform":"{}"}}"#, platform_name())).unwrap();
+        fs::write(&launcher, format!(r#"{{"version":1,"executable":"/missing","args":["--browser-host"],"installGeneration":"x","platform":"{}","ownerUid":{}}}"#, platform_name(), current_uid().unwrap())).unwrap();
         #[cfg(unix)]
         {
             fs::set_permissions(&launcher, fs::Permissions::from_mode(0o644)).unwrap();
@@ -354,6 +433,8 @@ mod tests {
     #[test]
     fn enable_only_clears_the_explicit_stop_inhibit() {
         let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        secure_root(dir.path());
         fs::write(dir.path().join(INHIBIT_FILE), "stopped").unwrap();
         enable(dir.path()).unwrap();
         assert!(!dir.path().join(INHIBIT_FILE).exists());
@@ -361,18 +442,29 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn runtime_directory_rejects_symlinks_and_non_private_modes() {
+        let dir = tempfile::tempdir().unwrap(); secure_root(dir.path());
+        assert!(private_directory(dir.path()));
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(!private_directory(dir.path()));
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let link = dir.path().with_extension("link"); std::os::unix::fs::symlink(dir.path(), &link).unwrap();
+        assert!(!private_directory(&link)); fs::remove_file(link).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn ensure_launches_fake_executable_and_waits_for_readiness() {
         use std::os::unix::net::UnixListener;
         let dir = tempfile::tempdir().unwrap();
+        secure_root(dir.path());
         let socket = dir.path().join("ready.sock");
         let exe = dir.path().join("fake app");
         executable(&exe);
         write_record(dir.path(), &exe);
-        fs::write(
-            dir.path().join("browser-host-token"),
-            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n",
-        )
-        .unwrap();
+        let token = dir.path().join("browser-host-token");
+        fs::write(&token, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n").unwrap();
+        fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).unwrap();
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let seen_launch = seen.clone();
         let mut server = None;

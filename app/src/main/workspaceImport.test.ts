@@ -56,7 +56,7 @@ describe('prepareWorkspaceImport', () => {
     const prepared = prepareWorkspaceImport({ current, browserState, doc: doc(true), mode: 'replace', activeWorkspace: 1, mintId: () => `mint${++n}` })
     let imported = false
     await commitPreparedWorkspaceImport({ prepared, layoutPath, expectedLayoutVersion: stored.version, browserStore: store, browserHost: {
-      importWorkspaceBrowsers: async () => { imported = true }, command: async () => ({}),
+      importWorkspaceBrowsersCommitted: async () => { imported = true }, destroyForAssociation: async () => {},
     } })
     expect(imported).toBe(true)
     const reloaded = parseLayout(await readFile(layoutPath, 'utf8'))

@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, stat, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, readdir, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { describe, expect, it } from 'vitest'
@@ -6,12 +6,22 @@ import {
   activationRequest,
   clearBrowserHostInhibit,
   coordinateBrowserHostQuit,
+  installStableAppImage,
   parseActivationRequest,
   registerBrowserHostLauncher,
+  ResidentIntentLatch,
   writeBrowserHostInhibit,
 } from './browserResident'
 
 describe('resident browser host activation', () => {
+  it('latches activation and quit intents until lifecycle handlers are ready', async () => {
+    const latch = new ResidentIntentLatch(); const calls: string[] = []
+    latch.requestActivation(); latch.requestQuit()
+    latch.install({ activate: async () => { calls.push('activate') }, quit: async () => { calls.push('quit') } })
+    await latch.consume()
+    expect(calls).toEqual(['activate', 'quit'])
+  })
+
   it('accepts only the bounded versioned activation envelope', () => {
     expect(activationRequest(['amber', '--browser-host'])).toEqual({ version: 1, mode: 'browser-host' })
     expect(activationRequest(['amber'])).toEqual({ version: 1, mode: 'normal' })
@@ -74,6 +84,25 @@ describe('resident browser host registration', () => {
     await expect(registerBrowserHostLauncher(root, {
       platform: 'linux', executable: '/tmp/.mount_amber/usr/bin/amber-ide', installGeneration: 'next', uid: process.getuid?.(),
     })).rejects.toThrow('stable')
+  })
+
+  it('rejects writable executable paths and parents', async () => {
+    if (process.platform === 'win32') return
+    const root = await mkdtemp(join(tmpdir(), 'amber-browser-resident-'))
+    const unsafeParent = join(root, 'unsafe'); await mkdir(unsafeParent, { mode: 0o777 })
+    await chmod(unsafeParent, 0o777)
+    const executable = join(unsafeParent, 'amber'); await writeFile(executable, '#!/bin/sh\n', { mode: 0o700 })
+    await expect(registerBrowserHostLauncher(root, { platform: 'linux', executable, installGeneration: 'x', uid: process.getuid!() })).rejects.toThrow('writable parent')
+  })
+
+  it('rolls an AppImage upgrade back when launcher registration fails', async () => {
+    if (process.platform === 'win32') return
+    const root = await mkdtemp(join(tmpdir(), 'amber-browser-resident-'))
+    const source = join(root, 'new.AppImage'), stable = join(root, 'stable.AppImage')
+    await writeFile(source, 'new', { mode: 0o700 }); await writeFile(stable, 'old', { mode: 0o700 })
+    await expect(installStableAppImage(source, stable, async () => { throw new Error('registration failed') })).rejects.toThrow('registration failed')
+    expect(await readFile(stable, 'utf8')).toBe('old')
+    expect((await readdir(root)).filter((name) => name.includes('.upgrade-'))).toEqual([])
   })
 
   it('writes and clears the explicit-stop inhibit durably', async () => {

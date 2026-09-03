@@ -1,12 +1,14 @@
 #![cfg(unix)]
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
 #[cfg(unix)]
 #[test]
 fn status_enable_and_inhibited_ensure_are_isolated_and_typed() {
     let dir = tempfile::tempdir().unwrap();
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let socket = dir.path().join("host.sock");
     let amber = env!("CARGO_BIN_EXE_amber");
 

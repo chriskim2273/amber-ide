@@ -9,6 +9,7 @@ import type { BrowserToolAction } from './browserToolProtocol'
 import { parseBrowserViewport } from '../shared/browserViewport'
 import { BrowserApprovalCoordinator, BrowserDialogCoordinator, interactionTargetDigest, interactionValueDigest, type ApprovalDecision } from './browserApproval'
 import { navigationPolicyAllows, selectPreviewOrigin } from './tabBrowserPolicy'
+import { BrowserOperationRegistry } from './browserOperationRegistry'
 
 export type TabBrowserCommand =
   | { type: 'open' }
@@ -106,13 +107,14 @@ export class TabBrowserService {
     private readonly host: TabBrowserHost,
     initialState: BrowserStateFile,
     window?: BrowserWindow,
+    private readonly operations = new BrowserOperationRegistry(),
   ) {
     this.persistedState = structuredClone(initialState); this.currentWindow = window ?? null
     this.approvals = new BrowserApprovalCoordinator(Date.now, (id) => this.host.isVisible(id) && this.approvalSurfaceVisible(id), (event) => this.eventSink(event), 60_000, (id) => this.approvalSurfaceReveal(id))
     this.dialogs = new BrowserDialogCoordinator(Date.now, (id) => this.host.isVisible(id) && this.approvalSurfaceVisible(id), (id) => { try { const status = this.host.status(id); return { pageIncarnation: status.pageIncarnation, generation: status.generation } } catch { return null } }, (event) => this.eventSink(event), 60_000, (id) => this.approvalSurfaceReveal(id))
   }
 
-  static async create(root: string, window: BrowserWindow, store = new TabBrowserStateStore(root)): Promise<TabBrowserService> {
+  static async create(root: string, window: BrowserWindow, store = new TabBrowserStateStore(root), operations = new BrowserOperationRegistry()): Promise<TabBrowserService> {
     const state = await store.load()
     const persistedState = structuredClone(state)
     // The persisted profile descriptor is authoritative. Falling back to a
@@ -123,7 +125,7 @@ export class TabBrowserService {
     const host = new TabBrowserHost(state, pages, Date.now, undefined, () => {
       void service.schedulePersist().catch((error) => console.error('tab browser state save failed', error))
     }, (event) => service.handleHostEvent(event))
-    service = new TabBrowserService(store, pages, host, persistedState, window)
+    service = new TabBrowserService(store, pages, host, persistedState, window, operations)
     return service
   }
 
@@ -171,7 +173,11 @@ export class TabBrowserService {
     this.eventSink(event)
   }
 
-  async importWorkspaceBrowsers(input: WorkspaceBrowserImport): Promise<void> {
+  importWorkspaceBrowsers(input: WorkspaceBrowserImport): Promise<void> {
+    return this.operations.run('workspace-import', async (signal) => { this.operations.assertDispatch(signal); await this.importWorkspaceBrowsersCommitted(input) })
+  }
+
+  async importWorkspaceBrowsersCommitted(input: WorkspaceBrowserImport): Promise<void> {
     const { entries, recovery } = input
     const ids = new Set<string>()
     for (const entry of entries) {
@@ -181,15 +187,31 @@ export class TabBrowserService {
     }
     this.suppressPersist = true
     try { this.host.importWorkspace(entries, recovery) } finally { this.suppressPersist = false }
-    this.persistedState = structuredClone(await this.store.load())
+    const loaded = await this.store.load()
+    this.persistedState = structuredClone(loaded)
+  }
+
+  async destroyForAssociation(id: string): Promise<void> {
+    this.approvals.clearBrowser(id); this.dialogs.clearBrowser(id); this.latestPiActions.delete(id)
+    try { this.host.close(id) } catch { return }
+    await this.schedulePersist()
   }
 
   workspaceSnapshot(): ReturnType<TabBrowserHost['workspaceSnapshot']> { return this.host.workspaceSnapshot() }
   recoveryItems(): ReturnType<TabBrowserHost['recoveryItems']> { return this.host.recoveryItems() }
-  async deleteRecovery(index: number): Promise<void> { this.host.deleteRecovery(index); await this.schedulePersist() }
-  async attachRecovery(index: number, id: BrowserId): Promise<BrowserRuntimeStatus> {
+  deleteRecovery(index: number): Promise<void> {
+    return this.operations.run('recovery', async (signal) => { this.operations.assertDispatch(signal); this.host.deleteRecovery(index); await this.schedulePersist() })
+  }
+  attachRecovery(index: number, id: BrowserId): Promise<BrowserRuntimeStatus> {
+    return this.operations.run('recovery', async (signal) => { this.operations.assertDispatch(signal); return this.attachRecoveryCommitted(index, id) })
+  }
+  async attachRecoveryCommitted(index: number, id: BrowserId): Promise<BrowserRuntimeStatus> {
     this.suppressPersist = true
-    try { return this.host.attachRecovery(index, id) } finally { this.suppressPersist = false; this.persistedState = structuredClone(await this.store.load()) }
+    try { return this.host.attachRecovery(index, id) }
+    finally {
+      this.suppressPersist = false
+      const loaded = await this.store.load(); this.persistedState = structuredClone(loaded)
+    }
   }
 
   private schedulePersist(): Promise<void> {
@@ -208,7 +230,10 @@ export class TabBrowserService {
   command(command: Extract<TabBrowserCommand, { type: 'automation' }>, signal?: AbortSignal, validate?: () => boolean | Promise<boolean>): Promise<unknown>
   command(command: TabBrowserCommand, signal?: AbortSignal, validate?: () => boolean | Promise<boolean>): Promise<unknown>
   command(command: TabBrowserCommand, signal?: AbortSignal, validate?: () => boolean | Promise<boolean>): Promise<unknown> {
-    if (this.draining) return Promise.reject(new Error('BROWSER_HOST_SHUTTING_DOWN'))
+    return this.operations.run('command', (ownedSignal) => this.enqueueCommand(command, ownedSignal, validate), signal)
+  }
+
+  private enqueueCommand(command: TabBrowserCommand, signal?: AbortSignal, validate?: () => boolean | Promise<boolean>): Promise<unknown> {
     // Opens must reach the host concurrently so the global capacity FIFO sees
     // every contender. Observations and hide also cannot sit behind a wait.
     if (command.type === 'hide' || command.type === 'destroy') this.activationControllers.get(command.id)?.abort()
@@ -243,8 +268,9 @@ export class TabBrowserService {
     this.latestPiActions.set(id, event); this.eventSink(event)
   }
   private async runCommand(command: TabBrowserCommand, signal?: AbortSignal, validate?: () => boolean | Promise<boolean>): Promise<unknown> {
+    this.operations.assertDispatch(signal)
     if (validate && !(await validate())) throw new Error('STALE_BROWSER_CONTEXT')
-    if (signal?.aborted) throw new Error('ACTION_CANCELLED')
+    this.operations.assertDispatch(signal)
     switch (command.type) {
       case 'open': {
         try {
@@ -338,24 +364,27 @@ export class TabBrowserService {
     }
   }
 
-  pendingWork(): { piActions: number; approvals: number; dialogs: number; pageLoads: number; queued: number; total: number } {
+  pendingWork(): { operations: number; piActions: number; approvals: number; dialogs: number; pageLoads: number; queued: number; total: number } {
+    const operations = this.operations.summary().total
     const piActions = [...this.activePi.values()].reduce((sum, entries) => sum + entries.size, 0)
     const approvals = this.approvals.pendingCount(), dialogs = this.dialogs.pendingCount()
     const pageLoads = this.host.pendingLoadCount(), queued = this.browserQueues.size + this.activationControllers.size
-    return { piActions, approvals, dialogs, pageLoads, queued, total: piActions + approvals + dialogs + pageLoads + queued }
+    return { operations, piActions, approvals, dialogs, pageLoads, queued, total: operations + approvals + dialogs + pageLoads }
   }
 
   beginDrain(): void {
     if (this.draining) return
     this.draining = true
+    this.operations.beginDrain()
     for (const controller of this.activationControllers.values()) controller.abort()
     this.approvals.clearAll(); this.dialogs.clearAll()
     for (const id of Object.keys(this.host.snapshot().records)) this.revokePi(id)
   }
 
-  cancelDrain(): void { this.draining = false }
+  cancelDrain(): void { this.draining = false; this.operations.cancelDrain() }
 
   async flushAndDestroy(): Promise<void> {
+    await this.operations.waitForEmpty()
     await Promise.allSettled([...this.browserQueues.values()])
     this.host.freezeAll()
     await this.schedulePersist()

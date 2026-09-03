@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { execFile } from 'node:child_process'
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
@@ -31,7 +31,7 @@ try {
   await exec(resolvedAmber, ['ctl', 'install-pi-extension'], { env })
   const extension = join(agentDir, 'extensions', 'amber-hook.ts')
   const first = await readFile(extension, 'utf8')
-  if (!first.startsWith('// amber-owned-extension:v5\n')) throw new Error('installed source is not the expected owned version')
+  if (!first.startsWith('// amber-owned-extension:v6\n')) throw new Error('installed source is not the expected owned version')
   await exec(resolvedAmber, ['ctl', 'install-pi-extension'], { env })
   if (await readFile(extension, 'utf8') !== first) throw new Error('second install changed the exact generated source')
 
@@ -54,9 +54,24 @@ try {
   const names = tools.map((tool) => tool.name)
   for (const name of expectedTools) if (!names.includes(name)) throw new Error(`Pi runtime did not register ${name}`)
   if (names.length !== new Set(names).size) throw new Error('Pi runtime registered duplicate tool names')
+  const statusTool = tools.find((tool) => tool.name === 'browser_status')
+
+  // Cold-start contract: the first tool sees neither token nor socket, invokes
+  // the bounded launcher once, then retries against the newly-ready host.
+  const coldState = join(root, 'cold-state'), coldRuntime = join(root, 'cold-runtime')
+  const coldSocket = join(coldRuntime, 'browser-host.sock'), coldToken = 'C'.repeat(43)
+  await mkdir(coldState, { mode: 0o700 }); await mkdir(coldRuntime, { mode: 0o700 })
+  const coldServer = join(root, 'cold-server.mjs'), coldLauncher = join(root, 'cold-amber')
+  await writeFile(coldServer, `import {createServer} from 'node:net';import {writeFileSync} from 'node:fs';const token=${JSON.stringify(coldToken)},sock=${JSON.stringify(coldSocket)},tokenPath=${JSON.stringify(join(coldState, 'browser-host-token'))};writeFileSync(tokenPath,token+'\\n',{mode:0o600});const frame=v=>{const b=Buffer.from(JSON.stringify(v)),o=Buffer.alloc(b.length+4);o.writeUInt32BE(b.length);b.copy(o,4);return o};const server=createServer(s=>{let b=Buffer.alloc(0),auth=false;s.on('data',c=>{b=Buffer.concat([b,c]);while(b.length>=4&&b.length>=b.readUInt32BE(0)+4){const n=b.readUInt32BE(0),v=JSON.parse(b.subarray(4,n+4));b=b.subarray(n+4);if(!auth){auth=true;s.write(frame({ok:v.token===token}));continue}s.write(frame({ok:true,result:{coldStarted:true}}));setTimeout(()=>server.close(()=>process.exit(0)),10)}})});server.listen(sock);setTimeout(()=>process.exit(2),10000).unref();`)
+  await writeFile(coldLauncher, `#!/usr/bin/env node\nconst {spawn}=require('node:child_process'),{existsSync}=require('node:fs');const p=spawn(process.execPath,[${JSON.stringify(coldServer)}],{detached:true,stdio:'ignore'});p.unref();const end=Date.now()+2000;(function wait(){if(existsSync(${JSON.stringify(coldSocket)}))process.exit(0);if(Date.now()>end)process.exit(2);setTimeout(wait,10)})()\n`)
+  await chmod(coldLauncher, 0o700)
+  process.env.AMBER_STATE_DIR = coldState; process.env.AMBER_SESSION = 'amber-1-1-0-verify'; process.env.AMBER_BROWSER_HOST_SOCKET = coldSocket; process.env.AMBER_BIN = coldLauncher
+  const coldResult = await statusTool.execute('verify-cold-start', {}, new AbortController().signal)
+  if (!coldResult.content?.[0]?.text?.includes('coldStarted')) throw new Error('first browser tool did not recover through launcher ensure')
+  process.env.AMBER_BIN = resolvedAmber
 
   const stateDir = join(root, 'state'), socketPath = join(root, 'browser.sock')
-  await mkdir(stateDir, { recursive: true })
+  await mkdir(stateDir, { recursive: true, mode: 0o700 })
   const token = 'A'.repeat(43)
   await writeFile(join(stateDir, 'browser-host-token'), `${token}\n`, { mode: 0o600 })
   process.env.AMBER_STATE_DIR = stateDir
@@ -81,7 +96,6 @@ try {
   })
   await new Promise((resolveListen, rejectListen) => { server.once('error', rejectListen); server.listen(socketPath, resolveListen) })
   try {
-    const statusTool = tools.find((tool) => tool.name === 'browser_status')
     const fillTool = tools.find((tool) => tool.name === 'browser_fill')
     const screenshotTool = tools.find((tool) => tool.name === 'browser_screenshot')
     const textResult = await statusTool.execute('verify-text', {}, new AbortController().signal)

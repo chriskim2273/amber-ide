@@ -969,10 +969,14 @@ fn browser_host_socket(explicit: Option<PathBuf>) -> PathBuf {
     if let Some(path) = std::env::var_os("AMBER_BROWSER_HOST_SOCKET") {
         return PathBuf::from(path);
     }
-    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    runtime.join("amber-ide").join("browser-host.sock")
+    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR").filter(|value| !value.is_empty()) {
+        return PathBuf::from(runtime).join("amber-ide").join("browser-host.sock");
+    }
+    #[cfg(unix)]
+    let fallback = format!("amber-ide-{}", unsafe { libc::geteuid() });
+    #[cfg(not(unix))]
+    let fallback = "amber-ide-unsupported".to_string();
+    std::env::temp_dir().join(fallback).join("browser-host.sock")
 }
 
 fn run_ctl_browser_host(
