@@ -104,6 +104,20 @@ describe('tab browser broker boundary', () => {
     expect(() => authorizeBrowserRequest(unshared, 'amber-1-2-0-pane')).toThrow('NO_BROWSER_FOR_TAB')
   })
 
+  it('does not unlink a live broker socket owned by another host', async () => {
+    if (process.platform === 'win32') return
+    const dir = await mkdtemp(join(tmpdir(), 'amber-browser-broker-')); cleanup.push(dir)
+    const socketPath = join(dir, 'broker.sock')
+    const first = new TabBrowserBrokerServer(socketPath, join(dir, 'token-a'), async () => ({}))
+    const second = new TabBrowserBrokerServer(socketPath, join(dir, 'token-b'), async () => ({}))
+    await first.start()
+    await expect(second.start()).rejects.toThrow('BROWSER_HOST_ALREADY_RUNNING')
+    await expect(new Promise<void>((resolve, reject) => {
+      const socket = connect(socketPath); socket.once('connect', () => { socket.destroy(); resolve() }); socket.once('error', reject)
+    })).resolves.toBeUndefined()
+    await first.close()
+  })
+
   it('rejects a symlink token file', async () => {
     if (process.platform === 'win32') return
     const dir = await mkdtemp(join(tmpdir(), 'amber-browser-broker-')); cleanup.push(dir)

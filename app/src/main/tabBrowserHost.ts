@@ -416,6 +416,16 @@ export class TabBrowserHost {
   /** Current renderer-capacity membership; used to prove admission compensation. */
   liveIds(): string[] { return this.capacity.liveIds() }
 
+  pendingLoadCount(): number {
+    let count = 0
+    for (const runtime of this.runtimes.values()) if (runtime.loading) count += 1
+    return count
+  }
+
+  freezeAll(): void {
+    for (const id of [...this.runtimes.keys()]) this.freeze(id)
+  }
+
   workspaceSnapshot(): Record<string, { mode: 'preview' | 'browse'; safeRestoreUrl: string; viewport: { width: number; height: number } }> {
     const out: Record<string, { mode: 'preview' | 'browse'; safeRestoreUrl: string; viewport: { width: number; height: number } }> = {}
     for (const record of Object.values(this.state.records)) {

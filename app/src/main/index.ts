@@ -1,4 +1,4 @@
-import { app, BrowserWindow, utilityProcess, MessageChannelMain, Menu, shell, Notification } from 'electron'
+import { app, BrowserWindow, utilityProcess, MessageChannelMain, Menu, shell, Notification, Tray, nativeImage } from 'electron'
 import type { MenuItemConstructorOptions } from 'electron'
 import { ipcMain, dialog, clipboard } from 'electron'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -84,6 +84,14 @@ import { parseWorkspaceFile } from '../shared/workspaceFile'
 import { commitPreparedWorkspaceImport, prepareWorkspaceImport } from './workspaceImport'
 import { browserContextMatches, captureBrowserContext, hasExactApprovalSurface, resolveBrowserContext, setBrowserForCurrentContext } from './browserWindowContext'
 import { createBrowserId } from '../shared/tabBrowser'
+import {
+  activationRequest,
+  clearBrowserHostInhibit,
+  coordinateBrowserHostQuit,
+  parseActivationRequest,
+  registerBrowserHostLauncher,
+  writeBrowserHostInhibit,
+} from './browserResident'
 import clientPath from '../client/index?modulePath'
 
 // A client child that stays up this long counts as a genuine run; a shorter
@@ -513,7 +521,7 @@ async function quitDaemonAndApp(win: BrowserWindow): Promise<void> {
         'The daemon was not installed via the app (dev mode or unmanaged), so it ' +
         'cannot be stopped from here. Quitting the app now — the daemon keeps running.',
     })
-    app.quit()
+    if (requestExplicitQuit) await requestExplicitQuit(); else app.quit()
     return
   }
 
@@ -531,7 +539,7 @@ async function quitDaemonAndApp(win: BrowserWindow): Promise<void> {
       })
       return
     }
-    app.quit()
+    if (requestExplicitQuit) await requestExplicitQuit(); else app.quit()
     return
   }
   const stop = stopDaemonCommand(process.platform, uid)
@@ -541,7 +549,7 @@ async function quitDaemonAndApp(win: BrowserWindow): Promise<void> {
       if (fb !== null) await spawnOk(fb.cmd, fb.args).catch(() => {})
     })
   }
-  app.quit()
+  if (requestExplicitQuit) await requestExplicitQuit(); else app.quit()
 }
 
 // Restart the daemon in place. Recovery path for a wedged daemon (and the way
@@ -647,6 +655,13 @@ async function installDesktopShortcut(win: BrowserWindow): Promise<void> {
     await spawnOk('gtk-update-icon-cache', [
       join(home, '.local', 'share', 'icons', 'hicolor'),
     ]).catch(() => {})
+    if (tabBrowserHostEnabled()) {
+      await registerBrowserHostLauncher(stateRoot(), {
+        platform: process.platform, executable: stable,
+        installGeneration: `${app.getVersion()}:${process.versions.electron}`,
+        uid: process.getuid?.(),
+      })
+    }
 
     await dialog.showMessageBox(win, {
       type: 'info',
@@ -674,6 +689,8 @@ async function installDesktopShortcut(win: BrowserWindow): Promise<void> {
 // item required by spec §3/§6. On Linux only that item plus the plain quit.
 function buildAppMenu(
   onQuitDaemon: () => void,
+  onQuitApp: () => void,
+  onEnableBrowserHost: (() => void) | null,
   onInstallDesktop: (() => void) | null,
   onRestartDaemon: () => void,
   onConnectHost: () => void,
@@ -681,9 +698,13 @@ function buildAppMenu(
   const isMac = process.platform === 'darwin'
   const sshSupport = isSupportedOnPlatform(process.platform)
   const template: MenuItemConstructorOptions[] = []
-  // macOS appMenu already carries a plain "Quit amber-ide" (quits the app,
-  // leaves the daemon running); on Linux we add that plain quit ourselves.
-  if (isMac) template.push({ role: 'appMenu' })
+  // Keep Quit under our coordinated drain instead of Electron's automatic
+  // role, which would close the broker before browser state is durable.
+  if (isMac) template.push({ label: app.name, submenu: [
+    { role: 'about' }, { type: 'separator' }, { role: 'services' },
+    { type: 'separator' }, { role: 'hide' }, { role: 'hideOthers' }, { role: 'unhide' },
+    { type: 'separator' }, { label: 'Quit Amber IDE', accelerator: 'Cmd+Q', click: () => onQuitApp() },
+  ] })
   const submenu: MenuItemConstructorOptions[] = [
     ...(onInstallDesktop !== null
       ? [
@@ -699,10 +720,13 @@ function buildAppMenu(
           toolTip: sshSupport.reason,
         },
     { type: 'separator' } as MenuItemConstructorOptions,
+    ...(onEnableBrowserHost
+      ? [{ label: 'Enable browser host', click: () => onEnableBrowserHost() }]
+      : [{ label: 'Browser host unavailable on this configuration', enabled: false }]),
     { label: 'Restart amber daemon', click: () => onRestartDaemon() },
     { label: 'Quit amber daemon', click: () => onQuitDaemon() },
   ]
-  if (!isMac) submenu.push({ type: 'separator' }, { role: 'quit', label: 'Quit Amber IDE' })
+  if (!isMac) submenu.push({ type: 'separator' }, { label: 'Quit Amber IDE', accelerator: 'CmdOrCtrl+Q', click: () => onQuitApp() })
   template.push({ label: isMac ? 'Daemon' : 'File', submenu })
   if (isMac) template.push({ role: 'editMenu' }, { role: 'windowMenu' })
   return Menu.buildFromTemplate(template)
@@ -740,7 +764,11 @@ interface WindowCtx {
 /** Per-window state, keyed by webContents id so IPC can route by sender. */
 const windowCtxs = new Map<number, WindowCtx>()
 let reopenLocalWindow: (() => Promise<void>) | null = null
-let onLocalWindowHidden: ((browserId: string) => void) | null = null
+let onLocalWindowHidden: (() => void) | null = null
+let residentTray: Tray | null = null
+let allowFinalQuit = false
+let explicitQuitInProgress = false
+let requestExplicitQuit: (() => Promise<void>) | null = null
 
 /** The window an IPC message came from. */
 function ctxFor(e: { sender: Electron.WebContents }): WindowCtx | undefined {
@@ -943,8 +971,9 @@ function killTunnels(): void {
   tunnels.clear()
 }
 
-async function openWindow(target: WindowTarget): Promise<WindowCtx> {
+async function openWindow(target: WindowTarget, options: { show?: boolean } = {}): Promise<WindowCtx> {
   const win = new BrowserWindow({
+    show: options.show ?? true,
     title: target.kind === 'remote' ? `amber — ${hostLabel(target.host ?? '')}` : 'amber',
     width: 1100,
     height: 720,
@@ -983,6 +1012,8 @@ async function openWindow(target: WindowTarget): Promise<WindowCtx> {
   if (target.kind === 'local') Menu.setApplicationMenu(
     buildAppMenu(
       () => { void quitDaemonAndApp(win) },
+      () => { void requestExplicitQuit?.() },
+      tabBrowserHostEnabled() ? () => { void clearBrowserHostInhibit(stateRoot()) } : null,
       canInstallDesktop ? () => { void installDesktopShortcut(win) } : null,
       () => { void restartDaemon(win) },
       () => promptConnectHost(),
@@ -1072,27 +1103,14 @@ async function openWindow(target: WindowTarget): Promise<WindowCtx> {
   let child: Electron.UtilityProcess | null = null
   let controlPort: Electron.MessagePortMain | null = null
   let relaunchAttempt = 0
-  let quitting = false
-  let windowClosed = false
-  let presentationSuspended = false
+  let windowClosed = options.show === false
+  let presentationSuspended = options.show === false
   const stopClient = (): void => {
     try { controlPort?.close() } catch { /* already closed */ }
     controlPort = null
     try { child?.kill() } catch { /* already dead */ }
     child = null
   }
-  // Tear the client utilityProcess down on quit. Spec §7: window close closes
-  // the utilityProcess and leaves the daemon running. Without this kill, the
-  // child outlives the window; combined with the historical darwin skip in
-  // window-all-closed, the red traffic-light left a headless Electron process
-  // in the Dock that required Force Quit.
-  const onBeforeQuit = (): void => {
-    killTunnels()
-    quitting = true
-    stopClient()
-  }
-  app.on('before-quit', onBeforeQuit)
-
   const notifyRenderer = (data: unknown): void => {
     if (!win.isDestroyed()) win.webContents.send('daemon-event', data)
   }
@@ -1122,14 +1140,14 @@ async function openWindow(target: WindowTarget): Promise<WindowCtx> {
       // (matches the "replace dead ports" intent; nothing will read port1 again).
       port1.close()
       if (child === c) { child = null; controlPort = null }
-      if (!shouldRelaunchClient({ quitting, windowClosed, windowDestroyed: win.isDestroyed() })) return
+      if (!shouldRelaunchClient({ quitting: allowFinalQuit, windowClosed, windowDestroyed: win.isDestroyed() })) return
       // Crash is never silent: flip the renderer to disconnected right away
       // (same shape the daemon uses), even if the window is gone on macOS.
       notifyRenderer({ status: 'disconnected' })
       relaunchAttempt = nextAttempt(relaunchAttempt, Date.now() - spawnedAt, CLIENT_STABLE_MS)
       const delay = backoffDelay(relaunchAttempt, { baseMs: 100, maxMs: 2000 })
       setTimeout(() => {
-        if (!shouldRelaunchClient({ quitting, windowClosed, windowDestroyed: win.isDestroyed() })) return
+        if (!shouldRelaunchClient({ quitting: allowFinalQuit, windowClosed, windowDestroyed: win.isDestroyed() })) return
         wireChild()
         // The renderer's MessagePorts died with the old child. Tell it to
         // re-request pane ports from the NEW child (handled via childEpoch).
@@ -1137,7 +1155,7 @@ async function openWindow(target: WindowTarget): Promise<WindowCtx> {
       }, delay)
     })
   }
-  wireChild()
+  if (options.show !== false) wireChild()
 
   const ctx: WindowCtx = {
     win,
@@ -1152,24 +1170,27 @@ async function openWindow(target: WindowTarget): Promise<WindowCtx> {
     resumeClient: () => {
       if (!presentationSuspended) return
       presentationSuspended = false
+      windowClosed = false
+      wireChild()
       notifyRenderer({ childRestart: true })
     },
   }
   windowCtxs.set(win.webContents.id, ctx)
   const id = win.webContents.id
   win.on('close', (event) => {
-    if (tabBrowserHostEnabled() && target.kind === 'local' && !quitting) {
+    if (tabBrowserHostEnabled() && target.kind === 'local' && !allowFinalQuit) {
       event.preventDefault()
       presentationSuspended = true
-      if (ctx.activeBrowserId) onLocalWindowHidden?.(ctx.activeBrowserId)
+      windowClosed = true
+      onLocalWindowHidden?.()
       child?.postMessage({ kind: 'suspend-panes' })
+      stopClient()
       win.hide()
     }
   })
   win.on('closed', () => {
     windowClosed = true
     windowCtxs.delete(id)
-    app.off('before-quit', onBeforeQuit)
     stopClient()
   })
   return ctx
@@ -1177,6 +1198,24 @@ async function openWindow(target: WindowTarget): Promise<WindowCtx> {
 
 async function main(): Promise<void> {
   if (!await preflightLinuxInputMethod()) return
+
+  const launch = activationRequest(process.argv)
+  if (tabBrowserHostEnabled()) {
+    if (launch.mode === 'normal') await clearBrowserHostInhibit(stateRoot())
+    if (app.isPackaged) {
+      try {
+        await registerBrowserHostLauncher(stateRoot(), {
+          platform: process.platform,
+          executable: process.execPath,
+          appImage: process.env['APPIMAGE'],
+          installGeneration: `${app.getVersion()}:${process.versions.electron}`,
+          uid: process.getuid?.(),
+        })
+      } catch (error) {
+        console.error('browser host launcher registration failed', error)
+      }
+    }
+  }
 
   const socket = resolveSocketPath(process.env, process.platform)
   const ensureDeps: EnsureDeps = {
@@ -1190,7 +1229,7 @@ async function main(): Promise<void> {
   }
   await ensureDaemon(socket, ensureDeps)
 
-  const ctx = await openWindow({ kind: 'local' })
+  const ctx = await openWindow({ kind: 'local' }, { show: launch.mode !== 'browser-host' })
   const win = ctx.win
   // Layout-v2 writes stay behind the deployed-reader barrier from the approved
   // rollout plan. Source compatibility alone is insufficient: an older
@@ -1203,7 +1242,7 @@ async function main(): Promise<void> {
       tabBrowserStateStore = new TabBrowserStateStore(stateRoot())
       await coordinateTabBrowserMigration(layoutPath(), tabBrowserStateStore)
       tabBrowser = await TabBrowserService.create(stateRoot(), win, tabBrowserStateStore)
-      onLocalWindowHidden = (id) => tabBrowser?.revokePi(id)
+      onLocalWindowHidden = () => tabBrowser?.windowHidden()
       tabBrowser.setApprovalSurface(
         (id) => hasExactApprovalSurface([...windowCtxs.values()].map((context) => ({ local: context.target.kind === 'local', destroyed: context.win.isDestroyed(), visible: context.win.isVisible(), browserId: context.activeBrowserId, expanded: context.activeBrowserExpanded })), id),
         (id) => {
@@ -1249,6 +1288,7 @@ async function main(): Promise<void> {
     if (existing) { existing.resumeClient(); existing.win.show(); existing.win.focus(); return }
     const reopened = await openWindow({ kind: 'local' })
     tabBrowser?.setWindow(reopened.win)
+    reopened.win.show(); reopened.win.focus()
   }
 
   let tabBrowserBroker: TabBrowserBrokerServer | null = null
@@ -1348,10 +1388,64 @@ async function main(): Promise<void> {
       authorizeReplay: async (request) => { try { await currentBrokerLayout(request); return true } catch { return false } },
     })
     await tabBrowserBroker.start()
-    app.once('before-quit', () => {
-      browserDaemonWatcher?.close(); browserDaemonWatcher = null
-      void tabBrowserBroker?.close()
+  }
+
+  requestExplicitQuit = async (): Promise<void> => {
+    if (allowFinalQuit || explicitQuitInProgress) return
+    explicitQuitInProgress = true
+    const work = tabBrowser?.pendingWork()
+    if (work && work.total > 0) {
+      const choice = await dialog.showMessageBox({
+        type: 'warning', buttons: ['Cancel', 'Quit anyway'], defaultId: 0, cancelId: 0,
+        title: 'Quit Amber IDE?', message: 'Browser work is still active.',
+        detail: `${work.piActions} Pi action(s), ${work.approvals} approval(s), ${work.dialogs} dialog(s), ${work.pageLoads} page load(s), and ${work.queued} queued operation(s) will be cancelled. The amber daemon and terminal sessions will keep running.`,
+      })
+      if (choice.response !== 1) { explicitQuitInProgress = false; return }
+    }
+    const result = await coordinateBrowserHostQuit({
+      writeInhibit: () => writeBrowserHostInhibit(stateRoot()),
+      beginDrain: () => tabBrowser?.beginDrain(),
+      flushAndDestroy: () => tabBrowser?.flushAndDestroy() ?? Promise.resolve(),
+      closeBroker: () => tabBrowserBroker?.close() ?? Promise.resolve(),
+      closeWatcher: () => { browserDaemonWatcher?.close(); browserDaemonWatcher = null },
+      closeWindows: () => {
+        residentTray?.destroy(); residentTray = null
+        allowFinalQuit = true
+        app.quit()
+      },
     })
+    if (result.ok) return
+    const failure = await dialog.showMessageBox({
+      type: 'error', buttons: ['Cancel quit', 'Force quit'], defaultId: 0, cancelId: 0,
+      title: 'Browser state could not be saved', message: result.error === 'QUIT_DRAIN_TIMEOUT' ? 'Amber timed out while saving browser state.' : 'Amber could not save browser state.',
+      detail: 'Force quit may lose the latest browser association or restore metadata. The amber daemon and terminal sessions will not be stopped.',
+    })
+    if (failure.response === 0) {
+      tabBrowser?.cancelDrain()
+      await clearBrowserHostInhibit(stateRoot()).catch(() => {})
+      explicitQuitInProgress = false
+      return
+    }
+    await tabBrowserBroker?.close().catch(() => {})
+    browserDaemonWatcher?.close(); browserDaemonWatcher = null
+    residentTray?.destroy(); residentTray = null
+    allowFinalQuit = true
+    app.exit(1)
+  }
+
+  if (tabBrowserSupported && process.platform === 'linux' && !residentTray) {
+    try {
+      const packagedIcon = join(process.resourcesPath, 'icon.png')
+      const devIcon = join(__dirname, '../../build/icon.png')
+      residentTray = new Tray(nativeImage.createFromPath(existsSync(packagedIcon) ? packagedIcon : devIcon))
+      residentTray.setToolTip('Amber IDE — browser host running')
+      residentTray.setContextMenu(Menu.buildFromTemplate([
+        { label: 'Open Amber IDE', click: () => { void reopenLocalWindow?.() } },
+        { type: 'separator' },
+        { label: 'Quit Amber IDE', click: () => { void requestExplicitQuit?.() } },
+      ]))
+      residentTray.on('click', () => { void reopenLocalWindow?.() })
+    } catch (error) { console.error('could not create browser-host tray', error) }
   }
 
   // These three are the only per-WINDOW handlers: each window has its own
@@ -1931,14 +2025,25 @@ async function main(): Promise<void> {
     inlineImages(String(mdDir), String(html)))
 }
 
-// Single-instance lock: a second launch (or a dev run whose predecessor didn't
-// fully exit) would open a second window + utilityProcess attaching the same
-// daemon sessions — duplicate subscriptions that read as "input sent twice".
-// Refuse to run a duplicate; the first instance keeps ownership.
-if (!app.requestSingleInstanceLock()) {
+app.on('before-quit', (event) => {
+  if (tabBrowserHostEnabled() && !allowFinalQuit && requestExplicitQuit) {
+    event.preventDefault()
+    void requestExplicitQuit()
+    return
+  }
+  killTunnels()
+})
+
+// Single-instance lock: a second launch sends only a bounded, versioned
+// activation envelope. The resident owner validates it before showing a local
+// window; arbitrary argv never reaches a shell or a replacement window.
+const launchActivation = activationRequest(process.argv)
+if (!app.requestSingleInstanceLock(launchActivation)) {
   app.quit()
 } else {
-  app.on('second-instance', () => { void reopenLocalWindow?.() })
+  app.on('second-instance', (_event, _argv, _cwd, additionalData) => {
+    if (parseActivationRequest(additionalData) !== null) void reopenLocalWindow?.()
+  })
   app.on('activate', () => { void reopenLocalWindow?.() })
   app.whenReady().then(main).catch((e) => {
     console.error(e)

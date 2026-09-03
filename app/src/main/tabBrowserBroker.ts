@@ -1,4 +1,4 @@
-import { createServer, type Server, type Socket } from 'node:net'
+import { connect, createServer, type Server, type Socket } from 'node:net'
 import { mkdir, open, readFile, unlink, lstat } from 'node:fs/promises'
 import { createHash, randomBytes } from 'node:crypto'
 import { dirname } from 'node:path'
@@ -151,6 +151,20 @@ async function tokenFile(path: string): Promise<string> {
 
 export interface TabBrowserBrokerOptions { requestTimeoutMs?: number; socketTimeoutMs?: number; resultTtlMs?: number; maxClientIdentities?: number; now?: () => number; authorizeReplay?: (request: BrokerRequest) => boolean | Promise<boolean> }
 
+async function rejectLiveSocket(path: string): Promise<void> {
+  let metadata
+  try { metadata = await lstat(path) } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return; throw error }
+  if (!metadata.isSocket()) throw new Error('INVALID_BROWSER_HOST_ENDPOINT')
+  const live = await new Promise<boolean>((resolve) => {
+    const socket = connect(path)
+    const timer = setTimeout(() => { socket.destroy(); resolve(true) }, 250)
+    socket.once('connect', () => { clearTimeout(timer); socket.destroy(); resolve(true) })
+    socket.once('error', (error: NodeJS.ErrnoException) => { clearTimeout(timer); resolve(error.code !== 'ECONNREFUSED' && error.code !== 'ENOENT') })
+  })
+  if (live) throw new Error('BROWSER_HOST_ALREADY_RUNNING')
+  await unlink(path)
+}
+
 export class TabBrowserBrokerServer {
   private server: Server | null = null
   private connections = 0
@@ -171,7 +185,7 @@ export class TabBrowserBrokerServer {
     if (process.platform === 'win32') throw new Error('BROWSER_HOST_UNAVAILABLE')
     const token = await tokenFile(this.tokenPath)
     await mkdir(dirname(this.socketPath), { recursive: true, mode: 0o700 })
-    await unlink(this.socketPath).catch((error: NodeJS.ErrnoException) => { if (error.code !== 'ENOENT') throw error })
+    await rejectLiveSocket(this.socketPath)
     this.server = createServer((socket) => {
       if (this.connections >= 8) { socket.destroy(); return }
       this.connections += 1; this.sockets.add(socket); this.accept(socket, token)

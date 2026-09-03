@@ -98,6 +98,7 @@ export class TabBrowserService {
   private runtimeFlush: NodeJS.Timeout | null = null
   private approvalSurfaceVisible: (browserId: string) => boolean = () => false
   private approvalSurfaceReveal: (browserId: string) => void = () => {}
+  private draining = false
 
   private constructor(
     private readonly store: TabBrowserStateStore,
@@ -127,6 +128,13 @@ export class TabBrowserService {
   }
 
   setWindow(window: BrowserWindow): void { this.currentWindow = window; this.pages.setWindow(window) }
+  windowHidden(): void {
+    this.currentWindow = null
+    for (const id of this.host.liveIds()) {
+      this.surfaceHidden(id)
+      this.host.hide(id)
+    }
+  }
   setApprovalSurface(visible: (browserId: string) => boolean, reveal: (browserId: string) => void): void { this.approvalSurfaceVisible = visible; this.approvalSurfaceReveal = reveal }
   surfaceHidden(id: string): void {
     this.approvals.invalidateBrowser(id); this.dialogs.clearBrowser(id)
@@ -200,6 +208,7 @@ export class TabBrowserService {
   command(command: Extract<TabBrowserCommand, { type: 'automation' }>, signal?: AbortSignal, validate?: () => boolean | Promise<boolean>): Promise<unknown>
   command(command: TabBrowserCommand, signal?: AbortSignal, validate?: () => boolean | Promise<boolean>): Promise<unknown>
   command(command: TabBrowserCommand, signal?: AbortSignal, validate?: () => boolean | Promise<boolean>): Promise<unknown> {
+    if (this.draining) return Promise.reject(new Error('BROWSER_HOST_SHUTTING_DOWN'))
     // Opens must reach the host concurrently so the global capacity FIFO sees
     // every contender. Observations and hide also cannot sit behind a wait.
     if (command.type === 'hide' || command.type === 'destroy') this.activationControllers.get(command.id)?.abort()
@@ -327,6 +336,32 @@ export class TabBrowserService {
       case 'destroy': this.approvals.clearBrowser(command.id); this.dialogs.clearBrowser(command.id); this.latestPiActions.delete(command.id); this.host.close(command.id); await this.schedulePersist(); return { closed: true }
       case 'close': case 'share': case 'designate': throw new Error('ASSOCIATION_COMMAND_REQUIRES_MAIN')
     }
+  }
+
+  pendingWork(): { piActions: number; approvals: number; dialogs: number; pageLoads: number; queued: number; total: number } {
+    const piActions = [...this.activePi.values()].reduce((sum, entries) => sum + entries.size, 0)
+    const approvals = this.approvals.pendingCount(), dialogs = this.dialogs.pendingCount()
+    const pageLoads = this.host.pendingLoadCount(), queued = this.browserQueues.size + this.activationControllers.size
+    return { piActions, approvals, dialogs, pageLoads, queued, total: piActions + approvals + dialogs + pageLoads + queued }
+  }
+
+  beginDrain(): void {
+    if (this.draining) return
+    this.draining = true
+    for (const controller of this.activationControllers.values()) controller.abort()
+    this.approvals.clearAll(); this.dialogs.clearAll()
+    for (const id of Object.keys(this.host.snapshot().records)) this.revokePi(id)
+  }
+
+  cancelDrain(): void { this.draining = false }
+
+  async flushAndDestroy(): Promise<void> {
+    await Promise.allSettled([...this.browserQueues.values()])
+    this.host.freezeAll()
+    await this.schedulePersist()
+    await this.persistQueue
+    if (this.runtimeFlush) { clearTimeout(this.runtimeFlush); this.runtimeFlush = null }
+    this.pendingRuntimeEvents.clear()
   }
 
   revokePi(id: string): void {

@@ -105,6 +105,8 @@ export class BrowserApprovalCoordinator {
     this.onEvent({ type: 'approval-resolved', browserId: pending.proposal.browserId, approvalId, digest: pending.digest, decision })
     if (error) pending.reject(error); else pending.resolve()
   }
+  pendingCount(): number { return this.pending.size }
+  clearAll(): void { for (const id of [...this.pending.keys()]) this.finish(id, 'revoked', new Error('APPROVAL_DENIED')) }
   invalidateBrowser(browserId: string): void {
     for (const [id, pending] of this.pending) if (pending.proposal.browserId === browserId) this.finish(id, 'revoked', new Error('APPROVAL_DENIED'))
   }
@@ -156,6 +158,8 @@ export class BrowserDialogCoordinator {
     }
     this.finish(dialogId, accept ? 'accept' : 'reject', { accept, ...(accept && promptText !== undefined ? { promptText: promptText.slice(0, 4096) } : {}) }); return true
   }
+  pendingCount(): number { return this.pending.size }
+  clearAll(): void { for (const id of [...this.pending.keys()]) this.finish(id, 'revoked', { accept: false }) }
   invalidateIdentity(browserId: string, pageIncarnation: string, generation: number): void { for (const [id, pending] of this.pending) if (pending.browserId === browserId && (pending.pageIncarnation !== pageIncarnation || pending.generation !== generation)) this.finish(id, 'revoked', { accept: false }) }
   clearBrowser(browserId: string): void { for (const [id, pending] of this.pending) if (pending.browserId === browserId) this.finish(id, 'revoked', { accept: false }) }
   private finish(dialogId: string, decision: 'accept' | 'reject' | 'expired' | 'revoked', value: BrowserDialogDecision): void {

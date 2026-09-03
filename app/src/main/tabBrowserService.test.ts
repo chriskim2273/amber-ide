@@ -50,6 +50,22 @@ describe('workspace browser staging contracts', () => {
 })
 
 describe('TabBrowserService dispatch authorization', () => {
+  it('rejects new commands during quit and freezes before the final durable save', async () => {
+    const state = emptyBrowserState(1), order: string[] = []
+    const host = {
+      snapshot: () => state, pendingLoadCount: () => 0, liveIds: () => [],
+      freezeAll: () => { order.push('freeze') },
+    }
+    const Service = TabBrowserService as unknown as new (s: TabBrowserStateStore, p: { setWindow: () => void }, h: typeof host, i: typeof state) => TabBrowserService
+    const service = new Service({ load: async () => state, update: async () => { order.push('persist'); return state } } as unknown as TabBrowserStateStore, { setWindow: () => {} }, host, state)
+    expect(service.pendingWork()).toMatchObject({ total: 0 })
+    service.beginDrain()
+    await expect(service.command({ type: 'open' })).rejects.toThrow('BROWSER_HOST_SHUTTING_DOWN')
+    await service.flushAndDestroy()
+    expect(order).toEqual(['freeze', 'persist'])
+    service.cancelDrain()
+  })
+
   it('coalesces high-rate host status changes into a bounded renderer update', async () => {
     vi.useFakeTimers()
     try {
