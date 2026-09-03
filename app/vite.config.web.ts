@@ -11,6 +11,11 @@ export default defineConfig({
   root: resolve('src/web'),
   plugins: [react()],
   build: {
+    // Keep native destructuring in the split dynamic-import bootstrap. The
+    // esbuild target matrix cannot lower destructuring inside Vite's preload
+    // wrapper, so selecting modern browsers makes the web build deterministic
+    // instead of failing during transpilation.
+    target: 'esnext',
     outDir: resolve('out/web'),
     emptyOutDir: true,
   },

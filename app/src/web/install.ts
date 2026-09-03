@@ -208,8 +208,8 @@ export function installAmber(home: string): void {
       const ch = new MessageChannel()
       return { port1: ch.port1 as unknown as PortLike, port2: ch.port2 }
     },
-    postPanePort: (session, port2) => {
-      window.postMessage({ amberPanePort: true, session }, '*', [port2 as MessagePort])
+    postPanePort: (session, port2, mode = 'terminal') => {
+      window.postMessage({ amberPanePort: true, session, mode }, '*', [port2 as MessagePort])
     },
     clipboard: {
       writeText: (text) => clipboard.writeText(text),

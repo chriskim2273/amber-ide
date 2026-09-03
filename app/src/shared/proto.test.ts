@@ -28,6 +28,23 @@ describe('proto', () => {
     expect(roundtrip(f)).toEqual(f)
   })
 
+  it('roundtrips Pi semantic capability, commands, events, and status', () => {
+    const frames: Frame[] = [
+      { type: 'control', msg: { kind: 'WatchPiEvents', version: 1 } },
+      { type: 'control', msg: { kind: 'PiBridgeHello', name: 'amber-1-1-0-pi' } },
+      { type: 'control', msg: { kind: 'PiBridgeCommand', name: 'amber-1-1-0-pi', command: { kind: 'Snapshot' } } },
+      { type: 'control', msg: { kind: 'PiBridgeCommand', name: 'amber-1-1-0-pi', command: { kind: 'Prompt', message: 'review', delivery: 'follow_up' } } },
+      { type: 'control', msg: { kind: 'PiBridgeCommand', name: 'amber-1-1-0-pi', command: { kind: 'Abort' } } },
+      { type: 'control', msg: { kind: 'PiBridgeCommand', name: 'amber-1-1-0-pi', command: { kind: 'SetThinkingLevel', level: 'high' } } },
+      { type: 'control', msg: { kind: 'PiEvent', name: 'amber-1-1-0-pi', seq: 8, event: { kind: 'snapshot', idle: true } } },
+      { type: 'control', msg: { kind: 'PiBridgeStatus', name: 'amber-1-1-0-pi', available: true } },
+    ]
+    for (const frame of frames) expect(roundtrip(frame)).toEqual(frame)
+    expect(new TextDecoder().decode(encode(frames[3]!).slice(5))).toBe(
+      '{"PiBridgeCommand":{"name":"amber-1-1-0-pi","command":{"Prompt":{"message":"review","delivery":"follow_up"}}}}',
+    )
+  })
+
   it('encodes the manual snapshot request and confirmation as daemon unit variants', () => {
     const request: Frame = { type: 'control', msg: { kind: 'Snapshot' } }
     const confirmation: Frame = { type: 'control', msg: { kind: 'SnapshotOk' } }

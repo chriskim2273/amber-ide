@@ -81,6 +81,8 @@ export type ServerMsg =
   | { t: 'memory'; name: string; rss_kb: number; growing: boolean }
   | { t: 'memoryPressure'; level: 'normal' | 'warning' | 'critical'; current_kb: number; budget_kb: number; blocked: boolean }
   | { t: 'resourcePressure'; level: 'normal' | 'critical'; causes: Array<'cpu' | 'io' | 'memory'>; blocked: boolean }
+  | { t: 'piEvent'; name: string; seq: number; event: Record<string, unknown> }
+  | { t: 'piStatus'; name: string; available: boolean }
 
 /** Parse one JSON text frame from `amber web`. `null` for anything this
  * shim has no use for (malformed JSON, an unknown `t`). */
@@ -122,6 +124,15 @@ export function parseServerMsg(text: string): ServerMsg | null {
         blocked: (raw['blocked'] as boolean) ?? false,
       }
     }
+    case 'piEvent': {
+      const event = raw['event']
+      if (typeof raw['name'] !== 'string' || typeof raw['seq'] !== 'number'
+        || !event || typeof event !== 'object' || Array.isArray(event)) return null
+      return { t: 'piEvent', name: raw['name'], seq: raw['seq'], event: event as Record<string, unknown> }
+    }
+    case 'piStatus':
+      if (typeof raw['name'] !== 'string' || typeof raw['available'] !== 'boolean') return null
+      return { t: 'piStatus', name: raw['name'], available: raw['available'] }
     case 'resourcePressure': {
       const level = raw['level']
       const causes = raw['causes']
@@ -251,7 +262,7 @@ export class ControlLink {
       // connection — it never opens anything — but ignore rather than
       // assume, matching the "unknown t is ignored" discipline `app.js` and
       // `parse_browser_msg` already use.
-      if (msg.t === 'backlog' || msg.t === 'exit') return
+      if (msg.t === 'backlog' || msg.t === 'exit' || msg.t === 'piEvent' || msg.t === 'piStatus') return
       this.dispatch(toDaemonEvent(msg))
     }
   }
@@ -302,7 +313,8 @@ export class PaneLink {
       // `crates/amber/src/web.rs`'s `map_browser_msg` is the actual bounds/
       // liveness check, this just paces the wire.
       if (m.resize) {
-        const { cols, rows } = m.resize
+        const cols = m.resize.cols
+        const rows = m.resize.rows
         if (this.resizeTimer !== null) clearTimeout(this.resizeTimer)
         this.resizeTimer = setTimeout(() => {
           this.resizeTimer = null
@@ -399,12 +411,94 @@ export class PaneLink {
   }
 }
 
+// ---- PiPaneLink: event-only semantic Pi connection -------------------------
+
+/** A graphical Pi pane deliberately does not send `open`, binary input, or
+ * resize. It carries only whitelisted semantic events and Pi commands. */
+export class PiPaneLink {
+  private socket: SocketLike
+  private closed = false
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null
+
+  constructor(
+    private readonly session: string,
+    private readonly connectSocket: () => SocketLike,
+    private readonly port: PortLike,
+  ) {
+    this.socket = connectSocket()
+    this.wire()
+    this.port.onmessage = (e: { data: unknown }): void => {
+      const command = (e.data as { command?: import('../shared/proto').PiCommand })?.command
+      if (!command || this.socket.readyState !== SOCKET_OPEN) return
+      switch (command.kind) {
+        case 'Snapshot':
+          this.socket.send(JSON.stringify({ t: 'piOpen', name: this.session }))
+          break
+        case 'Prompt':
+          this.socket.send(JSON.stringify({
+            t: 'piPrompt', name: this.session, message: command.message, delivery: command.delivery,
+          }))
+          break
+        case 'Abort':
+          this.socket.send(JSON.stringify({ t: 'piAbort', name: this.session }))
+          break
+        case 'SetThinkingLevel':
+          this.socket.send(JSON.stringify({ t: 'piThinking', name: this.session, level: command.level }))
+          break
+      }
+    }
+    this.port.start()
+  }
+
+  private wire(): void {
+    const socket = this.socket
+    socket.onopen = (): void => {
+      socket.send(JSON.stringify({ t: 'piOpen', name: this.session }))
+    }
+    socket.onclose = (): void => {
+      if (this.closed || this.reconnectTimer !== null) return
+      this.reconnectTimer = setTimeout(() => {
+        this.reconnectTimer = null
+        if (this.closed) return
+        this.socket = this.connectSocket()
+        this.wire()
+      }, RECONNECT_MS)
+    }
+    socket.onerror = (): void => {
+      try { socket.close() } catch { /* onclose handles retry */ }
+    }
+    socket.onmessage = (e: { data: unknown }): void => {
+      if (typeof e.data !== 'string') return
+      const msg = parseServerMsg(e.data)
+      if (!msg || (msg.t !== 'piEvent' && msg.t !== 'piStatus') || msg.name !== this.session) return
+      this.port.postMessage({
+        msg: msg.t === 'piEvent'
+          ? { kind: 'PiEvent', name: msg.name, seq: msg.seq, event: msg.event }
+          : { kind: 'PiBridgeStatus', name: msg.name, available: msg.available },
+      })
+    }
+  }
+
+  close(): void {
+    this.closed = true
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
+    if (this.socket.readyState === SOCKET_OPEN) {
+      this.socket.send(JSON.stringify({ t: 'piClose', name: this.session }))
+    }
+    this.port.close()
+    this.socket.close()
+  }
+}
+
 // ---- window.amber -----------------------------------------------------------
 
 export interface AmberDeps {
   connectSocket: () => SocketLike
   newChannel: () => { port1: PortLike; port2: unknown }
-  postPanePort: (session: string, port2: unknown) => void
+  postPanePort: (session: string, port2: unknown, mode?: 'terminal' | 'pi') => void
   clipboard: { writeText: (text: string) => Promise<void>; readText: () => Promise<string> }
   home: string
   machineName: string
@@ -469,6 +563,7 @@ export function createAmber(deps: AmberDeps): WebAmber {
 
   const control = new ControlLink(deps.connectSocket, dispatch)
   const panes = new Map<string, PaneLink>()
+  const piPanes = new Map<string, PiPaneLink>()
 
   const api: Window['amber'] = {
     softwareGl: deps.softwareGl,
@@ -486,6 +581,8 @@ export function createAmber(deps: AmberDeps): WebAmber {
 
     // --- §2.2/§4a: the pane MessageChannel path, one socket per pane -------
     openPane: (session): void => {
+      piPanes.get(session)?.close()
+      piPanes.delete(session)
       // A remount (workspace switch) before the old pane's close lands must
       // not leak a second socket+port for the same name — mirrors the
       // Electron client's `router.ts::attach`.
@@ -495,11 +592,24 @@ export function createAmber(deps: AmberDeps): WebAmber {
         dispatch({ frame: { type: 'control', msg: { kind: 'Exit', name, code } } }),
       )
       panes.set(session, link)
-      deps.postPanePort(session, channel.port2)
+      deps.postPanePort(session, channel.port2, 'terminal')
     },
     closePane: (session): void => {
       panes.get(session)?.close()
       panes.delete(session)
+    },
+    openPiPane: (session): void => {
+      panes.get(session)?.close()
+      panes.delete(session)
+      piPanes.get(session)?.close()
+      const channel = deps.newChannel()
+      const link = new PiPaneLink(session, deps.connectSocket, channel.port1)
+      piPanes.set(session, link)
+      deps.postPanePort(session, channel.port2, 'pi')
+    },
+    closePiPane: (session): void => {
+      piPanes.get(session)?.close()
+      piPanes.delete(session)
     },
 
     // --- session lifecycle: existing browser whitelist ----------------------

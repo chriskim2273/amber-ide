@@ -2,9 +2,18 @@
 
 **Date:** 2026-09-02
 
-**Status:** approved for implementation
+**Status:** implemented and release-readiness validated 2026-09-03
 
 **Scope decision:** The user explicitly approved a Pi-only exception to the repository constitution's previous “AI chat UI” exclusion. This does not authorize a generic cross-agent chat layer. Existing shell and agent terminal paths remain supported and unchanged.
+
+**Validation record (2026-09-03):**
+
+- Rust: `cargo test --workspace` passed (823 passed, 0 failed, 1 ignored), and `cargo clippy --workspace --all-targets -- -D warnings` passed.
+- App: Vitest passed (760 passed, 1 skipped across 61 passed / 1 skipped files), `npm run typecheck`, `npm run build`, and `npm run build:web` passed. The web build retains its existing large-chunk warning only.
+- Generated hook: extracted `amber-hook.ts` typechecked against the installed Pi `ExtensionAPI` (`@earendil-works/pi-coding-agent` 0.84.4); the generated-hook tests assert the 64 KiB text cap, 80 ms update throttle, image-body omission ordering, and public API-only implementation.
+- Private live smoke (`/tmp/amber-pi-gui-live`, `127.0.0.1:17719`) passed semantic open/snapshot, thinking-level command, reconnect snapshot, binary-PTY rejection in GUI mode, and terminal fallback PTY delivery. Process inspection showed one supervised Pi process and one Pi child; no production Amber state or daemon was touched.
+- `git diff --check` passed. Repository-wide `cargo fmt --all -- --check` remains red only because of pre-existing formatting drift outside this feature; no unrelated mass formatting was applied.
+- Remaining manual gap: real-device phone touch behavior and an authenticated real installed-Pi prompt/GUI toggle smoke still require a user-facing machine check; the private proof used the available real Pi process and harmless bridge commands.
 
 **Builds on:**
 

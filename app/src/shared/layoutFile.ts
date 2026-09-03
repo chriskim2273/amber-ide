@@ -40,6 +40,9 @@ export interface LayoutFile {
   frozen?: Record<string, FrozenEntry>
   browsers?: Record<string, BrowserEntry>
   editors?: Record<string, EditorEntry>
+  // Pi terminal is the default and is never persisted. Presence means the
+  // optional semantic chat view is selected for this supervised Pi session.
+  piViews?: Record<string, 'gui'>
   recentFiles?: string[] // most-recent-first, deduped, capped at RECENT_FILES_MAX
 }
 
@@ -98,6 +101,13 @@ function parseEditors(v: unknown): Record<string, EditorEntry> | undefined {
 
 // Most-recent-first, deduped, capped. The invariant lives in the parser too so a
 // hand-edited sidecar can't grow the list without bound.
+function parsePiViews(v: unknown): Record<string, 'gui'> | undefined {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return undefined
+  const out: Record<string, 'gui'> = {}
+  for (const [name, view] of Object.entries(v)) if (view === 'gui') out[name] = 'gui'
+  return Object.keys(out).length > 0 ? out : undefined
+}
+
 function parseRecentFiles(v: unknown): string[] | undefined {
   if (!Array.isArray(v)) return undefined
   return [...new Set(v.filter((p): p is string => typeof p === 'string'))].slice(0, RECENT_FILES_MAX)
@@ -244,7 +254,13 @@ function merge3(base: unknown, local: unknown, remote: unknown, path: string[] =
  * never trust a merged object's shape blindly.
  */
 export function mergeLayout(base: LayoutFile, local: LayoutFile, remote: LayoutFile): LayoutFile {
-  return parseLayout(JSON.stringify(merge3(base, local, remote)))
+  // `piViews` is an additive sparse preference map whose absent value means
+  // empty. Normalize that one optional container so two clients selecting GUI
+  // on different Pi panes merge per pane instead of racing on the top-level key.
+  const normalizePiViews = (layout: LayoutFile): LayoutFile => ({ ...layout, piViews: layout.piViews ?? {} })
+  return parseLayout(JSON.stringify(merge3(
+    normalizePiViews(base), normalizePiViews(local), normalizePiViews(remote),
+  )))
 }
 
 export function parseLayout(text: string): LayoutFile {
@@ -271,6 +287,10 @@ export function parseLayout(text: string): LayoutFile {
       ...((): { editors?: Record<string, EditorEntry> } => {
         const e = parseEditors(v.editors)
         return e ? { editors: e } : {}
+      })(),
+      ...((): { piViews?: Record<string, 'gui'> } => {
+        const p = parsePiViews(v.piViews)
+        return p ? { piViews: p } : {}
       })(),
       ...((): { recentFiles?: string[] } => {
         const r = parseRecentFiles(v.recentFiles)

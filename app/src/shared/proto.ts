@@ -77,11 +77,23 @@ export interface ProviderUsage {
   detail: string | null
 }
 
+export type PiDelivery = 'now' | 'steer' | 'follow_up'
+export type PiCommand =
+  | { kind: 'Snapshot' }
+  | { kind: 'Prompt'; message: string; delivery: PiDelivery }
+  | { kind: 'Abort' }
+  | { kind: 'SetThinkingLevel'; level: string }
+
 export type ControlMsg =
   | { kind: 'Hello' }
   | { kind: 'ListSessions' }
   | { kind: 'WatchSessions' }
   | { kind: 'WatchMemoryPressure'; version: number }
+  | { kind: 'WatchPiEvents'; version: number }
+  | { kind: 'PiBridgeHello'; name: string }
+  | { kind: 'PiBridgeCommand'; name: string; command: PiCommand }
+  | { kind: 'PiEvent'; name: string; seq: number; event: Record<string, unknown> }
+  | { kind: 'PiBridgeStatus'; name: string; available: boolean }
   | { kind: 'ListSessionsDetailed' }
   | { kind: 'Snapshot' }
   | { kind: 'SnapshotOk' }
@@ -166,6 +178,16 @@ function msgToJson(m: ControlMsg): unknown {
       return m.kind // unit variant -> bare string
     case 'WatchMemoryPressure':
       return { WatchMemoryPressure: { version: m.version } }
+    case 'WatchPiEvents':
+      return { WatchPiEvents: { version: m.version } }
+    case 'PiBridgeHello':
+      return { PiBridgeHello: { name: m.name } }
+    case 'PiBridgeCommand':
+      return { PiBridgeCommand: { name: m.name, command: piCommandToJson(m.command) } }
+    case 'PiEvent':
+      return { PiEvent: { name: m.name, seq: m.seq, event: m.event } }
+    case 'PiBridgeStatus':
+      return { PiBridgeStatus: { name: m.name, available: m.available } }
     case 'Create':
       return { Create: { name: m.name, cwd: m.cwd, kind: m.sessionKind } }
     case 'Attach': {
@@ -266,6 +288,33 @@ export function decodeProviderUsage(v: unknown): ProviderUsage {
   }
 }
 
+function piCommandToJson(command: PiCommand): unknown {
+  switch (command.kind) {
+    case 'Snapshot':
+    case 'Abort': return command.kind
+    case 'Prompt': return { Prompt: { message: command.message, delivery: command.delivery } }
+    case 'SetThinkingLevel': return { SetThinkingLevel: { level: command.level } }
+  }
+}
+
+function jsonToPiCommand(v: unknown): PiCommand | null {
+  if (v === 'Snapshot' || v === 'Abort') return { kind: v }
+  if (!v || typeof v !== 'object') return null
+  const entry = Object.entries(v as Record<string, unknown>)[0]
+  if (!entry) return null
+  const [kind, rawBody] = entry
+  const body = rawBody as Record<string, unknown>
+  if (kind === 'Prompt') {
+    const delivery = body['delivery']
+    if (typeof body['message'] !== 'string' || (delivery !== 'now' && delivery !== 'steer' && delivery !== 'follow_up')) return null
+    return { kind: 'Prompt', message: body['message'], delivery }
+  }
+  if (kind === 'SetThinkingLevel' && typeof body['level'] === 'string') {
+    return { kind: 'SetThinkingLevel', level: body['level'] }
+  }
+  return null
+}
+
 function jsonToMsg(v: unknown): ControlMsg | null {
   if (typeof v === 'string') {
     if (v === 'Hello' || v === 'ListSessions' || v === 'WatchSessions' ||
@@ -281,6 +330,18 @@ function jsonToMsg(v: unknown): ControlMsg | null {
     switch (key) {
       case 'Create': return { kind: 'Create', name: body['name'] as string, cwd: body['cwd'] as string, sessionKind: body['kind'] as string }
       case 'WatchMemoryPressure': return { kind: 'WatchMemoryPressure', version: body['version'] as number }
+      case 'WatchPiEvents': return { kind: 'WatchPiEvents', version: body['version'] as number }
+      case 'PiBridgeHello': return { kind: 'PiBridgeHello', name: body['name'] as string }
+      case 'PiBridgeCommand': {
+        const command = jsonToPiCommand(body['command'])
+        return command ? { kind: 'PiBridgeCommand', name: body['name'] as string, command } : null
+      }
+      case 'PiEvent': {
+        const event = body['event']
+        if (!event || typeof event !== 'object' || Array.isArray(event)) return null
+        return { kind: 'PiEvent', name: body['name'] as string, seq: body['seq'] as number, event: event as Record<string, unknown> }
+      }
+      case 'PiBridgeStatus': return { kind: 'PiBridgeStatus', name: body['name'] as string, available: body['available'] === true }
       case 'Attach': {
         const rawResume = body['resume'] as Record<string, unknown> | undefined
         const resume = rawResume

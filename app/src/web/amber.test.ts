@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import {
-  parseServerMsg, toDaemonEvent, ControlLink, PaneLink, createAmber,
+  parseServerMsg, toDaemonEvent, ControlLink, PaneLink, PiPaneLink, createAmber,
   type SocketLike, type PortLike, type AmberDeps, type RouterApi,
 } from './amber'
 
@@ -44,6 +44,10 @@ describe('parseServerMsg', () => {
       .toEqual({ t: 'memoryPressure', level: 'critical', current_kb: 7000000, budget_kb: 8000000, blocked: false })
     expect(parseServerMsg('{"t":"resourcePressure","level":"critical","causes":["cpu","io"]}'))
       .toEqual({ t: 'resourcePressure', level: 'critical', causes: ['cpu', 'io'], blocked: false })
+    expect(parseServerMsg('{"t":"piEvent","name":"pi","seq":2,"event":{"kind":"agent_start"}}'))
+      .toEqual({ t: 'piEvent', name: 'pi', seq: 2, event: { kind: 'agent_start' } })
+    expect(parseServerMsg('{"t":"piStatus","name":"pi","available":true}'))
+      .toEqual({ t: 'piStatus', name: 'pi', available: true })
   })
 
   it('returns null for an unknown t or malformed JSON', () => {
@@ -250,6 +254,42 @@ describe('PaneLink', () => {
     amber.openPane('s1') // remount before the first close() lands
     expect(firstPaneSocket.closed).toBe(true)
     expect(calls).toBe(3)
+  })
+})
+
+describe('PiPaneLink', () => {
+  it('opens an event-only Pi stream, routes semantic events, and sends commands as JSON', () => {
+    const socket = new FakeSocket()
+    const port = new FakePort()
+    const link = new PiPaneLink('pi', () => socket, port)
+    socket.open()
+    expect(socket.sent).toEqual([JSON.stringify({ t: 'piOpen', name: 'pi' })])
+
+    socket.emit(JSON.stringify({ t: 'piEvent', name: 'pi', seq: 4, event: { kind: 'agent_start' } }))
+    expect(port.posted).toEqual([{
+      msg: { kind: 'PiEvent', name: 'pi', seq: 4, event: { kind: 'agent_start' } },
+    }])
+
+    port.fromRenderer({ command: { kind: 'Prompt', message: 'hello', delivery: 'steer' } })
+    port.fromRenderer({ command: { kind: 'Abort' } })
+    expect(socket.sent.slice(1)).toEqual([
+      JSON.stringify({ t: 'piPrompt', name: 'pi', message: 'hello', delivery: 'steer' }),
+      JSON.stringify({ t: 'piAbort', name: 'pi' }),
+    ])
+
+    link.close()
+    expect(port.closed).toBe(true)
+    expect(socket.sent.at(-1)).toBe(JSON.stringify({ t: 'piClose', name: 'pi' }))
+  })
+
+  it('ignores PTY bytes and semantic events for a different Pi session', () => {
+    const socket = new FakeSocket()
+    const port = new FakePort()
+    new PiPaneLink('pi', () => socket, port)
+    socket.open()
+    socket.emit(new Uint8Array([1, 2]))
+    socket.emit(JSON.stringify({ t: 'piEvent', name: 'other', seq: 1, event: { kind: 'agent_start' } }))
+    expect(port.posted).toEqual([])
   })
 })
 

@@ -516,8 +516,8 @@ export const Pane = memo(function Pane(
     term.onScroll(() => setOpenBtn(null)) // anchor would drift off the moved line
 
     const onPortMsg = (e: MessageEvent): void => {
-      const d = e.data as { amberPanePort?: boolean; session?: string }
-      if (!d?.amberPanePort || d.session !== session || !e.ports[0]) return
+      const d = e.data as { amberPanePort?: boolean; session?: string; mode?: string }
+      if (!d?.amberPanePort || d.session !== session || (d.mode ?? 'terminal') !== 'terminal' || !e.ports[0]) return
       window.removeEventListener('message', onPortMsg)
       if (wired) { e.ports[0].close(); return }
       wired = true

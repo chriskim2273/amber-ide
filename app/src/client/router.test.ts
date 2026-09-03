@@ -4,10 +4,15 @@ import type { Frame } from '../shared/proto'
 
 class FakeConn {
   sent: Frame[] = []
-  private cb: ((f: Frame) => void) | null = null
+  private frameCb: ((f: Frame) => void) | null = null
+  private openCb: (() => void) | null = null
   send(f: Frame): void { this.sent.push(f) }
-  on(_e: 'frame', cb: (f: Frame) => void): void { this.cb = cb }
-  emit(f: Frame): void { this.cb?.(f) }
+  on(e: 'frame' | 'open', cb: ((f: Frame) => void) | (() => void)): void {
+    if (e === 'frame') this.frameCb = cb as (f: Frame) => void
+    else this.openCb = cb as () => void
+  }
+  emit(f: Frame): void { this.frameCb?.(f) }
+  emitOpen(): void { this.openCb?.() }
 }
 
 class FakePort implements PortLike {
@@ -221,6 +226,71 @@ describe('Router', () => {
       type: 'control',
       msg: { kind: 'Attach', name: 's', resume: { epoch: '7', offset: 130 } },
     }])
+  })
+
+  it('mode replacement closes the prior port and detaches the terminal exactly once', () => {
+    const conn = new FakeConn()
+    const router = new Router(conn)
+    const terminal = new FakePort()
+    const semantic = new FakePort()
+    router.attach('pi', terminal)
+    conn.sent.length = 0
+
+    router.attachPi('pi', semantic)
+    expect(terminal.closed).toBe(true)
+    expect(conn.sent.filter((frame) => frame.type === 'control' && frame.msg.kind === 'Detach'))
+      .toEqual([{ type: 'control', msg: { kind: 'Detach', name: 'pi' } }])
+    expect(conn.sent.some((frame) => frame.type === 'control' && frame.msg.kind === 'Attach')).toBe(false)
+
+    const terminalAgain = new FakePort()
+    router.attach('pi', terminalAgain)
+    expect(semantic.closed).toBe(true)
+    expect(router.attachedPiCount()).toBe(0)
+  })
+
+  it('routes Pi semantic events on a dedicated port without attaching the PTY', () => {
+    const conn = new FakeConn()
+    const router = new Router(conn)
+    const port = new FakePort()
+    router.attachPi('pi', port)
+
+    expect(conn.sent).toEqual([
+      { type: 'control', msg: { kind: 'WatchPiEvents', version: 1 } },
+      { type: 'control', msg: { kind: 'PiBridgeCommand', name: 'pi', command: { kind: 'Snapshot' } } },
+    ])
+    expect(conn.sent.some((frame) => frame.type === 'control' && frame.msg.kind === 'Attach')).toBe(false)
+
+    const event = { kind: 'PiEvent' as const, name: 'pi', seq: 2, event: { kind: 'agent_start' } }
+    conn.emit({ type: 'control', msg: event })
+    expect(port.posted).toEqual([{ msg: event }])
+  })
+
+  it('forwards Pi commands, resnapshots on reconnect, and releases the semantic port', () => {
+    const conn = new FakeConn()
+    const router = new Router(conn)
+    const port = new FakePort()
+    router.attachPi('pi', port)
+    conn.sent.length = 0
+
+    port.fromRenderer({ command: { kind: 'Prompt', message: 'hello', delivery: 'now' } })
+    expect(conn.sent).toEqual([{
+      type: 'control',
+      msg: { kind: 'PiBridgeCommand', name: 'pi', command: { kind: 'Prompt', message: 'hello', delivery: 'now' } },
+    }])
+
+    conn.sent.length = 0
+    conn.emitOpen()
+    expect(conn.sent).toEqual([
+      { type: 'control', msg: { kind: 'WatchPiEvents', version: 1 } },
+      { type: 'control', msg: { kind: 'PiBridgeCommand', name: 'pi', command: { kind: 'Snapshot' } } },
+    ])
+
+    router.closePi('pi')
+    expect(port.closed).toBe(true)
+    expect(router.attachedPiCount()).toBe(0)
+    conn.sent.length = 0
+    conn.emitOpen()
+    expect(conn.sent).toEqual([])
   })
 
   it('a data frame in the awaiting window is treated as an old daemon legacy replay', () => {

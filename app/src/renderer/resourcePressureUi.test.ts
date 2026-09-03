@@ -71,8 +71,8 @@ function splitView(active: boolean, onPaneFocus: () => void): JSX.Element {
     epoch: 0, portEpoch: 0, fontSize: 13, mobile: false, onPaneTitle: () => {}, onPaneFocus,
     onSetRatio: () => {}, onSplit: () => {}, onMove: () => {}, onMoveTo: () => {}, onClose: () => {},
     browsers: {}, onBrowserNav: () => {}, editors: {}, onEditorPath: () => {}, onEditorViewState: () => {},
-    onEditorDirty: () => {}, onEditorReady: () => {}, zoomedPane: null, onToggleZoom: () => {},
-    frozen: {}, onFreeze: () => {}, onUnfreeze: () => {},
+    onEditorDirty: () => {}, onEditorReady: () => {}, piViews: {}, onPiView: () => {},
+    zoomedPane: null, onToggleZoom: () => {}, frozen: {}, onFreeze: () => {}, onUnfreeze: () => {},
   })
 }
 

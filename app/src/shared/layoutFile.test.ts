@@ -1,6 +1,28 @@
 import { describe, it, expect } from 'vitest'
 import { emptyLayout, parseLayout, serializeLayout, orderTabs, moveTab, pushRecent, mergeLayout, LAYOUT_VERSION, type LayoutFile } from './layoutFile'
 
+describe('layout Pi views', () => {
+  it('persists only explicit gui selections and drops malformed values', () => {
+    const parsed = parseLayout(JSON.stringify({
+      version: 1, activeWorkspace: 1, workspaces: {},
+      piViews: { pi: 'gui', terminal: 'terminal', bad: true },
+    }))
+    expect(parsed.piViews).toEqual({ pi: 'gui' })
+    expect(serializeLayout(parsed)).toContain('"piViews":{"pi":"gui"}')
+  })
+
+  it('keeps terminal as the absent default', () => {
+    expect(parseLayout(JSON.stringify({ version: 1, activeWorkspace: 1, workspaces: {} })).piViews).toBeUndefined()
+  })
+
+  it('three-way merge preserves independent Pi view selections', () => {
+    const base = emptyLayout()
+    const local = { ...base, piViews: { 'pi-a': 'gui' as const } }
+    const remote = { ...base, piViews: { 'pi-b': 'gui' as const } }
+    expect(mergeLayout(base, local, remote).piViews).toEqual({ 'pi-a': 'gui', 'pi-b': 'gui' })
+  })
+})
+
 describe('layout editors map', () => {
   it('round-trips valid entries (incl. all optional fields)', () => {
     const l: LayoutFile = { version: 1, activeWorkspace: 1, workspaces: {},

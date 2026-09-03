@@ -1168,7 +1168,16 @@ async function main(): Promise<void> {
     if (!c || !proc || c.win.isDestroyed()) return
     const { port1: rPort, port2: uPort } = new MessageChannelMain()
     proc.postMessage({ kind: 'pane', session }, [uPort])
-    c.win.webContents.postMessage('pane-port', { session }, [rPort])
+    c.win.webContents.postMessage('pane-port', { session, mode: 'terminal' }, [rPort])
+  })
+
+  ipcMain.on('open-pi-pane', (e, session: string) => {
+    const c = ctxFor(e)
+    const proc = c?.child()
+    if (!c || !proc || c.win.isDestroyed()) return
+    const { port1: rPort, port2: uPort } = new MessageChannelMain()
+    proc.postMessage({ kind: 'pi-pane', session }, [uPort])
+    c.win.webContents.postMessage('pane-port', { session, mode: 'pi' }, [rPort])
   })
 
   // A Pane unmounted: tell the client to close that pane's port, forget the
@@ -1183,6 +1192,10 @@ async function main(): Promise<void> {
 
   ipcMain.on('close-pane', (e, session: string) => {
     ctxFor(e)?.child()?.postMessage({ kind: 'pane-close', session })
+  })
+
+  ipcMain.on('close-pi-pane', (e, session: string) => {
+    ctxFor(e)?.child()?.postMessage({ kind: 'pi-pane-close', session })
   })
 
   // Resolve a terminal selection to an EXISTING absolute path so the pane's

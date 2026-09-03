@@ -170,6 +170,26 @@ pub struct ProviderUsage {
     pub detail: Option<String>,
 }
 
+/// How a GUI-authored prompt should enter an already-running Pi agent loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PiDelivery {
+    Now,
+    Steer,
+    FollowUp,
+}
+
+/// Commands the optional Pi semantic pane can send to the public extension
+/// bridge inside the existing interactive Pi process. Kept closed and small:
+/// browser input must never become an arbitrary extension method invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PiCommand {
+    Snapshot,
+    Prompt { message: String, delivery: PiDelivery },
+    Abort,
+    SetThinkingLevel { level: String },
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ControlMsg {
     Hello,
@@ -288,6 +308,21 @@ pub enum ControlMsg {
     /// `version` lets a future pressure payload evolve without guessing client
     /// support. Version 1 is the current `MemoryPressure` shape.
     WatchMemoryPressure { version: u16 },
+    /// Client -> daemon: explicitly opt this connection into Pi semantic
+    /// events. Separate from WatchSessions so older strict clients are never
+    /// sent variants they cannot decode.
+    WatchPiEvents { version: u16 },
+    /// Pi extension -> daemon: register the semantic sideband for one live Pi
+    /// pane. Accepted only on the extension's private local connection.
+    PiBridgeHello { name: String },
+    /// GUI client -> daemon, then daemon -> registered Pi extension.
+    PiBridgeCommand { name: String, command: PiCommand },
+    /// Pi extension -> daemon -> Pi-capable clients. The daemon validates only
+    /// the bounded envelope; the versioned payload remains forward-compatible
+    /// with Pi's public extension event shapes.
+    PiEvent { name: String, seq: u64, event: serde_json::Value },
+    /// Daemon -> Pi-capable clients: whether the live extension sideband exists.
+    PiBridgeStatus { name: String, available: bool },
     /// Client -> daemon: request the full session set with metadata.
     ListSessionsDetailed,
     /// Daemon -> client: the full session set (reply to ListSessionsDetailed
@@ -458,6 +493,11 @@ fn known_control_variant(name: &str) -> bool {
             | "Backlog"
             | "WatchSessions"
             | "WatchMemoryPressure"
+            | "WatchPiEvents"
+            | "PiBridgeHello"
+            | "PiBridgeCommand"
+            | "PiEvent"
+            | "PiBridgeStatus"
             | "ListSessionsDetailed"
             | "Sessions"
             | "SessionsChanged"
@@ -733,6 +773,42 @@ mod tests {
     fn control_frame_roundtrips() {
         let f = Frame::Control(ControlMsg::Attach { name: "a".into(), raw_client: true, preview: false, resume: None });
         assert_eq!(roundtrip(&f), f);
+    }
+
+    #[test]
+    fn pi_bridge_controls_roundtrip_with_closed_commands() {
+        let messages = [
+            ControlMsg::WatchPiEvents { version: 1 },
+            ControlMsg::PiBridgeHello { name: "amber-1-1-0-pi".into() },
+            ControlMsg::PiBridgeCommand {
+                name: "amber-1-1-0-pi".into(),
+                command: PiCommand::Prompt {
+                    message: "review this".into(),
+                    delivery: PiDelivery::FollowUp,
+                },
+            },
+            ControlMsg::PiBridgeCommand {
+                name: "amber-1-1-0-pi".into(),
+                command: PiCommand::SetThinkingLevel { level: "high".into() },
+            },
+            ControlMsg::PiEvent {
+                name: "amber-1-1-0-pi".into(),
+                seq: 7,
+                event: serde_json::json!({"kind":"snapshot","idle":true}),
+            },
+            ControlMsg::PiBridgeStatus { name: "amber-1-1-0-pi".into(), available: true },
+        ];
+        for message in messages {
+            let frame = Frame::Control(message);
+            assert_eq!(roundtrip(&frame), frame);
+        }
+        for command in [PiCommand::Snapshot, PiCommand::Abort] {
+            let frame = Frame::Control(ControlMsg::PiBridgeCommand {
+                name: "amber-1-1-0-pi".into(),
+                command,
+            });
+            assert_eq!(roundtrip(&frame), frame);
+        }
     }
 
     #[test]

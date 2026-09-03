@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use amber_core::proto::{self, ControlMsg, Decoded, Decoder, Frame};
+use amber_core::proto::{self, ControlMsg, Decoded, Decoder, Frame, PiCommand};
 use amber_core::state::SessionKind;
 
 use crate::manager::{ResumeCause, SessionManager};
@@ -42,6 +42,7 @@ type Subscriptions = Vec<(String, Arc<PtySession>, u64)>;
 pub struct Daemon {
     manager: Arc<SessionManager>,
     watchers: Arc<crate::watchers::Watchers>,
+    pi_bridges: Arc<crate::pi_bridge::PiBridges>,
     /// Agent plan-quota snapshot, filled by [`crate::usage::start`]. Defaults
     /// to an empty cache so every existing `Daemon::new` call site (and every
     /// test) compiles unchanged and answers `GetUsage` with an empty list.
@@ -50,7 +51,12 @@ pub struct Daemon {
 
 impl Daemon {
     pub fn new(manager: Arc<SessionManager>, watchers: Arc<crate::watchers::Watchers>) -> Self {
-        Daemon { manager, watchers, usage: crate::usage::UsageCache::new() }
+        Daemon {
+            manager,
+            watchers,
+            pi_bridges: Arc::new(crate::pi_bridge::PiBridges::new()),
+            usage: crate::usage::UsageCache::new(),
+        }
     }
 
     /// Attach the usage poller's cache (the daemon's only quota source).
@@ -69,8 +75,9 @@ impl Daemon {
                     let manager = Arc::clone(&self.manager);
                     let watchers = Arc::clone(&self.watchers);
                     let usage = Arc::clone(&self.usage);
+                    let pi_bridges = Arc::clone(&self.pi_bridges);
                     thread::spawn(move || {
-                        if let Err(e) = handle_connection(manager, watchers, usage, stream) {
+                        if let Err(e) = handle_connection(manager, watchers, usage, pi_bridges, stream) {
                             eprintln!("amber daemon: connection error: {e}");
                         }
                     });
@@ -86,6 +93,7 @@ impl Daemon {
             Arc::clone(&self.manager),
             Arc::clone(&self.watchers),
             Arc::clone(&self.usage),
+            Arc::clone(&self.pi_bridges),
             stream,
         )
     }
@@ -221,12 +229,57 @@ fn suppress_backlog(raw_client: bool, kind: Option<SessionKind>) -> bool {
     raw_client && kind.is_some_and(|k| k.is_agent())
 }
 
+const PI_PROMPT_MAX_BYTES: usize = 64 * 1024;
+const PI_EVENT_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+fn validate_pi_command(command: &PiCommand) -> anyhow::Result<()> {
+    match command {
+        PiCommand::Prompt { message, .. } => {
+            if message.trim().is_empty() {
+                anyhow::bail!("Pi prompt must not be empty");
+            }
+            if message.len() > PI_PROMPT_MAX_BYTES {
+                anyhow::bail!("Pi prompt exceeds the 64 KiB limit");
+            }
+        }
+        PiCommand::SetThinkingLevel { level } => {
+            if !matches!(level.as_str(), "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max") {
+                anyhow::bail!("unsupported Pi thinking level: {level}");
+            }
+        }
+        PiCommand::Snapshot | PiCommand::Abort => {}
+    }
+    Ok(())
+}
+
+fn validate_pi_event(event: &serde_json::Value) -> anyhow::Result<()> {
+    let Some(kind) = event.get("kind").and_then(serde_json::Value::as_str) else {
+        anyhow::bail!("Pi event is missing a string kind");
+    };
+    if kind.is_empty() {
+        anyhow::bail!("Pi event kind must not be empty");
+    }
+    if serde_json::to_vec(event)?.len() > PI_EVENT_MAX_BYTES {
+        anyhow::bail!("Pi event exceeds the 4 MiB limit");
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct ConnectionDeps<'a> {
+    manager: &'a Arc<SessionManager>,
+    watchers: &'a Arc<crate::watchers::Watchers>,
+    usage: &'a Arc<crate::usage::UsageCache>,
+    pi_bridges: &'a Arc<crate::pi_bridge::PiBridges>,
+}
+
 /// Per-connection loop: decode frames from the read half, dispatch each one,
 /// and reply/forward via the shared write half.
 fn handle_connection(
     manager: Arc<SessionManager>,
     watchers: Arc<crate::watchers::Watchers>,
     usage: Arc<crate::usage::UsageCache>,
+    pi_bridges: Arc<crate::pi_bridge::PiBridges>,
     stream: LocalStream,
 ) -> anyhow::Result<()> {
     let (read_half, writer) = stream.into_split()?;
@@ -235,14 +288,20 @@ fn handle_connection(
     writer.set_write_timeout(Some(CLIENT_WRITE_TIMEOUT))?;
     let writer: SharedWriter = Arc::new(Mutex::new(writer));
     let mut subscriptions: Subscriptions = Vec::new();
+    let mut pi_registration: Option<(String, u64)> = None;
     let search_epoch = Arc::new(AtomicU64::new(0));
+    let deps = ConnectionDeps {
+        manager: &manager,
+        watchers: &watchers,
+        usage: &usage,
+        pi_bridges: &pi_bridges,
+    };
     let result = connection_loop(
-        &manager,
-        &watchers,
-        &usage,
+        deps,
         &writer,
         read_half,
         &mut subscriptions,
+        &mut pi_registration,
         &search_epoch,
     );
     search_epoch.fetch_add(1, Ordering::Relaxed);
@@ -250,16 +309,20 @@ fn handle_connection(
     for (_, sess, id) in subscriptions {
         sess.unsubscribe(id);
     }
+    if let Some((name, generation)) = pi_registration {
+        if pi_bridges.unregister(&name, generation) {
+            watchers.broadcast_pi(&ControlMsg::PiBridgeStatus { name, available: false });
+        }
+    }
     result
 }
 
 fn connection_loop(
-    manager: &Arc<SessionManager>,
-    watchers: &Arc<crate::watchers::Watchers>,
-    usage: &Arc<crate::usage::UsageCache>,
+    deps: ConnectionDeps<'_>,
     writer: &SharedWriter,
     mut read_half: LocalReader,
     subscriptions: &mut Subscriptions,
+    pi_registration: &mut Option<(String, u64)>,
     search_epoch: &Arc<AtomicU64>,
 ) -> anyhow::Result<()> {
     let mut decoder = Decoder::new();
@@ -269,7 +332,9 @@ fn connection_loop(
         while let Some(decoded) = decoder.next_decoded()? {
             match decoded {
                 Decoded::Frame(frame) => {
-                    handle_frame(manager, watchers, usage, writer, frame, subscriptions, search_epoch)
+                    handle_frame(
+                        deps, writer, frame, subscriptions, pi_registration, search_epoch,
+                    )
                 }
                 // Forward-compat: a control body this build can't decode (e.g. a
                 // newer client's new message). Framing is length-prefixed and the
@@ -290,22 +355,23 @@ fn connection_loop(
 }
 
 fn handle_frame(
-    manager: &Arc<SessionManager>,
-    watchers: &Arc<crate::watchers::Watchers>,
-    usage: &Arc<crate::usage::UsageCache>,
+    deps: ConnectionDeps<'_>,
     writer: &SharedWriter,
     frame: Frame,
     subscriptions: &mut Subscriptions,
+    pi_registration: &mut Option<(String, u64)>,
     search_epoch: &Arc<AtomicU64>,
 ) {
     match frame {
         Frame::Control(msg) => {
-            handle_control(manager, watchers, usage, writer, msg, subscriptions, search_epoch)
+            handle_control(
+                deps, writer, msg, subscriptions, pi_registration, search_epoch,
+            )
         }
         Frame::Data { session, bytes } => {
             // Input from the client: forward to the child's stdin. A stale
             // session name is not fatal to the connection — log and carry on.
-            if let Err(e) = manager.write(&session, &bytes) {
+            if let Err(e) = deps.manager.write(&session, &bytes) {
                 eprintln!("amber daemon: write to session {session} failed: {e}");
             }
         }
@@ -317,14 +383,19 @@ fn handle_frame(
 }
 
 fn handle_control(
-    manager: &Arc<SessionManager>,
-    watchers: &Arc<crate::watchers::Watchers>,
-    usage: &Arc<crate::usage::UsageCache>,
+    deps: ConnectionDeps<'_>,
     writer: &SharedWriter,
     msg: ControlMsg,
     subscriptions: &mut Subscriptions,
+    pi_registration: &mut Option<(String, u64)>,
     search_epoch: &Arc<AtomicU64>,
 ) {
+    let ConnectionDeps {
+        manager,
+        watchers,
+        usage,
+        pi_bridges,
+    } = deps;
     match msg {
         ControlMsg::Create { name, cwd, kind } => {
             let result = parse_kind(&kind).and_then(|k| manager.create(&name, cwd.clone(), k));
@@ -721,6 +792,11 @@ fn handle_control(
             let existed = manager.session(&name).is_some();
             match manager.remove(&name) {
                 Ok(()) if existed => {
+                    if pi_bridges.remove(&name) {
+                        watchers.broadcast_pi(&ControlMsg::PiBridgeStatus {
+                            name: name.clone(), available: false,
+                        });
+                    }
                     watchers.broadcast(&ControlMsg::SessionsChanged {
                         added: vec![],
                         removed: vec![name.clone()],
@@ -745,6 +821,121 @@ fn handle_control(
         ControlMsg::WatchMemoryPressure { version } => {
             watchers.register_pressure(writer, version);
         }
+        ControlMsg::WatchPiEvents { version } => {
+            watchers.register_pi(writer, version);
+            // A watcher that reconnects needs current availability immediately;
+            // status changes alone are insufficient after a transport gap.
+            if version >= 1 {
+                for info in manager.session_infos().unwrap_or_default() {
+                    if info.kind == SessionKind::Pi.as_str() {
+                        let _ = write_frame(
+                            writer,
+                            &Frame::Control(ControlMsg::PiBridgeStatus {
+                                available: pi_bridges.contains(&info.name),
+                                name: info.name,
+                            }),
+                        );
+                    }
+                }
+            }
+        }
+        ControlMsg::PiBridgeHello { name } => {
+            if manager.session_kind(&name) != Some(SessionKind::Pi) {
+                let _ = write_frame(
+                    writer,
+                    &Frame::Control(ControlMsg::Error {
+                        msg: format!("Pi bridge rejected for non-Pi or missing session: {name}"),
+                    }),
+                );
+                return;
+            }
+            if let Some((old_name, old_generation)) = pi_registration.take() {
+                pi_bridges.unregister(&old_name, old_generation);
+            }
+            let registration = pi_bridges.register(&name);
+            let generation = registration.generation;
+            let bridge_name = registration.name.clone();
+            let bridge_writer = Arc::clone(writer);
+            thread::spawn(move || {
+                while let Ok(command) = registration.rx.recv() {
+                    if write_frame(
+                        &bridge_writer,
+                        &Frame::Control(ControlMsg::PiBridgeCommand {
+                            name: bridge_name.clone(),
+                            command,
+                        }),
+                    )
+                    .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+            *pi_registration = Some((name.clone(), generation));
+            watchers.broadcast_pi(&ControlMsg::PiBridgeStatus { name, available: true });
+        }
+        ControlMsg::PiBridgeCommand { name, command } => {
+            if manager.session_kind(&name) != Some(SessionKind::Pi) {
+                let _ = write_frame(
+                    writer,
+                    &Frame::Control(ControlMsg::Error { msg: format!("not a Pi session: {name}") }),
+                );
+                return;
+            }
+            if let Err(error) = validate_pi_command(&command) {
+                let _ = write_frame(
+                    writer,
+                    &Frame::Control(ControlMsg::Error { msg: error.to_string() }),
+                );
+                return;
+            }
+            if !pi_bridges.contains(&name) {
+                let _ = write_frame(
+                    writer,
+                    &Frame::Control(ControlMsg::PiBridgeStatus { name, available: false }),
+                );
+                return;
+            }
+            if let Err(error) = pi_bridges.send(&name, command) {
+                if !pi_bridges.contains(&name) {
+                    let status = ControlMsg::PiBridgeStatus { name, available: false };
+                    let _ = write_frame(writer, &Frame::Control(status.clone()));
+                    watchers.broadcast_pi(&status);
+                } else {
+                    let _ = write_frame(
+                        writer,
+                        &Frame::Control(ControlMsg::Error { msg: error.to_string() }),
+                    );
+                }
+            }
+        }
+        ControlMsg::PiEvent { name, seq, event } => {
+            let authorized = pi_registration.as_ref().is_some_and(|(registered, generation)| {
+                registered == &name
+                    && manager.session_kind(&name) == Some(SessionKind::Pi)
+                    && pi_bridges.is_current(&name, *generation)
+            });
+            if !authorized {
+                let _ = write_frame(
+                    writer,
+                    &Frame::Control(ControlMsg::Error {
+                        msg: format!("unregistered Pi bridge event for session {name}"),
+                    }),
+                );
+                return;
+            }
+            match validate_pi_event(&event) {
+                Ok(()) => watchers.broadcast_pi(&ControlMsg::PiEvent { name, seq, event }),
+                Err(error) => {
+                    let _ = write_frame(
+                        writer,
+                        &Frame::Control(ControlMsg::Error { msg: error.to_string() }),
+                    );
+                }
+            }
+        }
+        // Daemon-to-client only. A client-originated status is inert.
+        ControlMsg::PiBridgeStatus { .. } => {}
         ControlMsg::ListSessionsDetailed => {
             let sessions = manager.session_infos().unwrap_or_default();
             let _ = write_frame(writer, &Frame::Control(ControlMsg::Sessions { sessions }));
@@ -798,6 +989,11 @@ fn handle_control(
             // arrives. `Created` doubles as the success ack — deliberately
             // reusing the existing variant rather than adding one, so the wire
             // surface (and the app's decoder) is unchanged.
+            if pi_bridges.remove(&from) {
+                watchers.broadcast_pi(&ControlMsg::PiBridgeStatus {
+                    name: from.clone(), available: false,
+                });
+            }
             watchers.broadcast(&ControlMsg::SessionsChanged {
                 added: vec![info],
                 removed: vec![from.clone()],
@@ -888,6 +1084,29 @@ mod tests {
         assert!(!suppress_backlog(false, Some(SessionKind::Claude)));
         assert!(!suppress_backlog(false, Some(SessionKind::Shell)));
         assert!(!suppress_backlog(true, None));
+    }
+
+    #[test]
+    fn pi_command_and_event_validation_enforces_bridge_bounds() {
+        assert!(validate_pi_command(&PiCommand::Snapshot).is_ok());
+        assert!(validate_pi_command(&PiCommand::Prompt {
+            message: "hello".into(),
+            delivery: amber_core::proto::PiDelivery::Now,
+        }).is_ok());
+        assert!(validate_pi_command(&PiCommand::Prompt {
+            message: "  ".into(),
+            delivery: amber_core::proto::PiDelivery::Now,
+        }).is_err());
+        assert!(validate_pi_command(&PiCommand::Prompt {
+            message: "x".repeat(PI_PROMPT_MAX_BYTES + 1),
+            delivery: amber_core::proto::PiDelivery::Now,
+        }).is_err());
+        assert!(validate_pi_command(&PiCommand::SetThinkingLevel { level: "extreme".into() }).is_err());
+        assert!(validate_pi_event(&serde_json::json!({"kind":"snapshot"})).is_ok());
+        assert!(validate_pi_event(&serde_json::json!({"payload":true})).is_err());
+        assert!(validate_pi_event(&serde_json::json!({
+            "kind":"message_end", "text":"x".repeat(PI_EVENT_MAX_BYTES)
+        })).is_err());
     }
 
     #[test]

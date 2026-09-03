@@ -129,7 +129,9 @@ body {
 
 /* Visible keyboard-focus ring on every interactive surface (shared token). */
 button:focus-visible,
-input:focus-visible {
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible {
   outline: var(--focus-ring);
   outline-offset: 1px;
 }
@@ -1566,3 +1568,226 @@ input:focus-visible {
 .usage-bar-danger > span { background: #f85149; }
 .usage-muted,
 .usage-empty { color: var(--text-dim); }
+
+/* ---- Pi semantic chat -------------------------------------------------- */
+/* Redesign-preserve: this stays inside Amber's existing dark workspace
+   tokens and compact pane geometry. It is an alternate rendering of one live
+   Pi session, not a second application shell. */
+.pane-view-toggle {
+  min-height: 24px;
+  padding: 2px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  color: var(--text-dim);
+  font: 600 10px/1 var(--font-ui);
+  cursor: pointer;
+}
+.pane-view-toggle:hover { color: var(--text); border-color: var(--accent); }
+
+.pi-chat {
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  display: grid;
+  grid-template-rows: auto auto auto minmax(0, 1fr) auto;
+  background: var(--bg);
+  color: var(--text);
+}
+.pi-chat-status {
+  min-width: 0;
+  min-height: 34px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-dim);
+  font-size: 11px;
+}
+.pi-chat-status label { display: flex; align-items: center; gap: 5px; }
+.pi-chat-status select,
+.pi-composer-actions select {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  color: var(--text);
+  padding: 3px 6px;
+  font: 11px var(--font-ui);
+}
+.pi-chat-model {
+  min-width: 0;
+  margin-left: auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-faint);
+}
+.pi-bridge-dot,
+.pi-tool-dot {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 7px;
+  border-radius: 50%;
+  background: var(--text-faint);
+}
+.pi-bridge-dot.idle { background: var(--ok); }
+.pi-bridge-dot.busy,
+.pi-tool-dot.running { background: var(--warn); }
+.pi-bridge-dot.offline { background: var(--danger); }
+.pi-dialog-notice,
+.pi-chat-error {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+.pi-dialog-notice { color: var(--warn); background: rgba(255, 180, 84, 0.08); }
+.pi-chat-error { color: var(--danger); background: var(--danger-soft); }
+.pi-transcript {
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding: 18px clamp(12px, 4vw, 42px) 28px;
+  scroll-behavior: smooth;
+}
+.pi-message {
+  width: min(100%, 820px);
+  margin: 0 auto 18px;
+  display: grid;
+  grid-template-columns: 54px minmax(0, 1fr);
+  gap: 12px;
+  content-visibility: auto;
+  contain-intrinsic-size: 0 120px;
+}
+.pi-message-role {
+  padding-top: 2px;
+  color: var(--text-faint);
+  font: 600 10px/1.4 var(--font-ui);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.pi-message.user .pi-message-role { color: var(--accent-2); }
+.pi-message.assistant .pi-message-role { color: var(--accent); }
+.pi-message-body {
+  min-width: 0;
+  font-size: 13px;
+  line-height: 1.62;
+  overflow-wrap: anywhere;
+}
+.pi-message.user .pi-message-body {
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+}
+.pi-markdown p { margin: 0 0 10px; white-space: pre-wrap; }
+.pi-markdown p:last-child { margin-bottom: 0; }
+.pi-markdown h2,
+.pi-markdown h3,
+.pi-markdown h4 { margin: 14px 0 7px; line-height: 1.25; text-wrap: balance; }
+.pi-markdown h2 { font-size: 18px; }
+.pi-markdown h3 { font-size: 15px; }
+.pi-markdown h4 { font-size: 13px; }
+.pi-markdown pre,
+.pi-inline-tool pre,
+.pi-tool-card pre {
+  max-width: 100%;
+  overflow: auto;
+  margin: 8px 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  font: 12px/1.55 var(--font-mono);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.pi-list-item { display: flex; gap: 7px; margin: 3px 0; }
+.pi-thinking,
+.pi-inline-tool,
+.pi-tool-card {
+  border-left: 2px solid var(--border-strong);
+  color: var(--text-dim);
+}
+.pi-thinking,
+.pi-inline-tool { margin: 8px 0; padding-left: 10px; }
+.pi-thinking summary,
+.pi-inline-tool summary,
+.pi-tool-card summary { cursor: pointer; color: var(--text-dim); }
+.pi-tool-card {
+  width: min(100%, 820px);
+  margin: 0 auto 10px;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--surface);
+  content-visibility: auto;
+}
+.pi-tool-card.error { border-left-color: var(--danger); }
+.pi-tool-card summary { display: flex; align-items: center; gap: 8px; font: 600 11px var(--font-mono); }
+.pi-tool-card summary > span:last-child { margin-left: auto; color: var(--text-faint); font: 10px var(--font-ui); }
+.pi-stream-caret {
+  display: inline-block;
+  width: 7px;
+  height: 14px;
+  margin-left: 3px;
+  vertical-align: -2px;
+  background: var(--accent);
+}
+.pi-chat-empty {
+  height: 100%;
+  min-height: 160px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  color: var(--text-faint);
+  text-align: center;
+}
+.pi-chat-empty strong { color: var(--text-dim); font-size: 14px; }
+.pi-composer {
+  padding: 10px clamp(12px, 4vw, 42px) 12px;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+}
+.pi-composer textarea {
+  display: block;
+  width: min(100%, 820px);
+  margin: 0 auto;
+  min-height: 58px;
+  max-height: 180px;
+  resize: vertical;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  background: var(--bg);
+  color: var(--text);
+  padding: 10px 12px;
+  font: 13px/1.45 var(--font-ui);
+}
+.pi-composer textarea::placeholder { color: var(--text-faint); }
+.pi-composer textarea:focus-visible { border-color: var(--accent); }
+.pi-composer-actions {
+  width: min(100%, 820px);
+  margin: 8px auto 0;
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 7px;
+}
+
+@media (max-width: 700px), (pointer: coarse) {
+  .pane-view-toggle { min-height: 44px; padding-inline: 10px; }
+  .pi-chat-status { min-height: 42px; padding-inline: 10px; }
+  .pi-chat-status label { display: none; }
+  .pi-transcript { padding: 14px 10px 20px; }
+  .pi-message { grid-template-columns: 1fr; gap: 4px; margin-bottom: 16px; }
+  .pi-message-role { padding-left: 2px; }
+  .pi-composer { padding: 8px 10px max(10px, env(safe-area-inset-bottom)); }
+  .pi-composer textarea { min-height: 64px; font-size: 16px; }
+  .pi-composer-actions .btn,
+  .pi-composer-actions select { min-height: 44px; }
+}
