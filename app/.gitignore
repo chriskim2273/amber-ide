@@ -3,4 +3,5 @@ out
 dist
 release
 resources/bin/amber
+resources/bin/amber-router
 *.log

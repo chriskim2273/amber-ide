@@ -11,6 +11,10 @@ set -euo pipefail
 
 APP_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 ROOT_DIR="$(cd "$APP_DIR/.." && pwd)"
+DIST_DIR="${AMBER_DIST_DIR:-$ROOT_DIR/dist}"
+if [[ "$DIST_DIR" != /* ]]; then
+    DIST_DIR="$ROOT_DIR/$DIST_DIR"
+fi
 
 os="$(uname -s)"
 
@@ -31,25 +35,25 @@ error: the static-musl Rust target is required to bundle a distributable amber.
 EOF
             exit 1
         fi
-        bash "$ROOT_DIR/scripts/dist.sh"
-        SRC="$ROOT_DIR/dist/amber-linux-x86_64"
-        ROUTER_SRC="$ROOT_DIR/dist/amber-router-linux-x86_64"
+        AMBER_DIST_DIR="$DIST_DIR" bash "$ROOT_DIR/scripts/dist.sh"
+        SRC="$DIST_DIR/amber-linux-x86_64"
+        ROUTER_SRC="$DIST_DIR/amber-router-linux-x86_64"
         ;;
     Darwin)
-        bash "$ROOT_DIR/scripts/dist.sh"
+        AMBER_DIST_DIR="$DIST_DIR" bash "$ROOT_DIR/scripts/dist.sh"
         if [ "${AMBER_MACOS_INTEL:-0}" = "1" ]; then
-            SRC="$ROOT_DIR/dist/amber-x86_64-apple-darwin"
-            ROUTER_SRC="$ROOT_DIR/dist/amber-router-x86_64-apple-darwin"
+            SRC="$DIST_DIR/amber-x86_64-apple-darwin"
+            ROUTER_SRC="$DIST_DIR/amber-router-x86_64-apple-darwin"
         else
-            SRC="$ROOT_DIR/dist/amber-macos-universal"
-            ROUTER_SRC="$ROOT_DIR/dist/amber-router-macos-universal"
+            SRC="$DIST_DIR/amber-macos-universal"
+            ROUTER_SRC="$DIST_DIR/amber-router-macos-universal"
         fi
         ;;
     MINGW*|MSYS*|CYGWIN*)
-        bash "$ROOT_DIR/scripts/dist.sh"
-        SRC="$ROOT_DIR/dist/amber-windows-x86_64.exe"
-        DAEMON_SRC="$ROOT_DIR/dist/amberd-windows-x86_64.exe"
-        ROUTER_SRC="$ROOT_DIR/dist/amber-router-windows-x86_64.exe"
+        AMBER_DIST_DIR="$DIST_DIR" bash "$ROOT_DIR/scripts/dist.sh"
+        SRC="$DIST_DIR/amber-windows-x86_64.exe"
+        DAEMON_SRC="$DIST_DIR/amberd-windows-x86_64.exe"
+        ROUTER_SRC="$DIST_DIR/amber-router-windows-x86_64.exe"
         ;;
     *)
         echo "error: unsupported OS: $os" >&2
