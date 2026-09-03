@@ -247,9 +247,12 @@ export class TabBrowserBrokerServer {
             for (const [key, entry] of this.results) if (now() - entry.acceptedAt >= resultTtl) this.results.delete(key)
             const digest = brokerRequestDigest(request)
             const cached = this.results.get(cacheKey)
-            const deferReply = (promise: Promise<unknown>): void => {
+            const deferReply = (promise: Promise<unknown>, signal?: AbortSignal): void => {
               completionDeferred = true
-              void promise.then((result) => {
+              const guarded = signal && this.options.operations
+                ? promise.then((result) => { this.options.operations!.assertDispatch(signal); return result })
+                : promise
+              void guarded.then((result) => {
                 safeWriteResult(request.requestId, result)
                 if (binaryAttachment(result) && cacheKey) this.results.delete(cacheKey)
               }, (error) => safeWrite({ version: 1, requestId: request.requestId, ok: false, error: safeBrokerError(error) }))
@@ -257,8 +260,31 @@ export class TabBrowserBrokerServer {
             }
             if (cached) {
               if (cached.digest !== digest) throw new Error('INVALID_REQUEST')
-              if (this.options.authorizeReplay && !(await this.options.authorizeReplay(request))) throw new Error('STALE_BROWSER_CONTEXT')
-              deferReply(cached.promise); return
+              if (this.options.operations) {
+                // A cached result is still page data. It must cross the same
+                // drain barrier as a fresh request; otherwise an already
+                // resolved replay can write after Quit has revoked the host.
+                let replaySignal: AbortSignal | undefined
+                const replay = this.options.operations.run('broker', async (signal) => {
+                  replaySignal = signal
+                  this.options.operations!.assertDispatch(signal)
+                  if (this.options.authorizeReplay && !(await this.options.authorizeReplay(request))) throw new Error('STALE_BROWSER_CONTEXT')
+                  this.options.operations!.assertDispatch(signal)
+                  const aborted = new Promise<never>((_resolve, reject) => {
+                    const onAbort = (): void => reject(new Error('ACTION_CANCELLED'))
+                    signal.addEventListener('abort', onAbort, { once: true })
+                    cached.promise.finally(() => signal.removeEventListener('abort', onAbort)).catch(() => {})
+                  })
+                  const result = await Promise.race([cached.promise, aborted])
+                  this.options.operations!.assertDispatch(signal)
+                  return result
+                })
+                deferReply(replay, replaySignal)
+              } else {
+                if (this.options.authorizeReplay && !(await this.options.authorizeReplay(request))) throw new Error('STALE_BROWSER_CONTEXT')
+                deferReply(cached.promise)
+              }
+              return
             } else {
               const knownClient = this.highWater.has(request.clientInstanceId)
               const previousSequence = this.highWater.get(request.clientInstanceId) ?? 0
@@ -306,7 +332,7 @@ export class TabBrowserBrokerServer {
               })
               this.results.set(cacheKey, { digest, promise, acceptedAt: now() })
               if (this.results.size > 256) this.results.delete(this.results.keys().next().value!)
-              deferReply(promise); return
+              deferReply(promise, controller.signal); return
             }
           } catch (error) {
             // Only stable error codes cross into Pi. Debugger/Node exception
