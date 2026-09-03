@@ -84,6 +84,7 @@ import { parseWorkspaceFile } from '../shared/workspaceFile'
 import { commitPreparedWorkspaceImport, prepareWorkspaceImport } from './workspaceImport'
 import { browserContextMatches, captureBrowserContext, hasExactApprovalSurface, resolveBrowserContext, setBrowserForCurrentContext } from './browserWindowContext'
 import { createBrowserId } from '../shared/tabBrowser'
+import { isRecoveryId } from '../shared/tabBrowserState'
 import { BrowserOperationRegistry } from './browserOperationRegistry'
 import { browserHostSocketPath } from './browserHostPaths'
 import {
@@ -1493,18 +1494,17 @@ async function main(): Promise<void> {
       if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) throw new Error('INVALID_REQUEST')
       const request = raw as Record<string, unknown>
       if (request['action'] === 'list' && Object.keys(request).length === 1) return { ok: true, result: tabBrowser.recoveryItems() }
-      if (typeof request['index'] !== 'number' || !Number.isSafeInteger(request['index']) || request['index'] < 0) throw new Error('INVALID_REQUEST')
+      if (typeof request['id'] !== 'string' || !isRecoveryId(request['id'])) throw new Error('INVALID_REQUEST')
+      const recoveryId = request['id']
+      const item = tabBrowser.recoveryItems().find((candidate) => candidate.id === recoveryId)
+      if (!item) throw new Error('NO_RECOVERY_ITEM')
       if (request['action'] === 'copy' && Object.keys(request).length === 2) {
-        const item = tabBrowser.recoveryItems()[request['index']]
-        if (!item) throw new Error('NO_RECOVERY_ITEM')
         clipboard.writeText(item.safeRestoreUrl); return { ok: true }
       }
       if (request['action'] === 'delete' && Object.keys(request).length === 2) {
-        await tabBrowser.deleteRecovery(request['index']); return { ok: true }
+        await tabBrowser.deleteRecovery(recoveryId); return { ok: true }
       }
       if (request['action'] !== 'attach' || Object.keys(request).length !== 2) throw new Error('INVALID_REQUEST')
-      const item = tabBrowser.recoveryItems()[request['index']]
-      if (!item) throw new Error('NO_RECOVERY_ITEM')
       const loaded = await loadLayoutFile(layoutPath())
       if (!loaded.text) throw new Error('NO_BROWSER_FOR_TAB')
       if (sender.activeWorkspace === null || sender.activeTab === null) throw new Error('NO_ACTIVE_TAB')
@@ -1516,13 +1516,13 @@ async function main(): Promise<void> {
         workspaces: { ...current.workspaces, [wsKey]: { ...workspace, tabs: { ...workspace.tabs, [tabKey]: { ...previous, browser } } } } }
       browserOperations.assertDispatch(signal)
       const saved = await commitBrowserLayoutMutation(layoutPath(), tabBrowserStateStore, serializeLayout(next), loaded.version, undefined, undefined, (state) => {
-        const recovery = state.migrationRecovery[request['index'] as number]
+        const recovery = state.migrationRecovery.find((candidate) => candidate.id === recoveryId)
         if (!recovery) throw new Error('NO_RECOVERY_ITEM')
-        const without = { ...state, migrationRecovery: state.migrationRecovery.filter((_item, index) => index !== request['index']) }
+        const without = { ...state, migrationRecovery: state.migrationRecovery.filter((candidate) => candidate.id !== recoveryId) }
         return stageWorkspaceBrowserState(without, { entries: [{ id, browser: { mode: 'browse', safeRestoreUrl: recovery.safeRestoreUrl } }], recovery: [] })
       })
       if (!('ok' in saved)) throw new Error('error' in saved ? saved.error : 'LAYOUT_CONFLICT')
-      await tabBrowser.attachRecoveryCommitted(request['index'], id)
+      await tabBrowser.attachRecoveryCommitted(recoveryId, id)
       sender.activeBrowserId = id; sender.win.webContents.send('tab-browser-association', { ws: sender.activeWorkspace, tab: sender.activeTab, browser })
       return { ok: true }
     } catch (error) { return { ok: false, error: error instanceof Error ? error.message : 'INTERNAL_ERROR' } }

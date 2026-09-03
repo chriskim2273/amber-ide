@@ -330,7 +330,7 @@ function App(): JSX.Element {
   const workspaceSourceTexts = useRef(new WeakMap<WorkspaceDoc, string>())
   const [notice, setNotice] = useState<string | null>(null)
   const [browserRecoveryOpen, setBrowserRecoveryOpen] = useState(false)
-  const [browserRecovery, setBrowserRecovery] = useState<Array<{ index: number; workspace: number; tab: number; safeRestoreUrl: string }>>([])
+  const [browserRecovery, setBrowserRecovery] = useState<Array<{ id: string; workspace: number; tab: number; safeRestoreUrl: string }>>([])
   useEffect(() => window.amber.onTabBrowserEvent?.((value) => {
     const event = value as { type?: unknown; waiting?: unknown; browserId?: unknown; workspace?: unknown; tab?: unknown; browser?: unknown }
     if (event.type === 'capacity-wait' && event.waiting === true) setNotice('Waiting for browser capacity…')
@@ -996,7 +996,7 @@ function App(): JSX.Element {
   }, [wsKey, tabKey, activeTab])
 
   const refreshBrowserRecovery = useCallback(async (): Promise<void> => {
-    const reply = await window.amber.browserRecovery?.({ action: 'list' }) as { ok?: boolean; result?: Array<{ index: number; workspace: number; tab: number; safeRestoreUrl: string }>; error?: string } | undefined
+    const reply = await window.amber.browserRecovery?.({ action: 'list' }) as { ok?: boolean; result?: Array<{ id: string; workspace: number; tab: number; safeRestoreUrl: string }>; error?: string } | undefined
     if (!reply?.ok) { setNotice(reply?.error ?? 'Browser recovery unavailable'); return }
     setBrowserRecovery(reply.result ?? []); setBrowserRecoveryOpen(true)
   }, [])
@@ -2605,11 +2605,11 @@ function App(): JSX.Element {
             <div className="help-head"><span className="help-title">Browser recovery</span><button className="icon-btn" aria-label="close" onClick={() => setBrowserRecoveryOpen(false)}><Icon name="close" /></button></div>
             <div className="dialog-body">
               {browserRecovery.length === 0 ? <p className="dialog-text">No recoverable browser URLs.</p> : browserRecovery.map((item) => (
-                <div className="recovery-row" key={`${item.index}:${item.safeRestoreUrl}`}><code>{item.safeRestoreUrl}</code><span>ws {item.workspace} · tab {item.tab}</span>
+                <div className="recovery-row" key={`${item.id}:${item.safeRestoreUrl}`}><code>{item.safeRestoreUrl}</code><span>ws {item.workspace} · tab {item.tab}</span>
                   <div className="dialog-actions">
-                    <button className="btn" onClick={() => void ensureBrowserContext().then(() => window.amber.browserRecovery?.({ action: 'attach', index: item.index })).then(() => refreshBrowserRecovery())}>Attach here</button>
-                    <button className="btn" onClick={() => void window.amber.browserRecovery?.({ action: 'copy', index: item.index })}>Copy URL</button>
-                    <button className="btn danger-btn" onClick={() => void window.amber.browserRecovery?.({ action: 'delete', index: item.index }).then(() => refreshBrowserRecovery())}>Delete</button>
+                    <button className="btn" onClick={() => void ensureBrowserContext().then(() => window.amber.browserRecovery?.({ action: 'attach', id: item.id })).then(() => refreshBrowserRecovery())}>Attach here</button>
+                    <button className="btn" onClick={() => void window.amber.browserRecovery?.({ action: 'copy', id: item.id })}>Copy URL</button>
+                    <button className="btn danger-btn" onClick={() => void window.amber.browserRecovery?.({ action: 'delete', id: item.id }).then(() => refreshBrowserRecovery())}>Delete</button>
                   </div>
                 </div>
               ))}

@@ -1,6 +1,6 @@
 import { planLoad, type WorkspaceDoc, type LoadPlan } from '../shared/workspaceFile'
 import { serializeLayout, type LayoutFile } from '../shared/layoutFile'
-import type { BrowserStateFile } from '../shared/tabBrowserState'
+import { createRecoveryId, type BrowserStateFile } from '../shared/tabBrowserState'
 import type { WorkspaceBrowserImport } from './tabBrowserService'
 import { removedBrowserIds } from './browserAssociationAuthority'
 import { saveLayoutFile } from './layoutIO'
@@ -84,9 +84,15 @@ export function prepareWorkspaceImport(input: {
     frozen,
     browserRevision: (input.current.browserRevision ?? 0) + 1,
   }
+  const recoveryIds = new Set(input.browserState?.migrationRecovery.map((item) => item.id) ?? [])
+  const mintRecoveryId = (): ReturnType<typeof createRecoveryId> => {
+    let id = createRecoveryId()
+    while (recoveryIds.has(id)) id = createRecoveryId()
+    recoveryIds.add(id); return id
+  }
   const browsers: WorkspaceBrowserImport = {
     entries: plan.browserRails.map(({ id, browser }) => ({ id, browser })),
-    recovery: plan.browserRecovery,
+    recovery: plan.browserRecovery.map((item) => ({ id: mintRecoveryId(), ...item })),
   }
   const removed = removedBrowserIds(input.current, next)
   return {

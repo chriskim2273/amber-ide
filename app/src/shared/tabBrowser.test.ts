@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { createBrowserId, isOpaqueBrowserId, parseLegacyBrowserName, safeRestoreUrl } from './tabBrowser'
 import { migrateLegacyBrowsers, type LegacyBrowserMigrationInput } from './tabBrowserMigration'
-import { parseBrowserState } from './tabBrowserState'
+import { isRecoveryId, parseBrowserState } from './tabBrowserState'
 
 const leaf = (paneId: string) => ({ kind: 'leaf' as const, paneId })
 
@@ -34,7 +34,8 @@ describe('legacy migration', () => {
     expect(tab.tree).toEqual(leaf('shell'))
     expect(tab.browser?.id).toBe('browser-01010101010101010101010101010101')
     expect(result.records[tab.browser!.id]!.safeRestoreUrl).toBe('https://one.test/')
-    expect(result.recovery).toEqual([{ workspace: 1, tab: 1, safeRestoreUrl: 'https://two.test/path' }])
+    expect(result.recovery).toMatchObject([{ workspace: 1, tab: 1, safeRestoreUrl: 'https://two.test/path' }])
+    expect(isRecoveryId(result.recovery[0]!.id)).toBe(true)
   })
 
   it('trusts sidecar coordinates rather than stale coordinates encoded in a legacy id', () => {
@@ -95,6 +96,25 @@ describe('browser state parser', () => {
       records: {},
       migrationRecovery: [{ workspace: 1, tab: 2, safeRestoreUrl: 'https://example.test/a?token=secret' }, { workspace: 'bad', tab: 2, safeRestoreUrl: 'https://bad.test' }],
     }))
-    expect(parsed.migrationRecovery).toEqual([{ workspace: 1, tab: 2, safeRestoreUrl: 'https://example.test/a' }])
+    expect(parsed.migrationRecovery).toHaveLength(1)
+    expect(parsed.migrationRecovery[0]).toMatchObject({ workspace: 1, tab: 2, safeRestoreUrl: 'https://example.test/a' })
+    expect(isRecoveryId(parsed.migrationRecovery[0]!.id)).toBe(true)
+  })
+
+  it('migrates legacy recovery entries to stable distinct identities', () => {
+    const value = {
+      version: 1, revision: 0, layoutRevision: 0,
+      profiles: { global: { id: 'global', partition: 'persist:amber-browser', createdAt: 1 } }, records: {},
+      migrationRecovery: [
+        { workspace: 1, tab: 2, safeRestoreUrl: 'https://one.test/' },
+        { workspace: 1, tab: 2, safeRestoreUrl: 'https://two.test/' },
+        { workspace: 1, tab: 2, safeRestoreUrl: 'https://one.test/' },
+      ],
+    }
+    const first = parseBrowserState(JSON.stringify(value)).migrationRecovery
+    const second = parseBrowserState(JSON.stringify(value)).migrationRecovery
+    expect(first.map((item) => item.id)).toEqual(second.map((item) => item.id))
+    expect(new Set(first.map((item) => item.id)).size).toBe(first.length)
+    expect(first.every((item) => isRecoveryId(item.id))).toBe(true)
   })
 })

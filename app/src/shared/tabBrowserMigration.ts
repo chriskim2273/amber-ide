@@ -1,6 +1,6 @@
 import { removeLeaf, type Node } from '../renderer/layout'
 import { createBrowserId, parseLegacyBrowserName, safeRestoreUrl, type BrowserId } from './tabBrowser'
-import type { BrowserRecord, MigrationRecoveryItem } from './tabBrowserState'
+import { deterministicRecoveryId, type BrowserRecord, type MigrationRecoveryItem } from './tabBrowserState'
 
 export interface LegacyBrowserEntry { ws: number; tab: number; ord: number; url: string }
 export interface MigratingTab { tree: Node | null; label?: string; browser?: { id: string; width: number; collapsed: boolean; designatedPi?: string; sharedWithPi?: boolean } }
@@ -19,7 +19,7 @@ function cloneWorkspaces(value: Record<string, MigratingWorkspace>): Record<stri
 export function migrateLegacyBrowsers(input: LegacyBrowserMigrationInput, random?: () => Uint8Array): LegacyBrowserMigrationResult {
   const workspaces = cloneWorkspaces(input.workspaces)
   const records: Partial<Record<BrowserId, BrowserRecord>> = {}
-  const recovery: MigrationRecoveryItem[] = []
+  const recovery: MigrationRecoveryItem[] = []; const recoveryIds = new Set<string>(); let recoveryOrdinal = 0
   const grouped = new Map<string, { name: string; entry: LegacyBrowserEntry }[]>()
   for (const [name, entry] of Object.entries(input.browsers)) {
     // Coordinates in legacy IDs became stale after cross-tab moves. The
@@ -43,7 +43,13 @@ export function migrateLegacyBrowsers(input: LegacyBrowserMigrationInput, random
       viewport: { width: 1280, height: 800 }, lifecycle: 'frozen', stateRevision: 1, lastUsedAt: now, lastFocusedAt: now,
     }
     for (const candidate of candidates) tab.tree = tab.tree ? removeLeaf(tab.tree, candidate.name) : null
-    for (const candidate of candidates.slice(1)) recovery.push({ workspace: candidate.entry.ws, tab: candidate.entry.tab, safeRestoreUrl: safeRestoreUrl(candidate.entry.url) })
+    for (const candidate of candidates.slice(1)) {
+      const safeUrl = safeRestoreUrl(candidate.entry.url)
+      let id = deterministicRecoveryId(candidate.entry.ws, candidate.entry.tab, safeUrl, recoveryOrdinal++)
+      while (recoveryIds.has(id)) id = deterministicRecoveryId(candidate.entry.ws, candidate.entry.tab, safeUrl, recoveryOrdinal++)
+      recoveryIds.add(id)
+      recovery.push({ id, workspace: candidate.entry.ws, tab: candidate.entry.tab, safeRestoreUrl: safeUrl })
+    }
   }
   return { workspaces, records, recovery }
 }

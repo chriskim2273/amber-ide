@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { BrowserCapacity, navigationPolicyAllows, selectPreviewOrigin } from './tabBrowserPolicy'
 import { createBrowserId, isOpaqueBrowserId, safeRestoreUrl, type BrowserId } from '../shared/tabBrowser'
+import { isRecoveryId, type RecoveryId } from '../shared/tabBrowserState'
 import type { WsBrowser } from '../shared/workspaceFile'
 import type { BrowserRecord, BrowserStateFile } from '../shared/tabBrowserState'
 import { parseBrowserViewport } from '../shared/browserViewport'
@@ -365,28 +366,39 @@ export class TabBrowserHost {
     if (runtime?.visible) { if (protectedValue) runtime.page.hide(); else runtime.page.show() }
   }
 
-  recoveryItems(): { index: number; workspace: number; tab: number; safeRestoreUrl: string }[] {
-    return this.state.migrationRecovery.map((item, index) => ({ index, ...item }))
+  recoveryItems(): { id: RecoveryId; workspace: number; tab: number; safeRestoreUrl: string }[] {
+    return this.state.migrationRecovery.map((item) => ({ ...item }))
   }
 
-  deleteRecovery(index: number): void {
-    if (!Number.isSafeInteger(index) || index < 0 || index >= this.state.migrationRecovery.length) throw new Error('NO_RECOVERY_ITEM')
+  private recoveryIndex(id: string): number {
+    if (!isRecoveryId(id)) throw new Error('NO_RECOVERY_ITEM')
+    const index = this.state.migrationRecovery.findIndex((item) => item.id === id)
+    if (index < 0) throw new Error('NO_RECOVERY_ITEM')
+    return index
+  }
+
+  deleteRecovery(id: RecoveryId): void {
+    const index = this.recoveryIndex(id)
     this.state.migrationRecovery.splice(index, 1); this.onStateChange()
   }
 
-  attachRecovery(index: number, id: BrowserId): BrowserRuntimeStatus {
-    const item = this.state.migrationRecovery[index]
-    if (!item) throw new Error('NO_RECOVERY_ITEM')
+  attachRecovery(recoveryId: RecoveryId, id: BrowserId): BrowserRuntimeStatus {
+    const index = this.recoveryIndex(recoveryId), item = this.state.migrationRecovery[index]!
     const status = this.importFrozen(id, { mode: 'browse', safeRestoreUrl: item.safeRestoreUrl })
     this.state.migrationRecovery.splice(index, 1); this.onStateChange()
     return status
   }
 
-  importWorkspace(entries: { id: BrowserId; browser: WsBrowser }[], recovery: { ws: number; tab: number; browser: WsBrowser }[]): BrowserRuntimeStatus[] {
+  importWorkspace(entries: { id: BrowserId; browser: WsBrowser }[], recovery: { id: RecoveryId; ws: number; tab: number; browser: WsBrowser }[]): BrowserRuntimeStatus[] {
     if (entries.some((entry) => this.state.records[entry.id])) throw new Error('BROWSER_ID_COLLISION')
     if (this.state.migrationRecovery.length + recovery.length > 100) throw new Error('BROWSER_RECOVERY_LIMIT')
+    const recoveryIds = new Set(this.state.migrationRecovery.map((item) => item.id))
+    for (const item of recovery) {
+      if (!isRecoveryId(item.id) || recoveryIds.has(item.id)) throw new Error('BROWSER_RECOVERY_ID_COLLISION')
+      recoveryIds.add(item.id)
+    }
     const statuses = entries.map((entry) => this.importFrozen(entry.id, entry.browser))
-    this.state.migrationRecovery.push(...recovery.map((item) => ({ workspace: item.ws, tab: item.tab, safeRestoreUrl: safeRestoreUrl(item.browser.safeRestoreUrl) })))
+    this.state.migrationRecovery.push(...recovery.map((item) => ({ id: item.id, workspace: item.ws, tab: item.tab, safeRestoreUrl: safeRestoreUrl(item.browser.safeRestoreUrl) })))
     this.onStateChange()
     return statuses
   }

@@ -5,6 +5,31 @@ export const BROWSER_STATE_VERSION = 1
 export const BROWSER_STATE_RECORD_MAX = 1000
 export const BROWSER_RECOVERY_MAX = 100
 
+export type RecoveryId = `recovery-${string}`
+const RECOVERY_ID_RE = /^recovery-[0-9a-f]{32}$/
+
+export function isRecoveryId(value: unknown): value is RecoveryId {
+  return typeof value === 'string' && RECOVERY_ID_RE.test(value)
+}
+
+export function createRecoveryId(random = (): Uint8Array => crypto.getRandomValues(new Uint8Array(16))): RecoveryId {
+  const bytes = random()
+  if (bytes.length !== 16) throw new Error('recovery id entropy must be exactly 16 bytes')
+  return `recovery-${[...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('')}`
+}
+
+/** Stable migration identity for a legacy entry that did not carry an id. */
+export function deterministicRecoveryId(workspace: number, tab: number, safeUrl: string, ordinal: number): RecoveryId {
+  const input = `${workspace}\u0000${tab}\u0000${safeUrl}\u0000${ordinal}`
+  const seeds = [0x811c9dc5, 0x9e3779b1, 0x85ebca77, 0xc2b2ae35]
+  const hashes = seeds.map((seed) => {
+    let hash = seed >>> 0
+    for (let index = 0; index < input.length; index++) hash = Math.imul(hash ^ input.charCodeAt(index), 0x01000193) >>> 0
+    return hash.toString(16).padStart(8, '0')
+  })
+  return `recovery-${hashes.join('')}`
+}
+
 export interface ProfileDescriptor {
   id: 'global'
   partition: string
@@ -27,7 +52,7 @@ export interface BrowserRecord {
   restoreError?: string
 }
 
-export interface MigrationRecoveryItem { workspace: number; tab: number; safeRestoreUrl: string }
+export interface MigrationRecoveryItem { id: RecoveryId; workspace: number; tab: number; safeRestoreUrl: string }
 export interface BrowserStateTransaction {
   id: string
   kind: 'legacy-layout-migration' | 'browser-association'
@@ -106,12 +131,16 @@ export function parseBrowserState(text: string): BrowserStateFile {
       const parsed = record(value, key)
       if (parsed) records[parsed.id] = parsed
     }
-    const migrationRecovery: MigrationRecoveryItem[] = []
+    const migrationRecovery: MigrationRecoveryItem[] = []; const recoveryIds = new Set<RecoveryId>()
     if (Array.isArray(raw['migrationRecovery'])) {
-      for (const value of raw['migrationRecovery'].slice(0, BROWSER_RECOVERY_MAX)) {
+      for (const [sourceIndex, value] of raw['migrationRecovery'].slice(0, BROWSER_RECOVERY_MAX).entries()) {
         const item = object(value)
         if (!item || !finite(item['workspace']) || !finite(item['tab']) || typeof item['safeRestoreUrl'] !== 'string') continue
-        migrationRecovery.push({ workspace: item['workspace'], tab: item['tab'], safeRestoreUrl: safeRestoreUrl(item['safeRestoreUrl']) })
+        const workspace = item['workspace'], tab = item['tab'], restoreUrl = safeRestoreUrl(item['safeRestoreUrl'])
+        let id = isRecoveryId(item['id']) && !recoveryIds.has(item['id']) ? item['id'] : deterministicRecoveryId(workspace, tab, restoreUrl, sourceIndex)
+        for (let collision = 1; recoveryIds.has(id); collision++) id = deterministicRecoveryId(workspace, tab, restoreUrl, sourceIndex + collision)
+        recoveryIds.add(id)
+        migrationRecovery.push({ id, workspace, tab, safeRestoreUrl: restoreUrl })
       }
     }
     const pendingRaw = object(raw['pendingTransaction'])

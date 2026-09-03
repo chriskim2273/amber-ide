@@ -322,14 +322,14 @@ describe('TabBrowserHost', () => {
   it('lists, attaches, and deletes bounded recovery items', () => {
     const state = emptyBrowserState(1)
     state.migrationRecovery = [
-      { workspace: 1, tab: 2, safeRestoreUrl: 'https://one.test/' },
-      { workspace: 1, tab: 3, safeRestoreUrl: 'https://two.test/' },
+      { id: 'recovery-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', workspace: 1, tab: 2, safeRestoreUrl: 'https://one.test/' },
+      { id: 'recovery-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', workspace: 1, tab: 3, safeRestoreUrl: 'https://two.test/' },
     ]
     const host = new TabBrowserHost(state, factory)
     expect(host.recoveryItems()).toHaveLength(2)
-    host.attachRecovery(0, 'browser-cccccccccccccccccccccccccccccccc')
+    host.attachRecovery('recovery-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'browser-cccccccccccccccccccccccccccccccc')
     expect(host.status('browser-cccccccccccccccccccccccccccccccc').safeRestoreUrl).toBe('https://one.test/')
-    host.deleteRecovery(0)
+    host.deleteRecovery('recovery-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')
     expect(host.recoveryItems()).toEqual([])
   })
 

@@ -407,14 +407,14 @@ describe('TabBrowserService recovery persistence', () => {
   it('survives a service restart after deleting a recovery item', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'amber-recovery-delete-')); dirs.push(dir)
     const store = new TabBrowserStateStore(dir)
-    const state = { ...emptyBrowserState(1), migrationRecovery: [{ workspace: 1, tab: 2, safeRestoreUrl: 'https://recover.test/' }] }
+    const state = { ...emptyBrowserState(1), migrationRecovery: [{ id: 'recovery-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' as const, workspace: 1, tab: 2, safeRestoreUrl: 'https://recover.test/' }] }
     await store.save(state)
     let service!: TabBrowserService
     const host = new TabBrowserHost(state, { create: () => { throw new Error('not used') } }, Date.now, undefined,
       () => { void (service as unknown as { schedulePersist: () => Promise<void> }).schedulePersist() })
     const Service = TabBrowserService as unknown as new (s: TabBrowserStateStore, p: { setWindow: () => void }, h: TabBrowserHost, i: typeof state) => TabBrowserService
     service = new Service(store, { setWindow: () => {} }, host, state)
-    await service.deleteRecovery(0)
+    await service.deleteRecovery('recovery-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')
     const restartedState = await new TabBrowserStateStore(dir).load()
     const restartedHost = new TabBrowserHost(restartedState, { create: () => { throw new Error('not used') } })
     const restarted = new Service(store, { setWindow: () => {} }, restartedHost, restartedState)
@@ -432,9 +432,18 @@ describe('applyBrowserRuntimeDelta', () => {
     expect(merged.pendingTransaction?.id).toBe('tx')
   })
   it('applies an exact recovery deletion without discarding concurrently added recovery', () => {
-    const previous = { ...emptyBrowserState(1), migrationRecovery: [{ workspace: 1, tab: 1, safeRestoreUrl: 'https://old.test/' }] }
+    const previous = { ...emptyBrowserState(1), migrationRecovery: [{ id: 'recovery-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' as const, workspace: 1, tab: 1, safeRestoreUrl: 'https://old.test/' }] }
     const runtime = { ...previous, migrationRecovery: [] }
-    const current = { ...previous, migrationRecovery: [...previous.migrationRecovery, { workspace: 2, tab: 2, safeRestoreUrl: 'https://new.test/' }] }
-    expect(applyBrowserRuntimeDelta(current, previous, runtime).migrationRecovery).toEqual([{ workspace: 2, tab: 2, safeRestoreUrl: 'https://new.test/' }])
+    const current = { ...previous, migrationRecovery: [...previous.migrationRecovery, { id: 'recovery-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' as const, workspace: 2, tab: 2, safeRestoreUrl: 'https://new.test/' }] }
+    expect(applyBrowserRuntimeDelta(current, previous, runtime).migrationRecovery).toEqual([{ id: 'recovery-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', workspace: 2, tab: 2, safeRestoreUrl: 'https://new.test/' }])
+  })
+
+  it('deletes only the selected identity when duplicate recovery URLs race', () => {
+    const first = { id: 'recovery-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' as const, workspace: 1, tab: 1, safeRestoreUrl: 'https://same.test/' }
+    const second = { id: 'recovery-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' as const, workspace: 1, tab: 1, safeRestoreUrl: 'https://same.test/' }
+    const previous = { ...emptyBrowserState(1), migrationRecovery: [first, second] }
+    const runtime = { ...previous, migrationRecovery: [second] }
+    const current = { ...previous, migrationRecovery: [first, second] }
+    expect(applyBrowserRuntimeDelta(current, previous, runtime).migrationRecovery).toEqual([second])
   })
 })

@@ -4,7 +4,7 @@ import { TabBrowserHost, type BrowserRuntimeStatus } from './tabBrowserHost'
 import { isOpaqueBrowserId, safeRestoreUrl, type BrowserId } from '../shared/tabBrowser'
 import type { WsBrowser } from '../shared/workspaceFile'
 import { TabBrowserStateStore } from './tabBrowserStateStore'
-import type { BrowserStateFile } from '../shared/tabBrowserState'
+import { isRecoveryId, type BrowserStateFile, type RecoveryId } from '../shared/tabBrowserState'
 import type { BrowserToolAction } from './browserToolProtocol'
 import { parseBrowserViewport } from '../shared/browserViewport'
 import { BrowserApprovalCoordinator, BrowserDialogCoordinator, interactionTargetDigest, interactionValueDigest, type ApprovalDecision } from './browserApproval'
@@ -33,7 +33,7 @@ export type TabBrowserCommand =
   | { type: 'resolveDialog'; id: string; dialogId: string; digest: string; accept: boolean; promptText?: string }
   | { type: 'destroy'; id: string }
 
-export interface WorkspaceBrowserImport { entries: { id: BrowserId; browser: WsBrowser }[]; recovery: { ws: number; tab: number; browser: WsBrowser }[] }
+export interface WorkspaceBrowserImport { entries: { id: BrowserId; browser: WsBrowser }[]; recovery: { id: RecoveryId; ws: number; tab: number; browser: WsBrowser }[] }
 
 export function stageWorkspaceBrowserState(state: BrowserStateFile, input: WorkspaceBrowserImport, now = Date.now()): BrowserStateFile {
   const records = { ...state.records }
@@ -46,11 +46,13 @@ export function stageWorkspaceBrowserState(state: BrowserStateFile, input: Works
       viewport, ...(previewOrigins ? { previewOrigins } : {}), lifecycle: 'frozen', stateRevision: 1, lastUsedAt: now, lastFocusedAt: 0 }
   }
   if (state.migrationRecovery.length + input.recovery.length > 100) throw new Error('BROWSER_RECOVERY_LIMIT')
-  return { ...state, records, migrationRecovery: [...state.migrationRecovery, ...input.recovery.map((item) => ({ workspace: item.ws, tab: item.tab, safeRestoreUrl: safeRestoreUrl(item.browser.safeRestoreUrl) }))] }
-}
-
-function recoveryKey(item: BrowserStateFile['migrationRecovery'][number]): string {
-  return `${item.workspace}\u0000${item.tab}\u0000${item.safeRestoreUrl}`
+  const recoveryIds = new Set(state.migrationRecovery.map((item) => item.id))
+  const migrationRecovery = input.recovery.map((item) => {
+    if (!isRecoveryId(item.id) || recoveryIds.has(item.id)) throw new Error('BROWSER_RECOVERY_ID_COLLISION')
+    recoveryIds.add(item.id)
+    return { id: item.id, workspace: item.ws, tab: item.tab, safeRestoreUrl: safeRestoreUrl(item.browser.safeRestoreUrl) }
+  })
+  return { ...state, records, migrationRecovery: [...state.migrationRecovery, ...migrationRecovery] }
 }
 
 /** Apply only host-owned runtime changes, preserving transaction fields and records changed by another writer. */
@@ -62,21 +64,23 @@ export function applyBrowserRuntimeDelta(current: BrowserStateFile, previous: Br
   for (const [id, record] of Object.entries(runtime.records) as Array<[BrowserId, NonNullable<BrowserStateFile['records'][BrowserId]>]>) {
     if (JSON.stringify(previous.records[id]) !== JSON.stringify(record)) records[id] = record
   }
-  const priorCounts = new Map<string, number>(); const nextCounts = new Map<string, number>()
-  for (const item of previous.migrationRecovery) priorCounts.set(recoveryKey(item), (priorCounts.get(recoveryKey(item)) ?? 0) + 1)
-  for (const item of runtime.migrationRecovery) nextCounts.set(recoveryKey(item), (nextCounts.get(recoveryKey(item)) ?? 0) + 1)
-  const remove = new Map<string, number>()
-  for (const [key, count] of priorCounts) if (count > (nextCounts.get(key) ?? 0)) remove.set(key, count - (nextCounts.get(key) ?? 0))
-  const recovery = current.migrationRecovery.filter((item) => {
-    const key = recoveryKey(item); const count = remove.get(key) ?? 0
-    if (count === 0) return true
-    remove.set(key, count - 1); return false
-  })
-  const currentCounts = new Map<string, number>()
-  for (const item of recovery) currentCounts.set(recoveryKey(item), (currentCounts.get(recoveryKey(item)) ?? 0) + 1)
-  for (const item of runtime.migrationRecovery) {
-    const key = recoveryKey(item); const wanted = nextCounts.get(key) ?? 0; const have = currentCounts.get(key) ?? 0
-    if (wanted > have) { recovery.push(item); currentCounts.set(key, have + 1) }
+
+  // Recovery entries are identity-bearing records. Comparing URL/location and
+  // counts cannot tell which duplicate item a concurrent delete targeted.
+  const previousById = new Map(previous.migrationRecovery.map((item) => [item.id, item]))
+  const runtimeById = new Map(runtime.migrationRecovery.map((item) => [item.id, item]))
+  const recovery = [...current.migrationRecovery]
+  for (const [id, prior] of previousById) {
+    const currentIndex = recovery.findIndex((item) => item.id === id)
+    if (currentIndex < 0) continue
+    const currentItem = recovery[currentIndex]!
+    const next = runtimeById.get(id)
+    if (!next && JSON.stringify(currentItem) === JSON.stringify(prior)) recovery.splice(currentIndex, 1)
+    else if (next && JSON.stringify(currentItem) === JSON.stringify(prior)) recovery[currentIndex] = next
+  }
+  const currentIds = new Set(recovery.map((item) => item.id))
+  for (const item of runtime.migrationRecovery) if (!previousById.has(item.id) && !currentIds.has(item.id)) {
+    recovery.push(item); currentIds.add(item.id)
   }
   return { ...current, revision: current.revision + 1, profiles: runtime.profiles, records, migrationRecovery: recovery }
 }
@@ -199,15 +203,15 @@ export class TabBrowserService {
 
   workspaceSnapshot(): ReturnType<TabBrowserHost['workspaceSnapshot']> { return this.host.workspaceSnapshot() }
   recoveryItems(): ReturnType<TabBrowserHost['recoveryItems']> { return this.host.recoveryItems() }
-  deleteRecovery(index: number): Promise<void> {
-    return this.operations.run('recovery', async (signal) => { this.operations.assertDispatch(signal); this.host.deleteRecovery(index); await this.schedulePersist() })
+  deleteRecovery(id: RecoveryId): Promise<void> {
+    return this.operations.run('recovery', async (signal) => { this.operations.assertDispatch(signal); this.host.deleteRecovery(id); await this.schedulePersist() })
   }
-  attachRecovery(index: number, id: BrowserId): Promise<BrowserRuntimeStatus> {
-    return this.operations.run('recovery', async (signal) => { this.operations.assertDispatch(signal); return this.attachRecoveryCommitted(index, id) })
+  attachRecovery(id: RecoveryId, browserId: BrowserId): Promise<BrowserRuntimeStatus> {
+    return this.operations.run('recovery', async (signal) => { this.operations.assertDispatch(signal); return this.attachRecoveryCommitted(id, browserId) })
   }
-  async attachRecoveryCommitted(index: number, id: BrowserId): Promise<BrowserRuntimeStatus> {
+  async attachRecoveryCommitted(id: RecoveryId, browserId: BrowserId): Promise<BrowserRuntimeStatus> {
     this.suppressPersist = true
-    try { return this.host.attachRecovery(index, id) }
+    try { return this.host.attachRecovery(id, browserId) }
     finally {
       this.suppressPersist = false
       const loaded = await this.store.load(); this.persistedState = structuredClone(loaded)
