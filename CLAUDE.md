@@ -1597,6 +1597,25 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   (`x86_64-linux-musl-gcc` or `musl-gcc`), failing with an actionable message
   rather than cc-rs's "failed to find tool".
 
+- [x] Freebuff froze the React web build (2026-09-02) — typing `freebuff` in
+  an `amber web` /app pane rendered nothing, Ctrl-C did nothing, the pane had
+  to be closed; memory pills kept updating (the control link was fine). Root
+  cause was NOT transport or the daemon: esbuild <=0.28.1 minify dropped the
+  backing declaration from `@xterm/xterm`'s `requestMode` enum
+  (`let r; ... (r||={})` became `(void 0||(s={}))`), so any program sending
+  `CSI ? n $ p` (DECRQM) — freebuff/OpenTUI poll mode 2026 at startup — threw
+  `ReferenceError: s is not defined` INSIDE `WriteBuffer._innerWrite`, which
+  killed the write loop mid-chunk with no reschedule: the pane's render
+  pipeline died while keystrokes still reached the pty. The desktop renderer
+  never ran the buggy path (electron-vite passes no explicit target, so no
+  legacy lowerings), which is why only amber web froze. Fix: npm
+  `overrides.esbuild = ^0.28.2` (verified emitting `let s;...(s||={})`) and
+  web build `target: 'es2022'` (0.28+ refuses to lower destructuring for the
+  old chain; the hosted client only reaches the owner's own tailnet
+  browsers). Gates: typecheck + 747 app tests + electron build + build:web
+  green. **Live-verified** via CDP against the real daemon: freebuff renders
+  its full TUI in /app and Ctrl-C exits cleanly back to the prompt.
+
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**
   `std::io::Read` (dedicated thread); `take_writer()` is one-shot;
