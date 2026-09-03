@@ -210,17 +210,16 @@ function deepEqual(a: unknown, b: unknown): boolean {
  * `local`'s, recursing one level deeper when both sides are still plain
  * objects — so e.g. the browser editing workspace 2's tree and the desktop
  * editing workspace 1's tree both survive even though they share the
- * top-level `workspaces` key, and this is schema-agnostic (works the same
- * for `browsers`/`editors`/`frozen`/anything added later), which is what
- * makes it safe against silently dropping a desktop-only pane.
- *
- * ponytail: a genuine double-edit of the exact same leaf (rare — two clients
- * dragging the same divider inside one retry window) resolves to `local` —
- * good enough for a bounded, rare race; escalate to a finer-grained merge
- * only if that's observed to bite in practice.
+ * top-level `workspaces` key. A tab's `tree` is deliberately the exception:
+ * it encodes one arrangement, and recursively interleaving two competing
+ * arrangements can manufacture invalid split nodes and duplicate pane ids.
+ * A genuine concurrent tree edit therefore resolves atomically to `local`.
  */
-function merge3(base: unknown, local: unknown, remote: unknown): unknown {
+function merge3(base: unknown, local: unknown, remote: unknown, path: string[] = []): unknown {
   if (deepEqual(local, remote)) return local
+  // The containing tab already established that local changed this field;
+  // preserving this complete tree is safer than combining incompatible moves.
+  if (path[path.length - 1] === 'tree') return local
   if (isPlainObj(base) && isPlainObj(local) && isPlainObj(remote)) {
     const keys = new Set([...Object.keys(base), ...Object.keys(local), ...Object.keys(remote)])
     const out: Record<string, unknown> = {}
@@ -231,7 +230,7 @@ function merge3(base: unknown, local: unknown, remote: unknown): unknown {
         continue // remote also lacks the key -> stays absent
       }
       if (!Object.hasOwn(local, k)) continue // local deleted this key -> respect the deletion
-      out[k] = merge3(base[k], local[k], remote[k])
+      out[k] = merge3(base[k], local[k], remote[k], [...path, k])
     }
     return out
   }

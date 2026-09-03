@@ -227,8 +227,7 @@ describe('moveTab', () => {
 })
 
 describe('mergeLayout (spec §6 CAS conflict retry)', () => {
-  const leaf = (paneId: string): LayoutFile['workspaces'][string]['tabs'][string]['tree'] =>
-    ({ kind: 'leaf', paneId })
+  const leaf = (paneId: string) => ({ kind: 'leaf' as const, paneId })
 
   it('merges edits to two different workspaces made from the same base', () => {
     const base: LayoutFile = {
@@ -291,6 +290,35 @@ describe('mergeLayout (spec §6 CAS conflict retry)', () => {
     const local: LayoutFile = { ...base, fontSize: 16 }
     const remote: LayoutFile = { ...base, fontSize: 18 }
     expect(mergeLayout(base, local, remote).fontSize).toBe(16)
+  })
+
+  it('keeps a complete local split tree when both clients rearrange the same tab', () => {
+    const base: LayoutFile = {
+      version: 1, activeWorkspace: 1,
+      workspaces: {
+        '1': { activeTab: 1, tabs: { '1': { tree: { kind: 'split', dir: 'h', ratio: 0.5, a: leaf('a'), b: leaf('b') } } } },
+      },
+    }
+    // Browser swaps the panes while desktop independently splits pane a. A
+    // property-wise JSON merge can combine these incompatible tree shapes,
+    // duplicate a, and discard b. The whole tree is one atomic arrangement.
+    const local: LayoutFile = {
+      ...base,
+      workspaces: {
+        '1': { activeTab: 1, tabs: { '1': { tree: { kind: 'split', dir: 'h', ratio: 0.5, a: leaf('b'), b: leaf('a') } } } },
+      },
+    }
+    const remote: LayoutFile = {
+      ...base,
+      workspaces: {
+        '1': { activeTab: 1, tabs: { '1': { tree: {
+          kind: 'split', dir: 'h', ratio: 0.5,
+          a: { kind: 'split', dir: 'v', ratio: 0.5, a: leaf('a'), b: leaf('c') }, b: leaf('b'),
+        } } } },
+      },
+    }
+    expect(mergeLayout(base, local, remote).workspaces['1']?.tabs['1']?.tree)
+      .toEqual(local.workspaces['1']?.tabs['1']?.tree)
   })
 
   it('is a no-op when local and remote ended up identical', () => {
