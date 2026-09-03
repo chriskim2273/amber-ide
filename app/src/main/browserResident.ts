@@ -111,7 +111,9 @@ export async function registerBrowserHostLauncher(root: string, input: BrowserHo
   return record
 }
 
-export async function installStableAppImage(source: string, destination: string, register: () => Promise<void>, uid = process.getuid?.()): Promise<void> {
+export interface AppImageUpgradeHooks { beforeCommit?: () => Promise<void> }
+
+export async function installStableAppImage(source: string, destination: string, register: () => Promise<void>, uid = process.getuid?.(), hooks?: AppImageUpgradeHooks): Promise<void> {
   if (uid === undefined) throw new Error('cannot determine current user')
   const sourcePath = await validateLauncherExecutable(source, 'linux', uid)
   const parent = dirname(destination)
@@ -121,25 +123,44 @@ export async function installStableAppImage(source: string, destination: string,
   const nonce = `${process.pid}-${randomUUID()}`
   const temporary = join(parent, `.${basename(destination)}.upgrade-${nonce}.tmp`)
   const backup = join(parent, `.${basename(destination)}.upgrade-${nonce}.old`)
-  let oldMoved = false, newInstalled = false
+  let backupReady = false, newInstalled = false
   try {
     await copyFile(sourcePath, temporary)
     await chmod(temporary, 0o700)
     const handle = await open(temporary, 'r'); try { await handle.sync() } finally { await handle.close() }
     await validateLauncherExecutable(temporary, 'linux', uid)
-    try { await lstat(destination); await rename(destination, backup); oldMoved = true } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
+
+    // Keep a private rollback copy while the old pathname remains visible. The
+    // final rename replaces that pathname in one filesystem operation; moving
+    // the old pathname away first would leave a crash window with no launcher.
+    try {
+      await copyFile(destination, backup)
+      await chmod(backup, 0o700)
+      const backupHandle = await open(backup, 'r'); try { await backupHandle.sync() } finally { await backupHandle.close() }
+      backupReady = true
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    }
+    await hooks?.beforeCommit?.()
     await rename(temporary, destination); newInstalled = true
     await syncDirectory(parent)
     await register()
-    if (oldMoved) { await rm(backup, { force: true }); oldMoved = false; await syncDirectory(parent) }
+    if (backupReady) { await rm(backup, { force: true }); backupReady = false; await syncDirectory(parent) }
   } catch (error) {
-    if (newInstalled) await rm(destination, { force: true }).catch(() => {})
-    if (oldMoved) await rename(backup, destination)
+    if (newInstalled) {
+      await rm(destination, { force: true }).catch(() => {})
+      if (backupReady) {
+        try { await rename(backup, destination); backupReady = false } catch { /* keep the rollback artifact for recovery */ }
+      }
+    }
     await syncDirectory(parent).catch(() => {})
     throw error
   } finally {
     await rm(temporary, { force: true }).catch(() => {})
-    await rm(backup, { force: true }).catch(() => {})
+    // A backup is unnecessary when the old pathname was never replaced or was
+    // restored successfully. If restoration itself failed, retain it rather
+    // than deleting the only known-good executable.
+    if (!newInstalled || !backupReady) await rm(backup, { force: true }).catch(() => {})
   }
 }
 

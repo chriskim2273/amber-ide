@@ -105,6 +105,21 @@ describe('resident browser host registration', () => {
     expect((await readdir(root)).filter((name) => name.includes('.upgrade-'))).toEqual([])
   })
 
+  it('keeps the prior stable image in place when replacement is interrupted before commit', async () => {
+    if (process.platform === 'win32') return
+    const root = await mkdtemp(join(tmpdir(), 'amber-browser-resident-'))
+    const source = join(root, 'new.AppImage'), stable = join(root, 'stable.AppImage')
+    await writeFile(source, 'new', { mode: 0o700 }); await writeFile(stable, 'old', { mode: 0o700 })
+    let observed = ''
+    const install = installStableAppImage as unknown as (source: string, destination: string, register: () => Promise<void>, uid: number | undefined, hooks: { beforeCommit: () => Promise<void> }) => Promise<void>
+    await expect(install(source, stable, async () => {}, process.getuid?.(), { beforeCommit: async () => {
+      observed = await readFile(stable, 'utf8')
+      throw new Error('simulated interruption')
+    } })).rejects.toThrow('simulated interruption')
+    expect(observed).toBe('old')
+    expect(await readFile(stable, 'utf8')).toBe('old')
+  })
+
   it('writes and clears the explicit-stop inhibit durably', async () => {
     const root = await mkdtemp(join(tmpdir(), 'amber-browser-resident-'))
     await writeBrowserHostInhibit(root)
