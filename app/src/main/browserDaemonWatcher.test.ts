@@ -3,11 +3,11 @@ import type { Frame } from '../shared/proto'
 import { BrowserDaemonWatcher, type MetadataConnection } from './browserDaemonWatcher'
 
 class FakeConnection implements MetadataConnection {
-  sent: Frame[] = []; closed = false
+  sent: Frame[] = []; closed = false; private currentEpoch = 0; private nextEpoch = 1
   callbacks: Record<'open'|'close'|'frame', Function[]> = { open: [], close: [], frame: [] }
-  on(event: 'frame', cb: (value: Frame) => void): void
-  on(event: 'open'|'close', cb: () => void): void
-  on(event: 'open'|'close'|'frame', cb: ((value: Frame) => void) | (() => void)): void { this.callbacks[event].push(cb) }
+  on(event: 'frame', cb: (value: Frame, epoch: number) => void): void
+  on(event: 'open'|'close', cb: (epoch: number) => void): void
+  on(event: 'open'|'close'|'frame', cb: ((value: Frame, epoch: number) => void) | ((epoch: number) => void)): void { this.callbacks[event].push(cb) }
   connect(): void {}
   send(frame: Frame): void { this.sent.push(frame) }
   close(): void { this.closed = true }
@@ -15,7 +15,8 @@ class FakeConnection implements MetadataConnection {
   emit(event: 'frame', value: Frame, epoch?: number): void
   emit(event: 'open'|'close'|'frame', value?: Frame | number, epoch?: number): void {
     const frame = typeof value === 'number' ? undefined : value
-    const eventEpoch = typeof value === 'number' ? value : epoch
+    const eventEpoch = typeof value === 'number' ? value : epoch ?? (event === 'open' ? this.nextEpoch++ : this.currentEpoch)
+    if (event === 'open') { this.currentEpoch = eventEpoch; this.nextEpoch = Math.max(this.nextEpoch, eventEpoch + 1) }
     for (const cb of this.callbacks[event]) event === 'frame' ? cb(frame, eventEpoch) : cb(eventEpoch)
   }
 }

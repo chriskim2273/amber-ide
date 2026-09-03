@@ -3,8 +3,8 @@ import type { ControllerSession } from './tabBrowserBroker'
 
 export interface MetadataConnection {
   /** The epoch is the socket generation allocated by the production Connection. */
-  on(event: 'frame', cb: (frame: Frame, epoch?: number) => void): void
-  on(event: 'open' | 'close', cb: (epoch?: number) => void): void
+  on(event: 'frame', cb: (frame: Frame, epoch: number) => void): void
+  on(event: 'open' | 'close', cb: (epoch: number) => void): void
   connect(): void
   send(frame: Frame): void
   close(): void
@@ -38,9 +38,9 @@ export class BrowserDaemonWatcher {
     this.started = true; this.connection.connect()
   }
 
-  private onOpen(epoch?: number): void {
+  private onOpen(epoch: number): void {
     if (this.closed) return
-    const nextEpoch = epoch ?? this.activeEpoch + 1
+    const nextEpoch = epoch
     if (nextEpoch < this.activeEpoch) return
     this.activeEpoch = nextEpoch
     this.connected = true; this.hasFullList = false; this.fullListAt = 0; this.sessions.clear()
@@ -53,9 +53,9 @@ export class BrowserDaemonWatcher {
     }, this.pollMs)
   }
 
-  private onClose(epoch?: number): void {
+  private onClose(epoch: number): void {
     if (this.closed) return
-    const sourceEpoch = epoch ?? this.activeEpoch
+    const sourceEpoch = epoch
     if (sourceEpoch < this.activeEpoch) return
     this.activeEpoch = sourceEpoch
     this.connected = false; this.hasFullList = false; this.fullListAt = 0; this.sessions.clear()
@@ -70,8 +70,8 @@ export class BrowserDaemonWatcher {
     })
   }
 
-  private onFrame(frame: Frame, epoch?: number): void {
-    if (this.closed || !this.connected || (epoch !== undefined && epoch !== this.activeEpoch) || frame.type !== 'control') return
+  private onFrame(frame: Frame, epoch: number): void {
+    if (this.closed || !this.connected || epoch !== this.activeEpoch || frame.type !== 'control') return
     if (frame.msg.kind === 'Sessions') {
       this.sessions.clear(); for (const info of frame.msg.sessions) this.set(info)
       this.hasFullList = true; this.fullListAt = this.now()
