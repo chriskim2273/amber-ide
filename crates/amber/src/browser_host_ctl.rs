@@ -272,6 +272,13 @@ pub fn status(root: &Path, socket: &Path) -> HostStatus {
 }
 
 pub fn enable(root: &Path) -> anyhow::Result<()> {
+    enable_for_platform(root, platform_name())
+}
+
+fn enable_for_platform(root: &Path, platform: &str) -> anyhow::Result<()> {
+    if platform == "unsupported" {
+        bail!("BROWSER_HOST_UNSUPPORTED: browser host launching is not supported on Windows");
+    }
     #[cfg(unix)]
     if !private_directory(root) {
         bail!("browser host state directory must be current-user owned mode 0700 and not a symlink");
@@ -438,6 +445,17 @@ mod tests {
         fs::write(dir.path().join(INHIBIT_FILE), "stopped").unwrap();
         enable(dir.path()).unwrap();
         assert!(!dir.path().join(INHIBIT_FILE).exists());
+    }
+
+    #[test]
+    fn unsupported_enable_fails_before_mutating_the_inhibit() {
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        secure_root(dir.path());
+        fs::write(dir.path().join(INHIBIT_FILE), "stopped").unwrap();
+        let error = enable_for_platform(dir.path(), "unsupported").unwrap_err();
+        assert!(error.to_string().contains("BROWSER_HOST_UNSUPPORTED"));
+        assert!(dir.path().join(INHIBIT_FILE).exists());
     }
 
     #[cfg(unix)]
