@@ -13,5 +13,12 @@ export default defineConfig({
   build: {
     outDir: resolve('out/web'),
     emptyOutDir: true,
+    // es2022: the client reaches only the owner's own tailnet browsers (the
+    // desktop IDE it mirrors already needs ES2022 class fields). The older
+    // default target chain forced esbuild's legacy lowerings, and pre-0.28.2
+    // esbuild mis-minified @xterm/xterm's `requestMode` enum bootstrap into
+    // `(void 0||(s={}))` — a strict-mode ReferenceError that killed the write
+    // pipeline the moment a TUI polled DECRQM (freebuff froze on start).
+    target: 'es2022',
   },
 })

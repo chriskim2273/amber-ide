@@ -106,5 +106,8 @@
     "qrcode": "^1.5.4",
     "react": "^18.3.0",
     "react-dom": "^18.3.0"
+  },
+  "overrides": {
+    "esbuild": "^0.28.2"
   }
 }
