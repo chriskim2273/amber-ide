@@ -28,11 +28,11 @@ EOF
 chmod +x "$TMP/bin/rustup" "$TMP/bin/cargo"
 
 FAKE_CARGO_LOG="$TMP/cargo.log" PATH="$TMP/bin:$PATH" \
-  CARGO_TARGET_DIR="$TMP/cargo-target" AMBER_DIST_DIR="$TMP/dist" \
+  CARGO_TARGET_DIR="cargo-target" AMBER_DIST_DIR="dist" \
   bash "$TMP/repo/scripts/dist.sh" >/dev/null
 
-[[ -f "$TMP/dist/amber-linux-x86_64" ]]
-[[ -f "$TMP/dist/amber-router-linux-x86_64" ]]
+[[ -f "$TMP/repo/dist/amber-linux-x86_64" ]]
+[[ -f "$TMP/repo/dist/amber-router-linux-x86_64" ]]
 grep -q -- '--bin amber-router' "$TMP/cargo.log"
 
 echo 'dist: PASS'

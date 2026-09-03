@@ -6,10 +6,14 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="${AMBER_DIST_DIR:-$ROOT/dist}"
+if [[ "$OUT" != /* ]]; then
+    OUT="$ROOT/$OUT"
+fi
 TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
 if [[ "$TARGET_DIR" != /* ]]; then
     TARGET_DIR="$ROOT/$TARGET_DIR"
 fi
+export CARGO_TARGET_DIR="$TARGET_DIR"
 mkdir -p "$OUT"
 
 build_linux() {
