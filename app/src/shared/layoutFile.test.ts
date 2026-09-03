@@ -10,6 +10,8 @@ describe('layout v2 tab browser compatibility', () => {
     expect(parsed.version).toBe(2)
     expect(parsed.browserRevision).toBe(4)
     expect(parsed.workspaces['1']!.tabs['1']!.browser?.id).toBe('browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')
+    const clamped = parseLayout(JSON.stringify({ version: 2, activeWorkspace: 1, workspaces: { '1': { activeTab: 1, tabs: { '1': { tree: null, browser: { id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', width: 1200, collapsed: false } } } } } }))
+    expect(clamped.workspaces['1']!.tabs['1']!.browser?.width).toBe(900)
   })
 })
 

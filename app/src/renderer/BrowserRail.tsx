@@ -1,11 +1,16 @@
 import { useEffect, useRef, useState } from 'react'
+import { clampBrowserViewport } from '../shared/browserViewport'
 import {
   BROWSER_VIEWPORT_PRESETS,
-  MAX_RAIL_WIDTH,
   MIN_RAIL_WIDTH,
+  MIN_TERMINAL_WIDTH,
   clampRailWidth,
   formatLastPiAction,
   keyboardRailWidth,
+  railReloadCommand,
+  railStopCommand,
+  railWidthMetrics,
+  reclampedRailWidth,
   railSecurity,
   railStatusLines,
   secondsRemaining,
@@ -42,6 +47,7 @@ export function BrowserRail(props: {
   const [customWidth, setCustomWidth] = useState('1280'), [customHeight, setCustomHeight] = useState('800')
   const [autoCollapsed, setAutoCollapsed] = useState(false)
   const [capacityWaiting, setCapacityWaiting] = useState(false)
+  const [availableWidth, setAvailableWidth] = useState(1200)
 
   const command = async (value: unknown): Promise<BrowserReply> => {
     await props.ensureContext()
@@ -79,12 +85,15 @@ export function BrowserRail(props: {
   }, [props.designatedPi, props.controllers, props.onPolicy])
 
   useEffect(() => {
-    const workarea = host.current?.parentElement
+    const workarea = host.current?.closest<HTMLElement>('.tab-browser-workarea')
     if (!workarea) return
-    const update = (): void => setAutoCollapsed(workarea.clientWidth < MIN_RAIL_WIDTH + 240)
+    const update = (): void => { setAvailableWidth(workarea.clientWidth); setAutoCollapsed(workarea.clientWidth < MIN_RAIL_WIDTH + MIN_TERMINAL_WIDTH) }
     update(); const observer = new ResizeObserver(update); observer.observe(workarea)
     return () => observer.disconnect()
   }, [props.id, props.collapsed])
+
+  const widthMetrics = railWidthMetrics(props.width, availableWidth)
+  useEffect(() => { const persisted = reclampedRailWidth(props.width, availableWidth); if (!autoCollapsed && persisted !== null) props.onWidth(persisted) }, [autoCollapsed, availableWidth, props.onWidth, props.width])
 
   const presentationHidden = props.collapsed || props.temporarilyHidden || props.occluded || viewportOpen || autoCollapsed
   useEffect(() => {
@@ -99,8 +108,8 @@ export function BrowserRail(props: {
       if (!stopped && reply.ok && 'id' in reply.result) {
         acceptStatus(reply.result); setError('')
         if (responsiveViewport) {
-          const current = reply.result
-          const resized = await command({ type: 'viewport', id: props.id, pageIncarnation: current.pageIncarnation, expectedGeneration: current.generation, width: Math.max(200, bounds.width), height: Math.max(200, bounds.height) })
+          const current = reply.result, viewport = clampBrowserViewport(bounds.width, bounds.height)
+          const resized = await command({ type: 'viewport', id: props.id, pageIncarnation: current.pageIncarnation, expectedGeneration: current.generation, ...viewport })
           if (!stopped && resized.ok && 'id' in resized.result) acceptStatus(resized.result)
         }
       } else if (!stopped && !reply.ok) setError(reply.error)
@@ -117,6 +126,13 @@ export function BrowserRail(props: {
   const withLease = async (request: (lease: BrowserStatus) => unknown): Promise<void> => {
     if (!status || status.lifecycle !== 'live') return
     const reply = await command(request(status))
+    if (reply.ok && 'id' in reply.result) { acceptStatus(reply.result); setError('') } else if (!reply.ok) setError(reply.error)
+  }
+  const reloadOrRestore = async (): Promise<void> => {
+    if (!status) return
+    const rect = host.current?.getBoundingClientRect()
+    const bounds = { x: Math.round(rect?.x ?? 0), y: Math.round(rect?.y ?? 0), width: Math.max(1, Math.round(rect?.width ?? widthMetrics.width)), height: Math.max(1, Math.round(rect?.height ?? 1)) }
+    const reply = await command(railReloadCommand(status, bounds))
     if (reply.ok && 'id' in reply.result) { acceptStatus(reply.result); setError('') } else if (!reply.ok) setError(reply.error)
   }
   const navigate = async (): Promise<void> => {
@@ -138,14 +154,12 @@ export function BrowserRail(props: {
     <span className="tab-browser-collapsed-label">{props.temporarilyHidden ? 'Terminal zoom' : autoCollapsed ? 'Narrow' : 'Browser'}</span>
   </aside>
 
-  return <aside className={`tab-browser-rail${status?.focused ? ' page-focused' : ''}`} style={{ width: props.width }} aria-label="Tab browser">
+  return <aside className={`tab-browser-rail${status?.focused ? ' page-focused' : ''}`} style={{ width: widthMetrics.width, minWidth: widthMetrics.min, maxWidth: widthMetrics.max }} aria-label="Tab browser">
     <div className="tab-browser-chrome" onFocusCapture={() => { if (status?.focused) void command({ type: 'focusChrome', id: props.id }) }}>
       <div className="tab-browser-nav" role="toolbar" aria-label="Browser navigation">
         <button className="icon-btn" aria-label="Back" disabled={!status || status.lifecycle === 'frozen'} onClick={() => void withLease((lease) => ({ type: 'history', id: props.id, direction: 'back', pageIncarnation: lease.pageIncarnation, expectedGeneration: lease.generation }))}>←</button>
         <button className="icon-btn" aria-label="Forward" disabled={!status || status.lifecycle === 'frozen'} onClick={() => void withLease((lease) => ({ type: 'history', id: props.id, direction: 'forward', pageIncarnation: lease.pageIncarnation, expectedGeneration: lease.generation }))}>→</button>
-        <button className="icon-btn" aria-label={status?.loading ? 'Stop loading' : 'Reload'} onClick={() => void (status?.loading
-          ? withLease((lease) => ({ type: 'stop', id: props.id, pageIncarnation: lease.pageIncarnation, expectedGeneration: lease.generation }))
-          : withLease((lease) => ({ type: 'reload', id: props.id, pageIncarnation: lease.pageIncarnation, expectedGeneration: lease.generation })))}>{status?.loading ? '■' : '↻'}</button>
+        <button className="icon-btn" aria-label={status?.loading ? 'Stop loading' : status?.lifecycle === 'frozen' ? 'Restore browser' : 'Reload'} disabled={!status} onClick={() => void (status?.loading ? withLease((lease) => railStopCommand(lease)) : reloadOrRestore())}>{status?.loading ? '■' : '↻'}</button>
       </div>
       <span className={`tab-browser-security ${security.level}`} title={security.label} aria-label={security.label}>●</span>
       <input ref={addressInput} aria-label="Browser address" value={address} placeholder="https://…" onChange={(event) => setAddress(event.target.value.slice(0, 8192))} onKeyDown={(event) => { if (event.key === 'Enter') void navigate() }} />
@@ -174,7 +188,7 @@ export function BrowserRail(props: {
       <div className="tab-browser-custom-viewport"><input aria-label="Custom viewport width" inputMode="numeric" value={customWidth} onChange={(event) => setCustomWidth(event.target.value.slice(0, 4))} /><span>×</span><input aria-label="Custom viewport height" inputMode="numeric" value={customHeight} onChange={(event) => setCustomHeight(event.target.value.slice(0, 4))} /><button className="btn" disabled={!validateCustomViewport(customWidth, customHeight)} onClick={() => { const value = validateCustomViewport(customWidth, customHeight); if (value) void setViewport(value.width, value.height) }}>Apply</button></div>
       <button className="btn" aria-pressed={responsiveViewport} onClick={() => {
         const rect = host.current?.getBoundingClientRect(); setResponsiveViewport(true); setViewportOpen(false)
-        if (rect && status?.lifecycle === 'live') void command({ type: 'viewport', id: props.id, pageIncarnation: status.pageIncarnation, expectedGeneration: status.generation, width: Math.max(200, Math.round(rect.width)), height: Math.max(200, Math.round(rect.height)) }).then((reply) => { if (reply.ok && 'id' in reply.result) acceptStatus(reply.result) })
+        if (rect && status?.lifecycle === 'live') void command({ type: 'viewport', id: props.id, pageIncarnation: status.pageIncarnation, expectedGeneration: status.generation, ...clampBrowserViewport(rect.width, rect.height) }).then((reply) => { if (reply.ok && 'id' in reply.result) acceptStatus(reply.result) })
       }}>Responsive to rail</button>
     </div>}
     <div className="tab-browser-state" role="status" aria-live="polite">
@@ -202,12 +216,12 @@ export function BrowserRail(props: {
     </div>}
     {props.occluded && <div className="tab-browser-occluded" role="status">Browser hidden while another Amber surface is open.</div>}
     <div ref={host} className="tab-browser-page-slot" />
-    <div className="tab-browser-grip" role="separator" tabIndex={0} aria-orientation="vertical" aria-label="Resize browser rail" aria-valuemin={MIN_RAIL_WIDTH} aria-valuemax={clampRailWidth(MAX_RAIL_WIDTH, host.current?.parentElement?.clientWidth ?? 1200)} aria-valuenow={props.width} aria-valuetext={`${props.width} pixels`}
-      onKeyDown={(event) => { const width = keyboardRailWidth(props.width, event.key, host.current?.parentElement?.clientWidth ?? 1200); if (width !== null) { event.preventDefault(); props.onWidth(width) } }}
+    <div className="tab-browser-grip" role="separator" tabIndex={0} aria-orientation="vertical" aria-label="Resize browser rail" aria-valuemin={widthMetrics.min} aria-valuemax={widthMetrics.max} aria-valuenow={widthMetrics.width} aria-valuetext={`${widthMetrics.width} pixels`}
+      onKeyDown={(event) => { const width = keyboardRailWidth(widthMetrics.width, event.key, availableWidth); if (width !== null) { event.preventDefault(); props.onWidth(width) } }}
       onPointerDown={(event) => {
         event.currentTarget.setPointerCapture(event.pointerId)
-        const startX = event.clientX, startWidth = props.width, available = host.current?.parentElement?.clientWidth ?? window.innerWidth
-        const move = (next: PointerEvent): void => props.onWidth(clampRailWidth(startWidth + startX - next.clientX, available))
+        const startX = event.clientX, startWidth = widthMetrics.width
+        const move = (next: PointerEvent): void => props.onWidth(clampRailWidth(startWidth + startX - next.clientX, availableWidth))
         const up = (): void => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up) }
         window.addEventListener('pointermove', move); window.addEventListener('pointerup', up)
       }} />

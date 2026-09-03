@@ -32,7 +32,7 @@ describe('browser tool protocol', () => {
   it('rejects raw debugger/script/storage/header surfaces and every unbounded field', () => {
     for (const action of [
       { type: 'cdp', method: 'Runtime.evaluate' }, { type: 'evaluate', script: 'document.cookie' },
-      { type: 'cookies' }, { type: 'storage' }, { type: 'headers' },
+      { type: 'cookies' }, { type: 'storage' }, { type: 'headers' }, { type: 'mode', mode: 'browse', ...page },
       { type: 'snapshot', ...page, limits: { maxDepth: 21 } },
       { type: 'find', ...page, snapshotId: 'snap-1', query: { text: 'x'.repeat(4097) } },
       { type: 'find', ...page, snapshotId: 'snap-1', query: { regex: '(a+)+$' } },

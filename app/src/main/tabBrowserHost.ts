@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto'
-import { BrowserCapacity } from './tabBrowserPolicy'
+import { BrowserCapacity, navigationPolicyAllows, selectPreviewOrigin } from './tabBrowserPolicy'
 import { createBrowserId, isOpaqueBrowserId, safeRestoreUrl, type BrowserId } from '../shared/tabBrowser'
 import type { WsBrowser } from '../shared/workspaceFile'
 import type { BrowserRecord, BrowserStateFile } from '../shared/tabBrowserState'
+import { parseBrowserViewport } from '../shared/browserViewport'
 import type { BrowserAutomation, BrowserBinaryAttachment } from './browserAutomation'
 import type { BrowserInteraction, BrowserToolAction } from './browserToolProtocol'
 import { classifyInteraction, type InteractionClassification, type InteractionTargetMetadata } from './browserApproval'
@@ -10,6 +11,7 @@ import { classifyInteraction, type InteractionClassification, type InteractionTa
 export type TabBrowserPageEvent =
   | { type: 'navigation-started' }
   | { type: 'navigation-committed'; url: string }
+  | { type: 'navigation-in-page'; url: string }
   | { type: 'loading-stopped' }
   | { type: 'title'; title: string }
   | { type: 'focus'; focused: boolean }
@@ -29,7 +31,7 @@ export interface TabBrowserPage {
   destroy(): void
 }
 export interface TabBrowserPageFactory {
-  create(id: BrowserId, onUserInput: () => void, onPageEvent: (event: TabBrowserPageEvent) => void): TabBrowserPage
+  create(id: BrowserId, onUserInput: () => void, onPageEvent: (event: TabBrowserPageEvent) => void, allowNavigation: (url: string) => boolean): TabBrowserPage
 }
 export interface BrowserRuntimeStatus extends BrowserRecord {
   pageIncarnation: string; generation: number; loading: boolean; capacityWaiting?: boolean
@@ -57,7 +59,10 @@ export class TabBrowserHost {
   ) {
     // A persisted `live` bit cannot mean a renderer survived process death.
     // Restore records frozen and recreate a page only on explicit activation.
-    for (const record of Object.values(this.state.records)) if (record) record.lifecycle = 'frozen'
+    for (const record of Object.values(this.state.records)) if (record) {
+      record.lifecycle = 'frozen'
+      if (record.mode === 'preview' && record.safeRestoreUrl !== 'about:blank' && !navigationPolicyAllows('preview', record.previewOrigins ?? [], record.safeRestoreUrl)) record.previewOrigins = selectPreviewOrigin(record.previewOrigins ?? [], record.safeRestoreUrl)
+    }
   }
 
   private record(id: string): BrowserRecord {
@@ -73,12 +78,18 @@ export class TabBrowserHost {
       id,
       () => { runtime.generation += 1; runtime.page.automation?.invalidate(); this.onStateChange(); this.emitRuntime(id) },
       (event) => this.pageEvent(id, runtime, event),
+      (url) => this.navigationAllowed(id, url),
     )
     runtime = { page, incarnation: randomUUID(), generation: 0, loading: false, automationNavigationPending: false, visible: false,
       currentUrl: this.record(id).safeRestoreUrl, focused: false, restoredAfterFreeze, diagnostics: { consoleIssues: 0, networkFailures: 0 } }
     this.runtimes.set(id, runtime)
     this.capacity.markLive(id, this.now())
     return runtime
+  }
+
+  private navigationAllowed(id: BrowserId, url: string): boolean {
+    const record = this.state.records[id]
+    return !!record && navigationPolicyAllows(record.mode, record.previewOrigins ?? [], url)
   }
 
   private pageEvent(id: BrowserId, runtime: Runtime, event: TabBrowserPageEvent): void {
@@ -89,11 +100,18 @@ export class TabBrowserHost {
       else if (!runtime.loading) runtime.generation += 1
       runtime.page.automation?.invalidate()
       runtime.loading = true
-    } else if (event.type === 'navigation-committed') {
+    } else if (event.type === 'navigation-committed' || event.type === 'navigation-in-page') {
+      const currentUrl = event.url.slice(0, 8192)
+      if (!this.navigationAllowed(id, currentUrl)) {
+        runtime.page.stop(); runtime.page.destroy(); this.runtimes.delete(id); this.capacity.markFrozen(id)
+        record.lifecycle = 'frozen'; record.restoreError = 'Navigation blocked by browser mode'; record.stateRevision += 1
+        this.onStateChange(); this.emitRuntime(id); return
+      }
+      if (event.type === 'navigation-in-page') { if (!runtime.loading) runtime.generation += 1; runtime.page.automation?.invalidate() }
       runtime.automationNavigationPending = false
       runtime.loading = false
-      runtime.currentUrl = event.url.slice(0, 8192)
-      record.safeRestoreUrl = safeRestoreUrl(event.url)
+      runtime.currentUrl = currentUrl
+      record.safeRestoreUrl = safeRestoreUrl(currentUrl)
       record.lastUsedAt = this.now()
       record.stateRevision += 1
     } else if (event.type === 'loading-stopped') {
@@ -179,8 +197,11 @@ export class TabBrowserHost {
   hide(id: string): void { const record = this.record(id); const runtime = this.runtimes.get(record.id); runtime?.page.hide(); if (runtime) { runtime.visible = false; runtime.focused = false }; this.capacity.protect(record.id, false); this.emitRuntime(record.id) }
   isVisible(id: string): boolean { return isOpaqueBrowserId(id) && this.runtimes.get(id)?.visible === true }
 
-  setMode(id: string, mode: 'preview' | 'browse'): BrowserRuntimeStatus {
-    const record = this.record(id); record.mode = mode; record.stateRevision += 1; this.onStateChange(); this.emitRuntime(record.id); return this.status(record.id)
+  setMode(id: string, mode: 'preview' | 'browse', source: 'user' | 'broker' = 'user'): BrowserRuntimeStatus {
+    if (source !== 'user') throw new Error('NAVIGATION_BLOCKED')
+    const record = this.record(id), runtime = this.runtimes.get(record.id)
+    if (mode === 'preview' && runtime?.currentUrl && runtime.currentUrl !== 'about:blank' && !navigationPolicyAllows('preview', record.previewOrigins ?? [], runtime.currentUrl)) record.previewOrigins = selectPreviewOrigin(record.previewOrigins ?? [], runtime.currentUrl)
+    record.mode = mode; record.stateRevision += 1; this.onStateChange(); this.emitRuntime(record.id); return this.status(record.id)
   }
 
   focusPage(id: string): BrowserRuntimeStatus {
@@ -198,14 +219,22 @@ export class TabBrowserHost {
     const record = this.record(id); this.runtimes.get(record.id)?.page.setBounds?.(bounds)
   }
 
-  async navigate(id: string, url: string, incarnation: string, generation: number, signal?: AbortSignal): Promise<BrowserRuntimeStatus> {
+  async navigate(id: string, url: string, incarnation: string, generation: number, signal?: AbortSignal, source: 'user' | 'broker' = 'user'): Promise<BrowserRuntimeStatus> {
     const record = this.record(id)
     const runtime = this.runtimes.get(record.id)
     if (!runtime || runtime.incarnation !== incarnation || runtime.generation !== generation) throw new Error('STALE_GENERATION')
-    const parsed = new URL(url)
+    let parsed: URL
+    try { parsed = new URL(url) } catch { throw new Error('NAVIGATION_BLOCKED') }
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') throw new Error('NAVIGATION_BLOCKED')
+    const priorOrigins = record.previewOrigins ? [...record.previewOrigins] : undefined
+    if (record.mode === 'preview' && !navigationPolicyAllows(record.mode, record.previewOrigins ?? [], parsed.href)) {
+      if (source !== 'user') throw new Error('NAVIGATION_BLOCKED')
+      record.previewOrigins = selectPreviewOrigin(record.previewOrigins ?? [], parsed.href)
+    }
+    if (!this.navigationAllowed(record.id, parsed.href)) throw new Error('NAVIGATION_BLOCKED')
     if (signal?.aborted) throw new Error('ACTION_CANCELLED')
     runtime.generation += 1
+    const navigationGeneration = runtime.generation
     runtime.loading = true
     this.emitRuntime(record.id)
     let abort: (() => void) | undefined
@@ -215,10 +244,15 @@ export class TabBrowserHost {
     })
     this.capacity.protectFor(record.id, 'operation', true)
     try { await (signal ? Promise.race([runtime.page.loadURL(parsed.href), cancelled]) : runtime.page.loadURL(parsed.href)) }
+    catch (error) { if (priorOrigins) record.previewOrigins = priorOrigins; else delete record.previewOrigins; throw error }
     finally {
       this.capacity.protectFor(record.id, 'operation', false)
       runtime.loading = false
       if (abort) signal?.removeEventListener('abort', abort)
+    }
+    if (this.runtimes.get(record.id) !== runtime || runtime.generation !== navigationGeneration) {
+      if (priorOrigins) record.previewOrigins = priorOrigins; else delete record.previewOrigins
+      throw new Error(this.runtimes.get(record.id) !== runtime ? 'NAVIGATION_BLOCKED' : 'ACTION_CANCELLED')
     }
     runtime.currentUrl = parsed.href.slice(0, 8192)
     record.safeRestoreUrl = safeRestoreUrl(parsed.href)
@@ -261,7 +295,7 @@ export class TabBrowserHost {
         catch (error) { runtime.automationNavigationPending = false; throw error }
         if ((result as { accepted: boolean }).accepted) { runtime.generation += 1; generationDelta = 1 }
         else runtime.automationNavigationPending = false
-      } else { result = await automation.setViewport(action.viewport, signal); runtime.generation += 1; generationDelta = 1; record.viewport = { width: action.viewport.width, height: action.viewport.height }; record.stateRevision += 1 }
+      } else { const viewport = parseBrowserViewport(action.viewport); if (!viewport) throw new Error('INVALID_REQUEST'); result = await automation.setViewport({ ...action.viewport, ...viewport }, signal); runtime.generation += 1; generationDelta = 1; record.viewport = viewport; record.stateRevision += 1 }
     } finally { this.capacity.protectFor(record.id, 'operation', false) }
     if (signal.aborted) throw new Error('ACTION_CANCELLED')
     const expectedAfter = action.expectedGeneration + generationDelta
@@ -306,9 +340,17 @@ export class TabBrowserHost {
     try { runtime = this.makeRuntime(record.id, true) } catch (error) { this.capacity.rollbackActivation(record.id); this.onStateChange(); throw error }
     record.lifecycle = 'live'; record.stateRevision += 1
     try {
+      if (!this.navigationAllowed(record.id, record.safeRestoreUrl)) throw new Error('NAVIGATION_BLOCKED')
       if (record.safeRestoreUrl !== 'about:blank') await runtime.page.loadURL(record.safeRestoreUrl)
       if (runtime.page.automation) await runtime.page.automation.setViewport({ width: record.viewport.width, height: record.viewport.height }, signal ?? new AbortController().signal)
+      delete record.restoreError; this.onStateChange(); this.emitRuntime(record.id)
       return this.status(record.id)
+    } catch (error) {
+      runtime.page.destroy(); this.runtimes.delete(record.id); this.capacity.markFrozen(record.id)
+      const code = signal?.aborted ? 'ACTION_CANCELLED' : error instanceof Error && error.message === 'NAVIGATION_BLOCKED' ? 'NAVIGATION_BLOCKED' : 'BROWSER_RESTORE_FAILED'
+      record.lifecycle = 'frozen'; record.restoreError = code === 'NAVIGATION_BLOCKED' ? 'Navigation blocked by browser mode' : code === 'ACTION_CANCELLED' ? 'Browser restore cancelled' : 'Browser restore failed'
+      record.stateRevision += 1; this.onStateChange(); this.emitRuntime(record.id)
+      throw new Error(code)
     } finally { this.capacity.settleActivation(record.id) }
   }
 
@@ -351,10 +393,12 @@ export class TabBrowserHost {
 
   importFrozen(id: BrowserId, browser: WsBrowser): BrowserRuntimeStatus {
     if (this.state.records[id]) throw new Error('BROWSER_ID_COLLISION')
-    const at = this.now()
+    const at = this.now(), restoreUrl = safeRestoreUrl(browser.safeRestoreUrl), viewport = parseBrowserViewport(browser.viewport ?? { width: 1280, height: 800 })
+    if (!viewport) throw new Error('INVALID_REQUEST')
+    const previewOrigins = browser.mode === 'preview' && restoreUrl !== 'about:blank' && !navigationPolicyAllows('preview', [], restoreUrl) ? selectPreviewOrigin([], restoreUrl) : undefined
     this.state.records[id] = {
-      id, profileId: 'global', mode: browser.mode, safeRestoreUrl: safeRestoreUrl(browser.safeRestoreUrl), title: '',
-      viewport: browser.viewport ?? { width: 1280, height: 800 }, lifecycle: 'frozen', stateRevision: 1,
+      id, profileId: 'global', mode: browser.mode, safeRestoreUrl: restoreUrl, title: '',
+      viewport, ...(previewOrigins ? { previewOrigins } : {}), lifecycle: 'frozen', stateRevision: 1,
       lastUsedAt: at, lastFocusedAt: 0,
     }
     this.onStateChange()

@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from 'node:crypto'
 import type { BrowserElementRef, BrowserInteraction, BrowserTarget, BrowserViewport, ConsoleLevel, FindQuery, SnapshotLimits, WaitCondition } from './browserToolProtocol'
 import type { InteractionTargetMetadata } from './browserApproval'
+import { parseBrowserViewport } from '../shared/browserViewport'
 
 const SCREENSHOT_MAX_BYTES = 10 * 1024 * 1024
 const SCREENSHOT_MAX_DIMENSION = 4096
@@ -537,5 +538,5 @@ export class BrowserAutomation {
   }
   reload(ignoreCache: boolean): { accepted: boolean } { this.invalidate(); return { accepted: this.controls.reload?.(ignoreCache) !== false } }
   history(direction: 'back' | 'forward'): { accepted: boolean } { this.invalidate(); return { accepted: this.controls.history?.(direction) !== false } }
-  async setViewport(viewport: BrowserViewport, signal: AbortSignal): Promise<{ viewport: BrowserViewport }> { abort(signal); await this.ensureAttached(); await this.transport.send('Emulation.setDeviceMetricsOverride', { width: viewport.width, height: viewport.height, deviceScaleFactor: viewport.deviceScaleFactor ?? 1, mobile: viewport.mobile ?? false, screenWidth: viewport.width, screenHeight: viewport.height }); abort(signal); this.invalidate(); return { viewport } }
+  async setViewport(viewport: BrowserViewport, signal: AbortSignal): Promise<{ viewport: BrowserViewport }> { const size = parseBrowserViewport(viewport); if (!size) throw new Error('INVALID_REQUEST'); abort(signal); await this.ensureAttached(); await this.transport.send('Emulation.setDeviceMetricsOverride', { width: size.width, height: size.height, deviceScaleFactor: viewport.deviceScaleFactor ?? 1, mobile: viewport.mobile ?? false, screenWidth: size.width, screenHeight: size.height }); abort(signal); this.invalidate(); return { viewport: { ...viewport, ...size } } }
 }

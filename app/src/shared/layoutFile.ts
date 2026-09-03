@@ -1,4 +1,5 @@
 import type { Node } from '../renderer/layout'
+import { clampStoredRailWidth } from './browserRail'
 
 export const LAYOUT_VERSION = 1
 export const TAB_BROWSER_LAYOUT_VERSION = 2
@@ -120,7 +121,7 @@ function parseBrowserRail(v: unknown): BrowserRailLayout | undefined {
   if (!isPlainObj(v) || typeof v['id'] !== 'string' || !/^browser-[0-9a-f]{32}$/.test(v['id'])) return undefined
   if (typeof v['width'] !== 'number' || !Number.isFinite(v['width']) || typeof v['collapsed'] !== 'boolean') return undefined
   return {
-    id: v['id'], width: Math.min(1200, Math.max(240, v['width'])), collapsed: v['collapsed'],
+    id: v['id'], width: clampStoredRailWidth(v['width']), collapsed: v['collapsed'],
     ...(typeof v['designatedPi'] === 'string' ? { designatedPi: v['designatedPi'] } : {}),
     ...(typeof v['sharedWithPi'] === 'boolean' ? { sharedWithPi: v['sharedWithPi'] } : {}),
   }

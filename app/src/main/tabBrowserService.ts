@@ -6,7 +6,9 @@ import type { WsBrowser } from '../shared/workspaceFile'
 import { TabBrowserStateStore } from './tabBrowserStateStore'
 import type { BrowserStateFile } from '../shared/tabBrowserState'
 import type { BrowserToolAction } from './browserToolProtocol'
+import { parseBrowserViewport } from '../shared/browserViewport'
 import { BrowserApprovalCoordinator, BrowserDialogCoordinator, interactionTargetDigest, interactionValueDigest, type ApprovalDecision } from './browserApproval'
+import { navigationPolicyAllows, selectPreviewOrigin } from './tabBrowserPolicy'
 
 export type TabBrowserCommand =
   | { type: 'open' }
@@ -36,8 +38,11 @@ export function stageWorkspaceBrowserState(state: BrowserStateFile, input: Works
   const records = { ...state.records }
   for (const { id, browser } of input.entries) {
     if (records[id]) throw new Error('BROWSER_ID_COLLISION')
-    records[id] = { id, profileId: 'global', mode: browser.mode, safeRestoreUrl: safeRestoreUrl(browser.safeRestoreUrl), title: '',
-      viewport: browser.viewport ?? { width: 1280, height: 800 }, lifecycle: 'frozen', stateRevision: 1, lastUsedAt: now, lastFocusedAt: 0 }
+    const restoreUrl = safeRestoreUrl(browser.safeRestoreUrl), viewport = parseBrowserViewport(browser.viewport ?? { width: 1280, height: 800 })
+    if (!viewport) throw new Error('INVALID_REQUEST')
+    const previewOrigins = browser.mode === 'preview' && restoreUrl !== 'about:blank' && !navigationPolicyAllows('preview', [], restoreUrl) ? selectPreviewOrigin([], restoreUrl) : undefined
+    records[id] = { id, profileId: 'global', mode: browser.mode, safeRestoreUrl: restoreUrl, title: '',
+      viewport, ...(previewOrigins ? { previewOrigins } : {}), lifecycle: 'frozen', stateRevision: 1, lastUsedAt: now, lastFocusedAt: 0 }
   }
   if (state.migrationRecovery.length + input.recovery.length > 100) throw new Error('BROWSER_RECOVERY_LIMIT')
   return { ...state, records, migrationRecovery: [...state.migrationRecovery, ...input.recovery.map((item) => ({ workspace: item.ws, tab: item.tab, safeRestoreUrl: safeRestoreUrl(item.browser.safeRestoreUrl) }))] }
@@ -199,7 +204,7 @@ export class TabBrowserService {
     // every contender. Observations and hide also cannot sit behind a wait.
     if (command.type === 'hide' || command.type === 'destroy') this.activationControllers.get(command.id)?.abort()
     if (command.type === 'navigate' || command.type === 'stop') this.dialogs.clearBrowser(command.id)
-    if (command.type === 'open' || command.type === 'status' || command.type === 'hide' || command.type === 'destroy' || command.type === 'resolveApproval' || command.type === 'resolveDialog' || command.type === 'stopPi') return this.runCommand(command, signal, validate)
+    if (command.type === 'open' || command.type === 'status' || command.type === 'stop' || command.type === 'hide' || command.type === 'destroy' || command.type === 'resolveApproval' || command.type === 'resolveDialog' || command.type === 'stopPi') return this.runCommand(command, signal, validate)
     if (command.type === 'close' || command.type === 'share' || command.type === 'designate') return Promise.reject(new Error('ASSOCIATION_COMMAND_REQUIRES_MAIN'))
     const key = command.id
     const prior = this.browserQueues.get(key) ?? Promise.resolve()
@@ -219,7 +224,7 @@ export class TabBrowserService {
     const lastAction = this.latestPiActions.get(id); return { ...status, ...(lastAction ? { lastAction } : {}) }
   }
   private brokerStatus(id: string, input?: Record<string, unknown>): Record<string, unknown> {
-    const { currentUrl: _privateCurrentUrl, ...status } = this.withLatestAction(id, input ?? this.host.status(id) as unknown as Record<string, unknown>)
+    const { currentUrl: _privateCurrentUrl, previewOrigins: _privatePreviewOrigins, ...status } = this.withLatestAction(id, input ?? this.host.status(id) as unknown as Record<string, unknown>)
     return status
   }
   private piAction(id: string, controller: string, action: string, phase: 'started' | 'completed' | 'failed', error?: unknown): void {
@@ -261,7 +266,7 @@ export class TabBrowserService {
         if (command.type === 'viewport') await this.schedulePersist()
         return this.withLatestAction(command.id, this.host.status(command.id))
       }
-      case 'mode': { const status = this.host.setMode(command.id, command.mode); await this.schedulePersist(); return this.withLatestAction(command.id, status) }
+      case 'mode': { const status = this.host.setMode(command.id, command.mode, 'user'); await this.schedulePersist(); return this.withLatestAction(command.id, status) }
       case 'focusPage': return this.withLatestAction(command.id, this.host.focusPage(command.id))
       case 'focusChrome': return this.withLatestAction(command.id, this.host.focusChrome(command.id))
       case 'navigate': {
@@ -269,7 +274,7 @@ export class TabBrowserService {
         const upstreamAbort = (): void => activeOwner?.controller.abort()
         if (activeOwner) { signal?.addEventListener('abort', upstreamAbort, { once: true }); if (signal?.aborted) activeOwner.controller.abort(); const set = this.activePi.get(command.id) ?? new Set<{ controller: AbortController; owner: string }>(); set.add(activeOwner); this.activePi.set(command.id, set) }
         if (command.broker) this.piAction(command.id, command.broker.controller, 'navigate', 'started')
-        try { const status = await this.host.navigate(command.id, command.url, command.pageIncarnation, command.expectedGeneration, activeOwner?.controller.signal ?? signal); await this.schedulePersist(); if (command.broker) this.piAction(command.id, command.broker.controller, 'navigate', 'completed'); return command.broker ? this.brokerStatus(command.id, status as unknown as Record<string, unknown>) : this.withLatestAction(command.id, status) }
+        try { const status = await this.host.navigate(command.id, command.url, command.pageIncarnation, command.expectedGeneration, activeOwner?.controller.signal ?? signal, command.broker ? 'broker' : 'user'); await this.schedulePersist(); if (command.broker) this.piAction(command.id, command.broker.controller, 'navigate', 'completed'); return command.broker ? this.brokerStatus(command.id, status as unknown as Record<string, unknown>) : this.withLatestAction(command.id, status) }
         catch (error) { if (command.broker) this.piAction(command.id, command.broker.controller, 'navigate', 'failed', error); throw error }
         finally { signal?.removeEventListener('abort', upstreamAbort); const set = this.activePi.get(command.id); if (activeOwner) set?.delete(activeOwner); if (set?.size === 0) this.activePi.delete(command.id) }
       }
@@ -358,9 +363,15 @@ export function parseTabBrowserCommand(value: unknown): TabBrowserCommand {
     return { type: 'designate', ...(typeof v['designatedPi'] === 'string' ? { designatedPi: v['designatedPi'] } : {}) }
   }
   if (typeof v['id'] !== 'string' || !isOpaqueBrowserId(v['id'])) throw new Error('INVALID_REQUEST')
-  if (v['type'] === 'hide' || v['type'] === 'status' || v['type'] === 'stop' || v['type'] === 'focusPage' || v['type'] === 'focusChrome') {
+  if (v['type'] === 'hide' || v['type'] === 'status' || v['type'] === 'focusPage' || v['type'] === 'focusChrome') {
     if (!exact(v, ['type', 'id'])) throw new Error('INVALID_REQUEST')
     return { type: v['type'], id: v['id'] }
+  }
+  if (v['type'] === 'stop') {
+    if (exact(v, ['type', 'id'])) return { type: 'stop', id: v['id'] }
+    if (!exact(v, ['type', 'id', 'pageIncarnation', 'expectedGeneration']) || typeof v['pageIncarnation'] !== 'string' || v['pageIncarnation'].length < 1 || v['pageIncarnation'].length > 128
+        || typeof v['expectedGeneration'] !== 'number' || !Number.isSafeInteger(v['expectedGeneration']) || v['expectedGeneration'] < 0) throw new Error('INVALID_REQUEST')
+    return { type: 'stop', id: v['id'], pageIncarnation: v['pageIncarnation'], expectedGeneration: v['expectedGeneration'] }
   }
   if (v['type'] === 'show' || v['type'] === 'bounds') {
     if (!exact(v, ['type', 'id', 'bounds'])) throw new Error('INVALID_REQUEST')
@@ -382,11 +393,10 @@ export function parseTabBrowserCommand(value: unknown): TabBrowserCommand {
       : { type: 'history', id: v['id'], direction: v['direction'] as 'back' | 'forward', pageIncarnation: v['pageIncarnation'], expectedGeneration: v['expectedGeneration'] }
   }
   if (v['type'] === 'mode' && exact(v, ['type', 'id', 'mode']) && (v['mode'] === 'preview' || v['mode'] === 'browse')) return { type: 'mode', id: v['id'], mode: v['mode'] }
-  if (v['type'] === 'viewport' && exact(v, ['type', 'id', 'pageIncarnation', 'expectedGeneration', 'width', 'height'])
+  const viewport = v['type'] === 'viewport' ? parseBrowserViewport({ width: v['width'], height: v['height'] }) : null
+  if (v['type'] === 'viewport' && viewport && exact(v, ['type', 'id', 'pageIncarnation', 'expectedGeneration', 'width', 'height'])
       && typeof v['pageIncarnation'] === 'string' && v['pageIncarnation'].length >= 1 && v['pageIncarnation'].length <= 128
-      && typeof v['expectedGeneration'] === 'number' && Number.isSafeInteger(v['expectedGeneration']) && v['expectedGeneration'] >= 0
-      && typeof v['width'] === 'number' && Number.isSafeInteger(v['width']) && v['width'] >= 200 && v['width'] <= 4096
-      && typeof v['height'] === 'number' && Number.isSafeInteger(v['height']) && v['height'] >= 200 && v['height'] <= 4096) return { type: 'viewport', id: v['id'], pageIncarnation: v['pageIncarnation'], expectedGeneration: v['expectedGeneration'], width: v['width'], height: v['height'] }
+      && typeof v['expectedGeneration'] === 'number' && Number.isSafeInteger(v['expectedGeneration']) && v['expectedGeneration'] >= 0) return { type: 'viewport', id: v['id'], pageIncarnation: v['pageIncarnation'], expectedGeneration: v['expectedGeneration'], ...viewport }
   if (v['type'] === 'navigate' && exact(v, ['type', 'id', 'url', 'pageIncarnation', 'expectedGeneration'])
       && typeof v['url'] === 'string' && v['url'].length <= 8192 && typeof v['pageIncarnation'] === 'string' && v['pageIncarnation'].length <= 128
       && typeof v['expectedGeneration'] === 'number' && Number.isSafeInteger(v['expectedGeneration']) && v['expectedGeneration'] >= 0) {

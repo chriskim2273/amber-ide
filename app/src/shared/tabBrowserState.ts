@@ -1,4 +1,5 @@
 import { isOpaqueBrowserId, safeRestoreUrl, type BrowserId } from './tabBrowser'
+import { parseBrowserViewport } from './browserViewport'
 
 export const BROWSER_STATE_VERSION = 1
 export const BROWSER_STATE_RECORD_MAX = 1000
@@ -18,6 +19,7 @@ export interface BrowserRecord {
   safeRestoreUrl: string
   title: string
   viewport: { width: number; height: number }
+  previewOrigins?: string[]
   lifecycle: 'live' | 'frozen'
   stateRevision: number
   lastUsedAt: number
@@ -48,6 +50,20 @@ function object(value: unknown): Record<string, unknown> | null {
 
 function finite(value: unknown): value is number { return typeof value === 'number' && Number.isFinite(value) }
 
+function previewOrigins(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  const out: string[] = []
+  for (const candidate of value.slice(0, 32)) {
+    if (typeof candidate !== 'string' || candidate.length > 256) continue
+    try {
+      const url = new URL(candidate)
+      if ((url.protocol !== 'http:' && url.protocol !== 'https:') || url.origin !== candidate || out.includes(candidate)) continue
+      out.push(candidate)
+    } catch { /* malformed origins are ignored independently */ }
+  }
+  return out
+}
+
 export function emptyBrowserState(now = Date.now()): BrowserStateFile {
   return {
     version: 1, revision: 0, layoutRevision: 0,
@@ -58,17 +74,19 @@ export function emptyBrowserState(now = Date.now()): BrowserStateFile {
 
 function record(value: unknown, key: string): BrowserRecord | null {
   const v = object(value)
-  const viewport = object(v?.['viewport'])
+  const viewport = parseBrowserViewport(v?.['viewport'])
+  const parsedPreviewOrigins = previewOrigins(v?.['previewOrigins'])
   if (!v || !isOpaqueBrowserId(key) || v['id'] !== key || v['profileId'] !== 'global') return null
   if (v['mode'] !== 'preview' && v['mode'] !== 'browse') return null
   if (v['lifecycle'] !== 'live' && v['lifecycle'] !== 'frozen') return null
   if (typeof v['safeRestoreUrl'] !== 'string' || typeof v['title'] !== 'string') return null
-  if (!viewport || !finite(viewport['width']) || !finite(viewport['height'])) return null
+  if (!viewport) return null
   if (!finite(v['stateRevision']) || !finite(v['lastUsedAt']) || !finite(v['lastFocusedAt'])) return null
   return {
     id: key, profileId: 'global', mode: v['mode'],
     safeRestoreUrl: safeRestoreUrl(v['safeRestoreUrl']), title: v['title'].slice(0, 512),
-    viewport: { width: Math.min(4096, Math.max(320, viewport['width'])), height: Math.min(4096, Math.max(240, viewport['height'])) },
+    viewport,
+    ...(parsedPreviewOrigins.length > 0 ? { previewOrigins: parsedPreviewOrigins } : {}),
     lifecycle: v['lifecycle'], stateRevision: v['stateRevision'], lastUsedAt: v['lastUsedAt'], lastFocusedAt: v['lastFocusedAt'],
     ...(typeof v['restoreError'] === 'string' ? { restoreError: v['restoreError'].slice(0, 1024) } : {}),
   }

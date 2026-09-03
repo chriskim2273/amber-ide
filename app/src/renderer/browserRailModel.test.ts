@@ -4,6 +4,10 @@ import {
   clampRailWidth,
   formatLastPiAction,
   keyboardRailWidth,
+  railReloadCommand,
+  reclampedRailWidth,
+  railStopCommand,
+  railWidthMetrics,
   railSecurity,
   railStatusLines,
   secondsRemaining,
@@ -26,6 +30,21 @@ describe('browser rail approval/action presentation', () => {
 })
 
 describe('browser rail product state', () => {
+  it('uses one rendered width calculation for style, pointer, keyboard, and ARIA', () => {
+    expect(railWidthMetrics(900, 800)).toEqual({ min: 280, max: 560, width: 560 })
+    expect(railWidthMetrics(50, 1200)).toEqual({ min: 280, max: 900, width: 280 })
+    expect(railWidthMetrics(5000, 1200)).toEqual({ min: 280, max: 900, width: 900 })
+    expect(reclampedRailWidth(900, 800)).toBe(560)
+    expect(reclampedRailWidth(560, 800)).toBeNull()
+  })
+
+  it('builds parser-compatible stop and live/frozen reload commands', () => {
+    const live = { id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', pageIncarnation: 'page-a', generation: 4, lifecycle: 'live' as const }
+    expect(railStopCommand(live)).toEqual({ type: 'stop', id: live.id, pageIncarnation: 'page-a', expectedGeneration: 4 })
+    expect(railReloadCommand(live, { x: 1, y: 2, width: 300, height: 400 })).toEqual({ type: 'reload', id: live.id, pageIncarnation: 'page-a', expectedGeneration: 4 })
+    expect(railReloadCommand({ ...live, lifecycle: 'frozen' }, { x: 1, y: 2, width: 300, height: 400 })).toEqual({ type: 'show', id: live.id, bounds: { x: 1, y: 2, width: 300, height: 400 } })
+  })
+
   it('clamps pointer and keyboard resizing while preserving terminal space', () => {
     expect(clampRailWidth(50, 1200)).toBe(280)
     expect(clampRailWidth(2000, 1200)).toBe(900)

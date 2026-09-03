@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { BrowserCapacity, browserWebPreferences, isAllowedBrowserUrl } from './tabBrowserPolicy'
+import { BrowserCapacity, browserWebPreferences, isAllowedBrowserUrl, navigationOrigin, navigationPolicyAllows, selectPreviewOrigin } from './tabBrowserPolicy'
 
 describe('browser security policy', () => {
   it('creates hardened remote preferences', () => {
@@ -11,6 +11,23 @@ describe('browser security policy', () => {
     expect(isAllowedBrowserUrl('about:blank')).toBe(true)
     expect(isAllowedBrowserUrl('file:///etc/passwd')).toBe(false)
     expect(isAllowedBrowserUrl('javascript:alert(1)')).toBe(false)
+  })
+  it('centralizes Browse and Preview origin policy for paths and redirects', () => {
+    expect(navigationPolicyAllows('browse', [], 'https://any.example/path')).toBe(true)
+    expect(navigationPolicyAllows('preview', [], 'http://localhost:3000/path')).toBe(true)
+    expect(navigationPolicyAllows('preview', [], 'http://127.9.8.7:4000/path')).toBe(true)
+    expect(navigationPolicyAllows('preview', [], 'http://[::1]:5000/path')).toBe(true)
+    expect(navigationPolicyAllows('preview', [], 'https://dev.example/path')).toBe(false)
+    expect(navigationPolicyAllows('preview', ['https://dev.example'], 'https://dev.example/other?q=1')).toBe(true)
+    expect(navigationPolicyAllows('preview', ['https://dev.example'], 'https://redirect.example/')).toBe(false)
+    expect(navigationPolicyAllows('preview', ['https://dev.example'], 'javascript:alert(1)')).toBe(false)
+  })
+  it('records only bounded explicit user-selected Preview origins', () => {
+    expect(navigationOrigin('https://dev.example/a')).toBe('https://dev.example')
+    expect(selectPreviewOrigin([], 'https://dev.example/a')).toEqual(['https://dev.example'])
+    expect(selectPreviewOrigin(['https://dev.example'], 'https://dev.example/b')).toEqual(['https://dev.example'])
+    expect(() => selectPreviewOrigin([], 'file:///tmp/site')).toThrow('NAVIGATION_BLOCKED')
+    expect(() => selectPreviewOrigin(Array.from({ length: 32 }, (_, index) => `https://dev-${index}.example`), 'https://overflow.example')).toThrow('PREVIEW_ORIGIN_LIMIT')
   })
 })
 

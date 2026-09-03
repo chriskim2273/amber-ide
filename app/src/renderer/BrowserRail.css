@@ -1,6 +1,6 @@
 .tab-browser-workarea { position: relative; min-height: 0; flex: 1; display: flex; overflow: hidden; }
 .tab-browser-workarea > .pane-stage { position: relative; flex: 1; min-width: 240px; min-height: 0; }
-.tab-browser-rail { position: relative; flex: 0 0 auto; min-width: 280px; max-width: min(70vw, 900px); height: 100%; border-left: 1px solid var(--border); background: var(--bg, #101014); display: flex; flex-direction: column; }
+.tab-browser-rail { position: relative; flex: 0 0 auto; height: 100%; border-left: 1px solid var(--border); background: var(--bg, #101014); display: flex; flex-direction: column; }
 .tab-browser-rail.page-focused { border-left-color: var(--accent); box-shadow: inset 2px 0 var(--accent); }
 .tab-browser-rail.collapsed { min-width: 36px; width: 36px; padding-top: 6px; align-items: center; gap: 8px; }
 .tab-browser-collapsed-label { color: var(--muted); font-size: 10px; writing-mode: vertical-rl; text-orientation: mixed; }
@@ -31,7 +31,6 @@
 .tab-browser-remote-unavailable { flex: 0 0 280px; max-width: 32vw; padding: 16px; border-left: 1px solid var(--border); color: var(--muted); background: var(--surface, #17171d); font-size: 12px; line-height: 1.5; }
 @media (max-width: 760px) {
   .tab-browser-tools { align-content: flex-start; }
-  .tab-browser-rail:not(.collapsed) { max-width: calc(100vw - 240px); }
   .tab-browser-chrome .btn { padding-inline: 7px; }
 }
 @media (prefers-reduced-motion: reduce) {

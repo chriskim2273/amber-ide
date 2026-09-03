@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { TabBrowserHost, type TabBrowserPage, type TabBrowserPageEvent, type TabBrowserPageFactory } from './tabBrowserHost'
-import { emptyBrowserState } from '../shared/tabBrowserState'
+import { emptyBrowserState, parseBrowserState } from '../shared/tabBrowserState'
 import type { BrowserAutomation } from './browserAutomation'
 
 class FakePage implements TabBrowserPage {
@@ -14,7 +14,8 @@ class FakePage implements TabBrowserPage {
 
 const userInputs = new Map<string, () => void>()
 const pageEvents = new Map<string, (event: TabBrowserPageEvent) => void>()
-const factory: TabBrowserPageFactory = { create: (id, onUserInput, onPageEvent) => { userInputs.set(id, onUserInput); pageEvents.set(id, onPageEvent); return new FakePage() } }
+const pagePolicies = new Map<string, (url: string) => boolean>()
+const factory: TabBrowserPageFactory = { create: (id, onUserInput, onPageEvent, allowNavigation) => { userInputs.set(id, onUserInput); pageEvents.set(id, onPageEvent); pagePolicies.set(id, allowNavigation); return new FakePage() } }
 
 describe('TabBrowserHost', () => {
   it('normalizes persisted live records to frozen until a renderer is recreated', () => {
@@ -54,6 +55,37 @@ describe('TabBrowserHost', () => {
     host.freeze(opened.status.id)
     const thawed = await host.thaw(opened.status.id)
     expect(thawed).toMatchObject({ lifecycle: 'live', restoredAfterFreeze: true, currentUrl: 'https://example.test/private' })
+  })
+
+  it('projects bounded main-frame in-page navigation and persists its safe restore URL', async () => {
+    const changes = vi.fn(), host = new TabBrowserHost(emptyBrowserState(1), factory, () => 50, undefined, changes)
+    const opened = await host.open({ visible: true }); const before = opened.status.generation
+    pageEvents.get(opened.status.id)!({ type: 'navigation-in-page', url: 'https://example.test/app/next?token=secret#section' })
+    expect(host.status(opened.status.id)).toMatchObject({ currentUrl: 'https://example.test/app/next?token=secret#section', safeRestoreUrl: 'https://example.test/app/next', generation: before + 1 })
+    expect(changes).toHaveBeenCalled()
+  })
+
+  it('enforces Preview policy for user selections, broker requests, redirects, and mode changes', async () => {
+    const host = new TabBrowserHost(emptyBrowserState(1), factory)
+    const opened = await host.open({ visible: true }); const id = opened.status.id
+    host.setMode(id, 'preview')
+    await expect(host.navigate(id, 'https://dev.example/app', host.status(id).pageIncarnation, host.status(id).generation, undefined, 'broker')).rejects.toThrow('NAVIGATION_BLOCKED')
+    await host.navigate(id, 'https://dev.example/app', host.status(id).pageIncarnation, host.status(id).generation, undefined, 'user')
+    expect(host.snapshot().records[id]?.previewOrigins).toEqual(['https://dev.example'])
+    const beforeSpa = host.status(id).generation
+    pageEvents.get(id)!({ type: 'navigation-in-page', url: 'https://dev.example/spa?secret=1#route' })
+    expect(host.status(id)).toMatchObject({ generation: beforeSpa + 1, currentUrl: 'https://dev.example/spa?secret=1#route', safeRestoreUrl: 'https://dev.example/spa' })
+    expect(pagePolicies.get(id)!('https://dev.example/redirected')).toBe(true)
+    expect(pagePolicies.get(id)!('https://other.example/redirected')).toBe(false)
+    expect(pagePolicies.get(id)!('http://localhost:4000/path')).toBe(true)
+    host.setMode(id, 'browse')
+    expect(pagePolicies.get(id)!('https://other.example/path')).toBe(true)
+    host.setMode(id, 'preview')
+    expect(() => host.setMode(id, 'browse', 'broker')).toThrow('NAVIGATION_BLOCKED')
+    expect(pagePolicies.get(id)!('https://dev.example/path')).toBe(true)
+    expect(pagePolicies.get(id)!('https://other.example/path')).toBe(false)
+    pageEvents.get(id)!({ type: 'navigation-committed', url: 'https://other.example/escaped' })
+    expect(host.status(id)).toMatchObject({ lifecycle: 'frozen', safeRestoreUrl: 'https://dev.example/spa', restoreError: 'Navigation blocked by browser mode' })
   })
 
   it('projects a dialog with an exact response channel and invalidates page generation', async () => {
@@ -179,6 +211,41 @@ describe('TabBrowserHost', () => {
     expect(host.status(visible.status.id).lifecycle).toBe('live')
   })
 
+  it('restores a crashed browser explicitly with a new incarnation and durable URL', async () => {
+    const pages: FakePage[] = []
+    const localFactory: TabBrowserPageFactory = { create: (id, onUserInput, onPageEvent, allowNavigation) => { userInputs.set(id, onUserInput); pageEvents.set(id, onPageEvent); pagePolicies.set(id, allowNavigation); const page = new FakePage(); pages.push(page); return page } }
+    const host = new TabBrowserHost(emptyBrowserState(1), localFactory)
+    const opened = await host.open({ visible: true }); const originalIncarnation = opened.status.pageIncarnation
+    await host.navigate(opened.status.id, 'https://restore.example/path?private=1', originalIncarnation, opened.status.generation, undefined, 'user')
+    pageEvents.get(opened.status.id)!({ type: 'crashed', reason: 'crashed' })
+    expect(host.status(opened.status.id)).toMatchObject({ lifecycle: 'frozen', safeRestoreUrl: 'https://restore.example/path' })
+    await host.thaw(opened.status.id); host.show(opened.status.id, { x: 1, y: 2, width: 400, height: 500 })
+    expect(host.status(opened.status.id)).toMatchObject({ lifecycle: 'live', currentUrl: 'https://restore.example/path', restoredAfterFreeze: true, visible: true })
+    expect(host.status(opened.status.id).pageIncarnation).not.toBe(originalIncarnation)
+    expect(pages.at(-1)?.url).toBe('https://restore.example/path')
+  })
+
+  it('keeps a failed explicit restore frozen with a stable recovery error', async () => {
+    const id = 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' as const, state = emptyBrowserState(1)
+    state.records[id] = { id, profileId: 'global', mode: 'browse', safeRestoreUrl: 'https://restore.example/path', title: '', viewport: { width: 800, height: 600 }, lifecycle: 'frozen', stateRevision: 1, lastUsedAt: 1, lastFocusedAt: 1 }
+    const pages: TabBrowserPageFactory = { create: () => ({ loadURL: async () => { throw new Error('secret transport detail') }, show: () => {}, hide: () => {}, stop: () => {}, destroy: () => {} }) }
+    const host = new TabBrowserHost(state, pages)
+    await expect(host.thaw(id)).rejects.toThrow('BROWSER_RESTORE_FAILED')
+    expect(host.status(id)).toMatchObject({ lifecycle: 'frozen', restoreError: 'Browser restore failed', safeRestoreUrl: 'https://restore.example/path' })
+  })
+
+  it('reapplies the exact minimum persisted viewport after parse, restart, and thaw', async () => {
+    const id = 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' as const
+    const raw = emptyBrowserState(1); raw.records[id] = { id, profileId: 'global', mode: 'browse', safeRestoreUrl: 'about:blank', title: '', viewport: { width: 200, height: 200 }, lifecycle: 'live', stateRevision: 1, lastUsedAt: 1, lastFocusedAt: 1 }
+    const restored = parseBrowserState(JSON.stringify(raw)), setViewport = vi.fn(async (viewport: { width: number; height: number }) => ({ viewport }))
+    const localFactory: TabBrowserPageFactory = { create: () => { const page = new FakePage() as FakePage & { automation: BrowserAutomation }; page.automation = { setViewport } as unknown as BrowserAutomation; return page } }
+    const host = new TabBrowserHost(restored, localFactory)
+    expect(host.status(id)).toMatchObject({ lifecycle: 'frozen', viewport: { width: 200, height: 200 } })
+    await host.thaw(id)
+    expect(setViewport).toHaveBeenCalledWith({ width: 200, height: 200 }, expect.any(AbortSignal))
+    expect(host.status(id).viewport).toEqual({ width: 200, height: 200 })
+  })
+
   it('freezes the eligible LRU fifth page and changes incarnation on thaw', async () => {
     let time = 0
     const host = new TabBrowserHost(emptyBrowserState(1), factory, () => ++time)
@@ -274,6 +341,19 @@ describe('TabBrowserHost', () => {
     await expect(host.thaw(id, undefined, () => false)).rejects.toThrow('STALE_BROWSER_CONTEXT')
     expect(creates).toBe(0)
     expect(host.status(id).lifecycle).toBe('frozen')
+  })
+
+  it('cancels an in-flight load when Stop advances its exact generation', async () => {
+    let release!: () => void
+    const localFactory: TabBrowserPageFactory = { create: () => ({ loadURL: () => new Promise<void>((resolve) => { release = resolve }), show: () => {}, hide: () => {}, stop: () => release(), destroy: () => {} }) }
+    const host = new TabBrowserHost(emptyBrowserState(1), localFactory)
+    const opened = await host.open({ visible: true }); host.setMode(opened.status.id, 'preview')
+    const current = host.status(opened.status.id)
+    const navigating = host.navigate(opened.status.id, 'https://dev.example/', current.pageIncarnation, current.generation)
+    host.stop(opened.status.id, opened.status.pageIncarnation, opened.status.generation + 1)
+    await expect(navigating).rejects.toThrow('ACTION_CANCELLED')
+    expect(host.status(opened.status.id)).toMatchObject({ lifecycle: 'live', currentUrl: 'about:blank', loading: false })
+    expect(host.snapshot().records[opened.status.id]?.previewOrigins).toBeUndefined()
   })
 
   it('stops an active page load without closing the browser', async () => {

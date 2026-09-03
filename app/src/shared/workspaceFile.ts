@@ -4,6 +4,8 @@ import { formatEditorName } from './editorName'
 import { createBrowserId, safeRestoreUrl, type BrowserId } from './tabBrowser'
 import { isDaemonSessionKind, type DaemonSessionKind } from './proto'
 import type { LayoutFile, WsLayout, TabLayout, FrozenEntry, BrowserRailLayout, EditorEntry } from './layoutFile'
+import { parseBrowserViewport } from './browserViewport'
+import { MAX_RAIL_WIDTH, MIN_RAIL_WIDTH } from './browserRail'
 
 // The `.amberws` portable workspace file. Structure (grouping/tree/labels) +
 // per-pane scrollback, versioned. Tree leaves are file-local placeholders
@@ -116,17 +118,13 @@ function parseWsBrowser(v: unknown): WsBrowser {
   const b = v as Record<string, unknown>
   if (b['mode'] !== 'preview' && b['mode'] !== 'browse') fail('browser.mode is unsupported')
   if (typeof b['safeRestoreUrl'] !== 'string') fail('browser.safeRestoreUrl must be a string')
-  const viewport = b['viewport']
-  if (viewport !== undefined && (typeof viewport !== 'object' || viewport === null || Array.isArray(viewport)
-      || typeof (viewport as Record<string, unknown>)['width'] !== 'number' || !Number.isFinite((viewport as Record<string, unknown>)['width'])
-      || typeof (viewport as Record<string, unknown>)['height'] !== 'number' || !Number.isFinite((viewport as Record<string, unknown>)['height'])
-      || ((viewport as Record<string, number>)['width'] ?? 0) < 320 || ((viewport as Record<string, number>)['width'] ?? 0) > 4096
-      || ((viewport as Record<string, number>)['height'] ?? 0) < 240 || ((viewport as Record<string, number>)['height'] ?? 0) > 4096)) fail('browser.viewport is invalid')
+  const viewport = b['viewport'] === undefined ? undefined : parseBrowserViewport(b['viewport'])
+  if (b['viewport'] !== undefined && !viewport) fail('browser.viewport is invalid')
   const width = b['width']
-  if (width !== undefined && (typeof width !== 'number' || !Number.isFinite(width) || width < 240 || width > 1200)) fail('browser.width is invalid')
+  if (width !== undefined && (typeof width !== 'number' || !Number.isSafeInteger(width) || width < MIN_RAIL_WIDTH || width > MAX_RAIL_WIDTH)) fail('browser.width is invalid')
   return {
     mode: b['mode'], safeRestoreUrl: safeRestoreUrl(b['safeRestoreUrl']),
-    ...(viewport ? { viewport: { width: Math.min(4096, Math.max(320, (viewport as { width: number }).width)), height: Math.min(4096, Math.max(240, (viewport as { height: number }).height)) } } : {}),
+    ...(viewport ? { viewport } : {}),
     ...(typeof b['collapsed'] === 'boolean' ? { collapsed: b['collapsed'] } : {}), ...(typeof width === 'number' ? { width } : {}),
   }
 }

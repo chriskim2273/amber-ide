@@ -75,6 +75,19 @@ describe('browser state parser', () => {
     expect(parsed.profiles.global.partition).toBe('persist:amber-browser')
   })
 
+  it('round-trips the shared minimum viewport and bounded Preview origins without widening it', () => {
+    const parsed = parseBrowserState(JSON.stringify({
+      version: 1, revision: 0, layoutRevision: 0,
+      profiles: { global: { id: 'global', partition: 'persist:amber-browser', createdAt: 1 } },
+      records: { 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa': {
+        id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', profileId: 'global', mode: 'preview', safeRestoreUrl: 'https://dev.example/app', title: '',
+        viewport: { width: 200, height: 200 }, previewOrigins: ['https://dev.example', 'file:///tmp', 'https://dev.example'],
+        lifecycle: 'frozen', stateRevision: 1, lastUsedAt: 1, lastFocusedAt: 1,
+      } }, migrationRecovery: [],
+    }))
+    expect(parsed.records['browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa']).toMatchObject({ viewport: { width: 200, height: 200 }, previewOrigins: ['https://dev.example'] })
+  })
+
   it('retains bounded, redacted migration recovery entries', () => {
     const parsed = parseBrowserState(JSON.stringify({
       version: 1, revision: 0, layoutRevision: 0,

@@ -1,7 +1,8 @@
+import { railWidthMetrics, MIN_RAIL_WIDTH, MAX_RAIL_WIDTH, MIN_TERMINAL_WIDTH } from '../shared/browserRail'
+import { parseBrowserViewport } from '../shared/browserViewport'
+export { railWidthMetrics, MIN_RAIL_WIDTH, MAX_RAIL_WIDTH, MIN_TERMINAL_WIDTH }
+
 export interface BrowserLastAction { action: string; phase: string; error?: string }
-export const MIN_RAIL_WIDTH = 280
-export const MAX_RAIL_WIDTH = 900
-export const MIN_TERMINAL_WIDTH = 240
 export const BROWSER_VIEWPORT_PRESETS = [
   { id: 'responsive', label: 'Responsive', viewport: null },
   { id: 'desktop', label: 'Desktop 1280 × 800', viewport: { width: 1280, height: 800 } },
@@ -18,8 +19,23 @@ export function formatLastPiAction(action: BrowserLastAction): string {
 }
 
 export function clampRailWidth(requested: number, availableWidth: number): number {
-  const availableMaximum = Math.max(MIN_RAIL_WIDTH, Math.floor(availableWidth) - MIN_TERMINAL_WIDTH)
-  return Math.min(Math.min(MAX_RAIL_WIDTH, availableMaximum), Math.max(MIN_RAIL_WIDTH, Math.round(requested)))
+  return railWidthMetrics(requested, availableWidth).width
+}
+
+export function reclampedRailWidth(requested: number, availableWidth: number): number | null {
+  const rendered = railWidthMetrics(requested, availableWidth).width
+  return rendered === requested ? null : rendered
+}
+
+interface RailPageStatus { id: string; pageIncarnation: string; generation: number; lifecycle: 'live' | 'frozen' }
+interface RailBounds { x: number; y: number; width: number; height: number }
+export function railStopCommand(status: RailPageStatus): { type: 'stop'; id: string; pageIncarnation: string; expectedGeneration: number } {
+  return { type: 'stop', id: status.id, pageIncarnation: status.pageIncarnation, expectedGeneration: status.generation }
+}
+export function railReloadCommand(status: RailPageStatus, bounds: RailBounds): { type: 'reload'; id: string; pageIncarnation: string; expectedGeneration: number } | { type: 'show'; id: string; bounds: RailBounds } {
+  return status.lifecycle === 'frozen'
+    ? { type: 'show', id: status.id, bounds }
+    : { type: 'reload', id: status.id, pageIncarnation: status.pageIncarnation, expectedGeneration: status.generation }
 }
 
 export function keyboardRailWidth(current: number, key: string, availableWidth: number): number | null {
@@ -44,8 +60,7 @@ export function railSecurity(rawUrl: string): { level: 'secure' | 'local' | 'ins
 
 export function validateCustomViewport(widthText: string, heightText: string): { width: number; height: number } | null {
   if (!/^\d{1,4}$/.test(widthText) || !/^\d{1,4}$/.test(heightText)) return null
-  const width = Number(widthText), height = Number(heightText)
-  return width >= 200 && width <= 4096 && height >= 200 && height <= 4096 ? { width, height } : null
+  return parseBrowserViewport({ width: Number(widthText), height: Number(heightText) })
 }
 
 export interface RailStatusInput {

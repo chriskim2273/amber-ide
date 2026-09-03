@@ -20,6 +20,40 @@ export function isAllowedBrowserUrl(value: string): boolean {
   } catch { return false }
 }
 
+export const MAX_PREVIEW_ORIGINS = 32
+
+export function navigationOrigin(value: string): string {
+  let url: URL
+  try { url = new URL(value) } catch { throw new Error('NAVIGATION_BLOCKED') }
+  if ((url.protocol !== 'http:' && url.protocol !== 'https:') || url.origin.length > 256) throw new Error('NAVIGATION_BLOCKED')
+  return url.origin
+}
+
+function loopback(hostname: string): boolean {
+  const normalized = hostname.toLowerCase()
+  if (normalized === 'localhost' || normalized === '[::1]') return true
+  const parts = normalized.split('.')
+  return parts.length === 4 && parts[0] === '127' && parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255)
+}
+
+/** Main-owned policy shared by direct loads, redirects, SPA projection, and broker navigation. */
+export function navigationPolicyAllows(mode: 'preview' | 'browse', previewOrigins: readonly string[], value: string): boolean {
+  if (value === 'about:blank') return true
+  let url: URL
+  try { url = new URL(value) } catch { return false }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return false
+  if (mode === 'browse') return true
+  return loopback(url.hostname) || previewOrigins.includes(url.origin)
+}
+
+/** Record an explicit trusted-renderer development-origin selection, never a broker choice. */
+export function selectPreviewOrigin(current: readonly string[], value: string): string[] {
+  const origin = navigationOrigin(value)
+  if (current.includes(origin)) return [...current]
+  if (current.length >= MAX_PREVIEW_ORIGINS) throw new Error('PREVIEW_ORIGIN_LIMIT')
+  return [...current, origin]
+}
+
 interface LiveEntry { lastUsedAt: number; protections: Set<string> }
 interface CapacityAdmission { inserted: boolean; victim?: { id: string; entry: LiveEntry }; victimFrozen: boolean }
 interface CapacityWaiter {

@@ -1,3 +1,5 @@
+import { parseBrowserViewport } from '../shared/browserViewport'
+
 export interface BrowserPageLease { pageIncarnation: string; expectedGeneration: number }
 export interface BrowserElementRef { snapshotId: string; ref: string }
 export interface BrowserRoleLocator { snapshotId: string; role: string; name?: string }
@@ -146,10 +148,11 @@ export function parseBrowserToolAction(value: unknown): BrowserToolAction {
   if (action['type'] === 'interact' && exact(action, [...BASE, 'operation'])) return { type: 'interact', ...lease, operation: interaction(action['operation']) }
   if (action['type'] === 'setViewport' && exact(action, [...BASE, 'viewport'])) {
     const viewport = record(action['viewport'])
-    if (!viewport || !exact(viewport, ['width', 'height', 'deviceScaleFactor', 'mobile'], ['width', 'height']) || !boundedInt(viewport['width'], 200, 4096) || !boundedInt(viewport['height'], 200, 4096)
+    const size = viewport ? parseBrowserViewport({ width: viewport['width'], height: viewport['height'] }) : null
+    if (!viewport || !size || !exact(viewport, ['width', 'height', 'deviceScaleFactor', 'mobile'], ['width', 'height'])
       || (viewport['deviceScaleFactor'] !== undefined && (typeof viewport['deviceScaleFactor'] !== 'number' || !Number.isFinite(viewport['deviceScaleFactor']) || viewport['deviceScaleFactor'] < 0.5 || viewport['deviceScaleFactor'] > 4))
       || (viewport['mobile'] !== undefined && typeof viewport['mobile'] !== 'boolean')) throw new Error('INVALID_REQUEST')
-    return { type: 'setViewport', ...lease, viewport: { width: viewport['width'], height: viewport['height'], ...(viewport['deviceScaleFactor'] === undefined ? {} : { deviceScaleFactor: viewport['deviceScaleFactor'] }), ...(viewport['mobile'] === undefined ? {} : { mobile: viewport['mobile'] }) } }
+    return { type: 'setViewport', ...lease, viewport: { width: size.width, height: size.height, ...(viewport['deviceScaleFactor'] === undefined ? {} : { deviceScaleFactor: viewport['deviceScaleFactor'] }), ...(viewport['mobile'] === undefined ? {} : { mobile: viewport['mobile'] }) } }
   }
   throw new Error('INVALID_REQUEST')
 }

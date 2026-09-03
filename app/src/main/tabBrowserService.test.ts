@@ -2,10 +2,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { applyBrowserRuntimeDelta, parseTabBrowserCommand, TabBrowserService } from './tabBrowserService'
+import { applyBrowserRuntimeDelta, parseTabBrowserCommand, stageWorkspaceBrowserState, TabBrowserService } from './tabBrowserService'
 import { TabBrowserStateStore } from './tabBrowserStateStore'
-import { TabBrowserHost } from './tabBrowserHost'
+import { TabBrowserHost, type TabBrowserPageEvent } from './tabBrowserHost'
 import { emptyBrowserState, type BrowserStateFile } from '../shared/tabBrowserState'
+import { railReloadCommand, railStopCommand } from '../renderer/browserRailModel'
 
 const dirs: string[] = []
 afterEach(async () => { await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true }))) })
@@ -22,6 +23,8 @@ describe('parseTabBrowserCommand', () => {
     expect(parseTabBrowserCommand({ type: 'mode', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', mode: 'preview' })).toMatchObject({ type: 'mode', mode: 'preview' })
     expect(parseTabBrowserCommand({ type: 'viewport', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', pageIncarnation: 'page', expectedGeneration: 2, width: 390, height: 844 })).toMatchObject({ type: 'viewport', width: 390, height: 844 })
     expect(parseTabBrowserCommand({ type: 'focusPage', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' })).toMatchObject({ type: 'focusPage' })
+    const stop = railStopCommand({ id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', pageIncarnation: 'page', generation: 2, lifecycle: 'live' })
+    expect(parseTabBrowserCommand(stop)).toEqual(stop)
     expect(parseTabBrowserCommand({ type: 'stopPi' }).type).toBe('stopPi')
     expect(parseTabBrowserCommand({ type: 'resolveApproval', approvalId: 'a', digest: 'a'.repeat(64), decision: 'approve-once' }).type).toBe('resolveApproval')
     expect(parseTabBrowserCommand({ type: 'resolveDialog', dialogId: 'd', digest: 'b'.repeat(64), accept: true, promptText: 'ok' }).type).toBe('resolveDialog')
@@ -35,6 +38,14 @@ describe('parseTabBrowserCommand', () => {
     expect(() => parseTabBrowserCommand({ type: 'bounds', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', bounds: { x: 0, y: 0, width: 100_000, height: 2 } })).toThrow('INVALID_REQUEST')
     expect(() => parseTabBrowserCommand({ type: 'viewport', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', pageIncarnation: 'page', expectedGeneration: 2, width: 1, height: 844 })).toThrow('INVALID_REQUEST')
     expect(() => parseTabBrowserCommand({ type: 'mode', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', mode: 'unsafe' })).toThrow('INVALID_REQUEST')
+  })
+})
+
+describe('workspace browser staging contracts', () => {
+  it('keeps minimum viewport and records an imported Preview restore origin', () => {
+    const id = 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' as const
+    const state = stageWorkspaceBrowserState(emptyBrowserState(1), { entries: [{ id, browser: { mode: 'preview', safeRestoreUrl: 'https://dev.example/app', viewport: { width: 200, height: 200 } } }], recovery: [] }, 2)
+    expect(state.records[id]).toMatchObject({ viewport: { width: 200, height: 200 }, previewOrigins: ['https://dev.example'] })
   })
 })
 
@@ -79,6 +90,19 @@ describe('TabBrowserService dispatch authorization', () => {
     expect(calls).toBe(1)
   })
 
+  it('dispatches the rail stop contract immediately so it can cancel an active load', async () => {
+    const state = emptyBrowserState(1), id = 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'; let release!: () => void; let stops = 0
+    const blocked = new Promise<void>((resolve) => { release = resolve })
+    const host = { navigate: async () => { await blocked; return { id, stateRevision: 1 } }, stop: () => { stops += 1; return { id, stateRevision: 2 } }, snapshot: () => state }
+    const Service = TabBrowserService as unknown as new (s: TabBrowserStateStore, p: { setWindow: () => void }, h: typeof host, i: typeof state) => TabBrowserService
+    const service = new Service({ update: async () => state } as unknown as TabBrowserStateStore, { setWindow: () => {} }, host, state)
+    const navigating = service.command({ type: 'navigate', id, url: 'https://example.test/', pageIncarnation: 'page', expectedGeneration: 1 })
+    await Promise.resolve()
+    const stopping = service.command(railStopCommand({ id, pageIncarnation: 'page', generation: 2, lifecycle: 'live' }))
+    await vi.waitFor(() => expect(stops).toBe(1))
+    release(); await navigating; await stopping
+  })
+
   it('revalidates a queued observation immediately before debugger dispatch', async () => {
     const state = emptyBrowserState(1); let release!: () => void; let automationCalls = 0
     const blocked = new Promise<void>((resolve) => { release = resolve })
@@ -120,12 +144,40 @@ describe('TabBrowserService dispatch authorization', () => {
   })
 
   it('reports broker navigation start and completion without exposing its URL', async () => {
-    const state = emptyBrowserState(1), id = 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', events: Array<Record<string, unknown>> = []
-    const host = { navigate: async () => ({ id, stateRevision: 1 }), snapshot: () => state }
+    const state = emptyBrowserState(1), id = 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', events: Array<Record<string, unknown>> = [], sources: string[] = []
+    const host = { navigate: async (...args: unknown[]) => { sources.push(String(args[5])); return { id, stateRevision: 1 } }, snapshot: () => state }
     const Service = TabBrowserService as unknown as new (s: TabBrowserStateStore, p: { setWindow: () => void }, h: typeof host, i: typeof state) => TabBrowserService
     const service = new Service({ update: async () => state } as unknown as TabBrowserStateStore, { setWindow: () => {} }, host, state); service.setEventSink((event) => events.push(event as Record<string, unknown>))
     await service.command({ type: 'navigate', id, url: 'https://example.test/?token=secret', pageIncarnation: 'page', expectedGeneration: 1, broker: { requestId: 'navigate-1', controller: 'amber-1-1-0-pi' } })
     expect(events.map((event) => event['phase'])).toEqual(['started', 'completed']); expect(JSON.stringify(events)).not.toContain('secret')
+    expect(sources).toEqual(['broker'])
+  })
+
+  it('marks trusted renderer navigation as user-selected for Preview policy', async () => {
+    const state = emptyBrowserState(1), id = 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'; let source = ''
+    const host = { navigate: async (...args: unknown[]) => { source = String(args[5]); return { id, stateRevision: 1 } }, snapshot: () => state }
+    const Service = TabBrowserService as unknown as new (s: TabBrowserStateStore, p: { setWindow: () => void }, h: typeof host, i: typeof state) => TabBrowserService
+    const service = new Service({ update: async () => state } as unknown as TabBrowserStateStore, { setWindow: () => {} }, host, state)
+    await service.command({ type: 'navigate', id, url: 'https://dev.example/', pageIncarnation: 'page', expectedGeneration: 1 })
+    expect(source).toBe('user')
+  })
+
+  it('runs the frozen Reload show contract through service thaw with a new page incarnation', async () => {
+    const state = emptyBrowserState(1), pages: Array<{ url: string; stopped: boolean }> = []; let emit!: (event: TabBrowserPageEvent) => void
+    const pageFactory = { create: (_id: string, _input: () => void, event: (value: TabBrowserPageEvent) => void) => { emit = event; const data = { url: 'about:blank', stopped: false }; pages.push(data); return { loadURL: async (url: string) => { data.url = url }, show: () => {}, hide: () => {}, stop: () => { data.stopped = true }, setBounds: () => {}, destroy: () => {} } } }
+    let service!: TabBrowserService
+    const host = new TabBrowserHost(state, pageFactory, Date.now, undefined, () => {}, (event) => (service as unknown as { handleHostEvent(event: unknown): void }).handleHostEvent(event))
+    const Service = TabBrowserService as unknown as new (s: TabBrowserStateStore, p: { setWindow: () => void }, h: TabBrowserHost, i: typeof state) => TabBrowserService
+    service = new Service({ update: async () => state } as unknown as TabBrowserStateStore, { setWindow: () => {} }, host, state)
+    const opened = await service.command({ type: 'open' }); if (!('id' in opened)) throw new Error('expected browser')
+    const initial = host.status(opened.id)
+    await host.navigate(opened.id, 'https://restore.example/path?secret=1', initial.pageIncarnation, initial.generation, undefined, 'user')
+    emit({ type: 'crashed', reason: 'renderer-gone' })
+    const frozen = host.status(opened.id); expect(frozen.lifecycle).toBe('frozen')
+    const restored = await service.command(railReloadCommand(frozen, { x: 1, y: 2, width: 400, height: 500 }))
+    expect(restored).toMatchObject({ id: opened.id, lifecycle: 'live', currentUrl: 'https://restore.example/path', visible: true }); expect(restored).not.toHaveProperty('restoreError')
+    expect((restored as { pageIncarnation: string }).pageIncarnation).not.toBe(initial.pageIncarnation)
+    expect(pages.at(-1)?.url).toBe('https://restore.example/path')
   })
 
   it('revalidates a capacity-waiting open and removes its provisional record after a context switch', async () => {

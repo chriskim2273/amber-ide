@@ -15,13 +15,17 @@ export function hardenBrowserSession(browserSession: Session): void {
   browserSession.on('will-download', (event) => event.preventDefault())
 }
 
+export function projectInPageNavigation(url: string, isMainFrame: boolean): TabBrowserPageEvent | null {
+  return isMainFrame ? { type: 'navigation-in-page', url: url.slice(0, 8192) } : null
+}
+
 export class ElectronTabBrowserPage implements TabBrowserPage {
   readonly view: WebContentsView
   readonly automation: BrowserAutomation
   private attached = false
   private disposing = false
   private bounds: Rectangle = { x: 0, y: 0, width: 1, height: 1 }
-  constructor(private window: BrowserWindow, partition: string, onUserInput: () => void, onPageEvent: (event: TabBrowserPageEvent) => void, private readonly onDestroy: () => void) {
+  constructor(private window: BrowserWindow, partition: string, onUserInput: () => void, onPageEvent: (event: TabBrowserPageEvent) => void, allowNavigation: (url: string) => boolean, private readonly onDestroy: () => void) {
     const browserSession = session.fromPartition(partition)
     hardenBrowserSession(browserSession)
     this.view = new WebContentsView({ webPreferences: browserWebPreferences(partition) })
@@ -48,9 +52,9 @@ export class ElectronTabBrowserPage implements TabBrowserPage {
     // and therefore no target enumeration or cross-page control surface.
     void this.automation.ensureAttached().catch(() => {})
     contents.setWindowOpenHandler(() => ({ action: 'deny' }))
-    this.view.webContents.on('will-navigate', (event, url) => { if (!isAllowedBrowserUrl(url)) event.preventDefault() })
-    this.view.webContents.on('will-redirect', (event, url) => { if (!isAllowedBrowserUrl(url)) event.preventDefault() })
-    this.view.webContents.on('will-frame-navigate', (event) => { if (!isAllowedBrowserUrl(event.url)) event.preventDefault() })
+    this.view.webContents.on('will-navigate', (event, url) => { if (!isAllowedBrowserUrl(url) || !allowNavigation(url)) event.preventDefault() })
+    this.view.webContents.on('will-redirect', (event, url) => { if (!isAllowedBrowserUrl(url) || !allowNavigation(url)) event.preventDefault() })
+    this.view.webContents.on('will-frame-navigate', (event) => { if (!isAllowedBrowserUrl(event.url) || (event.isMainFrame && !allowNavigation(event.url))) event.preventDefault() })
     this.view.webContents.on('before-input-event', (event, input) => {
       if ((input.control || input.meta) && input.shift && input.key.toLowerCase() === 'b') { event.preventDefault(); this.blur(); onPageEvent({ type: 'focus', focused: false }); return }
       onUserInput()
@@ -58,6 +62,7 @@ export class ElectronTabBrowserPage implements TabBrowserPage {
     this.view.webContents.on('before-mouse-event', onUserInput)
     this.view.webContents.on('did-start-navigation', (_event, _url, _inPlace, isMainFrame) => { if (isMainFrame) onPageEvent({ type: 'navigation-started' }) })
     this.view.webContents.on('did-navigate', (_event, url) => onPageEvent({ type: 'navigation-committed', url }))
+    this.view.webContents.on('did-navigate-in-page', (_event, url, isMainFrame) => { const projected = projectInPageNavigation(url, isMainFrame); if (projected) onPageEvent(projected) })
     this.view.webContents.on('did-stop-loading', () => onPageEvent({ type: 'loading-stopped' }))
     this.view.webContents.on('page-title-updated', (_event, title) => onPageEvent({ type: 'title', title }))
     this.view.webContents.on('focus', () => onPageEvent({ type: 'focus', focused: true }))
@@ -90,8 +95,8 @@ export class ElectronTabBrowserPageFactory implements TabBrowserPageFactory {
   readonly pages = new Map<BrowserId, ElectronTabBrowserPage>()
   constructor(private window: BrowserWindow, private readonly partition = 'persist:amber-browser') {}
   setWindow(window: BrowserWindow): void { this.window = window; for (const page of this.pages.values()) page.setWindow(window) }
-  create(id: BrowserId, onUserInput: () => void, onPageEvent: (event: TabBrowserPageEvent) => void): ElectronTabBrowserPage {
-    const page = new ElectronTabBrowserPage(this.window, this.partition, onUserInput, onPageEvent, () => this.pages.delete(id))
+  create(id: BrowserId, onUserInput: () => void, onPageEvent: (event: TabBrowserPageEvent) => void, allowNavigation: (url: string) => boolean): ElectronTabBrowserPage {
+    const page = new ElectronTabBrowserPage(this.window, this.partition, onUserInput, onPageEvent, allowNavigation, () => this.pages.delete(id))
     this.pages.set(id, page)
     return page
   }

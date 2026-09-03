@@ -24,6 +24,16 @@ describe('BrowserRail accessibility contract', () => {
     expect(html).toContain('aria-valuenow="420"')
   })
 
+  it('renders style and ARIA from the same clamped width metrics', () => {
+    const html = renderToStaticMarkup(createElement(BrowserRail, { ...props, width: 5000 }))
+    expect(html).toContain('width:900px')
+    expect(html).toContain('min-width:280px')
+    expect(html).toContain('max-width:900px')
+    expect(html).toContain('aria-valuemax="900"')
+    expect(html).toContain('aria-valuenow="900"')
+    expect(html).toContain('aria-valuetext="900 pixels"')
+  })
+
   it('labels collapsed and terminal-zoom states without mounting a page slot', () => {
     const collapsed = renderToStaticMarkup(createElement(BrowserRail, { ...props, collapsed: true }))
     expect(collapsed).toContain('aria-label="Tab browser collapsed"')
