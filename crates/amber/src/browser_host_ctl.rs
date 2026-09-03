@@ -437,14 +437,25 @@ mod tests {
             .contains("registered app"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn enable_only_clears_the_explicit_stop_inhibit() {
         let dir = tempfile::tempdir().unwrap();
         #[cfg(unix)]
         secure_root(dir.path());
         fs::write(dir.path().join(INHIBIT_FILE), "stopped").unwrap();
-        enable(dir.path()).unwrap();
+        enable_for_platform(dir.path(), "linux").unwrap();
         assert!(!dir.path().join(INHIBIT_FILE).exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_enable_is_unsupported_without_mutating_the_inhibit() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(INHIBIT_FILE), "stopped").unwrap();
+        let error = enable(dir.path()).unwrap_err();
+        assert!(error.to_string().contains("BROWSER_HOST_UNSUPPORTED"));
+        assert_eq!(fs::read_to_string(dir.path().join(INHIBIT_FILE)).unwrap(), "stopped");
     }
 
     #[test]
