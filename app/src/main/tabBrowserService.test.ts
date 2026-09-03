@@ -407,7 +407,7 @@ describe('TabBrowserService recovery persistence', () => {
   it('survives a service restart after deleting a recovery item', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'amber-recovery-delete-')); dirs.push(dir)
     const store = new TabBrowserStateStore(dir)
-    const state = { ...emptyBrowserState(1), migrationRecovery: [{ id: 'recovery-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' as const, workspace: 1, tab: 2, safeRestoreUrl: 'https://recover.test/' }] }
+    const state: BrowserStateFile = { ...emptyBrowserState(1), migrationRecovery: [{ id: 'recovery-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', workspace: 1, tab: 2, safeRestoreUrl: 'https://recover.test/' }] }
     await store.save(state)
     let service!: TabBrowserService
     const host = new TabBrowserHost(state, { create: () => { throw new Error('not used') } }, Date.now, undefined,
