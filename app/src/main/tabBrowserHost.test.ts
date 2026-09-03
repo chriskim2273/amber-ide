@@ -367,12 +367,37 @@ describe('TabBrowserHost', () => {
     await vi.waitFor(() => expect(resolveValidation).toBeTypeOf('function'))
     if (failure === 'close') host.close(victim)
     else pageEvents.get(victim)!({ type: 'crashed', reason: 'simulated crash' })
-    resolveValidation(false)
-    await expect(pending).rejects.toThrow('STALE_BROWSER_CONTEXT')
-    const expected = initial.slice(1).map((entry) => entry.id).sort()
+    resolveValidation(true)
+    const admitted = await pending
+    const expected = [...initial.slice(1).map((entry) => entry.id), admitted.status.id].sort()
     expect(host.liveIds().sort()).toEqual(expected)
     const next = (await host.open({ visible: false })).status.id
-    expect(host.liveIds().sort()).toEqual([...expected, next].sort())
+    expect(new Set(host.liveIds())).toEqual(new Set([initial[2]!.id, initial[3]!.id, admitted.status.id, next]))
+    if (failure === 'close') expect(() => host.status(victim)).toThrow('NO_BROWSER_FOR_TAB')
+    else expect(host.status(victim).lifecycle).toBe('frozen')
+  })
+
+  it.each(['close', 'crash'] as const)('completes a queued thaw when its selected victim %s before validation', async (failure) => {
+    let now = 0
+    const host = new TabBrowserHost(emptyBrowserState(1), factory, () => ++now)
+    const initial = [] as Array<{ id: string }>
+    for (let index = 0; index < 4; index++) initial.push((await host.open({ visible: false })).status)
+    const thawId = initial[0]!.id
+    host.freeze(thawId)
+    const filled = (await host.open({ visible: false })).status.id
+    expect(host.liveIds()).toContain(filled)
+
+    let resolveValidation!: (valid: boolean) => void
+    const pending = host.thaw(thawId, undefined, () => new Promise<boolean>((resolve) => { resolveValidation = resolve }))
+    await vi.waitFor(() => expect(resolveValidation).toBeTypeOf('function'))
+    const victim = initial[1]!.id
+    if (failure === 'close') host.close(victim)
+    else pageEvents.get(victim)!({ type: 'crashed', reason: 'simulated crash' })
+    resolveValidation(true)
+    await expect(pending).resolves.toMatchObject({ id: thawId, lifecycle: 'live', restoredAfterFreeze: true })
+    expect(new Set(host.liveIds())).toEqual(new Set([initial[2]!.id, initial[3]!.id, filled, thawId]))
+    const next = await host.open({ visible: false })
+    expect(new Set(host.liveIds())).toEqual(new Set([initial[3]!.id, filled, thawId, next.status.id]))
     if (failure === 'close') expect(() => host.status(victim)).toThrow('NO_BROWSER_FOR_TAB')
     else expect(host.status(victim).lifecycle).toBe('frozen')
   })

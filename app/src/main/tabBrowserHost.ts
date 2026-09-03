@@ -158,22 +158,31 @@ export class TabBrowserHost {
       activation = await this.capacity.activateQueued(id, at, signal, (waiting) => this.capacityEvent(id, waiting))
       if (validate && !(await validate())) throw new Error('STALE_BROWSER_CONTEXT')
       if (signal?.aborted) throw new Error('ACTION_CANCELLED')
-    } catch (error) { this.capacity.rollbackActivation(id); delete this.state.records[id]; this.onStateChange(); throw error }
-    if (activation.freeze && isOpaqueBrowserId(activation.freeze)) { this.capacity.markAdmissionVictimFrozen(id); this.freeze(activation.freeze) }
-    let runtime: Runtime
-    try { runtime = this.makeRuntime(id) }
-    catch (error) { this.capacity.rollbackActivation(id); delete this.state.records[id]; this.onStateChange(); throw error }
-    this.capacity.settleActivation(id)
-    if (options.visible) {
-      for (const [otherId, other] of this.runtimes) if (otherId !== id) { other.page.hide(); other.visible = false; this.capacity.protect(otherId, false) }
-      runtime.page.show(); runtime.visible = true; this.capacity.protect(id, true)
-    } else { runtime.page.hide(); runtime.visible = false }
-    return { status: this.status(id), page: runtime.page }
+      if (activation.freeze) this.freezeAdmissionVictim(id, activation.freeze)
+      const runtime = this.makeRuntime(id)
+      if (options.visible) {
+        for (const [otherId, other] of this.runtimes) if (otherId !== id) { other.page.hide(); other.visible = false; this.capacity.protect(otherId, false) }
+        runtime.page.show(); runtime.visible = true; this.capacity.protect(id, true)
+      } else { runtime.page.hide(); runtime.visible = false }
+      return { status: this.status(id), page: runtime.page }
+    } catch (error) {
+      this.capacity.rollbackActivation(id); delete this.state.records[id]; this.onStateChange(); throw error
+    } finally { this.capacity.settleActivation(id) }
   }
 
   private capacityEvent(id: BrowserId, waiting: boolean): void {
     if (waiting) this.capacityWaiting.add(id); else this.capacityWaiting.delete(id)
     this.onEvent({ type: 'capacity-wait', id, waiting }); this.onStateChange()
+  }
+
+  /** Complete an admission even when its selected victim was removed while validation awaited. */
+  private freezeAdmissionVictim(candidate: BrowserId, victim: string): void {
+    // The candidate now owns the capacity slot. Mark that ownership before
+    // touching the victim so any later rollback cannot recreate a page that has
+    // already closed or crashed.
+    this.capacity.markAdmissionVictimFrozen(candidate)
+    if (!isOpaqueBrowserId(victim) || !this.state.records[victim]) return
+    this.freeze(victim)
   }
 
   status(id: string): BrowserRuntimeStatus {
@@ -329,24 +338,22 @@ export class TabBrowserHost {
   async thaw(id: string, signal?: AbortSignal, validate?: () => boolean | Promise<boolean>): Promise<BrowserRuntimeStatus> {
     const record = this.record(id)
     if (this.runtimes.has(record.id)) return this.status(record.id)
-    const activation = await this.capacity.activateQueued(record.id, this.now(), signal, (waiting) => this.capacityEvent(record.id, waiting))
-    if (validate) {
-      let valid = false
-      try { valid = await validate() } catch (error) { this.capacity.rollbackActivation(record.id); throw error }
-      if (!valid) { this.capacity.rollbackActivation(record.id); throw new Error('STALE_BROWSER_CONTEXT') }
-    }
-    if (signal?.aborted) { this.capacity.rollbackActivation(record.id); throw new Error('ACTION_CANCELLED') }
-    if (activation.freeze && isOpaqueBrowserId(activation.freeze)) { this.capacity.markAdmissionVictimFrozen(record.id); this.freeze(activation.freeze) }
-    let runtime: Runtime
-    try { runtime = this.makeRuntime(record.id, true) } catch (error) { this.capacity.rollbackActivation(record.id); this.onStateChange(); throw error }
-    record.lifecycle = 'live'; record.stateRevision += 1
+    let activation: { freeze?: string }
+    let runtime: Runtime | undefined
     try {
+      activation = await this.capacity.activateQueued(record.id, this.now(), signal, (waiting) => this.capacityEvent(record.id, waiting))
+      if (validate && !(await validate())) throw new Error('STALE_BROWSER_CONTEXT')
+      if (signal?.aborted) throw new Error('ACTION_CANCELLED')
+      if (activation.freeze) this.freezeAdmissionVictim(record.id, activation.freeze)
+      runtime = this.makeRuntime(record.id, true)
+      record.lifecycle = 'live'; record.stateRevision += 1
       if (!this.navigationAllowed(record.id, record.safeRestoreUrl)) throw new Error('NAVIGATION_BLOCKED')
       if (record.safeRestoreUrl !== 'about:blank') await runtime.page.loadURL(record.safeRestoreUrl)
       if (runtime.page.automation) await runtime.page.automation.setViewport({ width: record.viewport.width, height: record.viewport.height }, signal ?? new AbortController().signal)
       delete record.restoreError; this.onStateChange(); this.emitRuntime(record.id)
       return this.status(record.id)
     } catch (error) {
+      if (!runtime) { this.capacity.rollbackActivation(record.id); throw error }
       runtime.page.destroy(); this.runtimes.delete(record.id); this.capacity.markFrozen(record.id)
       const code = signal?.aborted ? 'ACTION_CANCELLED' : error instanceof Error && error.message === 'NAVIGATION_BLOCKED' ? 'NAVIGATION_BLOCKED' : 'BROWSER_RESTORE_FAILED'
       record.lifecycle = 'frozen'; record.restoreError = code === 'NAVIGATION_BLOCKED' ? 'Navigation blocked by browser mode' : code === 'ACTION_CANCELLED' ? 'Browser restore cancelled' : 'Browser restore failed'
