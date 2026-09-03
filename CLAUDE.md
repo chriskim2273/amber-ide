@@ -1499,14 +1499,13 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   a disabled slot losing its model, Pi's object-vs-string models, the legacy
   id migration, `has_key` never reaching the UI, a save sending camelCase,
   `rotate-token` claiming a restart that did not happen, and the non-atomic
-  config write. **Still open: the static-musl release is UNVERIFIED** —
-  `amber-router` links `ring`, which needs a musl C toolchain, and this box has
-  no `musl-gcc` (`musl-tools` not installed); `scripts/dist.sh` exports
-  `CC_x86_64_unknown_linux_musl` when present and `app/scripts/dist.sh` asserts
-  both artifacts are static, but neither has been run. Also unrun: the
-  macOS/Windows unit paths (rendered + unit-tested only), `enable`/`disable`
-  against a real systemd, and the Windows CI binary assertion, which now needs
-  to cover three binaries and newly exercises `ring` on MSVC. Hosted `/app`
+  config write. Linux x86_64 static-musl packaging is now verified: the real
+  `npm run dist` chain builds `amber` and `amber-router`, asserts both are
+  static, and bundles both into the AppImage; the router's `ring` C build is
+  covered by the `/tmp` release gate. Still unrun: the macOS/Windows unit paths
+  (rendered + unit-tested only), `enable`/`disable` against a real systemd,
+  and the Windows CI binary assertion, which now needs to cover three binaries
+  and newly exercises `ring` on MSVC. Hosted `/app`
   (desktop view) uses the same pill/dialog: `amber web` proxies
   `/api/router/*` over the session cookie; the router bearer token never
   enters the browser, and plaintext keys only on the explicit reveal GET.
