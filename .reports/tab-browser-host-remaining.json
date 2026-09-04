@@ -38,7 +38,7 @@
     "independent review remediation makes Node/Rust legacy layout-lock parsing duplicate-safe for pid/start/token/created with reordered-field and cross-language parity coverage",
     "packaged Linux renderer catches synchronous WebGL2-unavailable addon failure and falls back to xterm DOM rendering",
     "browser automation uses the CDP Accessibility backendNodeId parameter and preserves DOM target identity",
-    "adapter-generated CDP input is excluded from the user-generation bump",
+    "source-aware bounded CDP input tokens suppress only exact adapter callbacks while physical keyboard, pointer, and composition events advance generation",
     "approval/dialog resolution preserves the acknowledged visible browser surface",
     "persisted Pi designation waits for the first complete daemon session list",
     "Electron main applies private userData/sessionData paths before the single-instance lock"
