@@ -10,6 +10,7 @@ import {
 } from '../shared/productivity'
 import { filterRecovery, type RecoveryFilter, type SearchScope } from './productivityModels'
 import { Icon } from './Icon'
+import { renamePanePickerEntry } from './panePicker'
 
 function Shell({ title, label, onClose, children }: { title: string; label: string; onClose: () => void; children: ReactNode }): JSX.Element {
   return <div className="help-overlay" onMouseDown={onClose}>
@@ -54,10 +55,15 @@ export function PanePickerDialog({ entries, onClose }: { entries: PaletteEntry[]
         else if (e.key === 'Enter') { e.preventDefault(); run(matches[selected]) }
       }} />
     <div className="productivity-list" role="listbox">
-      {matches.map((entry, index) => <button key={entry.id} className={'productivity-row' + (index === selected ? ' selected' : '')}
-        role="option" aria-selected={index === selected} onMouseEnter={() => setSelected(index)} onClick={() => run(entry)}>
-        <strong>{entry.label}</strong><small>{entry.detail}</small>
-      </button>)}
+      {matches.map((entry, index) => <div key={entry.id} className={'productivity-row pane-picker-row' + (index === selected ? ' selected' : '')}
+        role="option" aria-selected={index === selected} onMouseEnter={() => setSelected(index)}>
+        <button className="pane-picker-main" onClick={() => run(entry)}>
+          <strong>{entry.label}</strong><small>{entry.detail}</small>
+        </button>
+        {entry.rename && <button className="btn btn-ghost pane-picker-rename" onClick={(event) => {
+          event.stopPropagation(); renamePanePickerEntry(entry, onClose)
+        }}>Rename</button>}
+      </div>)}
       {matches.length === 0 && <div className="productivity-empty">No matching pane</div>}
     </div>
   </Shell>

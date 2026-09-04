@@ -53,7 +53,7 @@ vi.mock('./PressureBanners', async (importOriginal) => {
 })
 
 import { ParkedOverlay, ResourcePressureBanner } from './PressureBanners'
-import { shouldDismissContextMenu, SplitView } from './SplitView'
+import { focusSurface, shouldDismissContextMenu, SplitView } from './SplitView'
 import type { Node } from './layout'
 
 const PANE = 'amber-1-1-0-a'
@@ -445,6 +445,23 @@ async function withFakeDom<T>(body: (dom: { container: FakeElement }) => Promise
 }
 
 describe('resource-pressure renderer UI', () => {
+  it('focuses terminal, browser, and editor surfaces through one imperative seam', async () => {
+    await withFakeDom(async (dom) => {
+      const terminal = dom.container.ownerDocument.createElement('textarea')
+      dom.container.appendChild(terminal)
+      expect(focusSurface(dom.container as unknown as HTMLElement)).toBe(terminal)
+      dom.container.removeChild(terminal)
+      const browser = dom.container.ownerDocument.createElement('webview')
+      dom.container.appendChild(browser)
+      expect(focusSurface(dom.container as unknown as HTMLElement)).toBe(browser)
+      dom.container.removeChild(browser)
+      const editor = dom.container.ownerDocument.createElement('div')
+      editor.setAttribute('class', 'cm-content')
+      dom.container.appendChild(editor)
+      expect(focusSurface(dom.container as unknown as HTMLElement)).toBe(editor)
+    })
+  })
+
   it('keeps the context menu mounted through a pointer press on a menu action', async () => {
     await withFakeDom(async (dom) => {
       const menu = dom.container.ownerDocument.createElement('div')

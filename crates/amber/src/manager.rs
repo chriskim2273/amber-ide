@@ -24,9 +24,10 @@ const DEFAULT_ROWS: u16 = 24;
 const DEFAULT_COLS: u16 = 80;
 const CHILD_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Friendly titles are persisted metadata, not terminal control sequences. Keep
-/// them bounded and reject controls so every client can safely render the value
+/// them bounded in UTF-8 bytes and reject controls so every client can safely
+/// render the value
 /// in a header, picker, CLI row, or JSON response.
-const MAX_TITLE_CHARS: usize = 120;
+const MAX_TITLE_BYTES: usize = 120;
 
 /// `current_exe()` returns a `<path> (deleted)`-suffixed string, forever, once
 /// this process's own backing binary inode is unlinked (e.g. an in-place
@@ -615,18 +616,26 @@ impl SessionManager {
 
     /// Validate and normalize a user-facing title. Empty/whitespace-only
     /// values clear the title; control characters are rejected rather than
-    /// allowing a title to forge terminal/CLI output.
+    /// allowing a title to forge terminal/CLI output. The size limit is shared
+    /// with app-local title parsing: 120 UTF-8 bytes.
     pub fn validate_title(title: Option<&str>) -> anyhow::Result<Option<String>> {
         let Some(title) = title else { return Ok(None) };
         let title = title.trim();
         if title.is_empty() { return Ok(None) }
-        if title.chars().count() > MAX_TITLE_CHARS {
-            anyhow::bail!("title exceeds {MAX_TITLE_CHARS} characters");
+        if title.len() > MAX_TITLE_BYTES {
+            anyhow::bail!("title exceeds {MAX_TITLE_BYTES} UTF-8 bytes");
         }
         if title.chars().any(char::is_control) {
             anyhow::bail!("title contains a control character");
         }
         Ok(Some(title.to_string()))
+    }
+
+    /// Project persisted title data defensively even when a hand-edited legacy
+    /// record bypassed the mutation path. Restore repairs these records, while
+    /// this projection keeps a failed repair from leaking controls to clients.
+    fn safe_title(meta: &SessionMeta) -> Option<String> {
+        Self::validate_title(meta.title.as_deref()).ok().flatten()
     }
 
     /// Create a new session, persist its metadata, and track it live.
@@ -1173,13 +1182,43 @@ impl SessionManager {
         mut meta: SessionMeta,
         persist: bool,
     ) -> anyhow::Result<SessionMeta> {
+        let mut changed = false;
+        let mut kind_changed = false;
         if meta.resume_as_claude {
+            kind_changed = true;
             if meta.kind == SessionKind::Shell {
                 meta.kind = SessionKind::Claude;
             }
             meta.resume_as_claude = false;
-            if persist {
-                self.store.write_session(&meta)?;
+            changed = true;
+        }
+        if let Some(title) = meta.title.as_deref() {
+            match Self::validate_title(Some(title)) {
+                Ok(normalized) => {
+                    if normalized.as_deref() != Some(title) {
+                        meta.title = normalized;
+                        changed = true;
+                    }
+                }
+                Err(error) => {
+                    eprintln!(
+                        "amber daemon: clearing invalid friendly title for {}: {error}",
+                        meta.name
+                    );
+                    meta.title = None;
+                    changed = true;
+                }
+            }
+        }
+        if changed && persist {
+            if let Err(error) = self.store.write_session(&meta) {
+                if kind_changed {
+                    return Err(error);
+                }
+                eprintln!(
+                    "amber daemon: could not persist repaired friendly title for {}: {error}",
+                    meta.name
+                );
             }
         }
         Ok(meta)
@@ -2038,7 +2077,7 @@ impl SessionManager {
                     kind: meta.kind.as_str().to_string(),
                     alive: sess.is_alive(),
                     updated: meta.updated,
-                    title: meta.title.clone(),
+                    title: Self::safe_title(&meta),
                     run_state: match (sess.run_state(), sess.suspend_origin()) {
                         (Some(state), SuspendOrigin::Pressure) if state == "suspended" => {
                             Some("resource-suspended".to_string())
@@ -2244,6 +2283,7 @@ impl SessionManager {
         self.claude_absent.lock().unwrap().remove(from);
         drop(_transition);
         self.reconcile_cpu_weights();
+        let title = Self::safe_title(&meta);
 
         Ok(SessionInfo {
             name: meta.name,
@@ -2251,7 +2291,7 @@ impl SessionManager {
             kind: meta.kind.as_str().to_string(),
             alive: sess.is_alive(),
             updated: meta.updated,
-            title: meta.title.clone(),
+            title,
             run_state: sess.run_state(),
             claude_id: self
                 .store
@@ -4217,17 +4257,22 @@ mod tests {
                 },
             )
             .unwrap();
+        let mut metadata = mgr.store.read_session("amber-1-1-0-c").unwrap().unwrap();
+        metadata.title = Some("Agent build".into());
+        mgr.store.write_session(&metadata).unwrap();
         let before = mgr.session("amber-1-1-0-c").unwrap();
 
         let info = mgr.rename("amber-1-1-0-c", "amber-1-2-0-c").unwrap();
 
         assert_eq!(info.name, "amber-1-2-0-c");
         assert_eq!(info.kind, "claude");
+        assert_eq!(info.title.as_deref(), Some("Agent build"));
         assert_eq!(mgr.names(), vec!["amber-1-2-0-c".to_string()]);
         let after = mgr.session("amber-1-2-0-c").unwrap();
         assert!(!Arc::ptr_eq(&before, &after), "claude must be respawned");
         assert_ne!(before.pid(), after.pid(), "claude must get a fresh child");
         assert_eq!(info.slot, slot);
+        assert_eq!(mgr.store.read_session("amber-1-2-0-c").unwrap().unwrap().title.as_deref(), Some("Agent build"));
         assert!(cgroups.path().join(format!("session-{slot}")).is_dir());
         assert_eq!(
             mgr.store
@@ -4778,9 +4823,11 @@ mod tests {
         let to = "amber-1-2-0-title";
         mgr.create_with_title(from, "/tmp", SessionKind::Shell, Some("  Build monitor  "))
             .unwrap();
+        let created_updated = mgr.session_infos().unwrap()[0].updated;
         assert_eq!(mgr.session_infos().unwrap()[0].title.as_deref(), Some("Build monitor"));
 
         let updated = mgr.set_title(from, Some("Tests")).unwrap();
+        assert_eq!(updated.updated, created_updated, "title edits are not activity");
         assert_eq!(updated.title.as_deref(), Some("Tests"));
         assert_eq!(mgr.store.read_session(from).unwrap().unwrap().title.as_deref(), Some("Tests"));
 
@@ -4795,11 +4842,114 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn friendly_title_survives_restart_and_identity_rename() {
+        let dir = tempdir().unwrap();
+        {
+            let mgr = SessionManager::new(dir.path()).unwrap();
+            mgr.create_with_title(
+                "amber-1-1-0-persistent-title",
+                "/tmp",
+                SessionKind::Shell,
+                Some("Build monitor"),
+            )
+            .unwrap();
+            mgr.snapshot().unwrap();
+        }
+        {
+            let mgr = SessionManager::new(dir.path()).unwrap();
+            mgr.restore().unwrap();
+            assert_eq!(mgr.session_infos().unwrap()[0].title.as_deref(), Some("Build monitor"));
+            mgr.rename("amber-1-1-0-persistent-title", "amber-1-2-0-persistent-title")
+                .unwrap();
+            mgr.snapshot().unwrap();
+        }
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        mgr.restore().unwrap();
+        let info = mgr.session_infos().unwrap();
+        assert_eq!(info[0].name, "amber-1-2-0-persistent-title");
+        assert_eq!(info[0].title.as_deref(), Some("Build monitor"));
+        mgr.remove("amber-1-2-0-persistent-title").unwrap();
+    }
+
+    #[test]
     fn friendly_title_rejects_controls_and_absurd_lengths() {
         assert_eq!(SessionManager::validate_title(None).unwrap(), None);
         assert_eq!(SessionManager::validate_title(Some(" \t ")).unwrap(), None);
-        assert!(SessionManager::validate_title(Some("line\nnext")).is_err());
+        assert_eq!(SessionManager::validate_title(Some(&"x".repeat(120))).unwrap().unwrap().len(), 120);
         assert!(SessionManager::validate_title(Some(&"x".repeat(121))).is_err());
+        assert_eq!(SessionManager::validate_title(Some(&"é".repeat(60))).unwrap().unwrap().len(), 120);
+        assert!(SessionManager::validate_title(Some(&"é".repeat(61))).is_err());
+        assert!(SessionManager::validate_title(Some("line\nnext")).is_err());
+        assert!(SessionManager::validate_title(Some("bad\u{0085}title")).is_err());
+    }
+
+    #[test]
+    fn session_infos_never_emits_an_invalid_stored_friendly_title() {
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        mgr.create("amber-1-1-0-invalid-live-title", "/tmp", SessionKind::Shell)
+            .unwrap();
+        let mut metadata = mgr.store.read_session("amber-1-1-0-invalid-live-title").unwrap().unwrap();
+        metadata.title = Some("forged\nrow".into());
+        mgr.store.write_session(&metadata).unwrap();
+        assert_eq!(mgr.session_infos().unwrap()[0].title, None);
+        mgr.remove("amber-1-1-0-invalid-live-title").unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn restore_clears_and_persists_an_invalid_friendly_title() {
+        let dir = tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        store
+            .write_session(&SessionMeta {
+                name: "amber-1-1-0-invalid-title".into(),
+                cwd: PathBuf::from("/tmp"),
+                kind: SessionKind::Shell,
+                updated: 1,
+                title: Some("forged\nrow".into()),
+                resume_as_claude: false,
+                run_state: None,
+                slot: 1,
+            })
+            .unwrap();
+        store
+            .write_session(&SessionMeta {
+                name: "amber-1-1-1-healthy-title".into(),
+                cwd: PathBuf::from("/tmp"),
+                kind: SessionKind::Shell,
+                updated: 1,
+                title: Some("Healthy".into()),
+                resume_as_claude: false,
+                run_state: None,
+                slot: 2,
+            })
+            .unwrap();
+        store
+            .write_session(&SessionMeta {
+                name: "amber-1-1-2-overflow-title".into(),
+                cwd: PathBuf::from("/tmp"),
+                kind: SessionKind::Shell,
+                updated: 1,
+                title: Some("é".repeat(61)),
+                resume_as_claude: false,
+                run_state: None,
+                slot: 3,
+            })
+            .unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        mgr.restore().unwrap();
+        let infos = mgr.session_infos().unwrap();
+        assert_eq!(infos.len(), 3, "an invalid title must not lose its session");
+        assert_eq!(infos.iter().find(|info| info.name == "amber-1-1-0-invalid-title").unwrap().title, None);
+        assert_eq!(infos.iter().find(|info| info.name == "amber-1-1-1-healthy-title").unwrap().title.as_deref(), Some("Healthy"));
+        assert_eq!(infos.iter().find(|info| info.name == "amber-1-1-2-overflow-title").unwrap().title, None);
+        assert_eq!(store.read_session("amber-1-1-0-invalid-title").unwrap().unwrap().title, None);
+        assert_eq!(store.read_session("amber-1-1-2-overflow-title").unwrap().unwrap().title, None);
+        mgr.remove("amber-1-1-0-invalid-title").unwrap();
+        mgr.remove("amber-1-1-1-healthy-title").unwrap();
+        mgr.remove("amber-1-1-2-overflow-title").unwrap();
     }
 
     #[test]

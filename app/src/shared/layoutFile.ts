@@ -47,6 +47,23 @@ export interface LayoutFile {
   recentFiles?: string[] // most-recent-first, deduped, capped at RECENT_FILES_MAX
 }
 
+/** Drop sidecar title metadata whose app-local pane no longer exists. */
+export function pruneLocalTitles(layout: LayoutFile): LayoutFile {
+  if (!layout.titles) return layout
+  const live = new Set([
+    ...Object.keys(layout.browsers ?? {}),
+    ...Object.keys(layout.editors ?? {}),
+  ])
+  const kept = Object.fromEntries(
+    Object.entries(layout.titles).filter(([paneId]) => live.has(paneId)),
+  )
+  if (Object.keys(kept).length === Object.keys(layout.titles).length) return layout
+  if (Object.keys(kept).length > 0) return { ...layout, titles: kept }
+  const next = { ...layout }
+  delete next.titles
+  return next
+}
+
 // Shape-guard the frozen map (Task 4 lesson): reject a non-object/array top
 // level → undefined; drop non-object entries; coerce a non-string note away.
 function parseFrozen(v: unknown): Record<string, FrozenEntry> | undefined {
@@ -61,13 +78,15 @@ function parseFrozen(v: unknown): Record<string, FrozenEntry> | undefined {
 }
 
 // Friendly titles share the daemon's limits: trim outer whitespace, reject
-// blank/control values, and cap Unicode characters rather than UTF-16 units.
-// This is exported so sidecar, workspace, and interactive input all enforce the
-// same rule for app-local panes (daemon panes are validated by Rust).
+// blank/control values, and cap UTF-8 bytes rather than UTF-16 units. This is
+// exported so sidecar, workspace, and interactive input all enforce the same
+// rule for app-local panes (daemon panes are validated by Rust).
+const FRIENDLY_TITLE_MAX_BYTES = 120
+
 export function normalizeFriendlyTitle(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined
   const title = value.trim()
-  if (!title || [...title].length > 120) return undefined
+  if (!title || new TextEncoder().encode(title).length > FRIENDLY_TITLE_MAX_BYTES) return undefined
   if ([...title].some((char) => {
     const code = char.charCodeAt(0)
     return code < 0x20 || (code >= 0x7f && code <= 0x9f)

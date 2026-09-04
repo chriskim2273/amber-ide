@@ -168,6 +168,18 @@ function zoneRect(r: Rect, zone: Zone): Rect {
   }
 }
 
+export interface FocusableSurface { focus: () => void }
+
+/** Find the imperative focus target for any pane kind without remounting it. */
+export function focusSurface(
+  root: { querySelector: (selector: string) => Element | null } | null | undefined,
+): FocusableSurface | null {
+  if (!root) return null
+  return (root.querySelector('textarea')
+    ?? root.querySelector('webview')
+    ?? root.querySelector('.cm-content')) as FocusableSurface | null
+}
+
 export function SplitView(props: {
   tree: Node
   deadCodes: Record<string, number>
@@ -310,14 +322,14 @@ export function SplitView(props: {
   // (belt-and-suspenders alongside the overlay swallowing pointer events).
   const focusPane = (id: string, userInitiated = true): void => {
     if (frozenRef.current.has(id)) return
-    const input = bodyEls.current.get(id)?.querySelector('textarea')
-    if (!input) return
+    const surface = focusSurface(bodyEls.current.get(id))
+    if (!surface) return
     if (userInitiated) armFocusHint(id)
     else {
       suppressedFocusRef.current.add(id)
       requestAnimationFrame(() => suppressedFocusRef.current.delete(id))
     }
-    input.focus()
+    surface.focus()
   }
 
   // Keep-alive activation: when this tab goes hidden -> visible (parent flips

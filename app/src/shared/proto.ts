@@ -115,6 +115,8 @@ export type ControlMsg =
   | { kind: 'Kill'; name: string }
   | { kind: 'Rename'; from: string; to: string }
   | { kind: 'SetTitle'; name: string; title: string | null }
+  /** Daemon acknowledgement emitted after a title is persisted. */
+  | { kind: 'TitleSet'; name: string; title: string | null }
   | { kind: 'Suspend'; name: string }
   | { kind: 'Resume'; name: string }
   | { kind: 'Resize'; name: string; cols: number; rows: number }
@@ -208,6 +210,8 @@ function msgToJson(m: ControlMsg): unknown {
       return { Rename: { from: m.from, to: m.to } }
     case 'SetTitle':
       return { SetTitle: { name: m.name, title: m.title } }
+    case 'TitleSet':
+      return { TitleSet: { name: m.name, title: m.title } }
     case 'Suspend':
       return { Suspend: { name: m.name } }
     case 'Resume':
@@ -335,6 +339,10 @@ function jsonToMsg(v: unknown): ControlMsg | null {
       case 'Rename': return { kind: 'Rename', from: body['from'] as string, to: body['to'] as string }
       case 'SetTitle': return {
         kind: 'SetTitle', name: body['name'] as string,
+        title: body['title'] === null ? null : typeof body['title'] === 'string' ? body['title'] : null,
+      }
+      case 'TitleSet': return {
+        kind: 'TitleSet', name: body['name'] as string,
         title: body['title'] === null ? null : typeof body['title'] === 'string' ? body['title'] : null,
       }
       case 'Resize': return { kind: 'Resize', name: body['name'] as string, cols: body['cols'] as number, rows: body['rows'] as number }

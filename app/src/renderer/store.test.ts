@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { initialState, reduce, groupSessions, mergeBrowsers, isAgentKind, paneDot, tabDot, hasActivity, shouldHintTerminalFocus, shouldResumeMemoryParked, parkedOverlayText, resourcePressureMessage, type PaneModel, type WorkspaceModel } from './store'
+import { initialState, reduce, groupSessions, mergeBrowsers, mergeEditors, isAgentKind, paneDot, tabDot, hasActivity, shouldHintTerminalFocus, shouldResumeMemoryParked, parkedOverlayText, resourcePressureMessage, type PaneModel, type WorkspaceModel } from './store'
 import type { SessionInfo } from '../shared/proto'
 
 describe('mergeBrowsers', () => {
@@ -20,6 +20,16 @@ describe('mergeBrowsers', () => {
   it('is a no-op with no browser entries', () => {
     const ws: WorkspaceModel[] = [{ ws: 1, tabs: [] }]
     expect(mergeBrowsers(ws, {})).toBe(ws)
+  })
+  it('carries app-local titles through browser/editor reconciliation', () => {
+    const browser = mergeBrowsers([], {
+      'browser-1-1-0-b': { ws: 1, tab: 1, ord: 0, url: '' },
+    }, { 'browser-1-1-0-b': 'Docs' })
+    expect(browser[0]!.tabs[0]!.panes[0]!.title).toBe('Docs')
+    const editor = mergeEditors([], {
+      'editor-1-1-0-e': { ws: 1, tab: 1, ord: 0, path: null },
+    }, { 'editor-1-1-0-e': 'Notes' })
+    expect(editor[0]!.tabs[0]!.panes[0]!.title).toBe('Notes')
   })
 })
 

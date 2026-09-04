@@ -194,10 +194,12 @@ describe('parse shape-guards (drop malformed optionals silently)', () => {
     const doc = { version: 1, scope: 'one', workspaces: [{ tabs: [{ tab: 1, tree: null, panes: [
       { id: 'p0', kind: 'shell', cwd: '/a', ord: 0, title: ' Build ', scrollback: '' },
       { id: 'p1', kind: 'shell', cwd: '/b', ord: 1, title: 'bad\nname', scrollback: '' },
+      { id: 'p2', kind: 'shell', cwd: '/c', ord: 2, title: 'é'.repeat(61), scrollback: '' },
     ] }] }] }
     const panes = parseWorkspaceFile(JSON.stringify(doc)).workspaces[0]!.tabs[0]!.panes
     expect(panes[0]!.title).toBe('Build')
     expect(panes[1]!.title).toBeUndefined()
+    expect(panes[2]!.title).toBeUndefined()
   })
 
   it('drops a non-string tab label and a non-string frozenNote', () => {

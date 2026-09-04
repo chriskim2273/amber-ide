@@ -1896,6 +1896,24 @@ fn list_detailed(socket: &Path) -> anyhow::Result<Vec<amber_core::proto::Session
     }
 }
 
+/// Resolve `amber title`'s target. Unlike attach/kill/freeze, a title update
+/// first honors an exact session name even when it is numeric; only an unknown
+/// numeric token falls back to the stable slot namespace.
+fn resolve_title_target(
+    arg: &str,
+    sessions: &[amber_core::proto::SessionInfo],
+) -> anyhow::Result<String> {
+    if sessions.iter().any(|session| session.name == arg) {
+        return Ok(arg.to_string());
+    }
+    if let Ok(slot) = arg.parse::<u32>() {
+        return attach::pick_by_slot(sessions, slot)
+            .map(|session| session.name.clone())
+            .ok_or_else(|| anyhow::anyhow!("no session with slot {slot} (see `amber ls`)"));
+    }
+    anyhow::bail!("no such session: {arg}");
+}
+
 /// Resolve a CLI name-or-slot against the daemon's current listing. Missing
 /// names and missing slots are both errors (see `amber ls`).
 fn resolve_existing(socket: &Path, arg: &str) -> anyhow::Result<String> {
@@ -2026,49 +2044,67 @@ fn run_create(socket: &Path, name: &str, cwd: &Path, kind: &str, title: Option<&
 }
 
 /// `amber title <name|slot> [title]`: update daemon-owned friendly metadata.
-/// The daemon broadcasts the authoritative SessionInfo to watchers; this CLI
-/// waits for a detailed listing so it can confirm the result without inventing
-/// a title locally.
+/// The daemon sends a positive TitleSet acknowledgement only after persistence;
+/// waiting for that additive ack also gives this CLI a useful error against an
+/// older daemon that silently skips the new SetTitle request.
 fn run_title(socket: &Path, arg: &str, title: Option<&str>, clear: bool) -> anyhow::Result<()> {
+    run_title_with_ack_timeout(socket, arg, title, clear, DAEMON_REPLY_TIMEOUT)
+}
+
+fn run_title_with_ack_timeout(
+    socket: &Path,
+    arg: &str,
+    title: Option<&str>,
+    clear: bool,
+    ack_timeout: Duration,
+) -> anyhow::Result<()> {
     if clear && title.is_some() {
         anyhow::bail!("title text and --clear cannot be used together");
     }
     if !clear && title.is_none() {
         anyhow::bail!("provide title text or use --clear");
     }
-    let name = resolve_existing(socket, arg)?;
+    let sessions = list_detailed(socket)?;
+    let name = resolve_title_target(arg, &sessions)?;
     let requested = if clear { None } else { title };
     let mut stream = connect_daemon(socket)?;
     stream.write_all(&proto::encode(&Frame::Control(ControlMsg::SetTitle {
         name: name.clone(),
         title: requested.map(str::to_string),
     })))?;
-    stream.write_all(&proto::encode(&Frame::Control(ControlMsg::ListSessionsDetailed)))?;
 
+    let expected = requested
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     let mut decoder = Decoder::new();
     let mut buf = [0u8; 8192];
-    let deadline = std::time::Instant::now() + DAEMON_REPLY_TIMEOUT;
-    let mut error = None;
+    let deadline = std::time::Instant::now() + ack_timeout;
     loop {
         while let Some(frame) = decoder.next_frame()? {
             match frame {
-                Frame::Control(ControlMsg::Error { msg }) => error = Some(msg),
-                Frame::Control(ControlMsg::Sessions { sessions }) => {
-                    if let Some(msg) = error {
-                        anyhow::bail!("title failed: {msg}");
-                    }
-                    let Some(info) = sessions.into_iter().find(|s| s.name == name) else {
-                        anyhow::bail!("title failed: session {name} disappeared");
-                    };
-                    let shown = info.title.as_deref().unwrap_or("(none)");
+                Frame::Control(ControlMsg::Error { msg }) => {
+                    anyhow::bail!("title failed: {msg}");
+                }
+                Frame::Control(ControlMsg::TitleSet { name: ack_name, title: ack_title })
+                    if ack_name == name && ack_title == expected =>
+                {
+                    let shown = ack_title.as_deref().unwrap_or("(none)");
                     println!("titled {name}: {shown}");
                     return Ok(());
                 }
                 _ => {}
             }
         }
-        let n = read_daemon_reply_chunk(&mut stream, &mut buf, deadline)?;
-        if n == 0 { anyhow::bail!("daemon closed the connection before replying"); }
+        let n = match read_daemon_reply_chunk(&mut stream, &mut buf, deadline) {
+            Ok(n) => n,
+            Err(_) => anyhow::bail!(
+                "daemon does not support session titles; restart/update amber"
+            ),
+        };
+        if n == 0 {
+            anyhow::bail!("daemon does not support session titles; restart/update amber");
+        }
         decoder.feed(&buf[..n]);
     }
 }
@@ -2268,6 +2304,59 @@ mod tests {
             rows: 24,
             slot: 1,
         }
+    }
+
+    #[test]
+    fn title_target_prefers_an_exact_numeric_name_before_slot_fallback() {
+        let mut numeric_name = info("shell", true, None);
+        numeric_name.name = "3".into();
+        numeric_name.slot = 9;
+        let mut slot_name = info("shell", true, None);
+        slot_name.name = "amber-1-1-0-slot".into();
+        slot_name.slot = 3;
+        let mut fallback_slot = info("shell", true, None);
+        fallback_slot.name = "amber-1-1-0-fallback".into();
+        fallback_slot.slot = 7;
+        let sessions = vec![numeric_name, slot_name, fallback_slot];
+        assert_eq!(resolve_title_target("3", &sessions).unwrap(), "3");
+        assert_eq!(resolve_title_target("7", &sessions).unwrap(), "amber-1-1-0-fallback");
+        assert!(resolve_title_target("missing", &sessions).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn title_cli_rejects_a_daemon_without_the_title_ack() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("legacy.sock");
+        let listener = transport::bind(&socket).unwrap();
+        let mut listed = info("shell", true, None);
+        listed.name = "title-pane".into();
+        let server = std::thread::spawn(move || {
+            let mut listing = listener.accept().unwrap();
+            listing
+                .write_all(&proto::encode(&Frame::Control(ControlMsg::Sessions {
+                    sessions: vec![listed],
+                })))
+                .unwrap();
+            drop(listing);
+            let _request = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+        });
+        let error = run_title_with_ack_timeout(
+            &socket,
+            "title-pane",
+            Some("Build"),
+            false,
+            Duration::from_millis(50),
+        )
+        .unwrap_err();
+        server.join().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("daemon does not support session titles; restart/update amber"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

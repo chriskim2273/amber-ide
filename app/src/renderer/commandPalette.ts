@@ -4,6 +4,8 @@ export interface PaletteEntry {
   detail: string
   keywords: string
   run: () => void
+  /** Optional row action used by the pane picker without navigating first. */
+  rename?: () => void
 }
 
 function score(entry: PaletteEntry, raw: string): number | null {

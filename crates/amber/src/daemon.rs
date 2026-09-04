@@ -820,6 +820,17 @@ fn handle_control(
                     return;
                 }
             };
+            // The manager has persisted and returned authoritative metadata;
+            // only now acknowledge the request. The direct ack is required by
+            // newer clients to detect an older daemon that silently skipped
+            // this additive request.
+            let _ = write_frame(
+                writer,
+                &Frame::Control(ControlMsg::TitleSet {
+                    name: name.clone(),
+                    title: info.title.clone(),
+                }),
+            );
             // Title changes are metadata-only updates: keep the session name
             // stable and publish the complete authoritative SessionInfo through
             // the existing watcher delta. No optimistic client-side title state

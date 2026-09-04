@@ -2,7 +2,7 @@
  *
  * Contract (server):
  *   POST /api/auth      body = token (from the URL fragment) -> HttpOnly cookie
- *   GET  /api/sessions  -> [{name, kind, cwd, run_state, alive, title?}]
+ *   GET  /api/sessions  -> {sessions:[{name, kind, cwd, run_state, alive, title?}], layout}
  *   GET  /ws            JSON TEXT control frames + raw BINARY pty bytes
  *     up:   {t:'open',name} | {t:'close',name} | {t:'set-title',name,title} | BINARY = input bytes
  *     down: BINARY = pty output | {t:'sessions',sessions} | {t:'exit',name,code}
@@ -239,6 +239,10 @@ function main() {
     return sessions.filter(function (x) { return x.name === name; })[0] || null;
   }
 
+  function sessionKindLabel(kind) {
+    return kind || 'shell';
+  }
+
   function sessionTitle(s) {
     return s && s.title && s.title.trim() ? s.title.trim() : shortCwd(s ? s.cwd : '');
   }
@@ -387,7 +391,7 @@ function main() {
     var t = document.createElement('span');
     t.className = 'row-title';
     var p = parseName(s.name);
-    t.textContent = (s.title && s.title.trim()) || (s.kind === 'claude' ? 'claude' : 'shell') + (p ? ' · pane ' + p.ord : ' · ' + s.name);
+    t.textContent = (s.title && s.title.trim()) || sessionKindLabel(s.kind) + (p ? ' · pane ' + p.ord : ' · ' + s.name);
     var sub = document.createElement('span');
     sub.className = 'row-sub';
     sub.textContent = shortCwd(s.cwd);

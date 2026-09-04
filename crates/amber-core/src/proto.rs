@@ -229,6 +229,10 @@ pub enum ControlMsg {
     /// This never changes the daemon identity/name (and therefore never moves
     /// a pane between workspaces or tabs).
     SetTitle { name: String, title: Option<String> },
+    /// Daemon -> client: a requested title was persisted successfully. The
+    /// explicit ack lets clients distinguish a supported daemon from an older
+    /// one that silently skips the additive `SetTitle` request.
+    TitleSet { name: String, title: Option<String> },
     /// Client -> daemon: a `claude` session's `amber run` supervisor reports
     /// its current supervision phase (`state`: one of `"claude"`,
     /// `"claude-retrying"`, `"shell-fallback"`). The daemon stores it on the
@@ -462,6 +466,7 @@ fn known_control_variant(name: &str) -> bool {
             | "Kill"
             | "Rename"
             | "SetTitle"
+            | "TitleSet"
             | "ReportRunState"
             | "Suspend"
             | "Resume"
@@ -1054,6 +1059,23 @@ mod tests {
             let f = Frame::Control(unit);
             assert_eq!(roundtrip(&f), f);
         }
+    }
+
+    #[test]
+    fn title_set_ack_roundtrips_with_name_and_title() {
+        let set = Frame::Control(ControlMsg::TitleSet {
+            name: "amber-1-1-0-a".into(),
+            title: Some("Build".into()),
+        });
+        assert_eq!(roundtrip(&set), set);
+        assert_eq!(
+            serde_json::to_string(&ControlMsg::TitleSet {
+                name: "amber-1-1-0-a".into(),
+                title: None,
+            })
+            .unwrap(),
+            r#"{"TitleSet":{"name":"amber-1-1-0-a","title":null}}"#,
+        );
     }
 
     #[test]

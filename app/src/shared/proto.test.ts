@@ -23,6 +23,17 @@ describe('proto', () => {
     return frame
   }
 
+  it('roundtrips the TitleSet acknowledgement with the exact Rust JSON shape', () => {
+    const titled: Frame = { type: 'control', msg: { kind: 'TitleSet', name: 'amber-1-1-0-a', title: 'Build' } }
+    expect(roundtrip(titled)).toEqual(titled)
+    const cleared: Frame = { type: 'control', msg: { kind: 'TitleSet', name: 'amber-1-1-0-a', title: null } }
+    expect(roundtrip(cleared)).toEqual(cleared)
+    const wire = encode(titled)
+    const bodyLen = new DataView(wire.buffer).getUint32(0, false)
+    expect(new TextDecoder().decode(wire.slice(5, 4 + bodyLen)))
+      .toBe('{"TitleSet":{"name":"amber-1-1-0-a","title":"Build"}}')
+  })
+
   it('roundtrips a control frame', () => {
     const f: Frame = { type: 'control', msg: { kind: 'WatchSessions' } }
     expect(roundtrip(f)).toEqual(f)

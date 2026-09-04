@@ -36,7 +36,7 @@ import { formatBrowserName, isBrowserName, parseBrowserName } from '../shared/br
 import { formatEditorName, isEditorName, parseEditorName } from '../shared/editorName'
 import { splitLeaf, setRatio, reconcile, leaves, moveLeaf, type Node } from './layout'
 import {
-  emptyLayout, normalizeFriendlyTitle, parseLayout, serializeLayout, orderTabs, moveTab, mergeLayout,
+  emptyLayout, normalizeFriendlyTitle, parseLayout, pruneLocalTitles, serializeLayout, orderTabs, moveTab, mergeLayout,
   type LayoutFile, type TabLayout, type LoadLayoutResult, type SaveLayoutResult,
 } from '../shared/layoutFile'
 import {
@@ -48,6 +48,9 @@ import { stageReplay } from './replay'
 import { formatKb, parseBudgetInput, type BudgetView } from '../shared/budget'
 import { appChord, chordLabel, modLabel, CHORD_TABLE } from './keys'
 import { type PaletteEntry } from './commandPalette'
+import { titleUpdateMatches, type TitleUpdateRequest } from './titleUpdates'
+import { panePickerDetail } from './panePicker'
+import { clearZoomForDestination } from './navigation'
 import { activitySummary, bookmarkNeedle, makeBookmark, searchScopeNames, shouldNotify, type SearchScope } from './productivityModels'
 import {
   CommandPalette, PanePickerDialog, PaneTitleDialog, GlobalSearchDialog, RecoveryCenter, TemplatesDialog,
@@ -173,6 +176,7 @@ function toEvent(d: unknown): DaemonEvent | null {
 
 
 const DEFAULT_FONT_SIZE = 13
+const TITLE_ACK_TIMEOUT_MS = 5_000
 /** Phone default — see `.reports/mobile-agent-cols.md`. */
 const MOBILE_FONT_SIZE = 14
 // Stable empty frozen map so `layout.frozen ?? EMPTY_FROZEN` doesn't mint a new
@@ -347,6 +351,7 @@ function App(): JSX.Element {
   // picks save / discard / cancel. Cancel ABORTS the close.
   const [closeAsk, setCloseAsk] = useState<string | null>(null)
   const [titleEditPane, setTitleEditPane] = useState<string | null>(null)
+  const pendingTitleUpdates = useRef(new Map<string, { request: TitleUpdateRequest; timer: ReturnType<typeof setTimeout> }>())
   // A close of a TERMINAL pane, awaiting confirmation. Closing a pane kills its
   // daemon session — the pty, the shell, and anything running in it — and that
   // is not undoable, so it is asked rather than assumed.
@@ -454,6 +459,26 @@ function App(): JSX.Element {
     setTitleEditPane(paneId)
   }, [])
 
+  const submitDaemonTitle = useCallback((name: string, title: string | null): void => {
+    const pending = pendingTitleUpdates.current
+    const previous = pending.get(name)
+    if (previous) clearTimeout(previous.timer)
+    const request: TitleUpdateRequest = { name, title }
+    const timer = setTimeout(() => {
+      const current = pending.get(name)
+      if (current?.request !== request) return
+      pending.delete(name)
+      dispatch({ kind: 'Error', msg: 'daemon does not support session titles; restart/update amber' })
+    }, TITLE_ACK_TIMEOUT_MS)
+    pending.set(name, { request, timer })
+    window.amber.setSessionTitle(name, title)
+  }, [])
+
+  useEffect(() => () => {
+    for (const { timer } of pendingTitleUpdates.current.values()) clearTimeout(timer)
+    pendingTitleUpdates.current.clear()
+  }, [])
+
   const onSetPaneTitle = useCallback((paneId: string, value: string): void => {
     const title = normalizeFriendlyTitle(value)
     const trimmed = value.trim()
@@ -462,7 +487,7 @@ function App(): JSX.Element {
         const code = char.charCodeAt(0)
         return code < 0x20 || (code >= 0x7f && code <= 0x9f)
       })
-      setNotice(hasControl ? 'Pane titles cannot contain control characters.' : 'Pane titles are limited to 120 characters.')
+      setNotice(hasControl ? 'Pane titles cannot contain control characters.' : 'Pane titles are limited to 120 UTF-8 bytes.')
       return
     }
     if (isBrowserName(paneId) || isEditorName(paneId)) {
@@ -475,9 +500,9 @@ function App(): JSX.Element {
         return { ...l, titles: next }
       })
     } else {
-      window.amber.setSessionTitle(paneId, title || null)
+      submitDaemonTitle(paneId, title || null)
     }
-  }, [])
+  }, [submitDaemonTitle])
 
   const onPaneFocus = useCallback((name: string): void => {
     if (isBrowserName(name) || isEditorName(name)) return
@@ -499,6 +524,11 @@ function App(): JSX.Element {
       focused: document.hasFocus(), ws: locationRef.current.ws, tab: locationRef.current.tab,
     }, Date.now(), notificationDedup.current)) window.amber.notify?.({ title, body, ...(session ? { session } : {}) })
   }
+  useEffect(() => {
+    if (!loaded) return
+    setLayout((current) => pruneLocalTitles(current))
+  }, [loaded, layout.browsers, layout.editors, layout.titles])
+
   useEffect(() => {
     setTitles((prev) => {
       const live = new Set(sessions.map((s) => s.name))
@@ -549,6 +579,25 @@ function App(): JSX.Element {
       if (evTimer.current === null) evTimer.current = setTimeout(flush, COALESCE_MS)
     }
     window.amber.onDaemonEvent((d) => {
+      const frameMsg = (d as { frame?: { type?: string; msg?: unknown } }).frame
+      if (frameMsg?.type === 'control' && frameMsg.msg && typeof frameMsg.msg === 'object') {
+        const msg = frameMsg.msg as ControlMsg
+        const settleTitle = (name: string, title: string | null | undefined): void => {
+          const current = pendingTitleUpdates.current.get(name)
+          if (!current || !titleUpdateMatches(current.request, { name, title })) return
+          clearTimeout(current.timer)
+          pendingTitleUpdates.current.delete(name)
+        }
+        if (msg.kind === 'TitleSet') {
+          settleTitle(msg.name, msg.title)
+          return
+        }
+        if (msg.kind === 'Sessions') {
+          for (const session of msg.sessions) settleTitle(session.name, session.title)
+        } else if (msg.kind === 'SessionsChanged') {
+          for (const session of msg.added) settleTitle(session.name, session.title)
+        }
+      }
       // Backlog replies are routed to the pending dump resolver by name (not
       // through the store reducer) — a save is waiting on collectDumps for them.
       const bf = (d as { frame?: { type?: string; msg?: { kind?: string; name?: string; msg?: string; data?: Uint8Array } } }).frame
@@ -843,12 +892,7 @@ function App(): JSX.Element {
     setActiveTab(item.tab)
     // Desktop reveal preserves the mosaic. An old per-tab zoom must not hide the
     // requested pane; the explicit focus request runs once its tab is active.
-    setZoom((current) => {
-      if (!(destination in current)) return current
-      const next = { ...current }
-      delete next[destination]
-      return next
-    })
+    setZoom((current) => clearZoomForDestination(current, destination))
     setFocusRequest({ paneId: item.pane.name, seq: ++focusRequestSeq.current })
   }
   const openSessionList = (view: 'all' | 'attention'): void => {
@@ -1183,19 +1227,20 @@ function App(): JSX.Element {
     return () => window.removeEventListener('keydown', h)
   }, [showHelp])
 
-  // Esc dismisses the save-scope / load-mode / budget and Pocket sheets.
+  // Esc dismisses every renderer-owned overlay, including the pane picker even
+  // when focus is on a result row rather than its search input.
   useEffect(() => {
     if (!saveScopeOpen && !loadDoc && !closeAsk && !killAsk && !sessionsOpen && !budgetOpen
-      && !pocketAction && !pocketNewOpen) return
+      && productivityOverlay === null && titleEditPane === null && !pocketAction && !pocketNewOpen) return
     const h = (e: KeyboardEvent): void => {
       if (e.key !== 'Escape') return
       setSaveScopeOpen(false); setLoadDoc(null); setCloseAsk(null)
-      setKillAsk(null); setSessionsOpen(false); setBudgetOpen(false)
+      setKillAsk(null); setSessionsOpen(false); setBudgetOpen(false); setProductivityOverlay(null); setTitleEditPane(null)
       if (pocketAction || pocketNewOpen) closePocketSheet()
     }
     window.addEventListener('keydown', h)
     return () => window.removeEventListener('keydown', h)
-  }, [saveScopeOpen, loadDoc, closeAsk, killAsk, sessionsOpen, budgetOpen, pocketAction, pocketNewOpen])
+  }, [saveScopeOpen, loadDoc, closeAsk, killAsk, sessionsOpen, budgetOpen, productivityOverlay, titleEditPane, pocketAction, pocketNewOpen])
 
   // Opening the budget dialog fetches the daemon's live truth; the reply (and
   // every later one) lands here and refreshes the dialog in place.
@@ -1231,7 +1276,9 @@ function App(): JSX.Element {
     const parsed = parseName(paneId) ?? parseBrowserName(paneId) ?? parseEditorName(paneId)
     if (!parsed) { setNotice('That session no longer maps to a pane.'); return }
     const seq = ++navigationSeq.current
+    const destination = `${parsed.ws}:${parsed.tab}`
     setActiveWs(parsed.ws); setActiveTab(parsed.tab)
+    setZoom((current) => clearZoomForDestination(current, destination))
     if (query !== undefined) setFindRequest({ paneId, query, seq })
     else setFocusRequest({ paneId, seq })
     setProductivityOverlay(null)
@@ -1585,11 +1632,18 @@ function App(): JSX.Element {
     setProductivityOverlay(null); applyDocument(doc, 'new')
   }
   const paletteEntries: PaletteEntry[] = [
-    ...workspaces.flatMap((workspace) => workspace.tabs.flatMap((paneTab) => paneTab.panes.map((pane) => ({
-      id: `pane:${pane.name}`, label: `${pane.slot ? `#${pane.slot} ` : ''}${pane.title || titles[pane.name] || shortCwd(pane.cwd, window.amber.homeDir) || pane.kind}`,
-      detail: `ws ${workspace.ws} · tab ${paneTab.tab} · ${pane.kind} · ${pane.cwd}`, keywords: pane.name,
-      run: () => navigateTo(pane.name),
-    })))),
+    ...workspaces.flatMap((workspace) => workspace.tabs.flatMap((paneTab) => paneTab.panes.map((pane) => {
+      const workspaceLabel = layout.workspaces[String(workspace.ws)]?.label ?? `Workspace ${workspace.ws}`
+      const tabLabel = layout.workspaces[String(workspace.ws)]?.tabs[String(paneTab.tab)]?.label ?? `Tab ${paneTab.tab}`
+      return {
+        id: `pane:${pane.name}`,
+        label: `${pane.slot ? `#${pane.slot} ` : ''}${pane.title || titles[pane.name] || shortCwd(pane.cwd, window.amber.homeDir) || pane.kind}`,
+        detail: panePickerDetail(workspaceLabel, tabLabel, pane.kind, pane.cwd, pane.name),
+        keywords: pane.name,
+        run: () => navigateTo(pane.name),
+        rename: () => openPaneTitleEditor(pane.name),
+      }
+    }))),
     ...workspaces.map((workspace) => ({
       id: `workspace:${workspace.ws}`, label: layout.workspaces[String(workspace.ws)]?.label ?? `Workspace ${workspace.ws}`,
       detail: `${workspace.tabs.length} tabs`, keywords: `ws ${workspace.ws}`, run: () => { setActiveWs(workspace.ws); setActiveTab(workspace.tabs[0]?.tab ?? 1) },

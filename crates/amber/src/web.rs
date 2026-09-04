@@ -1997,6 +1997,14 @@ mod tests {
     }
 
     #[test]
+    fn mobile_flat_list_uses_the_actual_session_kind_for_every_agent() {
+        let source = include_str!("../assets/app.js");
+        assert!(source.contains("function sessionKindLabel"));
+        assert!(source.contains("sessionKindLabel(s.kind)"));
+        assert!(!source.contains("s.kind === 'claude' ? 'claude' : 'shell'"));
+    }
+
+    #[test]
     fn session_json_omits_unset_title_and_emits_set_title() {
         let plain = session_json(&s("amber-1-1-0-a", "shell"));
         assert!(plain.get("title").is_none());

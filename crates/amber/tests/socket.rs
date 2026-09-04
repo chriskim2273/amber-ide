@@ -410,6 +410,72 @@ fn socket_roundtrip_create_attach_write_read() {
 }
 
 #[test]
+fn set_title_persists_and_replies_with_matching_ack_and_delta() {
+    let (socket_path, manager, dir) = start_daemon_with_manager();
+    manager
+        .create("title-pane", "/tmp", amber_core::state::SessionKind::Shell)
+        .unwrap();
+
+    let mut stream = connect_with_retry(&socket_path);
+    let mut decoder = Decoder::new();
+    send(&mut stream, &Frame::Control(ControlMsg::WatchSessions));
+    read_frame_until(
+        &mut stream,
+        &mut decoder,
+        |frame| matches!(frame, Frame::Control(ControlMsg::Sessions { .. })),
+        Duration::from_secs(5),
+    );
+
+    send(
+        &mut stream,
+        &Frame::Control(ControlMsg::SetTitle {
+            name: "title-pane".into(),
+            title: Some("  Build monitor  ".into()),
+        }),
+    );
+    let mut ack = false;
+    let mut delta = false;
+    let mut buf = [0u8; 8192];
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && (!ack || !delta) {
+        while let Some(frame) = decoder.next_frame().unwrap() {
+            match frame {
+                Frame::Control(ControlMsg::TitleSet { name, title }) => {
+                    assert_eq!(name, "title-pane");
+                    assert_eq!(title.as_deref(), Some("Build monitor"));
+                    ack = true;
+                }
+                Frame::Control(ControlMsg::SessionsChanged { added, removed }) => {
+                    assert!(removed.is_empty());
+                    let info = added.iter().find(|info| info.name == "title-pane");
+                    assert_eq!(info.and_then(|info| info.title.as_deref()), Some("Build monitor"));
+                    delta = true;
+                }
+                _ => {}
+            }
+        }
+        if ack && delta {
+            break;
+        }
+        match stream.read_with_timeout(&mut buf, Duration::from_millis(100)) {
+            Ok(0) => panic!("daemon closed the connection unexpectedly"),
+            Ok(n) => decoder.feed(&buf[..n]),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(error) => panic!("read error: {error}"),
+        }
+    }
+    assert!(ack, "daemon did not send a matching TitleSet acknowledgement");
+    assert!(delta, "daemon did not broadcast the authoritative title");
+    let stored = amber_core::state::StateStore::new(dir.path().join("state"))
+        .read_session("title-pane")
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.title.as_deref(), Some("Build monitor"));
+}
+
+#[test]
 fn socket_create_pi_reports_pi_session_kind() {
     let (socket_path, _dir) = start_daemon();
     let mut stream = connect_with_retry(&socket_path);

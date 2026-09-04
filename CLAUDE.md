@@ -1598,7 +1598,7 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   rather than cc-rs's "failed to find tool".
 
 - [x] Durable friendly pane/session titles + picker (2026-09-04) — daemon-owned
-  optional titles are validated (trimmed, printable, ≤120 Unicode characters),
+  optional titles are validated (trimmed, printable, ≤120 UTF-8 bytes),
   persisted in `SessionMeta`, kept across identity renames, exposed through
   `amber ls`, `amber title`/`set-title`, desktop IPC, and the authenticated web
   protocol. Electron app-local browser/editor titles live in the sidecar and
@@ -1608,11 +1608,12 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   fallbacks. The picker has a toolbar entry, command-palette action, and
   Cmd/Ctrl+Shift+O chord; title editing uses a renderer dialog (not Electron's
   unsupported `window.prompt`). Mobile/web lists, mosaic tiles, filtering, and
-  title editing use the same daemon truth. Gates: Rust workspace tests **463**
-  passed, clippy `-D warnings` clean, app **755** tests passed (one deferred
+  title editing use the same daemon truth. Gates: `cargo test --workspace --all-targets`
+  passed, clippy `-D warnings` clean, app **767** tests passed (one deferred
   live-daemon test), TypeScript, Electron, and web builds green. Private daemon
-  CLI and authenticated websocket/API title smoke passed. Still manual: live
-  desktop title gesture and real-phone verification.
+  CLI and authenticated websocket/API title smoke passed; desktop CDP verified
+  picker labels/search, title rename, cross-workspace zoom clearing, focus, and
+  Escape dismissal. Still manual: real-phone touch/device verification.
 
 - [x] Freebuff froze the React web build (2026-09-02) — typing `freebuff` in
   an `amber web` /app pane rendered nothing, Ctrl-C did nothing, the pane had

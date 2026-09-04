@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { emptyLayout, parseLayout, serializeLayout, orderTabs, moveTab, pushRecent, mergeLayout, LAYOUT_VERSION, type LayoutFile } from './layoutFile'
+import { emptyLayout, normalizeFriendlyTitle, parseLayout, pruneLocalTitles, serializeLayout, orderTabs, moveTab, pushRecent, mergeLayout, LAYOUT_VERSION, type LayoutFile } from './layoutFile'
 
 describe('layout editors map', () => {
   it('round-trips valid entries (incl. all optional fields)', () => {
@@ -79,6 +79,25 @@ describe('pushRecent', () => {
 })
 
 describe('layout friendly titles', () => {
+  it('uses the 120-byte UTF-8 boundary shared with the daemon', () => {
+    expect(normalizeFriendlyTitle('x'.repeat(120))).toBe('x'.repeat(120))
+    expect(normalizeFriendlyTitle('x'.repeat(121))).toBeUndefined()
+    expect(normalizeFriendlyTitle('é'.repeat(60))).toBe('é'.repeat(60))
+    expect(normalizeFriendlyTitle('é'.repeat(61))).toBeUndefined()
+  })
+
+  it('prunes title entries for closed or unknown app-local panes', () => {
+    const layout: LayoutFile = {
+      version: 1, activeWorkspace: 1, workspaces: {},
+      titles: { 'browser-1-1-0-live': 'Docs', 'editor-1-1-1-live': 'Notes', orphan: 'Stale' },
+      browsers: { 'browser-1-1-0-live': { ws: 1, tab: 1, ord: 0, url: '' } },
+      editors: { 'editor-1-1-1-live': { ws: 1, tab: 1, ord: 1, path: null } },
+    }
+    expect(pruneLocalTitles(layout).titles).toEqual({
+      'browser-1-1-0-live': 'Docs', 'editor-1-1-1-live': 'Notes',
+    })
+  })
+
   it('round-trips valid titles and drops unsafe values', () => {
     const l: LayoutFile = { version: 1, activeWorkspace: 1, workspaces: {}, titles: { 'browser-1-1-0-a': 'Docs' } }
     expect(parseLayout(serializeLayout(l)).titles).toEqual(l.titles)
