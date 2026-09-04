@@ -337,6 +337,8 @@ describe('TabBrowserService dispatch authorization', () => {
       const state = emptyBrowserState(1), id = 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'; let release!: () => void; let freezes = 0; let calls = 0
       const host = {
         navigate: async () => { calls += 1; return new Promise((resolve) => { release = () => resolve({ id }) }) },
+        hasPendingOperation: () => true,
+        quarantine: async () => { throw new Error('DISPOSAL_FAILED') },
         snapshot: () => state, pendingLoadCount: () => 0, liveIds: () => [], freezeAll: () => { freezes += 1 },
       }
       const Service = TabBrowserService as unknown as new (s: TabBrowserStateStore, p: { setWindow: () => void }, h: typeof host, i: typeof state) => TabBrowserService
