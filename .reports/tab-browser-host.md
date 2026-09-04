@@ -314,6 +314,57 @@ made. Independent resident re-review, deployed-reader proof, packaged Linux
 physical-input evidence, and macOS native-view/focus/IME/accessibility/
 lifecycle/package gates remain open, so `mergeReady: false`.
 
+## P1 queue, control-file, lock, and Pi-frame follow-up (2026-09-04; implementation complete, independent review pending)
+
+This follow-up closes the four confirmed P1s without changing the daemon
+protocol or contacting a production daemon. It supersedes the earlier
+resident-pass shorthand that described malformed browser tokens as being
+quarantined and rotated: invalid browser-host token bytes now fail closed and
+are never replaced automatically.
+
+- Per-browser queue entries now carry explicit operation ownership. A cancelled
+  follower remains attached to its predecessor's FIFO tail and cannot release
+  the tail early or quarantine the active entry. Only an operation that passed
+  its own dispatch fence can bind a page incarnation and arm the one-shot
+  non-cooperative barrier. A timed-out active adapter is quarantined before a
+  later operation may thaw a fresh incarnation; late events/results remain
+  suppressed and queue/barrier/quarantine accounting drains for Quit.
+- Electron's compatibility marker has a synchronous bounded regular-file,
+  no-follow reader for the pre-renderer startup decision. Browser-host token
+  reads use the same bounded descriptor/identity/fatal-UTF-8 boundary and a
+  strict 43-character base64url grammar; invalid UTF-8, malformed, oversized,
+  symlink, FIFO, changed, or unsafe files return stable errors before the
+  broker listens or transmits a token. The Rust browser-host readiness probe
+  and launcher metadata reader were audited for the same fixed-size boundary.
+- Node and Rust layout locks now prepare and fsync a complete owner record in a
+  same-directory temporary, publish it with an exclusive hard link, and remove
+  the temporary only after publication. This is the cross-language no-replace
+  primitive, so a crash before publication leaves no final partial record and a
+  crash after publication leaves a complete record reclaimable only when its
+  PID/start identity is demonstrably dead. Identifiable dead legacy partial
+  records can be reclaimed; live, unknown, and unidentifiable legacy records
+  fail closed after the bounded timeout. Release compares owner token, exact
+  record text, and file metadata before unlinking, so an old owner cannot remove
+  a successor. Platforms/filesystems without the primitive fail closed rather
+  than age-stealing.
+- The generated Amber-owned Pi extension is v7. It bounds and validates the
+  browser token with a no-follow descriptor read, uses a fatal TextDecoder for
+  each broker JSON frame before JSON.parse, closes malformed connections, and
+  never normalizes invalid bytes to U+FFFD. The exact installed source is
+  compiled and loaded through Pi's production extension loader; runtime checks
+  cover invalid/oversized token files and an invalid UTF-8 reply frame.
+
+Validation is green in the isolated `/tmp` worktree: app **974 passed / 1
+intentional real-daemon skip**, Rust workspace **817 passed / 1 intentional
+delegated-cgroup ignore**, warnings-as-errors workspace Clippy, strict
+TypeScript, Electron and hosted-web production builds, static Linux AppImage
+packaging with both `amber` and `amber-router`, shell package contracts,
+exact installed Pi production-loader/runtime checks (including fatal token/frame
+fixtures), and `git diff --check`. `cargo fmt --all -- --check` remains red only
+for the repository's documented broad pre-existing formatter drift; no bulk
+reformat was applied. Independent review and external deployed-reader,
+physical-input, and platform gates remain pending; `mergeReady` stays false.
+
 ## Open blocking work
 
 1. Obtain independent review of the resident lifecycle/launcher/Quit implementation and remediate every valid finding before changing its P1 status.
