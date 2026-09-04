@@ -3,6 +3,7 @@ import type { BrowserElementRef, BrowserInteraction, BrowserTarget, BrowserViewp
 import type { InteractionTargetMetadata } from './browserApproval'
 import { parseBrowserViewport } from '../shared/browserViewport'
 import { BrowserAutomationError, safeBrowserCode } from './browserErrors'
+export { BrowserAutomationError } from './browserErrors'
 
 const SCREENSHOT_MAX_BYTES = 10 * 1024 * 1024
 const SCREENSHOT_MAX_DIMENSION = 4096
