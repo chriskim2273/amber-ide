@@ -18,12 +18,14 @@ pub enum PiStart {
 const EXTENSION_FILE: &str = "amber-hook.ts";
 
 /// The Pi extension amber installs to record session ids for exact resume.
-const EXTENSION_TS: &str = r#"// amber-owned-extension:v6
+const EXTENSION_TS: &str = r#"// amber-owned-extension:v7
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
 import { Type } from "typebox"
 import { spawn } from "node:child_process"
 import { connect } from "node:net"
-import { lstat, readFile } from "node:fs/promises"
+import { constants } from "node:fs"
+import { lstat, open } from "node:fs/promises"
+import { TextDecoder } from "node:util"
 import { dirname, join } from "node:path"
 import { tmpdir } from "node:os"
 
@@ -45,11 +47,41 @@ async function validatePrivateDirectory(path: string, uid: number) {
   if (metadata.isSymbolicLink() || !metadata.isDirectory() || metadata.uid !== uid || (metadata.mode & 0o777) !== 0o700) throw new Error("Amber browser host runtime directory is unsafe")
 }
 
+const BROWSER_TOKEN_MAX_BYTES = 128
+const BROWSER_TOKEN_RE = /^[A-Za-z0-9_-]{43}$/
+const FATAL_UTF8 = new TextDecoder("utf-8", { fatal: true })
+
 async function readBrowserToken(paths: { token: string, state: string, uid: number }) {
   await validatePrivateDirectory(paths.state, paths.uid)
   const metadata = await lstat(paths.token)
   if (metadata.isSymbolicLink() || !metadata.isFile() || metadata.uid !== paths.uid || (metadata.mode & 0o077) !== 0) throw new Error("Amber browser host token is unsafe")
-  return (await readFile(paths.token, "utf8")).trim()
+  let handle: Awaited<ReturnType<typeof open>> | undefined
+  try {
+    try { handle = await open(paths.token, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0)) }
+    catch (error: any) { if (error?.code === "ELOOP") throw new Error("Amber browser host token is unsafe"); throw error }
+    const opened = await handle.stat()
+    if (!opened.isFile() || opened.uid !== paths.uid || opened.dev !== metadata.dev || opened.ino !== metadata.ino) throw new Error("Amber browser host token changed")
+    if (opened.size > BROWSER_TOKEN_MAX_BYTES) throw new Error("Amber browser host token is too large")
+    const bytes = Buffer.alloc(BROWSER_TOKEN_MAX_BYTES + 1)
+    let length = 0
+    while (length < bytes.length) {
+      const result = await handle.read(bytes, length, bytes.length - length, length)
+      if (result.bytesRead === 0) break
+      length += result.bytesRead
+    }
+    if (length > BROWSER_TOKEN_MAX_BYTES) throw new Error("Amber browser host token is too large")
+    const after = await handle.stat(), pathAfter = await lstat(paths.token)
+    if (!after.isFile() || after.uid !== paths.uid || after.dev !== opened.dev || after.ino !== opened.ino
+      || after.size !== opened.size || after.mtimeMs !== opened.mtimeMs || after.ctimeMs !== opened.ctimeMs
+      || length !== opened.size || pathAfter.isSymbolicLink() || !pathAfter.isFile() || pathAfter.uid !== after.uid
+      || pathAfter.dev !== after.dev || pathAfter.ino !== after.ino || pathAfter.size !== after.size
+      || pathAfter.mtimeMs !== after.mtimeMs || pathAfter.ctimeMs !== after.ctimeMs) throw new Error("Amber browser host token changed")
+    let text: string
+    try { text = FATAL_UTF8.decode(bytes.subarray(0, length)) } catch { throw new Error("Amber browser host token is not valid UTF-8") }
+    const token = text.endsWith("\n") ? text.slice(0, -1).replace(/\r$/, "") : text
+    if (!BROWSER_TOKEN_RE.test(token)) throw new Error("Amber browser host token is invalid")
+    return token
+  } finally { await handle?.close().catch(() => {}) }
 }
 
 async function validateBrowserPaths(paths: { token: string, socket: string, state: string, uid: number }) {
@@ -120,7 +152,7 @@ async function sendBrowserRequest(paths: { token: string, socket: string, state:
           return finish(undefined, value)
         }
         let reply: any
-        try { reply = JSON.parse(body.toString("utf8")) } catch { return finish(new Error("Amber browser host sent invalid JSON")) }
+        try { reply = JSON.parse(FATAL_UTF8.decode(body)) } catch { return finish(new Error("Amber browser host sent invalid JSON")) }
         if (!authenticated) {
           if (!reply?.ok) return finish(new Error("Amber browser host authentication failed"))
           authenticated = true
@@ -145,7 +177,11 @@ async function browserRequest(action: unknown, signal?: AbortSignal) {
   catch (error: any) {
     if (error?.code !== "ENOENT") throw error
     await ensureBrowserHost(signal)
-    try { await validateBrowserPaths(paths); token = await readBrowserToken(paths) } catch { throw new Error("Amber browser host token is unavailable") }
+    try { await validateBrowserPaths(paths); token = await readBrowserToken(paths) }
+    catch (retryError: any) {
+      if (typeof retryError?.message === "string" && retryError.message.startsWith("Amber browser host token ")) throw retryError
+      throw new Error("Amber browser host token is unavailable")
+    }
   }
   if (!/^[A-Za-z0-9_-]{43}$/.test(token)) throw new Error("Amber browser host token is invalid")
   try { return await sendBrowserRequest(paths, token, amberSession, action, signal) }
@@ -435,7 +471,7 @@ pub fn ensure_global_pi_extension() {
 fn is_owned_extension_source(source: &str) -> bool {
     matches!(
         source.lines().next(),
-        Some("// amber-owned-extension:v2" | "// amber-owned-extension:v3" | "// amber-owned-extension:v4" | "// amber-owned-extension:v5" | "// amber-owned-extension:v6")
+        Some("// amber-owned-extension:v2" | "// amber-owned-extension:v3" | "// amber-owned-extension:v4" | "// amber-owned-extension:v5" | "// amber-owned-extension:v6" | "// amber-owned-extension:v7")
     )
 }
 
@@ -548,7 +584,7 @@ mod tests {
         let path = extensions.join("amber-hook.ts");
         let first = fs::read_to_string(&path).unwrap();
         assert_eq!(first, EXTENSION_TS);
-        assert!(first.starts_with("// amber-owned-extension:v6\n"));
+        assert!(first.starts_with("// amber-owned-extension:v7\n"));
         assert!(first.contains("amber-ide-${uid}"));
         assert!(first.contains("metadata.isSymbolicLink()"));
         assert!(first.contains("[\"ctl\", \"browser-host\", \"ensure\", \"--root\", state]"));
@@ -595,6 +631,9 @@ mod tests {
         assert!(first.contains("UNTRUSTED BROWSER CONTENT"));
         assert!(first.contains("type: \"image\" as const"));
         assert!(first.contains("browser-host-token"));
+        assert!(first.contains("BROWSER_TOKEN_MAX_BYTES"));
+        assert!(first.contains("new TextDecoder(\"utf-8\", { fatal: true })"));
+        assert!(first.contains("constants.O_NOFOLLOW"));
         assert!(first.contains("clientInstanceId: browserClientInstanceId"));
         assert!(first.contains("sequence: ++browserSequence"));
         assert!(!first.contains("Runtime.evaluate"));
@@ -666,7 +705,7 @@ mod tests {
         let extensions = dir.path().join("extensions");
         fs::create_dir_all(&extensions).unwrap();
         let path = extensions.join(EXTENSION_FILE);
-        let future = "// amber-owned-extension:v7\n// future payload\n";
+        let future = "// amber-owned-extension:v8\n// future payload\n";
         fs::write(&path, future).unwrap();
 
         assert!(install_extension_in(&extensions).is_err());

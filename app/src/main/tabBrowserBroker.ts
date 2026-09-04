@@ -116,6 +116,9 @@ export function authorizeBrowserRequest(layout: LayoutFile, amberSession: string
 
 const MAX_FRAME = 1024 * 1024
 const MAX_BINARY_FRAME = 10 * 1024 * 1024
+/** Generated browser-host tokens are 32 random bytes in base64url (43 chars). */
+export const BROWSER_HOST_TOKEN_MAX_BYTES = 128
+const BROWSER_HOST_TOKEN_RE = /^[A-Za-z0-9_-]{43}$/
 const FATAL_UTF8 = new TextDecoder('utf-8', { fatal: true })
 function frame(value: unknown): Buffer {
   const body = Buffer.from(JSON.stringify(value))
@@ -142,38 +145,59 @@ async function syncDirectory(path: string): Promise<void> {
   try { await handle.sync() } finally { await handle.close() }
 }
 
+function browserTokenError(code: string, detail = code): Error {
+  return Object.assign(new Error(`${code}: ${detail}`), { code })
+}
+
+/** Parse the complete on-disk token without trimming attacker-controlled data. */
+export function parseBrowserHostToken(text: string): string {
+  const token = text.endsWith('\n') ? text.slice(0, -1).replace(/\r$/, '') : text
+  if (!BROWSER_HOST_TOKEN_RE.test(token)) throw browserTokenError('BROWSER_HOST_TOKEN_INVALID')
+  return token
+}
+
 async function tokenFile(path: string): Promise<string> {
   const parent = dirname(path), uid = process.getuid?.() ?? -1
   await ensurePrivateRuntimeDirectory(parent, uid)
+  let tokenText: string | null
   try {
-    const metadata = await lstat(path)
-    if (metadata.isSymbolicLink() || !metadata.isFile() || (uid >= 0 && metadata.uid !== uid) || (metadata.mode & 0o077) !== 0) throw new Error('invalid browser host token file')
-    let tokenText: string | null
-    try { tokenText = await readSafeTextFile(path, { maxBytes: 128, ...(uid >= 0 ? { owner: uid } : {}) }) }
-    catch (error) {
-      // Invalid UTF-8 is a malformed credential, not a reason to leave the
-      // host permanently unavailable. Keep the existing bounded quarantine /
-      // rotation behavior; all identity, ownership, symlink, and mutation
-      // failures remain fatal.
-      if (error instanceof SafeFileReadError && error.code === 'INVALID_UTF8') tokenText = '\uFFFD'
-      else throw error
+    const metadata = await lstat(path).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return null
+      throw error
+    })
+    if (metadata && (metadata.isSymbolicLink() || !metadata.isFile() || (uid >= 0 && metadata.uid !== uid) || (metadata.mode & 0o077) !== 0)) {
+      throw browserTokenError('BROWSER_HOST_TOKEN_UNSAFE', 'invalid browser host token file')
     }
-    if (tokenText === null) throw Object.assign(new Error('token file changed'), { code: 'ENOENT' })
-    const token = tokenText.trim()
-    if (/^[A-Za-z0-9_-]{43}$/.test(token)) return token
-    const quarantine = `${path}.invalid`
-    await unlink(quarantine).catch((error: NodeJS.ErrnoException) => { if (error.code !== 'ENOENT') throw error })
-    await rename(path, quarantine)
-    await syncDirectory(parent)
+    tokenText = await readSafeTextFile(path, { maxBytes: BROWSER_HOST_TOKEN_MAX_BYTES, ...(uid >= 0 ? { owner: uid } : {}) })
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    if (error instanceof SafeFileReadError) {
+      const code = error.code === 'FILE_TOO_LARGE' ? 'BROWSER_HOST_TOKEN_TOO_LARGE'
+        : error.code === 'INVALID_UTF8' ? 'BROWSER_HOST_TOKEN_INVALID_UTF8'
+          : error.code === 'SYMLINK' ? 'BROWSER_HOST_TOKEN_UNSAFE'
+            : error.code === 'NOT_REGULAR' ? 'BROWSER_HOST_TOKEN_UNSAFE'
+              : error.code === 'WRONG_OWNER' ? 'BROWSER_HOST_TOKEN_UNSAFE'
+                : error.code === 'FILE_CHANGED' ? 'BROWSER_HOST_TOKEN_CHANGED' : 'BROWSER_HOST_TOKEN_READ_FAILED'
+      throw browserTokenError(code)
+    }
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') tokenText = null
+    else throw error
   }
+  if (tokenText !== null) return parseBrowserHostToken(tokenText)
+
+  // Only an actually absent file reaches allocation. Invalid, oversized, or
+  // unsafe files are fatal above; rotating one would hide corruption and could
+  // make a caller transmit a credential that no longer matches its owner.
   const token = randomBytes(32).toString('base64url')
   const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`
   const handle = await open(temporary, 'wx', 0o600)
   try { await handle.writeFile(`${token}\n`); await handle.sync() } finally { await handle.close() }
-  await rename(temporary, path)
-  await syncDirectory(parent)
+  try {
+    await rename(temporary, path)
+    await syncDirectory(parent)
+  } catch (error) {
+    await unlink(temporary).catch(() => {})
+    throw error
+  }
   return token
 }
 

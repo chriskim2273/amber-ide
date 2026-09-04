@@ -3,7 +3,8 @@ import { mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:f
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { connect } from 'node:net'
-import { authorizeBrowserRequest, brokerRequestDigest, dispatchAttachedBrokerAction, isEligiblePiController, parseBrokerRequest, safeBrokerError, TabBrowserBrokerServer } from './tabBrowserBroker'
+import { execFile } from 'node:child_process'
+import { authorizeBrowserRequest, BROWSER_HOST_TOKEN_MAX_BYTES, brokerRequestDigest, dispatchAttachedBrokerAction, isEligiblePiController, parseBrokerRequest, parseBrowserHostToken, safeBrokerError, TabBrowserBrokerServer } from './tabBrowserBroker'
 import type { LayoutFile } from '../shared/layoutFile'
 import { BrowserOperationRegistry } from './browserOperationRegistry'
 
@@ -119,17 +120,34 @@ describe('tab browser broker boundary', () => {
     await first.close()
   })
 
-  it('quarantines a corrupt private regular token and atomically rotates it', async () => {
+  it('fails closed on a corrupt private regular token without rotating or transmitting it', async () => {
     if (process.platform === 'win32') return
     const dir = await mkdtemp(join(tmpdir(), 'amber-browser-broker-')); cleanup.push(dir)
     const tokenPath = join(dir, 'token'); await writeFile(tokenPath, 'corrupt\n', { mode: 0o600 })
     await writeFile(`${tokenPath}.crash.tmp`, 'partial', { mode: 0o600 })
     const server = new TabBrowserBrokerServer(join(dir, 'broker.sock'), tokenPath, async () => ({}))
-    await server.start()
-    expect((await readFile(tokenPath, 'utf8')).trim()).toMatch(/^[A-Za-z0-9_-]{43}$/)
-    expect((await stat(tokenPath)).mode & 0o077).toBe(0)
-    expect((await readdir(dir)).some((name) => name === 'token.invalid')).toBe(true)
-    await server.close()
+    await expect(server.start()).rejects.toThrow('BROWSER_HOST_TOKEN_INVALID')
+    expect(await readFile(tokenPath, 'utf8')).toBe('corrupt\n')
+    expect(await readdir(dir)).not.toContain('token.invalid')
+  })
+
+  it('validates browser token text strictly before a server can allocate', () => {
+    const valid = 'A'.repeat(43)
+    expect(parseBrowserHostToken(`${valid}\n`)).toBe(valid)
+    expect(() => parseBrowserHostToken(`${valid} `)).toThrow('BROWSER_HOST_TOKEN_INVALID')
+    expect(() => parseBrowserHostToken('A'.repeat(42))).toThrow('BROWSER_HOST_TOKEN_INVALID')
+    expect(BROWSER_HOST_TOKEN_MAX_BYTES).toBeLessThan(1024)
+  })
+
+  it('rejects oversized and invalid-UTF8 token files before listening', async () => {
+    if (process.platform === 'win32') return
+    const dir = await mkdtemp(join(tmpdir(), 'amber-browser-broker-')); cleanup.push(dir)
+    const tokenPath = join(dir, 'token'), socketPath = join(dir, 'broker.sock')
+    await writeFile(tokenPath, Buffer.alloc(BROWSER_HOST_TOKEN_MAX_BYTES + 1, 0x78), { mode: 0o600 })
+    await expect(new TabBrowserBrokerServer(socketPath, tokenPath, async () => ({})).start()).rejects.toThrow('BROWSER_HOST_TOKEN_TOO_LARGE')
+    await writeFile(tokenPath, Buffer.from([0xc3, 0x28]), { mode: 0o600 })
+    await expect(new TabBrowserBrokerServer(socketPath, tokenPath, async () => ({})).start()).rejects.toThrow('BROWSER_HOST_TOKEN_INVALID_UTF8')
+    expect(await readdir(dir)).not.toContain('token.invalid')
   })
 
   it('rejects a symlink token file', async () => {
@@ -139,6 +157,18 @@ describe('tab browser broker boundary', () => {
     await symlink(join(dir, 'target'), join(dir, 'token'))
     const server = new TabBrowserBrokerServer(join(dir, 'broker.sock'), join(dir, 'token'), async () => ({}))
     await expect(server.start()).rejects.toThrow('invalid browser host token file')
+  })
+
+  it('rejects a FIFO token without waiting for a writer', async () => {
+    if (process.platform === 'win32') return
+    const dir = await mkdtemp(join(tmpdir(), 'amber-browser-broker-')); cleanup.push(dir)
+    const tokenPath = join(dir, 'token')
+    await new Promise<void>((resolve, reject) => {
+      execFile('mkfifo', [tokenPath], (error) => error ? reject(error) : resolve())
+    })
+    const started = Date.now()
+    await expect(new TabBrowserBrokerServer(join(dir, 'broker.sock'), tokenPath, async () => ({})).start()).rejects.toThrow('BROWSER_HOST_TOKEN_UNSAFE')
+    expect(Date.now() - started).toBeLessThan(1000)
   })
 
   it('requires the private token before dispatching a framed request', async () => {

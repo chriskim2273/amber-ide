@@ -5,10 +5,9 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { basename, dirname, join, resolve as resolvePathJoin, isAbsolute } from 'node:path'
 import { homedir, hostname, release as osRelease, tmpdir } from 'node:os'
 import { spawn, execFileSync } from 'node:child_process'
-import { TextDecoder } from 'node:util'
 import { randomUUID } from 'node:crypto'
 import { readFile, writeFile, rename, mkdir, copyFile, chmod, rm, stat, mkdtemp } from 'node:fs/promises'
-import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { resolveSocketPath } from '../shared/socketPath'
 import { HANDOFF_FILE_MAX, parseHandoff } from '../shared/handoff'
 import { pathCandidates } from '../shared/pathSel'
@@ -88,7 +87,7 @@ import { browserContextMatches, captureBrowserContext, hasExactApprovalSurface, 
 import { createBrowserId } from '../shared/tabBrowser'
 import { isRecoveryId } from '../shared/tabBrowserState'
 import { BrowserOperationRegistry } from './browserOperationRegistry'
-import { readSafeTextFile, SafeFileReadError } from './safeFileReader'
+import { readSafeTextFile, readSafeTextFileSync, SafeFileReadError } from './safeFileReader'
 import { browserHostSocketPath } from './browserHostPaths'
 import {
   activationRequest,
@@ -143,11 +142,13 @@ const COMPAT_SIGNATURE = compatSignature(process.versions.electron ?? 'unknown',
 
 function readCompatFlag(): string | null {
   try {
-    const bytes = readFileSync(compatFlagPath)
-    if (bytes.length > 1024) return null
-    return new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+    const owner = process.getuid?.()
+    return readSafeTextFileSync(compatFlagPath, { maxBytes: 256, ...(owner === undefined ? {} : { owner }) })
   } catch {
-    return null // absent (or unreadable, which is the same decision)
+    // The marker is only an optimization hint. Any absent, unsafe, oversized,
+    // changed, or malformed marker must fall back to the hardware-GPU probe;
+    // startup must never allocate from attacker-controlled bytes here.
+    return null
   }
 }
 

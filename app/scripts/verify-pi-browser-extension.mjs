@@ -31,7 +31,7 @@ try {
   await exec(resolvedAmber, ['ctl', 'install-pi-extension'], { env })
   const extension = join(agentDir, 'extensions', 'amber-hook.ts')
   const first = await readFile(extension, 'utf8')
-  if (!first.startsWith('// amber-owned-extension:v6\n')) throw new Error('installed source is not the expected owned version')
+  if (!first.startsWith('// amber-owned-extension:v7\n')) throw new Error('installed source is not the expected owned version')
   await exec(resolvedAmber, ['ctl', 'install-pi-extension'], { env })
   if (await readFile(extension, 'utf8') !== first) throw new Error('second install changed the exact generated source')
 
@@ -108,7 +108,48 @@ try {
     if (!imageResult.content?.[0]?.text?.startsWith(`${label}\n`) || imageResult.content?.[1]?.type !== 'image') throw new Error('binary image lost its untrusted-content label')
   } finally { await new Promise((resolveClose) => server.close(resolveClose)) }
 
-  process.stdout.write(`${JSON.stringify({ installedBytes: Buffer.byteLength(first), compiled: true, loaded: true, labeledResults: true, tools: names.sort() })}\n`)
+  // The production-loaded extension must reject malformed token bytes before
+  // opening a broker socket (and therefore before transmitting any token).
+  const invalidState = join(root, 'invalid-token-state')
+  await mkdir(invalidState, { mode: 0o700 })
+  await writeFile(join(invalidState, 'browser-host-token'), Buffer.from([0xc3, 0x28]), { mode: 0o600 })
+  process.env.AMBER_STATE_DIR = invalidState
+  let invalidTokenError = ''
+  try { await statusTool.execute('verify-invalid-token', {}, new AbortController().signal) }
+  catch (error) { invalidTokenError = error instanceof Error ? error.message : String(error) }
+  if (invalidTokenError !== 'Amber browser host token is not valid UTF-8') throw new Error(`invalid token was not rejected fatally: ${invalidTokenError}`)
+
+  await writeFile(join(invalidState, 'browser-host-token'), Buffer.alloc(129, 0x78), { mode: 0o600 })
+  let oversizedTokenError = ''
+  try { await statusTool.execute('verify-oversized-token', {}, new AbortController().signal) }
+  catch (error) { oversizedTokenError = error instanceof Error ? error.message : String(error) }
+  if (oversizedTokenError !== 'Amber browser host token is too large') throw new Error(`oversized token was not rejected before allocation: ${oversizedTokenError}`)
+
+  // A valid token still must not pass a replacement-decoded JSON frame. The
+  // extension's fatal decoder rejects the frame and destroys its socket.
+  const invalidSocket = join(root, 'invalid-frame.sock')
+  process.env.AMBER_STATE_DIR = stateDir
+  process.env.AMBER_BROWSER_HOST_SOCKET = invalidSocket
+  const invalidFrameServer = createServer((socket) => {
+    let buffer = Buffer.alloc(0), authenticated = false
+    socket.on('data', (chunk) => {
+      buffer = Buffer.concat([buffer, chunk])
+      while (buffer.length >= 4 && buffer.length >= buffer.readUInt32BE(0) + 4) {
+        const length = buffer.readUInt32BE(0)
+        buffer = buffer.subarray(4 + length)
+        if (!authenticated) { authenticated = true; socket.write(frame({ ok: true })); continue }
+        const malformed = Buffer.alloc(5); malformed.writeUInt32BE(1); malformed[4] = 0xc3; socket.write(malformed)
+      }
+    })
+  })
+  await new Promise((resolveListen, rejectListen) => { invalidFrameServer.once('error', rejectListen); invalidFrameServer.listen(invalidSocket, resolveListen) })
+  let invalidFrameError = ''
+  try { await statusTool.execute('verify-invalid-frame', {}, new AbortController().signal) }
+  catch (error) { invalidFrameError = error instanceof Error ? error.message : String(error) }
+  await new Promise((resolveClose) => invalidFrameServer.close(resolveClose))
+  if (invalidFrameError !== 'Amber browser host sent invalid JSON') throw new Error(`invalid UTF-8 frame was normalized or misclassified: ${invalidFrameError}`)
+
+  process.stdout.write(`${JSON.stringify({ installedBytes: Buffer.byteLength(first), compiled: true, loaded: true, labeledResults: true, fatalTokenAndFrameChecks: true, tools: names.sort() })}\n`)
 } finally {
   await rm(root, { recursive: true, force: true })
 }

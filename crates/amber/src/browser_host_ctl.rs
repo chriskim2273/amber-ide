@@ -1,4 +1,4 @@
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io;
 #[cfg(unix)]
 use std::io::{Read, Write};
@@ -84,6 +84,119 @@ fn private_file(path: &Path) -> bool {
         && metadata.permissions().mode() & 0o077 == 0
 }
 
+#[cfg(unix)]
+const BROWSER_HOST_TOKEN_MAX_BYTES: usize = 128;
+
+#[cfg(unix)]
+fn read_bounded_local_file(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    let initial = fs::symlink_metadata(path)?;
+    if initial.file_type().is_symlink() || !initial.is_file() || initial.len() > max_bytes as u64 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "bounded local file is unsafe"));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let mut file = options.open(path)?;
+    let opened = file.metadata()?;
+    if !opened.is_file()
+        || opened.dev() != initial.dev()
+        || opened.ino() != initial.ino()
+        || opened.len() > max_bytes as u64
+        || opened.permissions().mode() & 0o077 != initial.permissions().mode() & 0o077
+    {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "bounded local file changed"));
+    }
+    let mut bytes = vec![0_u8; max_bytes.saturating_add(1)];
+    let mut length = 0;
+    while length < bytes.len() {
+        let count = file.read(&mut bytes[length..])?;
+        if count == 0 { break; }
+        length += count;
+    }
+    if length > max_bytes { return Err(io::Error::new(io::ErrorKind::InvalidData, "bounded local file is oversized")); }
+    let after = file.metadata()?;
+    let path_after = fs::symlink_metadata(path)?;
+    if !after.is_file()
+        || after.dev() != opened.dev()
+        || after.ino() != opened.ino()
+        || after.len() != opened.len()
+        || after.modified().ok() != opened.modified().ok()
+        || path_after.file_type().is_symlink()
+        || !path_after.is_file()
+        || path_after.dev() != after.dev()
+        || path_after.ino() != after.ino()
+        || path_after.len() != after.len()
+        || path_after.modified().ok() != after.modified().ok()
+        || length as u64 != after.len()
+    {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "bounded local file changed"));
+    }
+    bytes.truncate(length);
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+fn read_browser_host_token(path: &Path) -> Option<String> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    let initial = fs::symlink_metadata(path).ok()?;
+    if initial.file_type().is_symlink()
+        || !initial.is_file()
+        || initial.uid() != unsafe { libc::geteuid() }
+        || initial.permissions().mode() & 0o077 != 0
+        || initial.len() > BROWSER_HOST_TOKEN_MAX_BYTES as u64
+    {
+        return None;
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let mut file = options.open(path).ok()?;
+    let opened = file.metadata().ok()?;
+    if !opened.is_file()
+        || opened.uid() != initial.uid()
+        || opened.permissions().mode() & 0o077 != 0
+        || opened.dev() != initial.dev()
+        || opened.ino() != initial.ino()
+        || opened.len() > BROWSER_HOST_TOKEN_MAX_BYTES as u64
+    {
+        return None;
+    }
+    let mut bytes = [0_u8; BROWSER_HOST_TOKEN_MAX_BYTES + 1];
+    let mut length = 0;
+    while length < bytes.len() {
+        let count = file.read(&mut bytes[length..]).ok()?;
+        if count == 0 { break; }
+        length += count;
+    }
+    if length > BROWSER_HOST_TOKEN_MAX_BYTES { return None; }
+    let after = file.metadata().ok()?;
+    let path_after = fs::symlink_metadata(path).ok()?;
+    if !after.is_file()
+        || after.uid() != opened.uid()
+        || after.permissions().mode() & 0o077 != 0
+        || after.dev() != opened.dev()
+        || after.ino() != opened.ino()
+        || after.len() != opened.len()
+        || after.modified().ok() != opened.modified().ok()
+        || path_after.file_type().is_symlink()
+        || !path_after.is_file()
+        || path_after.uid() != after.uid()
+        || path_after.permissions().mode() & 0o077 != 0
+        || path_after.dev() != after.dev()
+        || path_after.ino() != after.ino()
+        || path_after.len() != after.len()
+        || path_after.modified().ok() != after.modified().ok()
+        || length as u64 != after.len()
+    {
+        return None;
+    }
+    let text = String::from_utf8(bytes[..length].to_vec()).ok()?;
+    let token = text.strip_suffix('\n').map_or(text.as_str(), |value| value.strip_suffix('\r').unwrap_or(value));
+    if token.len() != 43 || !token.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-') {
+        return None;
+    }
+    Some(token.to_string())
+}
+
 fn socket_ready(root: &Path, socket: &Path) -> bool {
     #[cfg(unix)]
     {
@@ -93,17 +206,9 @@ fn socket_ready(root: &Path, socket: &Path) -> bool {
         if !private_directory(root) || !private_directory(socket_parent) || !private_file(&token_path) { return false; }
         let Ok(endpoint) = fs::symlink_metadata(socket) else { return false };
         if endpoint.file_type().is_symlink() || !endpoint.file_type().is_socket() || endpoint.uid() != unsafe { libc::geteuid() } { return false; }
-        let Ok(token) = fs::read_to_string(token_path) else {
+        let Some(token) = read_browser_host_token(&token_path) else {
             return false;
         };
-        let token = token.trim();
-        if token.len() != 43
-            || !token
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-        {
-            return false;
-        }
         let Ok(mut stream) = std::os::unix::net::UnixStream::connect(socket) else {
             return false;
         };
@@ -200,7 +305,15 @@ pub fn load_launcher(root: &Path) -> anyhow::Result<LauncherRecord> {
             bail!("browser host launcher registration has unsafe ownership or permissions");
         }
     }
-    let bytes = fs::read(&path)?;
+    if metadata.len() > 16 * 1024 {
+        bail!("browser host launcher registration is oversized");
+    }
+    let bytes = {
+        #[cfg(unix)]
+        { read_bounded_local_file(&path, 16 * 1024)? }
+        #[cfg(not(unix))]
+        { fs::read(&path)? }
+    };
     if bytes.len() > 16 * 1024 {
         bail!("browser host launcher registration is oversized");
     }
@@ -379,6 +492,38 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn browser_host_token_reader_is_bounded_fatal_and_no_follow() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        secure_root(dir.path());
+        let token = dir.path().join("browser-host-token");
+        fs::write(&token, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n").unwrap();
+        fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(read_browser_host_token(&token).as_deref(), Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
+
+        fs::write(&token, vec![b'x'; BROWSER_HOST_TOKEN_MAX_BYTES + 1]).unwrap();
+        assert!(read_browser_host_token(&token).is_none());
+        fs::write(&token, [0xc3, 0x28]).unwrap();
+        assert!(read_browser_host_token(&token).is_none());
+
+        let target = dir.path().join("target");
+        fs::write(&target, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::remove_file(&token).unwrap();
+        symlink(&target, &token).unwrap();
+        assert!(read_browser_host_token(&token).is_none());
+        fs::remove_file(&token).unwrap();
+
+        let raw = CString::new(token.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(raw.as_ptr(), 0o600) }, 0);
+        assert!(read_browser_host_token(&token).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn validates_private_owned_registration_and_separate_argv() {
         let dir = tempfile::tempdir().unwrap();
         secure_root(dir.path());
@@ -407,6 +552,17 @@ mod tests {
         fs::set_permissions(&unsafe_parent, fs::Permissions::from_mode(0o777)).unwrap();
         let nested = unsafe_parent.join("amber"); executable(&nested); write_record(dir.path(), &nested);
         assert!(load_launcher(dir.path()).unwrap_err().to_string().contains("writable parent"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_oversized_launcher_before_reading_the_body() {
+        let dir = tempfile::tempdir().unwrap();
+        secure_root(dir.path());
+        let launcher = dir.path().join(LAUNCHER_FILE);
+        fs::write(&launcher, vec![b'x'; 16 * 1024 + 1]).unwrap();
+        fs::set_permissions(&launcher, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(load_launcher(dir.path()).unwrap_err().to_string().contains("oversized"));
     }
 
     #[cfg(unix)]

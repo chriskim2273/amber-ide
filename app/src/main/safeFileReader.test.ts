@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { lstat, mkdtemp, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { readSafeTextFile } from './safeFileReader'
+import { readSafeTextFile, readSafeTextFileSync } from './safeFileReader'
 
 const dirs: string[] = []
 afterEach(async () => {
@@ -37,6 +37,24 @@ describe('readSafeTextFile', () => {
       ])).rejects.toMatchObject({ code: 'NOT_REGULAR' })
       await unlink(fifo)
       void open
+    }
+  })
+
+  it('uses the same bounded no-follow contract for synchronous startup markers', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'amber-safe-reader-')); dirs.push(dir)
+    const path = join(dir, 'marker')
+    await writeFile(path, 'electron=43 kernel=7\n')
+    expect(readSafeTextFileSync(path, { maxBytes: 256 })).toBe('electron=43 kernel=7\n')
+    await writeFile(path, Buffer.alloc(257, 0x78))
+    expect(() => readSafeTextFileSync(path, { maxBytes: 256 })).toThrow('FILE_TOO_LARGE')
+    await writeFile(path, Buffer.from([0xc3, 0x28]))
+    expect(() => readSafeTextFileSync(path, { maxBytes: 256 })).toThrow('INVALID_UTF8')
+    if (process.platform !== 'win32') {
+      const { execFile } = await import('node:child_process')
+      const { unlink } = await import('node:fs/promises')
+      await unlink(path)
+      await new Promise<void>((resolve, reject) => execFile('mkfifo', [path], (error) => error ? reject(error) : resolve()))
+      expect(() => readSafeTextFileSync(path, { maxBytes: 256 })).toThrow('NOT_REGULAR')
     }
   })
 

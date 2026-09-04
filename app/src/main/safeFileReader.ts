@@ -1,4 +1,4 @@
-import { constants } from 'node:fs'
+import { constants, closeSync, fstatSync, lstatSync, openSync, readSync } from 'node:fs'
 import type { Stats } from 'node:fs'
 import { lstat, open } from 'node:fs/promises'
 import type { FileHandle } from 'node:fs/promises'
@@ -133,6 +133,73 @@ export async function readSafeFileBytes(path: string, options: SafeFileReadOptio
  */
 export async function readSafeTextFile(path: string, options: SafeFileReadOptions): Promise<string | null> {
   const bytes = await readSafeFileBytes(path, options)
+  if (bytes === null) return null
+  try { return UTF8_DECODER.decode(bytes) }
+  catch { throw new SafeFileReadError('INVALID_UTF8') }
+}
+
+/**
+ * Synchronous counterpart for the few startup decisions that must happen
+ * before Electron allocates its renderer/GPU process. It deliberately keeps
+ * the same regular-file, no-follow, bounded read, identity, and fatal UTF-8
+ * contract as the async helper; callers can therefore not accidentally make
+ * the compatibility decision from an unbounded `readFileSync` allocation.
+ */
+export function readSafeFileBytesSync(path: string, options: SafeFileReadOptions): Buffer | null {
+  if (!Number.isSafeInteger(options.maxBytes) || options.maxBytes < 0) throw new SafeFileReadError('INVALID_LIMIT')
+  let before: Stats
+  try { before = lstatSync(path) }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+    throw error
+  }
+  if (before.isSymbolicLink()) throw new SafeFileReadError('SYMLINK')
+  if (!before.isFile() || !isOwner(before, options.owner)) throw new SafeFileReadError(!before.isFile() ? 'NOT_REGULAR' : 'WRONG_OWNER')
+  if (before.size > options.maxBytes) throw new SafeFileReadError('FILE_TOO_LARGE')
+
+  let fd: number | undefined
+  let opened: Stats
+  const flags = constants.O_RDONLY
+    | (process.platform === 'win32' ? 0x0020_0000 : (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0))
+  try {
+    try { fd = openSync(path, flags) }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ELOOP') throw new SafeFileReadError('SYMLINK')
+      throw error
+    }
+    opened = fstatSync(fd)
+    if (!opened.isFile() || !isOwner(opened, options.owner) || !sameIdentity(before, opened)) throw changedError()
+    if (opened.size > options.maxBytes) throw new SafeFileReadError('FILE_TOO_LARGE')
+    const requested = options.readBytes === undefined ? opened.size : options.readBytes
+    if (!Number.isSafeInteger(requested) || requested < 0) throw new SafeFileReadError('INVALID_LIMIT')
+    const expectedReadSize = Math.min(opened.size, requested)
+    const capacity = expectedReadSize + (expectedReadSize === opened.size ? 1 : 0)
+    const buffer = Buffer.alloc(Math.min(options.maxBytes + 1, Math.max(0, capacity)))
+    let offset = 0
+    while (offset < buffer.length) {
+      const count = readSync(fd, buffer, offset, buffer.length - offset, offset)
+      if (count === 0) break
+      offset += count
+    }
+    if (offset > options.maxBytes) throw new SafeFileReadError('FILE_TOO_LARGE')
+    const after = fstatSync(fd)
+    const pathAfter = lstatSync(path)
+    if (pathAfter.isSymbolicLink()) throw new SafeFileReadError('SYMLINK')
+    if (!pathAfter.isFile()) throw new SafeFileReadError('NOT_REGULAR')
+    if (!after.isFile() || !isOwner(after, options.owner) || !sameIdentity(opened, after)
+      || after.size > options.maxBytes || after.size !== opened.size || after.mtimeMs !== opened.mtimeMs || after.ctimeMs !== opened.ctimeMs
+      || offset !== expectedReadSize || !isOwner(pathAfter, options.owner)
+      || !sameIdentity(after, pathAfter) || pathAfter.size !== after.size || pathAfter.mtimeMs !== after.mtimeMs || pathAfter.ctimeMs !== after.ctimeMs) throw changedError()
+    return Buffer.from(buffer.subarray(0, offset))
+  } finally {
+    // `fd` is assigned only after a successful open. Keep the declaration
+    // outside the try so every error path closes a descriptor that exists.
+    if (typeof fd === 'number') closeSync(fd)
+  }
+}
+
+export function readSafeTextFileSync(path: string, options: SafeFileReadOptions): string | null {
+  const bytes = readSafeFileBytesSync(path, options)
   if (bytes === null) return null
   try { return UTF8_DECODER.decode(bytes) }
   catch { throw new SafeFileReadError('INVALID_UTF8') }
