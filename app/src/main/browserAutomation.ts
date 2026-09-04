@@ -382,7 +382,7 @@ export class BrowserAutomation {
     if (!entry.backendDOMNodeId) throw new Error('UNSUPPORTED_PAGE')
     const described = boundedResponse(await this.transport.send('DOM.describeNode', { backendNodeId: entry.backendDOMNodeId, depth: 0, pierce: false })); abort(signal)
     const domNode = described['node'] as Record<string, unknown> | undefined
-    const partial = boundedResponse(await this.transport.send('Accessibility.getPartialAXTree', { backendDOMNodeId: entry.backendDOMNodeId, fetchRelatives: false })); abort(signal)
+    const partial = boundedResponse(await this.transport.send('Accessibility.getPartialAXTree', { backendNodeId: entry.backendDOMNodeId, fetchRelatives: false })); abort(signal)
     const node = Array.isArray(partial['nodes']) ? (partial['nodes'] as AXNode[]).find((candidate) => !candidate.ignored) : undefined
     if (!node || property(node, 'disabled') === true) throw new Error('TARGET_NOT_ACTIONABLE')
     const role = text(node.role?.value, 256), name = redactBrowserText(text(node.name?.value, 4096))

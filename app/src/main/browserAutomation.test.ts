@@ -73,6 +73,21 @@ describe('browser automation', () => {
     expect(transport.boxBackends).not.toContain(999)
   })
 
+  it('uses the Accessibility backendNodeId parameter for current target checks', async () => {
+    class StrictAccessibilityDebugger extends FakeDebugger {
+      override async send(method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>> {
+        if (method === 'Accessibility.getPartialAXTree' && 'backendDOMNodeId' in (params ?? {})) throw new Error('missing backendNodeId')
+        if (method === 'Accessibility.getPartialAXTree' && params?.['backendNodeId'] === 2) return { nodes: [{ role: { value: 'button' }, name: { value: 'Submit' }, backendDOMNodeId: 2 }] }
+        return super.send(method, params)
+      }
+    }
+    const transport = new StrictAccessibilityDebugger()
+    const automation = new BrowserAutomation(transport, () => 'about:blank', () => false)
+    const snapshot = await automation.snapshot(lease, { maxDepth: 20, maxNodes: 20, maxBytes: 256 * 1024 }, new AbortController().signal)
+    const prepared = await automation.prepareInteraction(lease, { kind: 'click', target: { snapshotId: snapshot.snapshotId, ref: snapshot.nodes[1]!.ref } }, new AbortController().signal)
+    await expect(automation.executeInteraction(prepared, new AbortController().signal)).resolves.toEqual({ dispatched: true, rollbackPossible: false })
+  })
+
   it('includes ordinary StaticText for snapshot and text wait without script, style, whitespace, hidden, or duplicate output', async () => {
     class TextPageDebugger extends FakeDebugger {
       query = ''
@@ -216,7 +231,7 @@ describe('browser automation', () => {
         if (method === 'DOM.getSearchResults') return { nodeIds: [301, 302, 303, 304] }
         if (method === 'DOM.describeNode') { const id = params?.['nodeId'] ?? params?.['backendNodeId']; if (id === 300) return { node: { nodeName: 'FORM', backendNodeId: 300, attributes: ['action', this.formChanged ? '/profile/delete' : '/profile/save', 'method', 'post'] } }; if (id === 999) return { node: { nodeName: 'SPAN', parentId: 777, backendNodeId: 999 } }; if (id === 777) return { node: { nodeName: 'INPUT', parentId: 300, backendNodeId: 301, attributes: ['type', 'text'] } }; return { node: { nodeName: id === 302 ? 'BUTTON' : id === 304 ? 'SELECT' : 'INPUT', parentId: 300, backendNodeId: id, attributes: ['type', id === 302 ? 'button' : id === 303 ? 'checkbox' : 'text'] } } }
         if (method === 'Accessibility.getPartialAXTree') {
-          const id = params?.['nodeId'] ?? params?.['backendDOMNodeId']; const button = id === 302, checkbox = id === 303, select = id === 304
+          const id = params?.['nodeId'] ?? params?.['backendNodeId'] ?? params?.['backendDOMNodeId']; const button = id === 302, checkbox = id === 303, select = id === 304
           return { nodes: [{ nodeId: `ax-${id}`, role: { value: button ? 'button' : checkbox ? 'checkbox' : select ? 'combobox' : 'textbox' }, name: { value: this.changed ? 'Changed' : button ? 'Drop target' : checkbox ? 'Remember me' : select ? 'Country' : 'Search' }, backendDOMNodeId: id, properties: [{ name: 'checked', value: { value: false } }] }] }
         }
         if (method === 'DOM.pushNodesByBackendIdsToFrontend') return { nodeIds: [42] }
@@ -264,7 +279,7 @@ describe('browser automation', () => {
     class DialogInteractionDebugger extends FakeDebugger {
       override async send(method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>> {
         if (method === 'DOM.describeNode' && params?.['backendNodeId'] === 2) return { node: { nodeName: 'BUTTON', parentId: 101, backendNodeId: 2 } }
-        if (method === 'Accessibility.getPartialAXTree' && params?.['backendDOMNodeId'] === 2) return { nodes: [{ role: { value: 'button' }, name: { value: 'Submit' }, backendDOMNodeId: 2 }] }
+        if (method === 'Accessibility.getPartialAXTree' && params?.['backendNodeId'] === 2) return { nodes: [{ role: { value: 'button' }, name: { value: 'Submit' }, backendDOMNodeId: 2 }] }
         if (method === 'DOM.pushNodesByBackendIdsToFrontend') return { nodeIds: [22] }
         if (method === 'Input.dispatchMouseEvent' && params?.['type'] === 'mouseReleased') this.listeners.forEach((listener) => listener('Page.javascriptDialogOpening', { type: 'confirm', message: 'Continue?' }))
         return super.send(method, params)
@@ -287,7 +302,7 @@ describe('browser automation', () => {
     class CancellingDebugger extends FakeDebugger {
       override async send(method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>> {
         if (method === 'DOM.describeNode' && params?.['backendNodeId'] === 2) return { node: { nodeName: 'BUTTON', parentId: 101, backendNodeId: 2 } }
-        if (method === 'Accessibility.getPartialAXTree' && params?.['backendDOMNodeId'] === 2) return { nodes: [{ role: { value: 'button' }, name: { value: 'Submit' }, backendDOMNodeId: 2 }] }
+        if (method === 'Accessibility.getPartialAXTree' && params?.['backendNodeId'] === 2) return { nodes: [{ role: { value: 'button' }, name: { value: 'Submit' }, backendDOMNodeId: 2 }] }
         if (method === 'DOM.pushNodesByBackendIdsToFrontend') return { nodeIds: [22] }
         if (method === 'Input.dispatchMouseEvent') { controller.abort(); return {} }
         return super.send(method, params)
