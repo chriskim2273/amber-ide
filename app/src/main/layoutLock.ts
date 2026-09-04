@@ -23,14 +23,17 @@ export function parseLayoutLockRecord(text: string): LayoutLockRecord | null {
   if (lines.at(-1) !== '' || lines[0] !== LOCK_PROTOCOL) return null
   const values = new Map<string, string>()
   for (const line of lines.slice(1, -1)) {
-    const separator = line.indexOf('=')
-    if (separator <= 0 || values.has(line.slice(0, separator))) return null
-    values.set(line.slice(0, separator), line.slice(separator + 1))
+    const separator = line.indexOf('='), key = separator > 0 ? line.slice(0, separator) : ''
+    // Complete records have a closed schema. Reject unknown fields (including
+    // `created`) and every duplicate rather than allowing a later line to
+    // shadow the value that an owner wrote first.
+    if (separator <= 0 || !['pid', 'start', 'token'].includes(key) || values.has(key)) return null
+    values.set(key, line.slice(separator + 1))
   }
   const pidText = values.get('pid'), start = values.get('start'), token = values.get('token')
   if (!pidText || !start || !token || !/^\d+$/.test(pidText) || !/^[A-Za-z0-9_.:-]{1,256}$/.test(start) || !/^[A-Za-z0-9_.:-]{1,256}$/.test(token)) return null
   const pid = Number(pidText)
-  return Number.isSafeInteger(pid) && pid > 0 ? { pid, start, token } : null
+  return Number.isSafeInteger(pid) && pid > 0 && pid <= 0xffff_ffff ? { pid, start, token } : null
 }
 
 function parseLinuxStart(text: string): string | null {
@@ -114,18 +117,30 @@ async function snapshot(path: string): Promise<LockSnapshot | null> {
  * fails closed until an operator removes it after verifying the old process.
  */
 function parseLegacyOwner(text: string): LayoutLockRecord | null {
-  const lines = text.split('\n')
+  const body = text.endsWith('\n') ? text.slice(0, -1) : text
+  const lines = body.split('\n')
   if (lines[0] !== LOCK_PROTOCOL) return null
   let pid: number | undefined
   let start: string | undefined
+  // Duplicate fields are rejected even when byte-identical. Legacy recovery
+  // must never choose a later value from an ambiguous record.
+  const seen = new Set<string>()
   for (const line of lines.slice(1)) {
-    const separator = line.indexOf('=')
-    if (separator <= 0) continue
-    const key = line.slice(0, separator), value = line.slice(separator + 1)
-    if (key === 'pid' && /^\d+$/.test(value)) {
+    const separator = line.indexOf('='), key = separator > 0 ? line.slice(0, separator) : ''
+    if (separator <= 0 || !['pid', 'start', 'token', 'created'].includes(key) || seen.has(key)) return null
+    seen.add(key)
+    const value = line.slice(separator + 1)
+    if (key === 'pid') {
+      if (!/^\d+$/.test(value)) return null
       const candidate = Number(value)
-      if (Number.isSafeInteger(candidate) && candidate > 0) pid = candidate
-    } else if (key === 'start' && /^[A-Za-z0-9_.:-]{1,256}$/.test(value)) start = value
+      if (!Number.isSafeInteger(candidate) || candidate <= 0 || candidate > 0xffff_ffff) return null
+      pid = candidate
+    } else if (key === 'start') {
+      if (!/^[A-Za-z0-9_.:-]{1,256}$/.test(value)) return null
+      start = value
+    } else if ((key === 'token' || key === 'created') && !/^[A-Za-z0-9_.:-]{1,256}$/.test(value)) {
+      return null
+    }
   }
   return pid !== undefined && start !== undefined ? { pid, start, token: '' } : null
 }

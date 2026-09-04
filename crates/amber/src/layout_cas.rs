@@ -136,6 +136,9 @@ fn parse_lock_record(text: &str) -> Option<LayoutLockRecord> {
     let mut pid = None;
     let mut start = None;
     let mut token = None;
+    let mut seen_pid = false;
+    let mut seen_start = false;
+    let mut seen_token = false;
     for line in lines {
         if line.is_empty() {
             return None;
@@ -145,9 +148,25 @@ fn parse_lock_record(text: &str) -> Option<LayoutLockRecord> {
             return None;
         }
         match key {
-            "pid" if pid.is_none() => pid = value.parse::<u32>().ok().filter(|value| *value > 0),
-            "start" if start.is_none() && valid_lock_field(value) => start = Some(value.to_string()),
-            "token" if token.is_none() && valid_lock_field(value) => token = Some(value.to_string()),
+            "pid" if !seen_pid => {
+                seen_pid = true;
+                if !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return None;
+                }
+                pid = value.parse::<u32>().ok().filter(|value| *value > 0);
+            }
+            "start" if !seen_start => {
+                seen_start = true;
+                if valid_lock_field(value) {
+                    start = Some(value.to_string());
+                }
+            }
+            "token" if !seen_token => {
+                seen_token = true;
+                if valid_lock_field(value) {
+                    token = Some(value.to_string());
+                }
+            }
             _ => return None,
         }
     }
@@ -163,20 +182,49 @@ fn parse_lock_record(text: &str) -> Option<LayoutLockRecord> {
 /// only after the identified legacy owner is proven dead. A partial write that
 /// lacks both fields is deliberately unreclaimable and fails closed.
 fn parse_legacy_owner(text: &str) -> Option<LayoutLockRecord> {
-    let mut lines = text.split('\n');
+    let body = text.strip_suffix('\n').unwrap_or(text);
+    let mut lines = body.split('\n');
     if lines.next()? != LOCK_PROTOCOL {
         return None;
     }
     let mut pid = None;
     let mut start = None;
+    // Duplicate fields are rejected even when byte-identical. Legacy recovery
+    // must never choose a later value from an ambiguous record.
+    let mut seen_pid = false;
+    let mut seen_start = false;
+    let mut seen_token = false;
+    let mut seen_created = false;
     for line in lines {
-        let Some((key, value)) = line.split_once('=') else { continue };
+        let (key, value) = line.split_once('=')?;
         match key {
-            "pid" if value.bytes().all(|byte| byte.is_ascii_digit()) => {
+            "pid" if !seen_pid => {
+                seen_pid = true;
+                if !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return None;
+                }
                 pid = value.parse::<u32>().ok().filter(|value| *value > 0);
             }
-            "start" if valid_lock_field(value) => start = Some(value.to_string()),
-            _ => {}
+            "start" if !seen_start => {
+                seen_start = true;
+                if !valid_lock_field(value) {
+                    return None;
+                }
+                start = Some(value.to_string());
+            }
+            "token" if !seen_token => {
+                seen_token = true;
+                if !valid_lock_field(value) {
+                    return None;
+                }
+            }
+            "created" if !seen_created => {
+                seen_created = true;
+                if !valid_lock_field(value) {
+                    return None;
+                }
+            }
+            _ => return None,
         }
     }
     Some(LayoutLockRecord { pid: pid?, start: start?, token: String::new() })
@@ -716,6 +764,47 @@ mod tests {
             save(dir.path(), "replacement", None),
             SaveResult::Error("LAYOUT_FILE_LIMIT".into())
         );
+    }
+
+    #[test]
+    fn accepts_reordered_complete_records_but_rejects_duplicate_or_unknown_fields() {
+        let record = LayoutLockRecord { pid: 42, start: "linux:123".into(), token: "token".into() };
+        assert_eq!(parse_lock_record("amber-layout-lock-v1\ntoken=token\nstart=linux:123\npid=42\n"), Some(record.clone()));
+        assert!(parse_lock_record("amber-layout-lock-v1\npid=42\npid=42\nstart=linux:123\ntoken=token\n").is_none());
+        assert!(parse_lock_record("amber-layout-lock-v1\npid=42\nstart=linux:123\nstart=linux:124\ntoken=token\n").is_none());
+        assert!(parse_lock_record("amber-layout-lock-v1\npid=42\nstart=linux:123\ntoken=token\ntoken=other\n").is_none());
+        assert!(parse_lock_record("amber-layout-lock-v1\npid=42\nstart=linux:123\ntoken=token\ncreated=1\n").is_none());
+        assert!(parse_lock_record("amber-layout-lock-v1\npid=4294967296\nstart=linux:123\ntoken=token\n").is_none());
+        assert!(parse_lock_record("amber-layout-lock-v1\npid=+42\nstart=linux:123\ntoken=token\n").is_none());
+        assert!(parse_lock_record("amber-layout-lock-v1\npid=bad\npid=42\nstart=linux:123\ntoken=token\n").is_none());
+    }
+
+    #[test]
+    fn legacy_parser_rejects_duplicate_fields_even_when_values_match() {
+        assert!(parse_legacy_owner("amber-layout-lock-v1\npid=4294967000\nstart=linux:missing\ntoken=one\ntoken=one\ncreated=1\ncreated=1\n").is_none());
+    }
+
+    #[test]
+    fn legacy_parser_accepts_reordered_single_created_field() {
+        assert_eq!(
+            parse_legacy_owner("amber-layout-lock-v1\ncreated=1\nstart=linux:missing\npid=4294967000\ntoken=legacy\n"),
+            Some(LayoutLockRecord { pid: 4294967000, start: "linux:missing".into(), token: String::new() }),
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn does_not_reclaim_a_duplicate_legacy_identity_by_the_later_dead_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("{LAYOUT_FILE}.lock"));
+        let duplicate = format!("amber-layout-lock-v1\npid={}\nstart={}\npid=4294967000\nstart=linux:missing\n", std::process::id(), current_process_start());
+        fs::write(&path, &duplicate).unwrap();
+        let error = match acquire_lock_with_wait(dir.path(), Duration::from_millis(40)) {
+            Err(error) => error,
+            Ok(lock) => { drop(lock); panic!("duplicate legacy lock was reclaimed") }
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(fs::read_to_string(path).unwrap(), duplicate);
     }
 
     #[cfg(target_os = "linux")]

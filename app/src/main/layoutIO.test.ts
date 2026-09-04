@@ -141,6 +141,37 @@ describe('saveLayoutFile', () => {
     expect((await stat(path)).size).toBe(LAYOUT_FILE_MAX_BYTES + 1)
   })
 
+  it('accepts reordered complete records but rejects every duplicate or unknown field', () => {
+    const record = { pid: 42, start: 'linux:123', token: 'token' }
+    expect(parseLayoutLockRecord(formatLayoutLockRecord(record))).toEqual(record)
+    expect(parseLayoutLockRecord('amber-layout-lock-v1\ntoken=token\nstart=linux:123\npid=42\n')).toEqual(record)
+    expect(parseLayoutLockRecord('amber-layout-lock-v1\npid=42\npid=42\nstart=linux:123\ntoken=token\n')).toBeNull()
+    expect(parseLayoutLockRecord('amber-layout-lock-v1\npid=42\nstart=linux:123\nstart=linux:124\ntoken=token\n')).toBeNull()
+    expect(parseLayoutLockRecord('amber-layout-lock-v1\npid=42\nstart=linux:123\ntoken=token\ntoken=other\n')).toBeNull()
+    expect(parseLayoutLockRecord('amber-layout-lock-v1\npid=42\nstart=linux:123\ntoken=token\ncreated=1\n')).toBeNull()
+    expect(parseLayoutLockRecord('amber-layout-lock-v1\npid=4294967296\nstart=linux:123\ntoken=token\n')).toBeNull()
+    expect(parseLayoutLockRecord('amber-layout-lock-v1\npid=+42\nstart=linux:123\ntoken=token\n')).toBeNull()
+    expect(parseLayoutLockRecord('amber-layout-lock-v1\npid=bad\npid=42\nstart=linux:123\ntoken=token\n')).toBeNull()
+  })
+
+  it('does not classify a duplicate legacy identity by the later dead value', async () => {
+    const start = await currentProcessStartIdentity()
+    if (!start) return
+    const lockPath = `${path}.lock`
+    const duplicate = `amber-layout-lock-v1\npid=${process.pid}\nstart=${start}\npid=4294967000\nstart=linux:missing\n`
+    await writeFile(lockPath, duplicate)
+    await expect(acquireLayoutLock(lockPath, 40)).rejects.toThrow('LAYOUT_LOCK_TIMEOUT')
+    expect(await readFile(lockPath, 'utf8')).toBe(duplicate)
+  })
+
+  it('fails closed on duplicate legacy token and created fields, including identical values', async () => {
+    const lockPath = `${path}.lock`
+    const duplicate = 'amber-layout-lock-v1\npid=4294967000\nstart=linux:missing\ntoken=one\ntoken=one\ncreated=1\ncreated=1\n'
+    await writeFile(lockPath, duplicate)
+    await expect(acquireLayoutLock(lockPath, 40)).rejects.toThrow('LAYOUT_LOCK_TIMEOUT')
+    expect(await readFile(lockPath, 'utf8')).toBe(duplicate)
+  })
+
   it('does not age-steal a lock held by a live process', async () => {
     const start = await currentProcessStartIdentity()
     if (!start) return
@@ -161,6 +192,11 @@ describe('saveLayoutFile', () => {
     const lock = await acquireLayoutLock(lockPath, 100)
     expect(parseLayoutLockRecord(await readFile(lockPath, 'utf8'))).not.toBeNull()
     await lock.release()
+    expect(await saveLayoutFile(path, '{}', null)).toEqual({ ok: true, version: '{}' })
+  })
+
+  it('reclaims a reordered legacy lock with one created field only when its owner is dead', async () => {
+    await writeFile(`${path}.lock`, 'amber-layout-lock-v1\ncreated=1\nstart=linux:missing\npid=4294967000\ntoken=legacy\n')
     expect(await saveLayoutFile(path, '{}', null)).toEqual({ ok: true, version: '{}' })
   })
 
