@@ -124,7 +124,9 @@ platform.
 
 - `app/src/shared/layoutFile.ts` / `.test.ts` — `LoadLayoutResult`/
   `SaveLayoutResult`/`LayoutVersion` types, `mergeLayout`.
-- `app/src/main/layoutIO.ts` (new) / `.test.ts` (new) — Node CAS file IO.
+- `app/src/main/layoutIO.ts` (new) / `.test.ts` (new) /
+  `layoutIORace.test.ts` — Node CAS file IO and deterministic descriptor-race
+  fixtures.
 - `app/src/main/index.ts` — `layout-load`/`layout-save` IPC handlers now thin
   wrappers over `layoutIO.ts`.
 - `app/src/preload/index.ts` — `loadLayout`/`saveLayout` signatures updated.
@@ -174,10 +176,14 @@ platform.
 The later tab-browser host review added the bounded ingress work that was
 outside the original CAS commit: `crates/amber/src/layout_file.rs` is now the
 shared Rust regular-file loader used by both `layout_cas` and `mosaic`, with
-8 MiB, symlink, replacement/growth, and UTF-8 checks. Mosaic parsing validates
+8 MiB, symlink, replacement/growth, timeout, exact-byte, and fatal UTF-8
+checks. Mosaic parsing validates
 workspace/tab/map/string/tree bounds and its web poller caches an unchanged
 fallback. The Node CAS reread and SSH remote-layout probe use matching 8 MiB
-limits and no partial result on overflow/timeout. The broker admission fix and
+limits, fatal UTF-8 decoding, and no partial result on overflow/timeout.
+Deterministic tests cover truncation, truncate-and-regrow, append, FIFO, and
+symlink replacement during descriptor reads, plus shell-expanded XDG/HOME
+paths containing spaces and glob characters. The broker admission fix and
 its queue-key cancellation tests are tracked in `tab-browser-host.md` and the
 machine-readable remaining report. Current validation is recorded there; the
 branch remains `mergeReady: false` because the deployment/package/platform and

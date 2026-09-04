@@ -5,18 +5,45 @@ export type BrowserOperationSummary = Record<BrowserOperationKind, number> & { t
 
 interface ActiveOperation { kind: BrowserOperationKind; controller: AbortController }
 
+interface LinkedSignal {
+  signal: AbortSignal
+  dispose: () => void
+}
+
+function linkSignals(inherited: AbortSignal, external?: AbortSignal): LinkedSignal {
+  if (!external || external === inherited) return { signal: inherited, dispose: () => {} }
+  const controller = new AbortController()
+  const abort = (): void => controller.abort()
+  inherited.addEventListener('abort', abort, { once: true })
+  external.addEventListener('abort', abort, { once: true })
+  if (inherited.aborted || external.aborted) controller.abort()
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      inherited.removeEventListener('abort', abort)
+      external.removeEventListener('abort', abort)
+    },
+  }
+}
+
 export class BrowserOperationRegistry {
   private readonly active = new Map<symbol, ActiveOperation>()
-  private readonly context = new AsyncLocalStorage<AbortSignal>()
+  private readonly context = new AsyncLocalStorage<AbortSignal | undefined>()
   private accepting = true
   private readonly emptyWaiters = new Set<() => void>()
 
   run<T>(kind: BrowserOperationKind, work: (signal: AbortSignal) => Promise<T>, external?: AbortSignal): Promise<T> {
     const inherited = this.context.getStore()
     if (inherited) {
-      this.assertDispatch(inherited)
-      if (external?.aborted) return Promise.reject(new Error('ACTION_CANCELLED'))
-      return work(inherited)
+      const linked = linkSignals(inherited, external)
+      try {
+        this.assertDispatch(linked.signal)
+        const result = this.context.run(linked.signal, () => work(linked.signal))
+        return Promise.resolve(result).finally(linked.dispose)
+      } catch (error) {
+        linked.dispose()
+        return Promise.reject(error)
+      }
     }
     if (!this.accepting) return Promise.reject(new Error('BROWSER_HOST_SHUTTING_DOWN'))
     const key = Symbol(kind), controller = new AbortController()
@@ -36,17 +63,37 @@ export class BrowserOperationRegistry {
   }
 
   /**
-   * Run work with a controller owned by the caller. This is needed when a
-   * request has an asynchronous admission step before it can be put on its
-   * resource FIFO: the controller must already be visible to socket-close,
-   * owner-cancel, and drain before that step is awaited.
+   * Start a top-level operation without inheriting an ambient operation from
+   * the caller's promise continuation. Socket requests use this when their
+   * per-connection FIFO callback happens to run in an older request's async
+   * context; otherwise aborting that older request would cancel the new one.
+   */
+  runDetached<T>(kind: BrowserOperationKind, work: (signal: AbortSignal) => Promise<T>, external?: AbortSignal): Promise<T> {
+    return this.context.run(undefined, () => this.run(kind, work, external))
+  }
+
+  /** Detached counterpart for a caller-owned request controller. */
+  runWithControllerDetached<T>(kind: BrowserOperationKind, controller: AbortController, work: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    return this.context.run(undefined, () => this.runWithController(kind, controller, work))
+  }
+
+  /**
+   * Run work with a controller owned by the caller. The controller is
+   * registered before any asynchronous admission step so socket-close,
+   * owner-cancel, and drain can abort it immediately.
    */
   runWithController<T>(kind: BrowserOperationKind, controller: AbortController, work: (signal: AbortSignal) => Promise<T>): Promise<T> {
     const inherited = this.context.getStore()
     if (inherited) {
-      this.assertDispatch(inherited)
-      if (controller.signal.aborted) return Promise.reject(new Error('ACTION_CANCELLED'))
-      return work(inherited)
+      const linked = linkSignals(inherited, controller.signal)
+      try {
+        this.assertDispatch(linked.signal)
+        const result = this.context.run(linked.signal, () => work(linked.signal))
+        return Promise.resolve(result).finally(linked.dispose)
+      } catch (error) {
+        linked.dispose()
+        return Promise.reject(error)
+      }
     }
     if (!this.accepting) {
       controller.abort()

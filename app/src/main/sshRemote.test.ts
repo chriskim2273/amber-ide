@@ -1,12 +1,18 @@
 import { describe, it, expect } from 'vitest'
 import { EventEmitter } from 'node:events'
+import { execFile as execFileCallback } from 'node:child_process'
+import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { promisify } from 'node:util'
 import {
   sshTunnelArgv, sshProbeArgv, isValidHost, localSocketPath, hostLabel,
   REMOTE_SOCKET_PROBE, REMOTE_LAYOUT_PROBE, REMOTE_LAYOUT_PROBE_MAX_BYTES,
   parseAgentSock, explainSshFailure, isSupportedOnPlatform, runSshProbe,
   type SshProbeChild,
 } from './sshRemote'
+
+const execFile = promisify(execFileCallback)
 
 describe('sshTunnelArgv', () => {
   const a = sshTunnelArgv('me@box', '/tmp/w/remote.sock', '/run/user/1000/amber-ide/amberd.sock')
@@ -57,6 +63,36 @@ describe('sshProbeArgv', () => {
     expect(p.args[p.args.length - 1]).toBe(REMOTE_SOCKET_PROBE)
   })
 
+  it('quotes complete remote XDG and HOME paths while preserving remote expansion', () => {
+    expect(REMOTE_SOCKET_PROBE).toContain('"${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/amber-ide/amberd.sock}"')
+    expect(REMOTE_SOCKET_PROBE).toContain('"$HOME/.local/state/amber-ide/amberd.sock"')
+    expect(REMOTE_SOCKET_PROBE).toContain('printf "%s\\n" "$p"')
+    expect(REMOTE_LAYOUT_PROBE).toContain('"${XDG_STATE_HOME:-$HOME/.local/state}/amber-ide/ui-layout.json"')
+    const argv = sshProbeArgv('box', REMOTE_LAYOUT_PROBE)
+    expect(argv.args.at(-1)).toBe(REMOTE_LAYOUT_PROBE)
+  })
+
+  it('expands remote paths containing spaces and glob characters as data', async () => {
+    if (process.platform === 'win32') return
+    const root = await mkdtemp(join(tmpdir(), 'amber ssh probe [root] '))
+    try {
+      const runtime = join(root, 'runtime [*]'), home = join(root, 'home [*]'), state = join(root, 'state [*]')
+      const socket = join(runtime, 'amber-ide', 'amberd.sock')
+      const layout = join(state, 'amber-ide', 'ui-layout.json')
+      await mkdir(join(runtime, 'amber-ide'), { recursive: true })
+      await mkdir(join(state, 'amber-ide'), { recursive: true })
+      await writeFile(socket, '')
+      await writeFile(layout, '{"safe":true}')
+      const env = { ...process.env, XDG_RUNTIME_DIR: runtime, XDG_STATE_HOME: state, HOME: home }
+      const socketResult = await execFile('/bin/sh', ['-c', REMOTE_SOCKET_PROBE], { env })
+      const layoutResult = await execFile('/bin/sh', ['-c', REMOTE_LAYOUT_PROBE], { env })
+      expect(socketResult.stdout.trim()).toBe(socket)
+      expect(layoutResult.stdout).toBe('{"safe":true}')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('terminates a noncooperative child and forwards no partial layout on overflow', async () => {
     const child = new FakeProbeChild()
     const probe = runSshProbe('box', REMOTE_LAYOUT_PROBE, {}, { maxBytes: REMOTE_LAYOUT_PROBE_MAX_BYTES, timeoutMs: 100 }, {
@@ -86,6 +122,18 @@ describe('sshProbeArgv', () => {
     })
     await expect(probe).resolves.toMatchObject({ out: '', err: '', code: -1, error: 'SSH_PROBE_TIMEOUT' })
     expect(child.killed).toEqual(['SIGKILL'])
+  })
+
+  it('rejects distinct invalid UTF-8 output with one stable error and no text', async () => {
+    const first = new FakeProbeChild()
+    const firstProbe = runSshProbe('box', REMOTE_LAYOUT_PROBE, {}, { maxBytes: 32, timeoutMs: 100 }, { spawn: () => first })
+    first.stdout.emit('data', Buffer.from([0xc3, 0x28])); first.emit('close', 0)
+    await expect(firstProbe).resolves.toMatchObject({ out: '', err: '', code: -1, error: 'LAYOUT_INVALID_UTF8' })
+
+    const second = new FakeProbeChild()
+    const secondProbe = runSshProbe('box', REMOTE_LAYOUT_PROBE, {}, { maxBytes: 32, timeoutMs: 100 }, { spawn: () => second })
+    second.stdout.emit('data', Buffer.from([0xe2, 0x28, 0xa1])); second.emit('close', 0)
+    await expect(secondProbe).resolves.toMatchObject({ out: '', err: '', code: -1, error: 'LAYOUT_INVALID_UTF8' })
   })
 })
 

@@ -1,10 +1,13 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { execFile as execFileCallback } from 'node:child_process'
 import { mkdtemp, rm, readFile, lstat, symlink, writeFile, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { promisify } from 'node:util'
 import { loadLayoutFile, saveLayoutFile } from './layoutIO'
 import { LAYOUT_FILE_MAX_BYTES } from '../shared/layoutFile'
 
+const execFile = promisify(execFileCallback)
 let dir: string
 let path: string
 beforeEach(async () => {
@@ -26,10 +29,25 @@ describe('loadLayoutFile', () => {
     expect(await loadLayoutFile(path)).toEqual({ text: null, version: null, error: 'LAYOUT_FILE_LIMIT' })
   })
 
+  it('rejects a FIFO without waiting for a writer', async () => {
+    if (process.platform === 'win32') return
+    await execFile('mkfifo', [path])
+    const started = Date.now()
+    await expect(loadLayoutFile(path)).resolves.toEqual({ text: null, version: null, error: 'LAYOUT_NOT_REGULAR' })
+    expect(Date.now() - started).toBeLessThan(1000)
+  })
+
   it('returns text and a version equal to it', async () => {
     const { writeFile } = await import('node:fs/promises')
     await writeFile(path, '{"a":1}')
     expect(await loadLayoutFile(path)).toEqual({ text: '{"a":1}', version: '{"a":1}' })
+  })
+
+  it('rejects distinct invalid UTF-8 byte sequences with the same stable error', async () => {
+    await writeFile(path, Buffer.from([0x7b, 0x22, 0xc3, 0x28, 0x22, 0x3a, 0x31, 0x7d]))
+    expect(await loadLayoutFile(path)).toEqual({ text: null, version: null, error: 'LAYOUT_INVALID_UTF8' })
+    await writeFile(path, Buffer.from([0x7b, 0x22, 0xe2, 0x28, 0xa1, 0x22, 0x3a, 0x31, 0x7d]))
+    expect(await loadLayoutFile(path)).toEqual({ text: null, version: null, error: 'LAYOUT_INVALID_UTF8' })
   })
 
   it('returns nulls for a missing file (first run, no sidecar yet)', async () => {

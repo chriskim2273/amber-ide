@@ -11,6 +11,43 @@ import { BrowserApprovalCoordinator, BrowserDialogCoordinator, interactionTarget
 import { navigationPolicyAllows, selectPreviewOrigin } from './tabBrowserPolicy'
 import { BrowserOperationRegistry } from './browserOperationRegistry'
 
+/** Grace after cancellation before a non-cooperative page adapter is detached from the FIFO. */
+export const TAB_BROWSER_QUEUE_BARRIER_TIMEOUT_MS = 1_000
+
+function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(new Error('ACTION_CANCELLED'))
+  let onAbort: (() => void) | undefined
+  const cancelled = new Promise<never>((_resolve, reject) => {
+    onAbort = () => reject(new Error('ACTION_CANCELLED'))
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
+  return Promise.race([promise, cancelled]).finally(() => {
+    if (onAbort) signal.removeEventListener('abort', onAbort)
+  })
+}
+
+function boundedQueueBarrier(promise: Promise<unknown>, releaseSignal: AbortSignal, timeoutMs: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    let timer: NodeJS.Timeout | undefined
+    let finished = false
+    const finish = (): void => {
+      if (finished) return
+      finished = true
+      if (timer) clearTimeout(timer)
+      releaseSignal.removeEventListener('abort', release)
+      resolve()
+    }
+    const release = (): void => {
+      if (finished || timer) return
+      if (timeoutMs <= 0) { finish(); return }
+      timer = setTimeout(finish, timeoutMs); timer.unref()
+    }
+    promise.then(finish, finish)
+    releaseSignal.addEventListener('abort', release, { once: true })
+    if (releaseSignal.aborted) release()
+  })
+}
+
 export type TabBrowserCommand =
   | { type: 'open' }
   | { type: 'close' }
@@ -263,20 +300,42 @@ export class TabBrowserService {
     // every contender. Observations and hide also cannot sit behind a wait.
     if (command.type === 'hide' || command.type === 'destroy') this.activationControllers.get(command.id)?.abort()
     if (command.type === 'navigate' || command.type === 'stop') this.dialogs.clearBrowser(command.id)
-    if (command.type === 'open' || command.type === 'status' || command.type === 'stop' || command.type === 'hide' || command.type === 'destroy' || command.type === 'resolveApproval' || command.type === 'resolveDialog' || command.type === 'stopPi') return this.runCommand(command, signal, validate)
+    if (command.type === 'open' || command.type === 'status' || command.type === 'stop' || command.type === 'hide' || command.type === 'destroy' || command.type === 'resolveApproval' || command.type === 'resolveDialog' || command.type === 'stopPi') {
+      const immediate = this.runCommand(command, signal, validate)
+      return signal ? abortable(immediate, signal) : immediate
+    }
     if (command.type === 'close' || command.type === 'share' || command.type === 'designate') return Promise.reject(new Error('ASSOCIATION_COMMAND_REQUIRES_MAIN'))
     const key = command.id
     const prior = this.browserQueues.get(key) ?? Promise.resolve()
-    const controller = command.type === 'show' ? new AbortController() : null
-    if (controller) {
+    const controller = new AbortController()
+    if (command.type === 'show') {
       this.activationControllers.get(command.id)?.abort(); this.activationControllers.set(command.id, controller)
-      signal?.addEventListener('abort', () => controller.abort(), { once: true })
     }
-    const result = prior.catch(() => {}).then(() => this.runCommand(command, controller?.signal ?? signal, validate))
-    const tail = result.then(() => {}, () => {})
+    const abort = (): void => controller.abort()
+    signal?.addEventListener('abort', abort, { once: true })
+    if (signal?.aborted) controller.abort()
+    const operation = prior.catch(() => {}).then(async () => {
+      this.operations.assertDispatch(controller.signal)
+      const result = await this.runCommand(command, controller.signal, validate)
+      // A non-cooperative adapter may resolve after its caller was cancelled.
+      // Do not let that late result cross the service boundary or commit the
+      // command's post-dispatch state update to a dead request.
+      this.operations.assertDispatch(controller.signal)
+      return result
+    })
+    // Normal adapters retain strict FIFO and no overlap. Once cancellation
+    // aborts an adapter, wait for cooperative settlement, but release the
+    // queue after a bounded grace so one hung WebContents cannot block later
+    // mutations or resident quit forever. The late operation remains attached
+    // to this promise, so any eventual rejection is observed and isolated.
+    const tail = boundedQueueBarrier(operation, controller.signal, TAB_BROWSER_QUEUE_BARRIER_TIMEOUT_MS)
     this.browserQueues.set(key, tail)
-    void tail.finally(() => { if (this.browserQueues.get(key) === tail) this.browserQueues.delete(key); if (controller && this.activationControllers.get(key) === controller) this.activationControllers.delete(key) })
-    return result
+    void tail.then(() => {}, () => {}).finally(() => {
+      signal?.removeEventListener('abort', abort)
+      if (this.browserQueues.get(key) === tail) this.browserQueues.delete(key)
+      if (command.type === 'show' && this.activationControllers.get(key) === controller) this.activationControllers.delete(key)
+    })
+    return abortable(operation, controller.signal)
   }
 
   private withLatestAction<T extends object>(id: string, status: T): T & { lastAction?: unknown } {
@@ -299,7 +358,9 @@ export class TabBrowserService {
     switch (command.type) {
       case 'open': {
         try {
-          const opened = await this.host.open({ visible: true }, signal, validate); await this.schedulePersist(); return this.withLatestAction(opened.status.id, opened.status)
+          const opened = await this.host.open({ visible: true }, signal, validate)
+          this.operations.assertDispatch(signal)
+          await this.schedulePersist(); return this.withLatestAction(opened.status.id, opened.status)
         } catch (error) {
           // Capacity waiting can persist a provisional record through host events.
           // Do not reject until the compensating deletion is durable.
@@ -310,6 +371,7 @@ export class TabBrowserService {
       case 'show': {
         const before = this.host.status(command.id).stateRevision
         await this.host.thaw(command.id, signal, validate)
+        this.operations.assertDispatch(signal)
         const status = this.host.show(command.id, command.bounds)
         if (status.stateRevision !== before) await this.schedulePersist()
         return this.withLatestAction(command.id, status)
@@ -323,6 +385,7 @@ export class TabBrowserService {
             ? { type: 'history', direction: command.direction, pageIncarnation: command.pageIncarnation, expectedGeneration: command.expectedGeneration }
             : { type: 'setViewport', viewport: { width: command.width, height: command.height }, pageIncarnation: command.pageIncarnation, expectedGeneration: command.expectedGeneration }
         await this.host.runAutomation(command.id, action, signal ?? new AbortController().signal)
+        this.operations.assertDispatch(signal)
         if (command.type === 'viewport') await this.schedulePersist()
         return this.withLatestAction(command.id, this.host.status(command.id))
       }
@@ -334,7 +397,11 @@ export class TabBrowserService {
         const upstreamAbort = (): void => activeOwner?.controller.abort()
         if (activeOwner) { signal?.addEventListener('abort', upstreamAbort, { once: true }); if (signal?.aborted) activeOwner.controller.abort(); const set = this.activePi.get(command.id) ?? new Set<{ controller: AbortController; owner: string }>(); set.add(activeOwner); this.activePi.set(command.id, set) }
         if (command.broker) this.piAction(command.id, command.broker.controller, 'navigate', 'started')
-        try { const status = await this.host.navigate(command.id, command.url, command.pageIncarnation, command.expectedGeneration, activeOwner?.controller.signal ?? signal, command.broker ? 'broker' : 'user'); await this.schedulePersist(); if (command.broker) this.piAction(command.id, command.broker.controller, 'navigate', 'completed'); return command.broker ? this.brokerStatus(command.id, status as unknown as Record<string, unknown>) : this.withLatestAction(command.id, status) }
+        try {
+          const status = await this.host.navigate(command.id, command.url, command.pageIncarnation, command.expectedGeneration, activeOwner?.controller.signal ?? signal, command.broker ? 'broker' : 'user')
+          this.operations.assertDispatch(signal)
+          await this.schedulePersist(); if (command.broker) this.piAction(command.id, command.broker.controller, 'navigate', 'completed'); return command.broker ? this.brokerStatus(command.id, status as unknown as Record<string, unknown>) : this.withLatestAction(command.id, status)
+        }
         catch (error) { if (command.broker) this.piAction(command.id, command.broker.controller, 'navigate', 'failed', error); throw error }
         finally { signal?.removeEventListener('abort', upstreamAbort); const set = this.activePi.get(command.id); if (activeOwner) set?.delete(activeOwner); if (set?.size === 0) this.activePi.delete(command.id) }
       }
@@ -364,6 +431,7 @@ export class TabBrowserService {
                 targetLabel: [request.target, request.secondaryTarget].filter((target): target is NonNullable<typeof target> => !!target).map((target) => `${target.role} ${target.name}`.trim()).join(' → ').slice(0, 512), argumentSummary: classification.argumentSummary }, approvalSignal)
             } finally { try { this.host.protectApproval(command.id, false) } catch { /* record may close while approval is pending */ } }
           } : undefined)
+          this.operations.assertDispatch(signal)
           if (command.action.type === 'setViewport') await this.schedulePersist()
           if (command.broker) this.piAction(command.id, command.broker.controller, command.action.type === 'interact' ? command.action.operation.kind : command.action.type, 'completed')
           return result

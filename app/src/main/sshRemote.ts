@@ -11,17 +11,19 @@
 
 import { EventEmitter } from 'node:events'
 import { spawn as spawnProcess } from 'node:child_process'
+import { TextDecoder } from 'node:util'
 import { join } from 'node:path'
 import { LAYOUT_FILE_MAX_BYTES } from '../shared/layoutFile'
 
 /** Where the remote daemon's socket is, per `resolveSocketPath`'s own rules. */
 export const REMOTE_SOCKET_PROBE =
-  'ls ${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/amber-ide/amberd.sock} ' +
-  '"$HOME/.local/state/amber-ide/amberd.sock" 2>/dev/null | head -1'
+  'for p in "${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/amber-ide/amberd.sock}" ' +
+  '"$HOME/.local/state/amber-ide/amberd.sock"; do ' +
+  '[ -n "$p" ] && [ -e "$p" ] && printf "%s\\n" "$p" && break; done'
 
 /** Where the remote layout sidecar is. Same derivation, different file. */
 export const REMOTE_LAYOUT_PROBE =
-  'cat ${XDG_STATE_HOME:-$HOME/.local/state}/amber-ide/ui-layout.json 2>/dev/null'
+  'cat -- "${XDG_STATE_HOME:-$HOME/.local/state}/amber-ide/ui-layout.json" 2>/dev/null'
 
 /** The remote sidecar and the local CAS share one ingress byte contract. */
 export const REMOTE_LAYOUT_PROBE_MAX_BYTES = LAYOUT_FILE_MAX_BYTES
@@ -57,12 +59,13 @@ export interface SshProbeResult {
   out: string
   err: string
   code: number
-  error?: 'LAYOUT_FILE_LIMIT' | 'SSH_PROBE_TIMEOUT' | 'SSH_PROBE_FAILED'
+  error?: 'LAYOUT_FILE_LIMIT' | 'SSH_PROBE_TIMEOUT' | 'SSH_PROBE_FAILED' | 'LAYOUT_INVALID_UTF8'
 }
 
 const defaultSshProbeDeps: SshProbeDeps = {
   spawn: (cmd, args, options) => spawnProcess(cmd, args, options) as unknown as SshProbeChild,
 }
+const UTF8_DECODER = new TextDecoder('utf-8', { fatal: true })
 
 function boundedErrorText(error: unknown, maxBytes: number): string {
   const text = error instanceof Error ? error.message : String(error)
@@ -124,7 +127,11 @@ export function collectSshProbe(child: SshProbeChild, options: SshProbeOptions =
     function onStderr(chunk: unknown): void { accept(err, 'err', chunk) }
     function onClose(code: unknown): void {
       const exitCode = typeof code === 'number' ? code : -1
-      finish({ out: Buffer.concat(out).toString('utf8'), err: Buffer.concat(err).toString('utf8'), code: exitCode })
+      try {
+        finish({ out: UTF8_DECODER.decode(Buffer.concat(out)), err: UTF8_DECODER.decode(Buffer.concat(err)), code: exitCode })
+      } catch {
+        finish({ out: '', err: '', code: -1, error: 'LAYOUT_INVALID_UTF8' })
+      }
     }
     function onError(error: unknown): void {
       finish({ out: '', err: boundedErrorText(error, maxBytes), code: -1, error: 'SSH_PROBE_FAILED' })

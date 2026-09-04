@@ -253,12 +253,17 @@ untouched:
   strings, total nodes, and depth; the web poller caches an unchanged hostile
   fallback instead of reparsing it every second.
 
-Focused and repository validation completed in this worktree: app **936
+Focused and repository validation completed in this worktree: app **950
 passed / 1 intentional real-daemon skip**, strict typecheck, Rust workspace
-**800 passed / 1 intentional delegated-cgroup ignore**, warnings-as-errors
-workspace Clippy, Windows GNU cross-target compile, and `git diff --check`. No production daemon or profile
-was contacted. The full packaged Linux/macOS gates, deployed-reader proof,
-and independent resident re-review remain open; `mergeReady` stays false.
+**805 passed / 1 intentional delegated-cgroup ignore**, warnings-as-errors
+workspace Clippy, Windows GNU cross-target compile, Electron/web production
+builds, Linux AppImage packaging with static `amber` and `amber-router`, and
+`git diff --check`. The Rust and Node loaders now have deterministic
+truncate/regrow/append/FIFO/symlink-swap coverage, and remote probes are
+exercised with XDG/HOME paths containing spaces and glob characters. No
+production daemon or profile was contacted. The full packaged Linux/macOS
+gates, deployed-reader proof, and independent resident re-review remain open;
+`mergeReady` stays false.
 
 ## Open blocking work
 

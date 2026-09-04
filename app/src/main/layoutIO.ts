@@ -9,13 +9,31 @@
 import { constants } from 'node:fs'
 import { rename, mkdir, open, lstat, unlink } from 'node:fs/promises'
 import type { FileHandle } from 'node:fs/promises'
+import { TextDecoder } from 'node:util'
 import { randomUUID } from 'node:crypto'
 import { dirname } from 'node:path'
 import { layoutUtf8ByteLength, LAYOUT_FILE_MAX_BYTES } from '../shared/layoutFile'
 import type { LoadLayoutResult, SaveLayoutResult } from '../shared/layoutFile'
 
+const LAYOUT_READ_TIMEOUT_MS = 1_000
+const UTF8_DECODER = new TextDecoder('utf-8', { fatal: true })
+
+function deadlineError(): Error { return new Error('LAYOUT_READ_TIMEOUT') }
+
+async function withinDeadline<T>(operation: Promise<T>, deadline: number): Promise<T> {
+  const remaining = deadline - Date.now()
+  if (remaining <= 0) {
+    void operation.catch(() => {})
+    throw deadlineError()
+  }
+  let timer: NodeJS.Timeout | undefined
+  const timeout = new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(deadlineError()), remaining) })
+  try { return await Promise.race([operation, timeout]) } finally { if (timer) clearTimeout(timer) }
+}
+
 async function readBoundedText(path: string, maxBytes: number): Promise<string> {
-  const before = await lstat(path)
+  const deadline = Date.now() + LAYOUT_READ_TIMEOUT_MS
+  const before = await withinDeadline(lstat(path), deadline)
   if (before.isSymbolicLink()) throw new Error('LAYOUT_SYMLINK')
   if (!before.isFile()) throw new Error('LAYOUT_NOT_REGULAR')
   if (before.size > maxBytes) throw new Error('LAYOUT_FILE_LIMIT')
@@ -23,16 +41,22 @@ async function readBoundedText(path: string, maxBytes: number): Promise<string> 
   // O_NOFOLLOW closes the lstat -> open symlink swap on Unix. The descriptor
   // is then the object we measure and read; a path replacement cannot redirect
   // the in-progress read to an attacker-selected target.
-  const flags = constants.O_RDONLY | (process.platform === 'win32' ? 0 : (constants.O_NOFOLLOW ?? 0))
+  const flags = constants.O_RDONLY | (process.platform === 'win32' ? 0 : (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0))
   let handle: FileHandle
+  let openingExpired = false
+  const opening = open(path, flags).then(async (candidate) => {
+    if (openingExpired) { await candidate.close().catch(() => {}); throw deadlineError() }
+    return candidate
+  })
   try {
-    handle = await open(path, flags)
+    handle = await withinDeadline(opening, deadline)
   } catch (error) {
+    openingExpired = true
     if ((error as NodeJS.ErrnoException).code === 'ELOOP') throw new Error('LAYOUT_SYMLINK')
     throw error
   }
   try {
-    const metadata = await handle.stat()
+    const metadata = await withinDeadline(handle.stat(), deadline)
     if (!metadata.isFile()) throw new Error('LAYOUT_NOT_REGULAR')
     if (metadata.size > maxBytes) throw new Error('LAYOUT_FILE_LIMIT')
     // A max-sized allocation on every poll would churn for ordinary small
@@ -42,15 +66,15 @@ async function readBoundedText(path: string, maxBytes: number): Promise<string> 
     const buffer = Buffer.alloc(Math.min(maxBytes + 1, Math.max(1, metadata.size + 1)))
     let offset = 0
     while (offset < buffer.length) {
-      const result = await handle.read(buffer, offset, buffer.length - offset, offset)
+      const result = await withinDeadline(handle.read(buffer, offset, buffer.length - offset, offset), deadline)
       if (result.bytesRead === 0) break
       offset += result.bytesRead
     }
-    const after = await handle.stat()
+    const after = await withinDeadline(handle.stat(), deadline)
     if (after.size > maxBytes || offset > maxBytes) throw new Error('LAYOUT_FILE_LIMIT')
-    if (after.size !== metadata.size) throw new Error('LAYOUT_FILE_CHANGED')
+    if (offset !== metadata.size || after.size !== metadata.size || after.mtimeMs !== metadata.mtimeMs || after.ctimeMs !== metadata.ctimeMs) throw new Error('LAYOUT_FILE_CHANGED')
     let pathAfter
-    try { pathAfter = await lstat(path) } catch (error) {
+    try { pathAfter = await withinDeadline(lstat(path), deadline) } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new Error('LAYOUT_FILE_CHANGED')
       throw error
     }
@@ -58,9 +82,12 @@ async function readBoundedText(path: string, maxBytes: number): Promise<string> 
     if (!pathAfter.isFile()) throw new Error('LAYOUT_NOT_REGULAR')
     // A replacement with the same byte length must still invalidate a CAS
     // read. Atomic writers normally change both inode and mtime; inode is the
-    // decisive check where the platform exposes it.
-    if (pathAfter.dev !== metadata.dev || pathAfter.ino !== metadata.ino) throw new Error('LAYOUT_FILE_CHANGED')
-    return buffer.subarray(0, offset).toString('utf8')
+    // decisive check where the platform exposes it. Size, mtime, and ctime
+    // also have to agree with the descriptor's final fstat, so a hard-link or
+    // in-place mutation cannot hide behind the same identity.
+    if (pathAfter.dev !== after.dev || pathAfter.ino !== after.ino
+      || pathAfter.size !== after.size || pathAfter.mtimeMs !== after.mtimeMs || pathAfter.ctimeMs !== after.ctimeMs) throw new Error('LAYOUT_FILE_CHANGED')
+    try { return UTF8_DECODER.decode(buffer.subarray(0, offset)) } catch { throw new Error('LAYOUT_INVALID_UTF8') }
   } finally { await handle.close().catch(() => {}) }
 }
 

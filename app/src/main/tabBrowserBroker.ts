@@ -329,7 +329,7 @@ export class TabBrowserBrokerServer {
                 // drain barrier as a fresh request; otherwise an already
                 // resolved replay can write after Quit has revoked the host.
                 let replaySignal: AbortSignal | undefined
-                const replay = this.options.operations.run('broker', async (signal) => {
+                const replay = this.options.operations.runDetached('broker', async (signal) => {
                   replaySignal = signal
                   this.options.operations!.assertDispatch(signal)
                   if (this.options.authorizeReplay && !(await this.options.authorizeReplay(request))) throw new Error('STALE_BROWSER_CONTEXT')
@@ -363,6 +363,7 @@ export class TabBrowserBrokerServer {
               const unregister = (): void => { active.delete(controller); this.activeRequests.delete(controller) }
               controller.signal.addEventListener('abort', unregister, { once: true })
               let operationBarrier: Promise<void> = Promise.resolve()
+              let timedOut = false
               const execute = async (): Promise<unknown> => {
                 if (controller.signal.aborted) { unregister(); throw new Error('ACTION_CANCELLED') }
                 if (this.inFlight >= 32) { unregister(); throw new Error('REQUEST_LIMIT') }
@@ -386,7 +387,16 @@ export class TabBrowserBrokerServer {
                   })
                   try { return await Promise.race([operation, timeout, cancelled]) }
                   catch (error) {
-                    if (error instanceof Error && error.message === 'ACTION_TIMEOUT') { executionController.abort(); releaseController.abort() }
+                    if (error instanceof Error && error.message === 'ACTION_TIMEOUT') {
+                      // The request controller is the signal inherited by the
+                      // production broker -> service call chain. Aborting
+                      // only the adapter's signal leaves nested registry work
+                      // alive after the broker has already timed out.
+                      timedOut = true
+                      controller.abort()
+                      executionController.abort()
+                      releaseController.abort()
+                    }
                     throw error
                   }
                   finally {
@@ -396,6 +406,13 @@ export class TabBrowserBrokerServer {
                   }
                 } finally { unregister(); this.inFlight -= 1 }
               }
+              const preserveTimeout = <T>(promise: Promise<T>): Promise<T> => promise.catch((error) => {
+                // Aborting the request controller is required to stop nested
+                // service work, but the client-facing classification remains a
+                // timeout rather than being rewritten as cancellation.
+                if (timedOut && safeBrokerError(error) === 'ACTION_CANCELLED') throw new Error('ACTION_TIMEOUT')
+                throw error
+              })
               // With the default session queue key there is no asynchronous
               // admission step. Keep this path's scheduling shape unchanged so
               // replay replies retain their established FIFO ordering.
@@ -407,14 +424,16 @@ export class TabBrowserBrokerServer {
                 this.queueDepth.set(key, depth + 1)
                 const prior = this.queues.get(key) ?? Promise.resolve()
                 const scheduled = this.options.operations
-                  ? this.options.operations.run('broker', async (signal) => {
+                  ? this.options.operations.runDetached('broker', async (signal) => {
                       const abortOwned = (): void => controller.abort()
                       signal.addEventListener('abort', abortOwned, { once: true })
                       try { await prior.catch(() => {}); this.options.operations!.assertDispatch(signal); return await execute() }
                       finally { signal.removeEventListener('abort', abortOwned) }
                     }, controller.signal)
                   : prior.catch(() => {}).then(execute)
-                const promise = depth > 0 ? abortable(scheduled, controller.signal) : scheduled
+                const promise = !this.options.operations && depth === 0
+                  ? scheduled
+                  : preserveTimeout(depth > 0 ? abortable(scheduled, controller.signal) : scheduled)
                 const tail = scheduled.then(() => {}, () => {}).then(() => operationBarrier)
                 this.queues.set(key, tail)
                 void tail.then(() => {}, () => {}).finally(() => {
@@ -471,7 +490,7 @@ export class TabBrowserBrokerServer {
               let scheduled: Promise<unknown>
               try {
                 scheduled = this.options.operations
-                  ? this.options.operations.runWithController('broker', controller, queueAndExecute)
+                  ? this.options.operations.runWithControllerDetached('broker', controller, queueAndExecute)
                   : queueAndExecute(controller.signal)
               } catch (error) {
                 unregister(); throw error
@@ -483,7 +502,7 @@ export class TabBrowserBrokerServer {
               // A cancelled client gets its error immediately, even while it
               // is waiting behind an older request. Following work still uses
               // the separate queue tail and cannot overtake that operation.
-              const promise = abortable(scheduled, controller.signal)
+              const promise = preserveTimeout(abortable(scheduled, controller.signal))
               this.results.set(cacheKey, { digest, promise, acceptedAt: now() })
               connectionResults.add(cacheKey)
               if (this.results.size > 256) this.results.delete(this.results.keys().next().value!)

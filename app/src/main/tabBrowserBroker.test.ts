@@ -414,6 +414,43 @@ describe('tab browser broker boundary', () => {
     await server.close()
   })
 
+  it('aborts the request controller on timeout and suppresses a late nested service result', async () => {
+    if (process.platform === 'win32') return
+    const dir = await mkdtemp(join(tmpdir(), 'amber-browser-broker-')); cleanup.push(dir)
+    const socketPath = join(dir, 'broker.sock'), tokenPath = join(dir, 'token'), operations = new BrowserOperationRegistry()
+    let nestedSignal: AbortSignal | undefined
+    let release!: () => void
+    const server = new TabBrowserBrokerServer(socketPath, tokenPath, (_request, signal) => operations.run('broker', async () => operations.run('command', async (innerSignal) => {
+      nestedSignal = innerSignal
+      return new Promise((resolve) => { release = () => resolve({ secretResult: true }) })
+    }, signal), signal), { operations, queueKey: async () => 'browser:test', requestTimeoutMs: 15, operationBarrierTimeoutMs: 15 })
+    await server.start()
+    const token = (await readFile(tokenPath, 'utf8')).trim()
+    const encode = (value: unknown): Buffer => { const body = Buffer.from(JSON.stringify(value)); const out = Buffer.alloc(body.length + 4); out.writeUInt32BE(body.length); body.copy(out, 4); return out }
+    const reply = await new Promise<Record<string, unknown>>((resolve, reject) => {
+      const socket = connect(socketPath); let buffer = Buffer.alloc(0); let welcomed = false
+      socket.on('error', reject)
+      socket.on('connect', () => socket.write(encode({ token })))
+      socket.on('data', (chunk) => {
+        buffer = Buffer.concat([buffer, chunk])
+        while (buffer.length >= 4 && buffer.length >= buffer.readUInt32BE(0) + 4) {
+          const size = buffer.readUInt32BE(0); const value = JSON.parse(buffer.subarray(4, 4 + size).toString()) as Record<string, unknown>; buffer = buffer.subarray(4 + size)
+          if (!welcomed) {
+            welcomed = true
+            socket.write(encode({ version: 1, clientInstanceId: 'timeout-client', sequence: 1, requestId: 'timeout', amberSession: 'amber-1-2-0-pane', action: { type: 'status' } }))
+          } else {
+            socket.destroy(); resolve(value)
+          }
+        }
+      })
+    })
+    expect(reply).toMatchObject({ ok: false, error: 'ACTION_TIMEOUT' })
+    expect(nestedSignal?.aborted).toBe(true)
+    release()
+    await operations.waitForEmpty()
+    await server.close()
+  })
+
   it.each(['socket-close', 'stop-pi', 'drain'] as const)('cancels a request while queueKey is pending (%s), without losing later FIFO work', async (mode) => {
     if (process.platform === 'win32') return
     const dir = await mkdtemp(join(tmpdir(), 'amber-browser-broker-')); cleanup.push(dir)

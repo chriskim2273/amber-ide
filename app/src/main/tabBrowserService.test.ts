@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { applyBrowserRuntimeDelta, parseTabBrowserCommand, stageWorkspaceBrowserState, TabBrowserService } from './tabBrowserService'
+import { applyBrowserRuntimeDelta, parseTabBrowserCommand, stageWorkspaceBrowserState, TAB_BROWSER_QUEUE_BARRIER_TIMEOUT_MS, TabBrowserService } from './tabBrowserService'
 import { TabBrowserStateStore } from './tabBrowserStateStore'
 import { TabBrowserHost, type TabBrowserPageEvent } from './tabBrowserHost'
 import { emptyBrowserState, type BrowserStateFile } from '../shared/tabBrowserState'
@@ -70,6 +70,64 @@ describe('TabBrowserService dispatch authorization', () => {
     expect(calls).toBe(1)
   })
 
+  it('releases a cancelled non-cooperative browser queue after bounded grace', async () => {
+    vi.useFakeTimers()
+    try {
+      const state = emptyBrowserState(1), id = 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'; let release!: () => void; let calls = 0; let persists = 0
+      const host = {
+        navigate: async () => {
+          calls += 1
+          if (calls === 1) return new Promise((resolve) => { release = () => resolve({ id }) })
+          return { id }
+        },
+        snapshot: () => state, pendingLoadCount: () => 0, liveIds: () => [], freezeAll: () => {},
+      }
+      const Service = TabBrowserService as unknown as new (s: TabBrowserStateStore, p: { setWindow: () => void }, h: typeof host, i: typeof state) => TabBrowserService
+      const service = new Service({ update: async () => { persists += 1; return state } } as unknown as TabBrowserStateStore, { setWindow: () => {} }, host, state)
+      const command = { type: 'navigate' as const, id, url: 'https://example.test/', pageIncarnation: 'page', expectedGeneration: 1 }
+      const owner = new AbortController(); const first = service.command(command, owner.signal)
+      for (let attempt = 0; attempt < 10 && calls === 0; attempt++) await Promise.resolve()
+      expect(calls).toBe(1)
+      owner.abort()
+      await expect(first).rejects.toThrow('ACTION_CANCELLED')
+      const later = service.command(command)
+      await Promise.resolve()
+      expect(calls).toBe(1)
+      await vi.advanceTimersByTimeAsync(TAB_BROWSER_QUEUE_BARRIER_TIMEOUT_MS)
+      for (let attempt = 0; attempt < 10 && calls < 2; attempt++) await Promise.resolve()
+      expect(calls).toBe(2)
+      await expect(later).resolves.toMatchObject({ id })
+      release()
+      await Promise.resolve()
+      expect(persists).toBe(1)
+    } finally { vi.useRealTimers() }
+  })
+
+  it('bounds quit drain when a browser adapter ignores cancellation', async () => {
+    vi.useFakeTimers()
+    try {
+      const state = emptyBrowserState(1), id = 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'; let release!: () => void; let freezes = 0; let calls = 0
+      const host = {
+        navigate: async () => { calls += 1; return new Promise((resolve) => { release = () => resolve({ id }) }) },
+        snapshot: () => state, pendingLoadCount: () => 0, liveIds: () => [], freezeAll: () => { freezes += 1 },
+      }
+      const Service = TabBrowserService as unknown as new (s: TabBrowserStateStore, p: { setWindow: () => void }, h: typeof host, i: typeof state) => TabBrowserService
+      const service = new Service({ update: async () => state } as unknown as TabBrowserStateStore, { setWindow: () => {} }, host, state)
+      const pending = service.command({ type: 'navigate', id, url: 'https://example.test/', pageIncarnation: 'page', expectedGeneration: 1 })
+      const pendingCancelled = expect(pending).rejects.toThrow('ACTION_CANCELLED')
+      for (let attempt = 0; attempt < 10 && calls === 0; attempt++) await Promise.resolve()
+      expect(calls).toBe(1)
+      service.beginDrain()
+      const flushing = service.flushAndDestroy()
+      await vi.advanceTimersByTimeAsync(TAB_BROWSER_QUEUE_BARRIER_TIMEOUT_MS)
+      await expect(flushing).resolves.toBeUndefined()
+      await pendingCancelled
+      expect(freezes).toBe(1)
+      release()
+      await Promise.resolve()
+    } finally { vi.useRealTimers() }
+  })
+
   it('rejects new commands during quit and freezes before the final durable save', async () => {
     const state = emptyBrowserState(1), order: string[] = []
     const host = {
@@ -95,13 +153,14 @@ describe('TabBrowserService dispatch authorization', () => {
     const Service = TabBrowserService as unknown as new (s: TabBrowserStateStore, p: { setWindow: () => void }, h: typeof host, i: typeof state) => TabBrowserService
     const service = new Service({ load: async () => state, update: async () => state } as unknown as TabBrowserStateStore, { setWindow: () => {} }, host, state)
     const pending = service.command({ type: 'navigate', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', url: 'https://example.test/', pageIncarnation: 'page', expectedGeneration: 1 })
+    const pendingCancelled = expect(pending).rejects.toThrow('ACTION_CANCELLED')
     await vi.waitFor(() => expect(navigateCalls).toBe(1))
     service.beginDrain()
     const controller = new AbortController(); const flush = service.flushAndDestroy(controller.signal)
     controller.abort()
     await expect(flush).rejects.toThrow('ACTION_CANCELLED')
     expect(freezes).toBe(0)
-    release(); await pending
+    release(); await pendingCancelled
     service.cancelDrain(); service.beginDrain(); await service.flushAndDestroy()
     expect(freezes).toBe(1)
   })
@@ -341,7 +400,7 @@ describe('TabBrowserService approvals and Stop Pi', () => {
     const action = service.command({ type: 'automation', id, broker: { requestId: 'request-cancel', controller: 'amber-1-1-0-pi' }, action: { type: 'reload', pageIncarnation: 'page', expectedGeneration: 1, ignoreCache: false } }, owner.signal)
     await vi.waitFor(() => expect(events.some((event) => event['type'] === 'dialog-request')).toBe(true))
     owner.abort()
-    await expect(action).rejects.toThrow('DIALOG_DENIED')
+    await expect(action).rejects.toThrow('ACTION_CANCELLED')
     expect(events.some((event) => event['type'] === 'dialog-resolved' && event['decision'] === 'revoked')).toBe(true)
   })
 

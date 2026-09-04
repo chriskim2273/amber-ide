@@ -28,6 +28,61 @@ describe('BrowserOperationRegistry', () => {
     })
   })
 
+  it('links inherited and external cancellation through nested work', async () => {
+    const registry = new BrowserOperationRegistry()
+    const inherited = new AbortController(), external = new AbortController()
+    let nestedSignal: AbortSignal | undefined
+    let nestedStarted!: () => void
+    const started = new Promise<void>((resolve) => { nestedStarted = resolve })
+    const pending = registry.run('broker', async () => {
+      await registry.run('command', async (signal) => {
+        nestedSignal = signal; nestedStarted()
+        await new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve(), { once: true }))
+      }, external.signal)
+    }, inherited.signal)
+    await started
+    expect(nestedSignal).not.toBe(inherited.signal)
+    external.abort()
+    await pending
+    expect(nestedSignal?.aborted).toBe(true)
+    expect(inherited.signal.aborted).toBe(false)
+  })
+
+  it('propagates linked cancellation to a deeper nested operation', async () => {
+    const registry = new BrowserOperationRegistry()
+    const outer = new AbortController(), middle = new AbortController()
+    let deepest: AbortSignal | undefined
+    const pending = registry.run('broker', async () => {
+      await registry.run('command', async () => {
+        await registry.run('recovery', async (signal) => {
+          deepest = signal
+          await new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve(), { once: true }))
+        }, middle.signal)
+      }, middle.signal)
+    }, outer.signal)
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
+    outer.abort()
+    await pending
+    expect(deepest?.aborted).toBe(true)
+  })
+
+  it('detaches a queued request from an older ambient cancellation owner', async () => {
+    const registry = new BrowserOperationRegistry()
+    const outer = new AbortController(); let innerSignal: AbortSignal | undefined; let release!: () => void
+    const pending = registry.run('broker', async () => registry.runDetached('command', async (signal) => {
+      innerSignal = signal
+      await new Promise<void>((resolve) => { release = resolve })
+      return 'done'
+    }), outer.signal)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    outer.abort()
+    expect(innerSignal?.aborted).toBe(false)
+    registry.beginDrain()
+    expect(innerSignal?.aborted).toBe(true)
+    release()
+    await expect(pending).resolves.toBe('done')
+  })
+
   it('can accept new work after a cancelled drain', async () => {
     const registry = new BrowserOperationRegistry()
     registry.beginDrain(); registry.cancelDrain()

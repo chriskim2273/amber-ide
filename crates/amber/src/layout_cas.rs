@@ -149,6 +149,14 @@ pub fn save(root: &Path, text: &str, expected_version: Option<&str>) -> SaveResu
         let mut file = options.open(&tmp)?;
         file.write_all(text.as_bytes())?;
         file.sync_all()?;
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "LAYOUT_SYMLINK"));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
         fs::rename(&tmp, &path)?;
         #[cfg(unix)]
         fs::File::open(root)?.sync_all()?;

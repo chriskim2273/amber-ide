@@ -202,6 +202,10 @@ struct LayoutStamp {
     dev: u64,
     #[cfg(unix)]
     ino: u64,
+    #[cfg(windows)]
+    creation_time: u64,
+    #[cfg(windows)]
+    last_write_time: u64,
 }
 
 fn layout_stamp(path: &Path) -> Option<LayoutStamp> {
@@ -221,6 +225,16 @@ fn layout_stamp(path: &Path) -> Option<LayoutStamp> {
         ino: {
             use std::os::unix::fs::MetadataExt;
             metadata.ino()
+        },
+        #[cfg(windows)]
+        creation_time: {
+            use std::os::windows::fs::MetadataExt;
+            metadata.creation_time()
+        },
+        #[cfg(windows)]
+        last_write_time: {
+            use std::os::windows::fs::MetadataExt;
+            metadata.last_write_time()
         },
     })
 }
