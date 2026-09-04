@@ -36,7 +36,7 @@ import { formatBrowserName, isBrowserName, parseBrowserName } from '../shared/br
 import { formatEditorName, isEditorName, parseEditorName } from '../shared/editorName'
 import { splitLeaf, setRatio, reconcile, leaves, moveLeaf, type Node } from './layout'
 import {
-  emptyLayout, normalizeFriendlyTitle, parseLayout, pruneLocalTitles, serializeLayout, orderTabs, moveTab, mergeLayout,
+  emptyLayout, normalizeFriendlyTitle, parseLayout, pruneLocalTitles, serializeLayout, trimFriendlyTitle, orderTabs, moveTab, mergeLayout,
   type LayoutFile, type TabLayout, type LoadLayoutResult, type SaveLayoutResult,
 } from '../shared/layoutFile'
 import {
@@ -48,7 +48,7 @@ import { stageReplay } from './replay'
 import { formatKb, parseBudgetInput, type BudgetView } from '../shared/budget'
 import { appChord, chordLabel, modLabel, CHORD_TABLE } from './keys'
 import { type PaletteEntry } from './commandPalette'
-import { titleUpdateMatches, type TitleUpdateRequest } from './titleUpdates'
+import { titleCreateComplete, titleUpdateMatches, type TitleUpdateRequest } from './titleUpdates'
 import { panePickerDetail } from './panePicker'
 import { clearZoomForDestination } from './navigation'
 import { activitySummary, bookmarkNeedle, makeBookmark, searchScopeNames, shouldNotify, type SearchScope } from './productivityModels'
@@ -352,6 +352,14 @@ function App(): JSX.Element {
   const [closeAsk, setCloseAsk] = useState<string | null>(null)
   const [titleEditPane, setTitleEditPane] = useState<string | null>(null)
   const pendingTitleUpdates = useRef(new Map<string, { request: TitleUpdateRequest; timer: ReturnType<typeof setTimeout> }>())
+  const pendingTitleCreates = useRef(new Map<string, {
+    request: TitleUpdateRequest
+    created: boolean
+    acknowledged: boolean
+    failed: boolean
+    timer: ReturnType<typeof setTimeout>
+  }>())
+  const [titleCreateSeq, setTitleCreateSeq] = useState(0)
   // A close of a TERMINAL pane, awaiting confirmation. Closing a pane kills its
   // daemon session — the pty, the shell, and anything running in it — and that
   // is not undoable, so it is asked rather than assumed.
@@ -378,10 +386,11 @@ function App(): JSX.Element {
   const [budgetError, setBudgetError] = useState<string | null>(null)
   // A load in flight: created sessions not yet all confirmed by the daemon. The
   // sidecar (trees/labels/frozen) + scrollback replay commit ONCE the daemon
-  // confirms every created session AND (replace mode) the killed old panes are
-  // gone — the load equivalent of the split `pending` placement pattern.
+  // confirms every created session, every title-bearing create has both Created
+  // and TitleSet, AND (replace mode) the killed old panes are gone — the load
+  // equivalent of the split `pending` placement pattern.
   const [pendingLoad, setPendingLoad] = useState<
-    { plan: LoadPlan; createNames: string[]; killed: string[] } | null>(null)
+    { plan: LoadPlan; createNames: string[]; killed: string[]; titleNames: string[] } | null>(null)
   // Backlog-reply resolvers, keyed by session name (correlates DumpBacklog
   // requests to their async `Backlog` frames). A ref — mutating it must never
   // re-render. Consumed + cleared by collectDumps via register/unregister.
@@ -474,14 +483,38 @@ function App(): JSX.Element {
     window.amber.setSessionTitle(name, title)
   }, [])
 
+  const trackTitleCreate = useCallback((name: string, title: string): void => {
+    const pending = pendingTitleCreates.current
+    const previous = pending.get(name)
+    if (previous) clearTimeout(previous.timer)
+    const request: TitleUpdateRequest = { name, title: normalizeFriendlyTitle(title) ?? null }
+    const entry = {
+      request,
+      created: false,
+      acknowledged: false,
+      failed: false,
+      timer: undefined as unknown as ReturnType<typeof setTimeout>,
+    }
+    entry.timer = setTimeout(() => {
+      const current = pending.get(name)
+      if (current !== entry || titleCreateComplete(entry)) return
+      entry.failed = true
+      setTitleCreateSeq((sequence) => sequence + 1)
+      dispatch({ kind: 'Error', msg: 'daemon does not support session titles; restart/update amber' })
+    }, TITLE_ACK_TIMEOUT_MS)
+    pending.set(name, entry)
+  }, [])
+
   useEffect(() => () => {
     for (const { timer } of pendingTitleUpdates.current.values()) clearTimeout(timer)
+    for (const { timer } of pendingTitleCreates.current.values()) clearTimeout(timer)
     pendingTitleUpdates.current.clear()
+    pendingTitleCreates.current.clear()
   }, [])
 
   const onSetPaneTitle = useCallback((paneId: string, value: string): void => {
     const title = normalizeFriendlyTitle(value)
-    const trimmed = value.trim()
+    const trimmed = trimFriendlyTitle(value)
     if (trimmed && title === undefined) {
       const hasControl = [...trimmed].some((char) => {
         const code = char.charCodeAt(0)
@@ -588,8 +621,29 @@ function App(): JSX.Element {
           clearTimeout(current.timer)
           pendingTitleUpdates.current.delete(name)
         }
+        const markTitleCreate = (name: string, update: (entry: {
+          created: boolean
+          acknowledged: boolean
+          failed: boolean
+        }) => void): void => {
+          const current = pendingTitleCreates.current.get(name)
+          if (!current) return
+          update(current)
+          setTitleCreateSeq((sequence) => sequence + 1)
+          if (titleCreateComplete(current) && !current.failed) {
+            clearTimeout(current.timer)
+          }
+        }
+        if (msg.kind === 'Created') {
+          markTitleCreate(msg.name, (entry) => { entry.created = true })
+          return
+        }
         if (msg.kind === 'TitleSet') {
           settleTitle(msg.name, msg.title)
+          const current = pendingTitleCreates.current.get(msg.name)
+          if (current && titleUpdateMatches(current.request, { name: msg.name, title: msg.title })) {
+            markTitleCreate(msg.name, (entry) => { entry.acknowledged = true })
+          }
           return
         }
         if (msg.kind === 'Sessions') {
@@ -1182,6 +1236,11 @@ function App(): JSX.Element {
       const at = plan.workspaces[String(first)]?.activeTab
       if (at !== undefined) setActiveTab(at)
     }
+    for (const name of plan.creates.filter((create) => create.title !== undefined).map((create) => create.name)) {
+      const pending = pendingTitleCreates.current.get(name)
+      if (pending) clearTimeout(pending.timer)
+      pendingTitleCreates.current.delete(name)
+    }
     setPendingLoad(null)
   }, [])
 
@@ -1195,10 +1254,14 @@ function App(): JSX.Element {
     const live = new Set(state.sessions.map((s) => s.name))
     const created = pendingLoad.createNames.every((n) => live.has(n))
     const oldGone = pendingLoad.killed.every((n) => !live.has(n))
-    if (created && oldGone) { commitLoad(pendingLoad, null); return }
+    const titlesReady = pendingLoad.titleNames.every((name) => {
+      const title = pendingTitleCreates.current.get(name)
+      return title !== undefined && (title.failed || titleCreateComplete(title))
+    })
+    if (created && oldGone && titlesReady) { commitLoad(pendingLoad, null); return }
     const t = setTimeout(() => commitLoad(pendingLoad, new Set(state.sessions.map((s) => s.name))), 8000)
     return () => clearTimeout(t)
-  }, [pendingLoad, state.sessions, commitLoad])
+  }, [pendingLoad, state.sessions, titleCreateSeq, commitLoad])
 
   // App-owned keyboard chords (new tab / new pane / switch tab). The 'close'
   // chord is handled in SplitView (it needs the focused-pane identity). This
@@ -1524,7 +1587,8 @@ function App(): JSX.Element {
 
   // Load step 2: chosen mode. Replace kills the current workspace's panes first
   // (one-way — removal lands via daemon events); createSession per planned pane;
-  // the pendingLoad effect commits the sidecar + replay once the daemon confirms.
+  // the pendingLoad effect commits the sidecar + replay once the daemon confirms
+  // Created plus every title-bearing TitleSet (or reports an old-daemon timeout).
   const applyDocument = (doc: WorkspaceDoc, mode: 'new' | 'replace'): void => {
     const liveWs = workspaces.map((w) => w.ws)
     const killed: string[] = []
@@ -1544,8 +1608,14 @@ function App(): JSX.Element {
     // Pane's mount effect (child) runs before App's commit effect (parent), so
     // takeReplay must find its bytes already staged or the replay is lost.
     stageReplay(plan.scrollback)
-    for (const c of plan.creates) window.amber.createSession(c.name, c.cwd, c.kind, c.title)
-    setPendingLoad({ plan, createNames: plan.creates.map((c) => c.name), killed })
+    const titleNames = plan.creates
+      .filter((create) => create.title !== undefined)
+      .map((create) => create.name)
+    for (const c of plan.creates) {
+      if (c.title !== undefined) trackTitleCreate(c.name, c.title)
+      window.amber.createSession(c.name, c.cwd, c.kind, c.title)
+    }
+    setPendingLoad({ plan, createNames: plan.creates.map((c) => c.name), killed, titleNames })
   }
   const createCheckpoint = async (name: string, automatic = false, scope: 'one' | 'all' = 'one'): Promise<boolean> => {
     if (!window.amber.writeCheckpoint) return false

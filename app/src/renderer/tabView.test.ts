@@ -60,6 +60,14 @@ describe('deriveTab', () => {
     expect(paneMeta.a!.title).toBe('~/proj · pi')
   })
 
+  it('preserves a valid U+FEFF friendly title instead of treating it as blank', () => {
+    const { paneMeta } = deriveTab(
+      [pane({ name: 'a', title: '\uFEFFBuild\uFEFF', cwd: '/home/u/proj' })],
+      null, {}, {}, home,
+    )
+    expect(paneMeta.a!.title).toBe('\uFEFFBuild\uFEFF · shell')
+  })
+
   it('lets a durable friendly title outrank OSC and cwd fallbacks', () => {
     const { paneMeta } = deriveTab(
       [pane({ name: 'a', title: '  Release checklist  ', cwd: '/home/u/proj' }),

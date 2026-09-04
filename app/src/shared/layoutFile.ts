@@ -77,15 +77,21 @@ function parseFrozen(v: unknown): Record<string, FrozenEntry> | undefined {
   return out
 }
 
-// Friendly titles share the daemon's limits: trim outer whitespace, reject
-// blank/control values, and cap UTF-8 bytes rather than UTF-16 units. This is
-// exported so sidecar, workspace, and interactive input all enforce the same
-// rule for app-local panes (daemon panes are validated by Rust).
+// Friendly titles share the daemon's limits: trim Unicode White_Space at the
+// edges (not U+FEFF), reject blank/control values, and cap UTF-8 bytes rather
+// than UTF-16 units. This is exported so sidecar, workspace, and interactive
+// input all enforce the same rule for app-local panes (daemon panes are
+// validated by Rust).
 const FRIENDLY_TITLE_MAX_BYTES = 120
+const FRIENDLY_TITLE_EDGE_SPACE = /^\p{White_Space}+|\p{White_Space}+$/gu
+
+export function trimFriendlyTitle(value: string): string {
+  return value.replace(FRIENDLY_TITLE_EDGE_SPACE, '')
+}
 
 export function normalizeFriendlyTitle(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined
-  const title = value.trim()
+  const title = trimFriendlyTitle(value)
   if (!title || new TextEncoder().encode(title).length > FRIENDLY_TITLE_MAX_BYTES) return undefined
   if ([...title].some((char) => {
     const code = char.charCodeAt(0)

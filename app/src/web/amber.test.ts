@@ -44,6 +44,12 @@ describe('parseServerMsg', () => {
       .toEqual({ t: 'memoryPressure', level: 'critical', current_kb: 7000000, budget_kb: 8000000, blocked: false })
     expect(parseServerMsg('{"t":"resourcePressure","level":"critical","causes":["cpu","io"]}'))
       .toEqual({ t: 'resourcePressure', level: 'critical', causes: ['cpu', 'io'], blocked: false })
+    expect(parseServerMsg('{"t":"titleSet","name":"s","title":"Build"}'))
+      .toEqual({ t: 'titleSet', name: 's', title: 'Build' })
+    expect(parseServerMsg('{"t":"titleSet","name":"s","title":null}'))
+      .toEqual({ t: 'titleSet', name: 's', title: null })
+    expect(parseServerMsg('{"t":"created","name":"s"}'))
+      .toEqual({ t: 'created', name: 's' })
   })
 
   it('returns null for an unknown t or malformed JSON', () => {
@@ -54,6 +60,13 @@ describe('parseServerMsg', () => {
 })
 
 describe('toDaemonEvent', () => {
+  it('maps title acknowledgements and creates to the frame shape main.tsx expects', () => {
+    expect(toDaemonEvent({ t: 'titleSet', name: 's', title: 'Build' }))
+      .toEqual({ frame: { type: 'control', msg: { kind: 'TitleSet', name: 's', title: 'Build' } } })
+    expect(toDaemonEvent({ t: 'created', name: 's' }))
+      .toEqual({ frame: { type: 'control', msg: { kind: 'Created', name: 's' } } })
+  })
+
   it('maps sessions/error/activity/memory to the frame shape main.tsx expects', () => {
     expect(toDaemonEvent({ t: 'sessions', sessions: [] }))
       .toEqual({ frame: { type: 'control', msg: { kind: 'Sessions', sessions: [] } } })
@@ -265,6 +278,20 @@ describe('ControlLink', () => {
     expect(socket.sent).toEqual([
       JSON.stringify({ t: 'kill', name: 's' }),
       JSON.stringify({ t: 'suspend', name: 's' }),
+    ])
+  })
+
+  it('dispatches title acknowledgements and create acks as onDaemonEvent frames', () => {
+    const events: unknown[] = []
+    const socket = new FakeSocket()
+    new ControlLink(() => socket, (ev) => events.push(ev))
+    socket.open()
+    events.length = 0
+    socket.emit(JSON.stringify({ t: 'created', name: 's' }))
+    socket.emit(JSON.stringify({ t: 'titleSet', name: 's', title: 'Build' }))
+    expect(events).toEqual([
+      { frame: { type: 'control', msg: { kind: 'Created', name: 's' } } },
+      { frame: { type: 'control', msg: { kind: 'TitleSet', name: 's', title: 'Build' } } },
     ])
   })
 

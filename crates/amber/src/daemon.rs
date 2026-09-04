@@ -335,16 +335,32 @@ fn handle_control(
             };
             let _ = write_frame(writer, &Frame::Control(reply));
             if result.is_ok() {
+                // A title-bearing create has a two-part positive confirmation:
+                // Created first, then TitleSet after the persisted metadata is
+                // read back. Plain Create keeps the old one-ack wire behavior.
+                let info = manager
+                    .session_infos()
+                    .ok()
+                    .and_then(|infos| infos.into_iter().find(|i| i.name == name));
+                if title.is_some() {
+                    if let Some(info) = &info {
+                        let _ = write_frame(
+                            writer,
+                            &Frame::Control(ControlMsg::TitleSet {
+                                name: name.clone(),
+                                title: info.title.clone(),
+                            }),
+                        );
+                    }
+                }
                 // Publish daemon truth before the fsync-backed journal append.
                 // Otherwise a watcher that subscribes after the Created ack can
                 // receive a duplicate added-only delta after its full snapshot.
-                if let Ok(infos) = manager.session_infos() {
-                    if let Some(info) = infos.into_iter().find(|i| i.name == name) {
-                        watchers.broadcast(&ControlMsg::SessionsChanged {
-                            added: vec![info],
-                            removed: vec![],
-                        });
-                    }
+                if let Some(info) = info {
+                    watchers.broadcast(&ControlMsg::SessionsChanged {
+                        added: vec![info],
+                        removed: vec![],
+                    });
                 }
                 manager.record_recovery_event(
                     "info", "session.created", Some(&name),

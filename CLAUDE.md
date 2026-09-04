@@ -1598,20 +1598,24 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   rather than cc-rs's "failed to find tool".
 
 - [x] Durable friendly pane/session titles + picker (2026-09-04) — daemon-owned
-  optional titles are validated (trimmed, printable, ≤120 UTF-8 bytes),
+  optional titles are validated with the same Unicode White_Space trim (U+FEFF
+  preserved), printable controls rejected, and a ≤120 UTF-8-byte cap. They are
   persisted in `SessionMeta`, kept across identity renames, exposed through
   `amber ls`, `amber title`/`set-title`, desktop IPC, and the authenticated web
-  protocol. Electron app-local browser/editor titles live in the sidecar and
-  portable `.amberws` files; daemon titles round-trip through workspace load.
+  protocol. `TitleSet` is emitted only after persistence; title-bearing creates
+  require both Created and TitleSet, with bounded old-daemon errors. Electron
+  app-local browser/editor titles live in the sidecar and portable `.amberws`
+  files; daemon titles round-trip through workspace load.
   Headers, session cleanup rows, command-center cards, handoff metadata, and
   the searchable pane picker prefer the friendly title over live OSC/file/cwd
   fallbacks. The picker has a toolbar entry, command-palette action, and
   Cmd/Ctrl+Shift+O chord; title editing uses a renderer dialog (not Electron's
   unsupported `window.prompt`). Mobile/web lists, mosaic tiles, filtering, and
   title editing use the same daemon truth. Gates: `cargo test --workspace --all-targets`
-  passed, clippy `-D warnings` clean, app **767** tests passed (one deferred
+  passed, clippy `-D warnings` clean, app **773** tests passed (one deferred
   live-daemon test), TypeScript, Electron, and web builds green. Private daemon
-  CLI and authenticated websocket/API title smoke passed; desktop CDP verified
+  CLI, authenticated websocket title-create/set/clear, and API title smoke
+  passed; desktop CDP verified
   picker labels/search, title rename, cross-workspace zoom clearing, focus, and
   Escape dismissal. Still manual: real-phone touch/device verification.
 

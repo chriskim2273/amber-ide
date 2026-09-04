@@ -37,6 +37,8 @@
 //!   its own pane geometry.
 //! - `{"t":"exit","name":"..","code":n}`
 //! - `{"t":"error","msg":".."}`
+//! - correlated title-create replies: `{"t":"created","name":".."}` then
+//!   `{"t":"titleSet","name":"..","title":null|string}`
 //!
 //! Unknown `t`, malformed JSON, or a binary frame with no open session are
 //! **ignored** — never an error that closes the socket.
@@ -83,6 +85,7 @@ use amber_core::proto::{self, ControlMsg, Decoded, Decoder, Frame, SessionInfo};
 use crate::transport::{self, LocalReader, LocalWriter};
 
 use crate::layout_cas;
+use crate::manager::SessionManager;
 use crate::mosaic;
 use crate::router_ops;
 use crate::routerctl;
@@ -695,6 +698,7 @@ const RECONNECT_MAX: Duration = Duration::from_secs(5);
 const GEOMETRY_POLL: Duration = Duration::from_secs(1);
 /// Agent plan quota refresh — matches the daemon's own poller interval.
 const USAGE_POLL: Duration = Duration::from_secs(60);
+const TITLE_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One queued frame for a browser client. `Arc` so a broadcast clones a
 /// pointer, not the payload.
@@ -702,6 +706,14 @@ const USAGE_POLL: Duration = Duration::from_secs(60);
 enum Out {
     Text(Arc<String>),
     Binary(Arc<Vec<u8>>),
+}
+
+struct PendingTitle {
+    client: u64,
+    /// A `Create{title}` confirmation is complete only after both Created and
+    /// TitleSet have arrived. SetTitle requests do not need a Created frame.
+    created: bool,
+    since: Instant,
 }
 
 struct Client {
@@ -730,6 +742,10 @@ struct HubInner {
     /// `Frame::Backlog` carries no client id, so this is the only way to
     /// route the one-shot reply back to whoever asked).
     dump_pending: HashMap<String, Vec<u64>>,
+    /// Browser title requests awaiting a correlated daemon acknowledgement.
+    /// The key is the daemon's normalized `(name, title)` pair; entries are
+    /// bounded by `TITLE_ACK_TIMEOUT` and removed when their browser closes.
+    title_pending: HashMap<(String, Option<String>), Vec<PendingTitle>>,
     /// Last `Usage` reply, already serialized for `GET /api/usage`. Empty
     /// until the 60 s quota tick has been answered once.
     usage: String,
@@ -799,6 +815,7 @@ impl Hub {
                 clients: Vec::new(),
                 pending_backlog: HashSet::new(),
                 dump_pending: HashMap::new(),
+                title_pending: HashMap::new(),
                 usage: String::new(),
                 borrows: HashMap::new(),
             }),
@@ -904,6 +921,7 @@ impl Hub {
         // socket dying IS the release. This is the whole reason the borrow map
         // lives server-side rather than in the shim (spec §2.2).
         Self::release_all(&mut inner, id);
+        Self::forget_title_client(&mut inner, id);
         let open = inner.clients.remove(pos).open;
         Self::detach_if_unwanted(&mut inner, open);
     }
@@ -955,6 +973,103 @@ impl Hub {
             inner.pending_backlog.insert(name.clone());
         }
         Self::write_daemon(inner, frame);
+    }
+
+    fn prune_title_pending(inner: &mut HubInner) {
+        inner.title_pending.retain(|_, requests| {
+            requests.retain(|request| request.since.elapsed() < TITLE_ACK_TIMEOUT);
+            !requests.is_empty()
+        });
+    }
+
+    /// Remember a browser operation that expects a title acknowledgement. The
+    /// daemon applies the canonical trim/validation, so correlation uses that
+    /// normalized title rather than arbitrary browser whitespace.
+    fn track_title_pending(
+        inner: &mut HubInner,
+        client: u64,
+        name: &str,
+        title: Option<&String>,
+        requires_created: bool,
+    ) {
+        let Ok(normalized) = SessionManager::validate_title(title.map(String::as_str)) else {
+            return;
+        };
+        Self::prune_title_pending(inner);
+        let requests = inner
+            .title_pending
+            .entry((name.to_string(), normalized))
+            .or_default();
+        if requests.iter().any(|request| request.client == client) {
+            return;
+        }
+        requests.push(PendingTitle {
+            client,
+            created: !requires_created,
+            since: Instant::now(),
+        });
+    }
+
+    fn forget_title_client(inner: &mut HubInner, client: u64) {
+        inner.title_pending.retain(|_, requests| {
+            requests.retain(|request| request.client != client);
+            !requests.is_empty()
+        });
+    }
+
+    /// Forward a Created ack only to title-bearing browser creates. The title
+    /// request remains pending until its matching TitleSet arrives.
+    fn title_created_ack(inner: &mut HubInner, name: &str) {
+        Self::prune_title_pending(inner);
+        let mut clients = Vec::new();
+        for ((pending_name, _), requests) in &mut inner.title_pending {
+            if pending_name != name {
+                continue;
+            }
+            for request in requests.iter_mut().filter(|request| !request.created) {
+                request.created = true;
+                clients.push(request.client);
+            }
+        }
+        clients.sort_unstable();
+        clients.dedup();
+        let out = Out::Text(Arc::new(
+            serde_json::json!({ "t": "created", "name": name }).to_string(),
+        ));
+        for client in clients {
+            Self::queue(inner, |candidate| candidate.id == client, out.clone());
+        }
+    }
+
+    /// Forward a TitleSet ack only to clients that submitted the same
+    /// normalized `(name, title)` request. A Create title also requires the
+    /// preceding Created ack, preserving the daemon's documented order.
+    fn title_set_ack(inner: &mut HubInner, name: String, title: Option<String>) {
+        Self::prune_title_pending(inner);
+        let key = (name.clone(), title.clone());
+        let Some(requests) = inner.title_pending.remove(&key) else {
+            return;
+        };
+        let mut remaining = Vec::new();
+        let mut clients = Vec::new();
+        for request in requests {
+            if request.created {
+                clients.push(request.client);
+            } else {
+                remaining.push(request);
+            }
+        }
+        if !remaining.is_empty() {
+            inner.title_pending.insert(key, remaining);
+        }
+        clients.sort_unstable();
+        clients.dedup();
+        let out = Out::Text(Arc::new(
+            serde_json::json!({ "t": "titleSet", "name": name, "title": title }).to_string(),
+        ));
+        for client in clients {
+            Self::queue(inner, |candidate| candidate.id == client, out.clone());
+        }
     }
 
     /// Queue `msg` to every client matching `want`, evicting any whose queue
@@ -1068,6 +1183,15 @@ impl Hub {
                 return;
             }
         }
+        match &msg {
+            BrowserMsg::Create { name, title, .. } if title.is_some() => {
+                Self::track_title_pending(&mut inner, id, name, title.as_ref(), true);
+            }
+            BrowserMsg::SetTitle { name, title } => {
+                Self::track_title_pending(&mut inner, id, name, title.as_ref(), false);
+            }
+            _ => {}
+        }
         // Borrow bookkeeping (spec §2.2) BEFORE the open field moves: a client
         // changing which session it looks at releases what it held.
         match &msg {
@@ -1173,6 +1297,12 @@ impl Hub {
                     Self::queue(&mut inner, |c| c.id == id, payload.clone());
                 }
             }
+            Frame::Control(ControlMsg::Created { name }) => {
+                Self::title_created_ack(&mut inner, &name);
+            }
+            Frame::Control(ControlMsg::TitleSet { name, title }) => {
+                Self::title_set_ack(&mut inner, name, title);
+            }
             Frame::Control(ControlMsg::Sessions { sessions }) => {
                 // Unchanged is the common case for the geometry poll — don't
                 // churn every browser with an identical push, UNLESS the
@@ -1263,7 +1393,7 @@ impl Hub {
                 ));
                 Self::queue(&mut inner, |_| true, out);
             }
-            // Acks (Created/Killed/SessionList/…): nothing the UI needs.
+            // Other acks (Killed/SessionList/…): nothing the UI needs.
             _ => {}
         }
     }
@@ -1343,6 +1473,7 @@ fn run_daemon_link(hub: Arc<Hub>) {
                 // out on its own (same as any other daemon-unreachable gap).
                 inner.pending_backlog.clear();
                 inner.dump_pending.clear();
+                inner.title_pending.clear();
                 // An empty session list with a stale non-empty layout would be
                 // incoherent (every leaf it names is now unreachable); "" here
                 // renders as `"layout":null`, matching the empty session list.
@@ -1402,6 +1533,7 @@ pub fn serve(
             thread::sleep(GEOMETRY_POLL);
             let file = mosaic::load(&hub.root);
             let mut inner = hub.inner.lock().unwrap();
+            Hub::prune_title_pending(&mut inner);
             let rendered = Hub::render_layout(&file, &inner.sessions);
             if rendered != inner.layout {
                 inner.layout = rendered;
@@ -1994,6 +2126,64 @@ mod tests {
             rows: 24,
             slot: 1,
         }
+    }
+
+    #[test]
+    fn embedded_mobile_client_handles_title_ack_and_bounded_timeout() {
+        let source = include_str!("../assets/app.js");
+        assert!(source.contains("msg.t === 'titleSet'"));
+        assert!(source.contains("daemon does not support session titles; restart/update amber"));
+        assert!(source.contains("pendingTitle"));
+        assert!(source.contains("titleKey(name, normalized)"));
+        assert!(source.contains("TITLE_ACK_TIMEOUT_MS"));
+    }
+
+    #[test]
+    fn title_ack_routes_only_to_the_correlated_browser_request() {
+        let hub = borrow_hub(vec![s("amber-1-1-0-title", "shell")]);
+        let (requester, requester_rx) = hub.add_client();
+        let (_other, other_rx) = hub.add_client();
+        let _ = recv_out(&requester_rx);
+        let _ = recv_out(&requester_rx);
+        let _ = recv_out(&other_rx);
+        let _ = recv_out(&other_rx);
+
+        hub.handle_browser(requester, r#"{"t":"set-title","name":"amber-1-1-0-title","title":"  Build  "}"#);
+        hub.on_frame(Frame::Control(ControlMsg::TitleSet {
+            name: "amber-1-1-0-title".into(),
+            title: Some("Build".into()),
+        }));
+
+        let Out::Text(text) = recv_out(&requester_rx) else { panic!("expected title acknowledgement") };
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+            serde_json::json!({ "t": "titleSet", "name": "amber-1-1-0-title", "title": "Build" }),
+        );
+        assert!(other_rx.try_recv().is_err(), "title ack leaked to another browser client");
+    }
+
+    #[test]
+    fn title_bearing_create_forwards_created_then_title_ack() {
+        let hub = borrow_hub(vec![]);
+        let (requester, requester_rx) = hub.add_client();
+        let _ = recv_out(&requester_rx);
+        let _ = recv_out(&requester_rx);
+        hub.handle_browser(requester, r#"{"t":"create","name":"amber-1-1-0-created","cwd":"/tmp","kind":"shell","title":"Build"}"#);
+
+        hub.on_frame(Frame::Control(ControlMsg::Created { name: "amber-1-1-0-created".into() }));
+        hub.on_frame(Frame::Control(ControlMsg::TitleSet {
+            name: "amber-1-1-0-created".into(),
+            title: Some("Build".into()),
+        }));
+
+        let Out::Text(created) = recv_out(&requester_rx) else { panic!("expected Created acknowledgement") };
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&created).unwrap(), serde_json::json!({
+            "t": "created", "name": "amber-1-1-0-created",
+        }));
+        let Out::Text(title) = recv_out(&requester_rx) else { panic!("expected TitleSet acknowledgement") };
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&title).unwrap(), serde_json::json!({
+            "t": "titleSet", "name": "amber-1-1-0-created", "title": "Build",
+        }));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 import type { CommandCenterItem, CommandCenterModel } from './commandCenter'
 import type { ProviderUsage } from '../shared/proto'
+import { normalizeFriendlyTitle } from '../shared/layoutFile'
 import { remaining, tightest } from '../shared/usageView'
 import { shortCwd } from './tabView'
 import './PocketCommandCenter.css'
@@ -37,7 +38,7 @@ function formatMemory(kib: number): string {
 }
 
 export function pocketSessionTitle(item: CommandCenterItem, titles: Record<string, string>, home: string): string {
-  const friendly = item.pane.title?.trim()
+  const friendly = normalizeFriendlyTitle(item.pane.title)
   if (friendly) return friendly
   const live = titles[item.pane.name]?.trim()
   if (live) return live

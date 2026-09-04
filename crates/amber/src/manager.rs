@@ -614,13 +614,14 @@ impl SessionManager {
         Ok(sess)
     }
 
-    /// Validate and normalize a user-facing title. Empty/whitespace-only
+    /// Validate and normalize a user-facing title. Unicode White_Space at the
+    /// edges is trimmed (U+FEFF is deliberately preserved), whitespace-only
     /// values clear the title; control characters are rejected rather than
     /// allowing a title to forge terminal/CLI output. The size limit is shared
     /// with app-local title parsing: 120 UTF-8 bytes.
     pub fn validate_title(title: Option<&str>) -> anyhow::Result<Option<String>> {
         let Some(title) = title else { return Ok(None) };
-        let title = title.trim();
+        let title = title.trim_matches(char::is_whitespace);
         if title.is_empty() { return Ok(None) }
         if title.len() > MAX_TITLE_BYTES {
             anyhow::bail!("title exceeds {MAX_TITLE_BYTES} UTF-8 bytes");
@@ -4876,6 +4877,8 @@ mod tests {
     fn friendly_title_rejects_controls_and_absurd_lengths() {
         assert_eq!(SessionManager::validate_title(None).unwrap(), None);
         assert_eq!(SessionManager::validate_title(Some(" \t ")).unwrap(), None);
+        assert_eq!(SessionManager::validate_title(Some("\u{0085} Build \u{0085}")).unwrap().as_deref(), Some("Build"));
+        assert_eq!(SessionManager::validate_title(Some("\u{FEFF} Build \u{FEFF}")).unwrap().as_deref(), Some("\u{FEFF} Build \u{FEFF}"));
         assert_eq!(SessionManager::validate_title(Some(&"x".repeat(120))).unwrap().unwrap().len(), 120);
         assert!(SessionManager::validate_title(Some(&"x".repeat(121))).is_err());
         assert_eq!(SessionManager::validate_title(Some(&"é".repeat(60))).unwrap().unwrap().len(), 120);

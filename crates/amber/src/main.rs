@@ -2123,6 +2123,17 @@ fn create_session_with_title(
     kind: &str,
     title: Option<&str>,
 ) -> anyhow::Result<String> {
+    create_session_with_title_timeout(socket, name, cwd, kind, title, DAEMON_REPLY_TIMEOUT)
+}
+
+fn create_session_with_title_timeout(
+    socket: &Path,
+    name: &str,
+    cwd: &Path,
+    kind: &str,
+    title: Option<&str>,
+    reply_timeout: Duration,
+) -> anyhow::Result<String> {
     let mut stream = connect_daemon(socket)?;
     let request = Frame::Control(ControlMsg::Create {
         name: name.to_string(),
@@ -2132,19 +2143,48 @@ fn create_session_with_title(
     });
     stream.write_all(&proto::encode(&request))?;
 
+    let expected_title = title
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let title_bearing = title.is_some();
+    let mut created = false;
     let mut decoder = Decoder::new();
     let mut buf = [0u8; 8192];
-    let deadline = std::time::Instant::now() + DAEMON_REPLY_TIMEOUT;
+    let deadline = std::time::Instant::now() + reply_timeout;
     loop {
-        match decoder.next_frame()? {
-            Some(Frame::Control(ControlMsg::Created { name })) => return Ok(name),
-            Some(Frame::Control(ControlMsg::Error { msg })) => {
-                anyhow::bail!("create failed: {msg}");
+        while let Some(frame) = decoder.next_frame()? {
+            match frame {
+                Frame::Control(ControlMsg::Created { name: ack_name }) if ack_name == name => {
+                    created = true;
+                    if !title_bearing {
+                        return Ok(ack_name);
+                    }
+                }
+                Frame::Control(ControlMsg::Error { msg }) => {
+                    anyhow::bail!("create failed: {msg}");
+                }
+                Frame::Control(ControlMsg::TitleSet { name: ack_name, title: ack_title })
+                    if created && ack_name == name && ack_title == expected_title =>
+                {
+                    return Ok(name.to_string());
+                }
+                _ => {}
             }
-            _ => {}
         }
-        let n = read_daemon_reply_chunk(&mut stream, &mut buf, deadline)?;
+        let n = match read_daemon_reply_chunk(&mut stream, &mut buf, deadline) {
+            Ok(n) => n,
+            Err(_) if title_bearing && created => anyhow::bail!(
+                "session {name} was created, but daemon does not support session titles; restart/update amber"
+            ),
+            Err(error) => return Err(error),
+        };
         if n == 0 {
+            if title_bearing && created {
+                anyhow::bail!(
+                    "session {name} was created, but daemon does not support session titles; restart/update amber"
+                );
+            }
             anyhow::bail!("daemon closed the connection before replying");
         }
         decoder.feed(&buf[..n]);
@@ -2357,6 +2397,37 @@ mod tests {
                 .contains("daemon does not support session titles; restart/update amber"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn title_bearing_create_cli_rejects_missing_title_ack_after_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("legacy-create.sock");
+        let listener = transport::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut stream = listener.accept().unwrap();
+            stream
+                .write_all(&proto::encode(&Frame::Control(ControlMsg::Created {
+                    name: "created-title".into(),
+                })))
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+        });
+        let error = create_session_with_title_timeout(
+            &socket,
+            "created-title",
+            Path::new("/tmp"),
+            "shell",
+            Some("Build"),
+            Duration::from_millis(50),
+        )
+        .unwrap_err();
+        server.join().unwrap();
+        assert!(error.to_string().contains("session created-title was created"));
+        assert!(error
+            .to_string()
+            .contains("daemon does not support session titles; restart/update amber"));
     }
 
     #[test]

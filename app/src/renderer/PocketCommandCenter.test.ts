@@ -51,6 +51,11 @@ function render(overrides: Partial<Parameters<typeof PocketCommandCenter>[0]> = 
 }
 
 describe('pocketSessionTitle', () => {
+  it('preserves U+FEFF in a valid friendly title', () => {
+    const working = model.groups[1]!.items[0]!
+    expect(pocketSessionTitle({ ...working, pane: { ...working.pane, title: '\uFEFFBuild\uFEFF' } }, {}, '/home/u')).toBe('\uFEFFBuild\uFEFF')
+  })
+
   it('prefers a durable friendly title before live title and cwd fallbacks', () => {
     const working = model.groups[1]!.items[0]!
     expect(pocketSessionTitle({ ...working, pane: { ...working.pane, title: 'Release monitor' } }, { [working.pane.name]: 'live title' }, '/home/u')).toBe('Release monitor')

@@ -410,6 +410,48 @@ fn socket_roundtrip_create_attach_write_read() {
 }
 
 #[test]
+fn title_bearing_create_emits_created_then_title_ack() {
+    let (socket_path, dir) = start_daemon();
+    let mut stream = connect_with_retry(&socket_path);
+    let mut decoder = Decoder::new();
+    send(
+        &mut stream,
+        &Frame::Control(ControlMsg::Create {
+            name: "title-create".into(),
+            cwd: "/tmp".into(),
+            kind: "shell".into(),
+            title: Some("  Build  ".into()),
+        }),
+    );
+    let first = read_frame_until(
+        &mut stream,
+        &mut decoder,
+        |frame| matches!(frame, Frame::Control(ControlMsg::Created { .. })),
+        Duration::from_secs(5),
+    );
+    assert!(matches!(
+        first,
+        Frame::Control(ControlMsg::Created { name }) if name == "title-create"
+    ));
+    let second = read_frame_until(
+        &mut stream,
+        &mut decoder,
+        |frame| matches!(frame, Frame::Control(ControlMsg::TitleSet { .. })),
+        Duration::from_secs(5),
+    );
+    assert!(matches!(
+        second,
+        Frame::Control(ControlMsg::TitleSet { name, title })
+            if name == "title-create" && title.as_deref() == Some("Build")
+    ));
+    let stored = amber_core::state::StateStore::new(dir.path().join("state"))
+        .read_session("title-create")
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.title.as_deref(), Some("Build"));
+}
+
+#[test]
 fn set_title_persists_and_replies_with_matching_ack_and_delta() {
     let (socket_path, manager, dir) = start_daemon_with_manager();
     manager

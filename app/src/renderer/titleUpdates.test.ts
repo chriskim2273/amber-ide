@@ -1,5 +1,13 @@
 import { describe, expect, it } from 'vitest'
-import { titleUpdateMatches } from './titleUpdates'
+import { titleCreateComplete, titleUpdateMatches } from './titleUpdates'
+
+describe('titleCreateComplete', () => {
+  it('requires both Created and matching TitleSet acknowledgements', () => {
+    expect(titleCreateComplete({ created: false, acknowledged: true })).toBe(false)
+    expect(titleCreateComplete({ created: true, acknowledged: false })).toBe(false)
+    expect(titleCreateComplete({ created: true, acknowledged: true })).toBe(true)
+  })
+})
 
 describe('titleUpdateMatches', () => {
   it('accepts only the submitted name and normalized title', () => {

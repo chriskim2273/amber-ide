@@ -81,6 +81,8 @@ export type ServerMsg =
   | { t: 'memory'; name: string; rss_kb: number; growing: boolean }
   | { t: 'memoryPressure'; level: 'normal' | 'warning' | 'critical'; current_kb: number; budget_kb: number; blocked: boolean }
   | { t: 'resourcePressure'; level: 'normal' | 'critical'; causes: Array<'cpu' | 'io' | 'memory'>; blocked: boolean }
+  | { t: 'titleSet'; name: string; title: string | null }
+  | { t: 'created'; name: string }
 
 /** Parse one JSON text frame from `amber web`. `null` for anything this
  * shim has no use for (malformed JSON, an unknown `t`). */
@@ -130,6 +132,11 @@ export function parseServerMsg(text: string): ServerMsg | null {
         || !causes.every((cause) => cause === 'cpu' || cause === 'io' || cause === 'memory')) return null
       return { t: 'resourcePressure', level, causes: [...causes] as Array<'cpu' | 'io' | 'memory'>, blocked: (raw['blocked'] as boolean) ?? false }
     }
+    case 'titleSet':
+      if (typeof raw['name'] !== 'string' || (raw['title'] !== null && typeof raw['title'] !== 'string')) return null
+      return { t: 'titleSet', name: raw['name'], title: raw['title'] as string | null }
+    case 'created':
+      return typeof raw['name'] === 'string' ? { t: 'created', name: raw['name'] } : null
     default:
       return null
   }
@@ -140,9 +147,10 @@ export function parseServerMsg(text: string): ServerMsg | null {
  * expect. `exit`/`backlog`/`backlogReply` are excluded on purpose: `exit` is
  * handled by `PaneLink` (it needs no translation help, just a name/code
  * passthrough), and the backlog messages need the binary payload that
- * arrives in a separate frame — see `ControlLink`. */
+ * arrives in a separate frame — see `ControlLink`. Created/titleSet replies
+ * are forwarded only when the web server correlates them to this operation. */
 export function toDaemonEvent(
-  m: Extract<ServerMsg, { t: 'sessions' | 'error' | 'activity' | 'memory' | 'memoryPressure' | 'resourcePressure' }>,
+  m: Extract<ServerMsg, { t: 'sessions' | 'error' | 'activity' | 'memory' | 'memoryPressure' | 'resourcePressure' | 'titleSet' | 'created' }>,
 ): unknown {
   switch (m.t) {
     case 'sessions':
@@ -178,6 +186,10 @@ export function toDaemonEvent(
           msg: { kind: 'ResourcePressure', level: m.level, causes: m.causes, blocked: m.blocked },
         },
       }
+    case 'titleSet':
+      return { frame: { type: 'control', msg: { kind: 'TitleSet', name: m.name, title: m.title } } }
+    case 'created':
+      return { frame: { type: 'control', msg: { kind: 'Created', name: m.name } } }
   }
 }
 

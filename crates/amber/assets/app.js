@@ -6,7 +6,8 @@
  *   GET  /ws            JSON TEXT control frames + raw BINARY pty bytes
  *     up:   {t:'open',name} | {t:'close',name} | {t:'set-title',name,title} | BINARY = input bytes
  *     down: BINARY = pty output | {t:'sessions',sessions} | {t:'exit',name,code}
- *           | {t:'error',msg}
+ *           | {t:'error',msg} | correlated {t:'created',name} then
+ *             {t:'titleSet',name,title}
  *
  * HARD RULE (spec §4): the phone NEVER sends a resize — a pty's winsize is
  * shared with the desktop app, so a resize would reflow the user's live panes
@@ -96,6 +97,12 @@ function main() {
   var curWs = null;       // selected workspace id, null = follow the server's activeWorkspace
   var curTab = null;      // selected tab id within curWs
   var filterQuery = '';
+  // Browser title requests are correlated by the daemon name + normalized title.
+  // The server routes acknowledgements only to the requesting socket; this
+  // client timeout covers an older daemon that silently skips SetTitle.
+  var pendingTitle = {};
+  var TITLE_ACK_TIMEOUT_MS = 5000;
+  var FRIENDLY_TITLE_EDGE_SPACE = /^\p{White_Space}+|\p{White_Space}+$/gu;
   var open = null;        // session name currently open (survives reconnects)
   var freshBacklog = false; // next binary frame is the replayed scrollback
   var term = null;
@@ -244,7 +251,7 @@ function main() {
   }
 
   function sessionTitle(s) {
-    return s && s.title && s.title.trim() ? s.title.trim() : shortCwd(s ? s.cwd : '');
+    return normalizeTitle(s && s.title) || shortCwd(s ? s.cwd : '');
   }
 
   function matchesFilter(s) {
@@ -322,7 +329,7 @@ function main() {
       var pick = window.prompt(paneId + '\n' + choices.join(' / '), choices[0]);
       if (pick === 'title') {
         var nextTitle = window.prompt('friendly title (blank clears)', s.title || '');
-        if (nextTitle !== null) control({ t: 'set-title', name: paneId, title: nextTitle });
+        if (nextTitle !== null) requestTitle(paneId, nextTitle);
       } else if (pick === 'close') killPane(paneId);
       else if (pick === 'freeze') setFrozen(paneId, true);
       else if (pick === 'unfreeze') setFrozen(paneId, false);
@@ -391,7 +398,7 @@ function main() {
     var t = document.createElement('span');
     t.className = 'row-title';
     var p = parseName(s.name);
-    t.textContent = (s.title && s.title.trim()) || sessionKindLabel(s.kind) + (p ? ' · pane ' + p.ord : ' · ' + s.name);
+    t.textContent = normalizeTitle(s.title) || sessionKindLabel(s.kind) + (p ? ' · pane ' + p.ord : ' · ' + s.name);
     var sub = document.createElement('span');
     sub.className = 'row-sub';
     sub.textContent = shortCwd(s.cwd);
@@ -548,6 +555,53 @@ function main() {
     if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
   }
 
+  // Keep the embedded client aligned with Rust/TS: Unicode White_Space edges
+  // trim, U+FEFF stays, controls and titles over 120 UTF-8 bytes do not.
+  function normalizeTitle(value) {
+    if (typeof value !== 'string') return null;
+    var title = value.replace(FRIENDLY_TITLE_EDGE_SPACE, '');
+    if (!title || new TextEncoder().encode(title).length > 120 || /[\u0000-\u001f\u007f-\u009f]/.test(title)) return null;
+    return title;
+  }
+
+  function titleKey(name, title) { return JSON.stringify([name, title]); }
+
+  function trackTitle(name, title, requiresCreated) {
+    var normalized = normalizeTitle(title);
+    var raw = typeof title === 'string' ? title.replace(FRIENDLY_TITLE_EDGE_SPACE, '') : '';
+    if (title !== null && normalized === null && raw) return;
+    var key = titleKey(name, normalized);
+    var previous = pendingTitle[key];
+    if (previous) clearTimeout(previous.timer);
+    var request = { name: name, title: normalized, created: !requiresCreated };
+    request.timer = setTimeout(function () {
+      if (pendingTitle[key] !== request) return;
+      delete pendingTitle[key];
+      banner('daemon does not support session titles; restart/update amber', 'warn');
+    }, TITLE_ACK_TIMEOUT_MS);
+    pendingTitle[key] = request;
+  }
+
+  function requestTitle(name, title) {
+    trackTitle(name, title, false);
+    control({ t: 'set-title', name: name, title: title });
+  }
+
+  function titleSet(name, title) {
+    var normalized = normalizeTitle(title);
+    var key = titleKey(name, normalized);
+    var request = pendingTitle[key];
+    if (!request || !request.created) return;
+    clearTimeout(request.timer);
+    delete pendingTitle[key];
+  }
+
+  function titleCreated(name) {
+    Object.keys(pendingTitle).forEach(function (key) {
+      if (pendingTitle[key].name === name) pendingTitle[key].created = true;
+    });
+  }
+
   // The tree is NEVER edited locally (core rule: the mosaic is server-driven,
   // per Task 5) — the server's next `sessions` push is the only thing that
   // adds, removes or moves a pane. `pending` only draws a placeholder tile so
@@ -556,13 +610,16 @@ function main() {
 
   var CREATE_KINDS = { shell: 1, claude: 1, grok: 1, codex: 1, opencode: 1, hermes: 1, pi: 1 };
 
-  function newPane(kind, cwd) {
+  function newPane(kind, cwd, title) {
     // Mirrors the server's CREATE_KINDS check (web.rs) so a bad kind banners
     // instead of silently no-opping.
     if (!CREATE_KINDS[kind]) { banner('kind must be shell, claude, grok, codex, opencode, hermes or pi', 'warn'); return; }
     var name = paneName(curWs, curTab, freeOrd(curWs, curTab));
     pending[name] = Date.now() + 3000;
-    control({ t: 'create', name: name, cwd: cwd, kind: kind });
+    if (title !== undefined) trackTitle(name, title, true);
+    var create = { t: 'create', name: name, cwd: cwd, kind: kind };
+    if (title !== undefined) create.title = title;
+    control(create);
     renderList();
     setTimeout(function () { delete pending[name]; renderList(); }, 3000);
   }
@@ -610,7 +667,13 @@ function main() {
       }
       var msg;
       try { msg = JSON.parse(ev.data); } catch (e) { return; }
-      if (msg.t === 'sessions') {
+      if (msg.t === 'created') {
+        titleCreated(msg.name);
+      }
+      else if (msg.t === 'titleSet') {
+        titleSet(msg.name, msg.title);
+      }
+      else if (msg.t === 'sessions') {
         sessions = msg.sessions || []; layout = msg.layout || null;
         if (open) titleEl.textContent = sessionTitle(sessionByName(open)) || open;
         renderList(); syncGeom();

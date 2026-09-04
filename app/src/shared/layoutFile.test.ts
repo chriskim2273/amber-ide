@@ -79,6 +79,11 @@ describe('pushRecent', () => {
 })
 
 describe('layout friendly titles', () => {
+  it('uses Unicode White_Space edges while preserving U+FEFF', () => {
+    expect(normalizeFriendlyTitle('\u0085 Build \u0085')).toBe('Build')
+    expect(normalizeFriendlyTitle('\uFEFF Build \uFEFF')).toBe('\uFEFF Build \uFEFF')
+  })
+
   it('uses the 120-byte UTF-8 boundary shared with the daemon', () => {
     expect(normalizeFriendlyTitle('x'.repeat(120))).toBe('x'.repeat(120))
     expect(normalizeFriendlyTitle('x'.repeat(121))).toBeUndefined()

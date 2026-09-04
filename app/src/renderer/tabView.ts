@@ -4,6 +4,7 @@
 // through deriveTab, so no two consumers can compute divergent trees.
 import { reconcile, type Node } from './layout'
 import type { PaneModel } from './store'
+import { normalizeFriendlyTitle } from '../shared/layoutFile'
 import type { PaneMeta } from './SplitView'
 
 export function shortCwd(cwd: string, home: string): string {
@@ -54,7 +55,7 @@ export function deriveTab(
     // A durable friendly title outranks live OSC/file titles. OSC remains the
     // useful fallback for shells whose title changes with the current command;
     // blank OSC 2 (some prompts) falls back to cwd.
-    const friendly = p.title?.trim()
+    const friendly = normalizeFriendlyTitle(p.title)
     const osc = titles[p.name]
     // An editor pane has no OSC stream: it reports its file name through the same
     // title channel, and an unsaved buffer has neither that nor a cwd.
