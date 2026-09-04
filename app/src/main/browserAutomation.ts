@@ -279,7 +279,10 @@ export class BrowserAutomation {
           const candidates = Array.isArray(partial['nodes']) ? partial['nodes'] as AXNode[] : []
           const node = candidates.find((candidate) => !candidate.ignored)
           if (!node) continue
-          const backendDOMNodeId = typeof node.backendDOMNodeId === 'number' ? node.backendDOMNodeId : (typeof domNode?.['backendNodeId'] === 'number' ? domNode['backendNodeId'] : undefined)
+          // DOM search identifies the requested element; prefer its backend id
+          // over AX's related identity, which can point at a containing node on
+          // Electron 43 after the page has been restored or reattached.
+          const backendDOMNodeId = typeof domNode?.['backendNodeId'] === 'number' ? domNode['backendNodeId'] : (typeof node.backendDOMNodeId === 'number' ? node.backendDOMNodeId : undefined)
           const axNodeId = typeof node.nodeId === 'string' && node.nodeId ? createHash('sha256').update(node.nodeId).digest('base64url') : ''
           const identity = axNodeId ? `ax:${axNodeId}` : (backendDOMNodeId === undefined ? '' : `dom:${backendDOMNodeId}`)
           if (identity && seenAXNodes.has(identity)) continue

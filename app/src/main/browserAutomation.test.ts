@@ -54,6 +54,25 @@ describe('browser automation', () => {
     expect(JSON.stringify(snapshot)).not.toContain('hunter2')
   })
 
+  it('keeps the DOM backend identity when the AX response reports a different backend id', async () => {
+    class MismatchedBackendDebugger extends FakeDebugger {
+      boxBackends: number[] = []
+      override async send(method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>> {
+        if (method === 'Accessibility.getPartialAXTree' && params?.['nodeId'] === 102) {
+          return { nodes: [{ role: { value: 'button' }, name: { value: 'Submit' }, backendDOMNodeId: 999 }] }
+        }
+        if (method === 'DOM.getBoxModel' && typeof params?.['backendNodeId'] === 'number') this.boxBackends.push(params['backendNodeId'])
+        return super.send(method, params)
+      }
+    }
+    const transport = new MismatchedBackendDebugger()
+    const automation = new BrowserAutomation(transport, () => 'about:blank', () => false)
+    const snapshot = await automation.snapshot(lease, { maxDepth: 20, maxNodes: 20, maxBytes: 256 * 1024 }, new AbortController().signal)
+    await automation.inspect(lease, { snapshotId: snapshot.snapshotId, ref: snapshot.nodes[1]!.ref }, new AbortController().signal)
+    expect(transport.boxBackends).toContain(2)
+    expect(transport.boxBackends).not.toContain(999)
+  })
+
   it('includes ordinary StaticText for snapshot and text wait without script, style, whitespace, hidden, or duplicate output', async () => {
     class TextPageDebugger extends FakeDebugger {
       query = ''
