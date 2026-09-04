@@ -29,6 +29,10 @@ function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
 interface BrowserQueueOperation {
   /** The caller's controller. This operation, not the queue key, owns it. */
   controller: AbortController
+  /** Browser identity used to abort all work for a closed/hidden pane. */
+  id: string
+  /** Broker controller identity; undefined means direct/user work. */
+  owner?: string
   /** Set only after this entry has passed the pre-dispatch cancellation fence. */
   started: boolean
   /** Bound only at actual dispatch, never while the entry is merely queued. */
@@ -37,12 +41,19 @@ interface BrowserQueueOperation {
   isolationStarted: boolean
 }
 
+type QueueTerminalState = 'cooperative' | 'isolated' | 'poisoned'
+
 /**
  * Keep one queue tail per operation. A cancelled follower must still wait for
  * its predecessor's tail: resolving its tail immediately would let the next
  * entry overtake an active adapter. Only an entry that actually started may
  * arm the bounded non-cooperative adapter barrier, and the isolation callback
  * is therefore bound to that entry's runtime identity.
+ *
+ * The returned tail always reaches an explicit terminal state. In particular,
+ * an isolation failure is not converted into a rejected-but-swallowed promise
+ * (which would leave the tail pending forever) and is not allowed to release
+ * the queue until the caller has poisoned or otherwise disposed the runtime.
  */
 function boundedQueueBarrier(
   promise: Promise<unknown>,
@@ -51,40 +62,58 @@ function boundedQueueBarrier(
   operationStarted: () => boolean,
   stillPending?: () => boolean | undefined,
   isolate?: () => void | Promise<void>,
-): Promise<void> {
-  return new Promise<void>((resolve) => {
+  onIsolationFailure?: (error: unknown) => void,
+): Promise<QueueTerminalState> {
+  return new Promise<QueueTerminalState>((resolve) => {
     let timer: NodeJS.Timeout | undefined
     let finished = false
     let operationSettled = false
-    const finish = (): void => {
+    let isolationStarted = false
+    const finish = (state: QueueTerminalState): void => {
       if (finished) return
       finished = true
       if (timer) clearTimeout(timer)
       releaseSignal.removeEventListener('abort', release)
-      resolve()
+      resolve(state)
+    }
+    const failIsolation = (error: unknown): void => {
+      try { onIsolationFailure?.(error) } catch { /* failure handling must not strand the queue */ }
+      finish('poisoned')
+    }
+    const startIsolation = (): void => {
+      if (finished || isolationStarted) return
+      isolationStarted = true
+      let attempt: Promise<void>
+      try {
+        if (!isolate) throw new Error('BROWSER_HOST_QUARANTINE_UNAVAILABLE')
+        attempt = Promise.resolve(isolate())
+      } catch (error) {
+        failIsolation(error); return
+      }
+      void attempt.then(() => finish('isolated'), failIsolation)
+    }
+    const readPending = (): boolean | undefined => {
+      try { return stillPending?.() } catch { return undefined }
     }
     const release = (): void => {
-      if (finished || timer || operationSettled) {
-        if (operationSettled) finish()
+      if (finished || timer || operationSettled || isolationStarted) {
+        if (operationSettled && !isolationStarted) finish('cooperative')
         return
       }
       // This entry is still waiting behind another entry. Its cancellation is
       // not permission to release the tail or quarantine the active entry.
       if (!operationStarted()) return
-      const pending = stillPending?.()
-      if (pending === false) { finish(); return }
-      if (timeoutMs <= 0) {
-        void Promise.resolve(isolate?.()).then(finish, () => {})
-        return
-      }
+      const pending = readPending()
+      if (pending === false) { finish('cooperative'); return }
+      if (timeoutMs <= 0) { startIsolation(); return }
       timer = setTimeout(() => {
         timer = undefined
-        if (operationSettled) { finish(); return }
-        const adapterPending = stillPending?.()
-        if (adapterPending === false) { finish(); return }
+        if (operationSettled) { finish('cooperative'); return }
+        const adapterPending = readPending()
+        if (adapterPending === false) { finish('cooperative'); return }
         // The operation owns this callback. Do not infer ownership from the
         // browser id: a queued follower can share the same incarnation.
-        void Promise.resolve(isolate?.()).then(finish, () => {})
+        startIsolation()
       }, timeoutMs)
       timer.unref()
     }
@@ -93,7 +122,7 @@ function boundedQueueBarrier(
       // A cooperative operation, including a cancelled queued follower that
       // has just reached the head, releases normally. A non-cooperative active
       // operation is released by the isolation timer above.
-      finish()
+      if (!isolationStarted) finish('cooperative')
     }
     promise.then(settled, settled)
     releaseSignal.addEventListener('abort', release, { once: true })
@@ -191,6 +220,10 @@ export class TabBrowserService {
   private readonly observedGeneration = new Map<string, number>()
   private readonly latestPiActions = new Map<string, { type: 'pi-action'; browserId: string; controller: string; action: string; phase: 'started' | 'completed' | 'failed'; error?: string; at: number }>()
   private readonly pendingRuntimeEvents = new Map<string, unknown>()
+  /** Queue entries own a distinct controller from their caller/registry. */
+  private readonly browserQueueOwners = new Set<BrowserQueueOperation>()
+  /** A failed disposal makes future work fail closed until the pane is closed. */
+  private readonly poisonedBrowsers = new Set<string>()
   /** Operations whose caller has gone away but whose page adapter is being isolated. */
   private readonly quarantinedOperations = new Set<symbol>()
   private drainGeneration = 0
@@ -236,9 +269,28 @@ export class TabBrowserService {
     }
   }
   setApprovalSurface(visible: (browserId: string) => boolean, reveal: (browserId: string) => void): void { this.approvalSurfaceVisible = visible; this.approvalSurfaceReveal = reveal }
+  private abortQueueOwners(id: string, owner?: string): void {
+    for (const operation of this.browserQueueOwners) if (operation.id === id && (owner === undefined || operation.owner === owner)) operation.controller.abort()
+  }
+  private abortPiQueueOwners(id: string): void {
+    for (const operation of this.browserQueueOwners) if (operation.id === id && operation.owner !== undefined) operation.controller.abort()
+  }
+  private abortBrowserWork(id: string): void {
+    this.activationControllers.get(id)?.abort()
+    this.abortQueueOwners(id)
+    for (const active of this.activePi.get(id) ?? []) active.controller.abort()
+    this.activePi.delete(id)
+  }
+  private abortAllQueueOwners(): void {
+    for (const operation of this.browserQueueOwners) operation.controller.abort()
+  }
+  private assertBrowserUsable(id: string): void {
+    if (this.poisonedBrowsers.has(id)) throw new Error('BROWSER_HOST_POISONED')
+  }
+  private poisonBrowser(id: string): void { this.poisonedBrowsers.add(id) }
   surfaceHidden(id: string): void {
     this.approvals.invalidateBrowser(id); this.dialogs.clearBrowser(id)
-    for (const active of this.activePi.get(id) ?? []) active.controller.abort()
+    this.abortBrowserWork(id)
   }
   setEventSink(sink: (event: unknown) => void): void { this.eventSink = sink }
   private queueRuntimeEvent(id: string, event: unknown): void {
@@ -291,7 +343,9 @@ export class TabBrowserService {
 
   async destroyForAssociation(id: string): Promise<void> {
     this.approvals.clearBrowser(id); this.dialogs.clearBrowser(id); this.latestPiActions.delete(id)
+    this.abortBrowserWork(id)
     try { this.host.close(id) } catch { return }
+    this.poisonedBrowsers.delete(id)
     await this.schedulePersist()
   }
 
@@ -369,9 +423,18 @@ export class TabBrowserService {
     const abort = (): void => controller.abort()
     signal?.addEventListener('abort', abort, { once: true })
     if (signal?.aborted) controller.abort()
-    const ownership: BrowserQueueOperation = { controller, started: false, identity: undefined, isolationStarted: false }
+    const ownership: BrowserQueueOperation = {
+      controller,
+      id: key,
+      ...((command.type === 'navigate' || command.type === 'automation') && command.broker ? { owner: command.broker.controller } : {}),
+      started: false,
+      identity: undefined,
+      isolationStarted: false,
+    }
+    this.browserQueueOwners.add(ownership)
     const operation = prior.catch(() => {}).then(async () => {
       this.operations.assertDispatch(controller.signal)
+      this.assertBrowserUsable(key)
       // A follower that was cancelled while queued never gets a bound runtime
       // and therefore cannot quarantine the operation active before it. The
       // dispatch callback below flips `started` only when this entry is about
@@ -389,7 +452,7 @@ export class TabBrowserService {
     // queue after a bounded grace so one hung WebContents cannot block later
     // mutations or resident quit forever. The late operation remains attached
     // to this promise, so any eventual rejection is observed and isolated.
-    const tail = boundedQueueBarrier(operation, controller.signal, TAB_BROWSER_QUEUE_BARRIER_TIMEOUT_MS,
+    const barrier = boundedQueueBarrier(operation, controller.signal, TAB_BROWSER_QUEUE_BARRIER_TIMEOUT_MS,
       () => ownership.started,
       () => {
         const identity = ownership.identity
@@ -397,10 +460,13 @@ export class TabBrowserService {
         const pending = (this.host as unknown as { hasPendingOperation?: (id: string, incarnation: string) => boolean }).hasPendingOperation
         return typeof pending === 'function' ? pending.call(this.host, identity.id, identity.pageIncarnation) : undefined
       },
-      () => this.isolateBrowserOperation(ownership))
+      () => this.isolateBrowserOperation(ownership),
+      () => { this.poisonBrowser(key) })
+    const tail = barrier.then(() => {})
     this.browserQueues.set(key, tail)
     void tail.then(() => {}, () => {}).finally(() => {
       signal?.removeEventListener('abort', abort)
+      this.browserQueueOwners.delete(ownership)
       if (this.browserQueues.get(key) === tail) this.browserQueues.delete(key)
       if (command.type === 'show' && this.activationControllers.get(key) === controller) this.activationControllers.delete(key)
     })
@@ -419,7 +485,26 @@ export class TabBrowserService {
     const { id, pageIncarnation } = ownership.identity
     const key = Symbol('browser-quarantine')
     this.quarantinedOperations.add(key)
-    try { await this.host.quarantine?.(id, pageIncarnation) } finally { this.quarantinedOperations.delete(key) }
+    try {
+      const quarantine = (this.host as unknown as { quarantine?: (browserId: string, incarnation: string) => void | Promise<void> }).quarantine
+      try {
+        if (!quarantine) throw new Error('BROWSER_HOST_QUARANTINE_UNAVAILABLE')
+        await quarantine.call(this.host, id, pageIncarnation)
+      } catch (error) {
+        // A failing adapter disposal must not release this FIFO into an
+        // unknown runtime. Prefer the host's normal frozen teardown; if that
+        // is also unavailable/fails, the browser is poisoned and later work is
+        // rejected before dispatch.
+        const freeze = (this.host as unknown as { freeze?: (browserId: string) => void | Promise<void> }).freeze
+        try {
+          if (!freeze) throw new Error('BROWSER_HOST_FREEZE_UNAVAILABLE')
+          await freeze.call(this.host, id)
+          return
+        } catch {
+          throw error
+        }
+      }
+    } finally { this.quarantinedOperations.delete(key) }
   }
 
   private withLatestAction<T extends object>(id: string, status: T): T & { lastAction?: unknown } {
@@ -439,6 +524,8 @@ export class TabBrowserService {
     this.operations.assertDispatch(signal)
     if (validate && !(await validate())) throw new Error('STALE_BROWSER_CONTEXT')
     this.operations.assertDispatch(signal)
+    const browserId = 'id' in command && typeof command.id === 'string' ? command.id : undefined
+    if (browserId && command.type !== 'status' && command.type !== 'destroy' && command.type !== 'resolveApproval' && command.type !== 'resolveDialog' && command.type !== 'stopPi') this.assertBrowserUsable(browserId)
     switch (command.type) {
       case 'open': {
         try {
@@ -539,7 +626,12 @@ export class TabBrowserService {
         return this.host.status(command.id)
       }
       case 'stopPi': this.revokePi(command.id); return this.host.status(command.id)
-      case 'destroy': this.approvals.clearBrowser(command.id); this.dialogs.clearBrowser(command.id); this.latestPiActions.delete(command.id); this.host.close(command.id); await this.schedulePersist(); return { closed: true }
+      case 'destroy': {
+        this.approvals.clearBrowser(command.id); this.dialogs.clearBrowser(command.id); this.latestPiActions.delete(command.id)
+        this.abortBrowserWork(command.id)
+        this.host.close(command.id); this.poisonedBrowsers.delete(command.id)
+        await this.schedulePersist(); return { closed: true }
+      }
       case 'close': case 'share': case 'designate': throw new Error('ASSOCIATION_COMMAND_REQUIRES_MAIN')
     }
   }
@@ -558,6 +650,10 @@ export class TabBrowserService {
     this.draining = true; this.drainGeneration += 1
     this.operations.beginDrain()
     for (const controller of this.activationControllers.values()) controller.abort()
+    // The registry owns the caller/operation controllers, while each browser
+    // FIFO owns a distinct controller. Abort both layers so queued direct work
+    // cannot enter after the outer operation has drained.
+    this.abortAllQueueOwners()
     this.approvals.clearAll(); this.dialogs.clearAll()
     for (const id of Object.keys(this.host.snapshot().records)) this.revokePi(id)
   }
@@ -583,6 +679,7 @@ export class TabBrowserService {
 
   async flushAndDestroy(signal?: AbortSignal): Promise<void> {
     const generation = this.drainGeneration
+    this.abortAllQueueOwners()
     await this.waitForDrain(this.operations.waitForEmpty(), signal, generation)
     await this.waitForDrain(Promise.allSettled([...this.browserQueues.values()]), signal, generation)
     this.host.freezeAll()
@@ -594,9 +691,15 @@ export class TabBrowserService {
   }
 
   revokePi(id: string): void {
-    if (this.revokedPi.has(id)) return
-    this.revokedPi.add(id); this.approvals.clearBrowser(id); this.dialogs.clearBrowser(id)
-    try { this.host.revokePi(id) } catch { /* close may already have removed the record */ }
+    const firstRevocation = !this.revokedPi.has(id)
+    this.revokedPi.add(id)
+    if (firstRevocation) {
+      this.approvals.clearBrowser(id); this.dialogs.clearBrowser(id)
+      try { this.host.revokePi(id) } catch { /* close may already have removed the record */ }
+    }
+    // A broker request can be waiting behind another request and therefore is
+    // absent from activePi. Its FIFO owner must still be cancelled on revoke.
+    this.abortPiQueueOwners(id)
     for (const active of this.activePi.get(id) ?? []) active.controller.abort()
     this.activePi.delete(id)
   }

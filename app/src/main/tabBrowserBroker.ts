@@ -563,6 +563,10 @@ export class TabBrowserBrokerServer {
     for (const [controller, session] of this.activeRequests) if (session === amberSession) controller.abort()
   }
   async close(): Promise<void> {
+    // Socket close normally reaches these controllers through the per-connection
+    // handler, but abort explicitly first so a queue owner waiting behind a
+    // non-cooperative adapter cannot depend on close-event scheduling.
+    for (const controller of this.activeRequests.keys()) controller.abort()
     for (const socket of this.sockets) socket.destroy()
     if (this.server) await new Promise<void>((resolve) => this.server!.close(() => resolve()))
     this.server = null

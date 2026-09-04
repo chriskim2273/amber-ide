@@ -80,7 +80,7 @@ describe('TabBrowserService dispatch authorization', () => {
           if (calls === 1) return new Promise((resolve) => { release = () => resolve({ id }) })
           return { id }
         },
-        snapshot: () => state, pendingLoadCount: () => 0, liveIds: () => [], freezeAll: () => {},
+        quarantine: () => {}, snapshot: () => state, pendingLoadCount: () => 0, liveIds: () => [], freezeAll: () => {},
       }
       const Service = TabBrowserService as unknown as new (s: TabBrowserStateStore, p: { setWindow: () => void }, h: typeof host, i: typeof state) => TabBrowserService
       const service = new Service({ update: async () => { persists += 1; return state } } as unknown as TabBrowserStateStore, { setWindow: () => {} }, host, state)
@@ -181,6 +181,126 @@ describe('TabBrowserService dispatch authorization', () => {
       releaseActive(); await Promise.resolve()
       expect(service.pendingWork()).toMatchObject({ queued: 0, quarantined: 0, total: 0 })
     } finally { vi.useRealTimers() }
+  })
+
+  it('poisons a browser when quarantine fails without hanging later FIFO work or quit', async () => {
+    vi.useFakeTimers()
+    try {
+      const state = emptyBrowserState(1), id = 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+      let releaseActive!: () => void
+      let calls = 0, maxActive = 0, active = 0, freezes = 0
+      const host = {
+        navigate: async () => {
+          calls += 1; active += 1; maxActive = Math.max(maxActive, active)
+          if (calls === 1) return new Promise((resolve) => { releaseActive = () => { active -= 1; resolve({ id }) } })
+          active -= 1; return { id }
+        },
+        hasPendingOperation: () => true,
+        quarantine: async () => { throw new Error('DISPOSAL_FAILED') },
+        snapshot: () => state, pendingLoadCount: () => 0, liveIds: () => [], freezeAll: () => { freezes += 1 },
+      }
+      const Service = TabBrowserService as unknown as new (s: TabBrowserStateStore, p: { setWindow: () => void }, h: typeof host, i: typeof state) => TabBrowserService
+      const service = new Service({ update: async () => state } as unknown as TabBrowserStateStore, { setWindow: () => {} }, host, state)
+      const command = (url: string) => ({ type: 'navigate' as const, id, url, pageIncarnation: 'page', expectedGeneration: 1 })
+      const ownerA = new AbortController(), ownerB = new AbortController()
+      const first = service.command(command('https://example.test/a'), ownerA.signal)
+      await vi.waitFor(() => expect(calls).toBe(1))
+      const cancelled = service.command(command('https://example.test/b'), ownerB.signal)
+      const later = service.command(command('https://example.test/c'))
+      ownerA.abort(); ownerB.abort()
+      const laterResult = expect(later).rejects.toThrow('BROWSER_HOST_POISONED')
+      await expect(first).rejects.toThrow('ACTION_CANCELLED')
+      await expect(cancelled).rejects.toThrow('ACTION_CANCELLED')
+      await vi.advanceTimersByTimeAsync(TAB_BROWSER_QUEUE_BARRIER_TIMEOUT_MS)
+      await laterResult
+      expect(calls).toBe(1)
+      expect(maxActive).toBe(1)
+      expect(service.pendingWork()).toMatchObject({ queued: 0, quarantined: 0, total: 0 })
+      service.beginDrain()
+      await expect(service.flushAndDestroy()).resolves.toBeUndefined()
+      expect(freezes).toBe(1)
+      releaseActive(); await Promise.resolve()
+    } finally { vi.useRealTimers() }
+  })
+
+  it('aborts queued direct work when its browser is hidden, without releasing a live predecessor', async () => {
+    vi.useFakeTimers()
+    try {
+      const state = emptyBrowserState(1), id = 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'; let release!: () => void; let calls = 0; let signal!: AbortSignal
+      const host = {
+        navigate: async (_id: string, _url: string, _page: string, _generation: number, operationSignal: AbortSignal) => {
+          calls += 1; signal = operationSignal
+          if (calls === 1) return new Promise((resolve) => { release = () => resolve({ id }) })
+          return { id }
+        },
+        hasPendingOperation: () => true,
+        quarantine: () => {},
+        snapshot: () => state, pendingLoadCount: () => 0, liveIds: () => [], freezeAll: () => {},
+      }
+      const Service = TabBrowserService as unknown as new (s: TabBrowserStateStore, p: { setWindow: () => void }, h: typeof host, i: typeof state) => TabBrowserService
+      const service = new Service({ update: async () => state } as unknown as TabBrowserStateStore, { setWindow: () => {} }, host, state)
+      const command = (url: string) => ({ type: 'navigate' as const, id, url, pageIncarnation: 'page', expectedGeneration: 1 })
+      const first = service.command(command('https://example.test/a'))
+      const firstResult = expect(first).rejects.toThrow('ACTION_CANCELLED')
+      await vi.waitFor(() => expect(calls).toBe(1))
+      const hidden = service.command(command('https://example.test/b'))
+      service.surfaceHidden(id)
+      await expect(hidden).rejects.toThrow('ACTION_CANCELLED')
+      expect(signal.aborted).toBe(true)
+      expect(calls).toBe(1)
+      release(); await firstResult
+      await vi.advanceTimersByTimeAsync(TAB_BROWSER_QUEUE_BARRIER_TIMEOUT_MS)
+      expect(service.pendingWork()).toMatchObject({ queued: 0, quarantined: 0, total: 0 })
+    } finally { vi.useRealTimers() }
+  })
+
+  it('closes a browser by aborting its queue owner before disposing the host runtime', async () => {
+    vi.useFakeTimers()
+    try {
+      const state = emptyBrowserState(1), id = 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'; let release!: () => void; let signal!: AbortSignal; const order: string[] = []
+      const host = {
+        navigate: async (_id: string, _url: string, _page: string, _generation: number, operationSignal: AbortSignal) => {
+          signal = operationSignal
+          return new Promise((resolve) => { release = () => resolve({ id }) })
+        },
+        close: () => { order.push(`close:${signal.aborted}`) },
+        hasPendingOperation: () => false,
+        snapshot: () => state, pendingLoadCount: () => 0, liveIds: () => [], freezeAll: () => {},
+      }
+      const Service = TabBrowserService as unknown as new (s: TabBrowserStateStore, p: { setWindow: () => void }, h: typeof host, i: typeof state) => TabBrowserService
+      const service = new Service({ update: async () => state } as unknown as TabBrowserStateStore, { setWindow: () => {} }, host, state)
+      const pending = service.command({ type: 'navigate', id, url: 'https://example.test/', pageIncarnation: 'page', expectedGeneration: 1 })
+      const pendingResult = expect(pending).rejects.toThrow('ACTION_CANCELLED')
+      await vi.waitFor(() => expect(signal).toBeDefined())
+      await service.destroyForAssociation(id)
+      expect(order).toEqual(['close:true'])
+      release(); await pendingResult
+      await vi.advanceTimersByTimeAsync(TAB_BROWSER_QUEUE_BARRIER_TIMEOUT_MS)
+      expect(service.pendingWork()).toMatchObject({ queued: 0, quarantined: 0, total: 0 })
+    } finally { vi.useRealTimers() }
+  })
+
+  it('revokes Pi work through both the active adapter and its queued owner, preserving direct work', async () => {
+    const state = emptyBrowserState(1), id = 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'; let started = false; let automationCalls = 0; let navigations = 0
+    const host = {
+      runAutomation: async (_id: string, _action: unknown, signal: AbortSignal) => {
+        automationCalls += 1; started = true
+        return new Promise((_resolve, reject) => signal.addEventListener('abort', () => reject(new Error('ACTION_CANCELLED')), { once: true }))
+      },
+      navigate: async () => { navigations += 1; return { id } },
+      snapshot: () => state, pendingLoadCount: () => 0, liveIds: () => [],
+    }
+    const Service = TabBrowserService as unknown as new (s: TabBrowserStateStore, p: { setWindow: () => void }, h: typeof host, i: typeof state) => TabBrowserService
+    const service = new Service({ update: async () => state } as unknown as TabBrowserStateStore, { setWindow: () => {} }, host, state)
+    const action = { type: 'console' as const, pageIncarnation: 'page', expectedGeneration: 1, limit: 10 }
+    const first = service.command({ type: 'automation', id, broker: { requestId: 'one', controller: 'pi-owner' }, action })
+    await vi.waitFor(() => expect(started).toBe(true))
+    const queued = service.command({ type: 'automation', id, broker: { requestId: 'two', controller: 'pi-owner' }, action })
+    service.revokePi(id)
+    await expect(first).rejects.toThrow('ACTION_CANCELLED')
+    await expect(queued).rejects.toThrow('ACTION_CANCELLED')
+    await expect(service.command({ type: 'navigate', id, url: 'https://example.test/', pageIncarnation: 'page', expectedGeneration: 1 })).resolves.toMatchObject({ id })
+    expect({ automationCalls, navigations }).toEqual({ automationCalls: 1, navigations: 1 })
   })
 
   it('quarantines a non-cooperative adapter before the same-browser FIFO continues', async () => {
@@ -478,7 +598,7 @@ describe('TabBrowserService approvals and Stop Pi', () => {
     const action = service.command({ type: 'automation', id, broker: { requestId: 'request-collapse', controller: 'amber-1-1-0-pi' }, action: { type: 'interact', pageIncarnation: 'page', expectedGeneration: 1, operation: { kind: 'click', target: { snapshotId: 'snap', ref: 'n1' } } } })
     await vi.waitFor(() => expect(events.some((event) => event['type'] === 'approval-request')).toBe(true))
     await service.command({ type: 'hide', id })
-    await expect(action).rejects.toThrow('APPROVAL_DENIED')
+    await expect(action).rejects.toThrow('ACTION_CANCELLED')
     expect(events.some((event) => event['type'] === 'approval-resolved')).toBe(true)
   })
 
