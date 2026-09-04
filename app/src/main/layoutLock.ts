@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
-import { lstat, open, unlink } from 'node:fs/promises'
+import { dirname } from 'node:path'
+import { lstat, link, open, unlink } from 'node:fs/promises'
 import type { Stats } from 'node:fs'
-import type { FileHandle } from 'node:fs/promises'
 import { execFile as execFileCallback } from 'node:child_process'
 import { promisify } from 'node:util'
 import { readSafeTextFile } from './safeFileReader'
@@ -12,7 +12,7 @@ const LOCK_RECORD_MAX_BYTES = 4096
 const LOCK_WAIT_MS = 2_000
 
 export interface LayoutLockRecord { pid: number; start: string; token: string }
-interface LockSnapshot { record: LayoutLockRecord; text: string; stat: Stats }
+interface LockSnapshot { record: LayoutLockRecord | null; text: string; stat: Stats }
 
 export function formatLayoutLockRecord(record: LayoutLockRecord): string {
   return `${LOCK_PROTOCOL}\npid=${record.pid}\nstart=${record.start}\ntoken=${record.token}\n`
@@ -100,9 +100,34 @@ async function snapshot(path: string): Promise<LockSnapshot | null> {
   const text = await readSafeTextFile(path, { maxBytes: LOCK_RECORD_MAX_BYTES })
   if (text === null) return null
   const stat = await lstat(path)
-  const record = parseLayoutLockRecord(text)
-  if (!record) return { record: { pid: 1, start: 'unknown', token: '' }, text, stat }
-  return { record, text, stat }
+  return { record: parseLayoutLockRecord(text), text, stat }
+}
+
+/**
+ * Recover only the owner identity from an old lock that was published by
+ * writing the final pathname in place. A complete new lock is always parsed
+ * by `parseLayoutLockRecord`; this fallback is intentionally incomplete and
+ * can reclaim only when the old PID/start identity is demonstrably dead.
+ *
+ * A partial legacy record with no complete PID and start field is not safely
+ * reclaimable: removing it could race a still-writing old owner. Such a file
+ * fails closed until an operator removes it after verifying the old process.
+ */
+function parseLegacyOwner(text: string): LayoutLockRecord | null {
+  const lines = text.split('\n')
+  if (lines[0] !== LOCK_PROTOCOL) return null
+  let pid: number | undefined
+  let start: string | undefined
+  for (const line of lines.slice(1)) {
+    const separator = line.indexOf('=')
+    if (separator <= 0) continue
+    const key = line.slice(0, separator), value = line.slice(separator + 1)
+    if (key === 'pid' && /^\d+$/.test(value)) {
+      const candidate = Number(value)
+      if (Number.isSafeInteger(candidate) && candidate > 0) pid = candidate
+    } else if (key === 'start' && /^[A-Za-z0-9_.:-]{1,256}$/.test(value)) start = value
+  }
+  return pid !== undefined && start !== undefined ? { pid, start, token: '' } : null
 }
 
 function sameFile(a: Stats, b: Stats): boolean {
@@ -112,7 +137,7 @@ function sameFile(a: Stats, b: Stats): boolean {
 async function removeIfUnchanged(path: string, expected: LockSnapshot): Promise<boolean> {
   let current: LockSnapshot | null
   try { current = await snapshot(path) } catch { return false }
-  if (!current || current.record.token !== expected.record.token || current.text !== expected.text || !sameFile(current.stat, expected.stat)) return false
+  if (!current || current.record?.token !== expected.record?.token || current.text !== expected.text || !sameFile(current.stat, expected.stat)) return false
   try { await unlink(path); return true } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
     throw error
@@ -120,6 +145,18 @@ async function removeIfUnchanged(path: string, expected: LockSnapshot): Promise<
 }
 
 function lockTimeout(): Error { return new Error('LAYOUT_LOCK_TIMEOUT') }
+
+async function syncDirectory(path: string): Promise<void> {
+  if (process.platform === 'win32') return
+  const handle = await open(path, 'r')
+  try { await handle.sync() } finally { await handle.close() }
+}
+
+function lockPublicationError(error: unknown): Error {
+  const code = (error as NodeJS.ErrnoException).code
+  if (code === 'ENOTSUP' || code === 'EOPNOTSUPP' || code === 'EXDEV' || code === 'EPERM') return new Error('LAYOUT_LOCK_UNSUPPORTED')
+  return error instanceof Error ? error : new Error(String(error))
+}
 
 export interface LayoutLock {
   release(): Promise<void>
@@ -129,32 +166,53 @@ export async function acquireLayoutLock(path: string, waitMs = LOCK_WAIT_MS): Pr
   const started = Date.now()
   const start = await currentProcessStartIdentity() ?? `unknown:${process.pid}`
   const token = randomUUID().replace(/-/g, '')
-  const text = formatLayoutLockRecord({ pid: process.pid, start, token })
+  const owner = { pid: process.pid, start, token }
+  const text = formatLayoutLockRecord(owner)
+  const parent = dirname(path)
   for (;;) {
-    let handle: FileHandle | null = null
+    // Never create the final pathname until the complete, fsynced owner record
+    // is ready. `link` is the cross-language no-replace publication primitive:
+    // both Node and Rust either expose the whole record or leave no final lock.
+    const temporary = `${path}.${process.pid}.${token}.${randomUUID()}.tmp`
+    let contended = false
     try {
-      handle = await open(path, 'wx', 0o600)
-      await handle.writeFile(text, 'utf8')
-      await handle.sync()
-      const acquiredStat = await handle.stat()
-      const acquired: LockSnapshot = { record: { pid: process.pid, start, token }, text, stat: acquiredStat }
-      const ownerHandle = handle
-      return {
-        release: async () => {
-          await ownerHandle.close().catch(() => {})
-          await removeIfUnchanged(path, acquired)
-        },
+      const handle = await open(temporary, 'wx', 0o600)
+      try { await handle.writeFile(text, 'utf8'); await handle.sync() } finally { await handle.close() }
+      try {
+        await link(temporary, path)
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'EEXIST') contended = true
+        else throw lockPublicationError(error)
       }
-    } catch (error) {
-      await handle?.close().catch(() => {})
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
-      const current = await snapshot(path).catch(() => null)
-      if (current) {
-        const state = current.record.token ? await ownerState(current.record) : 'unknown'
-        if (state === 'dead') { await removeIfUnchanged(path, current); continue }
+      if (!contended) {
+        // The final pathname now names the complete prepared inode. Cleanup is
+        // not part of publication; a crash before this unlink leaves only an
+        // unreferenced preparation alongside a valid lock.
+        await unlink(temporary).catch(() => {})
+        const acquiredStat = await lstat(path)
+        const acquired: LockSnapshot = { record: owner, text, stat: acquiredStat }
+        await syncDirectory(parent).catch(() => {})
+        return { release: async () => { await removeIfUnchanged(path, acquired) } }
       }
-      if (Date.now() - started >= waitMs) throw lockTimeout()
-      await new Promise((resolve) => setTimeout(resolve, Math.min(10, waitMs - (Date.now() - started))))
+    } finally {
+      await unlink(temporary).catch(() => {})
     }
+
+    const current = await snapshot(path).catch(() => null)
+    if (current) {
+      // A valid record is the normal path. A malformed final file can only be
+      // from the pre-publication protocol; reclaim it only when its complete
+      // legacy PID/start identity is demonstrably dead. An unidentifiable
+      // partial write stays in place and fails closed rather than stealing a
+      // live old owner.
+      const legacyOwner = current.record ?? parseLegacyOwner(current.text)
+      if (legacyOwner && await ownerState(legacyOwner) === 'dead') {
+        await removeIfUnchanged(path, current)
+        continue
+      }
+    }
+    const remaining = waitMs - (Date.now() - started)
+    if (remaining <= 0) throw lockTimeout()
+    await new Promise((resolve) => setTimeout(resolve, Math.min(10, remaining)))
   }
 }

@@ -93,15 +93,13 @@ struct LayoutLock {
     record: LayoutLockRecord,
     text: String,
     metadata: fs::Metadata,
-    file: Option<fs::File>,
 }
 
 impl Drop for LayoutLock {
     fn drop(&mut self) {
-        // Close before unlinking for Windows, where an open handle can deny a
-        // pathname removal. The token and unchanged-record checks prevent an
-        // owner from deleting a successor that reclaimed/replaced this lock.
-        let _ = self.file.take();
+        // The token and unchanged-record checks prevent an old owner from
+        // removing a successor that reclaimed/replaced this lock. No final
+        // pathname handle is kept open: Windows may otherwise deny unlink.
         if let Ok(Some(current)) = read_lock(&self.path) {
             if current.record.as_ref() == Some(&self.record)
                 && current.text == self.text
@@ -158,6 +156,30 @@ fn parse_lock_record(text: &str) -> Option<LayoutLockRecord> {
         start: start?,
         token: token?,
     })
+}
+
+/// Extract only the complete PID/start identity from the pre-publication
+/// protocol. New writers never expose this shape, so reclaiming it is safe
+/// only after the identified legacy owner is proven dead. A partial write that
+/// lacks both fields is deliberately unreclaimable and fails closed.
+fn parse_legacy_owner(text: &str) -> Option<LayoutLockRecord> {
+    let mut lines = text.split('\n');
+    if lines.next()? != LOCK_PROTOCOL {
+        return None;
+    }
+    let mut pid = None;
+    let mut start = None;
+    for line in lines {
+        let Some((key, value)) = line.split_once('=') else { continue };
+        match key {
+            "pid" if value.bytes().all(|byte| byte.is_ascii_digit()) => {
+                pid = value.parse::<u32>().ok().filter(|value| *value > 0);
+            }
+            "start" if valid_lock_field(value) => start = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    Some(LayoutLockRecord { pid: pid?, start: start?, token: String::new() })
 }
 
 #[cfg(target_os = "linux")]
@@ -353,6 +375,26 @@ fn acquire_lock(root: &Path) -> std::io::Result<LayoutLock> {
     acquire_lock_with_wait(root, LOCK_WAIT)
 }
 
+#[cfg(unix)]
+fn sync_lock_directory(path: &Path) {
+    if let Some(parent) = path.parent() {
+        if let Ok(directory) = fs::File::open(parent) {
+            let _ = directory.sync_all();
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_lock_directory(_path: &Path) {}
+
+fn lock_publication_error(error: std::io::Error) -> std::io::Error {
+    if error.kind() == std::io::ErrorKind::Unsupported {
+        std::io::Error::new(std::io::ErrorKind::Unsupported, "LAYOUT_LOCK_UNSUPPORTED")
+    } else {
+        error
+    }
+}
+
 fn acquire_lock_with_wait(root: &Path, lock_wait: Duration) -> std::io::Result<LayoutLock> {
     let path = root.join(format!("{LAYOUT_FILE}.lock"));
     let started = Instant::now();
@@ -362,7 +404,12 @@ fn acquire_lock_with_wait(root: &Path, lock_wait: Duration) -> std::io::Result<L
         token: format!("{:032x}", random_token()),
     };
     let text = format_lock_record(&record);
+    let temporary = root.join(format!("{LAYOUT_FILE}.lock.{}.{}.tmp", std::process::id(), record.token));
     loop {
+        // Prepare and fsync the complete record before exposing the final
+        // pathname. `hard_link` is the no-replace publication primitive shared
+        // with Node's `fs.promises.link`: readers see either no lock or all
+        // owner fields, never the old create-then-write partial file.
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -370,48 +417,52 @@ fn acquire_lock_with_wait(root: &Path, lock_wait: Duration) -> std::io::Result<L
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        match options.open(&path) {
-            Ok(mut file) => {
-                let result = (|| -> std::io::Result<fs::Metadata> {
-                    file.write_all(text.as_bytes())?;
-                    file.sync_all()?;
-                    file.metadata()
-                })();
-                let metadata = match result {
-                    Ok(metadata) => metadata,
-                    Err(error) => {
-                        drop(file);
-                        let _ = fs::remove_file(&path);
-                        return Err(error);
-                    }
-                };
-                return Ok(LayoutLock {
-                    path,
-                    record,
-                    text,
-                    metadata,
-                    file: Some(file),
-                });
+        let mut file = options.open(&temporary)?;
+        let prepared = file.write_all(text.as_bytes()).and_then(|()| file.sync_all());
+        drop(file);
+        if let Err(error) = prepared {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+
+        match fs::hard_link(&temporary, &path) {
+            Ok(()) => {
+                // The final pathname now references the fsynced complete inode.
+                // Cleanup is deliberately after publication; a crash before it
+                // leaves only an orphan temp next to a valid lock.
+                let _ = fs::remove_file(&temporary);
+                let metadata = fs::symlink_metadata(&path)?;
+                sync_lock_directory(&path);
+                return Ok(LayoutLock { path, record, text, metadata });
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                if let Ok(Some(current)) = read_lock(&path) {
-                    if let Some(record) = current.record.as_ref() {
-                        if owner_state(record) == OwnerState::Dead {
-                            remove_lock_if_unchanged(&path, &current);
-                            continue;
-                        }
-                    }
-                }
-                if started.elapsed() >= lock_wait {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "layout write lock timeout",
-                    ));
-                }
-                std::thread::sleep(Duration::from_millis(1).min(lock_wait.saturating_sub(started.elapsed())));
+                let _ = fs::remove_file(&temporary);
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                let _ = fs::remove_file(&temporary);
+                return Err(lock_publication_error(error));
+            }
         }
+
+        if let Ok(Some(current)) = read_lock(&path) {
+            // New locks are complete records. A malformed final file can only
+            // be from the legacy create-then-write protocol; reclaim it only
+            // when its complete legacy PID/start identity is demonstrably dead.
+            // A partial record without those fields remains fail-closed so a
+            // still-writing old owner cannot be stolen.
+            let legacy_owner = current.record.clone().or_else(|| parse_legacy_owner(&current.text));
+            if legacy_owner.as_ref().is_some_and(|owner| owner_state(owner) == OwnerState::Dead) {
+                remove_lock_if_unchanged(&path, &current);
+                continue;
+            }
+        }
+        if started.elapsed() >= lock_wait {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "layout write lock timeout",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(1).min(lock_wait.saturating_sub(started.elapsed())));
     }
 }
 
@@ -697,6 +748,57 @@ mod tests {
         };
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
         assert_eq!(parse_lock_record(&fs::read_to_string(path).unwrap()), Some(record));
+    }
+
+    #[test]
+    fn publishes_a_complete_lock_and_ignores_an_orphaned_prepublication_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("{LAYOUT_FILE}.lock.orphan.tmp"));
+        fs::write(path, b"amber-layout-lock-v1\npid=\n").unwrap();
+        let lock = acquire_lock_with_wait(dir.path(), Duration::from_millis(200)).unwrap();
+        let published = fs::read_to_string(dir.path().join(format!("{LAYOUT_FILE}.lock"))).unwrap();
+        assert!(parse_lock_record(&published).is_some());
+        drop(lock);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reclaims_a_malformed_legacy_lock_only_when_its_identity_is_dead() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("{LAYOUT_FILE}.lock"));
+        fs::write(path, b"amber-layout-lock-v1\npid=4294967000\nstart=linux:missing\n").unwrap();
+        let lock = acquire_lock_with_wait(dir.path(), Duration::from_millis(200)).unwrap();
+        drop(lock);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn does_not_reclaim_a_malformed_legacy_lock_while_its_identity_is_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("{LAYOUT_FILE}.lock"));
+        let start = current_process_start();
+        let partial = format!("amber-layout-lock-v1\npid={}\nstart={}\n", std::process::id(), start);
+        fs::write(&path, &partial).unwrap();
+        let error = match acquire_lock_with_wait(dir.path(), Duration::from_millis(40)) {
+            Err(error) => error,
+            Ok(lock) => { drop(lock); panic!("live malformed lock was reclaimed") }
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(fs::read_to_string(path).unwrap(), partial);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fails_closed_on_an_unidentifiable_partial_legacy_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("{LAYOUT_FILE}.lock"));
+        fs::write(&path, b"amber-layout-lock-v1\npid=").unwrap();
+        let error = match acquire_lock_with_wait(dir.path(), Duration::from_millis(40)) {
+            Err(error) => error,
+            Ok(lock) => { drop(lock); panic!("unidentifiable malformed lock was reclaimed") }
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(fs::read_to_string(path).unwrap(), "amber-layout-lock-v1\npid=");
     }
 
     #[cfg(target_os = "linux")]

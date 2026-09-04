@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { loadLayoutFile, saveLayoutFile } from './layoutIO'
-import { acquireLayoutLock, currentProcessStartIdentity, formatLayoutLockRecord } from './layoutLock'
+import { acquireLayoutLock, currentProcessStartIdentity, formatLayoutLockRecord, parseLayoutLockRecord } from './layoutLock'
 import { LAYOUT_FILE_MAX_BYTES } from '../shared/layoutFile'
 
 const execFile = promisify(execFileCallback)
@@ -153,6 +153,37 @@ describe('saveLayoutFile', () => {
   it('reclaims a dead owner and writes after a crash', async () => {
     await writeFile(`${path}.lock`, formatLayoutLockRecord({ pid: 4_294_967_000, start: 'linux:missing', token: 'dead-owner' }))
     expect(await saveLayoutFile(path, '{}', null)).toEqual({ ok: true, version: '{}' })
+  })
+
+  it('publishes complete lock records and ignores an orphaned pre-publication temp', async () => {
+    const lockPath = `${path}.lock`
+    await writeFile(`${lockPath}.orphan.tmp`, 'amber-layout-lock-v1\npid=\n')
+    const lock = await acquireLayoutLock(lockPath, 100)
+    expect(parseLayoutLockRecord(await readFile(lockPath, 'utf8'))).not.toBeNull()
+    await lock.release()
+    expect(await saveLayoutFile(path, '{}', null)).toEqual({ ok: true, version: '{}' })
+  })
+
+  it('reclaims a malformed legacy lock only when its identifiable owner is dead', async () => {
+    await writeFile(`${path}.lock`, 'amber-layout-lock-v1\npid=4294967000\nstart=linux:missing\n')
+    expect(await saveLayoutFile(path, '{}', null)).toEqual({ ok: true, version: '{}' })
+  })
+
+  it('does not reclaim a malformed legacy lock while its identifiable owner is live', async () => {
+    const start = await currentProcessStartIdentity()
+    if (!start) return
+    const lockPath = `${path}.lock`
+    const partial = `amber-layout-lock-v1\npid=${process.pid}\nstart=${start}\n`
+    await writeFile(lockPath, partial)
+    expect(await saveLayoutFile(path, '{}', null)).toMatchObject({ error: 'LAYOUT_LOCK_TIMEOUT' })
+    expect(await readFile(lockPath, 'utf8')).toBe(partial)
+  })
+
+  it('fails closed on an unidentifiable partial legacy lock', async () => {
+    const lockPath = `${path}.lock`
+    await writeFile(lockPath, 'amber-layout-lock-v1\npid=')
+    expect(await saveLayoutFile(path, '{}', null)).toMatchObject({ error: 'LAYOUT_LOCK_TIMEOUT' })
+    expect(await readFile(lockPath, 'utf8')).toBe('amber-layout-lock-v1\npid=')
   })
 
   it('does not reclaim a lock whose owner identity is unknown', async () => {
