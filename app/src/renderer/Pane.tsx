@@ -11,6 +11,7 @@ import { takeReplay } from './replay'
 import { decodeOsc52Payload } from './osc'
 import { KeyboardInputModeTracker, shiftEnterSequence } from './terminalKeys'
 import { installTerminalUnicode } from './terminalUnicode'
+import { loadOptionalWebgl } from './terminalRenderer'
 
 // Imperative scrollback-search handle handed to the chrome (the find bar in
 // SplitView) via `onSearchReady`. Search execution stays outside React — the
@@ -181,7 +182,7 @@ export const Pane = memo(function Pane(
     if (!window.amber.softwareGl) {
       const webgl = new WebglAddon()
       webgl.onContextLoss(() => webgl.dispose())
-      term.loadAddon(webgl)
+      loadOptionalWebgl(term, webgl)
     }
     // Scrollback search. Decorations are passed on EVERY call (not just for the
     // highlight): the addon fires onDidChangeResults only when decorations are
