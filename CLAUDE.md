@@ -1520,9 +1520,11 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   The adapter carries typed `dispatched` state; partial failures become
   `ACTION_FAILED_NO_ROLLBACK` with current context, `retryable:false`, and a
   fresh-snapshot instruction through the broker and generated Pi result. Fresh
-  gates at code HEAD `6e8ecbb`: app 1001 passed/1 intentional skip, Rust 821
+  gates at code HEAD `c5b87c8`: app 1001 passed/1 intentional skip, Rust 821
   passed/1 delegated-cgroup ignore, strict typecheck/build/web build/Clippy,
-  packaged AppImage and Pi verifier green. Linux package input evidence uses
+  packaged AppImage (SHA-256
+  `9cde8e497113320c32faf00c002850b268a8f678486821d8f66fe7e7e1b6fa2e`) and Pi
+  verifier green. Linux package input evidence uses
   Xvfb/XTest only; it is not physical-hardware evidence. External deployed-
   reader, independent-review, macOS, and physical/manual gates remain open.
 
