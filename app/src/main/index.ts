@@ -89,6 +89,7 @@ import { isRecoveryId } from '../shared/tabBrowserState'
 import { BrowserOperationRegistry } from './browserOperationRegistry'
 import { readSafeTextFile, readSafeTextFileSync, SafeFileReadError } from './safeFileReader'
 import { browserHostSocketPath } from './browserHostPaths'
+import { electronPaths } from './electronPaths'
 import {
   activationRequest,
   clearBrowserHostInhibit,
@@ -104,6 +105,10 @@ import clientPath from '../client/index?modulePath'
 // A client child that stays up this long counts as a genuine run; a shorter
 // life is treated as a crash-loop and widens the relaunch backoff.
 const CLIENT_STABLE_MS = 5000
+
+const electronPathConfig = electronPaths(process.env, { userData: app.getPath('userData'), sessionData: app.getPath('sessionData') })
+app.setPath('userData', electronPathConfig.userData)
+app.setPath('sessionData', electronPathConfig.sessionData)
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 

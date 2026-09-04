@@ -14,7 +14,7 @@ describe('BrowserRail command context', () => {
   it('waits for the first daemon session list before revoking a persisted controller', () => {
     expect(shouldRevokeDesignatedPi('amber-1-1-pi', [], false)).toBe(false)
     expect(shouldRevokeDesignatedPi('amber-1-1-pi', [], true)).toBe(true)
-    expect(shouldRevokeDesignatedPi('amber-1-1-pi', [{ name: 'amber-1-1-pi', label: 'Pi' }], true)).toBe(false)
+    expect(shouldRevokeDesignatedPi('amber-1-1-pi', [{ name: 'amber-1-1-pi' }], true)).toBe(false)
   })
   it('does not re-acknowledge the surface while resolving a visible approval or dialog', () => {
     expect(browserCommandNeedsContext({ type: 'resolveApproval' })).toBe(false)
