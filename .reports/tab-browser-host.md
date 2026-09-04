@@ -347,7 +347,8 @@ are never replaced automatically.
   record text, and file metadata before unlinking, so an old owner cannot remove
   a successor. Platforms/filesystems without the primitive fail closed rather
   than age-stealing.
-- The generated Amber-owned Pi extension is v7. It bounds and validates the
+- The generated Amber-owned Pi extension remains v6 while adding the bounded
+  validation. It bounds and validates the
   browser token with a no-follow descriptor read, uses a fatal TextDecoder for
   each broker JSON frame before JSON.parse, closes malformed connections, and
   never normalizes invalid bytes to U+FFFD. The exact installed source is

@@ -18,7 +18,7 @@ pub enum PiStart {
 const EXTENSION_FILE: &str = "amber-hook.ts";
 
 /// The Pi extension amber installs to record session ids for exact resume.
-const EXTENSION_TS: &str = r#"// amber-owned-extension:v7
+const EXTENSION_TS: &str = r#"// amber-owned-extension:v6
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
 import { Type } from "typebox"
 import { spawn } from "node:child_process"
@@ -471,7 +471,7 @@ pub fn ensure_global_pi_extension() {
 fn is_owned_extension_source(source: &str) -> bool {
     matches!(
         source.lines().next(),
-        Some("// amber-owned-extension:v2" | "// amber-owned-extension:v3" | "// amber-owned-extension:v4" | "// amber-owned-extension:v5" | "// amber-owned-extension:v6" | "// amber-owned-extension:v7")
+        Some("// amber-owned-extension:v2" | "// amber-owned-extension:v3" | "// amber-owned-extension:v4" | "// amber-owned-extension:v5" | "// amber-owned-extension:v6")
     )
 }
 
@@ -584,7 +584,7 @@ mod tests {
         let path = extensions.join("amber-hook.ts");
         let first = fs::read_to_string(&path).unwrap();
         assert_eq!(first, EXTENSION_TS);
-        assert!(first.starts_with("// amber-owned-extension:v7\n"));
+        assert!(first.starts_with("// amber-owned-extension:v6\n"));
         assert!(first.contains("amber-ide-${uid}"));
         assert!(first.contains("metadata.isSymbolicLink()"));
         assert!(first.contains("[\"ctl\", \"browser-host\", \"ensure\", \"--root\", state]"));
@@ -705,7 +705,7 @@ mod tests {
         let extensions = dir.path().join("extensions");
         fs::create_dir_all(&extensions).unwrap();
         let path = extensions.join(EXTENSION_FILE);
-        let future = "// amber-owned-extension:v8\n// future payload\n";
+        let future = "// amber-owned-extension:v7\n// future payload\n";
         fs::write(&path, future).unwrap();
 
         assert!(install_extension_in(&extensions).is_err());

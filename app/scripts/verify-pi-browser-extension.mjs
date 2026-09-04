@@ -31,7 +31,7 @@ try {
   await exec(resolvedAmber, ['ctl', 'install-pi-extension'], { env })
   const extension = join(agentDir, 'extensions', 'amber-hook.ts')
   const first = await readFile(extension, 'utf8')
-  if (!first.startsWith('// amber-owned-extension:v7\n')) throw new Error('installed source is not the expected owned version')
+  if (!first.startsWith('// amber-owned-extension:v6\n')) throw new Error('installed source is not the expected owned version')
   await exec(resolvedAmber, ['ctl', 'install-pi-extension'], { env })
   if (await readFile(extension, 'utf8') !== first) throw new Error('second install changed the exact generated source')
 
