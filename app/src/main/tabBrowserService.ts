@@ -372,12 +372,12 @@ export class TabBrowserService {
     const ownership: BrowserQueueOperation = { controller, started: false, identity: undefined, isolationStarted: false }
     const operation = prior.catch(() => {}).then(async () => {
       this.operations.assertDispatch(controller.signal)
-      // This is the ownership boundary. A follower that was cancelled while
-      // queued never gets a bound runtime and therefore cannot quarantine the
-      // operation that was active before it.
-      ownership.started = true
+      // A follower that was cancelled while queued never gets a bound runtime
+      // and therefore cannot quarantine the operation active before it. The
+      // dispatch callback below flips `started` only when this entry is about
+      // to invoke its own adapter, after any async authorization validation.
       ownership.identity = this.browserOperationIdentity(command)
-      const result = await this.runCommand(command, controller.signal, validate)
+      const result = await this.runCommand(command, controller.signal, validate, () => { ownership.started = true })
       // A non-cooperative adapter may resolve after its caller was cancelled.
       // Do not let that late result cross the service boundary or commit the
       // command's post-dispatch state update to a dead request.
@@ -435,7 +435,7 @@ export class TabBrowserService {
     if (!this.latestPiActions.has(id) && this.latestPiActions.size >= 256) this.latestPiActions.delete(this.latestPiActions.keys().next().value as string)
     this.latestPiActions.set(id, event); this.eventSink(event)
   }
-  private async runCommand(command: TabBrowserCommand, signal?: AbortSignal, validate?: () => boolean | Promise<boolean>): Promise<unknown> {
+  private async runCommand(command: TabBrowserCommand, signal?: AbortSignal, validate?: () => boolean | Promise<boolean>, onDispatch?: () => void): Promise<unknown> {
     this.operations.assertDispatch(signal)
     if (validate && !(await validate())) throw new Error('STALE_BROWSER_CONTEXT')
     this.operations.assertDispatch(signal)
@@ -461,13 +461,14 @@ export class TabBrowserService {
         return this.withLatestAction(command.id, status)
       }
       case 'hide': this.surfaceHidden(command.id); this.host.hide(command.id); return this.host.status(command.id)
-      case 'bounds': this.host.setBounds(command.id, command.bounds); return this.withLatestAction(command.id, this.host.status(command.id))
+      case 'bounds': onDispatch?.(); this.host.setBounds(command.id, command.bounds); return this.withLatestAction(command.id, this.host.status(command.id))
       case 'reload': case 'history': case 'viewport': {
         const action: BrowserToolAction = command.type === 'reload'
           ? { type: 'reload', pageIncarnation: command.pageIncarnation, expectedGeneration: command.expectedGeneration, ignoreCache: false }
           : command.type === 'history'
             ? { type: 'history', direction: command.direction, pageIncarnation: command.pageIncarnation, expectedGeneration: command.expectedGeneration }
             : { type: 'setViewport', viewport: { width: command.width, height: command.height }, pageIncarnation: command.pageIncarnation, expectedGeneration: command.expectedGeneration }
+        onDispatch?.()
         await this.host.runAutomation(command.id, action, signal ?? new AbortController().signal)
         this.operations.assertDispatch(signal)
         if (command.type === 'viewport') await this.schedulePersist()
@@ -482,6 +483,7 @@ export class TabBrowserService {
         if (activeOwner) { signal?.addEventListener('abort', upstreamAbort, { once: true }); if (signal?.aborted) activeOwner.controller.abort(); const set = this.activePi.get(command.id) ?? new Set<{ controller: AbortController; owner: string }>(); set.add(activeOwner); this.activePi.set(command.id, set) }
         if (command.broker) this.piAction(command.id, command.broker.controller, 'navigate', 'started')
         try {
+          onDispatch?.()
           const status = await this.host.navigate(command.id, command.url, command.pageIncarnation, command.expectedGeneration, activeOwner?.controller.signal ?? signal, command.broker ? 'broker' : 'user')
           this.operations.assertDispatch(signal)
           await this.schedulePersist(); if (command.broker) this.piAction(command.id, command.broker.controller, 'navigate', 'completed'); return command.broker ? this.brokerStatus(command.id, status as unknown as Record<string, unknown>) : this.withLatestAction(command.id, status)
@@ -502,6 +504,7 @@ export class TabBrowserService {
         if (command.broker && activeOwner) { this.revokedPi.delete(command.id); const set = this.activePi.get(command.id) ?? new Set<{ controller: AbortController; owner: string }>(); set.add(activeOwner); this.activePi.set(command.id, set) }
         if (command.broker) this.piAction(command.id, command.broker.controller, command.action.type === 'interact' ? command.action.operation.kind : command.action.type, 'started')
         try {
+          onDispatch?.()
           const result = await this.host.runAutomation(command.id, command.action, controller.signal, command.broker ? async (request, approvalSignal) => {
             const classification = request.classification
             if (!classification.consequential) return
