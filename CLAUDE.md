@@ -1511,6 +1511,21 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   enters the browser, and plaintext keys only on the explicit reveal GET.
   The proxy itself stays loopback-only.
 
+- [x] Browser host uniform input generations (2026-09-04) — Electron has no
+  trustworthy physical/CDP source marker, so every `before-input-event` and
+  `before-mouse-event` callback advances generation; signature/token suppression
+  was removed. Host validates the prepared generation immediately before the
+  first irreversible dispatch, increments before it, accepts later input or
+  navigation increments, and reports the final generation plus interleaving.
+  The adapter carries typed `dispatched` state; partial failures become
+  `ACTION_FAILED_NO_ROLLBACK` with current context, `retryable:false`, and a
+  fresh-snapshot instruction through the broker and generated Pi result. Fresh
+  gates at code HEAD `6e8ecbb`: app 1001 passed/1 intentional skip, Rust 821
+  passed/1 delegated-cgroup ignore, strict typecheck/build/web build/Clippy,
+  packaged AppImage and Pi verifier green. Linux package input evidence uses
+  Xvfb/XTest only; it is not physical-hardware evidence. External deployed-
+  reader, independent-review, macOS, and physical/manual gates remain open.
+
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**
   `std::io::Read` (dedicated thread); `take_writer()` is one-shot;
