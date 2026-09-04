@@ -18,7 +18,7 @@ pub enum PiStart {
 const EXTENSION_FILE: &str = "amber-hook.ts";
 
 /// The Pi extension amber installs to record session ids for exact resume.
-const EXTENSION_TS: &str = r#"// amber-owned-extension:v6
+const EXTENSION_TS: &str = r#"// amber-owned-extension:v7
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
 import { Type } from "typebox"
 import { spawn } from "node:child_process"
@@ -159,12 +159,55 @@ async function sendBrowserRequest(paths: { token: string, socket: string, state:
           socket.write(encode({ version: 1, requestId: `${Date.now()}-${Math.random()}`, clientInstanceId: browserClientInstanceId, sequence: ++browserSequence, amberSession, action }))
           continue
         }
-        if (!reply?.ok) return finish(new Error(String(reply?.error || "Amber browser request failed")))
+        if (!reply?.ok) return finish(new BrowserRequestError(reply))
         if (reply.result?.attachment?.encoding === "binary-frame") { pendingBinary = reply.result; continue }
         finish(undefined, reply.result)
       }
     })
   })
+}
+
+const SAFE_BROWSER_CODE = /^[A-Z][A-Z0-9_]{1,63}$/
+const ACTION_FAILED_NO_ROLLBACK = "ACTION_FAILED_NO_ROLLBACK"
+const FRESH_SNAPSHOT_MESSAGE = "Input was dispatched and cannot be rolled back. Take a fresh browser snapshot before retrying."
+
+type BrowserFailure = {
+  __browserFailure: true
+  code: string
+  retryable: boolean
+  message: string
+  pageIncarnation?: string
+  generation?: number
+  snapshotHint?: boolean
+  dispatched?: boolean
+}
+
+function browserFailureMessage(code: string) {
+  if (code === ACTION_FAILED_NO_ROLLBACK) return FRESH_SNAPSHOT_MESSAGE
+  if (code === "STALE_GENERATION") return "The browser page changed. Take a fresh browser snapshot before retrying."
+  return `Browser action failed: ${code}.`
+}
+
+function browserFailure(reply: any): BrowserFailure {
+  const raw = typeof reply?.code === "string" ? reply.code : reply?.error
+  const legacy = raw === "ACTION_CANCELLED_NO_ROLLBACK" || raw === "STALE_GENERATION_NO_ROLLBACK" || raw === "STALE_BROWSER_CONTEXT_NO_ROLLBACK"
+  const code = typeof raw === "string" && SAFE_BROWSER_CODE.test(raw) && !legacy ? raw : legacy ? ACTION_FAILED_NO_ROLLBACK : "INTERNAL_ERROR"
+  const pageIncarnation = typeof reply?.pageIncarnation === "string" && reply.pageIncarnation.length > 0 && reply.pageIncarnation.length <= 256 ? reply.pageIncarnation : undefined
+  const generation = typeof reply?.generation === "number" && Number.isSafeInteger(reply.generation) && reply.generation >= 0 ? reply.generation : undefined
+  const dispatched = reply?.dispatched === true || legacy || code === ACTION_FAILED_NO_ROLLBACK
+  return { __browserFailure: true, code, retryable: code === ACTION_FAILED_NO_ROLLBACK ? false : reply?.retryable === true, message: browserFailureMessage(code),
+    ...(pageIncarnation === undefined ? {} : { pageIncarnation }), ...(generation === undefined ? {} : { generation }),
+    ...(code === ACTION_FAILED_NO_ROLLBACK ? { snapshotHint: true, dispatched: true } : dispatched ? { dispatched: true } : {}) }
+}
+
+class BrowserRequestError extends Error {
+  readonly failure: BrowserFailure
+  constructor(reply: any) {
+    const failure = browserFailure(reply)
+    super(failure.code)
+    this.name = "BrowserRequestError"
+    this.failure = failure
+  }
 }
 
 async function browserRequest(action: unknown, signal?: AbortSignal) {
@@ -186,9 +229,11 @@ async function browserRequest(action: unknown, signal?: AbortSignal) {
   if (!/^[A-Za-z0-9_-]{43}$/.test(token)) throw new Error("Amber browser host token is invalid")
   try { return await sendBrowserRequest(paths, token, amberSession, action, signal) }
   catch (error) {
+    if (error instanceof BrowserRequestError) return error.failure
     if (!(error instanceof Error) || error.message !== "Amber browser host is unavailable") throw error
     await ensureBrowserHost(signal)
-    return sendBrowserRequest(paths, token, amberSession, action, signal)
+    try { return await sendBrowserRequest(paths, token, amberSession, action, signal) }
+    catch (retryError) { if (retryError instanceof BrowserRequestError) return retryError.failure; throw retryError }
   }
 }
 
@@ -208,6 +253,13 @@ function result(value: any) {
   if (value?.__image && value?.mediaType === "image/png") {
     const { __image, ...metadata } = value
     return { content: [{ type: "text" as const, text: boundedResultText(metadata) }, { type: "image" as const, data: __image, mimeType: "image/png" }], details }
+  }
+  if (value?.__browserFailure === true) {
+    const { __browserFailure, ...failure } = value
+    const modelValue = failure.snapshotHint === true
+      ? { ...failure, nextStep: "Call browser_snapshot with the reported pageIncarnation and generation before retrying." }
+      : failure
+    return { content: [{ type: "text" as const, text: boundedResultText(modelValue) }], details }
   }
   return { content: [{ type: "text" as const, text: boundedResultText(value) }], details }
 }
@@ -471,7 +523,7 @@ pub fn ensure_global_pi_extension() {
 fn is_owned_extension_source(source: &str) -> bool {
     matches!(
         source.lines().next(),
-        Some("// amber-owned-extension:v2" | "// amber-owned-extension:v3" | "// amber-owned-extension:v4" | "// amber-owned-extension:v5" | "// amber-owned-extension:v6")
+        Some("// amber-owned-extension:v2" | "// amber-owned-extension:v3" | "// amber-owned-extension:v4" | "// amber-owned-extension:v5" | "// amber-owned-extension:v6" | "// amber-owned-extension:v7")
     )
 }
 
@@ -584,7 +636,7 @@ mod tests {
         let path = extensions.join("amber-hook.ts");
         let first = fs::read_to_string(&path).unwrap();
         assert_eq!(first, EXTENSION_TS);
-        assert!(first.starts_with("// amber-owned-extension:v6\n"));
+        assert!(first.starts_with("// amber-owned-extension:v7\n"));
         assert!(first.contains("amber-ide-${uid}"));
         assert!(first.contains("metadata.isSymbolicLink()"));
         assert!(first.contains("[\"ctl\", \"browser-host\", \"ensure\", \"--root\", state]"));
@@ -636,6 +688,9 @@ mod tests {
         assert!(first.contains("constants.O_NOFOLLOW"));
         assert!(first.contains("clientInstanceId: browserClientInstanceId"));
         assert!(first.contains("sequence: ++browserSequence"));
+        assert!(first.contains("ACTION_FAILED_NO_ROLLBACK"));
+        assert!(first.contains("snapshotHint"));
+        assert!(first.contains("nextStep: \"Call browser_snapshot"));
         assert!(!first.contains("Runtime.evaluate"));
         assert!(!first.contains("Network.getResponseBody"));
         assert!(!first.contains("document.cookie"));
@@ -705,7 +760,7 @@ mod tests {
         let extensions = dir.path().join("extensions");
         fs::create_dir_all(&extensions).unwrap();
         let path = extensions.join(EXTENSION_FILE);
-        let future = "// amber-owned-extension:v7\n// future payload\n";
+        let future = "// amber-owned-extension:v8\n// future payload\n";
         fs::write(&path, future).unwrap();
 
         assert!(install_extension_in(&extensions).is_err());

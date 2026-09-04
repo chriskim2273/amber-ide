@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { BrowserAutomation, redactBrowserText, sanitizeBrowserUrl, type BrowserDebuggerTransport } from './browserAutomation'
-import { electronKeyInput, electronMouseInput, SyntheticInputAccounting } from './browserInput'
+import { BrowserAutomationError } from './browserErrors'
 import type { BrowserInteraction } from './browserToolProtocol'
 
 class FakeDebugger implements BrowserDebuggerTransport {
@@ -89,90 +89,66 @@ describe('browser automation', () => {
     await expect(automation.executeInteraction(prepared, new AbortController().signal)).resolves.toEqual({ dispatched: true, rollbackPossible: false })
   })
 
-  it('registers exact keyboard and pointer dispatches, retains late callbacks briefly, and clears them for the next action', async () => {
+  it('dispatches keyboard and pointer input while allowing later generation increments', async () => {
     class InputRecordingDebugger extends FakeDebugger {
       inputParams: Array<{ method: string; params: Record<string, unknown> }> = []
+      onInput?: () => void
       override async send(method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>> {
-        if (method === 'Input.dispatchMouseEvent' || method === 'Input.dispatchKeyEvent') this.inputParams.push({ method, params: params ?? {} })
+        if (method === 'Input.dispatchMouseEvent' || method === 'Input.dispatchKeyEvent') {
+          this.inputParams.push({ method, params: params ?? {} })
+          this.onInput?.()
+        }
         if (method === 'DOM.describeNode' && params?.['backendNodeId'] === 2) return { node: { nodeName: 'BUTTON', parentId: 101, backendNodeId: 2 } }
         if (method === 'Accessibility.getPartialAXTree' && params?.['backendNodeId'] === 2) return { nodes: [{ role: { value: 'button' }, name: { value: 'Submit' }, backendDOMNodeId: 2 }] }
         return super.send(method, params)
       }
     }
-    const transport = new InputRecordingDebugger(), accounting = new SyntheticInputAccounting()
-    const automation = new BrowserAutomation(transport, () => 'about:blank', () => false, {}, {
-      onSyntheticInputScopeStart: () => accounting.clear(),
-      onSyntheticInput: (input) => accounting.expect(input),
-      clearSyntheticInput: () => accounting.clear(),
-    })
+    const transport = new InputRecordingDebugger(), generations = [lease.generation]
+    transport.onInput = () => generations.push(generations.at(-1)! + 1)
+    const automation = new BrowserAutomation(transport, () => 'about:blank', () => false)
     const snapshot = await automation.snapshot(lease, { maxDepth: 20, maxNodes: 20, maxBytes: 256 * 1024 }, new AbortController().signal)
     const target = { snapshotId: snapshot.snapshotId, ref: snapshot.nodes[1]!.ref }
     const prepared = await automation.prepareInteraction(lease, { kind: 'press', target, key: 'Enter' }, new AbortController().signal)
-    await automation.executeInteraction(prepared, new AbortController().signal)
+    const result = await automation.executeInteraction(prepared, new AbortController().signal, (dispatched) => dispatched || generations.at(-1) === lease.generation)
+    expect(result).toEqual({ dispatched: true, rollbackPossible: false })
     expect(transport.inputParams.map((entry) => entry.method)).toEqual([
       'Input.dispatchMouseEvent', 'Input.dispatchMouseEvent', 'Input.dispatchKeyEvent', 'Input.dispatchKeyEvent',
     ])
     expect(transport.inputParams.at(-1)?.params).toMatchObject({ type: 'keyUp', key: 'Enter', code: 'Enter', modifiers: 0 })
-    expect(accounting.pendingCount()).toBe(4)
-    expect(accounting.observe(electronMouseInput({ type: 'mouseDown', x: 50, y: 10, button: 'left', clickCount: 1, modifiers: [] }))).toBe(true)
-    expect(accounting.observe(electronMouseInput({ type: 'mouseUp', x: 50, y: 10, button: 'left', clickCount: 1, modifiers: [] }))).toBe(true)
-    expect(accounting.observe(electronKeyInput({ type: 'keyDown', key: 'Enter', code: 'Enter', modifiers: [], isAutoRepeat: false, isComposing: false, location: 0 }))).toBe(true)
-    expect(accounting.observe(electronKeyInput({ type: 'keyUp', key: 'Enter', code: 'Enter', modifiers: [], isAutoRepeat: false, isComposing: false, location: 0 }))).toBe(true)
-    expect(accounting.pendingCount()).toBe(0)
-
-    const second = await automation.prepareInteraction(lease, { kind: 'click', target }, new AbortController().signal)
-    await automation.executeInteraction(second, new AbortController().signal)
-    expect(accounting.pendingCount()).toBe(2)
-    await automation.prepareInteraction(lease, { kind: 'click', target }, new AbortController().signal)
-    expect(accounting.pendingCount()).toBe(0)
-    expect(accounting.observe(electronMouseInput({ type: 'mouseDown', x: 50, y: 10, button: 'left', clickCount: 1, modifiers: [] }))).toBe(false)
+    expect(generations).toHaveLength(5)
   })
 
-  it('does not let a concurrent observation clear an active interaction ledger', async () => {
-    let release!: () => void
-    class ConcurrentDebugger extends FakeDebugger {
+  it('keeps callback ordering out of the adapter and reports a typed partial dispatch failure', async () => {
+    class FailingDebugger extends FakeDebugger {
+      inputCount = 0
       override async send(method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>> {
+        if (method === 'Input.dispatchMouseEvent') {
+          this.inputCount += 1
+          if (this.inputCount === 2) throw new Error('debugger transport detail')
+        }
         if (method === 'DOM.describeNode' && params?.['backendNodeId'] === 2) return { node: { nodeName: 'BUTTON', parentId: 101, backendNodeId: 2 } }
         if (method === 'Accessibility.getPartialAXTree' && params?.['backendNodeId'] === 2) return { nodes: [{ role: { value: 'button' }, name: { value: 'Submit' }, backendDOMNodeId: 2 }] }
-        if (method === 'Input.dispatchMouseEvent' && params?.['type'] === 'mousePressed') await new Promise<void>((resolve) => { release = resolve })
         return super.send(method, params)
       }
     }
-    const accounting = new SyntheticInputAccounting()
-    const automation = new BrowserAutomation(new ConcurrentDebugger(), () => 'about:blank', () => false, {}, {
-      onSyntheticInputScopeStart: () => accounting.clear(),
-      onSyntheticInput: (input) => accounting.expect(input),
-      clearSyntheticInput: () => accounting.clear(),
-    })
+    const automation = new BrowserAutomation(new FailingDebugger(), () => 'about:blank', () => false)
     const snapshot = await automation.snapshot(lease, { maxDepth: 20, maxNodes: 20, maxBytes: 256 * 1024 }, new AbortController().signal)
     const prepared = await automation.prepareInteraction(lease, { kind: 'click', target: { snapshotId: snapshot.snapshotId, ref: snapshot.nodes[1]!.ref } }, new AbortController().signal)
-    const interaction = automation.executeInteraction(prepared, new AbortController().signal)
-    await vi.waitFor(() => expect(release).toBeTypeOf('function'))
-    expect(accounting.pendingCount()).toBe(1)
-    await automation.snapshot(lease, { maxDepth: 20, maxNodes: 20, maxBytes: 256 * 1024 }, new AbortController().signal)
-    expect(accounting.pendingCount()).toBe(1)
-    release()
-    await interaction
+    const failure = await automation.executeInteraction(prepared, new AbortController().signal).catch((error: unknown) => error)
+    expect(failure).toBeInstanceOf(BrowserAutomationError)
+    expect(failure).toMatchObject({ code: 'INTERNAL_ERROR', dispatched: true })
+    expect((failure as Error).message).toBe('INTERNAL_ERROR')
   })
 
-  it('clears all expected dispatch tokens as soon as an interaction is cancelled', async () => {
-    const controller = new AbortController(), accounting = new SyntheticInputAccounting()
-    class CancellingDebugger extends FakeDebugger {
-      override async send(method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>> {
-        if (method === 'DOM.describeNode' && params?.['backendNodeId'] === 2) return { node: { nodeName: 'BUTTON', parentId: 101, backendNodeId: 2 } }
-        if (method === 'Accessibility.getPartialAXTree' && params?.['backendNodeId'] === 2) return { nodes: [{ role: { value: 'button' }, name: { value: 'Submit' }, backendDOMNodeId: 2 }] }
-        if (method === 'Input.dispatchMouseEvent') { controller.abort(); return {} }
-        return super.send(method, params)
-      }
+  it('keeps a pre-dispatch cancellation or stale-generation failure rollback-safe', async () => {
+    const automation = new BrowserAutomation(new FakeDebugger(), () => 'about:blank', () => false)
+    const prepared = {
+      lease,
+      operation: { kind: 'press' as const, key: 'Enter' },
+      target: { role: 'document', name: '', tag: 'body', type: '', fingerprint: 'document' },
     }
-    const automation = new BrowserAutomation(new CancellingDebugger(), () => 'about:blank', () => false, {}, {
-      onSyntheticInput: (input) => accounting.expect(input),
-      clearSyntheticInput: () => accounting.clear(),
-    })
-    const snapshot = await automation.snapshot(lease, { maxDepth: 20, maxNodes: 20, maxBytes: 256 * 1024 }, new AbortController().signal)
-    const prepared = await automation.prepareInteraction(lease, { kind: 'click', target: { snapshotId: snapshot.snapshotId, ref: snapshot.nodes[1]!.ref } }, new AbortController().signal)
-    await expect(automation.executeInteraction(prepared, controller.signal)).rejects.toThrow('ACTION_CANCELLED_NO_ROLLBACK')
-    expect(accounting.pendingCount()).toBe(0)
+    const failure = await automation.executeInteraction(prepared, new AbortController().signal, () => false).catch((error: unknown) => error)
+    expect(failure).toMatchObject({ code: 'STALE_GENERATION', dispatched: false })
   })
 
   it('includes ordinary StaticText for snapshot and text wait without script, style, whitespace, hidden, or duplicate output', async () => {
@@ -398,7 +374,8 @@ describe('browser automation', () => {
     const transport = new CancellingDebugger(), automation = new BrowserAutomation(transport, () => 'about:blank', () => false)
     const snapshot = await automation.snapshot(lease, { maxDepth: 20, maxNodes: 20, maxBytes: 256 * 1024 }, new AbortController().signal)
     const prepared = await automation.prepareInteraction(lease, { kind: 'click', target: { snapshotId: snapshot.snapshotId, ref: 'n2' } }, new AbortController().signal)
-    await expect(automation.executeInteraction(prepared, controller.signal)).rejects.toThrow('ACTION_CANCELLED_NO_ROLLBACK')
+    const failure = await automation.executeInteraction(prepared, controller.signal).catch((error: unknown) => error)
+    expect(failure).toMatchObject({ code: 'ACTION_CANCELLED', dispatched: true })
   })
 
   it('returns screenshot bytes in memory and rejects oversized captures', async () => {

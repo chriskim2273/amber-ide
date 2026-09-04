@@ -10,6 +10,7 @@ import { parseBrowserViewport } from '../shared/browserViewport'
 import { BrowserApprovalCoordinator, BrowserDialogCoordinator, interactionTargetDigest, interactionValueDigest, type ApprovalDecision } from './browserApproval'
 import { navigationPolicyAllows, selectPreviewOrigin } from './tabBrowserPolicy'
 import { BrowserOperationRegistry } from './browserOperationRegistry'
+import { ACTION_FAILED_NO_ROLLBACK, BrowserActionError, FRESH_SNAPSHOT_MESSAGE, safeBrowserCode } from './browserErrors'
 
 /** Grace after cancellation before a non-cooperative page adapter is detached from the FIFO. */
 export const TAB_BROWSER_QUEUE_BARRIER_TIMEOUT_MS = 1_000
@@ -507,6 +508,14 @@ export class TabBrowserService {
     } finally { this.quarantinedOperations.delete(key) }
   }
 
+  private noRollbackFailure(id: string): BrowserActionError {
+    let status: Partial<BrowserRuntimeStatus> = {}
+    try { status = this.host.status(id) } catch { /* the browser may have closed after dispatch */ }
+    return new BrowserActionError({ code: ACTION_FAILED_NO_ROLLBACK, retryable: false, message: FRESH_SNAPSHOT_MESSAGE,
+      ...(status.pageIncarnation ? { pageIncarnation: status.pageIncarnation } : {}),
+      ...(typeof status.generation === 'number' ? { generation: status.generation } : {}), snapshotHint: true, dispatched: true })
+  }
+
   private withLatestAction<T extends object>(id: string, status: T): T & { lastAction?: unknown } {
     const lastAction = this.latestPiActions.get(id); return { ...status, ...(lastAction ? { lastAction } : {}) }
   }
@@ -515,8 +524,8 @@ export class TabBrowserService {
     return status
   }
   private piAction(id: string, controller: string, action: string, phase: 'started' | 'completed' | 'failed', error?: unknown): void {
-    const raw = error instanceof Error ? error.message : 'INTERNAL_ERROR'
-    const event = { type: 'pi-action' as const, browserId: id, controller: controller.slice(0, 256), action: action.slice(0, 64), phase, ...(phase === 'failed' ? { error: /^[A-Z][A-Z0-9_]{1,63}$/.test(raw) ? raw : 'INTERNAL_ERROR' } : {}), at: Date.now() }
+    const raw = error instanceof BrowserActionError ? error.code : error instanceof Error ? error.message : 'INTERNAL_ERROR'
+    const event = { type: 'pi-action' as const, browserId: id, controller: controller.slice(0, 256), action: action.slice(0, 64), phase, ...(phase === 'failed' ? { error: safeBrowserCode(raw) } : {}), at: Date.now() }
     if (!this.latestPiActions.has(id) && this.latestPiActions.size >= 256) this.latestPiActions.delete(this.latestPiActions.keys().next().value as string)
     this.latestPiActions.set(id, event); this.eventSink(event)
   }
@@ -590,9 +599,10 @@ export class TabBrowserService {
         const activeOwner = command.broker ? { controller, owner: `${command.broker.controller}\u0000${command.broker.requestId}` } : null
         if (command.broker && activeOwner) { this.revokedPi.delete(command.id); const set = this.activePi.get(command.id) ?? new Set<{ controller: AbortController; owner: string }>(); set.add(activeOwner); this.activePi.set(command.id, set) }
         if (command.broker) this.piAction(command.id, command.broker.controller, command.action.type === 'interact' ? command.action.operation.kind : command.action.type, 'started')
+        let result: unknown
         try {
           onDispatch?.()
-          const result = await this.host.runAutomation(command.id, command.action, controller.signal, command.broker ? async (request, approvalSignal) => {
+          result = await this.host.runAutomation(command.id, command.action, controller.signal, command.broker ? async (request, approvalSignal) => {
             const classification = request.classification
             if (!classification.consequential) return
             this.observedGeneration.set(command.id, request.generation)
@@ -610,8 +620,10 @@ export class TabBrowserService {
           if (command.broker) this.piAction(command.id, command.broker.controller, command.action.type === 'interact' ? command.action.operation.kind : command.action.type, 'completed')
           return result
         } catch (error) {
-          if (command.broker) this.piAction(command.id, command.broker.controller, command.action.type === 'interact' ? command.action.operation.kind : command.action.type, 'failed', error)
-          throw error
+          const dispatched = command.action.type === 'interact' && typeof result === 'object' && result !== null && (result as { dispatched?: unknown }).dispatched === true
+          const reported = dispatched && !(error instanceof BrowserActionError) ? this.noRollbackFailure(command.id) : error
+          if (command.broker) this.piAction(command.id, command.broker.controller, command.action.type === 'interact' ? command.action.operation.kind : command.action.type, 'failed', reported)
+          throw reported
         } finally {
           signal?.removeEventListener('abort', upstreamAbort)
           const set = this.activePi.get(command.id); if (activeOwner) set?.delete(activeOwner); if (set?.size === 0) this.activePi.delete(command.id)

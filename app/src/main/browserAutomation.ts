@@ -2,7 +2,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import type { BrowserElementRef, BrowserInteraction, BrowserTarget, BrowserViewport, ConsoleLevel, FindQuery, SnapshotLimits, WaitCondition } from './browserToolProtocol'
 import type { InteractionTargetMetadata } from './browserApproval'
 import { parseBrowserViewport } from '../shared/browserViewport'
-import { cdpKeyInput, cdpMouseInput, type CdpMouseInputType, type SyntheticInput, type SyntheticInputToken } from './browserInput'
+import { BrowserAutomationError, safeBrowserCode } from './browserErrors'
 
 const SCREENSHOT_MAX_BYTES = 10 * 1024 * 1024
 const SCREENSHOT_MAX_DIMENSION = 4096
@@ -13,6 +13,13 @@ const SNAPSHOT_SEARCH_XPATH = "//*[not(self::script or self::style or self::nosc
 const SAFE_ATTRIBUTES = new Set(['id', 'class', 'role', 'aria-label', 'aria-labelledby', 'aria-describedby', 'name', 'type', 'placeholder', 'title', 'alt'])
 const SAFE_COMPUTED_STYLES = new Set(['display', 'visibility', 'position', 'color', 'background-color', 'font-family', 'font-size', 'font-weight', 'line-height', 'width', 'height', 'overflow', 'opacity'])
 const ENABLE_METHODS = ['Accessibility.enable', 'DOM.enable', 'CSS.enable', 'Page.enable', 'Runtime.enable', 'Network.enable'] as const
+type CdpMouseInputType = 'mousePressed' | 'mouseReleased' | 'mouseMoved' | 'mouseWheel'
+
+function keyCodeFor(value: string): string {
+  if (/^[A-Za-z]$/.test(value)) return `Key${value.toUpperCase()}`
+  if (/^[0-9]$/.test(value)) return `Digit${value}`
+  return value
+}
 
 export interface BrowserDebuggerTransport {
   isAttached(): boolean
@@ -28,12 +35,6 @@ export interface BrowserAutomationControls {
   history?(direction: 'back' | 'forward'): boolean | void
   dialog?(dialog: { type: string; message: string }): Promise<{ accept: boolean; promptText?: string }>
   onDiagnostics?(diagnostics: { consoleIssues: number; networkFailures: number }): void
-  /** Arm the adapter ledger before a new operation; stale tokens are cleared. */
-  onSyntheticInputScopeStart?(): void
-  /** Register one exact callback expected from a CDP Input dispatch. */
-  onSyntheticInput?(input: SyntheticInput): SyntheticInputToken | void
-  /** Clear all adapter expectations after invalidation or cancellation. */
-  clearSyntheticInput?(): void
 }
 export interface AccessibilityNodeResult { ref: string; depth: number; role: string; name: string; disabled?: boolean; focused?: boolean }
 export interface SnapshotResult { snapshotId: string; url: string; nodes: AccessibilityNodeResult[]; truncated: boolean }
@@ -153,9 +154,9 @@ export class BrowserAutomation {
     this.consoleRing = new BoundedRing(options.ringItems ?? 1_000, options.ringBytes ?? 1024 * 1024)
     this.networkRing = new BoundedRing(options.ringItems ?? 1_000, options.ringBytes ?? 1024 * 1024)
   }
-  invalidate(): void { this.snapshotCache = null; this.controls.clearSyntheticInput?.() }
+  invalidate(): void { this.snapshotCache = null }
   dispose(): void {
-    this.disposed = true; this.snapshotCache = null; this.controls.clearSyntheticInput?.(); this.requests.clear(); this.activeRequests = 0
+    this.disposed = true; this.snapshotCache = null; this.requests.clear(); this.activeRequests = 0
     if (this.diagnosticsTimer) clearTimeout(this.diagnosticsTimer); this.diagnosticsTimer = null
     if (this.attachedByUs && this.transport.isAttached()) { try { this.transport.detach?.() } catch { /* page teardown is best-effort */ } }
   }
@@ -412,7 +413,7 @@ export class BrowserAutomation {
     return { x: Math.min(...xs) + width / 2, y: Math.min(...ys) + height / 2, ...(checked === undefined ? {} : { checked }), metadata: current }
   }
   async prepareInteraction(lease: BrowserAutomationLease, operation: BrowserInteraction, signal: AbortSignal): Promise<PreparedBrowserInteraction> {
-    this.controls.onSyntheticInputScopeStart?.(); abort(signal); await this.ensureAttached(); abort(signal)
+    abort(signal); await this.ensureAttached(); abort(signal)
     const primaryTarget = operation.kind === 'drag' ? operation.source : ('target' in operation ? operation.target : undefined)
     const primary = primaryTarget ? this.resolveTarget(lease, primaryTarget) : undefined
     const secondary = operation.kind === 'drag' ? this.resolveTarget(lease, operation.target) : undefined
@@ -449,69 +450,62 @@ export class BrowserAutomation {
     }
     throw new Error('TARGET_OCCLUDED')
   }
-  async executeInteraction(prepared: PreparedBrowserInteraction, signal: AbortSignal, stillCurrent: () => boolean = () => true): Promise<{ dispatched: true; rollbackPossible: false }> {
-    this.controls.onSyntheticInputScopeStart?.()
-    const inputTokens = new Set<SyntheticInputToken>()
-    const clearInputTokens = (): void => {
-      for (const token of inputTokens) token.clear()
-      inputTokens.clear()
-      this.controls.clearSyntheticInput?.()
+  async executeInteraction(prepared: PreparedBrowserInteraction, signal: AbortSignal, stillCurrent: (dispatched: boolean) => boolean = () => true): Promise<{ dispatched: true; rollbackPossible: false }> {
+    let dispatched = false
+    const asAutomationError = (error: unknown): BrowserAutomationError => {
+      if (error instanceof BrowserAutomationError) return error
+      const code = safeBrowserCode(error instanceof Error ? error.message : undefined)
+      return new BrowserAutomationError(code, dispatched)
     }
-    const onAbort = (): void => { clearInputTokens() }
-    signal.addEventListener('abort', onAbort, { once: true })
-    let completed = false
+    const ensure = (): void => {
+      if (signal.aborted) throw new BrowserAutomationError('ACTION_CANCELLED', dispatched)
+      // Before the first irreversible command, the host requires the exact
+      // prepared generation. Once one command succeeds, only page identity is
+      // required: user input and navigation may legitimately advance it.
+      if (!stillCurrent(dispatched)) throw new BrowserAutomationError('STALE_GENERATION', dispatched)
+    }
+    const sendIrreversible = async (method: 'Input.dispatchMouseEvent' | 'Input.dispatchKeyEvent' | 'Input.insertText', params: Record<string, unknown>): Promise<void> => {
+      ensure()
+      try {
+        await this.transport.send(method, params)
+        dispatched = true
+      } catch (error) {
+        throw asAutomationError(error)
+      }
+    }
+    const pointFor = async (entry: SnapshotEntry, expected: InteractionTargetMetadata): Promise<{ x: number; y: number; checked?: boolean }> => {
+      const point = await this.actionable(entry, signal)
+      if (point.metadata.fingerprint !== expected.fingerprint) throw new BrowserAutomationError('STALE_GENERATION', dispatched)
+      ensure(); const exactPoint = await this.hitTest(entry, point, signal); ensure()
+      return { ...point, ...exactPoint }
+    }
+    const mouse = async (type: CdpMouseInputType, point: { x: number; y: number }, extra: Record<string, unknown> = {}): Promise<void> => {
+      const params = { type, x: point.x, y: point.y, button: 'none', clickCount: 0, ...extra }
+      await sendIrreversible('Input.dispatchMouseEvent', params)
+    }
+    const key = async (type: 'keyDown' | 'keyUp', value: string, modifiers = 0): Promise<void> => {
+      const key = value === 'Space' ? ' ' : value
+      await sendIrreversible('Input.dispatchKeyEvent', { type, key, code: keyCodeFor(value), modifiers })
+    }
+    const operation = prepared.operation
     try {
-      let dispatched = false
-      const ensure = (): void => {
-        if (signal.aborted) throw new Error(dispatched ? 'ACTION_CANCELLED_NO_ROLLBACK' : 'ACTION_CANCELLED')
-        if (!stillCurrent()) throw new Error(dispatched ? 'STALE_GENERATION_NO_ROLLBACK' : 'STALE_GENERATION')
-      }
-      const sendInput = async (method: 'Input.dispatchMouseEvent' | 'Input.dispatchKeyEvent', params: Record<string, unknown>, expected: SyntheticInput): Promise<void> => {
-        let token: SyntheticInputToken | undefined
-        try {
-          const registered = this.controls.onSyntheticInput?.(expected)
-          if (registered) { token = registered; inputTokens.add(registered) }
-          await this.transport.send(method, params)
-        } catch (error) {
-          token?.clear()
-          if (token) inputTokens.delete(token)
-          throw error
-        }
-      }
-      const pointFor = async (entry: SnapshotEntry, expected: InteractionTargetMetadata): Promise<{ x: number; y: number; checked?: boolean }> => {
-        const point = await this.actionable(entry, signal)
-        if (point.metadata.fingerprint !== expected.fingerprint) throw new Error('STALE_GENERATION')
-        ensure(); const exactPoint = await this.hitTest(entry, point, signal); ensure()
-        return { ...point, ...exactPoint }
-      }
-      const mouse = async (type: CdpMouseInputType, point: { x: number; y: number }, extra: Record<string, unknown> = {}): Promise<void> => {
-        ensure(); dispatched = true
-        const params = { type, x: point.x, y: point.y, button: 'none', clickCount: 0, ...extra }
-        await sendInput('Input.dispatchMouseEvent', params, cdpMouseInput(type, params))
-      }
-      const key = async (type: 'keyDown' | 'keyUp', value: string, modifiers = 0): Promise<void> => {
-        ensure(); dispatched = true
-        const expected = cdpKeyInput(type, value, modifiers)
-        await sendInput('Input.dispatchKeyEvent', { type, key: expected.key, code: expected.code, modifiers }, expected)
-      }
       const click = async (point: { x: number; y: number }, count = 1): Promise<void> => { await mouse('mousePressed', point, { button: 'left', clickCount: count }); await mouse('mouseReleased', point, { button: 'left', clickCount: count }) }
-      const operation = prepared.operation
       const primaryPoint = prepared.primary ? await pointFor(prepared.primary, prepared.target) : undefined
       if ((operation.kind === 'click' || operation.kind === 'doubleClick') && primaryPoint) await click(primaryPoint, operation.kind === 'doubleClick' ? 2 : 1)
       else if (operation.kind === 'hover' && primaryPoint) await mouse('mouseMoved', primaryPoint)
       else if ((operation.kind === 'fill' || operation.kind === 'type') && primaryPoint) {
         await click(primaryPoint)
         if (operation.kind === 'fill') { const modifier = process.platform === 'darwin' ? 4 : 2; await key('keyDown', 'a', modifier); await key('keyUp', 'a', modifier) }
-        ensure(); dispatched = true; await this.transport.send('Input.insertText', { text: operation.text })
+        await sendIrreversible('Input.insertText', { text: operation.text })
       } else if (operation.kind === 'press') {
         if (primaryPoint) await click(primaryPoint)
         await key('keyDown', operation.key); await key('keyUp', operation.key)
       } else if (operation.kind === 'select' && primaryPoint) {
-        if (operation.values.length !== 1) throw new Error('UNSUPPORTED_PAGE')
-        await click(primaryPoint); ensure(); dispatched = true; await this.transport.send('Input.insertText', { text: operation.values[0] }); await key('keyDown', 'Enter'); await key('keyUp', 'Enter')
+        if (operation.values.length !== 1) throw new BrowserAutomationError('UNSUPPORTED_PAGE', dispatched)
+        await click(primaryPoint); await sendIrreversible('Input.insertText', { text: operation.values[0] }); await key('keyDown', 'Enter'); await key('keyUp', 'Enter')
       } else if ((operation.kind === 'check' || operation.kind === 'uncheck') && primaryPoint) {
         const desired = operation.kind === 'check'
-        if (primaryPoint.checked === undefined) throw new Error('TARGET_NOT_ACTIONABLE')
+        if (primaryPoint.checked === undefined) throw new BrowserAutomationError('TARGET_NOT_ACTIONABLE', dispatched)
         if (primaryPoint.checked !== desired) await click(primaryPoint)
       } else if (operation.kind === 'scroll') {
         const point = primaryPoint ?? { x: 1, y: 1 }; await mouse('mouseWheel', point, { deltaX: operation.deltaX, deltaY: operation.deltaY })
@@ -521,23 +515,20 @@ export class BrowserAutomation {
         try { secondaryPoint = await pointFor(prepared.secondary, prepared.secondaryTarget) }
         catch (error) {
           const params = { type: 'mouseReleased', x: primaryPoint.x, y: primaryPoint.y, button: 'left', clickCount: 1 }
-          await sendInput('Input.dispatchMouseEvent', params, cdpMouseInput('mouseReleased', params)).catch(() => {})
-          const code = error instanceof Error && /^[A-Z][A-Z0-9_]{1,63}$/.test(error.message) ? error.message : 'INTERNAL_ERROR'
-          throw new Error(code.endsWith('_NO_ROLLBACK') ? code : `${code}_NO_ROLLBACK`)
+          await sendIrreversible('Input.dispatchMouseEvent', params).catch(() => {})
+          throw asAutomationError(error)
         }
         await mouse('mouseMoved', secondaryPoint, { button: 'left' }); await mouse('mouseReleased', secondaryPoint, { button: 'left', clickCount: 1 })
-      } else throw new Error('TARGET_NOT_ACTIONABLE')
+      } else throw new BrowserAutomationError('TARGET_NOT_ACTIONABLE', dispatched)
       // CDP may deliver javascriptDialogOpening immediately after the Input
       // command resolves. Keep the owning broker request alive through that task
       // so disconnect/cancel remains the dialog's cancellation owner.
       await new Promise<void>((resolve) => setImmediate(resolve))
       const dialogBarrier = this.dialogBarrier; if (dialogBarrier) await dialogBarrier
       ensure()
-      completed = true
       return { dispatched: true, rollbackPossible: false }
-    } finally {
-      signal.removeEventListener('abort', onAbort)
-      if (!completed) clearInputTokens()
+    } catch (error) {
+      throw asAutomationError(error)
     }
   }
   async screenshot(lease: BrowserAutomationLease, target: BrowserElementRef | undefined, fullPage: boolean, signal: AbortSignal): Promise<BrowserBinaryAttachment> {

@@ -8,6 +8,7 @@ import { parseBrowserViewport } from '../shared/browserViewport'
 import type { BrowserAutomation, BrowserBinaryAttachment } from './browserAutomation'
 import type { BrowserInteraction, BrowserToolAction } from './browserToolProtocol'
 import { classifyInteraction, type InteractionClassification, type InteractionTargetMetadata } from './browserApproval'
+import { ACTION_FAILED_NO_ROLLBACK, BrowserActionError, BrowserAutomationError, FRESH_SNAPSHOT_MESSAGE } from './browserErrors'
 
 export type TabBrowserPageEvent =
   | { type: 'navigation-started' }
@@ -30,6 +31,10 @@ function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
   return Promise.race([promise, cancelled]).finally(() => {
     if (onAbort) signal.removeEventListener('abort', onAbort)
   })
+}
+
+function adapterDispatched(error: unknown): boolean {
+  return error instanceof BrowserAutomationError && error.dispatched
 }
 
 export interface TabBrowserPage {
@@ -211,7 +216,7 @@ export class TabBrowserHost {
   status(id: string): BrowserRuntimeStatus {
     const record = this.record(id)
     const runtime = this.runtimes.get(record.id)
-    return { ...record, pageIncarnation: runtime?.incarnation ?? '', generation: runtime?.generation ?? 0, loading: runtime?.loading ?? false,
+    return { ...record, pageIncarnation: runtime?.incarnation ?? '', generation: runtime?.generation ?? this.generationFloor.get(record.id) ?? 0, loading: runtime?.loading ?? false,
       currentUrl: runtime?.currentUrl ?? record.safeRestoreUrl, visible: runtime?.visible ?? false, focused: runtime?.focused ?? false,
       restoredAfterFreeze: runtime?.restoredAfterFreeze ?? false, diagnostics: runtime?.diagnostics ?? { consoleIssues: 0, networkFailures: 0 },
       ...(this.capacityWaiting.has(record.id) ? { capacityWaiting: true } : {}) }
@@ -335,6 +340,19 @@ export class TabBrowserHost {
     const status = this.status(record.id); this.onStateChange(); this.emitRuntime(record.id); return status
   }
 
+  private noRollbackFailure(id: BrowserId, runtime: Runtime): BrowserActionError {
+    const current = this.runtimes.get(id)
+    return new BrowserActionError({
+      code: ACTION_FAILED_NO_ROLLBACK,
+      retryable: false,
+      message: FRESH_SNAPSHOT_MESSAGE,
+      pageIncarnation: current?.incarnation ?? runtime.incarnation,
+      generation: current?.generation ?? this.generationFloor.get(id) ?? runtime.generation,
+      snapshotHint: true,
+      dispatched: true,
+    })
+  }
+
   async runAutomation(id: string, action: BrowserToolAction, signal: AbortSignal, approve?: (request: InteractionApprovalRequest, signal: AbortSignal) => Promise<void>): Promise<unknown | BrowserBinaryAttachment> {
     const record = this.record(id)
     const runtime = this.runtimes.get(record.id)
@@ -343,10 +361,8 @@ export class TabBrowserHost {
     if (signal.aborted) throw new Error('ACTION_CANCELLED')
     const automation = runtime.page.automation
     const lease = { browserId: record.id, pageIncarnation: runtime.incarnation, generation: runtime.generation }
-    let result: unknown; let generationDelta = 0; let interactionDispatched = false
+    let result: unknown; let generationDelta = 0; let interactionDispatched = false; let interactionDispatchGeneration: number | undefined
     const pending = this.beginPending(runtime)
-    const onAbort = (): void => { runtime.suppressEvents = true }
-    signal.addEventListener('abort', onAbort, { once: true })
     this.capacity.protectFor(record.id, 'operation', true)
     try {
       if (action.type === 'snapshot') result = await automation.snapshot(lease, action.limits, signal)
@@ -366,9 +382,11 @@ export class TabBrowserHost {
         }
         if (signal.aborted) throw new Error('ACTION_CANCELLED')
         if (this.runtimes.get(record.id) !== runtime || runtime.incarnation !== action.pageIncarnation || runtime.generation !== action.expectedGeneration) throw new Error('STALE_GENERATION')
-        runtime.generation += 1; generationDelta = 1; automation.invalidate()
-        result = await automation.executeInteraction(prepared, signal, () => this.runtimes.get(record.id) === runtime && runtime.incarnation === action.pageIncarnation && runtime.generation === action.expectedGeneration + 1)
-        interactionDispatched = true
+        runtime.generation += 1; generationDelta = 1; interactionDispatchGeneration = runtime.generation; automation.invalidate()
+        this.onStateChange(); this.emitRuntime(record.id)
+        result = await automation.executeInteraction(prepared, signal, (dispatched) => this.runtimes.get(record.id) === runtime && runtime.incarnation === action.pageIncarnation
+          && (dispatched || runtime.generation === interactionDispatchGeneration))
+        interactionDispatched = typeof result === 'object' && result !== null && (result as { dispatched?: unknown }).dispatched === true
       } else if (action.type === 'reload' || action.type === 'history') {
         runtime.automationNavigationPending = true
         try { result = action.type === 'reload' ? automation.reload(action.ignoreCache) : automation.history(action.direction) }
@@ -382,19 +400,27 @@ export class TabBrowserHost {
         if (this.runtimes.get(record.id) !== runtime || runtime.incarnation !== action.pageIncarnation || runtime.generation !== action.expectedGeneration) throw new Error('STALE_GENERATION')
         runtime.generation += 1; generationDelta = 1; record.viewport = viewport; record.stateRevision += 1
       }
+    } catch (error) {
+      if (action.type === 'interact' && (interactionDispatched || adapterDispatched(error))) throw this.noRollbackFailure(record.id, runtime)
+      throw error
     } finally {
-      signal.removeEventListener('abort', onAbort)
       this.endPending(runtime, pending)
       this.capacity.protectFor(record.id, 'operation', false)
     }
-    if (signal.aborted) throw new Error(action.type === 'interact' && interactionDispatched ? 'ACTION_CANCELLED_NO_ROLLBACK' : 'ACTION_CANCELLED')
+    if (signal.aborted) {
+      if (action.type === 'interact' && interactionDispatched) throw this.noRollbackFailure(record.id, runtime)
+      throw new Error('ACTION_CANCELLED')
+    }
     const expectedAfter = action.expectedGeneration + generationDelta
-    if (this.runtimes.get(record.id) !== runtime || runtime.incarnation !== action.pageIncarnation || runtime.generation !== expectedAfter) {
-      if (action.type === 'interact' && interactionDispatched) throw new Error('STALE_GENERATION_NO_ROLLBACK')
+    const sameRuntime = this.runtimes.get(record.id) === runtime && runtime.incarnation === action.pageIncarnation
+    if (!sameRuntime) {
+      if (action.type === 'interact' && interactionDispatched) throw this.noRollbackFailure(record.id, runtime)
       throw new Error('STALE_GENERATION')
     }
+    if (action.type !== 'interact' && runtime.generation !== expectedAfter) throw new Error('STALE_GENERATION')
     this.onStateChange(); this.emitRuntime(record.id)
-    const context = { browserId: record.id, pageIncarnation: runtime.incarnation, generation: runtime.generation }
+    const context = { browserId: record.id, pageIncarnation: runtime.incarnation, generation: runtime.generation,
+      ...(action.type === 'interact' ? { interleaved: runtime.generation !== interactionDispatchGeneration } : {}) }
     if (typeof result === 'object' && result !== null) return { ...result, ...context }
     return { value: result, ...context }
   }

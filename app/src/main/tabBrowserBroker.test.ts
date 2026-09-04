@@ -7,6 +7,7 @@ import { execFile } from 'node:child_process'
 import { authorizeBrowserRequest, BROWSER_HOST_TOKEN_MAX_BYTES, brokerRequestDigest, dispatchAttachedBrokerAction, isEligiblePiController, parseBrokerRequest, parseBrowserHostToken, safeBrokerError, TabBrowserBrokerServer } from './tabBrowserBroker'
 import type { LayoutFile } from '../shared/layoutFile'
 import { BrowserOperationRegistry } from './browserOperationRegistry'
+import { ACTION_FAILED_NO_ROLLBACK, BrowserActionError, FRESH_SNAPSHOT_MESSAGE } from './browserErrors'
 
 const cleanup: string[] = []
 afterEach(async () => { for (const path of cleanup.splice(0)) await rm(path, { recursive: true, force: true }) })
@@ -72,8 +73,10 @@ describe('tab browser broker boundary', () => {
 
   it('reports that a completed interaction cannot be rolled back when authority changes before return', async () => {
     const action = { type: 'interact' as const, pageIncarnation: 'page', expectedGeneration: 1, operation: { kind: 'click' as const, target: { snapshotId: 'snap', ref: 'n1' } } }
-    await expect(dispatchAttachedBrokerAction(action, 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', new AbortController().signal,
-      () => false, async () => ({ dispatched: true, rollbackPossible: false }))).rejects.toThrow('STALE_BROWSER_CONTEXT_NO_ROLLBACK')
+    const error = await dispatchAttachedBrokerAction(action, 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', new AbortController().signal,
+      () => false, async () => ({ dispatched: true, rollbackPossible: false })).catch((value: unknown) => value)
+    expect(error).toMatchObject({ code: 'ACTION_FAILED_NO_ROLLBACK', retryable: false, snapshotHint: true, dispatched: true })
+    expect((error as Error).message).toContain('fresh browser snapshot')
   })
 
   it('aborts active cancellable work when controller authority is revoked', async () => {
@@ -193,6 +196,34 @@ describe('tab browser broker boundary', () => {
       })
     })
     expect(replies).toEqual([{ ok: true }, { version: 1, requestId: 'x', ok: true, result: { action: 'status' } }])
+    await server.close()
+  })
+
+  it('returns a structured no-rollback error with the current page identity', async () => {
+    if (process.platform === 'win32') return
+    const dir = await mkdtemp(join(tmpdir(), 'amber-browser-broker-')); cleanup.push(dir)
+    const socketPath = join(dir, 'broker.sock'); const tokenPath = join(dir, 'token')
+    const server = new TabBrowserBrokerServer(socketPath, tokenPath, async () => {
+      throw new BrowserActionError({ code: ACTION_FAILED_NO_ROLLBACK, retryable: false, message: FRESH_SNAPSHOT_MESSAGE,
+        pageIncarnation: 'page-current', generation: 12, snapshotHint: true, dispatched: true })
+    })
+    await server.start(); const token = (await readFile(tokenPath, 'utf8')).trim()
+    const encode = (value: unknown): Buffer => { const body = Buffer.from(JSON.stringify(value)); const out = Buffer.alloc(body.length + 4); out.writeUInt32BE(body.length); body.copy(out, 4); return out }
+    const reply = await new Promise<Record<string, unknown>>((resolve, reject) => {
+      const socket = connect(socketPath); let buffer = Buffer.alloc(0); let welcomed = false
+      socket.on('error', reject); socket.on('connect', () => socket.write(encode({ token })))
+      socket.on('data', (chunk) => {
+        buffer = Buffer.concat([buffer, chunk])
+        while (buffer.length >= 4 && buffer.length >= buffer.readUInt32BE(0) + 4) {
+          const size = buffer.readUInt32BE(0); const value = JSON.parse(buffer.subarray(4, 4 + size).toString()) as Record<string, unknown>; buffer = buffer.subarray(4 + size)
+          if (!welcomed) { welcomed = true; socket.write(encode({ version: 1, clientInstanceId: 'partial-client', sequence: 1, requestId: 'partial', amberSession: 'amber-1-2-0-pane', action: { type: 'status' } })) }
+          else { socket.end(); resolve(value) }
+        }
+      })
+    })
+    expect(reply).toMatchObject({ ok: false, error: ACTION_FAILED_NO_ROLLBACK, code: ACTION_FAILED_NO_ROLLBACK, retryable: false,
+      message: FRESH_SNAPSHOT_MESSAGE, pageIncarnation: 'page-current', generation: 12, snapshotHint: true, dispatched: true })
+    expect(JSON.stringify(reply)).not.toContain('secret')
     await server.close()
   })
 

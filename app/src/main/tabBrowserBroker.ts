@@ -10,6 +10,7 @@ import type { BrowserBinaryAttachment } from './browserAutomation'
 import { ensurePrivateRuntimeDirectory } from './browserHostPaths'
 import type { BrowserOperationRegistry } from './browserOperationRegistry'
 import { readSafeTextFile, SafeFileReadError } from './safeFileReader'
+import { ACTION_FAILED_NO_ROLLBACK, BrowserActionError, FRESH_SNAPSHOT_MESSAGE, isBrowserActionError, safeBrowserCode } from './browserErrors'
 
 export type BrokerAction =
   | { type: 'open' }
@@ -91,11 +92,21 @@ export async function dispatchAttachedBrokerAction(
     let result: unknown
     try { result = await dispatch(command, controller.signal, checkAuthority) }
     catch (error) {
-      if (revoked && error instanceof Error && error.message.endsWith('_NO_ROLLBACK')) throw error
+      const code = safeBrokerFailure(error).code
+      if (revoked && code === ACTION_FAILED_NO_ROLLBACK) throw error
       if (revoked) throw new Error('STALE_BROWSER_CONTEXT')
       throw error
     }
-    if (!(await checkAuthority())) { revoked = true; controller.abort(); throw new Error(action.type === 'interact' ? 'STALE_BROWSER_CONTEXT_NO_ROLLBACK' : 'STALE_BROWSER_CONTEXT') }
+    if (!(await checkAuthority())) {
+      revoked = true; controller.abort()
+      if (action.type === 'interact') {
+        const context = typeof result === 'object' && result !== null ? result as Record<string, unknown> : {}
+        throw new BrowserActionError({ code: ACTION_FAILED_NO_ROLLBACK, retryable: false, message: FRESH_SNAPSHOT_MESSAGE,
+          ...(typeof context['pageIncarnation'] === 'string' ? { pageIncarnation: context['pageIncarnation'] } : {}),
+          ...(typeof context['generation'] === 'number' ? { generation: context['generation'] } : {}), snapshotHint: true, dispatched: true })
+      }
+      throw new Error('STALE_BROWSER_CONTEXT')
+    }
     return result
   } finally {
     clearInterval(timer); signal.removeEventListener('abort', abortFromCaller)
@@ -131,9 +142,66 @@ function binaryFrameHeader(value: Buffer): Buffer {
 export function brokerRequestDigest(request: Pick<BrokerRequest, 'sequence' | 'amberSession' | 'action'>): string {
   return createHash('sha256').update(JSON.stringify({ sequence: request.sequence, amberSession: request.amberSession, action: request.action })).digest('hex')
 }
+const RETRYABLE_BROWSER_ERRORS = new Set([
+  'ACTION_CANCELLED', 'ACTION_TIMEOUT', 'BROWSER_CAPACITY_BUSY', 'BROWSER_FROZEN', 'BROWSER_HOST_UNAVAILABLE',
+  'INTERNAL_ERROR', 'PAGE_CLOSED', 'STALE_GENERATION', 'TARGET_AMBIGUOUS', 'TARGET_NOT_ACTIONABLE', 'TARGET_NOT_FOUND',
+  'TARGET_OCCLUDED', 'UNSUPPORTED_PAGE',
+])
+
+function brokerMessage(code: string): string {
+  if (code === ACTION_FAILED_NO_ROLLBACK) return FRESH_SNAPSHOT_MESSAGE
+  if (code === 'STALE_GENERATION') return 'The browser page changed. Take a fresh browser snapshot before retrying.'
+  if (code === 'ACTION_CANCELLED') return 'The browser action was cancelled before input was dispatched.'
+  if (code === 'ACTION_TIMEOUT') return 'The browser action timed out before completion.'
+  return `Browser action failed: ${code}.`
+}
+
+export interface BrokerFailureDetails {
+  code: string
+  retryable: boolean
+  message: string
+  pageIncarnation?: string
+  generation?: number
+  snapshotHint?: boolean
+  dispatched?: boolean
+}
+
+function isNoRollbackCode(code: string): boolean {
+  return code === ACTION_FAILED_NO_ROLLBACK || code === 'ACTION_CANCELLED_NO_ROLLBACK' || code === 'STALE_GENERATION_NO_ROLLBACK' || code === 'STALE_BROWSER_CONTEXT_NO_ROLLBACK'
+}
+
+export function safeBrokerFailure(error: unknown): BrokerFailureDetails {
+  const actionError = isBrowserActionError(error) ? error : null
+  const rawValue = error as { code?: unknown; dispatched?: unknown; pageIncarnation?: unknown; generation?: unknown } | null
+  const rawCode = actionError?.code ?? rawValue?.code ?? (error instanceof Error ? error.message : undefined)
+  const normalized = safeBrowserCode(rawCode)
+  const dispatched = actionError?.dispatched === true || rawValue?.dispatched === true || isNoRollbackCode(normalized)
+  const code = isNoRollbackCode(normalized) || dispatched ? ACTION_FAILED_NO_ROLLBACK : normalized
+  const details: BrokerFailureDetails = {
+    code,
+    retryable: code === ACTION_FAILED_NO_ROLLBACK ? false : actionError?.retryable ?? RETRYABLE_BROWSER_ERRORS.has(code),
+    message: brokerMessage(code),
+    ...(typeof (actionError?.pageIncarnation ?? rawValue?.pageIncarnation) === 'string' && (actionError?.pageIncarnation ?? rawValue?.pageIncarnation) ? { pageIncarnation: String(actionError?.pageIncarnation ?? rawValue?.pageIncarnation).slice(0, 256) } : {}),
+    ...(actionError?.generation !== undefined ? { generation: actionError.generation } : typeof rawValue?.generation === 'number' && Number.isSafeInteger(rawValue.generation) && rawValue.generation >= 0 ? { generation: rawValue.generation } : {}),
+    ...(code === ACTION_FAILED_NO_ROLLBACK ? { snapshotHint: true, dispatched: true } : dispatched ? { dispatched: true } : {}),
+  }
+  return details
+}
+
 export function safeBrokerError(error: unknown): string {
-  const raw = error instanceof Error ? error.message : 'INTERNAL_ERROR'
-  return /^[A-Z][A-Z0-9_]{1,63}$/.test(raw) ? raw : 'INTERNAL_ERROR'
+  return safeBrokerFailure(error).code
+}
+
+function brokerErrorEnvelope(requestId: string | undefined, error: unknown): Record<string, unknown> {
+  const details = safeBrokerFailure(error)
+  return {
+    ...(requestId ? { version: 1, requestId } : {}), ok: false, error: details.code, code: details.code,
+    retryable: details.retryable, message: details.message,
+    ...(details.pageIncarnation === undefined ? {} : { pageIncarnation: details.pageIncarnation }),
+    ...(details.generation === undefined ? {} : { generation: details.generation }),
+    ...(details.snapshotHint === undefined ? {} : { snapshotHint: details.snapshotHint }),
+    ...(details.dispatched === undefined ? {} : { dispatched: details.dispatched }),
+  }
 }
 function binaryAttachment(value: unknown): value is BrowserBinaryAttachment {
   const candidate = value as Partial<BrowserBinaryAttachment> | null
@@ -352,13 +420,13 @@ export class TabBrowserBrokerServer {
                 safeWriteResult(request.requestId, result)
                 if (binaryAttachment(result) && cacheKey) this.results.delete(cacheKey)
               }, (error) => {
-                const code = safeBrokerError(error)
+                const details = safeBrokerFailure(error)
                 // A cancelled/timed-out action did not produce a replayable
                 // result. Keeping its promise in the five-minute cache would
                 // retain request/controller closures and make a retry replay a
                 // cancellation forever.
-                if ((code === 'ACTION_CANCELLED' || code === 'ACTION_TIMEOUT' || code === 'BROWSER_HOST_SHUTTING_DOWN') && cacheKey) this.results.delete(cacheKey)
-                safeWrite({ version: 1, requestId: request.requestId, ok: false, error: code })
+                if ((details.code === 'ACTION_CANCELLED' || details.code === 'ACTION_TIMEOUT' || details.code === 'BROWSER_HOST_SHUTTING_DOWN') && cacheKey) this.results.delete(cacheKey)
+                safeWrite(brokerErrorEnvelope(request.requestId, error))
               })
                 .finally(() => { queued -= 1; if (cacheKey) connectionResults.delete(cacheKey) })
             }
@@ -551,9 +619,9 @@ export class TabBrowserBrokerServer {
           } catch (error) {
             // Only stable error codes cross into Pi. Debugger/Node exception
             // text can contain URLs, local paths, headers, or page content.
-            const message = safeBrokerError(error)
-            safeWrite({ ...(requestId ? { version: 1, requestId } : {}), ok: false, error: message })
-            if (!authenticated || (message === 'INVALID_REQUEST' && !requestId)) socket.destroySoon()
+            const details = safeBrokerFailure(error)
+            safeWrite(brokerErrorEnvelope(requestId, error))
+            if (!authenticated || (details.code === 'INVALID_REQUEST' && !requestId)) socket.destroySoon()
           } finally { if (!completionDeferred) queued -= 1 }
         })
       }

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { TabBrowserHost, type TabBrowserPage, type TabBrowserPageEvent, type TabBrowserPageFactory } from './tabBrowserHost'
 import { emptyBrowserState, parseBrowserState } from '../shared/tabBrowserState'
+import { BrowserAutomationError } from './browserErrors'
 import type { BrowserAutomation } from './browserAutomation'
 
 class FakePage implements TabBrowserPage {
@@ -29,7 +30,7 @@ describe('TabBrowserHost', () => {
     expect(host.status('browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa').lifecycle).toBe('frozen')
   })
 
-  it('reports final observed generation and no-rollback truth when physical input overlaps Pi dispatch', async () => {
+  it('reports the final generation when input overlaps a dispatched interaction', async () => {
     const host = new TabBrowserHost(emptyBrowserState(1), factory)
     const opened = await host.open({ visible: true })
     const page = opened.page as FakePage
@@ -37,11 +38,72 @@ describe('TabBrowserHost', () => {
     page.automation = {
       invalidate: vi.fn(),
       prepareInteraction: vi.fn(async () => ({ lease: { browserId: opened.status.id, pageIncarnation: opened.status.pageIncarnation, generation: opened.status.generation }, operation: { kind: 'click', target: { snapshotId: 'snapshot', ref: 'n1' } }, target })),
-      executeInteraction: vi.fn(async () => { userInputs.get(opened.status.id)!(); return { dispatched: true, rollbackPossible: false } }),
+      executeInteraction: vi.fn(async () => { expect(host.status(opened.status.id).generation).toBe(1); userInputs.get(opened.status.id)!(); return { dispatched: true, rollbackPossible: false } }),
     } as unknown as BrowserAutomation
     const before = opened.status.generation
-    await expect(host.runAutomation(opened.status.id, { type: 'interact', pageIncarnation: opened.status.pageIncarnation, expectedGeneration: before, operation: { kind: 'click', target: { snapshotId: 'snapshot', ref: 'n1' } } }, new AbortController().signal)).rejects.toThrow('STALE_GENERATION_NO_ROLLBACK')
-    expect(host.status(opened.status.id).generation).toBe(before + 2)
+    const result = await host.runAutomation(opened.status.id, { type: 'interact', pageIncarnation: opened.status.pageIncarnation, expectedGeneration: before, operation: { kind: 'click', target: { snapshotId: 'snapshot', ref: 'n1' } } }, new AbortController().signal)
+    expect(result).toMatchObject({ dispatched: true, generation: before + 2, pageIncarnation: opened.status.pageIncarnation, interleaved: true })
+  })
+
+  it('keeps a late callback from a prior action as a new generation during the next FIFO action', async () => {
+    const host = new TabBrowserHost(emptyBrowserState(1), factory)
+    const opened = await host.open({ visible: true })
+    let releaseSecond!: () => void; let calls = 0
+    const target = { role: 'button', name: 'Open', tag: 'button', type: 'button', fingerprint: 'fingerprint' }
+    const executeInteraction = vi.fn(async () => {
+      calls += 1
+      if (calls === 2) await new Promise<void>((resolve) => { releaseSecond = resolve })
+      return { dispatched: true, rollbackPossible: false }
+    })
+    const page = opened.page as FakePage
+    page.automation = {
+      invalidate: vi.fn(),
+      prepareInteraction: vi.fn(async () => ({ lease: { browserId: opened.status.id, pageIncarnation: opened.status.pageIncarnation, generation: host.status(opened.status.id).generation }, operation: { kind: 'click', target: { snapshotId: 'snapshot', ref: 'n1' } }, target })),
+      executeInteraction,
+    } as unknown as BrowserAutomation
+    const action = (): { type: 'interact'; pageIncarnation: string; expectedGeneration: number; operation: { kind: 'click'; target: { snapshotId: string; ref: string } } } => ({ type: 'interact', pageIncarnation: host.status(opened.status.id).pageIncarnation, expectedGeneration: host.status(opened.status.id).generation, operation: { kind: 'click', target: { snapshotId: 'snapshot', ref: 'n1' } } })
+    const first = await host.runAutomation(opened.status.id, action(), new AbortController().signal)
+    const second = host.runAutomation(opened.status.id, action(), new AbortController().signal)
+    await vi.waitFor(() => expect(releaseSecond).toBeTypeOf('function'))
+    // This callback could be a delayed CDP event from the first action. It is
+    // still input, so it advances the generation independently of the second.
+    userInputs.get(opened.status.id)!()
+    releaseSecond()
+    await expect(second).resolves.toMatchObject({ dispatched: true, generation: (first as { generation: number }).generation + 2, interleaved: true })
+  })
+
+  it('converts a typed adapter failure after the first accepted input to a stable no-rollback error', async () => {
+    const host = new TabBrowserHost(emptyBrowserState(1), factory)
+    const opened = await host.open({ visible: true }), page = opened.page as FakePage
+    const target = { role: 'button', name: 'Open', tag: 'button', type: 'button', fingerprint: 'fingerprint' }
+    page.automation = {
+      invalidate: vi.fn(),
+      prepareInteraction: vi.fn(async () => ({ lease: { browserId: opened.status.id, pageIncarnation: opened.status.pageIncarnation, generation: opened.status.generation }, operation: { kind: 'click', target: { snapshotId: 'snapshot', ref: 'n1' } }, target })),
+      executeInteraction: vi.fn(async () => {
+        userInputs.get(opened.status.id)!()
+        throw new BrowserAutomationError('ACTION_CANCELLED', true)
+      }),
+    } as unknown as BrowserAutomation
+    const error = await host.runAutomation(opened.status.id, { type: 'interact', pageIncarnation: opened.status.pageIncarnation, expectedGeneration: 0, operation: { kind: 'click', target: { snapshotId: 'snapshot', ref: 'n1' } } }, new AbortController().signal).catch((value: unknown) => value)
+    expect(error).toMatchObject({ code: 'ACTION_FAILED_NO_ROLLBACK', retryable: false, dispatched: true, snapshotHint: true, pageIncarnation: opened.status.pageIncarnation, generation: 2 })
+    expect((error as Error).message).toContain('fresh browser snapshot')
+  })
+
+  it('reports the current identity and generation when a dispatched interaction loses its page', async () => {
+    const host = new TabBrowserHost(emptyBrowserState(1), factory)
+    const opened = await host.open({ visible: true }), page = opened.page as FakePage
+    const target = { role: 'button', name: 'Open', tag: 'button', type: 'button', fingerprint: 'fingerprint' }
+    page.automation = {
+      invalidate: vi.fn(),
+      prepareInteraction: vi.fn(async () => ({ lease: { browserId: opened.status.id, pageIncarnation: opened.status.pageIncarnation, generation: opened.status.generation }, operation: { kind: 'click', target: { snapshotId: 'snapshot', ref: 'n1' } }, target })),
+      executeInteraction: vi.fn(async () => {
+        userInputs.get(opened.status.id)!()
+        pageEvents.get(opened.status.id)!({ type: 'crashed', reason: 'test' })
+        throw new BrowserAutomationError('PAGE_CLOSED', true)
+      }),
+    } as unknown as BrowserAutomation
+    const error = await host.runAutomation(opened.status.id, { type: 'interact', pageIncarnation: opened.status.pageIncarnation, expectedGeneration: 0, operation: { kind: 'click', target: { snapshotId: 'snapshot', ref: 'n1' } } }, new AbortController().signal).catch((value: unknown) => value)
+    expect(error).toMatchObject({ code: 'ACTION_FAILED_NO_ROLLBACK', retryable: false, dispatched: true, generation: 3, pageIncarnation: opened.status.pageIncarnation })
   })
 
   it('rechecks generation after approval before dispatching a consequential interaction', async () => {

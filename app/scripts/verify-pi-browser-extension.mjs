@@ -31,7 +31,7 @@ try {
   await exec(resolvedAmber, ['ctl', 'install-pi-extension'], { env })
   const extension = join(agentDir, 'extensions', 'amber-hook.ts')
   const first = await readFile(extension, 'utf8')
-  if (!first.startsWith('// amber-owned-extension:v6\n')) throw new Error('installed source is not the expected owned version')
+  if (!first.startsWith('// amber-owned-extension:v7\n')) throw new Error('installed source is not the expected owned version')
   await exec(resolvedAmber, ['ctl', 'install-pi-extension'], { env })
   if (await readFile(extension, 'utf8') !== first) throw new Error('second install changed the exact generated source')
 
@@ -90,6 +90,9 @@ try {
         if (value.action?.type === 'screenshot') {
           socket.write(frame({ ok: true, result: { contentTrust: 'untrusted-browser-content', mediaType: 'image/png', attachment: { encoding: 'binary-frame', byteLength: image.length } } }))
           const header = Buffer.allocUnsafe(4); header.writeUInt32BE(image.length); socket.write(header); socket.write(image)
+        } else if (value.action?.type === 'interact') {
+          socket.write(frame({ ok: false, error: 'ACTION_FAILED_NO_ROLLBACK', code: 'ACTION_FAILED_NO_ROLLBACK', retryable: false,
+            message: 'Input was dispatched and cannot be rolled back. Take a fresh browser snapshot before retrying.', pageIncarnation: 'page-current', generation: 4, snapshotHint: true, dispatched: true }))
         } else socket.write(frame({ ok: true, result: { pageLines: Array.from({ length: 2100 }, () => 'x'.repeat(30)) } }))
       }
     })
@@ -103,7 +106,10 @@ try {
     if (!textResult.content?.[0]?.text?.startsWith(`${label}\n`)) throw new Error('untrusted text label missing')
     if (Buffer.byteLength(textResult.content[0].text) > 50000 || textResult.content[0].text.split('\n').length > 2000) throw new Error('labeled text result exceeded bounds')
     const fillResult = await fillTool.execute('verify-fill', { pageIncarnation: 'page', expectedGeneration: 1, target: { snapshotId: 'snap', ref: 'n1' }, text: 'fixture-sensitive-value' }, new AbortController().signal)
-    if (JSON.stringify(fillResult).includes('fixture-sensitive-value') || !fillResult.content?.[0]?.text?.startsWith(`${label}\n`)) throw new Error('interaction result leaked input or lost trust label')
+    const fillText = fillResult.content?.[0]?.text ?? ''
+    if (JSON.stringify(fillResult).includes('fixture-sensitive-value') || !fillText.startsWith(`${label}\n`)
+      || !fillText.includes('ACTION_FAILED_NO_ROLLBACK') || !fillText.includes('retryable') || !fillText.includes('nextStep')
+      || !fillText.includes('fresh browser snapshot')) throw new Error('structured partial interaction result was lost, leaked, or not actionable')
     const imageResult = await screenshotTool.execute('verify-image', { pageIncarnation: 'page', expectedGeneration: 1 }, new AbortController().signal)
     if (!imageResult.content?.[0]?.text?.startsWith(`${label}\n`) || imageResult.content?.[1]?.type !== 'image') throw new Error('binary image lost its untrusted-content label')
   } finally { await new Promise((resolveClose) => server.close(resolveClose)) }

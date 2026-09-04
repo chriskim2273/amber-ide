@@ -1,34 +1,44 @@
 import { describe, expect, it, vi } from 'vitest'
 import { createInputEventHandlers, projectInPageNavigation } from './electronTabBrowserPage'
-import { cdpKeyInput, cdpMouseInput, SyntheticInputAccounting } from './browserInput'
 
 describe('Electron tab browser page events', () => {
-  it('consumes only exact adapter callbacks and records concurrent physical keyboard, composition, and pointer input', () => {
-    const accounting = new SyntheticInputAccounting(), user = vi.fn(), blur = vi.fn()
-    const handlers = createInputEventHandlers(accounting, user, blur)
-    accounting.expect(cdpKeyInput('keyDown', 'a', 0))
-    handlers.beforeInputEvent({ preventDefault: vi.fn() }, { type: 'keyDown', key: 'b', code: 'KeyB', isAutoRepeat: false, isComposing: false, shift: false, control: false, alt: false, meta: false, location: 0, modifiers: [] })
-    expect(user).toHaveBeenCalledOnce()
-    handlers.beforeInputEvent({ preventDefault: vi.fn() }, { type: 'keyDown', key: 'a', code: 'KeyA', isAutoRepeat: false, isComposing: false, shift: false, control: false, alt: false, meta: false, location: 0, modifiers: [] })
-    expect(user).toHaveBeenCalledOnce()
-
-    accounting.expect(cdpKeyInput('keyDown', 'a', 0))
-    handlers.beforeInputEvent({ preventDefault: vi.fn() }, { type: 'keyDown', key: 'a', code: 'KeyA', isAutoRepeat: false, isComposing: true, shift: false, control: false, alt: false, meta: false, location: 0, modifiers: [] })
-    expect(user).toHaveBeenCalledTimes(2)
-
-    accounting.expect(cdpMouseInput('mousePressed', { x: 10, y: 20, button: 'left', clickCount: 1, modifiers: 0 }))
-    handlers.beforeMouseEvent({ preventDefault: vi.fn() }, { type: 'mouseDown', x: 11, y: 20, button: 'left', clickCount: 1, modifiers: [] })
-    expect(user).toHaveBeenCalledTimes(3)
-    handlers.beforeMouseEvent({ preventDefault: vi.fn() }, { type: 'mouseDown', x: 10, y: 20, button: 'left', clickCount: 1, modifiers: [] })
-    expect(user).toHaveBeenCalledTimes(3)
+  it('advances generation for every keyboard, mouse, drag, and composition callback', () => {
+    const input = vi.fn(), blur = vi.fn()
+    const handlers = createInputEventHandlers(input, blur)
+    const event = { preventDefault: vi.fn() }
+    const key = { type: 'keyDown', key: 'a', code: 'KeyA', isAutoRepeat: false, isComposing: false, shift: false, control: false, alt: false, meta: false, location: 0, modifiers: [] }
+    const composing = { ...key, isComposing: true }
+    handlers.beforeInputEvent(event, key)
+    handlers.beforeInputEvent(event, composing)
+    // A CDP callback and an identical physical callback are indistinguishable;
+    // both are real page input and both advance the generation.
+    handlers.beforeInputEvent(event, key)
+    const drag = [
+      { type: 'mouseMove', x: 10, y: 20, clickCount: 0, modifiers: [] },
+      { type: 'mouseDown', x: 10, y: 20, button: 'left', clickCount: 1, modifiers: [] },
+      { type: 'mouseMove', x: 100, y: 200, button: 'left', clickCount: 0, modifiers: [] },
+      { type: 'mouseUp', x: 100, y: 200, button: 'left', clickCount: 1, modifiers: [] },
+    ] as const
+    drag.forEach((mouse) => handlers.beforeMouseEvent(event, mouse as unknown as Parameters<typeof handlers.beforeMouseEvent>[1]))
+    expect(input).toHaveBeenCalledTimes(7)
+    expect(blur).not.toHaveBeenCalled()
   })
 
-  it('does not leak a late callback after cancellation into the next action', () => {
-    const accounting = new SyntheticInputAccounting(), user = vi.fn(), handlers = createInputEventHandlers(accounting, user, vi.fn())
-    accounting.expect(cdpMouseInput('mousePressed', { x: 10, y: 20, button: 'left', clickCount: 1, modifiers: 0 }))
-    accounting.clear()
-    handlers.beforeMouseEvent({ preventDefault: vi.fn() }, { type: 'mouseDown', x: 10, y: 20, button: 'left', clickCount: 1, modifiers: [] })
-    expect(user).toHaveBeenCalledOnce()
+  it('counts reserved shortcuts before preventing them and does not suppress late or out-of-order callbacks', () => {
+    const input = vi.fn(), blur = vi.fn(), preventDefault = vi.fn()
+    const handlers = createInputEventHandlers(input, blur)
+    const event = { preventDefault }
+    const shortcut = { type: 'keyDown', key: 'b', code: 'KeyB', isAutoRepeat: false, isComposing: false, shift: true, control: true, alt: false, meta: false, location: 0, modifiers: [] }
+    handlers.beforeInputEvent(event, shortcut)
+    expect(input).toHaveBeenCalledOnce()
+    expect(preventDefault).toHaveBeenCalledOnce()
+    expect(blur).toHaveBeenCalledOnce()
+
+    // These may belong to an earlier CDP action, but they still represent
+    // observed input and cannot consume state belonging to a later action.
+    handlers.beforeMouseEvent(event, { type: 'mouseUp', x: 1, y: 1, button: 'left', clickCount: 1, modifiers: [] })
+    handlers.beforeInputEvent(event, { ...shortcut, key: 'a', code: 'KeyA', shift: false, control: false })
+    expect(input).toHaveBeenCalledTimes(3)
   })
 
   it('projects only bounded main-frame history/hash navigation', () => {

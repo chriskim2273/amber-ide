@@ -582,6 +582,7 @@ At minimum:
 - `APPROVAL_DENIED`
 - `ACTION_TIMEOUT`
 - `ACTION_CANCELLED`
+- `ACTION_FAILED_NO_ROLLBACK`
 - `PAGE_CLOSED`
 - `UNSUPPORTED_PAGE`
 - `POLICY_BLOCKED`
@@ -730,6 +731,7 @@ Snapshot element references are scoped to `{browserId, pageIncarnation, generati
 - Approval binds a digest of request ID, controller, browser ID, page incarnation, generation, origin, action, target, and redacted arguments. Any change invalidates it. Approval expiry, navigation, controller loss, revoke, cancellation, or host drain denies the action.
 - Cancellation removes queued work or aborts adapter work where supported. Once dispatch crosses a documented non-cancellable boundary, the result reports that cancellation cannot imply rollback.
 - A user action during a dispatched mutation may still interleave; completion reports the observed final generation and any Playwright failure.
+- If any irreversible input dispatch succeeds and the mutation later fails or is cancelled, the result is `ACTION_FAILED_NO_ROLLBACK` with `retryable: false`, the current page incarnation/generation when available, and a fresh-snapshot instruction. A failure before the first accepted dispatch remains a safe ordinary error.
 - Browser chrome displays Pi activity and the last action.
 - `Stop Pi` cancels cancellable broker work but cannot undo site-side effects.
 - Consequential actions require approval before dispatch because cancellation is not rollback.
