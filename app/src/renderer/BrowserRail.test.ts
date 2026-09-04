@@ -1,7 +1,7 @@
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
-import { BrowserRail, browserCommandNeedsContext } from './BrowserRail'
+import { BrowserRail, browserCommandNeedsContext, shouldRevokeDesignatedPi } from './BrowserRail'
 
 const props = {
   id: '0123456789ABCDEFGHJKMNPQRS', width: 420, collapsed: false,
@@ -11,6 +11,11 @@ const props = {
 }
 
 describe('BrowserRail command context', () => {
+  it('waits for the first daemon session list before revoking a persisted controller', () => {
+    expect(shouldRevokeDesignatedPi('amber-1-1-pi', [], false)).toBe(false)
+    expect(shouldRevokeDesignatedPi('amber-1-1-pi', [], true)).toBe(true)
+    expect(shouldRevokeDesignatedPi('amber-1-1-pi', [{ name: 'amber-1-1-pi', label: 'Pi' }], true)).toBe(false)
+  })
   it('does not re-acknowledge the surface while resolving a visible approval or dialog', () => {
     expect(browserCommandNeedsContext({ type: 'resolveApproval' })).toBe(false)
     expect(browserCommandNeedsContext({ type: 'resolveDialog' })).toBe(false)

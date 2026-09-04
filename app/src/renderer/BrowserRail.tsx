@@ -32,9 +32,13 @@ export function browserCommandNeedsContext(value: unknown): boolean {
   return type !== 'resolveApproval' && type !== 'resolveDialog'
 }
 
+export function shouldRevokeDesignatedPi(designatedPi: string | undefined, controllers: readonly { name: string }[], controllersReady: boolean): boolean {
+  return controllersReady && !!designatedPi && !controllers.some((controller) => controller.name === designatedPi)
+}
+
 export function BrowserRail(props: {
   id: string; width: number; collapsed: boolean; designatedPi?: string; sharedWithPi?: boolean
-  controllers: { name: string; label: string }[]; temporarilyHidden?: boolean; occluded?: boolean
+  controllers: { name: string; label: string }[]; controllersReady?: boolean; temporarilyHidden?: boolean; occluded?: boolean
   onWidth: (width: number) => void; onCollapsed: (collapsed: boolean) => void; onClose: () => void; onRecovery: () => void
   onPolicy: (policy: { designatedPi?: string; sharedWithPi: boolean }) => void
   ensureContext: () => Promise<void>
@@ -87,8 +91,8 @@ export function BrowserRail(props: {
   }, [approval, dialog])
 
   useEffect(() => {
-    if (props.designatedPi && !props.controllers.some((controller) => controller.name === props.designatedPi)) props.onPolicy({ sharedWithPi: false })
-  }, [props.designatedPi, props.controllers, props.onPolicy])
+    if (shouldRevokeDesignatedPi(props.designatedPi, props.controllers, props.controllersReady !== false)) props.onPolicy({ sharedWithPi: false })
+  }, [props.designatedPi, props.controllers, props.controllersReady, props.onPolicy])
 
   useEffect(() => {
     const workarea = host.current?.closest<HTMLElement>('.tab-browser-workarea')

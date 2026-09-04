@@ -2217,6 +2217,7 @@ function App(): JSX.Element {
           {...(tabBrowser.designatedPi ? { designatedPi: tabBrowser.designatedPi } : {})}
           {...(tabBrowser.sharedWithPi !== undefined ? { sharedWithPi: tabBrowser.sharedWithPi } : {})}
           controllers={(tab?.panes ?? []).filter((pane) => pane.kind === 'pi').map((pane) => ({ name: pane.name, label: titles[pane.name] || pane.name }))}
+          controllersReady={sawSessions}
           onPolicy={(policy) => { void ensureBrowserContext().then(() => {
             if (policy.designatedPi !== tabBrowser.designatedPi) return window.amber.browserCommand({ type: 'designate', ...(policy.designatedPi ? { designatedPi: policy.designatedPi } : {}) })
             if (policy.sharedWithPi !== !!tabBrowser.sharedWithPi) return window.amber.browserCommand({ type: 'share', sharedWithPi: policy.sharedWithPi })
