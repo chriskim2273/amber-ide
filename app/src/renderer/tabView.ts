@@ -51,15 +51,16 @@ export function deriveTab(
   const paneMeta: Record<string, PaneMeta> = {}
   panes.forEach((p) => {
     if (p.deadCode !== null) deadCodes[p.name] = p.deadCode
-    // Prefer a live OSC title over cwd; blank OSC 2 (some prompts) falls back.
-    // Pi panes are cleaned of their brand/cwd tokens so the header reads a bare
-    // session name (cleanOscTitle no-ops for every other kind).
+    // A durable friendly title outranks live OSC/file titles. OSC remains the
+    // useful fallback for shells whose title changes with the current command;
+    // blank OSC 2 (some prompts) falls back to cwd.
+    const friendly = p.title?.trim()
     const osc = titles[p.name]
     // An editor pane has no OSC stream: it reports its file name through the same
     // title channel, and an unsaved buffer has neither that nor a cwd.
-    const lead = osc && osc.trim().length > 0
+    const lead = friendly || (osc && osc.trim().length > 0
       ? cleanOscTitle(osc, p.kind, p.cwd)
-      : (p.kind === 'editor' ? (p.cwd ? shortCwd(p.cwd, home) : 'untitled') : shortCwd(p.cwd, home))
+      : (p.kind === 'editor' ? (p.cwd ? shortCwd(p.cwd, home) : 'untitled') : shortCwd(p.cwd, home)))
     // An agent pane that fell back to a shell is labelled as such, not by its
     // kind (`shell (claude exited)` / `shell (grok exited)`).
     const suffix = p.runState === 'shell-fallback' ? `shell (${p.kind} exited)` : p.kind
@@ -71,7 +72,8 @@ export function deriveTab(
     // guess.
     const idx = p.slot
     paneMeta[p.name] = {
-      kind: p.kind, title: `${idx ? `#${idx} ` : ''}${lead} · ${suffix}`, cwd: p.cwd, runState: p.runState,
+      kind: p.kind, title: `${idx ? `#${idx} ` : ''}${lead} · ${suffix}`, cwd: p.cwd,
+      friendlyTitle: friendly, runState: p.runState,
       rssKb: m?.rssKb, growing: m?.growing, claudeId: p.claudeId,
     }
   })

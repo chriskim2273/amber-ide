@@ -68,7 +68,7 @@ beforeEach(() => {
 function splitView(active: boolean, onPaneFocus: () => void): JSX.Element {
   return createElement(SplitView, {
     tree: TREE, deadCodes: {}, meta: { [PANE]: { kind: 'claude', title: 'agent', cwd: '/tmp', runState: 'resource-suspended' } }, active,
-    epoch: 0, portEpoch: 0, fontSize: 13, mobile: false, onPaneTitle: () => {}, onPaneFocus,
+    epoch: 0, portEpoch: 0, fontSize: 13, mobile: false, onPaneTitle: () => {}, onSetTitle: () => {}, onPaneFocus,
     onSetRatio: () => {}, onSplit: () => {}, onMove: () => {}, onMoveTo: () => {}, onClose: () => {},
     browsers: {}, onBrowserNav: () => {}, editors: {}, onEditorPath: () => {}, onEditorViewState: () => {},
     onEditorDirty: () => {}, onEditorReady: () => {}, zoomedPane: null, onToggleZoom: () => {},

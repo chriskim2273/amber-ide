@@ -22,6 +22,47 @@ function Shell({ title, label, onClose, children }: { title: string; label: stri
   </div>
 }
 
+export function PaneTitleDialog(props: { current: string; onSave: (title: string) => void; onClose: () => void }): JSX.Element {
+  const [value, setValue] = useState(props.current)
+  return <Shell title="Friendly pane title" label="Friendly pane title" onClose={props.onClose}>
+    <form className="productivity-controls" onSubmit={(event) => { event.preventDefault(); props.onSave(value) }}>
+      <input autoFocus className="productivity-search" maxLength={120} placeholder="Optional title" aria-label="friendly pane title"
+        value={value} onChange={(event) => setValue(event.target.value)} onKeyDown={(event) => {
+          if (event.key === 'Escape') props.onClose()
+          else event.stopPropagation()
+        }} />
+      <button className="btn btn-accent" type="submit">Save</button>
+      <button className="btn btn-ghost" type="button" onClick={() => props.onSave('')}>Clear</button>
+    </form>
+    <p className="productivity-hint">Titles are shown instead of live terminal or file names. Leave blank to restore the automatic title.</p>
+  </Shell>
+}
+
+export function PanePickerDialog({ entries, onClose }: { entries: PaletteEntry[]; onClose: () => void }): JSX.Element {
+  const [query, setQuery] = useState('')
+  const [selected, setSelected] = useState(0)
+  const matches = useMemo(() => filterPalette(entries, query), [entries, query])
+  useEffect(() => setSelected(0), [query])
+  const run = (entry: PaletteEntry | undefined): void => { if (entry) { onClose(); entry.run() } }
+  return <Shell title="Pane picker" label="Pane picker" onClose={onClose}>
+    <input autoFocus className="productivity-search" placeholder="Search panes by title, folder, or id" value={query}
+      aria-label="search panes" onChange={(e) => setQuery(e.target.value)} onKeyDown={(e) => {
+        e.stopPropagation()
+        if (e.key === 'Escape') onClose()
+        else if (e.key === 'ArrowDown') { e.preventDefault(); setSelected((n) => Math.min(Math.max(0, matches.length - 1), n + 1)) }
+        else if (e.key === 'ArrowUp') { e.preventDefault(); setSelected((n) => Math.max(0, n - 1)) }
+        else if (e.key === 'Enter') { e.preventDefault(); run(matches[selected]) }
+      }} />
+    <div className="productivity-list" role="listbox">
+      {matches.map((entry, index) => <button key={entry.id} className={'productivity-row' + (index === selected ? ' selected' : '')}
+        role="option" aria-selected={index === selected} onMouseEnter={() => setSelected(index)} onClick={() => run(entry)}>
+        <strong>{entry.label}</strong><small>{entry.detail}</small>
+      </button>)}
+      {matches.length === 0 && <div className="productivity-empty">No matching pane</div>}
+    </div>
+  </Shell>
+}
+
 export function CommandPalette({ entries, onClose }: { entries: PaletteEntry[]; onClose: () => void }): JSX.Element {
   const [query, setQuery] = useState('')
   const [selected, setSelected] = useState(0)

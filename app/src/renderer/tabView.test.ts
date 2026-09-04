@@ -60,6 +60,16 @@ describe('deriveTab', () => {
     expect(paneMeta.a!.title).toBe('~/proj · pi')
   })
 
+  it('lets a durable friendly title outrank OSC and cwd fallbacks', () => {
+    const { paneMeta } = deriveTab(
+      [pane({ name: 'a', title: '  Release checklist  ', cwd: '/home/u/proj' }),
+       pane({ name: 'b', title: 'Build logs', cwd: '/home/u/x' })],
+      null, {}, { 'a': 'vim', 'b': 'shell' }, home,
+    )
+    expect(paneMeta.a!.title).toBe('Release checklist · shell')
+    expect(paneMeta.b!.title).toBe('Build logs · shell')
+  })
+
   it('titles a pane from its OSC title when present, else the short cwd', () => {
     const { paneMeta } = deriveTab(
       [pane({ name: 'a', cwd: '/home/u/proj' }), pane({ name: 'b', cwd: '/home/u/x' })],

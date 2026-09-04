@@ -30,6 +30,8 @@ export interface SessionInfo {
   cwd: string
   kind: DaemonSessionKind
   alive: boolean
+  /** User-chosen friendly title, separate from the name/grouping identity. */
+  title?: string | undefined
   // Unix seconds of the session's last state-store write; the daemon's
   // ordering key for "most recent". Optional on the wire (serde default 0);
   // the app does not use it today.
@@ -85,7 +87,7 @@ export type ControlMsg =
   | { kind: 'ListSessionsDetailed' }
   | { kind: 'Snapshot' }
   | { kind: 'SnapshotOk' }
-  | { kind: 'Create'; name: string; cwd: string; sessionKind: string }
+  | { kind: 'Create'; name: string; cwd: string; sessionKind: string; title?: string | undefined }
   // `resume` carries the client's delta-replay watermark. Its KEY PRESENCE is
   // the opt-in to `AttachBacklog` replies: `{ epoch: '0', offset: 0 }` means
   // "new-style client, no watermark yet" (0 is reserved — rings never mint
@@ -112,6 +114,7 @@ export type ControlMsg =
   | { kind: 'Backlog'; name: string; data: Uint8Array }
   | { kind: 'Kill'; name: string }
   | { kind: 'Rename'; from: string; to: string }
+  | { kind: 'SetTitle'; name: string; title: string | null }
   | { kind: 'Suspend'; name: string }
   | { kind: 'Resume'; name: string }
   | { kind: 'Resize'; name: string; cols: number; rows: number }
@@ -167,7 +170,7 @@ function msgToJson(m: ControlMsg): unknown {
     case 'WatchMemoryPressure':
       return { WatchMemoryPressure: { version: m.version } }
     case 'Create':
-      return { Create: { name: m.name, cwd: m.cwd, kind: m.sessionKind } }
+      return { Create: { name: m.name, cwd: m.cwd, kind: m.sessionKind, ...(m.title === undefined ? {} : { title: m.title }) } }
     case 'Attach': {
       // `preview` (mosaic tile attach), like `raw_client`, is never set by the
       // Electron app — it always wants the full backlog on a fresh mount — so
@@ -203,6 +206,8 @@ function msgToJson(m: ControlMsg): unknown {
       return { Kill: { name: m.name } }
     case 'Rename':
       return { Rename: { from: m.from, to: m.to } }
+    case 'SetTitle':
+      return { SetTitle: { name: m.name, title: m.title } }
     case 'Suspend':
       return { Suspend: { name: m.name } }
     case 'Resume':
@@ -279,7 +284,11 @@ function jsonToMsg(v: unknown): ControlMsg | null {
   if (v && typeof v === 'object') {
     const [key, body] = Object.entries(v as Record<string, unknown>)[0] as [string, Record<string, unknown>]
     switch (key) {
-      case 'Create': return { kind: 'Create', name: body['name'] as string, cwd: body['cwd'] as string, sessionKind: body['kind'] as string }
+      case 'Create': return {
+        kind: 'Create', name: body['name'] as string, cwd: body['cwd'] as string,
+        sessionKind: body['kind'] as string,
+        ...(body['title'] === undefined ? {} : { title: typeof body['title'] === 'string' ? body['title'] : undefined }),
+      }
       case 'WatchMemoryPressure': return { kind: 'WatchMemoryPressure', version: body['version'] as number }
       case 'Attach': {
         const rawResume = body['resume'] as Record<string, unknown> | undefined
@@ -324,6 +333,10 @@ function jsonToMsg(v: unknown): ControlMsg | null {
       case 'Backlog': return { kind: 'Backlog', name: body['name'] as string, data: Uint8Array.from(body['data'] as number[]) }
       case 'Kill': return { kind: 'Kill', name: body['name'] as string }
       case 'Rename': return { kind: 'Rename', from: body['from'] as string, to: body['to'] as string }
+      case 'SetTitle': return {
+        kind: 'SetTitle', name: body['name'] as string,
+        title: body['title'] === null ? null : typeof body['title'] === 'string' ? body['title'] : null,
+      }
       case 'Resize': return { kind: 'Resize', name: body['name'] as string, cols: body['cols'] as number, rows: body['rows'] as number }
       case 'Usage': {
         const raw = Array.isArray(body['providers']) ? (body['providers'] as unknown[]) : []

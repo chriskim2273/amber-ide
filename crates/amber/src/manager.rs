@@ -23,6 +23,10 @@ use crate::watchers::Watchers;
 const DEFAULT_ROWS: u16 = 24;
 const DEFAULT_COLS: u16 = 80;
 const CHILD_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Friendly titles are persisted metadata, not terminal control sequences. Keep
+/// them bounded and reject controls so every client can safely render the value
+/// in a header, picker, CLI row, or JSON response.
+const MAX_TITLE_CHARS: usize = 120;
 
 /// `current_exe()` returns a `<path> (deleted)`-suffixed string, forever, once
 /// this process's own backing binary inode is unlinked (e.g. an in-place
@@ -609,6 +613,22 @@ impl SessionManager {
         Ok(sess)
     }
 
+    /// Validate and normalize a user-facing title. Empty/whitespace-only
+    /// values clear the title; control characters are rejected rather than
+    /// allowing a title to forge terminal/CLI output.
+    pub fn validate_title(title: Option<&str>) -> anyhow::Result<Option<String>> {
+        let Some(title) = title else { return Ok(None) };
+        let title = title.trim();
+        if title.is_empty() { return Ok(None) }
+        if title.chars().count() > MAX_TITLE_CHARS {
+            anyhow::bail!("title exceeds {MAX_TITLE_CHARS} characters");
+        }
+        if title.chars().any(char::is_control) {
+            anyhow::bail!("title contains a control character");
+        }
+        Ok(Some(title.to_string()))
+    }
+
     /// Create a new session, persist its metadata, and track it live.
     pub fn create(
         &self,
@@ -616,7 +636,21 @@ impl SessionManager {
         cwd: impl Into<PathBuf>,
         kind: SessionKind,
     ) -> anyhow::Result<Arc<PtySession>> {
+        self.create_with_title(name, cwd, kind, None)
+    }
+
+    /// Create a session with optional friendly display metadata. The title is
+    /// persisted in the same authoritative session record as the name/cwd/kind,
+    /// while remaining independent from the name used for workspace grouping.
+    pub fn create_with_title(
+        &self,
+        name: &str,
+        cwd: impl Into<PathBuf>,
+        kind: SessionKind,
+        title: Option<&str>,
+    ) -> anyhow::Result<Arc<PtySession>> {
         Self::validate_name(name)?;
+        let title = Self::validate_title(title)?;
         // Store an absolute, stable cwd (not a relative `.`) so claude resume
         // works across daemon restarts / reboots regardless of launch context.
         let cwd = Self::resolve_cwd(&cwd.into());
@@ -648,6 +682,7 @@ impl SessionManager {
             cwd,
             kind,
             updated: Self::now(),
+            title,
             resume_as_claude: false,
             run_state: None,
             slot,
@@ -1645,6 +1680,30 @@ impl SessionManager {
         }
     }
 
+    /// Set or clear a session's friendly title without changing its identity.
+    /// The returned info is the same daemon truth sent to watchers, which keeps
+    /// the app's one-way flow intact (it never edits a title optimistically).
+    pub fn set_title(&self, name: &str, title: Option<&str>) -> anyhow::Result<SessionInfo> {
+        let title = Self::validate_title(title)?;
+        let _maint = self.maintenance.lock().unwrap();
+        self.finish_pending_rename()?;
+        let session = self
+            .session(name)
+            .ok_or_else(|| anyhow::anyhow!("no such session: {name}"))?;
+        let meta = self
+            .effective_meta_for(name, &session)?
+            .ok_or_else(|| anyhow::anyhow!("session {name} vanished from the store"))?;
+        // A display-only title is not session activity: preserve `updated` so
+        // `amber attach`'s newest-session ordering does not change merely
+        // because a user renamed a pane's label.
+        let updated = SessionMeta { title, ..meta };
+        self.store.write_session(&updated)?;
+        self.session_infos()?
+            .into_iter()
+            .find(|info| info.name == name)
+            .ok_or_else(|| anyhow::anyhow!("session {name} vanished after title update"))
+    }
+
     /// Record an agent session's supervision phase (from `ReportRunState`).
     /// Errors — surfaced to the client as an `Error` reply — if the session is
     /// unknown, is not an agent session, or `state` is not one of the four
@@ -1979,6 +2038,7 @@ impl SessionManager {
                     kind: meta.kind.as_str().to_string(),
                     alive: sess.is_alive(),
                     updated: meta.updated,
+                    title: meta.title.clone(),
                     run_state: match (sess.run_state(), sess.suspend_origin()) {
                         (Some(state), SuspendOrigin::Pressure) if state == "suspended" => {
                             Some("resource-suspended".to_string())
@@ -2191,6 +2251,7 @@ impl SessionManager {
             kind: meta.kind.as_str().to_string(),
             alive: sess.is_alive(),
             updated: meta.updated,
+            title: meta.title.clone(),
             run_state: sess.run_state(),
             claude_id: self
                 .store
@@ -2368,6 +2429,7 @@ mod tests {
                 cwd: PathBuf::from("/tmp"),
                 kind: SessionKind::Claude,
                 updated: 1,
+                title: None,
                 resume_as_claude: false,
                 run_state: None,
                 slot,
@@ -2445,6 +2507,7 @@ mod tests {
                 cwd: PathBuf::from("/"),
                 kind: SessionKind::Shell,
                 updated: 0,
+                title: None,
                 resume_as_claude: false,
                 run_state: None,
                 slot: 1,
@@ -3204,6 +3267,7 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
             kind: SessionKind::Shell,
             updated: 1,
+            title: None,
             resume_as_claude: false,
             run_state: None,
             slot: 1,
@@ -3248,6 +3312,7 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
             kind: SessionKind::Shell,
             updated: 1,
+            title: None,
             resume_as_claude: false,
             run_state: None,
             slot: 0,
@@ -3292,6 +3357,7 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
             kind: SessionKind::Shell,
             updated: 1,
+            title: None,
             resume_as_claude: false,
             run_state: None,
             slot: 1,
@@ -3351,6 +3417,7 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             kind: SessionKind::Shell,
             updated: 1,
+            title: None,
             resume_as_claude: true,
             run_state: None,
             slot: 1,
@@ -3441,6 +3508,7 @@ mod tests {
                 cwd: dir.path().to_path_buf(),
                 kind: SessionKind::Shell,
                 updated: 1,
+                title: None,
                 resume_as_claude: true,
                 run_state: None,
                 slot: 1,
@@ -3467,6 +3535,7 @@ mod tests {
                 cwd: dir.path().to_path_buf(),
                 kind: SessionKind::Shell,
                 updated: 1,
+                title: None,
                 resume_as_claude: true,
                 run_state: None,
                 slot: 1,
@@ -3997,6 +4066,7 @@ mod tests {
                     cwd: PathBuf::from("/tmp"),
                     kind: SessionKind::Shell,
                     updated: 1,
+                    title: None,
                     resume_as_claude: false,
                     run_state: None,
                     slot: 0,
@@ -4036,6 +4106,7 @@ mod tests {
                 cwd: PathBuf::from("/tmp"),
                 kind: SessionKind::Shell,
                 updated: 1,
+                title: None,
                 resume_as_claude: false,
                 run_state: None,
                 slot: 0,
@@ -4699,6 +4770,39 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn friendly_title_is_persisted_and_survives_identity_rename() {
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        let from = "amber-1-1-0-title";
+        let to = "amber-1-2-0-title";
+        mgr.create_with_title(from, "/tmp", SessionKind::Shell, Some("  Build monitor  "))
+            .unwrap();
+        assert_eq!(mgr.session_infos().unwrap()[0].title.as_deref(), Some("Build monitor"));
+
+        let updated = mgr.set_title(from, Some("Tests")).unwrap();
+        assert_eq!(updated.title.as_deref(), Some("Tests"));
+        assert_eq!(mgr.store.read_session(from).unwrap().unwrap().title.as_deref(), Some("Tests"));
+
+        let renamed = mgr.rename(from, to).unwrap();
+        assert_eq!(renamed.title.as_deref(), Some("Tests"));
+        assert_eq!(mgr.store.read_session(to).unwrap().unwrap().title.as_deref(), Some("Tests"));
+
+        let cleared = mgr.set_title(to, Some("  ")).unwrap();
+        assert_eq!(cleared.title, None);
+        assert_eq!(mgr.store.read_session(to).unwrap().unwrap().title, None);
+        mgr.remove(to).unwrap();
+    }
+
+    #[test]
+    fn friendly_title_rejects_controls_and_absurd_lengths() {
+        assert_eq!(SessionManager::validate_title(None).unwrap(), None);
+        assert_eq!(SessionManager::validate_title(Some(" \t ")).unwrap(), None);
+        assert!(SessionManager::validate_title(Some("line\nnext")).is_err());
+        assert!(SessionManager::validate_title(Some(&"x".repeat(121))).is_err());
+    }
+
+    #[test]
     fn restore_keeps_stored_slots_and_repairs_missing_or_duplicate_ones() {
         // The store is user-visible JSON: it can predate this feature (slot 0)
         // or be hand-edited into duplicates. Restore must repair, never panic
@@ -4712,6 +4816,7 @@ mod tests {
                     cwd: PathBuf::from("/tmp"),
                     kind: SessionKind::Shell,
                     updated: 1,
+                    title: None,
                     resume_as_claude: false,
                     run_state: None,
                     slot,

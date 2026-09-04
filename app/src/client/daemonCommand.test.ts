@@ -12,6 +12,15 @@ function sent(cmd: DaemonCommand): Frame[] {
 }
 
 describe('handleDaemonCommand', () => {
+  it('maps friendly title updates and optional create titles', () => {
+    expect(sent({ cmd: 'setTitle', name: 'amber-1-1-0-a', title: 'Build' })).toEqual([
+      { type: 'control', msg: { kind: 'SetTitle', name: 'amber-1-1-0-a', title: 'Build' } },
+    ])
+    expect(sent({ cmd: 'create', name: 'amber-1-1-0-a', cwd: '/tmp', sessionKind: 'shell', title: 'Build' })).toEqual([
+      { type: 'control', msg: { kind: 'Create', name: 'amber-1-1-0-a', cwd: '/tmp', sessionKind: 'shell', title: 'Build' } },
+    ])
+  })
+
   it('maps the getUsage gesture to a GetUsage control message', () => {
     expect(sent({ cmd: 'getUsage' })).toEqual([{ type: 'control', msg: { kind: 'GetUsage' } }])
   })

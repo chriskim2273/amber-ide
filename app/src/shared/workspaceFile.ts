@@ -3,7 +3,7 @@ import { formatName } from './names'
 import { formatBrowserName } from './browserName'
 import { formatEditorName } from './editorName'
 import { isDaemonSessionKind, type DaemonSessionKind } from './proto'
-import type { LayoutFile, WsLayout, TabLayout, FrozenEntry, BrowserEntry, EditorEntry } from './layoutFile'
+import { normalizeFriendlyTitle, type LayoutFile, type WsLayout, type TabLayout, type FrozenEntry, type BrowserEntry, type EditorEntry } from './layoutFile'
 
 // The `.amberws` portable workspace file. Structure (grouping/tree/labels) +
 // per-pane scrollback, versioned. Tree leaves are file-local placeholders
@@ -22,6 +22,9 @@ export interface WsPane {
   cwd: string
   ord: number
   frozenNote?: string // presence (incl. '') = frozen; the value is the note
+  /** Optional friendly title; daemon panes send it on create, app-local panes
+   * store it in the sidecar title map when the plan is committed. */
+  title?: string
   scrollback: string // base64; '' when no dump was captured (always '' for browser/editor)
   url?: string // browser panes only: the saved address
   // Editor panes only: the file PATH. Contents are NEVER embedded — a loaded
@@ -94,6 +97,10 @@ function parsePane(v: unknown): WsPane {
     scrollback: p['scrollback'],
     // frozenNote is optional; drop it unless a string ('' is valid = frozen, no note).
     ...(typeof p['frozenNote'] === 'string' ? { frozenNote: p['frozenNote'] } : {}),
+    ...(() => {
+      const title = normalizeFriendlyTitle(p['title'])
+      return title === undefined ? {} : { title }
+    })(),
     ...(typeof p['url'] === 'string' ? { url: p['url'] } : {}),
     // `path` is string | null; anything else (incl. missing) loads as a scratch
     // buffer rather than failing the whole file.
@@ -180,7 +187,7 @@ export function treeFromPlaceholders(tree: Node | null, idToName: Record<string,
 // Narrow structural inputs (superset-compatible with store.ts's WorkspaceModel/
 // TabModel/PaneModel) so this module stays pure and never imports the renderer
 // store.
-export interface SavePane { name: string; cwd: string; kind: string; ord: number; url?: string; path?: string | null }
+export interface SavePane { name: string; cwd: string; kind: string; ord: number; url?: string; path?: string | null; title?: string | undefined }
 export interface SaveTab { tab: number; panes: SavePane[] }
 export interface SaveWorkspace { ws: number; tabs: SaveTab[] }
 
@@ -219,6 +226,10 @@ export function assembleSave(
           // Frozen presence must survive even with no note → encode '' so the
           // pane still round-trips as frozen (presence, not truthiness).
           ...(fz ? { frozenNote: fz.note ?? '' } : {}),
+          ...(() => {
+            const title = normalizeFriendlyTitle(p.title)
+            return title === undefined ? {} : { title }
+          })(),
           ...(p.kind === 'browser' ? { url: p.url ?? '' } : {}),
           ...(p.kind === 'editor' ? { path: p.path ?? null } : {}),
         }
@@ -244,7 +255,7 @@ export type LoadOptions =
   | { mode: 'new'; nextWs: number; mintId: () => string }
   | { mode: 'replace'; ws: number; mintId: () => string }
 
-export interface LoadCreate { name: string; cwd: string; kind: DaemonSessionKind }
+export interface LoadCreate { name: string; cwd: string; kind: DaemonSessionKind; title?: string | undefined }
 export interface LoadPlan {
   creates: LoadCreate[]
   workspaces: Record<string, WsLayout> // sidecar mutations, keyed by ws-number string
@@ -252,6 +263,7 @@ export interface LoadPlan {
   scrollback: Record<string, Uint8Array> // keyed by minted session name
   browsers: Record<string, BrowserEntry> // app-local browser panes, keyed by minted browser id
   editors: Record<string, EditorEntry> // app-local editor panes, keyed by minted editor id
+  titles: Record<string, string> // app-local friendly titles, keyed by minted pane id
   targetWorkspaces: number[] // ws numbers used, in doc order
 }
 
@@ -263,6 +275,7 @@ export function buildLoadPlan(doc: WorkspaceDoc, opts: LoadOptions): LoadPlan {
   const scrollback: Record<string, Uint8Array> = {}
   const browsers: Record<string, BrowserEntry> = {}
   const editors: Record<string, EditorEntry> = {}
+  const titles: Record<string, string> = {}
   const targetWorkspaces: number[] = []
 
   doc.workspaces.forEach((ws, wsIdx) => {
@@ -278,6 +291,7 @@ export function buildLoadPlan(doc: WorkspaceDoc, opts: LoadOptions): LoadPlan {
           const bname = formatBrowserName({ ws: targetWs, tab: tab.tab, ord: pane.ord, id: opts.mintId() })
           idToName[pane.id] = bname
           browsers[bname] = { ws: targetWs, tab: tab.tab, ord: pane.ord, url: pane.url ?? '' }
+          if (pane.title) titles[bname] = pane.title
           continue
         }
         // Editor panes are app-local too (same class as browser): sidecar entry,
@@ -286,11 +300,12 @@ export function buildLoadPlan(doc: WorkspaceDoc, opts: LoadOptions): LoadPlan {
           const ename = formatEditorName({ ws: targetWs, tab: tab.tab, ord: pane.ord, id: opts.mintId() })
           idToName[pane.id] = ename
           editors[ename] = { ws: targetWs, tab: tab.tab, ord: pane.ord, path: pane.path ?? null }
+          if (pane.title) titles[ename] = pane.title
           continue
         }
         const name = formatName({ ws: targetWs, tab: tab.tab, ord: pane.ord, id: opts.mintId() })
         idToName[pane.id] = name
-        creates.push({ name, cwd: pane.cwd, kind: pane.kind })
+        creates.push({ name, cwd: pane.cwd, kind: pane.kind, ...(pane.title ? { title: pane.title } : {}) })
         if (pane.frozenNote !== undefined) frozen[name] = pane.frozenNote === '' ? {} : { note: pane.frozenNote }
         if (pane.scrollback !== '') scrollback[name] = fromBase64(pane.scrollback)
       }
@@ -308,7 +323,7 @@ export function buildLoadPlan(doc: WorkspaceDoc, opts: LoadOptions): LoadPlan {
     }
   })
 
-  return { creates, workspaces, frozen, scrollback, browsers, editors, targetWorkspaces }
+  return { creates, workspaces, frozen, scrollback, browsers, editors, titles, targetWorkspaces }
 }
 
 // Lowest free workspace number: one above the highest live number (gaps are NOT
@@ -341,6 +356,7 @@ export function planLoad(
     scrollback: { ...firstPlan.scrollback, ...restPlan.scrollback },
     browsers: { ...firstPlan.browsers, ...restPlan.browsers },
     editors: { ...firstPlan.editors, ...restPlan.editors },
+    titles: { ...firstPlan.titles, ...restPlan.titles },
     targetWorkspaces: [...firstPlan.targetWorkspaces, ...restPlan.targetWorkspaces],
   }
 }

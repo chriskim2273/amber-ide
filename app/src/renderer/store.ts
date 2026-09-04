@@ -53,7 +53,19 @@ export type DaemonEvent =
   | { kind: 'MarkSeen'; names: string[] }
   // UI-originated: the user dismissed the daemon-error banner.
   | { kind: 'ClearError' }
-export interface PaneModel { name: string; cwd: string; kind: string; alive: boolean; ord: number; deadCode: number | null; runState?: string | undefined; claudeId?: string | undefined; slot?: number | undefined }
+export interface PaneModel {
+  name: string
+  cwd: string
+  kind: string
+  alive: boolean
+  ord: number
+  deadCode: number | null
+  /** Daemon-owned title, or an app-local sidecar title. */
+  title?: string | undefined
+  runState?: string | undefined
+  claudeId?: string | undefined
+  slot?: number | undefined
+}
 export interface TabModel { tab: number; panes: PaneModel[] }
 export interface WorkspaceModel { ws: number; tabs: TabModel[] }
 
@@ -248,8 +260,8 @@ export function hasActivity(state: AppState, panes: PaneModel[], frozen?: Set<st
 // grouped model so they flow through deriveTab exactly like a daemon pane. A
 // browser pane's {ws,tab} may be a grouping that has no daemon session at all,
 // so ws/tab entries are created on demand. Result stays sorted by ord.
-export function mergeBrowsers(workspaces: WorkspaceModel[], browsers: Record<string, BrowserEntry>): WorkspaceModel[] {
-  return mergeLocalPanes(workspaces, browsers, 'browser')
+export function mergeBrowsers(workspaces: WorkspaceModel[], browsers: Record<string, BrowserEntry>, titles?: Record<string, string>): WorkspaceModel[] {
+  return mergeLocalPanes(workspaces, browsers, 'browser', titles)
 }
 
 // Editor panes (spec 2026-07-19) are the same class as browser panes: app-local,
@@ -258,8 +270,9 @@ export function mergeBrowsers(workspaces: WorkspaceModel[], browsers: Record<str
 export function mergeEditors(
   workspaces: WorkspaceModel[],
   editors: Record<string, { ws: number; tab: number; ord: number; path: string | null }>,
+  titles?: Record<string, string>,
 ): WorkspaceModel[] {
-  return mergeLocalPanes(workspaces, editors, 'editor')
+  return mergeLocalPanes(workspaces, editors, 'editor', titles)
 }
 
 // Shared body of the two merges above: fold sidecar-owned panes into the grouped
@@ -270,6 +283,7 @@ function mergeLocalPanes(
   workspaces: WorkspaceModel[],
   entriesMap: Record<string, { ws: number; tab: number; ord: number; path?: string | null }>,
   kind: string,
+  titles?: Record<string, string>,
 ): WorkspaceModel[] {
   const entries = Object.entries(entriesMap)
   if (entries.length === 0) return workspaces
@@ -284,7 +298,11 @@ function mergeLocalPanes(
     const tabs = wsMap.get(b.ws)!
     if (!tabs.has(b.tab)) tabs.set(b.tab, [])
     const cwd = typeof b.path === 'string' ? b.path.slice(0, b.path.lastIndexOf('/') + 1) : ''
-    tabs.get(b.tab)!.push({ name, cwd, kind, alive: true, ord: b.ord, deadCode: null })
+    const title = titles?.[name]
+    tabs.get(b.tab)!.push({
+      name, cwd, kind, alive: true, ord: b.ord, deadCode: null,
+      ...(title ? { title } : {}),
+    })
   }
   return [...wsMap.entries()].sort((a, b) => a[0] - b[0]).map(([ws, tabs]) => ({
     ws,
@@ -302,7 +320,7 @@ export function groupSessions(state: AppState): WorkspaceModel[] {
     const pane: PaneModel = {
       name: sess.name, cwd: sess.cwd, kind: sess.kind, alive: sess.alive,
       ord: p.ord, deadCode: sess.name in state.dead ? state.dead[sess.name]! : null,
-      runState: sess.run_state, claudeId: sess.claude_id, slot: sess.slot,
+      title: sess.title, runState: sess.run_state, claudeId: sess.claude_id, slot: sess.slot,
     }
     if (!wsMap.has(p.ws)) wsMap.set(p.ws, new Map())
     const tabs = wsMap.get(p.ws)!

@@ -108,7 +108,7 @@ fn large_backlog_does_not_block_control_on_shared_connection() {
     let producer = UnixStream::connect(&sock).unwrap();
     send(
         &producer,
-        ControlMsg::Create { name: "amber-1-1-0-a".into(), cwd: cwd.clone(), kind: "shell".into() },
+        ControlMsg::Create { name: "amber-1-1-0-a".into(), cwd: cwd.clone(), kind: "shell".into(), title: None },
     );
     // Synchronize: the session must exist before anyone attaches it.
     let mut pr = producer.try_clone().unwrap();
@@ -159,7 +159,7 @@ fn large_backlog_does_not_block_control_on_shared_connection() {
     send(&victim, ControlMsg::Attach { name: "amber-1-1-0-a".into(), raw_client: false, preview: false, resume: None });
     send(
         &victim,
-        ControlMsg::Create { name: "amber-2-2-0-b".into(), cwd, kind: "shell".into() },
+        ControlMsg::Create { name: "amber-2-2-0-b".into(), cwd, kind: "shell".into(), title: None },
     );
 
     // The invariant under test is that the daemon PROCESSED the control frame

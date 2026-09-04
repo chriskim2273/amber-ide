@@ -138,7 +138,7 @@ fn reattach_with_a_current_watermark_replays_only_the_delta() {
     let producer = UnixStream::connect(&sock).unwrap();
     send(
         &producer,
-        ControlMsg::Create { name: name.into(), cwd: cwd.clone(), kind: "shell".into() },
+        ControlMsg::Create { name: name.into(), cwd: cwd.clone(), kind: "shell".into(), title: None },
     );
     let mut pr = producer.try_clone().unwrap();
     // Wait for Created (skip any earlier frames).
@@ -211,7 +211,7 @@ fn reattach_with_a_stale_watermark_falls_back_to_full_with_reset_semantics() {
     let cwd = dir.path().to_string_lossy().into_owned();
     let name = "amber-1-1-0-a";
     let producer = UnixStream::connect(&sock).unwrap();
-    send(&producer, ControlMsg::Create { name: name.into(), cwd, kind: "shell".into() });
+    send(&producer, ControlMsg::Create { name: name.into(), cwd, kind: "shell".into(), title: None });
     let mut pr = producer.try_clone().unwrap();
     let mut d = Decoder::new();
     while !matches!(
@@ -256,7 +256,7 @@ fn a_legacy_attach_is_never_shown_the_attach_backlog_variant() {
     let cwd = dir.path().to_string_lossy().into_owned();
     let name = "amber-1-1-0-a";
     let producer = UnixStream::connect(&sock).unwrap();
-    send(&producer, ControlMsg::Create { name: name.into(), cwd, kind: "shell".into() });
+    send(&producer, ControlMsg::Create { name: name.into(), cwd, kind: "shell".into(), title: None });
     let mut pr = producer.try_clone().unwrap();
     let mut d = Decoder::new();
     while !matches!(

@@ -12,9 +12,10 @@ import type { Frame } from '../shared/proto'
  * control MessagePort.
  */
 export type DaemonCommand =
-  | { cmd: 'create'; name: string; cwd: string; sessionKind: string }
+  | { cmd: 'create'; name: string; cwd: string; sessionKind: string; title?: string }
   | { cmd: 'kill'; name: string }
   | { cmd: 'rename'; from: string; to: string }
+  | { cmd: 'setTitle'; name: string; title: string | null }
   | { cmd: 'dumpBacklog'; name: string }
   | { cmd: 'searchScrollback'; requestId: number; query: string; names: string[]; limit: number }
   | { cmd: 'listRecoveryEvents'; limit: number }
@@ -35,11 +36,13 @@ export type DaemonCommand =
  */
 export function handleDaemonCommand(conn: { send: (f: Frame) => void }, cmd: DaemonCommand): void {
   if (cmd.cmd === 'create') {
-    conn.send({ type: 'control', msg: { kind: 'Create', name: cmd.name, cwd: cmd.cwd, sessionKind: cmd.sessionKind } })
+    conn.send({ type: 'control', msg: { kind: 'Create', name: cmd.name, cwd: cmd.cwd, sessionKind: cmd.sessionKind, ...(cmd.title === undefined ? {} : { title: cmd.title }) } })
   } else if (cmd.cmd === 'kill') {
     conn.send({ type: 'control', msg: { kind: 'Kill', name: cmd.name } })
   } else if (cmd.cmd === 'rename') {
     conn.send({ type: 'control', msg: { kind: 'Rename', from: cmd.from, to: cmd.to } })
+  } else if (cmd.cmd === 'setTitle') {
+    conn.send({ type: 'control', msg: { kind: 'SetTitle', name: cmd.name, title: cmd.title } })
   } else if (cmd.cmd === 'dumpBacklog') {
     conn.send({ type: 'control', msg: { kind: 'DumpBacklog', name: cmd.name } })
   } else if (cmd.cmd === 'searchScrollback') {

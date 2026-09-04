@@ -128,7 +128,7 @@ fn non_reading_client_is_dropped_and_never_freezes_the_daemon() {
     let producer = UnixStream::connect(&sock).unwrap();
     send(
         &producer,
-        ControlMsg::Create { name: "amber-1-1-0-a".into(), cwd: cwd.clone(), kind: "shell".into() },
+        ControlMsg::Create { name: "amber-1-1-0-a".into(), cwd: cwd.clone(), kind: "shell".into(), title: None },
     );
     let mut pr = producer.try_clone().unwrap();
     read_control_until(&mut pr, |m| matches!(m, ControlMsg::Created { name } if name == "amber-1-1-0-a"));
@@ -159,7 +159,7 @@ fn non_reading_client_is_dropped_and_never_freezes_the_daemon() {
     read_control_until(&mut healthy, |m| matches!(m, ControlMsg::SessionList { .. }));
     send(
         &healthy,
-        ControlMsg::Create { name: "amber-2-2-0-b".into(), cwd, kind: "shell".into() },
+        ControlMsg::Create { name: "amber-2-2-0-b".into(), cwd, kind: "shell".into(), title: None },
     );
     read_control_until(&mut healthy, |m| matches!(m, ControlMsg::Created { name } if name == "amber-2-2-0-b"));
 

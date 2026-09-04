@@ -20,7 +20,16 @@ const Editor = lazy(() => import('./Editor').then((m) => ({ default: m.Editor })
 /** How long a finger must rest before a drag arms instead of scrolling. */
 const LONG_PRESS_MS = 400
 
-export interface PaneMeta { kind: string; title: string; cwd: string; runState?: string | undefined; rssKb?: number | undefined; growing?: boolean | undefined; claudeId?: string | undefined }
+export interface PaneMeta {
+  kind: string
+  title: string
+  cwd: string
+  friendlyTitle?: string | undefined
+  runState?: string | undefined
+  rssKb?: number | undefined
+  growing?: boolean | undefined
+  claudeId?: string | undefined
+}
 
 /** Which agent binary a pane's recorded conversation id belongs to. Explicit
  *  agent kinds map to themselves; a shell pane with a recorded id got it from a
@@ -172,6 +181,7 @@ export function SplitView(props: {
   portEpoch: number
   fontSize: number
   onPaneTitle: (session: string, title: string) => void
+  onSetTitle: (paneId: string) => void
   onPaneFocus: (session: string) => void
   /** One-shot cross-workspace reveal request from desktop overview surfaces. */
   focusRequest?: { paneId: string; seq: number } | null
@@ -1016,6 +1026,9 @@ export function SplitView(props: {
             {reload?.show && menuMeta && <button className="ctx-item" role="menuitem" onClick={run(() => setReloadPane(paneId))}>
               <Icon name="reload" /><span>Reload {agentOf(menuMeta.kind)}…</span>
             </button>}
+            <button className="ctx-item" role="menuitem" onClick={run(() => props.onSetTitle(paneId))}>
+              <Icon name="edit" /><span>{menuMeta?.friendlyTitle ? 'Edit friendly title…' : 'Set friendly title…'}</span>
+            </button>
             {menuHasTerm && <div className="ctx-sep" />}
             <button className="ctx-item" role="menuitem"
               onClick={() => setMenu({ paneId, x: menu.x, y: menu.y, split: 'h' })}>

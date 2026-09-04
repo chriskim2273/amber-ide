@@ -139,6 +139,7 @@ impl Fixture {
             name: name.clone(),
             cwd: self.dir.path().to_string_lossy().into_owned(),
             kind: "shell".into(),
+            title: None,
         })))
         .unwrap();
         let mut dec = proto::Decoder::new();

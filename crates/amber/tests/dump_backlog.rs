@@ -64,7 +64,7 @@ fn dump_backlog_returns_ring_bytes_and_errors_on_unknown() {
     let conn = UnixStream::connect(&sock).unwrap();
     send(
         &conn,
-        ControlMsg::Create { name: "amber-1-1-0-a".into(), cwd, kind: "shell".into() },
+        ControlMsg::Create { name: "amber-1-1-0-a".into(), cwd, kind: "shell".into(), title: None },
     );
     let mut c = conn.try_clone().unwrap();
     read_control_until(&mut c, |m| matches!(m, ControlMsg::Created { name } if name == "amber-1-1-0-a"));

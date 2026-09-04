@@ -503,8 +503,9 @@ export function createAmber(deps: AmberDeps): WebAmber {
     },
 
     // --- session lifecycle: existing browser whitelist ----------------------
-    createSession: (name, cwd, sessionKind): void => control.send({ t: 'create', name, cwd, kind: sessionKind }),
+    createSession: (name, cwd, sessionKind, title): void => control.send({ t: 'create', name, cwd, kind: sessionKind, ...(title === undefined ? {} : { title }) }),
     killSession: (name): void => control.send({ t: 'kill', name }),
+    setSessionTitle: (name, title): void => control.send({ t: 'set-title', name, title }),
     renameSession: (from, to): void => control.send({ t: 'move', from, to }),
     suspendSession: (name): void => control.send({ t: 'suspend', name }),
     resumeSession: (name): void => control.send({ t: 'resume', name }),

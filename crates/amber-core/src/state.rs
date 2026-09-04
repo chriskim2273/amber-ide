@@ -75,6 +75,11 @@ pub struct SessionMeta {
     pub cwd: PathBuf,
     pub kind: SessionKind,
     pub updated: u64,
+    /// User-chosen display metadata. It is independent of `name`, whose
+    /// workspace/tab segments are the daemon identity and grouping contract.
+    /// Older session records omit it and deserialize as no title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     /// A `Shell` session that was running a hand-started `claude` at snapshot
     /// time. On restore it is relaunched as a supervised claude (resuming that
     /// conversation) instead of a bare shell. Defaulted for older records.
@@ -1127,6 +1132,7 @@ mod tests {
             cwd: PathBuf::from("/tmp/proj"),
             kind: SessionKind::Shell,
             updated: 1_700_000_000,
+            title: None,
             resume_as_claude: false,
             run_state: None,
             slot: 1,

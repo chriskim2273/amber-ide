@@ -70,6 +70,7 @@ fn watcher_sees_create_and_kill_deltas() {
             name: "amber-1-1-0-a".into(),
             cwd: dir.path().to_string_lossy().into_owned(),
             kind: "shell".into(),
+            title: None,
         },
     );
 
@@ -120,6 +121,7 @@ fn watcher_snapshot_arrives_before_later_deltas() {
             name: "amber-1-1-0-after-watch".into(),
             cwd: dir.path().to_string_lossy().into_owned(),
             kind: "shell".into(),
+            title: None,
         },
     );
 

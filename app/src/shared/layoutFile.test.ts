@@ -78,6 +78,17 @@ describe('pushRecent', () => {
   })
 })
 
+describe('layout friendly titles', () => {
+  it('round-trips valid titles and drops unsafe values', () => {
+    const l: LayoutFile = { version: 1, activeWorkspace: 1, workspaces: {}, titles: { 'browser-1-1-0-a': 'Docs' } }
+    expect(parseLayout(serializeLayout(l)).titles).toEqual(l.titles)
+    const parsed = parseLayout(JSON.stringify({ version: 1, activeWorkspace: 1, workspaces: {}, titles: {
+      ok: ' Build ', blank: '  ', control: 'bad\nname', c1: 'bad\u0085name', tooLong: 'x'.repeat(121), emojiTooLong: '😀'.repeat(121), bad: 4,
+    } }))
+    expect(parsed.titles).toEqual({ ok: 'Build' })
+  })
+})
+
 describe('layout browsers map', () => {
   it('round-trips valid entries', () => {
     const l: LayoutFile = { version: 1, activeWorkspace: 1, workspaces: {},

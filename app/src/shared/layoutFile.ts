@@ -38,6 +38,10 @@ export interface LayoutFile {
   workspaces: Record<string, WsLayout>
   fontSize?: number
   frozen?: Record<string, FrozenEntry>
+  // Explicit friendly titles for app-local panes. Daemon session titles live in
+  // authoritative SessionMeta instead; keeping this map app-owned lets a title
+  // survive sidecar reload without pretending the sidecar owns a daemon pane.
+  titles?: Record<string, string>
   browsers?: Record<string, BrowserEntry>
   editors?: Record<string, EditorEntry>
   recentFiles?: string[] // most-recent-first, deduped, capped at RECENT_FILES_MAX
@@ -56,9 +60,35 @@ function parseFrozen(v: unknown): Record<string, FrozenEntry> | undefined {
   return out
 }
 
+// Friendly titles share the daemon's limits: trim outer whitespace, reject
+// blank/control values, and cap Unicode characters rather than UTF-16 units.
+// This is exported so sidecar, workspace, and interactive input all enforce the
+// same rule for app-local panes (daemon panes are validated by Rust).
+export function normalizeFriendlyTitle(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const title = value.trim()
+  if (!title || [...title].length > 120) return undefined
+  if ([...title].some((char) => {
+    const code = char.charCodeAt(0)
+    return code < 0x20 || (code >= 0x7f && code <= 0x9f)
+  })) return undefined
+  return title
+}
+
 // Shape-guard the browsers map (same lesson as parseFrozen): reject a
 // non-object/array top level; drop entries missing/mistyping any field. A
 // malformed entry is silently dropped so a hand-edited sidecar never throws.
+function parseTitles(v: unknown): Record<string, string> | undefined {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return undefined
+  const out: Record<string, string> = {}
+  for (const [name, title] of Object.entries(v)) {
+    const clean = normalizeFriendlyTitle(title)
+    if (clean === undefined) continue
+    out[name] = clean
+  }
+  return out
+}
+
 function parseBrowsers(v: unknown): Record<string, BrowserEntry> | undefined {
   if (typeof v !== 'object' || v === null || Array.isArray(v)) return undefined
   const out: Record<string, BrowserEntry> = {}
@@ -263,6 +293,10 @@ export function parseLayout(text: string): LayoutFile {
       ...((): { frozen?: Record<string, FrozenEntry> } => {
         const f = parseFrozen(v.frozen)
         return f ? { frozen: f } : {}
+      })(),
+      ...((): { titles?: Record<string, string> } => {
+        const t = parseTitles(v.titles)
+        return t ? { titles: t } : {}
       })(),
       ...((): { browsers?: Record<string, BrowserEntry> } => {
         const b = parseBrowsers(v.browsers)

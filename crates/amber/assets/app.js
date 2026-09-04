@@ -2,9 +2,9 @@
  *
  * Contract (server):
  *   POST /api/auth      body = token (from the URL fragment) -> HttpOnly cookie
- *   GET  /api/sessions  -> [{name, kind, cwd, run_state, alive}]
+ *   GET  /api/sessions  -> [{name, kind, cwd, run_state, alive, title?}]
  *   GET  /ws            JSON TEXT control frames + raw BINARY pty bytes
- *     up:   {t:'open',name} | {t:'close',name} | BINARY = input bytes
+ *     up:   {t:'open',name} | {t:'close',name} | {t:'set-title',name,title} | BINARY = input bytes
  *     down: BINARY = pty output | {t:'sessions',sessions} | {t:'exit',name,code}
  *           | {t:'error',msg}
  *
@@ -82,6 +82,7 @@ function main() {
   var $ = function (id) { return document.getElementById(id); };
   var viewList = $('view-list'), viewTerm = $('view-term');
   var listEl = $('list'), countEl = $('list-count'), bannerEl = $('banner');
+  var filterEl = $('session-filter');
   var wsBarEl = $('ws-bar'), tabBarEl = $('tab-bar'), mosaicEl = $('mosaic');
   var screenEl = $('screen'), sizerEl = $('sizer'), stageEl = $('stage'), hostEl = $('host');
   var titleEl = $('term-title'), ctrlBtn = $('k-ctrl');
@@ -94,6 +95,7 @@ function main() {
   var frozen = {};        // paneId -> true, rebuilt from layout.frozen on every push
   var curWs = null;       // selected workspace id, null = follow the server's activeWorkspace
   var curTab = null;      // selected tab id within curWs
+  var filterQuery = '';
   var open = null;        // session name currently open (survives reconnects)
   var freshBacklog = false; // next binary frame is the replayed scrollback
   var term = null;
@@ -131,6 +133,11 @@ function main() {
   // to no workspaces at all), the workspace/tab/tile mosaic otherwise.
   function renderList() {
     countEl.textContent = sessions.length ? sessions.length + ' session' + (sessions.length === 1 ? '' : 's') : '';
+    if (filterQuery.trim()) {
+      wsBarEl.hidden = tabBarEl.hidden = mosaicEl.hidden = true;
+      listEl.hidden = false;
+      return renderFlatList();
+    }
     frozen = {};
     (layout && layout.frozen || []).forEach(function (name) { frozen[name] = true; });
     if (!layout || !layout.workspaces || !layout.workspaces.length) {
@@ -232,6 +239,16 @@ function main() {
     return sessions.filter(function (x) { return x.name === name; })[0] || null;
   }
 
+  function sessionTitle(s) {
+    return s && s.title && s.title.trim() ? s.title.trim() : shortCwd(s ? s.cwd : '');
+  }
+
+  function matchesFilter(s) {
+    var q = filterQuery.trim().toLowerCase();
+    if (!q) return true;
+    return [s.title, s.cwd, s.name, s.kind].filter(Boolean).join(' ').toLowerCase().indexOf(q) >= 0;
+  }
+
   // Lowest ord not taken by a live session in this ws/tab. Needs the live
   // `sessions` closure, so unlike `parseName`/`makeId` this can't be a
   // top-level pure helper.
@@ -281,7 +298,7 @@ function main() {
 
     var title = document.createElement('span');
     title.className = 'tile-title';
-    title.textContent = shortCwd(s.cwd);
+    title.textContent = sessionTitle(s);
 
     var tag = document.createElement('span');
     tag.className = 'tile-tag';
@@ -295,11 +312,14 @@ function main() {
     menu.addEventListener('click', function (e) {
       e.stopPropagation();          // don't open the terminal
       var agent = s.kind === 'claude' || s.kind === 'grok' || s.kind === 'codex' || s.kind === 'opencode' || s.kind === 'hermes' || s.kind === 'pi';
-      var choices = ['close'];
+      var choices = ['title', 'close'];
       if (agent) choices.push(s.run_state === 'suspended' ? 'unfreeze' : 'freeze');
       choices.push('move to tab…');
       var pick = window.prompt(paneId + '\n' + choices.join(' / '), choices[0]);
-      if (pick === 'close') killPane(paneId);
+      if (pick === 'title') {
+        var nextTitle = window.prompt('friendly title (blank clears)', s.title || '');
+        if (nextTitle !== null) control({ t: 'set-title', name: paneId, title: nextTitle });
+      } else if (pick === 'close') killPane(paneId);
       else if (pick === 'freeze') setFrozen(paneId, true);
       else if (pick === 'unfreeze') setFrozen(paneId, false);
       else if (pick && pick.indexOf('move') === 0) {
@@ -321,6 +341,14 @@ function main() {
 
   function renderFlatList() {
     listEl.textContent = '';
+    var visible = sessions.filter(matchesFilter);
+    if (!visible.length) {
+      var empty = document.createElement('p');
+      empty.className = 'empty';
+      empty.textContent = sessions.length ? 'No matching panes.' : 'No sessions. Start one from the desktop app.';
+      listEl.appendChild(empty);
+      return;
+    }
     if (!sessions.length) {
       var empty = document.createElement('p');
       empty.className = 'empty';
@@ -329,7 +357,7 @@ function main() {
       return;
     }
     var groups = new Map();
-    sessions.forEach(function (s) {
+    visible.forEach(function (s) {
       var p = parseName(s.name);
       var key = p ? 'Workspace ' + p.ws + ' · Tab ' + p.tab : 'Other';
       if (!groups.has(key)) groups.set(key, []);
@@ -359,7 +387,7 @@ function main() {
     var t = document.createElement('span');
     t.className = 'row-title';
     var p = parseName(s.name);
-    t.textContent = (s.kind === 'claude' ? 'claude' : 'shell') + (p ? ' · pane ' + p.ord : ' · ' + s.name);
+    t.textContent = (s.title && s.title.trim()) || (s.kind === 'claude' ? 'claude' : 'shell') + (p ? ' · pane ' + p.ord : ' · ' + s.name);
     var sub = document.createElement('span');
     sub.className = 'row-sub';
     sub.textContent = shortCwd(s.cwd);
@@ -480,7 +508,7 @@ function main() {
     freshBacklog = true;
     ensureTerm();
     term.reset();
-    titleEl.textContent = name;
+    titleEl.textContent = sessionTitle(sessionByName(name)) || name;
     viewList.hidden = true;
     viewTerm.hidden = false;
     send({ t: 'focus', name: name });
@@ -507,7 +535,7 @@ function main() {
   }
 
   /* ---------- pane gestures ---------- */
-  // create/kill/move/suspend/resume are the ONLY browser messages the server
+  // create/kill/move/set-title/suspend/resume are the ONLY browser messages the server
   // accepts (Task 4's whitelist in web.rs); everything else it silently
   // ignores. Deliberately no `resize` here and none is ever added — a pty's
   // winsize is shared with the desktop app's panes.
@@ -578,7 +606,11 @@ function main() {
       }
       var msg;
       try { msg = JSON.parse(ev.data); } catch (e) { return; }
-      if (msg.t === 'sessions') { sessions = msg.sessions || []; layout = msg.layout || null; renderList(); syncGeom(); }
+      if (msg.t === 'sessions') {
+        sessions = msg.sessions || []; layout = msg.layout || null;
+        if (open) titleEl.textContent = sessionTitle(sessionByName(open)) || open;
+        renderList(); syncGeom();
+      }
       else if (msg.t === 'exit') {
         if (msg.name === open && term) term.write('\r\n\x1b[33m[session exited: ' + msg.code + ']\x1b[0m\r\n');
       } else if (msg.t === 'error') {
@@ -600,6 +632,16 @@ function main() {
 
   /* ---------- wiring ---------- */
 
+  filterEl.addEventListener('input', function () {
+    filterQuery = filterEl.value || '';
+    if (filterQuery.trim()) {
+      wsBarEl.hidden = tabBarEl.hidden = mosaicEl.hidden = true;
+      listEl.hidden = false;
+      renderFlatList();
+    } else {
+      renderList();
+    }
+  });
   $('back').addEventListener('click', leave);
   $('zoom-in').addEventListener('click', function () { setZoom(zoom * 1.25); });
   $('zoom-out').addEventListener('click', function () { setZoom(zoom / 1.25); });

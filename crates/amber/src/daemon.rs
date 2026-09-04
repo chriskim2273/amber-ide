@@ -326,8 +326,9 @@ fn handle_control(
     search_epoch: &Arc<AtomicU64>,
 ) {
     match msg {
-        ControlMsg::Create { name, cwd, kind } => {
-            let result = parse_kind(&kind).and_then(|k| manager.create(&name, cwd.clone(), k));
+        ControlMsg::Create { name, cwd, kind, title } => {
+            let result = parse_kind(&kind)
+                .and_then(|k| manager.create_with_title(&name, cwd.clone(), k, title.as_deref()));
             let reply = match &result {
                 Ok(_) => ControlMsg::Created { name: name.clone() },
                 Err(e) => ControlMsg::Error { msg: e.to_string() },
@@ -807,6 +808,26 @@ fn handle_control(
                 format!("renamed from {from}"), None,
             );
             let _ = write_frame(writer, &Frame::Control(ControlMsg::Created { name: to }));
+        }
+        ControlMsg::SetTitle { name, title } => {
+            let info = match manager.set_title(&name, title.as_deref()) {
+                Ok(info) => info,
+                Err(e) => {
+                    let _ = write_frame(
+                        writer,
+                        &Frame::Control(ControlMsg::Error { msg: e.to_string() }),
+                    );
+                    return;
+                }
+            };
+            // Title changes are metadata-only updates: keep the session name
+            // stable and publish the complete authoritative SessionInfo through
+            // the existing watcher delta. No optimistic client-side title state
+            // or new wire event is needed.
+            watchers.broadcast(&ControlMsg::SessionsChanged {
+                added: vec![info],
+                removed: vec![],
+            });
         }
         ControlMsg::GetUsage => {
             // Cache read only. A live fetch here would put curl and a directory

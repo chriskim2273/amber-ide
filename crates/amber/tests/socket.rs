@@ -382,6 +382,7 @@ fn socket_roundtrip_create_attach_write_read() {
             name: "s".into(),
             cwd: "/tmp".into(),
             kind: "shell".into(),
+            title: None,
         }),
     );
     read_frame_until(
@@ -414,7 +415,7 @@ fn socket_create_pi_reports_pi_session_kind() {
     let mut stream = connect_with_retry(&socket_path);
     let mut decoder = Decoder::new();
     send(&mut stream, &Frame::Control(ControlMsg::Create {
-        name: "pi-pane".into(), cwd: "/tmp".into(), kind: "pi".into(),
+        name: "pi-pane".into(), cwd: "/tmp".into(), kind: "pi".into(), title: None,
     }));
     read_frame_until(&mut stream, &mut decoder,
         |f| matches!(f, Frame::Control(ControlMsg::Created { name }) if name == "pi-pane"),
@@ -457,6 +458,7 @@ fn snapshot_control_flushes_scrollback_and_acks() {
             name: "snap".into(),
             cwd: "/tmp".into(),
             kind: "shell".into(),
+            title: None,
         }),
     );
     read_frame_until(
@@ -491,6 +493,7 @@ fn attached_client_receives_exit_when_child_dies() {
             name: "mortal".into(),
             cwd: "/tmp".into(),
             kind: "shell".into(),
+            title: None,
         }),
     );
     read_frame_until(
@@ -533,6 +536,7 @@ fn rename_moves_a_live_shell_session_and_broadcasts_the_delta() {
             name: "amber-1-1-0-mv".into(),
             cwd: "/tmp".into(),
             kind: "shell".into(),
+            title: None,
         }),
     );
     read_frame_until(
@@ -638,6 +642,7 @@ fn rename_of_an_unknown_or_colliding_session_is_refused() {
                 name: name.into(),
                 cwd: "/tmp".into(),
                 kind: "shell".into(),
+                title: None,
             }),
         );
         read_frame_until(
@@ -699,6 +704,7 @@ fn kill_via_cli_removes_the_session() {
             name: "victim".into(),
             cwd: "/tmp".into(),
             kind: "shell".into(),
+            title: None,
         }),
     );
     read_frame_until(
@@ -770,6 +776,7 @@ fn kill_via_cli_resolves_a_slot_number() {
                 name: name.into(),
                 cwd: "/tmp".into(),
                 kind: "shell".into(),
+                title: None,
             }),
         );
         read_frame_until(
@@ -822,6 +829,7 @@ fn freeze_via_cli_errors_on_missing_and_non_agent() {
             name: "sh".into(),
             cwd: "/tmp".into(),
             kind: "shell".into(),
+            title: None,
         }),
     );
     read_frame_until(
@@ -918,8 +926,8 @@ fn rename_via_cli_moves_the_session() {
             name: "cli-mv".into(),
             cwd: "/tmp".into(),
             kind: "shell".into(),
-        }),
-    );
+            title: None,
+        }),    );
     read_frame_until(
         &mut stream,
         &mut decoder,
@@ -1014,9 +1022,9 @@ fn list_sessions_returns_all_created_names() {
                 name: name.into(),
                 cwd: "/tmp".into(),
                 kind: "shell".into(),
+                title: None,
             }),
-        );
-        read_frame_until(
+        );        read_frame_until(
             &mut stream,
             &mut decoder,
             |f| matches!(f, Frame::Control(ControlMsg::Created { .. })),

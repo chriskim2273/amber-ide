@@ -227,7 +227,10 @@ pub enum BrowserMsg {
     Open { name: String },
     Close { name: String },
     Focus { name: String },
-    Create { name: String, cwd: String, kind: String },
+    Create { name: String, cwd: String, kind: String, title: Option<String> },
+    /// Set or clear the daemon-owned friendly title; unlike `Move`, this never
+    /// changes the session name or its workspace/tab grouping.
+    SetTitle { name: String, title: Option<String> },
     Kill { name: String },
     Move { from: String, to: String },
     Suspend { name: String },
@@ -250,11 +253,21 @@ pub enum BrowserMsg {
 pub fn parse_browser_msg(text: &str) -> Option<BrowserMsg> {
     let v: serde_json::Value = serde_json::from_str(text).ok()?;
     let f = |k: &str| v.get(k)?.as_str().map(str::to_string);
+    let optional_text = |k: &str| match v.get(k) {
+        None | Some(serde_json::Value::Null) => Some(None),
+        Some(value) => value.as_str().map(|s| Some(s.to_string())),
+    };
     match v.get("t")?.as_str()? {
         "open" => Some(BrowserMsg::Open { name: f("name")? }),
         "close" => Some(BrowserMsg::Close { name: f("name")? }),
         "focus" => Some(BrowserMsg::Focus { name: f("name")? }),
-        "create" => Some(BrowserMsg::Create { name: f("name")?, cwd: f("cwd")?, kind: f("kind")? }),
+        "create" => Some(BrowserMsg::Create {
+            name: f("name")?,
+            cwd: f("cwd")?,
+            kind: f("kind")?,
+            title: optional_text("title")?,
+        }),
+        "set-title" => Some(BrowserMsg::SetTitle { name: f("name")?, title: optional_text("title")? }),
         "kill" => Some(BrowserMsg::Kill { name: f("name")? }),
         "move" => Some(BrowserMsg::Move { from: f("from")?, to: f("to")? }),
         "suspend" => Some(BrowserMsg::Suspend { name: f("name")? }),
@@ -345,7 +358,7 @@ pub fn map_browser_msg(
             }
             vec![ControlMsg::Focus { name: name.clone() }]
         }
-        BrowserMsg::Create { name, cwd, kind } => {
+        BrowserMsg::Create { name, cwd, kind, title } => {
             // Grammar first: a name outside it belongs to no workspace, and
             // `s<n>` would shadow the bare-`amber` CLI namespace.
             if mosaic::parse_pane_name(name).is_none()
@@ -355,7 +368,18 @@ pub fn map_browser_msg(
             {
                 return Vec::new();
             }
-            vec![ControlMsg::Create { name: name.clone(), cwd: cwd.clone(), kind: kind.clone() }]
+            vec![ControlMsg::Create {
+                name: name.clone(),
+                cwd: cwd.clone(),
+                kind: kind.clone(),
+                title: title.clone(),
+            }]
+        }
+        BrowserMsg::SetTitle { name, title } => {
+            if !live(name) {
+                return Vec::new();
+            }
+            vec![ControlMsg::SetTitle { name: name.clone(), title: title.clone() }]
         }
         BrowserMsg::Kill { name } => {
             if !live(name) {
@@ -741,7 +765,7 @@ pub struct Hub {
 }
 
 fn session_json(s: &SessionInfo) -> serde_json::Value {
-    serde_json::json!({
+    let mut out = serde_json::json!({
         "name": s.name,
         "kind": s.kind,
         "cwd": s.cwd,
@@ -752,7 +776,13 @@ fn session_json(s: &SessionInfo) -> serde_json::Value {
         "cols": s.cols,
         "rows": s.rows,
         "slot": s.slot,
-    })
+    });
+    // Keep the additive field absent for old/untitled sessions rather than
+    // emitting a noisy JSON null. This mirrors SessionInfo's wire shape.
+    if let Some(title) = s.title.as_deref() {
+        out["title"] = serde_json::Value::String(title.to_string());
+    }
+    out
 }
 
 impl Hub {
@@ -1059,6 +1089,7 @@ impl Hub {
             BrowserMsg::Close { .. } => None,
             BrowserMsg::Focus { .. }
             | BrowserMsg::Create { .. }
+            | BrowserMsg::SetTitle { .. }
             | BrowserMsg::Kill { .. }
             | BrowserMsg::Move { .. }
             | BrowserMsg::Suspend { .. }
@@ -1956,12 +1987,22 @@ mod tests {
             kind: kind.into(),
             alive: true,
             updated: 0,
+            title: None,
             run_state: None,
             claude_id: None,
             cols: 80,
             rows: 24,
             slot: 1,
         }
+    }
+
+    #[test]
+    fn session_json_omits_unset_title_and_emits_set_title() {
+        let plain = session_json(&s("amber-1-1-0-a", "shell"));
+        assert!(plain.get("title").is_none());
+        let mut titled = s("amber-1-1-0-a", "shell");
+        titled.title = Some("Build monitor".into());
+        assert_eq!(session_json(&titled)["title"], "Build monitor");
     }
 
     // ---- grid borrowing (spec §2.2) -----------------------------------
@@ -2115,7 +2156,15 @@ mod tests {
         );
         assert_eq!(
             parse_browser_msg(r#"{"t":"create","name":"s","cwd":"/tmp","kind":"shell"}"#),
-            Some(BrowserMsg::Create { name: "s".into(), cwd: "/tmp".into(), kind: "shell".into() })
+            Some(BrowserMsg::Create { name: "s".into(), cwd: "/tmp".into(), kind: "shell".into(), title: None })
+        );
+        assert_eq!(
+            parse_browser_msg(r#"{"t":"set-title","name":"s","title":"Build"}"#),
+            Some(BrowserMsg::SetTitle { name: "s".into(), title: Some("Build".into()) })
+        );
+        assert_eq!(
+            parse_browser_msg(r#"{"t":"set-title","name":"s","title":null}"#),
+            Some(BrowserMsg::SetTitle { name: "s".into(), title: None })
         );
         assert_eq!(
             parse_browser_msg(r#"{"t":"kill","name":"s"}"#),
@@ -2232,11 +2281,27 @@ mod tests {
     }
 
     #[test]
+    fn set_title_reaches_only_a_known_session() {
+        let live = [s("amber-1-1-0-aa", "shell")];
+        assert_eq!(
+            map_browser_msg(
+                &BrowserMsg::SetTitle { name: "amber-1-1-0-aa".into(), title: Some("Build".into()) },
+                None,
+                &live,
+            ),
+            vec![ControlMsg::SetTitle { name: "amber-1-1-0-aa".into(), title: Some("Build".into()) }],
+        );
+        assert!(map_browser_msg(
+            &BrowserMsg::SetTitle { name: "missing".into(), title: None }, None, &live,
+        ).is_empty());
+    }
+
+    #[test]
     fn create_requires_the_pane_grammar_and_a_known_kind() {
         let live = [s("amber-1-1-0-aa", "shell")];
         let mk = |name: &str, kind: &str| {
             map_browser_msg(
-                &BrowserMsg::Create { name: name.into(), cwd: "/tmp".into(), kind: kind.into() },
+                &BrowserMsg::Create { name: name.into(), cwd: "/tmp".into(), kind: kind.into(), title: None },
                 None,
                 &live,
             )
@@ -2263,6 +2328,7 @@ mod tests {
                 name: "amber-1-1-0-aa".into(),
                 cwd: "/definitely/not/a/real/dir".into(),
                 kind: "shell".into(),
+                title: None,
             },
             None,
             &live,

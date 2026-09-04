@@ -23,10 +23,11 @@ contextBridge.exposeInMainWorld('amber', {
   openPane: (session: string) => ipcRenderer.send('open-pane', session),
   // Pane unmounted: release its client-side port + daemon subscription.
   closePane: (session: string) => ipcRenderer.send('close-pane', session),
-  createSession: (name: string, cwd: string, sessionKind: string) =>
-    ipcRenderer.send('daemon-command', { cmd: 'create', name, cwd, sessionKind }),
+  createSession: (name: string, cwd: string, sessionKind: string, title?: string) =>
+    ipcRenderer.send('daemon-command', { cmd: 'create', name, cwd, sessionKind, ...(title === undefined ? {} : { title }) }),
   killSession: (name: string) => ipcRenderer.send('daemon-command', { cmd: 'kill', name }),
   renameSession: (from: string, to: string) => ipcRenderer.send('daemon-command', { cmd: 'rename', from, to }),
+  setSessionTitle: (name: string, title: string | null) => ipcRenderer.send('daemon-command', { cmd: 'setTitle', name, title }),
   // Slice 3 freeze grace: park/un-park a claude session to free its RAM.
   suspendSession: (name: string) => ipcRenderer.send('daemon-command', { cmd: 'suspend', name }),
   resumeSession: (name: string) => ipcRenderer.send('daemon-command', { cmd: 'resume', name }),

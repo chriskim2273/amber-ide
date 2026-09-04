@@ -65,6 +65,9 @@ enum Command {
         cwd: PathBuf,
         #[arg(long, default_value = "shell")]
         kind: String,
+        /// Optional friendly title shown by `amber ls` and the app.
+        #[arg(long)]
+        title: Option<String>,
         #[arg(long)]
         socket: Option<PathBuf>,
     },
@@ -96,6 +99,19 @@ enum Command {
     Rename {
         from: String,
         to: String,
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+    /// Set or clear a session's friendly title without renaming its identity.
+    #[command(name = "title", visible_alias = "set-title")]
+    Title {
+        /// Session name or stable slot number from `amber ls`.
+        name: String,
+        /// New title. Omit with --clear to remove the title.
+        title: Option<String>,
+        /// Clear the current friendly title.
+        #[arg(long)]
+        clear: bool,
         #[arg(long)]
         socket: Option<PathBuf>,
     },
@@ -355,14 +371,17 @@ fn main() -> anyhow::Result<()> {
             run_attach(&resolve_socket(socket)?, name, no_prefix, no_status, force)
         }
         Command::Ls { socket } => run_ls(&resolve_socket(socket)?),
-        Command::Create { name, cwd, kind, socket } => {
-            run_create(&resolve_socket(socket)?, &name, &cwd, &kind)
+        Command::Create { name, cwd, kind, title, socket } => {
+            run_create(&resolve_socket(socket)?, &name, &cwd, &kind, title.as_deref())
         }
         Command::Kill { name, socket } => run_kill(&resolve_socket(socket)?, &name),
         Command::Freeze { name, socket } => run_suspend(&resolve_socket(socket)?, &name, true),
         Command::Unfreeze { name, socket } => run_suspend(&resolve_socket(socket)?, &name, false),
         Command::Rename { from, to, socket } => {
             run_rename(&resolve_socket(socket)?, &from, &to)
+        }
+        Command::Title { name, title, clear, socket } => {
+            run_title(&resolve_socket(socket)?, &name, title.as_deref(), clear)
         }
         Command::Web { port, new_token, print_url, root, socket } => {
             run_web(root, socket, port, new_token, print_url)
@@ -1688,13 +1707,15 @@ fn run_ls(socket: &Path) -> anyhow::Result<()> {
             let cw = cwds.iter().map(|c| c.len()).max().unwrap_or(0);
             for (s, cwd) in sessions.iter().zip(&cwds) {
                 let status = ls_status(s);
+                let title = s.title.as_deref().map(|title| format!("  [{title}]")).unwrap_or_default();
                 println!(
-                    "{:>w$}  {:<nw$}  {:<cw$}  {}{}",
+                    "{:>w$}  {:<nw$}  {:<cw$}  {}{}{}",
                     s.slot,
                     s.name,
                     cwd,
                     s.kind,
                     status,
+                    title,
                     w = w,
                     nw = nw,
                     cw = cw
@@ -1999,20 +2020,79 @@ fn run_rename(socket: &Path, from: &str, to: &str) -> anyhow::Result<()> {
     }
 }
 
-fn run_create(socket: &Path, name: &str, cwd: &Path, kind: &str) -> anyhow::Result<()> {
-    println!("created {}", create_session(socket, name, cwd, kind)?);
+fn run_create(socket: &Path, name: &str, cwd: &Path, kind: &str, title: Option<&str>) -> anyhow::Result<()> {
+    println!("created {}", create_session_with_title(socket, name, cwd, kind, title)?);
     Ok(())
+}
+
+/// `amber title <name|slot> [title]`: update daemon-owned friendly metadata.
+/// The daemon broadcasts the authoritative SessionInfo to watchers; this CLI
+/// waits for a detailed listing so it can confirm the result without inventing
+/// a title locally.
+fn run_title(socket: &Path, arg: &str, title: Option<&str>, clear: bool) -> anyhow::Result<()> {
+    if clear && title.is_some() {
+        anyhow::bail!("title text and --clear cannot be used together");
+    }
+    if !clear && title.is_none() {
+        anyhow::bail!("provide title text or use --clear");
+    }
+    let name = resolve_existing(socket, arg)?;
+    let requested = if clear { None } else { title };
+    let mut stream = connect_daemon(socket)?;
+    stream.write_all(&proto::encode(&Frame::Control(ControlMsg::SetTitle {
+        name: name.clone(),
+        title: requested.map(str::to_string),
+    })))?;
+    stream.write_all(&proto::encode(&Frame::Control(ControlMsg::ListSessionsDetailed)))?;
+
+    let mut decoder = Decoder::new();
+    let mut buf = [0u8; 8192];
+    let deadline = std::time::Instant::now() + DAEMON_REPLY_TIMEOUT;
+    let mut error = None;
+    loop {
+        while let Some(frame) = decoder.next_frame()? {
+            match frame {
+                Frame::Control(ControlMsg::Error { msg }) => error = Some(msg),
+                Frame::Control(ControlMsg::Sessions { sessions }) => {
+                    if let Some(msg) = error {
+                        anyhow::bail!("title failed: {msg}");
+                    }
+                    let Some(info) = sessions.into_iter().find(|s| s.name == name) else {
+                        anyhow::bail!("title failed: session {name} disappeared");
+                    };
+                    let shown = info.title.as_deref().unwrap_or("(none)");
+                    println!("titled {name}: {shown}");
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+        let n = read_daemon_reply_chunk(&mut stream, &mut buf, deadline)?;
+        if n == 0 { anyhow::bail!("daemon closed the connection before replying"); }
+        decoder.feed(&buf[..n]);
+    }
 }
 
 /// Create a session and return the name the daemon acked. Silent, because bare
 /// `amber` hands straight off to the raw client — a "created" line would just
 /// be scribbled over by the attach decoration.
 fn create_session(socket: &Path, name: &str, cwd: &Path, kind: &str) -> anyhow::Result<String> {
+    create_session_with_title(socket, name, cwd, kind, None)
+}
+
+fn create_session_with_title(
+    socket: &Path,
+    name: &str,
+    cwd: &Path,
+    kind: &str,
+    title: Option<&str>,
+) -> anyhow::Result<String> {
     let mut stream = connect_daemon(socket)?;
     let request = Frame::Control(ControlMsg::Create {
         name: name.to_string(),
         cwd: cwd.to_string_lossy().to_string(),
         kind: kind.to_string(),
+        title: title.map(str::to_string),
     });
     stream.write_all(&proto::encode(&request))?;
 
@@ -2181,6 +2261,7 @@ mod tests {
             kind: kind.to_string(),
             alive,
             updated: 0,
+            title: None,
             run_state: run_state.map(str::to_string),
             claude_id: None,
             cols: 80,

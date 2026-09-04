@@ -190,6 +190,16 @@ describe('parse shape-guards (drop malformed optionals silently)', () => {
     const doc = { version: 1, scope: 'one', workspaces: [{ tabOrder: [2, 'x', 1, null], tabs: [{ tab: 1, tree: null, panes: [] }] }] }
     expect(parseWorkspaceFile(JSON.stringify(doc)).workspaces[0]!.tabOrder).toEqual([2, 1])
   })
+  it('normalizes friendly titles and drops controls', () => {
+    const doc = { version: 1, scope: 'one', workspaces: [{ tabs: [{ tab: 1, tree: null, panes: [
+      { id: 'p0', kind: 'shell', cwd: '/a', ord: 0, title: ' Build ', scrollback: '' },
+      { id: 'p1', kind: 'shell', cwd: '/b', ord: 1, title: 'bad\nname', scrollback: '' },
+    ] }] }] }
+    const panes = parseWorkspaceFile(JSON.stringify(doc)).workspaces[0]!.tabs[0]!.panes
+    expect(panes[0]!.title).toBe('Build')
+    expect(panes[1]!.title).toBeUndefined()
+  })
+
   it('drops a non-string tab label and a non-string frozenNote', () => {
     const doc = { version: 1, scope: 'one', workspaces: [{ tabs: [{ tab: 1, label: 9, tree: null, panes: [{ id: 'p0', kind: 'shell', cwd: '/a', ord: 0, frozenNote: 5, scrollback: '' }] }] }] }
     const tab = parseWorkspaceFile(JSON.stringify(doc)).workspaces[0]!.tabs[0]!
@@ -281,6 +291,13 @@ describe('assembleSave', () => {
     expect(t1.panes[0]!.frozenNote).toBeUndefined()
   })
 
+  it('includes pane titles in the portable document', () => {
+    const doc = assembleSave('one', [{ ws: 1, tabs: [{ tab: 1, panes: [
+      { name: 'amber-1-1-0-a', cwd: '/a', kind: 'shell', ord: 0, title: 'Build monitor' },
+    ] }] }], { version: 1, activeWorkspace: 1, workspaces: {} }, {})
+    expect(doc.workspaces[0]!.tabs[0]!.panes[0]!.title).toBe('Build monitor')
+  })
+
   it('drops a sidecar tree leaf naming a session absent from live panes (no raw-name leak)', () => {
     const sc: LayoutFile = {
       version: 1, activeWorkspace: 1,
@@ -336,6 +353,18 @@ describe('buildLoadPlan', () => {
     // Scrollback keyed by minted name; missing dump omitted.
     expect(Object.keys(plan.scrollback)).toEqual(['amber-7-1-0-id0'])
     expect(Array.from(plan.scrollback['amber-7-1-0-id0']!)).toEqual([1, 2, 3])
+  })
+
+  it('carries daemon titles into create plans and app-local title maps', () => {
+    const doc: WorkspaceDoc = {
+      version: 1, scope: 'one', workspaces: [{ tabs: [{ tab: 1, tree: null, panes: [
+        { id: 'p0', kind: 'shell', cwd: '/a', ord: 0, title: 'Build', scrollback: '' },
+        { id: 'p1', kind: 'browser', cwd: '', ord: 1, title: 'Docs', url: 'https://example.com', scrollback: '' },
+      ] }] }],
+    }
+    const plan = buildLoadPlan(doc, { mode: 'new', nextWs: 4, mintId: mkMint() })
+    expect(plan.creates[0]!.title).toBe('Build')
+    expect(Object.values(plan.titles)).toEqual(['Docs'])
   })
 
   it('reuses the target ws for mode replace', () => {

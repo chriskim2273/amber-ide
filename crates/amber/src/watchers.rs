@@ -389,6 +389,7 @@ mod tests {
                         kind: "shell".into(),
                         alive: true,
                         updated: 0,
+                        title: None,
                         run_state: None,
                         claude_id: None,
                         cols: 80,

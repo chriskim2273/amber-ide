@@ -5,6 +5,8 @@ export interface SessionRow {
   name: string
   cwd: string
   kind: string
+  /** Durable friendly title, when the daemon has one. */
+  title?: string
   alive: boolean
   slot: number
   /** Workspace/tab this session shows up in, or null when no pane can show it. */
@@ -38,6 +40,7 @@ export function sessionRows(sessions: SessionInfo[], claudeNames: Record<string,
         name: s.name,
         cwd: s.cwd,
         kind: s.kind,
+        ...(s.title ? { title: s.title } : {}),
         alive: s.alive,
         slot: s.slot ?? 0,
         ws: p ? p.ws : null,

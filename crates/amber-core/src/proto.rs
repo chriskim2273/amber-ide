@@ -15,6 +15,12 @@ pub struct SessionInfo {
     pub cwd: String,
     pub kind: String,
     pub alive: bool,
+    /// Optional friendly title chosen by the user. This is deliberately
+    /// separate from `name`: names encode workspace/tab grouping and are the
+    /// daemon's identity, while titles are display metadata that survive a
+    /// rename/move unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     /// Unix seconds of the session's last state-store write (creation, or a
     /// later cwd change) — the honest ordering key for "most recent" (e.g.
     /// `amber attach` with no name). `#[serde(default)]` keeps the wire
@@ -174,7 +180,15 @@ pub struct ProviderUsage {
 pub enum ControlMsg {
     Hello,
     ListSessions,
-    Create { name: String, cwd: String, kind: String },
+    Create {
+        name: String,
+        cwd: String,
+        kind: String,
+        /// Optional friendly display title. `#[serde(default)]` preserves the
+        /// wire contract for older clients that only send name/cwd/kind.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+    },
     /// `raw_client: true` marks a plain-terminal client (`amber attach`),
     /// which cannot safely replay historical alt-screen bytes (spec §5).
     /// `#[serde(default)]` keeps the wire backward compatible: clients that
@@ -211,6 +225,10 @@ pub enum ControlMsg {
     Resize { name: String, cols: u16, rows: u16 },
     Kill { name: String },
     Rename { from: String, to: String },
+    /// Client -> daemon: set or clear a session's friendly display title.
+    /// This never changes the daemon identity/name (and therefore never moves
+    /// a pane between workspaces or tabs).
+    SetTitle { name: String, title: Option<String> },
     /// Client -> daemon: a `claude` session's `amber run` supervisor reports
     /// its current supervision phase (`state`: one of `"claude"`,
     /// `"claude-retrying"`, `"shell-fallback"`). The daemon stores it on the
@@ -443,6 +461,7 @@ fn known_control_variant(name: &str) -> bool {
             | "Resize"
             | "Kill"
             | "Rename"
+            | "SetTitle"
             | "ReportRunState"
             | "Suspend"
             | "Resume"
@@ -1015,6 +1034,7 @@ mod tests {
             kind: "claude".into(),
             alive: true,
             updated: 1_700_000_000,
+            title: Some("Project shell".into()),
             run_state: Some("claude-retrying".into()),
             claude_id: Some("sid-abc".into()),
             cols: 120,
@@ -1034,6 +1054,31 @@ mod tests {
             let f = Frame::Control(unit);
             assert_eq!(roundtrip(&f), f);
         }
+    }
+
+    #[test]
+    fn friendly_title_is_optional_on_the_wire() {
+        let no_title = serde_json::to_string(&ControlMsg::Create {
+            name: "amber-1-1-0-a".into(),
+            cwd: "/tmp".into(),
+            kind: "shell".into(),
+            title: None,
+        })
+        .unwrap();
+        assert_eq!(no_title, r#"{"Create":{"name":"amber-1-1-0-a","cwd":"/tmp","kind":"shell"}}"#);
+        let titled = serde_json::to_string(&ControlMsg::Create {
+            name: "amber-1-1-0-a".into(),
+            cwd: "/tmp".into(),
+            kind: "shell".into(),
+            title: Some("Build".into()),
+        })
+        .unwrap();
+        assert!(titled.contains(r#""title":"Build""#));
+        let legacy: SessionInfo = serde_json::from_str(
+            r#"{"name":"s","cwd":"/tmp","kind":"shell","alive":true}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.title, None);
     }
 
     #[test]
@@ -1076,6 +1121,7 @@ mod tests {
             kind: "claude".into(),
             alive: true,
             updated: 0,
+            title: None,
             run_state: Some("shell-fallback".into()),
             claude_id: None,
             cols: 80,

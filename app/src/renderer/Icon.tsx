@@ -1,6 +1,6 @@
 export type IconName =
   | 'add' | 'folder' | 'more' | 'move' | 'close' | 'split-right' | 'split-down'
-  | 'refresh' | 'reload' | 'snowflake' | 'play' | 'save' | 'load' | 'sessions'
+  | 'refresh' | 'reload' | 'snowflake' | 'play' | 'save' | 'load' | 'edit' | 'sessions'
   | 'memory' | 'help' | 'preserve' | 'preset' | 'up' | 'down' | 'maximize' | 'restore'
 
 export function Icon({ name, size = 16 }: { name: IconName; size?: number }): JSX.Element {
@@ -32,6 +32,7 @@ export function Icon({ name, size = 16 }: { name: IconName; size?: number }): JS
     case 'play': return <svg {...common}><path d="m8 5 11 7-11 7z" /></svg>
     case 'save': return <svg {...common}><path d="M5 3.5h12l2 2V20.5H5zM8 3.5v6h8v-6M8 20.5v-7h8v7" /></svg>
     case 'load': return <svg {...common}><path d="M4 8.5h6l2-2h8v12H4zM12 10v6m-2.5-2.5L12 16l2.5-2.5" /></svg>
+    case 'edit': return <svg {...common}><path d="m4 16.5-.8 4.3 4.3-.8L19 8.5 15.5 5zM13.5 7l3.5 3.5" /></svg>
     case 'sessions': return <svg {...common}><rect x="4" y="4" width="16" height="12" rx="2" /><path d="m7 8 2 2-2 2M11 12h4M8 20h8" /></svg>
     case 'memory': return <svg {...common}><rect x="6" y="6" width="12" height="12" rx="2" /><path d="M9 2.5v3M15 2.5v3M9 18.5v3M15 18.5v3M2.5 9h3M2.5 15h3M18.5 9h3M18.5 15h3M10 10h4v4h-4z" /></svg>
     case 'help': return <svg {...common}><circle cx="12" cy="12" r="9" /><path d="M9.8 9a2.3 2.3 0 1 1 3.1 2.2c-.9.4-.9 1.1-.9 1.8M12 17h.01" /></svg>

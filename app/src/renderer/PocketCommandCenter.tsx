@@ -37,6 +37,8 @@ function formatMemory(kib: number): string {
 }
 
 export function pocketSessionTitle(item: CommandCenterItem, titles: Record<string, string>, home: string): string {
+  const friendly = item.pane.title?.trim()
+  if (friendly) return friendly
   const live = titles[item.pane.name]?.trim()
   if (live) return live
   const cwd = shortCwd(item.pane.cwd, home)

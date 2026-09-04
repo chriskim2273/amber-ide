@@ -27,6 +27,12 @@ describe('sessionRows', () => {
     expect(rows[0]!.claudeName).toBe('Fix the daemon freeze')
   })
 
+  it('carries a durable friendly title separately from transcript labels', () => {
+    const rows = sessionRows([s({ name: 'amber-1-1-0-a', title: 'Build monitor', kind: 'claude' })], {})
+    expect(rows[0]!.title).toBe('Build monitor')
+    expect(rows[0]!.claudeName).toBe('')
+  })
+
   it('leaves claudeName empty when the transcript yielded nothing', () => {
     const rows = sessionRows([s({ name: 'amber-1-1-0-a', kind: 'claude', claude_id: 'uuid-x' })], {})
     expect(rows[0]!.claudeName).toBe('')

@@ -51,6 +51,11 @@ function render(overrides: Partial<Parameters<typeof PocketCommandCenter>[0]> = 
 }
 
 describe('pocketSessionTitle', () => {
+  it('prefers a durable friendly title before live title and cwd fallbacks', () => {
+    const working = model.groups[1]!.items[0]!
+    expect(pocketSessionTitle({ ...working, pane: { ...working.pane, title: 'Release monitor' } }, { [working.pane.name]: 'live title' }, '/home/u')).toBe('Release monitor')
+  })
+
   it('prefers a live title, then project leaf, then kind instead of a bare home marker', () => {
     const working = model.groups[1]!.items[0]!
     expect(pocketSessionTitle(working, { [working.pane.name]: 'live title' }, '/home/u')).toBe('live title')

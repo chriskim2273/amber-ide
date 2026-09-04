@@ -414,6 +414,19 @@ describe('createAmber', () => {
     }
   })
 
+  it('setSessionTitle sends a title and supports clearing', () => {
+    const socket = new FakeSocket()
+    const amber = createAmber(deps({ connectSocket: () => socket }))
+    socket.open()
+    socket.sent.length = 0
+    amber.setSessionTitle('n', 'Build monitor')
+    amber.setSessionTitle('n', null)
+    expect(socket.sent).toEqual([
+      JSON.stringify({ t: 'set-title', name: 'n', title: 'Build monitor' }),
+      JSON.stringify({ t: 'set-title', name: 'n', title: null }),
+    ])
+  })
+
   it('clipboardWrite/clipboardRead delegate to the injected clipboard, no server round trip', async () => {
     const writes: string[] = []
     const amber = createAmber(deps({

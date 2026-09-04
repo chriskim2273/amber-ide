@@ -36,7 +36,7 @@ import { formatBrowserName, isBrowserName, parseBrowserName } from '../shared/br
 import { formatEditorName, isEditorName, parseEditorName } from '../shared/editorName'
 import { splitLeaf, setRatio, reconcile, leaves, moveLeaf, type Node } from './layout'
 import {
-  emptyLayout, parseLayout, serializeLayout, orderTabs, moveTab, mergeLayout,
+  emptyLayout, normalizeFriendlyTitle, parseLayout, serializeLayout, orderTabs, moveTab, mergeLayout,
   type LayoutFile, type TabLayout, type LoadLayoutResult, type SaveLayoutResult,
 } from '../shared/layoutFile'
 import {
@@ -50,7 +50,7 @@ import { appChord, chordLabel, modLabel, CHORD_TABLE } from './keys'
 import { type PaletteEntry } from './commandPalette'
 import { activitySummary, bookmarkNeedle, makeBookmark, searchScopeNames, shouldNotify, type SearchScope } from './productivityModels'
 import {
-  CommandPalette, GlobalSearchDialog, RecoveryCenter, TemplatesDialog,
+  CommandPalette, PanePickerDialog, PaneTitleDialog, GlobalSearchDialog, RecoveryCenter, TemplatesDialog,
   BookmarksDialog, PresetInputsDialog, CheckpointsDialog, ProjectProfileDialog,
 } from './ProductivityDialogs'
 import './theme.css'
@@ -62,9 +62,10 @@ declare global {
       onDaemonEvent: (cb: (d: unknown) => void) => void
       openPane: (session: string) => void
       closePane: (session: string) => void
-      createSession: (name: string, cwd: string, sessionKind: string) => void
+      createSession: (name: string, cwd: string, sessionKind: string, title?: string) => void
       killSession: (name: string) => void
       renameSession: (from: string, to: string) => void
+      setSessionTitle: (name: string, title: string | null) => void
       suspendSession: (name: string) => void
       resumeSession: (name: string) => void
       focusSession: (name: string) => void
@@ -180,6 +181,7 @@ const EMPTY_FROZEN: Record<string, { note?: string }> = {}
 // Stable empty editors map — same reason as EMPTY_FROZEN: a fresh {} every
 // render would defeat SplitView's memoized children.
 const EMPTY_EDITORS: NonNullable<LayoutFile['editors']> = {}
+const EMPTY_TITLES: NonNullable<LayoutFile['titles']> = {}
 // App-wide terminal font size, clamped to a sane range (integer px).
 function clampFont(n: number): number {
   return Math.max(8, Math.min(32, Math.round(n)))
@@ -312,7 +314,7 @@ function App(): JSX.Element {
   const [saveScopeOpen, setSaveScopeOpen] = useState(false)
   const [loadDoc, setLoadDoc] = useState<WorkspaceDoc | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
-  type ProductivityOverlay = 'palette' | 'search' | 'recovery' | 'templates' | 'bookmarks' | 'presets' | 'checkpoints' | 'project'
+  type ProductivityOverlay = 'palette' | 'pane-picker' | 'search' | 'recovery' | 'templates' | 'bookmarks' | 'presets' | 'checkpoints' | 'project'
   const [productivityOverlay, setProductivityOverlay] = useState<ProductivityOverlay | null>(null)
   const [productivity, setProductivity] = useState<ProductivityFile>(emptyProductivity)
   const productivityRef = useRef(productivity)
@@ -344,6 +346,7 @@ function App(): JSX.Element {
   // A close blocked on unsaved work (spec §3.3): the pane stays until the user
   // picks save / discard / cancel. Cancel ABORTS the close.
   const [closeAsk, setCloseAsk] = useState<string | null>(null)
+  const [titleEditPane, setTitleEditPane] = useState<string | null>(null)
   // A close of a TERMINAL pane, awaiting confirmation. Closing a pane kills its
   // daemon session — the pty, the shell, and anything running in it — and that
   // is not undoable, so it is asked rather than assumed.
@@ -442,6 +445,38 @@ function App(): JSX.Element {
   const onPaneTitle = useCallback((session: string, title: string): void => {
     const t = title.slice(0, 120)
     setTitles((prev) => (prev[session] === t ? prev : { ...prev, [session]: t }))
+  }, [])
+
+  // Friendly titles for app-local panes are persisted in the sidecar; daemon
+  // session titles go through SetTitle and return via SessionInfo events. This
+  // keeps the daemon authoritative for every daemon-backed pane.
+  const openPaneTitleEditor = useCallback((paneId: string): void => {
+    setTitleEditPane(paneId)
+  }, [])
+
+  const onSetPaneTitle = useCallback((paneId: string, value: string): void => {
+    const title = normalizeFriendlyTitle(value)
+    const trimmed = value.trim()
+    if (trimmed && title === undefined) {
+      const hasControl = [...trimmed].some((char) => {
+        const code = char.charCodeAt(0)
+        return code < 0x20 || (code >= 0x7f && code <= 0x9f)
+      })
+      setNotice(hasControl ? 'Pane titles cannot contain control characters.' : 'Pane titles are limited to 120 characters.')
+      return
+    }
+    if (isBrowserName(paneId) || isEditorName(paneId)) {
+      setLayout((l) => {
+        const current = l.titles ?? EMPTY_TITLES
+        if (title) return { ...l, titles: { ...current, [paneId]: title } }
+        if (!(paneId in current)) return l
+        const next = { ...current }
+        delete next[paneId]
+        return { ...l, titles: next }
+      })
+    } else {
+      window.amber.setSessionTitle(paneId, title || null)
+    }
   }, [])
 
   const onPaneFocus = useCallback((name: string): void => {
@@ -760,7 +795,11 @@ function App(): JSX.Element {
     })
   }
 
-  const workspaces = mergeEditors(mergeBrowsers(groupSessions(state), layout.browsers ?? {}), layout.editors ?? {})
+  const localTitles = layout.titles ?? EMPTY_TITLES
+  const workspaces = mergeEditors(
+    mergeBrowsers(groupSessions(state), layout.browsers ?? {}, localTitles),
+    layout.editors ?? {}, localTitles,
+  )
   const pocketAll = commandCenterModel({ workspaces, state, frozen: frozenSet })
   const needsAttention = pocketAll.groups.find((group) => group.id === 'needs-you')?.items ?? []
   const pocketModel = commandCenterModel({
@@ -1090,6 +1129,7 @@ function App(): JSX.Element {
       if (Object.keys(plan.frozen).length) next.frozen = { ...(l.frozen ?? {}), ...plan.frozen }
       if (Object.keys(plan.browsers).length) next.browsers = { ...(l.browsers ?? {}), ...plan.browsers }
       if (Object.keys(plan.editors ?? {}).length) next.editors = { ...(l.editors ?? {}), ...(plan.editors ?? {}) }
+      if (Object.keys(plan.titles).length) next.titles = { ...(l.titles ?? {}), ...plan.titles }
       return next
     })
     const first = plan.targetWorkspaces[0]
@@ -1246,6 +1286,12 @@ function App(): JSX.Element {
   const dropEditorPane = useCallback((paneId: string): void => {
     editorApis.current.delete(paneId)
     setTitles((t) => { if (!(paneId in t)) return t; const c = { ...t }; delete c[paneId]; return c })
+    setLayout((l) => {
+      if (!l.titles?.[paneId]) return l
+      const next = { ...l.titles }
+      delete next[paneId]
+      return { ...l, titles: next }
+    })
     window.amber.editorDraftClear(paneId)
     setDirtyEditors((d) => { if (!(paneId in d)) return d; const c = { ...d }; delete c[paneId]; return c })
     setLayout((l) => {
@@ -1266,10 +1312,13 @@ function App(): JSX.Element {
     if (isBrowserName(paneId)) {
       setTitles((t) => { if (!(paneId in t)) return t; const c = { ...t }; delete c[paneId]; return c })
       setLayout((l) => {
-        if (!l.browsers?.[paneId]) return l
+        const titles = l.titles
+        const nextTitles = titles && paneId in titles ? { ...titles } : null
+        if (nextTitles) delete nextTitles[paneId]
+        if (!l.browsers?.[paneId]) return nextTitles ? { ...l, titles: nextTitles } : l
         const rest = { ...l.browsers }
         delete rest[paneId]
-        return { ...l, browsers: rest }
+        return { ...l, ...(nextTitles ? { titles: nextTitles } : {}), browsers: rest }
       })
     } else if (isEditorName(paneId)) {
       dropEditorPane(paneId)
@@ -1382,6 +1431,7 @@ function App(): JSX.Element {
     ws: w.ws,
     tabs: w.tabs.map((t) => ({ tab: t.tab, panes: t.panes.map((p) => ({
       name: p.name, cwd: p.cwd, kind: p.kind, ord: p.ord,
+      ...(p.title ? { title: p.title } : {}),
       ...(p.kind === 'browser' ? { url: layoutRef.current.browsers?.[p.name]?.url ?? '' } : {}),
       ...(p.kind === 'editor' ? { path: layoutRef.current.editors?.[p.name]?.path ?? null } : {}),
     })) })),
@@ -1447,7 +1497,7 @@ function App(): JSX.Element {
     // Pane's mount effect (child) runs before App's commit effect (parent), so
     // takeReplay must find its bytes already staged or the replay is lost.
     stageReplay(plan.scrollback)
-    for (const c of plan.creates) window.amber.createSession(c.name, c.cwd, c.kind)
+    for (const c of plan.creates) window.amber.createSession(c.name, c.cwd, c.kind, c.title)
     setPendingLoad({ plan, createNames: plan.creates.map((c) => c.name), killed })
   }
   const createCheckpoint = async (name: string, automatic = false, scope: 'one' | 'all' = 'one'): Promise<boolean> => {
@@ -1519,7 +1569,7 @@ function App(): JSX.Element {
         let binary = ''; for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000))
         const text = serializeHandoff({ version: 1, exportedAt: Date.now(), session: {
           kind: info.kind, cwd: info.cwd, ...(info.slot ? { slot: info.slot } : {}),
-          ...(titles[session] ? { title: titles[session] } : {}), ...(info.run_state ? { runState: info.run_state } : {}),
+          ...((info.title || titles[session]) ? { title: info.title || titles[session] } : {}), ...(info.run_state ? { runState: info.run_state } : {}),
           ...(info.claude_id ? { conversationId: info.claude_id } : {}),
         }, scrollback: btoa(binary), bookmarks: productivity.bookmarks[session] ?? [] })
         return window.amber.saveHandoffFile?.(text, `amber-${info.slot ?? 'session'}.amberhandoff`)
@@ -1536,7 +1586,7 @@ function App(): JSX.Element {
   }
   const paletteEntries: PaletteEntry[] = [
     ...workspaces.flatMap((workspace) => workspace.tabs.flatMap((paneTab) => paneTab.panes.map((pane) => ({
-      id: `pane:${pane.name}`, label: `${pane.slot ? `#${pane.slot} ` : ''}${titles[pane.name] || shortCwd(pane.cwd, window.amber.homeDir) || pane.kind}`,
+      id: `pane:${pane.name}`, label: `${pane.slot ? `#${pane.slot} ` : ''}${pane.title || titles[pane.name] || shortCwd(pane.cwd, window.amber.homeDir) || pane.kind}`,
       detail: `ws ${workspace.ws} · tab ${paneTab.tab} · ${pane.kind} · ${pane.cwd}`, keywords: pane.name,
       run: () => navigateTo(pane.name),
     })))),
@@ -1563,6 +1613,7 @@ function App(): JSX.Element {
     { id: 'action:save', label: 'Save workspace…', detail: 'Structure and retained scrollback', keywords: 'export amberws', run: () => setSaveScopeOpen(true) },
     { id: 'action:load', label: 'Load workspace…', detail: 'Create or replace from .amberws', keywords: 'import restore', run: () => { void doLoad() } },
     { id: 'action:help', label: 'Keyboard shortcuts', detail: chordLabel('help'), keywords: 'help keys', run: () => setShowHelp(true) },
+    { id: 'action:pane-picker', label: 'Pane picker', detail: chordLabel('pane-picker'), keywords: 'switch focus sessions', run: () => openProductivity('pane-picker') },
     { id: 'action:new-pane', label: 'New pane', detail: chordLabel('new-pane'), keywords: 'create terminal', run: () => startPane() },
     { id: 'action:new-tab', label: 'New tab', detail: chordLabel('new-tab'), keywords: 'create', run: openTab },
   ]
@@ -1575,6 +1626,7 @@ function App(): JSX.Element {
     else if (c?.type === 'next-tab') stepTab(1)
     else if (c?.type === 'help') setShowHelp(true)
     else if (c?.type === 'command-palette') openProductivity('palette')
+    else if (c?.type === 'pane-picker') openProductivity('pane-picker')
     else if (c?.type === 'global-search' && productivityAvailable) openProductivity('search')
     else if (c?.type === 'font-bigger') bumpFont(1)
     else if (c?.type === 'font-smaller') bumpFont(-1)
@@ -1899,6 +1951,10 @@ function App(): JSX.Element {
             </div>
           )}
         </div>
+        <button className="btn btn-ghost btn-with-icon pane-picker-open" aria-label="pane picker"
+          title={`Pane picker · ${chordLabel('pane-picker')}`} onClick={() => openProductivity('pane-picker')}>
+          <Icon name="sessions" size={14} /> Panes
+        </button>
         <div className="spacer" />
         {remoteHost.length > 0 && (
           <span className="remote-marker"
@@ -2104,7 +2160,7 @@ function App(): JSX.Element {
                     {layerTree
                       ? <SplitView tree={layerTree} active={isActive} deadCodes={d.deadCodes} meta={d.paneMeta}
                           epoch={reconnectEpoch} portEpoch={childEpoch} mobile={mobile}
-                          fontSize={fontSize} onPaneTitle={onPaneTitle} onPaneFocus={onPaneFocus}
+                          fontSize={fontSize} onPaneTitle={onPaneTitle} onSetTitle={openPaneTitleEditor} onPaneFocus={onPaneFocus}
                           focusRequest={isActive ? focusRequest : null}
                           zoomedPane={isActive ? zoomedPane : null}
                           frozen={frozen}
@@ -2276,7 +2332,7 @@ function App(): JSX.Element {
                       <span className="session-slot">{p.slot ? `#${p.slot}` : '—'}</span>
                       <span className={'kind-dot ' + (isAgentKind(p.kind) ? p.kind : 'shell')} title={p.kind} />
                       <span className="session-main">
-                        <span className="session-name">{p.claudeName || p.cwd}</span>
+                        <span className="session-name">{p.title || p.claudeName || p.cwd}</span>
                         <span className="session-sub">{p.name}</span>
                       </span>
                     </li>
@@ -2311,7 +2367,7 @@ function App(): JSX.Element {
         const itemsByName = new Map(pocketAll.groups.flatMap((group) => group.items).map((item) => [item.pane.name, item]))
         const needle = activityQuery.trim().toLowerCase()
         const rows = baseRows.filter((row) => {
-          if (needle !== '' && !`${row.name} ${row.cwd} ${row.kind} ${row.claudeName} ${titles[row.name] ?? ''}`.toLowerCase().includes(needle)) return false
+          if (needle !== '' && !`${row.name} ${row.cwd} ${row.kind} ${row.title ?? ''} ${row.claudeName} ${titles[row.name] ?? ''}`.toLowerCase().includes(needle)) return false
           const live = sessions.find((session) => session.name === row.name)
           if (activityState === 'live') return row.alive
           if (activityState === 'exited') return !row.alive
@@ -2397,7 +2453,7 @@ function App(): JSX.Element {
                         title={r.kind} />
                       <span className="session-main">
                         <span className="session-name">
-                          {r.claudeName || r.cwd}
+                          {r.title || r.claudeName || r.cwd}
                           {!r.alive && <span className="session-tag dead"> exited</span>}
                           {!r.inPane && <span className="session-tag" title="live in the daemon, but its name maps to no pane"> no pane</span>}
                         </span>
@@ -2593,9 +2649,12 @@ function App(): JSX.Element {
         <UsagePanel rows={usage} now={Math.floor(Date.now() / 1000)} onClose={() => setUsageOpen(false)} />
       )}
       {productivityOverlay === 'palette' && <CommandPalette entries={paletteEntries} onClose={() => setProductivityOverlay(null)} />}
+      {productivityOverlay === 'pane-picker' && <PanePickerDialog entries={paletteEntries.filter((entry) => entry.id.startsWith('pane:'))} onClose={() => setProductivityOverlay(null)} />}
+      {titleEditPane !== null && <PaneTitleDialog current={paneMeta[titleEditPane]?.friendlyTitle ?? ''}
+        onSave={(value) => { onSetPaneTitle(titleEditPane, value); setTitleEditPane(null) }} onClose={() => setTitleEditPane(null)} />}
       {productivityOverlay === 'search' && <GlobalSearchDialog results={searchResults} loading={searchLoading} error={searchError}
         onClose={() => setProductivityOverlay(null)} onSearch={runGlobalSearch}
-        describe={(name) => { const info = sessions.find((session) => session.name === name); const parsed = parseName(name); return `${info?.slot ? `#${info.slot} · ` : ''}${titles[name] || shortCwd(info?.cwd ?? '', window.amber.homeDir) || name}${parsed ? ` · ws ${parsed.ws} · tab ${parsed.tab}` : ''}` }}
+        describe={(name) => { const info = sessions.find((session) => session.name === name); const parsed = parseName(name); return `${info?.slot ? `#${info.slot} · ` : ''}${info?.title || titles[name] || shortCwd(info?.cwd ?? '', window.amber.homeDir) || name}${parsed ? ` · ws ${parsed.ws} · tab ${parsed.tab}` : ''}` }}
         onPick={(result, query) => navigateTo(result.name, query)} />}
       {productivityOverlay === 'recovery' && <RecoveryCenter events={recoveryEvents} sessions={sessions} loading={recoveryLoading} error={recoveryError}
         onClose={() => setProductivityOverlay(null)} onRefresh={refreshRecovery}
