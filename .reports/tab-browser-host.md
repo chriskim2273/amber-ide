@@ -355,15 +355,28 @@ are never replaced automatically.
   compiled and loaded through Pi's production extension loader; runtime checks
   cover invalid/oversized token files and an invalid UTF-8 reply frame.
 
-Validation is green in the isolated `/tmp` worktree: app **974 passed / 1
-intentional real-daemon skip**, Rust workspace **817 passed / 1 intentional
+Independent-review remediation now gives every browser queue barrier an
+explicit cooperative/isolated/poisoned terminal state: quarantine failures
+fall back to frozen teardown or poison the browser before later work can
+enter, and queue owners are aborted alongside adapter/registry controllers by
+hide, association close, Pi revoke, and quit. Legacy Node/Rust lock recovery
+rejects duplicate (including identical) `pid`, `start`, `token`, or `created`
+fields, rejects unknown/oversized/non-canonical fields consistently, and only
+accepts reordered unique records. New regressions cover isolation rejection,
+A/B/C no-overlap and quit completion, direct hidden work, association close,
+Pi-owner revoke, and cross-language lock vectors.
+
+Validation is green in the isolated `/tmp` worktree: app **982 passed / 1
+intentional real-daemon skip**, Rust workspace **821 passed / 1 intentional
 delegated-cgroup ignore**, warnings-as-errors workspace Clippy, strict
 TypeScript, Electron and hosted-web production builds, static Linux AppImage
 packaging with both `amber` and `amber-router`, shell package contracts,
-exact installed Pi production-loader/runtime checks (including fatal token/frame
-fixtures), and `git diff --check`. `cargo fmt --all -- --check` remains red only
-for the repository's documented broad pre-existing formatter drift; no bulk
-reformat was applied. Independent review and external deployed-reader,
+exact installed Pi 0.81 production-loader/runtime checks (including fatal
+token/frame fixtures), and `git diff --check`. A separate global Pi 0.85
+probe is not claimed because that published install imports its omitted
+`@earendil-works/pi-server` dependency. `cargo fmt --all -- --check` remains
+red only for the repository's documented broad pre-existing formatter drift; no
+bulk reformat was applied. Independent review and external deployed-reader,
 physical-input, and platform gates remain pending; `mergeReady` stays false.
 
 ## Open blocking work

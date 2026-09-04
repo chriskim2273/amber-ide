@@ -33,7 +33,9 @@
     "per-operation browser FIFO ownership keeps cancelled followers from releasing predecessors or quarantining the wrong incarnation",
     "startup compatibility markers and browser-host token files use bounded regular-file no-follow reads with fatal UTF-8 and strict token validation",
     "Node and Rust layout locks publish complete fsynced owner records through cross-language exclusive hard links, with safe legacy recovery",
-    "the generated Pi broker uses a fatal UTF-8 decoder for every JSON frame and rejects invalid token bytes before socket transmission"
+    "the generated Pi broker uses a fatal UTF-8 decoder for every JSON frame and rejects invalid token bytes before socket transmission",
+    "independent review remediation gives browser queue barriers explicit cooperative/isolated/poisoned terminal states, aborts distinct queue owners on hide/close/revoke/quit, and bounds quarantine failure without overlap",
+    "independent review remediation makes Node/Rust legacy layout-lock parsing duplicate-safe for pid/start/token/created with reordered-field and cross-language parity coverage"
   ],
   "remaining": [
     {
@@ -94,7 +96,7 @@
       "id": "P1-browser-queue-ownership",
       "severity": "important",
       "status": "completed",
-      "work": "Each per-browser queue entry owns its controller, dispatch-start boundary, bound page incarnation, one-shot quarantine, and FIFO tail. A cancelled queued follower waits behind its predecessor without touching the active runtime; timed-out active work is isolated before a later show/thaw can create a fresh incarnation. Focused regressions cover A/B/C ordering, late settlement, barrier cleanup, and quit pending counts."
+      "work": "Each per-browser queue entry owns its controller, dispatch-start boundary, bound page incarnation, one-shot quarantine, and FIFO tail. A cancelled queued follower waits behind its predecessor without touching the active runtime; timed-out active work is isolated before a later show/thaw can create a fresh incarnation. Review remediation gives the barrier explicit cooperative/isolated/poisoned terminal states, falls back to frozen teardown or fails later work closed when quarantine rejects, and aborts both adapter and queue-owner controllers on hide, association close, Pi revoke, and quit. Focused regressions cover A/B/C ordering, isolation rejection, direct hidden work, close/revoke ownership, late settlement, barrier cleanup, and quit completion."
     },
     {
       "id": "P1-fixed-control-file-ingress",
@@ -106,7 +108,7 @@
       "id": "P1-layout-lock-publication-recovery",
       "severity": "important",
       "status": "completed",
-      "work": "Node and Rust prepare and fsync complete lock records, publish them with same-directory exclusive hard links, and clean up only after publication. Valid dead owners and identifiable dead legacy partial records are reclaimed by PID/start identity; live, unknown, or unidentifiable legacy records fail closed, and release compares record/text/metadata before unlinking successors."
+      "work": "Node and Rust prepare and fsync complete lock records, publish them with same-directory exclusive hard links, and clean up only after publication. Valid dead owners and identifiable dead legacy partial records are reclaimed by PID/start identity; live, unknown, or unidentifiable legacy records fail closed, and release compares record/text/metadata before unlinking successors. Review remediation rejects duplicate (including identical) pid/start/token/created fields, invalid/oversized/non-canonical values, and unknown fields in both parsers while preserving unique reordered legacy records; live-then-dead duplicate recovery tests prove ambiguous records are never reclaimed."
     },
     {
       "id": "P1-pi-fatal-broker-frames",
