@@ -2,6 +2,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import type { BrowserElementRef, BrowserInteraction, BrowserTarget, BrowserViewport, ConsoleLevel, FindQuery, SnapshotLimits, WaitCondition } from './browserToolProtocol'
 import type { InteractionTargetMetadata } from './browserApproval'
 import { parseBrowserViewport } from '../shared/browserViewport'
+import { cdpKeyInput, cdpMouseInput, type CdpMouseInputType, type SyntheticInput, type SyntheticInputToken } from './browserInput'
 
 const SCREENSHOT_MAX_BYTES = 10 * 1024 * 1024
 const SCREENSHOT_MAX_DIMENSION = 4096
@@ -27,6 +28,12 @@ export interface BrowserAutomationControls {
   history?(direction: 'back' | 'forward'): boolean | void
   dialog?(dialog: { type: string; message: string }): Promise<{ accept: boolean; promptText?: string }>
   onDiagnostics?(diagnostics: { consoleIssues: number; networkFailures: number }): void
+  /** Arm the adapter ledger before a new operation; stale tokens are cleared. */
+  onSyntheticInputScopeStart?(): void
+  /** Register one exact callback expected from a CDP Input dispatch. */
+  onSyntheticInput?(input: SyntheticInput): SyntheticInputToken | void
+  /** Clear all adapter expectations after invalidation or cancellation. */
+  clearSyntheticInput?(): void
 }
 export interface AccessibilityNodeResult { ref: string; depth: number; role: string; name: string; disabled?: boolean; focused?: boolean }
 export interface SnapshotResult { snapshotId: string; url: string; nodes: AccessibilityNodeResult[]; truncated: boolean }
@@ -136,6 +143,7 @@ export class BrowserAutomation {
   private consoleIssues = 0
   private networkFailures = 0
   private disposed = false
+  private syntheticInteractionActive = false
   constructor(
     private readonly transport: BrowserDebuggerTransport,
     private readonly currentUrl: () => string,
@@ -146,9 +154,12 @@ export class BrowserAutomation {
     this.consoleRing = new BoundedRing(options.ringItems ?? 1_000, options.ringBytes ?? 1024 * 1024)
     this.networkRing = new BoundedRing(options.ringItems ?? 1_000, options.ringBytes ?? 1024 * 1024)
   }
-  invalidate(): void { this.snapshotCache = null }
+  private beginSyntheticInputScope(): void {
+    if (!this.syntheticInteractionActive) this.controls.onSyntheticInputScopeStart?.()
+  }
+  invalidate(): void { this.snapshotCache = null; this.controls.clearSyntheticInput?.() }
   dispose(): void {
-    this.disposed = true; this.snapshotCache = null; this.requests.clear(); this.activeRequests = 0
+    this.disposed = true; this.snapshotCache = null; this.controls.clearSyntheticInput?.(); this.requests.clear(); this.activeRequests = 0
     if (this.diagnosticsTimer) clearTimeout(this.diagnosticsTimer); this.diagnosticsTimer = null
     if (this.attachedByUs && this.transport.isAttached()) { try { this.transport.detach?.() } catch { /* page teardown is best-effort */ } }
   }
@@ -235,7 +246,7 @@ export class BrowserAutomation {
     }
   }
   async snapshot(lease: BrowserAutomationLease, limits: SnapshotLimits, signal: AbortSignal): Promise<SnapshotResult> {
-    abort(signal); await this.ensureAttached(); abort(signal)
+    this.beginSyntheticInputScope(); abort(signal); await this.ensureAttached(); abort(signal)
     // CDP's getFullAXTree materializes an attacker-controlled tree before a
     // caller can apply limits. Search DOM node ids in small pages, then ask for
     // one node's partial AX projection at a time. No response is accumulated
@@ -307,6 +318,7 @@ export class BrowserAutomation {
     return entry
   }
   find(lease: BrowserAutomationLease, snapshotId: string, query: FindQuery): { snapshotId: string; matches: AccessibilityNodeResult[]; truncated: boolean } {
+    this.beginSyntheticInputScope()
     const cache = this.snapshotCache
     if (!cache || !sameLease(cache.lease, lease) || cache.snapshotId !== snapshotId) throw new Error('STALE_GENERATION')
     const regex = query.regex ? new RegExp(query.regex, 'iu') : null
@@ -314,7 +326,7 @@ export class BrowserAutomation {
     return { snapshotId, matches: matches.slice(0, query.limit), truncated: matches.length > query.limit }
   }
   async inspect(lease: BrowserAutomationLease, target: BrowserElementRef, signal: AbortSignal): Promise<Record<string, unknown>> {
-    abort(signal); await this.ensureAttached(); const entry = this.resolve(lease, target)
+    this.beginSyntheticInputScope(); abort(signal); await this.ensureAttached(); const entry = this.resolve(lease, target)
     if (!entry.backendDOMNodeId) throw new Error('UNSUPPORTED_PAGE')
     const pushed = await this.transport.send('DOM.pushNodesByBackendIdsToFrontend', { backendNodeIds: [entry.backendDOMNodeId] }); abort(signal)
     const nodeId = Array.isArray(pushed['nodeIds']) && typeof pushed['nodeIds'][0] === 'number' ? pushed['nodeIds'][0] : undefined
@@ -405,7 +417,7 @@ export class BrowserAutomation {
     return { x: Math.min(...xs) + width / 2, y: Math.min(...ys) + height / 2, ...(checked === undefined ? {} : { checked }), metadata: current }
   }
   async prepareInteraction(lease: BrowserAutomationLease, operation: BrowserInteraction, signal: AbortSignal): Promise<PreparedBrowserInteraction> {
-    abort(signal); await this.ensureAttached(); abort(signal)
+    this.beginSyntheticInputScope(); abort(signal); await this.ensureAttached(); abort(signal)
     const primaryTarget = operation.kind === 'drag' ? operation.source : ('target' in operation ? operation.target : undefined)
     const primary = primaryTarget ? this.resolveTarget(lease, primaryTarget) : undefined
     const secondary = operation.kind === 'drag' ? this.resolveTarget(lease, operation.target) : undefined
@@ -443,61 +455,101 @@ export class BrowserAutomation {
     throw new Error('TARGET_OCCLUDED')
   }
   async executeInteraction(prepared: PreparedBrowserInteraction, signal: AbortSignal, stillCurrent: () => boolean = () => true): Promise<{ dispatched: true; rollbackPossible: false }> {
-    let dispatched = false
-    const ensure = (): void => {
-      if (signal.aborted) throw new Error(dispatched ? 'ACTION_CANCELLED_NO_ROLLBACK' : 'ACTION_CANCELLED')
-      if (!stillCurrent()) throw new Error(dispatched ? 'STALE_GENERATION_NO_ROLLBACK' : 'STALE_GENERATION')
+    const wasSyntheticInteractionActive = this.syntheticInteractionActive
+    this.syntheticInteractionActive = true
+    if (!wasSyntheticInteractionActive) this.controls.onSyntheticInputScopeStart?.()
+    const inputTokens = new Set<SyntheticInputToken>()
+    const clearInputTokens = (): void => {
+      for (const token of inputTokens) token.clear()
+      inputTokens.clear()
+      this.controls.clearSyntheticInput?.()
     }
-    const pointFor = async (entry: SnapshotEntry, expected: InteractionTargetMetadata): Promise<{ x: number; y: number; checked?: boolean }> => {
-      const point = await this.actionable(entry, signal)
-      if (point.metadata.fingerprint !== expected.fingerprint) throw new Error('STALE_GENERATION')
-      ensure(); const exactPoint = await this.hitTest(entry, point, signal); ensure()
-      return { ...point, ...exactPoint }
-    }
-    const mouse = async (type: string, point: { x: number; y: number }, extra: Record<string, unknown> = {}): Promise<void> => { ensure(); dispatched = true; await this.transport.send('Input.dispatchMouseEvent', { type, x: point.x, y: point.y, ...extra }) }
-    const key = async (type: 'keyDown' | 'keyUp', value: string, modifiers = 0): Promise<void> => { ensure(); dispatched = true; await this.transport.send('Input.dispatchKeyEvent', { type, key: value === 'Space' ? ' ' : value, modifiers }) }
-    const click = async (point: { x: number; y: number }, count = 1): Promise<void> => { await mouse('mousePressed', point, { button: 'left', clickCount: count }); await mouse('mouseReleased', point, { button: 'left', clickCount: count }) }
-    const operation = prepared.operation
-    const primaryPoint = prepared.primary ? await pointFor(prepared.primary, prepared.target) : undefined
-    if ((operation.kind === 'click' || operation.kind === 'doubleClick') && primaryPoint) await click(primaryPoint, operation.kind === 'doubleClick' ? 2 : 1)
-    else if (operation.kind === 'hover' && primaryPoint) await mouse('mouseMoved', primaryPoint)
-    else if ((operation.kind === 'fill' || operation.kind === 'type') && primaryPoint) {
-      await click(primaryPoint)
-      if (operation.kind === 'fill') { const modifier = process.platform === 'darwin' ? 4 : 2; await key('keyDown', 'a', modifier); await key('keyUp', 'a', modifier) }
-      ensure(); dispatched = true; await this.transport.send('Input.insertText', { text: operation.text })
-    } else if (operation.kind === 'press') {
-      if (primaryPoint) await click(primaryPoint)
-      await key('keyDown', operation.key); await key('keyUp', operation.key)
-    } else if (operation.kind === 'select' && primaryPoint) {
-      if (operation.values.length !== 1) throw new Error('UNSUPPORTED_PAGE')
-      await click(primaryPoint); ensure(); dispatched = true; await this.transport.send('Input.insertText', { text: operation.values[0] }); await key('keyDown', 'Enter'); await key('keyUp', 'Enter')
-    } else if ((operation.kind === 'check' || operation.kind === 'uncheck') && primaryPoint) {
-      const desired = operation.kind === 'check'
-      if (primaryPoint.checked === undefined) throw new Error('TARGET_NOT_ACTIONABLE')
-      if (primaryPoint.checked !== desired) await click(primaryPoint)
-    } else if (operation.kind === 'scroll') {
-      const point = primaryPoint ?? { x: 1, y: 1 }; await mouse('mouseWheel', point, { deltaX: operation.deltaX, deltaY: operation.deltaY })
-    } else if (operation.kind === 'drag' && primaryPoint && prepared.secondary && prepared.secondaryTarget) {
-      await mouse('mouseMoved', primaryPoint); await mouse('mousePressed', primaryPoint, { button: 'left', clickCount: 1 })
-      let secondaryPoint: { x: number; y: number }
-      try { secondaryPoint = await pointFor(prepared.secondary, prepared.secondaryTarget) }
-      catch (error) {
-        await this.transport.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: primaryPoint.x, y: primaryPoint.y, button: 'left', clickCount: 1 }).catch(() => {})
-        const code = error instanceof Error && /^[A-Z][A-Z0-9_]{1,63}$/.test(error.message) ? error.message : 'INTERNAL_ERROR'
-        throw new Error(code.endsWith('_NO_ROLLBACK') ? code : `${code}_NO_ROLLBACK`)
+    const onAbort = (): void => { clearInputTokens() }
+    signal.addEventListener('abort', onAbort, { once: true })
+    let completed = false
+    try {
+      let dispatched = false
+      const ensure = (): void => {
+        if (signal.aborted) throw new Error(dispatched ? 'ACTION_CANCELLED_NO_ROLLBACK' : 'ACTION_CANCELLED')
+        if (!stillCurrent()) throw new Error(dispatched ? 'STALE_GENERATION_NO_ROLLBACK' : 'STALE_GENERATION')
       }
-      await mouse('mouseMoved', secondaryPoint, { button: 'left' }); await mouse('mouseReleased', secondaryPoint, { button: 'left', clickCount: 1 })
-    } else throw new Error('TARGET_NOT_ACTIONABLE')
-    // CDP may deliver javascriptDialogOpening immediately after the Input
-    // command resolves. Keep the owning broker request alive through that task
-    // so disconnect/cancel remains the dialog's cancellation owner.
-    await new Promise<void>((resolve) => setImmediate(resolve))
-    const dialogBarrier = this.dialogBarrier; if (dialogBarrier) await dialogBarrier
-    ensure()
-    return { dispatched: true, rollbackPossible: false }
+      const sendInput = async (method: 'Input.dispatchMouseEvent' | 'Input.dispatchKeyEvent', params: Record<string, unknown>, expected: SyntheticInput): Promise<void> => {
+        let token: SyntheticInputToken | undefined
+        try {
+          const registered = this.controls.onSyntheticInput?.(expected)
+          if (registered) { token = registered; inputTokens.add(registered) }
+          await this.transport.send(method, params)
+        } catch (error) {
+          token?.clear()
+          if (token) inputTokens.delete(token)
+          throw error
+        }
+      }
+      const pointFor = async (entry: SnapshotEntry, expected: InteractionTargetMetadata): Promise<{ x: number; y: number; checked?: boolean }> => {
+        const point = await this.actionable(entry, signal)
+        if (point.metadata.fingerprint !== expected.fingerprint) throw new Error('STALE_GENERATION')
+        ensure(); const exactPoint = await this.hitTest(entry, point, signal); ensure()
+        return { ...point, ...exactPoint }
+      }
+      const mouse = async (type: CdpMouseInputType, point: { x: number; y: number }, extra: Record<string, unknown> = {}): Promise<void> => {
+        ensure(); dispatched = true
+        const params = { type, x: point.x, y: point.y, button: 'none', clickCount: 0, ...extra }
+        await sendInput('Input.dispatchMouseEvent', params, cdpMouseInput(type, params))
+      }
+      const key = async (type: 'keyDown' | 'keyUp', value: string, modifiers = 0): Promise<void> => {
+        ensure(); dispatched = true
+        const expected = cdpKeyInput(type, value, modifiers)
+        await sendInput('Input.dispatchKeyEvent', { type, key: expected.key, code: expected.code, modifiers }, expected)
+      }
+      const click = async (point: { x: number; y: number }, count = 1): Promise<void> => { await mouse('mousePressed', point, { button: 'left', clickCount: count }); await mouse('mouseReleased', point, { button: 'left', clickCount: count }) }
+      const operation = prepared.operation
+      const primaryPoint = prepared.primary ? await pointFor(prepared.primary, prepared.target) : undefined
+      if ((operation.kind === 'click' || operation.kind === 'doubleClick') && primaryPoint) await click(primaryPoint, operation.kind === 'doubleClick' ? 2 : 1)
+      else if (operation.kind === 'hover' && primaryPoint) await mouse('mouseMoved', primaryPoint)
+      else if ((operation.kind === 'fill' || operation.kind === 'type') && primaryPoint) {
+        await click(primaryPoint)
+        if (operation.kind === 'fill') { const modifier = process.platform === 'darwin' ? 4 : 2; await key('keyDown', 'a', modifier); await key('keyUp', 'a', modifier) }
+        ensure(); dispatched = true; await this.transport.send('Input.insertText', { text: operation.text })
+      } else if (operation.kind === 'press') {
+        if (primaryPoint) await click(primaryPoint)
+        await key('keyDown', operation.key); await key('keyUp', operation.key)
+      } else if (operation.kind === 'select' && primaryPoint) {
+        if (operation.values.length !== 1) throw new Error('UNSUPPORTED_PAGE')
+        await click(primaryPoint); ensure(); dispatched = true; await this.transport.send('Input.insertText', { text: operation.values[0] }); await key('keyDown', 'Enter'); await key('keyUp', 'Enter')
+      } else if ((operation.kind === 'check' || operation.kind === 'uncheck') && primaryPoint) {
+        const desired = operation.kind === 'check'
+        if (primaryPoint.checked === undefined) throw new Error('TARGET_NOT_ACTIONABLE')
+        if (primaryPoint.checked !== desired) await click(primaryPoint)
+      } else if (operation.kind === 'scroll') {
+        const point = primaryPoint ?? { x: 1, y: 1 }; await mouse('mouseWheel', point, { deltaX: operation.deltaX, deltaY: operation.deltaY })
+      } else if (operation.kind === 'drag' && primaryPoint && prepared.secondary && prepared.secondaryTarget) {
+        await mouse('mouseMoved', primaryPoint); await mouse('mousePressed', primaryPoint, { button: 'left', clickCount: 1 })
+        let secondaryPoint: { x: number; y: number }
+        try { secondaryPoint = await pointFor(prepared.secondary, prepared.secondaryTarget) }
+        catch (error) {
+          const params = { type: 'mouseReleased', x: primaryPoint.x, y: primaryPoint.y, button: 'left', clickCount: 1 }
+          await sendInput('Input.dispatchMouseEvent', params, cdpMouseInput('mouseReleased', params)).catch(() => {})
+          const code = error instanceof Error && /^[A-Z][A-Z0-9_]{1,63}$/.test(error.message) ? error.message : 'INTERNAL_ERROR'
+          throw new Error(code.endsWith('_NO_ROLLBACK') ? code : `${code}_NO_ROLLBACK`)
+        }
+        await mouse('mouseMoved', secondaryPoint, { button: 'left' }); await mouse('mouseReleased', secondaryPoint, { button: 'left', clickCount: 1 })
+      } else throw new Error('TARGET_NOT_ACTIONABLE')
+      // CDP may deliver javascriptDialogOpening immediately after the Input
+      // command resolves. Keep the owning broker request alive through that task
+      // so disconnect/cancel remains the dialog's cancellation owner.
+      await new Promise<void>((resolve) => setImmediate(resolve))
+      const dialogBarrier = this.dialogBarrier; if (dialogBarrier) await dialogBarrier
+      ensure()
+      completed = true
+      return { dispatched: true, rollbackPossible: false }
+    } finally {
+      signal.removeEventListener('abort', onAbort)
+      if (!completed) clearInputTokens()
+      this.syntheticInteractionActive = wasSyntheticInteractionActive
+    }
   }
   async screenshot(lease: BrowserAutomationLease, target: BrowserElementRef | undefined, fullPage: boolean, signal: AbortSignal): Promise<BrowserBinaryAttachment> {
-    abort(signal); await this.ensureAttached(); let clip: { x: number; y: number; width: number; height: number; scale: number } | undefined
+    this.beginSyntheticInputScope(); abort(signal); await this.ensureAttached(); let clip: { x: number; y: number; width: number; height: number; scale: number } | undefined
     if (target) { const entry = this.resolve(lease, target); if (!entry.backendDOMNodeId) throw new Error('UNSUPPORTED_PAGE'); const box = await this.transport.send('DOM.getBoxModel', { backendNodeId: entry.backendDOMNodeId }); const border = (box['model'] as Record<string, unknown> | undefined)?.['border'] as number[] | undefined; if (!border || border.length !== 8) throw new Error('UNSUPPORTED_PAGE'); clip = { x: Math.min(border[0]!, border[2]!, border[4]!, border[6]!), y: Math.min(border[1]!, border[3]!, border[5]!, border[7]!), width: Math.max(border[0]!, border[2]!, border[4]!, border[6]!) - Math.min(border[0]!, border[2]!, border[4]!, border[6]!), height: Math.max(border[1]!, border[3]!, border[5]!, border[7]!) - Math.min(border[1]!, border[3]!, border[5]!, border[7]!), scale: 1 } }
     else {
       const metrics = await this.transport.send('Page.getLayoutMetrics')
@@ -516,9 +568,10 @@ export class BrowserAutomation {
     if (dimensions.width > SCREENSHOT_MAX_DIMENSION || dimensions.height > SCREENSHOT_MAX_DIMENSION) throw new Error('REQUEST_LIMIT')
     return { mediaType: 'image/png', data, ...dimensions }
   }
-  consoleSince(cursor: string | undefined, levels: ConsoleLevel[] | undefined, limit: number): { cursor: string; items: Record<string, unknown>[]; dropped: number; truncated: boolean } { const wanted = levels ? new Set(levels) : null; return this.consoleRing.since(cursor, limit, wanted ? (entry) => wanted.has(entry['level'] as ConsoleLevel) : undefined) }
-  networkSince(cursor: string | undefined, limit: number, failedOnly: boolean): { cursor: string; items: Record<string, unknown>[]; dropped: number; truncated: boolean } { return this.networkRing.since(cursor, limit, failedOnly ? (entry) => entry['failed'] === true : undefined) }
+  consoleSince(cursor: string | undefined, levels: ConsoleLevel[] | undefined, limit: number): { cursor: string; items: Record<string, unknown>[]; dropped: number; truncated: boolean } { this.beginSyntheticInputScope(); const wanted = levels ? new Set(levels) : null; return this.consoleRing.since(cursor, limit, wanted ? (entry) => wanted.has(entry['level'] as ConsoleLevel) : undefined) }
+  networkSince(cursor: string | undefined, limit: number, failedOnly: boolean): { cursor: string; items: Record<string, unknown>[]; dropped: number; truncated: boolean } { this.beginSyntheticInputScope(); return this.networkRing.since(cursor, limit, failedOnly ? (entry) => entry['failed'] === true : undefined) }
   async wait(lease: BrowserAutomationLease, condition: WaitCondition, timeoutMs: number, signal: AbortSignal, stillCurrent: () => boolean = () => true): Promise<{ matched: boolean; elapsedMs: number }> {
+    this.beginSyntheticInputScope()
     const start = Date.now()
     if (condition.kind === 'networkIdle') { await this.ensureAttached(); this.lastNetworkActivity = start }
     while (Date.now() - start < timeoutMs) {
@@ -539,7 +592,7 @@ export class BrowserAutomation {
     }
     throw new Error('ACTION_TIMEOUT')
   }
-  reload(ignoreCache: boolean): { accepted: boolean } { this.invalidate(); return { accepted: this.controls.reload?.(ignoreCache) !== false } }
-  history(direction: 'back' | 'forward'): { accepted: boolean } { this.invalidate(); return { accepted: this.controls.history?.(direction) !== false } }
-  async setViewport(viewport: BrowserViewport, signal: AbortSignal): Promise<{ viewport: BrowserViewport }> { const size = parseBrowserViewport(viewport); if (!size) throw new Error('INVALID_REQUEST'); abort(signal); await this.ensureAttached(); await this.transport.send('Emulation.setDeviceMetricsOverride', { width: size.width, height: size.height, deviceScaleFactor: viewport.deviceScaleFactor ?? 1, mobile: viewport.mobile ?? false, screenWidth: size.width, screenHeight: size.height }); abort(signal); this.invalidate(); return { viewport: { ...viewport, ...size } } }
+  reload(ignoreCache: boolean): { accepted: boolean } { this.beginSyntheticInputScope(); this.invalidate(); return { accepted: this.controls.reload?.(ignoreCache) !== false } }
+  history(direction: 'back' | 'forward'): { accepted: boolean } { this.beginSyntheticInputScope(); this.invalidate(); return { accepted: this.controls.history?.(direction) !== false } }
+  async setViewport(viewport: BrowserViewport, signal: AbortSignal): Promise<{ viewport: BrowserViewport }> { this.beginSyntheticInputScope(); const size = parseBrowserViewport(viewport); if (!size) throw new Error('INVALID_REQUEST'); abort(signal); await this.ensureAttached(); await this.transport.send('Emulation.setDeviceMetricsOverride', { width: size.width, height: size.height, deviceScaleFactor: viewport.deviceScaleFactor ?? 1, mobile: viewport.mobile ?? false, screenWidth: size.width, screenHeight: size.height }); abort(signal); this.invalidate(); return { viewport: { ...viewport, ...size } } }
 }

@@ -1,8 +1,9 @@
-import { WebContentsView, session, type BrowserWindow, type Rectangle, type Session } from 'electron'
+import { WebContentsView, session, type BrowserWindow, type Input, type MouseInputEvent, type Rectangle, type Session } from 'electron'
 import { browserWebPreferences, isAllowedBrowserUrl } from './tabBrowserPolicy'
 import type { BrowserId } from '../shared/tabBrowser'
 import type { TabBrowserPage, TabBrowserPageEvent, TabBrowserPageFactory } from './tabBrowserHost'
 import { BrowserAutomation, type BrowserDebuggerTransport } from './browserAutomation'
+import { electronKeyInput, electronMouseInput, SyntheticInputAccounting } from './browserInput'
 
 const hardenedSessions = new WeakSet<Session>()
 export function hardenBrowserSession(browserSession: Session): void {
@@ -19,11 +20,42 @@ export function projectInPageNavigation(url: string, isMainFrame: boolean): TabB
   return isMainFrame ? { type: 'navigation-in-page', url: url.slice(0, 8192) } : null
 }
 
+interface PreventableInputEvent { preventDefault(): void }
+
+/**
+ * Keep the Electron adapter's event-source boundary in one place. A matching
+ * one-shot token came from a CDP Input command; every other callback is user
+ * input, including composition and pointer events that arrive during Pi work.
+ */
+export function createInputEventHandlers(
+  accounting: SyntheticInputAccounting,
+  onUserInput: () => void,
+  onBlurShortcut: () => void,
+): {
+  beforeInputEvent: (event: PreventableInputEvent, input: Input) => void
+  beforeMouseEvent: (_event: PreventableInputEvent, input: MouseInputEvent) => void
+} {
+  return {
+    beforeInputEvent: (event, input) => {
+      const synthetic = input.type === 'keyDown' || input.type === 'keyUp' ? electronKeyInput(input) : null
+      if (synthetic && accounting.observe(synthetic)) return
+      if ((input.control || input.meta) && input.shift && input.key.toLowerCase() === 'b') { event.preventDefault(); onBlurShortcut(); return }
+      onUserInput()
+    },
+    beforeMouseEvent: (_event, input) => {
+      const synthetic = ['mouseDown', 'mouseUp', 'mouseMove', 'mouseWheel'].includes(input.type) ? electronMouseInput(input) : null
+      if (synthetic && accounting.observe(synthetic)) return
+      onUserInput()
+    },
+  }
+}
+
 export class ElectronTabBrowserPage implements TabBrowserPage {
   readonly view: WebContentsView
   readonly automation: BrowserAutomation
   private attached = false
   private disposing = false
+  private readonly inputAccounting = new SyntheticInputAccounting()
   private bounds: Rectangle = { x: 0, y: 0, width: 1, height: 1 }
   constructor(private window: BrowserWindow, partition: string, onUserInput: () => void, onPageEvent: (event: TabBrowserPageEvent) => void, allowNavigation: (url: string) => boolean, private readonly onDestroy: () => void) {
     const browserSession = session.fromPartition(partition)
@@ -47,6 +79,9 @@ export class ElectronTabBrowserPage implements TabBrowserPage {
       },
       dialog: (dialog) => new Promise((resolve) => onPageEvent({ type: 'dialog', dialogType: dialog.type, message: dialog.message, respond: resolve })),
       onDiagnostics: (diagnostics) => onPageEvent({ type: 'diagnostics', ...diagnostics }),
+      onSyntheticInputScopeStart: () => this.inputAccounting.clear(),
+      onSyntheticInput: (input) => this.inputAccounting.expect(input),
+      clearSyntheticInput: () => this.inputAccounting.clear(),
     })
     // Attach to this WebContents only; there is no remote-debugging endpoint
     // and therefore no target enumeration or cross-page control surface.
@@ -55,11 +90,9 @@ export class ElectronTabBrowserPage implements TabBrowserPage {
     this.view.webContents.on('will-navigate', (event, url) => { if (!isAllowedBrowserUrl(url) || !allowNavigation(url)) event.preventDefault() })
     this.view.webContents.on('will-redirect', (event, url) => { if (!isAllowedBrowserUrl(url) || !allowNavigation(url)) event.preventDefault() })
     this.view.webContents.on('will-frame-navigate', (event) => { if (!isAllowedBrowserUrl(event.url) || (event.isMainFrame && !allowNavigation(event.url))) event.preventDefault() })
-    this.view.webContents.on('before-input-event', (event, input) => {
-      if ((input.control || input.meta) && input.shift && input.key.toLowerCase() === 'b') { event.preventDefault(); this.blur(); onPageEvent({ type: 'focus', focused: false }); return }
-      onUserInput()
-    })
-    this.view.webContents.on('before-mouse-event', onUserInput)
+    const inputHandlers = createInputEventHandlers(this.inputAccounting, onUserInput, () => { this.blur(); onPageEvent({ type: 'focus', focused: false }) })
+    this.view.webContents.on('before-input-event', inputHandlers.beforeInputEvent)
+    this.view.webContents.on('before-mouse-event', inputHandlers.beforeMouseEvent)
     this.view.webContents.on('did-start-navigation', (_event, _url, _inPlace, isMainFrame) => { if (isMainFrame) onPageEvent({ type: 'navigation-started' }) })
     this.view.webContents.on('did-navigate', (_event, url) => onPageEvent({ type: 'navigation-committed', url }))
     this.view.webContents.on('did-navigate-in-page', (_event, url, isMainFrame) => { const projected = projectInPageNavigation(url, isMainFrame); if (projected) onPageEvent(projected) })
@@ -99,7 +132,7 @@ export class ElectronTabBrowserPage implements TabBrowserPage {
   hide(): void {
     if (this.attached) { this.window.contentView.removeChildView(this.view); this.attached = false }
   }
-  destroy(): void { this.disposing = true; this.automation.dispose(); this.hide(); if (!this.view.webContents.isDestroyed()) this.view.webContents.close(); this.onDestroy() }
+  destroy(): void { this.disposing = true; this.inputAccounting.clear(); this.automation.dispose(); this.hide(); if (!this.view.webContents.isDestroyed()) this.view.webContents.close(); this.onDestroy() }
 }
 
 export class ElectronTabBrowserPageFactory implements TabBrowserPageFactory {
