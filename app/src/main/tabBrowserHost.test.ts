@@ -5,6 +5,7 @@ import type { BrowserAutomation } from './browserAutomation'
 
 class FakePage implements TabBrowserPage {
   url = 'about:blank'; destroyed = false; visible = false; stopped = false
+  automation?: BrowserAutomation
   async loadURL(url: string) { this.url = url }
   show() { this.visible = true }
   hide() { this.visible = false }
@@ -26,6 +27,21 @@ describe('TabBrowserHost', () => {
     }
     const host = new TabBrowserHost(state, factory)
     expect(host.status('browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa').lifecycle).toBe('frozen')
+  })
+
+  it('does not count adapter-generated input as a second user generation change', async () => {
+    const host = new TabBrowserHost(emptyBrowserState(1), factory)
+    const opened = await host.open({ visible: true })
+    const page = opened.page as FakePage
+    const target = { role: 'button', name: 'Open', tag: 'button', type: 'button', fingerprint: 'fingerprint' }
+    page.automation = {
+      invalidate: vi.fn(),
+      prepareInteraction: vi.fn(async () => ({ lease: { browserId: opened.status.id, pageIncarnation: opened.status.pageIncarnation, generation: opened.status.generation }, operation: { kind: 'click', target: { snapshotId: 'snapshot', ref: 'n1' } }, target })),
+      executeInteraction: vi.fn(async () => { userInputs.get(opened.status.id)!(); return { dispatched: true, rollbackPossible: false } }),
+    } as unknown as BrowserAutomation
+    const before = opened.status.generation
+    await host.runAutomation(opened.status.id, { type: 'interact', pageIncarnation: opened.status.pageIncarnation, expectedGeneration: before, operation: { kind: 'click', target: { snapshotId: 'snapshot', ref: 'n1' } } }, new AbortController().signal)
+    expect(host.status(opened.status.id).generation).toBe(before + 1)
   })
 
   it('creates visibly before navigation and advances generation', async () => {

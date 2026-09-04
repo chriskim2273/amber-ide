@@ -8,6 +8,7 @@ import { parseBrowserViewport } from '../shared/browserViewport'
 import type { BrowserAutomation, BrowserBinaryAttachment } from './browserAutomation'
 import type { BrowserInteraction, BrowserToolAction } from './browserToolProtocol'
 import { classifyInteraction, type InteractionClassification, type InteractionTargetMetadata } from './browserApproval'
+import { shouldRecordUserInput } from './browserInput'
 
 export type TabBrowserPageEvent =
   | { type: 'navigation-started' }
@@ -55,7 +56,7 @@ export type TabBrowserHostEvent = { type: 'capacity-wait'; id: BrowserId; waitin
 interface Runtime {
   page: TabBrowserPage; incarnation: string; generation: number; loading: boolean; automationNavigationPending: boolean; visible: boolean
   currentUrl: string; focused: boolean; restoredAfterFreeze: boolean; diagnostics: { consoleIssues: number; networkFailures: number }
-  pendingOperations: Set<symbol>; suppressEvents: boolean
+  pendingOperations: Set<symbol>; suppressEvents: boolean; automationInput: boolean
 }
 export interface InteractionApprovalRequest { operation: BrowserInteraction; target: InteractionTargetMetadata; secondaryTarget?: InteractionTargetMetadata; classification: InteractionClassification; origin: string; pageIncarnation: string; generation: number }
 
@@ -93,7 +94,7 @@ export class TabBrowserHost {
     const page = this.pages.create(
       id,
       () => {
-        if (!runtime || this.runtimes.get(id) !== runtime) return
+        if (!runtime || this.runtimes.get(id) !== runtime || !shouldRecordUserInput(runtime.automationInput)) return
         runtime.generation += 1; runtime.page.automation?.invalidate(); this.onStateChange(); this.emitRuntime(id)
       },
       (event) => this.pageEvent(id, runtime, event),
@@ -101,7 +102,7 @@ export class TabBrowserHost {
     )
     runtime = { page, incarnation: randomUUID(), generation: this.generationFloor.get(id) ?? 0, loading: false, automationNavigationPending: false, visible: false,
       currentUrl: this.record(id).safeRestoreUrl, focused: false, restoredAfterFreeze, diagnostics: { consoleIssues: 0, networkFailures: 0 },
-      pendingOperations: new Set<symbol>(), suppressEvents: false }
+      pendingOperations: new Set<symbol>(), suppressEvents: false, automationInput: false }
     this.runtimes.set(id, runtime)
     this.capacity.markLive(id, this.now())
     return runtime
@@ -367,7 +368,12 @@ export class TabBrowserHost {
         if (signal.aborted) throw new Error('ACTION_CANCELLED')
         if (this.runtimes.get(record.id) !== runtime || runtime.incarnation !== action.pageIncarnation || runtime.generation !== action.expectedGeneration) throw new Error('STALE_GENERATION')
         runtime.generation += 1; generationDelta = 1; automation.invalidate()
-        result = await automation.executeInteraction(prepared, signal, () => this.runtimes.get(record.id) === runtime && runtime.incarnation === action.pageIncarnation && runtime.generation === action.expectedGeneration + 1)
+        runtime.automationInput = true
+        try {
+          result = await automation.executeInteraction(prepared, signal, () => this.runtimes.get(record.id) === runtime && runtime.incarnation === action.pageIncarnation && runtime.generation === action.expectedGeneration + 1)
+        } finally {
+          runtime.automationInput = false
+        }
       } else if (action.type === 'reload' || action.type === 'history') {
         runtime.automationNavigationPending = true
         try { result = action.type === 'reload' ? automation.reload(action.ignoreCache) : automation.history(action.direction) }
