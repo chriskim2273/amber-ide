@@ -123,7 +123,7 @@ describe('browser automation', () => {
     const second = await automation.prepareInteraction(lease, { kind: 'click', target }, new AbortController().signal)
     await automation.executeInteraction(second, new AbortController().signal)
     expect(accounting.pendingCount()).toBe(2)
-    await automation.snapshot(lease, { maxDepth: 20, maxNodes: 20, maxBytes: 256 * 1024 }, new AbortController().signal)
+    await automation.prepareInteraction(lease, { kind: 'click', target }, new AbortController().signal)
     expect(accounting.pendingCount()).toBe(0)
     expect(accounting.observe(electronMouseInput({ type: 'mouseDown', x: 50, y: 10, button: 'left', clickCount: 1, modifiers: [] }))).toBe(false)
   })

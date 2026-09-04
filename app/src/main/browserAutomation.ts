@@ -143,7 +143,6 @@ export class BrowserAutomation {
   private consoleIssues = 0
   private networkFailures = 0
   private disposed = false
-  private syntheticInteractionActive = false
   constructor(
     private readonly transport: BrowserDebuggerTransport,
     private readonly currentUrl: () => string,
@@ -153,9 +152,6 @@ export class BrowserAutomation {
   ) {
     this.consoleRing = new BoundedRing(options.ringItems ?? 1_000, options.ringBytes ?? 1024 * 1024)
     this.networkRing = new BoundedRing(options.ringItems ?? 1_000, options.ringBytes ?? 1024 * 1024)
-  }
-  private beginSyntheticInputScope(): void {
-    if (!this.syntheticInteractionActive) this.controls.onSyntheticInputScopeStart?.()
   }
   invalidate(): void { this.snapshotCache = null; this.controls.clearSyntheticInput?.() }
   dispose(): void {
@@ -246,7 +242,7 @@ export class BrowserAutomation {
     }
   }
   async snapshot(lease: BrowserAutomationLease, limits: SnapshotLimits, signal: AbortSignal): Promise<SnapshotResult> {
-    this.beginSyntheticInputScope(); abort(signal); await this.ensureAttached(); abort(signal)
+    abort(signal); await this.ensureAttached(); abort(signal)
     // CDP's getFullAXTree materializes an attacker-controlled tree before a
     // caller can apply limits. Search DOM node ids in small pages, then ask for
     // one node's partial AX projection at a time. No response is accumulated
@@ -318,7 +314,6 @@ export class BrowserAutomation {
     return entry
   }
   find(lease: BrowserAutomationLease, snapshotId: string, query: FindQuery): { snapshotId: string; matches: AccessibilityNodeResult[]; truncated: boolean } {
-    this.beginSyntheticInputScope()
     const cache = this.snapshotCache
     if (!cache || !sameLease(cache.lease, lease) || cache.snapshotId !== snapshotId) throw new Error('STALE_GENERATION')
     const regex = query.regex ? new RegExp(query.regex, 'iu') : null
@@ -326,7 +321,7 @@ export class BrowserAutomation {
     return { snapshotId, matches: matches.slice(0, query.limit), truncated: matches.length > query.limit }
   }
   async inspect(lease: BrowserAutomationLease, target: BrowserElementRef, signal: AbortSignal): Promise<Record<string, unknown>> {
-    this.beginSyntheticInputScope(); abort(signal); await this.ensureAttached(); const entry = this.resolve(lease, target)
+    abort(signal); await this.ensureAttached(); const entry = this.resolve(lease, target)
     if (!entry.backendDOMNodeId) throw new Error('UNSUPPORTED_PAGE')
     const pushed = await this.transport.send('DOM.pushNodesByBackendIdsToFrontend', { backendNodeIds: [entry.backendDOMNodeId] }); abort(signal)
     const nodeId = Array.isArray(pushed['nodeIds']) && typeof pushed['nodeIds'][0] === 'number' ? pushed['nodeIds'][0] : undefined
@@ -417,7 +412,7 @@ export class BrowserAutomation {
     return { x: Math.min(...xs) + width / 2, y: Math.min(...ys) + height / 2, ...(checked === undefined ? {} : { checked }), metadata: current }
   }
   async prepareInteraction(lease: BrowserAutomationLease, operation: BrowserInteraction, signal: AbortSignal): Promise<PreparedBrowserInteraction> {
-    this.beginSyntheticInputScope(); abort(signal); await this.ensureAttached(); abort(signal)
+    this.controls.onSyntheticInputScopeStart?.(); abort(signal); await this.ensureAttached(); abort(signal)
     const primaryTarget = operation.kind === 'drag' ? operation.source : ('target' in operation ? operation.target : undefined)
     const primary = primaryTarget ? this.resolveTarget(lease, primaryTarget) : undefined
     const secondary = operation.kind === 'drag' ? this.resolveTarget(lease, operation.target) : undefined
@@ -455,9 +450,7 @@ export class BrowserAutomation {
     throw new Error('TARGET_OCCLUDED')
   }
   async executeInteraction(prepared: PreparedBrowserInteraction, signal: AbortSignal, stillCurrent: () => boolean = () => true): Promise<{ dispatched: true; rollbackPossible: false }> {
-    const wasSyntheticInteractionActive = this.syntheticInteractionActive
-    this.syntheticInteractionActive = true
-    if (!wasSyntheticInteractionActive) this.controls.onSyntheticInputScopeStart?.()
+    this.controls.onSyntheticInputScopeStart?.()
     const inputTokens = new Set<SyntheticInputToken>()
     const clearInputTokens = (): void => {
       for (const token of inputTokens) token.clear()
@@ -545,11 +538,10 @@ export class BrowserAutomation {
     } finally {
       signal.removeEventListener('abort', onAbort)
       if (!completed) clearInputTokens()
-      this.syntheticInteractionActive = wasSyntheticInteractionActive
     }
   }
   async screenshot(lease: BrowserAutomationLease, target: BrowserElementRef | undefined, fullPage: boolean, signal: AbortSignal): Promise<BrowserBinaryAttachment> {
-    this.beginSyntheticInputScope(); abort(signal); await this.ensureAttached(); let clip: { x: number; y: number; width: number; height: number; scale: number } | undefined
+    abort(signal); await this.ensureAttached(); let clip: { x: number; y: number; width: number; height: number; scale: number } | undefined
     if (target) { const entry = this.resolve(lease, target); if (!entry.backendDOMNodeId) throw new Error('UNSUPPORTED_PAGE'); const box = await this.transport.send('DOM.getBoxModel', { backendNodeId: entry.backendDOMNodeId }); const border = (box['model'] as Record<string, unknown> | undefined)?.['border'] as number[] | undefined; if (!border || border.length !== 8) throw new Error('UNSUPPORTED_PAGE'); clip = { x: Math.min(border[0]!, border[2]!, border[4]!, border[6]!), y: Math.min(border[1]!, border[3]!, border[5]!, border[7]!), width: Math.max(border[0]!, border[2]!, border[4]!, border[6]!) - Math.min(border[0]!, border[2]!, border[4]!, border[6]!), height: Math.max(border[1]!, border[3]!, border[5]!, border[7]!) - Math.min(border[1]!, border[3]!, border[5]!, border[7]!), scale: 1 } }
     else {
       const metrics = await this.transport.send('Page.getLayoutMetrics')
@@ -568,10 +560,9 @@ export class BrowserAutomation {
     if (dimensions.width > SCREENSHOT_MAX_DIMENSION || dimensions.height > SCREENSHOT_MAX_DIMENSION) throw new Error('REQUEST_LIMIT')
     return { mediaType: 'image/png', data, ...dimensions }
   }
-  consoleSince(cursor: string | undefined, levels: ConsoleLevel[] | undefined, limit: number): { cursor: string; items: Record<string, unknown>[]; dropped: number; truncated: boolean } { this.beginSyntheticInputScope(); const wanted = levels ? new Set(levels) : null; return this.consoleRing.since(cursor, limit, wanted ? (entry) => wanted.has(entry['level'] as ConsoleLevel) : undefined) }
-  networkSince(cursor: string | undefined, limit: number, failedOnly: boolean): { cursor: string; items: Record<string, unknown>[]; dropped: number; truncated: boolean } { this.beginSyntheticInputScope(); return this.networkRing.since(cursor, limit, failedOnly ? (entry) => entry['failed'] === true : undefined) }
+  consoleSince(cursor: string | undefined, levels: ConsoleLevel[] | undefined, limit: number): { cursor: string; items: Record<string, unknown>[]; dropped: number; truncated: boolean } { const wanted = levels ? new Set(levels) : null; return this.consoleRing.since(cursor, limit, wanted ? (entry) => wanted.has(entry['level'] as ConsoleLevel) : undefined) }
+  networkSince(cursor: string | undefined, limit: number, failedOnly: boolean): { cursor: string; items: Record<string, unknown>[]; dropped: number; truncated: boolean } { return this.networkRing.since(cursor, limit, failedOnly ? (entry) => entry['failed'] === true : undefined) }
   async wait(lease: BrowserAutomationLease, condition: WaitCondition, timeoutMs: number, signal: AbortSignal, stillCurrent: () => boolean = () => true): Promise<{ matched: boolean; elapsedMs: number }> {
-    this.beginSyntheticInputScope()
     const start = Date.now()
     if (condition.kind === 'networkIdle') { await this.ensureAttached(); this.lastNetworkActivity = start }
     while (Date.now() - start < timeoutMs) {
@@ -592,7 +583,7 @@ export class BrowserAutomation {
     }
     throw new Error('ACTION_TIMEOUT')
   }
-  reload(ignoreCache: boolean): { accepted: boolean } { this.beginSyntheticInputScope(); this.invalidate(); return { accepted: this.controls.reload?.(ignoreCache) !== false } }
-  history(direction: 'back' | 'forward'): { accepted: boolean } { this.beginSyntheticInputScope(); this.invalidate(); return { accepted: this.controls.history?.(direction) !== false } }
-  async setViewport(viewport: BrowserViewport, signal: AbortSignal): Promise<{ viewport: BrowserViewport }> { this.beginSyntheticInputScope(); const size = parseBrowserViewport(viewport); if (!size) throw new Error('INVALID_REQUEST'); abort(signal); await this.ensureAttached(); await this.transport.send('Emulation.setDeviceMetricsOverride', { width: size.width, height: size.height, deviceScaleFactor: viewport.deviceScaleFactor ?? 1, mobile: viewport.mobile ?? false, screenWidth: size.width, screenHeight: size.height }); abort(signal); this.invalidate(); return { viewport: { ...viewport, ...size } } }
+  reload(ignoreCache: boolean): { accepted: boolean } { this.invalidate(); return { accepted: this.controls.reload?.(ignoreCache) !== false } }
+  history(direction: 'back' | 'forward'): { accepted: boolean } { this.invalidate(); return { accepted: this.controls.history?.(direction) !== false } }
+  async setViewport(viewport: BrowserViewport, signal: AbortSignal): Promise<{ viewport: BrowserViewport }> { const size = parseBrowserViewport(viewport); if (!size) throw new Error('INVALID_REQUEST'); abort(signal); await this.ensureAttached(); await this.transport.send('Emulation.setDeviceMetricsOverride', { width: size.width, height: size.height, deviceScaleFactor: viewport.deviceScaleFactor ?? 1, mobile: viewport.mobile ?? false, screenWidth: size.width, screenHeight: size.height }); abort(signal); this.invalidate(); return { viewport: { ...viewport, ...size } } }
 }
