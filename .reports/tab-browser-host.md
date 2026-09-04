@@ -397,7 +397,7 @@ physical-input, and platform gates remain pending; `mergeReady` stays false.
 
 ## External acceptance gates (2026-09-04; sole validation run)
 
-This run used one unique evidence root, `/tmp/amber-tab-browser-validation/20260904T174029-1660527`, with private `HOME`, `XDG_STATE_HOME`, `XDG_RUNTIME_DIR`, daemon/browser sockets, Electron data/cache, browser profile, Pi roots, Cargo/npm/Electron caches, and a PID ledger. All launch and destructive actions were path/PID guarded. No production daemon, profile, config, service manager, installed binary, production AppImage, or global Pi extension was contacted or modified. The branch was clean at start and the final source HEAD was `642caa03c31f50ef71ea06cf9d9b54fe8ad93a1f`.
+This run used one unique evidence root, `/tmp/amber-tab-browser-validation/20260904T174029-1660527`, with private `HOME`, `XDG_STATE_HOME`, `XDG_RUNTIME_DIR`, daemon/browser sockets, Electron data/cache, browser profile, Pi roots, Cargo/npm/Electron caches, and a PID ledger. All launch and destructive actions were path/PID guarded. No production daemon, profile, config, service manager, installed binary, production AppImage, or global Pi extension was contacted or modified. The branch was clean at start and the validated code HEAD was `642caa03c31f50ef71ea06cf9d9b54fe8ad93a1f`; the subsequent `059fee3` commit contains only this evidence/report update.
 
 The latest queue/control-file/layout-lock remediation already has an independent PASS with no blocking findings. The rail (`P1-rail-product-states`) and Pi semantic/approval work (`P1-pi-tools-and-approvals`) retain their previously recorded independent PASS reviews. The resident lifecycle review remains pending, so its P1 stays partial and `mergeReady: false`.
 
