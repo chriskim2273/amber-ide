@@ -26,7 +26,10 @@
     "migration recovery overflow is preserved and rejected before migration writes",
     "broker requests are registered before asynchronous queue-key admission and abort on socket close, Stop Pi, or drain without dispatching later",
     "Node CAS rereads and remote SSH layout probes enforce the shared 8 MiB byte bound, bounded stderr/timeout handling, and no partial remote layout",
-    "Rust mosaic and layout CAS share a bounded regular-file loader with symlink/TOCTOU checks, graph/string containment, and cached polling fallback"
+    "Rust mosaic and layout CAS share a bounded regular-file loader with symlink/TOCTOU checks, graph/string containment, and cached polling fallback",
+    "timed-out browser adapter work is quarantined after a bounded FIFO barrier, with page destruction, generation tombstones, and late-event suppression",
+    "Node state, workspace, layout, productivity, editor, transcript, token, and broker ingress reads use bounded regular-file identity checks with fatal UTF-8 decoding",
+    "Node and Rust layout locks use PID start identity plus owner tokens, reclaim only demonstrably dead owners, and release only unchanged records"
   ],
   "remaining": [
     {

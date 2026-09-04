@@ -1,6 +1,6 @@
 # Tab browser host implementation report
 
-Date: 2026-09-03
+Date: 2026-09-04
 Branch: `feat/tab-browser-host`
 
 ## Result
@@ -264,6 +264,55 @@ exercised with XDG/HOME paths containing spaces and glob characters. No
 production daemon or profile was contacted. The full packaged Linux/macOS
 gates, deployed-reader proof, and independent resident re-review remain open;
 `mergeReady` stays false.
+
+## Accepted P1 containment and lock remediation (2026-09-04; implementation complete, independent re-review pending)
+
+This pass closes the four accepted P1 containment findings without changing the
+Amber daemon protocol or contacting a production daemon:
+
+- Timed-out browser adapter work now remains attached to a bounded per-browser
+  FIFO barrier until the adapter settles. If it does not settle, the host
+  quarantines the exact page incarnation: it invalidates automation, advances a
+  generation tombstone, suppresses late page events, stops and destroys the
+  native page, marks the record frozen, and emits the durable state change.
+  Quarantine work is included in pending-work accounting so Quit cannot claim a
+  clean drain while isolation is still running.
+- Node file ingress is centralized in `safeFileReader.ts`. It opens bounded
+  regular-file descriptors with symlink/FIFO rejection, checks current-user
+  ownership when requested, validates descriptor/path identity and metadata
+  before returning, detects growth/replacement, and decodes UTF-8 fatally.
+  Layout, browser state, workspace imports, productivity/checkpoint files,
+  editor files/drafts/images, Claude transcript prefixes, compatibility flags,
+  broker tokens, and macOS service logs now use the hardened boundary.
+- Protocol JSON and UTF-8 session names are fatal rather than replacement-
+  decoded. Invalid broker JSON returns the stable `INVALID_REQUEST` path and
+  closes unauthenticated/malformed connections; the shared daemon decoder
+  rejects invalid control JSON and data-frame session names.
+- TypeScript and Rust layout CAS locks now carry a versioned owner record with
+  PID, process-start identity, and a per-acquisition token. Age alone never
+  reclaims a lock: only a demonstrably dead owner is reclaimed, unknown owner
+  state waits for the bounded timeout, and release requires matching record
+  content and file metadata so an old owner cannot remove a successor lock.
+
+TDD coverage includes non-cooperative adapter quarantine/FIFO release,
+invalid UTF-8 in state/layout/editor/protocol ingress, symlink/FIFO and
+truncate/regrow/append identity races, live/dead/unknown lock owners, and
+successor-lock protection.
+
+Final isolated validation in this worktree: app **964 passed / 1 intentional
+real-daemon skip** (`npm test`); Rust workspace **811 passed / 1 intentional
+delegated-cgroup ignore** (`cargo test --workspace --all-targets --quiet`);
+workspace warnings-as-errors Clippy; strict TypeScript typecheck; Electron and
+hosted-web production builds; Linux `npm run dist` with static-musl `amber` and
+`amber-router` bundled into an AppImage; shell contract tests; and
+`git diff --check`. `cargo fmt --all -- --check` remains red only for the
+repository's documented broad pre-existing formatter drift, and `npm run lint`
+remains unavailable because the repository has no ESLint 9 flat config. The
+Windows GNU cross-target check is unavailable on this Linux host because the
+`ring` build requires `x86_64-w64-mingw32-gcc`; no Windows execution claim is
+made. Independent resident re-review, deployed-reader proof, packaged Linux
+physical-input evidence, and macOS native-view/focus/IME/accessibility/
+lifecycle/package gates remain open, so `mergeReady: false`.
 
 ## Open blocking work
 

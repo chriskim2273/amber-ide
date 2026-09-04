@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { loadLayoutFile, saveLayoutFile } from './layoutIO'
+import { acquireLayoutLock, currentProcessStartIdentity, formatLayoutLockRecord } from './layoutLock'
 import { LAYOUT_FILE_MAX_BYTES } from '../shared/layoutFile'
 
 const execFile = promisify(execFileCallback)
@@ -138,5 +139,34 @@ describe('saveLayoutFile', () => {
     await writeFile(path, Buffer.alloc(LAYOUT_FILE_MAX_BYTES + 1, 0x7a))
     expect(await saveLayoutFile(path, 'after', loaded.version)).toEqual({ error: 'LAYOUT_FILE_LIMIT' })
     expect((await stat(path)).size).toBe(LAYOUT_FILE_MAX_BYTES + 1)
+  })
+
+  it('does not age-steal a lock held by a live process', async () => {
+    const start = await currentProcessStartIdentity()
+    if (!start) return
+    await writeFile(`${path}.lock`, formatLayoutLockRecord({ pid: process.pid, start, token: 'live-owner' }))
+    const result = await saveLayoutFile(path, '{}', null)
+    expect(result).toMatchObject({ error: 'LAYOUT_LOCK_TIMEOUT' })
+    expect(await readFile(`${path}.lock`, 'utf8')).toContain('token=live-owner')
+  })
+
+  it('reclaims a dead owner and writes after a crash', async () => {
+    await writeFile(`${path}.lock`, formatLayoutLockRecord({ pid: 4_294_967_000, start: 'linux:missing', token: 'dead-owner' }))
+    expect(await saveLayoutFile(path, '{}', null)).toEqual({ ok: true, version: '{}' })
+  })
+
+  it('does not reclaim a lock whose owner identity is unknown', async () => {
+    const lockPath = `${path}.lock`
+    await writeFile(lockPath, formatLayoutLockRecord({ pid: process.pid, start: 'unknown:owner', token: 'unknown-owner' }))
+    await expect(acquireLayoutLock(lockPath, 30)).rejects.toThrow('LAYOUT_LOCK_TIMEOUT')
+    expect(await readFile(lockPath, 'utf8')).toContain('token=unknown-owner')
+  })
+
+  it('does not let an old owner release a successor lock', async () => {
+    await saveLayoutFile(path, '{}', null)
+    const loaded = await loadLayoutFile(path)
+    await writeFile(`${path}.lock`, formatLayoutLockRecord({ pid: 4_294_967_000, start: 'linux:missing', token: 'successor' }))
+    expect(await saveLayoutFile(path, '{"next":true}', loaded.version)).toEqual({ ok: true, version: '{"next":true}' })
+    expect(await readFile(path, 'utf8')).toBe('{"next":true}')
   })
 })

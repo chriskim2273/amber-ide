@@ -1,13 +1,15 @@
 import { connect, createServer, type Server, type Socket } from 'node:net'
-import { open, readFile, rename, unlink, lstat } from 'node:fs/promises'
+import { open, rename, unlink, lstat } from 'node:fs/promises'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { dirname } from 'node:path'
+import { TextDecoder } from 'node:util'
 import type { LayoutFile } from '../shared/layoutFile'
 import type { TabBrowserCommand } from './tabBrowserService'
 import { parseBrowserToolAction, type BrowserToolAction } from './browserToolProtocol'
 import type { BrowserBinaryAttachment } from './browserAutomation'
 import { ensurePrivateRuntimeDirectory } from './browserHostPaths'
 import type { BrowserOperationRegistry } from './browserOperationRegistry'
+import { readSafeTextFile, SafeFileReadError } from './safeFileReader'
 
 export type BrokerAction =
   | { type: 'open' }
@@ -114,6 +116,7 @@ export function authorizeBrowserRequest(layout: LayoutFile, amberSession: string
 
 const MAX_FRAME = 1024 * 1024
 const MAX_BINARY_FRAME = 10 * 1024 * 1024
+const FATAL_UTF8 = new TextDecoder('utf-8', { fatal: true })
 function frame(value: unknown): Buffer {
   const body = Buffer.from(JSON.stringify(value))
   const out = Buffer.allocUnsafe(body.length + 4); out.writeUInt32BE(body.length); body.copy(out, 4); return out
@@ -144,8 +147,19 @@ async function tokenFile(path: string): Promise<string> {
   await ensurePrivateRuntimeDirectory(parent, uid)
   try {
     const metadata = await lstat(path)
-    if (metadata.isSymbolicLink() || !metadata.isFile() || metadata.uid !== uid || (metadata.mode & 0o077) !== 0) throw new Error('invalid browser host token file')
-    const token = (await readFile(path, 'utf8')).trim()
+    if (metadata.isSymbolicLink() || !metadata.isFile() || (uid >= 0 && metadata.uid !== uid) || (metadata.mode & 0o077) !== 0) throw new Error('invalid browser host token file')
+    let tokenText: string | null
+    try { tokenText = await readSafeTextFile(path, { maxBytes: 128, ...(uid >= 0 ? { owner: uid } : {}) }) }
+    catch (error) {
+      // Invalid UTF-8 is a malformed credential, not a reason to leave the
+      // host permanently unavailable. Keep the existing bounded quarantine /
+      // rotation behavior; all identity, ownership, symlink, and mutation
+      // failures remain fatal.
+      if (error instanceof SafeFileReadError && error.code === 'INVALID_UTF8') tokenText = '\uFFFD'
+      else throw error
+    }
+    if (tokenText === null) throw Object.assign(new Error('token file changed'), { code: 'ENOENT' })
+    const token = tokenText.trim()
     if (/^[A-Za-z0-9_-]{43}$/.test(token)) return token
     const quarantine = `${path}.invalid`
     await unlink(quarantine).catch((error: NodeJS.ErrnoException) => { if (error.code !== 'ENOENT') throw error })
@@ -291,7 +305,9 @@ export class TabBrowserBrokerServer {
         chain = chain.then(async () => {
           let requestId: string | undefined, cacheKey: string | undefined, completionDeferred = false
           try {
-            const value: unknown = JSON.parse(body.toString('utf8'))
+            let value: unknown
+            try { value = JSON.parse(FATAL_UTF8.decode(body)) }
+            catch { throw new Error('INVALID_REQUEST') }
             if (!authenticated) {
               const hello = object(value)
               if (!hello || !exact(hello, ['token']) || hello['token'] !== token) throw new Error('UNAUTHORIZED')

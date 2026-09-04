@@ -188,3 +188,31 @@ its queue-key cancellation tests are tracked in `tab-browser-host.md` and the
 machine-readable remaining report. Current validation is recorded there; the
 branch remains `mergeReady: false` because the deployment/package/platform and
 independent resident-review gates are still open.
+
+## 2026-09-04 owner-bound lock and ingress follow-up
+
+The cross-process lock now uses the same versioned owner record on both sides:
+PID, process-start identity, and a unique acquisition token. Node and Rust
+reclaim only a lock whose owner identity is demonstrably dead; unknown process
+state waits until the bounded lock timeout. Release rereads and compares the
+record text plus file metadata before unlinking, preventing an old writer from
+removing a successor lock. Windows process-query failures are treated as
+unknown rather than as proof of a dead owner.
+
+The sidecar and its callers also use bounded, regular-file-only reads with
+fatal UTF-8 and descriptor/path identity checks. Node's shared reader covers
+layout CAS plus browser state, workspace/productivity/checkpoint, editor,
+transcript, token, broker, and service-log ingress. Rust's shared reader is
+used by both layout CAS and mosaic. The original prefix-only checkpoint and
+transcript reads remain bounded while validating the complete file size and
+identity.
+
+Current isolated gates: app **964 passed / 1 intentional real-daemon skip**;
+Rust **811 passed / 1 intentional delegated-cgroup ignore**; warnings-as-errors
+workspace Clippy; strict TypeScript typecheck; Electron/web builds; static
+Linux AppImage packaging containing both `amber` and `amber-router`; shell
+contract tests; and `git diff --check`. Full rustfmt remains blocked only by
+the repository's documented pre-existing formatter drift. Windows GNU
+cross-target compilation could not run on this Linux host because `ring` needs
+`x86_64-w64-mingw32-gcc`. The branch remains `mergeReady: false` pending the
+independent resident review and external deployment/platform gates.

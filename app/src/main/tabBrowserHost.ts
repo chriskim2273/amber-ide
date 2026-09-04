@@ -20,8 +20,20 @@ export type TabBrowserPageEvent =
   | { type: 'dialog'; dialogType: string; message: string; respond: (decision: { accept: boolean; promptText?: string }) => void }
   | { type: 'crashed'; reason: string }
 
+function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(new Error('ACTION_CANCELLED'))
+  let onAbort: (() => void) | undefined
+  const cancelled = new Promise<never>((_resolve, reject) => {
+    onAbort = () => reject(new Error('ACTION_CANCELLED'))
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
+  return Promise.race([promise, cancelled]).finally(() => {
+    if (onAbort) signal.removeEventListener('abort', onAbort)
+  })
+}
+
 export interface TabBrowserPage {
-  loadURL(url: string): Promise<void>
+  loadURL(url: string, signal?: AbortSignal): Promise<void>
   show(): void
   hide(): void
   stop(): void
@@ -43,12 +55,15 @@ export type TabBrowserHostEvent = { type: 'capacity-wait'; id: BrowserId; waitin
 interface Runtime {
   page: TabBrowserPage; incarnation: string; generation: number; loading: boolean; automationNavigationPending: boolean; visible: boolean
   currentUrl: string; focused: boolean; restoredAfterFreeze: boolean; diagnostics: { consoleIssues: number; networkFailures: number }
+  pendingOperations: Set<symbol>; suppressEvents: boolean
 }
 export interface InteractionApprovalRequest { operation: BrowserInteraction; target: InteractionTargetMetadata; secondaryTarget?: InteractionTargetMetadata; classification: InteractionClassification; origin: string; pageIncarnation: string; generation: number }
 
 export class TabBrowserHost {
   private readonly capacity = new BrowserCapacity(4)
   private readonly runtimes = new Map<BrowserId, Runtime>()
+  /** Tombstones prevent a late adapter callback from reusing an old generation. */
+  private readonly generationFloor = new Map<BrowserId, number>()
   private readonly capacityWaiting = new Set<BrowserId>()
   constructor(
     private readonly state: BrowserStateFile,
@@ -77,12 +92,16 @@ export class TabBrowserHost {
     let runtime!: Runtime
     const page = this.pages.create(
       id,
-      () => { runtime.generation += 1; runtime.page.automation?.invalidate(); this.onStateChange(); this.emitRuntime(id) },
+      () => {
+        if (!runtime || this.runtimes.get(id) !== runtime) return
+        runtime.generation += 1; runtime.page.automation?.invalidate(); this.onStateChange(); this.emitRuntime(id)
+      },
       (event) => this.pageEvent(id, runtime, event),
       (url) => this.navigationAllowed(id, url),
     )
-    runtime = { page, incarnation: randomUUID(), generation: 0, loading: false, automationNavigationPending: false, visible: false,
-      currentUrl: this.record(id).safeRestoreUrl, focused: false, restoredAfterFreeze, diagnostics: { consoleIssues: 0, networkFailures: 0 } }
+    runtime = { page, incarnation: randomUUID(), generation: this.generationFloor.get(id) ?? 0, loading: false, automationNavigationPending: false, visible: false,
+      currentUrl: this.record(id).safeRestoreUrl, focused: false, restoredAfterFreeze, diagnostics: { consoleIssues: 0, networkFailures: 0 },
+      pendingOperations: new Set<symbol>(), suppressEvents: false }
     this.runtimes.set(id, runtime)
     this.capacity.markLive(id, this.now())
     return runtime
@@ -94,7 +113,7 @@ export class TabBrowserHost {
   }
 
   private pageEvent(id: BrowserId, runtime: Runtime, event: TabBrowserPageEvent): void {
-    if (this.runtimes.get(id) !== runtime) return
+    if (this.runtimes.get(id) !== runtime || runtime.suppressEvents) return
     const record = this.record(id)
     if (event.type === 'navigation-started') {
       if (runtime.automationNavigationPending) runtime.automationNavigationPending = false
@@ -104,7 +123,10 @@ export class TabBrowserHost {
     } else if (event.type === 'navigation-committed' || event.type === 'navigation-in-page') {
       const currentUrl = event.url.slice(0, 8192)
       if (!this.navigationAllowed(id, currentUrl)) {
-        runtime.page.stop(); runtime.page.destroy(); this.runtimes.delete(id); this.capacity.markFrozen(id)
+        this.runtimes.delete(id); runtime.suppressEvents = true; runtime.pendingOperations.clear(); runtime.page.automation?.invalidate()
+        try { runtime.page.stop() } catch { /* page may already be gone */ }
+        try { runtime.page.destroy() } catch { /* disposal is best effort */ }
+        runtime.generation += 1; this.generationFloor.set(id, runtime.generation); this.capacity.markFrozen(id)
         record.lifecycle = 'frozen'; record.restoreError = 'Navigation blocked by browser mode'; record.stateRevision += 1
         this.onStateChange(); this.emitRuntime(id); return
       }
@@ -131,8 +153,9 @@ export class TabBrowserHost {
     } else {
       runtime.automationNavigationPending = false
       runtime.loading = false
-      runtime.page.destroy()
-      this.runtimes.delete(id)
+      this.runtimes.delete(id); runtime.suppressEvents = true; runtime.pendingOperations.clear(); runtime.page.automation?.invalidate()
+      runtime.generation += 1; this.generationFloor.set(id, runtime.generation)
+      try { runtime.page.destroy() } catch { /* disposal is best effort */ }
       this.capacity.markFrozen(id)
       record.lifecycle = 'frozen'
       record.restoreError = `Page crashed: ${event.reason}`.slice(0, 1024)
@@ -229,6 +252,43 @@ export class TabBrowserHost {
     const record = this.record(id); this.runtimes.get(record.id)?.page.setBounds?.(bounds)
   }
 
+  private beginPending(runtime: Runtime): symbol {
+    const operation = Symbol('browser-operation')
+    runtime.pendingOperations.add(operation)
+    return operation
+  }
+
+  private endPending(runtime: Runtime, operation: symbol): void {
+    runtime.pendingOperations.delete(operation)
+    if (runtime.pendingOperations.size === 0) runtime.suppressEvents = false
+  }
+
+  /** True while the native adapter can still call back for this page. */
+  hasPendingOperation(id: string, incarnation: string): boolean {
+    if (!isOpaqueBrowserId(id)) return false
+    const runtime = this.runtimes.get(id)
+    return !!runtime && runtime.incarnation === incarnation && runtime.pendingOperations.size > 0
+  }
+
+  /** Detach a non-cooperative adapter before another command may use this id. */
+  quarantine(id: string, incarnation: string): void {
+    const record = this.record(id), runtime = this.runtimes.get(record.id)
+    if (!runtime || runtime.incarnation !== incarnation) return
+    // Remove the identity before destroying the page. Electron can synchronously
+    // emit teardown events, and those events must see the tombstone.
+    this.runtimes.delete(record.id)
+    runtime.suppressEvents = true
+    runtime.pendingOperations.clear()
+    runtime.generation += 1
+    this.generationFloor.set(record.id, runtime.generation)
+    runtime.page.automation?.invalidate()
+    try { runtime.page.stop() } catch { /* an already wedged WebContents is disposable */ }
+    try { runtime.page.destroy() } catch { /* disposal is best effort */ }
+    this.capacity.markFrozen(record.id)
+    record.lifecycle = 'frozen'; record.restoreError = 'Browser operation isolated after cancellation'; record.stateRevision += 1
+    this.onStateChange(); this.emitRuntime(record.id)
+  }
+
   async navigate(id: string, url: string, incarnation: string, generation: number, signal?: AbortSignal, source: 'user' | 'broker' = 'user'): Promise<BrowserRuntimeStatus> {
     const record = this.record(id)
     const runtime = this.runtimes.get(record.id)
@@ -246,22 +306,27 @@ export class TabBrowserHost {
     runtime.generation += 1
     const navigationGeneration = runtime.generation
     runtime.loading = true
+    runtime.suppressEvents = false
     this.emitRuntime(record.id)
+    const pending = this.beginPending(runtime)
+    let load: Promise<void>
+    try { load = runtime.page.loadURL(parsed.href, signal) } catch (error) { load = Promise.reject(error) }
+    void load.then(() => this.endPending(runtime, pending), () => this.endPending(runtime, pending))
     let abort: (() => void) | undefined
     const cancelled = new Promise<never>((_resolve, reject) => {
-      abort = () => { runtime.page.stop(); reject(new Error('ACTION_CANCELLED')) }
+      abort = () => { runtime.suppressEvents = true; try { runtime.page.stop() } catch { /* page may already be gone */ } reject(new Error('ACTION_CANCELLED')) }
       signal?.addEventListener('abort', abort, { once: true })
     })
     this.capacity.protectFor(record.id, 'operation', true)
-    try { await (signal ? Promise.race([runtime.page.loadURL(parsed.href), cancelled]) : runtime.page.loadURL(parsed.href)) }
-    catch (error) { if (priorOrigins) record.previewOrigins = priorOrigins; else delete record.previewOrigins; throw error }
+    try { await (signal ? Promise.race([load, cancelled]) : load) }
+    catch (error) { if (this.runtimes.get(record.id) === runtime) { if (priorOrigins) record.previewOrigins = priorOrigins; else delete record.previewOrigins }; throw error }
     finally {
       this.capacity.protectFor(record.id, 'operation', false)
       runtime.loading = false
       if (abort) signal?.removeEventListener('abort', abort)
     }
     if (this.runtimes.get(record.id) !== runtime || runtime.generation !== navigationGeneration) {
-      if (priorOrigins) record.previewOrigins = priorOrigins; else delete record.previewOrigins
+      if (this.runtimes.get(record.id) === runtime) { if (priorOrigins) record.previewOrigins = priorOrigins; else delete record.previewOrigins }
       throw new Error(this.runtimes.get(record.id) !== runtime ? 'NAVIGATION_BLOCKED' : 'ACTION_CANCELLED')
     }
     runtime.currentUrl = parsed.href.slice(0, 8192)
@@ -279,6 +344,9 @@ export class TabBrowserHost {
     const automation = runtime.page.automation
     const lease = { browserId: record.id, pageIncarnation: runtime.incarnation, generation: runtime.generation }
     let result: unknown; let generationDelta = 0
+    const pending = this.beginPending(runtime)
+    const onAbort = (): void => { runtime.suppressEvents = true }
+    signal.addEventListener('abort', onAbort, { once: true })
     this.capacity.protectFor(record.id, 'operation', true)
     try {
       if (action.type === 'snapshot') result = await automation.snapshot(lease, action.limits, signal)
@@ -290,6 +358,7 @@ export class TabBrowserHost {
       else if (action.type === 'wait') result = await automation.wait(lease, action.condition, action.timeoutMs, signal, () => this.runtimes.get(record.id) === runtime && runtime.generation === action.expectedGeneration)
       else if (action.type === 'interact') {
         const prepared = await automation.prepareInteraction(lease, action.operation, signal)
+        if (signal.aborted) throw new Error('ACTION_CANCELLED')
         const classification = classifyInteraction(action.operation, prepared.target, prepared.secondaryTarget)
         if (classification.consequential) {
           if (!approve) throw new Error('APPROVAL_REQUIRED')
@@ -305,8 +374,18 @@ export class TabBrowserHost {
         catch (error) { runtime.automationNavigationPending = false; throw error }
         if ((result as { accepted: boolean }).accepted) { runtime.generation += 1; generationDelta = 1 }
         else runtime.automationNavigationPending = false
-      } else { const viewport = parseBrowserViewport(action.viewport); if (!viewport) throw new Error('INVALID_REQUEST'); result = await automation.setViewport({ ...action.viewport, ...viewport }, signal); runtime.generation += 1; generationDelta = 1; record.viewport = viewport; record.stateRevision += 1 }
-    } finally { this.capacity.protectFor(record.id, 'operation', false) }
+      } else {
+        const viewport = parseBrowserViewport(action.viewport); if (!viewport) throw new Error('INVALID_REQUEST')
+        result = await automation.setViewport({ ...action.viewport, ...viewport }, signal)
+        if (signal.aborted) throw new Error('ACTION_CANCELLED')
+        if (this.runtimes.get(record.id) !== runtime || runtime.incarnation !== action.pageIncarnation || runtime.generation !== action.expectedGeneration) throw new Error('STALE_GENERATION')
+        runtime.generation += 1; generationDelta = 1; record.viewport = viewport; record.stateRevision += 1
+      }
+    } finally {
+      signal.removeEventListener('abort', onAbort)
+      this.endPending(runtime, pending)
+      this.capacity.protectFor(record.id, 'operation', false)
+    }
     if (signal.aborted) throw new Error('ACTION_CANCELLED')
     const expectedAfter = action.expectedGeneration + generationDelta
     if (this.runtimes.get(record.id) !== runtime || runtime.incarnation !== action.pageIncarnation || runtime.generation !== expectedAfter) throw new Error('STALE_GENERATION')
@@ -329,8 +408,13 @@ export class TabBrowserHost {
 
   freeze(id: string): void {
     const record = this.record(id)
-    this.runtimes.get(record.id)?.page.destroy()
+    const runtime = this.runtimes.get(record.id)
     this.runtimes.delete(record.id)
+    if (runtime) {
+      runtime.suppressEvents = true; runtime.pendingOperations.clear(); runtime.page.automation?.invalidate()
+      runtime.generation += 1; this.generationFloor.set(record.id, runtime.generation)
+      try { runtime.page.destroy() } catch { /* disposal is best effort */ }
+    }
     this.capacity.markFrozen(record.id)
     record.lifecycle = 'frozen'; record.stateRevision += 1; this.onStateChange(); this.emitRuntime(record.id)
   }
@@ -348,13 +432,25 @@ export class TabBrowserHost {
       runtime = this.makeRuntime(record.id, true)
       record.lifecycle = 'live'; record.stateRevision += 1
       if (!this.navigationAllowed(record.id, record.safeRestoreUrl)) throw new Error('NAVIGATION_BLOCKED')
-      if (record.safeRestoreUrl !== 'about:blank') await runtime.page.loadURL(record.safeRestoreUrl)
-      if (runtime.page.automation) await runtime.page.automation.setViewport({ width: record.viewport.width, height: record.viewport.height }, signal ?? new AbortController().signal)
+      if (record.safeRestoreUrl !== 'about:blank') {
+        const pending = this.beginPending(runtime)
+        let load: Promise<void>
+        try { load = runtime.page.loadURL(record.safeRestoreUrl, signal) } catch (error) { load = Promise.reject(error) }
+        void load.then(() => this.endPending(runtime!, pending), () => this.endPending(runtime!, pending))
+        await abortable(load, signal ?? new AbortController().signal)
+      }
+      if (runtime.page.automation) {
+        const viewport = Promise.resolve(runtime.page.automation.setViewport({ width: record.viewport.width, height: record.viewport.height }, signal ?? new AbortController().signal))
+        await abortable(viewport, signal ?? new AbortController().signal)
+      }
       delete record.restoreError; this.onStateChange(); this.emitRuntime(record.id)
       return this.status(record.id)
     } catch (error) {
       if (!runtime) { this.capacity.rollbackActivation(record.id); throw error }
-      runtime.page.destroy(); this.runtimes.delete(record.id); this.capacity.markFrozen(record.id)
+      this.runtimes.delete(record.id); runtime.suppressEvents = true; runtime.pendingOperations.clear(); runtime.page.automation?.invalidate()
+      runtime.generation += 1; this.generationFloor.set(record.id, runtime.generation)
+      try { runtime.page.destroy() } catch { /* disposal is best effort */ }
+      this.capacity.markFrozen(record.id)
       const code = signal?.aborted ? 'ACTION_CANCELLED' : error instanceof Error && error.message === 'NAVIGATION_BLOCKED' ? 'NAVIGATION_BLOCKED' : 'BROWSER_RESTORE_FAILED'
       record.lifecycle = 'frozen'; record.restoreError = code === 'NAVIGATION_BLOCKED' ? 'Navigation blocked by browser mode' : code === 'ACTION_CANCELLED' ? 'Browser restore cancelled' : 'Browser restore failed'
       record.stateRevision += 1; this.onStateChange(); this.emitRuntime(record.id)

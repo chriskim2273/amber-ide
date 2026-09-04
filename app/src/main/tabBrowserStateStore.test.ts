@@ -78,6 +78,12 @@ describe('TabBrowserStateStore', () => {
     expect(loaded.migrationRecovery.at(-1)?.safeRestoreUrl).toBe(`https://recovery.test/${BROWSER_RECOVERY_MAX}`)
   })
 
+  it('returns an empty state for invalid UTF-8 that permissive decoding would make valid JSON', async () => {
+    const store = new TabBrowserStateStore(dir)
+    await writeFile(join(dir, 'browser-state.json'), Buffer.from('{"version":1,"profiles":{"global":{"partition":"persist:amber-browser"}},"records":{},"migrationRecovery":[],"title":"\xc3(\"}', 'binary'))
+    expect((await store.load()).revision).toBe(0)
+  })
+
   it('returns an empty state when the file is malformed', async () => {
     const store = new TabBrowserStateStore(dir)
     await writeFile(join(dir, 'browser-state.json'), '{bad')

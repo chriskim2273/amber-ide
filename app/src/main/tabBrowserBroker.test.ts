@@ -166,6 +166,27 @@ describe('tab browser broker boundary', () => {
     await server.close()
   })
 
+  it('closes on invalid UTF-8 before JSON parsing', async () => {
+    if (process.platform === 'win32') return
+    const dir = await mkdtemp(join(tmpdir(), 'amber-browser-broker-')); cleanup.push(dir)
+    const socketPath = join(dir, 'broker.sock'); const tokenPath = join(dir, 'token')
+    const server = new TabBrowserBrokerServer(socketPath, tokenPath, async () => ({}))
+    await server.start(); const token = (await readFile(tokenPath, 'utf8')).trim()
+    const encode = (value: unknown): Buffer => { const body = Buffer.from(JSON.stringify(value)); const out = Buffer.alloc(body.length + 4); out.writeUInt32BE(body.length); body.copy(out, 4); return out }
+    await new Promise<void>((resolve, reject) => {
+      const socket = connect(socketPath); socket.on('error', () => {})
+      const timer = setTimeout(() => { socket.destroy(); reject(new Error('broker did not close malformed ingress')) }, 1000)
+      socket.once('close', () => { clearTimeout(timer); resolve() })
+      socket.once('connect', () => socket.write(encode({ token })))
+      socket.once('data', () => {
+        const body = Buffer.from([0xc3])
+        const malformed = Buffer.alloc(4 + body.length); malformed.writeUInt32BE(body.length); body.copy(malformed, 4)
+        socket.write(malformed)
+      })
+    })
+    await server.close()
+  })
+
   it('transports screenshot attachments as a raw binary frame, never a path or JSON byte array', async () => {
     if (process.platform === 'win32') return
     const dir = await mkdtemp(join(tmpdir(), 'amber-browser-broker-')); cleanup.push(dir)

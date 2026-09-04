@@ -122,6 +122,7 @@ const TAG_CONTROL = 0
 const TAG_DATA = 1
 const TAG_BACKLOG = 2
 const MAX_FRAME_LEN = 64 * 1024 * 1024
+const FATAL_UTF8 = new TextDecoder('utf-8', { fatal: true })
 
 // ControlMsg <-> serde-externally-tagged JSON value.
 function msgToJson(m: ControlMsg): unknown {
@@ -480,7 +481,7 @@ export class Decoder {
 
     const tag = this.buf[body]
     if (tag === TAG_CONTROL) {
-      const json = new TextDecoder().decode(this.buf.subarray(body + 1, end))
+      const json = FATAL_UTF8.decode(this.buf.subarray(body + 1, end))
       const msg = jsonToMsg(JSON.parse(json))
       return msg === null ? SKIP_CONTROL : { type: 'control', msg }
     }
@@ -494,7 +495,7 @@ export class Decoder {
       const nameLen = view.getUint16(body + 1, false)
       const nameEnd = body + 3 + nameLen
       if (nameEnd > end) throw new Error('truncated data frame name')
-      const session = new TextDecoder().decode(this.buf.subarray(body + 3, nameEnd))
+      const session = FATAL_UTF8.decode(this.buf.subarray(body + 3, nameEnd))
       // slice(), not subarray(): the payload outlives this call (it is posted to
       // the renderer), and the shared buffer is reused by later frames.
       const bytes = this.buf.slice(nameEnd, end)

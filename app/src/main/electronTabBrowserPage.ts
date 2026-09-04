@@ -69,9 +69,20 @@ export class ElectronTabBrowserPage implements TabBrowserPage {
     this.view.webContents.on('blur', () => onPageEvent({ type: 'focus', focused: false }))
     this.view.webContents.on('render-process-gone', (_event, details) => { if (!this.disposing) onPageEvent({ type: 'crashed', reason: details.reason }) })
   }
-  async loadURL(url: string): Promise<void> {
+  async loadURL(url: string, signal?: AbortSignal): Promise<void> {
     if (!isAllowedBrowserUrl(url)) throw new Error('NAVIGATION_BLOCKED')
-    await this.view.webContents.loadURL(url)
+    if (signal?.aborted) throw new Error('ACTION_CANCELLED')
+    let onAbort: (() => void) | undefined
+    const cancelled = signal ? new Promise<never>((_resolve, reject) => {
+      onAbort = () => { this.stop(); reject(new Error('ACTION_CANCELLED')) }
+      signal.addEventListener('abort', onAbort, { once: true })
+    }) : null
+    try {
+      const loading = this.view.webContents.loadURL(url)
+      await (cancelled ? Promise.race([loading, cancelled]) : loading)
+    } finally {
+      if (onAbort) signal?.removeEventListener('abort', onAbort)
+    }
   }
   stop(): void { this.view.webContents.stop() }
   focus(): void { this.view.webContents.focus() }

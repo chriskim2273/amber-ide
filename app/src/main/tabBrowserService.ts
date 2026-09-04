@@ -26,10 +26,21 @@ function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
   })
 }
 
-function boundedQueueBarrier(promise: Promise<unknown>, releaseSignal: AbortSignal, timeoutMs: number): Promise<void> {
+function boundedQueueBarrier(
+  promise: Promise<unknown>,
+  releaseSignal: AbortSignal,
+  timeoutMs: number,
+  stillPending?: () => boolean | undefined,
+  isolate?: () => void | Promise<void>,
+): Promise<void> {
   return new Promise<void>((resolve) => {
     let timer: NodeJS.Timeout | undefined
     let finished = false
+    let operationSettled = false
+    const adapterPending = (): boolean => {
+      const explicit = stillPending?.()
+      return explicit === undefined ? !operationSettled : explicit
+    }
     const finish = (): void => {
       if (finished) return
       finished = true
@@ -39,10 +50,15 @@ function boundedQueueBarrier(promise: Promise<unknown>, releaseSignal: AbortSign
     }
     const release = (): void => {
       if (finished || timer) return
-      if (timeoutMs <= 0) { finish(); return }
-      timer = setTimeout(finish, timeoutMs); timer.unref()
+      if (!adapterPending() || timeoutMs <= 0) { finish(); return }
+      timer = setTimeout(() => {
+        timer = undefined
+        if (!adapterPending()) { finish(); return }
+        Promise.resolve(isolate?.()).catch(() => {}).finally(finish)
+      }, timeoutMs)
+      timer.unref()
     }
-    promise.then(finish, finish)
+    promise.then(() => { operationSettled = true; if (!releaseSignal.aborted || !adapterPending()) finish() }, () => { operationSettled = true; if (!releaseSignal.aborted || !adapterPending()) finish() })
     releaseSignal.addEventListener('abort', release, { once: true })
     if (releaseSignal.aborted) release()
   })
@@ -138,6 +154,8 @@ export class TabBrowserService {
   private readonly observedGeneration = new Map<string, number>()
   private readonly latestPiActions = new Map<string, { type: 'pi-action'; browserId: string; controller: string; action: string; phase: 'started' | 'completed' | 'failed'; error?: string; at: number }>()
   private readonly pendingRuntimeEvents = new Map<string, unknown>()
+  /** Operations whose caller has gone away but whose page adapter is being isolated. */
+  private readonly quarantinedOperations = new Set<string>()
   private drainGeneration = 0
   private runtimeFlush: NodeJS.Timeout | null = null
   private approvalSurfaceVisible: (browserId: string) => boolean = () => false
@@ -328,7 +346,13 @@ export class TabBrowserService {
     // queue after a bounded grace so one hung WebContents cannot block later
     // mutations or resident quit forever. The late operation remains attached
     // to this promise, so any eventual rejection is observed and isolated.
-    const tail = boundedQueueBarrier(operation, controller.signal, TAB_BROWSER_QUEUE_BARRIER_TIMEOUT_MS)
+    const identity = this.browserOperationIdentity(command)
+    const tail = boundedQueueBarrier(operation, controller.signal, TAB_BROWSER_QUEUE_BARRIER_TIMEOUT_MS,
+      identity ? () => {
+        const pending = (this.host as unknown as { hasPendingOperation?: (id: string, incarnation: string) => boolean }).hasPendingOperation
+        return typeof pending === 'function' ? pending.call(this.host, identity.id, identity.pageIncarnation) : undefined
+      } : undefined,
+      identity ? () => this.isolateBrowserOperation(identity.id, identity.pageIncarnation) : undefined)
     this.browserQueues.set(key, tail)
     void tail.then(() => {}, () => {}).finally(() => {
       signal?.removeEventListener('abort', abort)
@@ -336,6 +360,18 @@ export class TabBrowserService {
       if (command.type === 'show' && this.activationControllers.get(key) === controller) this.activationControllers.delete(key)
     })
     return abortable(operation, controller.signal)
+  }
+
+  private browserOperationIdentity(command: TabBrowserCommand): { id: string; pageIncarnation: string } | undefined {
+    if (command.type === 'navigate' || command.type === 'reload' || command.type === 'history' || command.type === 'viewport') return { id: command.id, pageIncarnation: command.pageIncarnation }
+    if (command.type === 'automation') return { id: command.id, pageIncarnation: command.action.pageIncarnation }
+    return undefined
+  }
+
+  private async isolateBrowserOperation(id: string, pageIncarnation: string): Promise<void> {
+    const key = `${id}\u0000${pageIncarnation}`
+    this.quarantinedOperations.add(key)
+    try { await this.host.quarantine?.(id, pageIncarnation) } finally { this.quarantinedOperations.delete(key) }
   }
 
   private withLatestAction<T extends object>(id: string, status: T): T & { lastAction?: unknown } {
@@ -457,12 +493,13 @@ export class TabBrowserService {
     }
   }
 
-  pendingWork(): { operations: number; piActions: number; approvals: number; dialogs: number; pageLoads: number; queued: number; total: number } {
+  pendingWork(): { operations: number; piActions: number; approvals: number; dialogs: number; pageLoads: number; queued: number; quarantined: number; total: number } {
     const operations = this.operations.summary().total
     const piActions = [...this.activePi.values()].reduce((sum, entries) => sum + entries.size, 0)
     const approvals = this.approvals.pendingCount(), dialogs = this.dialogs.pendingCount()
     const pageLoads = this.host.pendingLoadCount(), queued = this.browserQueues.size + this.activationControllers.size
-    return { operations, piActions, approvals, dialogs, pageLoads, queued, total: operations + approvals + dialogs + pageLoads }
+    const quarantined = this.quarantinedOperations.size
+    return { operations, piActions, approvals, dialogs, pageLoads, queued, quarantined, total: operations + approvals + dialogs + pageLoads + queued + quarantined }
   }
 
   beginDrain(): void {

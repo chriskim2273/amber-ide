@@ -5,8 +5,9 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { basename, dirname, join, resolve as resolvePathJoin, isAbsolute } from 'node:path'
 import { homedir, hostname, release as osRelease, tmpdir } from 'node:os'
 import { spawn, execFileSync } from 'node:child_process'
+import { TextDecoder } from 'node:util'
 import { randomUUID } from 'node:crypto'
-import { readFile, writeFile, rename, mkdir, copyFile, chmod, rm, stat, lstat, open, mkdtemp } from 'node:fs/promises'
+import { readFile, writeFile, rename, mkdir, copyFile, chmod, rm, stat, mkdtemp } from 'node:fs/promises'
 import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
 import { resolveSocketPath } from '../shared/socketPath'
 import { HANDOFF_FILE_MAX, parseHandoff } from '../shared/handoff'
@@ -87,6 +88,7 @@ import { browserContextMatches, captureBrowserContext, hasExactApprovalSurface, 
 import { createBrowserId } from '../shared/tabBrowser'
 import { isRecoveryId } from '../shared/tabBrowserState'
 import { BrowserOperationRegistry } from './browserOperationRegistry'
+import { readSafeTextFile, SafeFileReadError } from './safeFileReader'
 import { browserHostSocketPath } from './browserHostPaths'
 import {
   activationRequest,
@@ -107,21 +109,21 @@ const CLIENT_STABLE_MS = 5000
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
 async function readBoundedTextFile(path: string, maxBytes: number, limitCode: string): Promise<string> {
-  const handle = await open(path, 'r')
   try {
-    const metadata = await handle.stat()
-    if (!metadata.isFile()) throw new Error('WORKSPACE_NOT_REGULAR')
-    if (metadata.size > maxBytes) throw new Error(limitCode)
-    const buffer = Buffer.alloc(Math.min(maxBytes + 1, Math.max(1, metadata.size + 1)))
-    let offset = 0
-    while (offset < buffer.length) {
-      const result = await handle.read(buffer, offset, buffer.length - offset, offset)
-      if (result.bytesRead === 0) break
-      offset += result.bytesRead
-    }
-    if (offset > maxBytes) throw new Error(limitCode)
-    return buffer.subarray(0, offset).toString('utf8')
-  } finally { await handle.close().catch(() => {}) }
+    const owner = process.getuid?.()
+    const text = await readSafeTextFile(path, { maxBytes, ...(owner === undefined ? {} : { owner }) })
+    if (text === null) throw new Error('WORKSPACE_FILE_CHANGED')
+    return text
+  } catch (error) {
+    if (!(error instanceof SafeFileReadError)) throw error
+    if (error.code === 'FILE_TOO_LARGE') throw new Error(limitCode)
+    if (error.code === 'SYMLINK') throw new Error('WORKSPACE_SYMLINK')
+    if (error.code === 'NOT_REGULAR') throw new Error('WORKSPACE_NOT_REGULAR')
+    if (error.code === 'INVALID_UTF8') throw new Error('WORKSPACE_INVALID_UTF8')
+    if (error.code === 'READ_TIMEOUT') throw new Error('WORKSPACE_READ_TIMEOUT')
+    if (error.code === 'FILE_CHANGED') throw new Error('WORKSPACE_FILE_CHANGED')
+    throw error
+  }
 }
 
 function stateRoot(): string {
@@ -141,7 +143,9 @@ const COMPAT_SIGNATURE = compatSignature(process.versions.electron ?? 'unknown',
 
 function readCompatFlag(): string | null {
   try {
-    return readFileSync(compatFlagPath, 'utf8')
+    const bytes = readFileSync(compatFlagPath)
+    if (bytes.length > 1024) return null
+    return new TextDecoder('utf-8', { fatal: true }).decode(bytes)
   } catch {
     return null // absent (or unreadable, which is the same decision)
   }
@@ -1767,6 +1771,16 @@ async function main(): Promise<void> {
     return stdout.trim()
   })
 
+  const readBoundedLog = async (path: string): Promise<string> => {
+    try {
+      const owner = process.getuid?.()
+      const text = await readSafeTextFile(path, { maxBytes: 4 * 1024 * 1024, ...(owner === undefined ? {} : { owner }) })
+      return text ?? 'no log available: file not found'
+    } catch (error) {
+      return `no log available: ${error instanceof Error ? error.message : String(error)}`
+    }
+  }
+
   ipcMain.handle('web:logTail', async (): Promise<string> => {
     if (process.platform === 'linux') {
       const { stdout, stderr } = await runCapture('journalctl', [
@@ -1780,11 +1794,7 @@ async function main(): Promise<void> {
       return stdout || stderr
     }
     // launchd has no journal — the agent writes StandardErrorPath here.
-    try {
-      return await readFile(join(homedir(), 'Library', 'Logs', 'amber-web.log'), 'utf8')
-    } catch (e) {
-      return `no log available: ${String(e)}`
-    }
+    return readBoundedLog(join(homedir(), 'Library', 'Logs', 'amber-web.log'))
   })
 
   ipcMain.handle('web:openLocal', async () => {
@@ -1891,11 +1901,7 @@ async function main(): Promise<void> {
       ])
       return stdout || stderr
     }
-    try {
-      return await readFile(join(homedir(), 'Library', 'Logs', 'amber-router.log'), 'utf8')
-    } catch (e) {
-      return `no log available: ${String(e)}`
-    }
+    return readBoundedLog(join(homedir(), 'Library', 'Logs', 'amber-router.log'))
   })
 
   ipcMain.handle('pick-folder', async () => {
@@ -2030,9 +2036,6 @@ async function main(): Promise<void> {
     })
     if (r.canceled || r.filePaths.length === 0 || !r.filePaths[0]) return null
     const selected = r.filePaths[0]
-    const metadata = await lstat(selected)
-    if (metadata.isSymbolicLink() || !metadata.isFile()) throw new Error('WORKSPACE_NOT_REGULAR')
-    if (metadata.size > WORKSPACE_FILE_MAX_BYTES) throw new Error('WORKSPACE_FILE_LIMIT')
     const text = await readBoundedTextFile(selected, WORKSPACE_FILE_MAX_BYTES, 'WORKSPACE_FILE_LIMIT')
     assertWorkspaceFileBytes(text)
     return text

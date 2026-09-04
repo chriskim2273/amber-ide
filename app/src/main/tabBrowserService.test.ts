@@ -103,6 +103,34 @@ describe('TabBrowserService dispatch authorization', () => {
     } finally { vi.useRealTimers() }
   })
 
+  it('quarantines a non-cooperative adapter before the same-browser FIFO continues', async () => {
+    vi.useFakeTimers()
+    try {
+      const state = emptyBrowserState(1), id = 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'; let release!: () => void; let calls = 0
+      const quarantines: Array<{ id: string; page: string }> = []
+      const host = {
+        navigate: async (_id: string, _url: string, _page: string, _generation: number) => {
+          calls += 1
+          if (calls === 1) return new Promise((resolve) => { release = () => resolve({ id }) })
+          return { id }
+        },
+        quarantine: (browserId: string, pageIncarnation: string) => { quarantines.push({ id: browserId, page: pageIncarnation }) },
+        snapshot: () => state, pendingLoadCount: () => 0, liveIds: () => [], freezeAll: () => {},
+      }
+      const Service = TabBrowserService as unknown as new (s: TabBrowserStateStore, p: { setWindow: () => void }, h: typeof host, i: typeof state) => TabBrowserService
+      const service = new Service({ update: async () => state } as unknown as TabBrowserStateStore, { setWindow: () => {} }, host, state)
+      const command = { type: 'navigate' as const, id, url: 'https://example.test/', pageIncarnation: 'page', expectedGeneration: 1 }
+      const owner = new AbortController(); const first = service.command(command, owner.signal)
+      await vi.waitFor(() => expect(calls).toBe(1))
+      owner.abort(); await expect(first).rejects.toThrow('ACTION_CANCELLED')
+      const later = service.command(command)
+      await vi.advanceTimersByTimeAsync(TAB_BROWSER_QUEUE_BARRIER_TIMEOUT_MS)
+      await expect(later).resolves.toMatchObject({ id })
+      expect(quarantines).toEqual([{ id, page: 'page' }])
+      release(); await Promise.resolve()
+    } finally { vi.useRealTimers() }
+  })
+
   it('bounds quit drain when a browser adapter ignores cancellation', async () => {
     vi.useFakeTimers()
     try {
