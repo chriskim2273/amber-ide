@@ -253,7 +253,7 @@ untouched:
   strings, total nodes, and depth; the web poller caches an unchanged hostile
   fallback instead of reparsing it every second.
 
-Focused and repository validation completed in this worktree: app **950
+Focused and repository validation completed in this worktree: app **951
 passed / 1 intentional real-daemon skip**, strict typecheck, Rust workspace
 **805 passed / 1 intentional delegated-cgroup ignore**, warnings-as-errors
 workspace Clippy, Windows GNU cross-target compile, Electron/web production
