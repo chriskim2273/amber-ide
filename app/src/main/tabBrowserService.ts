@@ -26,10 +26,29 @@ function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
   })
 }
 
+interface BrowserQueueOperation {
+  /** The caller's controller. This operation, not the queue key, owns it. */
+  controller: AbortController
+  /** Set only after this entry has passed the pre-dispatch cancellation fence. */
+  started: boolean
+  /** Bound only at actual dispatch, never while the entry is merely queued. */
+  identity: { id: string; pageIncarnation: string } | undefined
+  /** Isolation is a one-shot transition for this operation. */
+  isolationStarted: boolean
+}
+
+/**
+ * Keep one queue tail per operation. A cancelled follower must still wait for
+ * its predecessor's tail: resolving its tail immediately would let the next
+ * entry overtake an active adapter. Only an entry that actually started may
+ * arm the bounded non-cooperative adapter barrier, and the isolation callback
+ * is therefore bound to that entry's runtime identity.
+ */
 function boundedQueueBarrier(
   promise: Promise<unknown>,
   releaseSignal: AbortSignal,
   timeoutMs: number,
+  operationStarted: () => boolean,
   stillPending?: () => boolean | undefined,
   isolate?: () => void | Promise<void>,
 ): Promise<void> {
@@ -37,10 +56,6 @@ function boundedQueueBarrier(
     let timer: NodeJS.Timeout | undefined
     let finished = false
     let operationSettled = false
-    const adapterPending = (): boolean => {
-      const explicit = stillPending?.()
-      return explicit === undefined ? !operationSettled : explicit
-    }
     const finish = (): void => {
       if (finished) return
       finished = true
@@ -49,16 +64,38 @@ function boundedQueueBarrier(
       resolve()
     }
     const release = (): void => {
-      if (finished || timer) return
-      if (!adapterPending() || timeoutMs <= 0) { finish(); return }
+      if (finished || timer || operationSettled) {
+        if (operationSettled) finish()
+        return
+      }
+      // This entry is still waiting behind another entry. Its cancellation is
+      // not permission to release the tail or quarantine the active entry.
+      if (!operationStarted()) return
+      const pending = stillPending?.()
+      if (pending === false) { finish(); return }
+      if (timeoutMs <= 0) {
+        void Promise.resolve(isolate?.()).then(finish, () => {})
+        return
+      }
       timer = setTimeout(() => {
         timer = undefined
-        if (!adapterPending()) { finish(); return }
-        Promise.resolve(isolate?.()).catch(() => {}).finally(finish)
+        if (operationSettled) { finish(); return }
+        const adapterPending = stillPending?.()
+        if (adapterPending === false) { finish(); return }
+        // The operation owns this callback. Do not infer ownership from the
+        // browser id: a queued follower can share the same incarnation.
+        void Promise.resolve(isolate?.()).then(finish, () => {})
       }, timeoutMs)
       timer.unref()
     }
-    promise.then(() => { operationSettled = true; if (!releaseSignal.aborted || !adapterPending()) finish() }, () => { operationSettled = true; if (!releaseSignal.aborted || !adapterPending()) finish() })
+    const settled = (): void => {
+      operationSettled = true
+      // A cooperative operation, including a cancelled queued follower that
+      // has just reached the head, releases normally. A non-cooperative active
+      // operation is released by the isolation timer above.
+      finish()
+    }
+    promise.then(settled, settled)
     releaseSignal.addEventListener('abort', release, { once: true })
     if (releaseSignal.aborted) release()
   })
@@ -155,7 +192,7 @@ export class TabBrowserService {
   private readonly latestPiActions = new Map<string, { type: 'pi-action'; browserId: string; controller: string; action: string; phase: 'started' | 'completed' | 'failed'; error?: string; at: number }>()
   private readonly pendingRuntimeEvents = new Map<string, unknown>()
   /** Operations whose caller has gone away but whose page adapter is being isolated. */
-  private readonly quarantinedOperations = new Set<string>()
+  private readonly quarantinedOperations = new Set<symbol>()
   private drainGeneration = 0
   private runtimeFlush: NodeJS.Timeout | null = null
   private approvalSurfaceVisible: (browserId: string) => boolean = () => false
@@ -332,8 +369,14 @@ export class TabBrowserService {
     const abort = (): void => controller.abort()
     signal?.addEventListener('abort', abort, { once: true })
     if (signal?.aborted) controller.abort()
+    const ownership: BrowserQueueOperation = { controller, started: false, identity: undefined, isolationStarted: false }
     const operation = prior.catch(() => {}).then(async () => {
       this.operations.assertDispatch(controller.signal)
+      // This is the ownership boundary. A follower that was cancelled while
+      // queued never gets a bound runtime and therefore cannot quarantine the
+      // operation that was active before it.
+      ownership.started = true
+      ownership.identity = this.browserOperationIdentity(command)
       const result = await this.runCommand(command, controller.signal, validate)
       // A non-cooperative adapter may resolve after its caller was cancelled.
       // Do not let that late result cross the service boundary or commit the
@@ -346,13 +389,15 @@ export class TabBrowserService {
     // queue after a bounded grace so one hung WebContents cannot block later
     // mutations or resident quit forever. The late operation remains attached
     // to this promise, so any eventual rejection is observed and isolated.
-    const identity = this.browserOperationIdentity(command)
     const tail = boundedQueueBarrier(operation, controller.signal, TAB_BROWSER_QUEUE_BARRIER_TIMEOUT_MS,
-      identity ? () => {
+      () => ownership.started,
+      () => {
+        const identity = ownership.identity
+        if (!identity) return false
         const pending = (this.host as unknown as { hasPendingOperation?: (id: string, incarnation: string) => boolean }).hasPendingOperation
         return typeof pending === 'function' ? pending.call(this.host, identity.id, identity.pageIncarnation) : undefined
-      } : undefined,
-      identity ? () => this.isolateBrowserOperation(identity.id, identity.pageIncarnation) : undefined)
+      },
+      () => this.isolateBrowserOperation(ownership))
     this.browserQueues.set(key, tail)
     void tail.then(() => {}, () => {}).finally(() => {
       signal?.removeEventListener('abort', abort)
@@ -368,8 +413,11 @@ export class TabBrowserService {
     return undefined
   }
 
-  private async isolateBrowserOperation(id: string, pageIncarnation: string): Promise<void> {
-    const key = `${id}\u0000${pageIncarnation}`
+  private async isolateBrowserOperation(ownership: BrowserQueueOperation): Promise<void> {
+    if (!ownership.started || ownership.isolationStarted || !ownership.identity) return
+    ownership.isolationStarted = true
+    const { id, pageIncarnation } = ownership.identity
+    const key = Symbol('browser-quarantine')
     this.quarantinedOperations.add(key)
     try { await this.host.quarantine?.(id, pageIncarnation) } finally { this.quarantinedOperations.delete(key) }
   }
