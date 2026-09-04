@@ -24,7 +24,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::mosaic::LAYOUT_FILE;
+use crate::{layout_file, mosaic::LAYOUT_FILE};
 
 /// Read result: both fields `None` when the sidecar doesn't exist yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,12 +36,12 @@ pub struct Loaded {
 /// Read the sidecar. Never fails — a missing/unreadable file is `None`/`None`,
 /// matching the "no sidecar yet" first-run case.
 pub fn load(root: &Path) -> Loaded {
-    match fs::read_to_string(root.join(LAYOUT_FILE)) {
-        Ok(text) => Loaded {
+    match layout_file::read_bounded_regular_file(&root.join(LAYOUT_FILE)) {
+        Ok(Some(text)) => Loaded {
             version: Some(text.clone()),
             text: Some(text),
         },
-        Err(_) => Loaded {
+        Ok(None) | Err(_) => Loaded {
             text: None,
             version: None,
         },
@@ -114,6 +114,9 @@ fn acquire_lock(root: &Path) -> std::io::Result<LayoutLock> {
 /// Cross-process CAS write. Node and Rust writers share the same short-lived
 /// lock file, so the content check and atomic replace are one critical section.
 pub fn save(root: &Path, text: &str, expected_version: Option<&str>) -> SaveResult {
+    if text.len() as u64 > layout_file::LAYOUT_FILE_MAX_BYTES {
+        return SaveResult::Error("LAYOUT_FILE_LIMIT".into());
+    }
     if let Err(e) = fs::create_dir_all(root) {
         return SaveResult::Error(e.to_string());
     }
@@ -122,7 +125,10 @@ pub fn save(root: &Path, text: &str, expected_version: Option<&str>) -> SaveResu
         Err(error) => return SaveResult::Error(error.to_string()),
     };
     let path = root.join(LAYOUT_FILE);
-    let current = fs::read_to_string(&path).ok();
+    let current = match layout_file::read_bounded_regular_file(&path) {
+        Ok(value) => value,
+        Err(error) => return SaveResult::Error(error.code().into()),
+    };
     if current.as_deref() != expected_version {
         return SaveResult::Conflict {
             version: current.clone(),
@@ -309,5 +315,41 @@ mod tests {
                 version: "{}".into()
             }
         );
+    }
+
+    #[test]
+    fn load_accepts_the_eight_mib_boundary_but_cas_never_returns_oversized_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let boundary = vec![b'x'; crate::layout_file::LAYOUT_FILE_MAX_BYTES as usize];
+        fs::write(dir.path().join(LAYOUT_FILE), &boundary).unwrap();
+        assert_eq!(load(dir.path()).text.as_deref().map(str::len), Some(boundary.len()));
+
+        fs::write(
+            dir.path().join(LAYOUT_FILE),
+            vec![b'y'; crate::layout_file::LAYOUT_FILE_MAX_BYTES as usize + 1],
+        )
+        .unwrap();
+        let loaded = load(dir.path());
+        assert_eq!(loaded.text, None);
+        assert_eq!(loaded.version, None);
+        assert_eq!(
+            save(dir.path(), "replacement", None),
+            SaveResult::Error("LAYOUT_FILE_LIMIT".into())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cas_rejects_a_symlink_current_file_instead_of_following_or_replacing_it() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        fs::write(&target, "keep").unwrap();
+        symlink(&target, dir.path().join(LAYOUT_FILE)).unwrap();
+        assert_eq!(
+            save(dir.path(), "overwrite", Some("keep")),
+            SaveResult::Error("LAYOUT_SYMLINK".into())
+        );
+        assert_eq!(fs::read_to_string(target).unwrap(), "keep");
     }
 }

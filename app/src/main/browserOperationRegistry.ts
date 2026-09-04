@@ -30,13 +30,46 @@ export class BrowserOperationRegistry {
         return await work(controller.signal)
       } finally {
         external?.removeEventListener('abort', abort)
-        this.active.delete(key)
-        if (this.active.size === 0) {
-          for (const resolve of this.emptyWaiters) resolve()
-          this.emptyWaiters.clear()
-        }
+        this.finish(key)
       }
     })
+  }
+
+  /**
+   * Run work with a controller owned by the caller. This is needed when a
+   * request has an asynchronous admission step before it can be put on its
+   * resource FIFO: the controller must already be visible to socket-close,
+   * owner-cancel, and drain before that step is awaited.
+   */
+  runWithController<T>(kind: BrowserOperationKind, controller: AbortController, work: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    const inherited = this.context.getStore()
+    if (inherited) {
+      this.assertDispatch(inherited)
+      if (controller.signal.aborted) return Promise.reject(new Error('ACTION_CANCELLED'))
+      return work(inherited)
+    }
+    if (!this.accepting) {
+      controller.abort()
+      return Promise.reject(new Error('BROWSER_HOST_SHUTTING_DOWN'))
+    }
+    const key = Symbol(kind)
+    this.active.set(key, { kind, controller })
+    return this.context.run(controller.signal, async () => {
+      try {
+        this.assertDispatch(controller.signal)
+        return await work(controller.signal)
+      } finally {
+        this.finish(key)
+      }
+    })
+  }
+
+  private finish(key: symbol): void {
+    this.active.delete(key)
+    if (this.active.size === 0) {
+      for (const resolve of this.emptyWaiters) resolve()
+      this.emptyWaiters.clear()
+    }
   }
 
   assertDispatch(signal?: AbortSignal): void {

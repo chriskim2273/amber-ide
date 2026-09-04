@@ -159,10 +159,26 @@ platform.
   function instead. If this is not acceptable for this feature specifically,
   it would need a lightweight renderer-level harness that doesn't currently
   exist anywhere in the app.
-- I did not modify `crates/amber/src/mosaic.rs` (the read-only mosaic render
-  path for the old hand-written `assets/app.js` UI) — it's a separate reader of
-  the same file for a different consumer and out of scope for CAS.
+- The original CAS commit did not modify `crates/amber/src/mosaic.rs` because
+  its read-only render path was then out of scope. The 2026-09-03 containment
+  follow-up now does: mosaic and CAS share the bounded regular-file loader,
+  graph/string validation, and cached hostile-file polling fallback. This is a
+  separate hardening pass and not a change to CAS merge semantics.
 - `cargo clippy`/`cargo test` run through this environment's normal shell
   produced a misleading summarized report at one point (see Test summary
   above); I verified directly against the real `cargo` binary before relying on
   the result. Flagging in case it recurs for whoever reviews this next.
+
+## 2026-09-03 containment follow-up
+
+The later tab-browser host review added the bounded ingress work that was
+outside the original CAS commit: `crates/amber/src/layout_file.rs` is now the
+shared Rust regular-file loader used by both `layout_cas` and `mosaic`, with
+8 MiB, symlink, replacement/growth, and UTF-8 checks. Mosaic parsing validates
+workspace/tab/map/string/tree bounds and its web poller caches an unchanged
+fallback. The Node CAS reread and SSH remote-layout probe use matching 8 MiB
+limits and no partial result on overflow/timeout. The broker admission fix and
+its queue-key cancellation tests are tracked in `tab-browser-host.md` and the
+machine-readable remaining report. Current validation is recorded there; the
+branch remains `mergeReady: false` because the deployment/package/platform and
+independent resident-review gates are still open.

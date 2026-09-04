@@ -413,4 +413,62 @@ describe('tab browser broker boundary', () => {
     expect(replies[3]).toMatchObject({ ok: true, result: { action: 'status' } })
     await server.close()
   })
+
+  it.each(['socket-close', 'stop-pi', 'drain'] as const)('cancels a request while queueKey is pending (%s), without losing later FIFO work', async (mode) => {
+    if (process.platform === 'win32') return
+    const dir = await mkdtemp(join(tmpdir(), 'amber-browser-broker-')); cleanup.push(dir)
+    const socketPath = join(dir, 'broker.sock'), tokenPath = join(dir, 'token')
+    const operations = new BrowserOperationRegistry()
+    let handleCalls = 0
+    let releaseKey!: (key: string) => void
+    let queueEntered!: () => void
+    const entered = new Promise<void>((resolve) => { queueEntered = resolve })
+    let first = true
+    const server = new TabBrowserBrokerServer(socketPath, tokenPath, async () => { handleCalls += 1; return { handled: true } }, {
+      operations,
+      queueKey: async () => {
+        if (!first) return 'browser:test'
+        first = false; queueEntered()
+        return new Promise<string>((resolve) => { releaseKey = resolve })
+      },
+    })
+    await server.start()
+    const token = (await readFile(tokenPath, 'utf8')).trim()
+    const encode = (value: unknown): Buffer => { const body = Buffer.from(JSON.stringify(value)); const out = Buffer.alloc(body.length + 4); out.writeUInt32BE(body.length); body.copy(out, 4); return out }
+    const firstSocket = connect(socketPath); firstSocket.on('error', () => {})
+    await new Promise<void>((resolve) => firstSocket.once('connect', resolve))
+    firstSocket.write(encode({ token }))
+    await new Promise<void>((resolve) => firstSocket.once('data', () => resolve()))
+    firstSocket.write(encode({ version: 1, clientInstanceId: `cancel-${mode}`, sequence: 1, requestId: 'cancelled', amberSession: 'amber-1-2-0-pane', action: { type: 'status' } }))
+    await entered
+    expect(operations.summary()).toMatchObject({ broker: 1, total: 1 })
+
+    if (mode === 'socket-close') firstSocket.destroy()
+    else if (mode === 'stop-pi') server.cancelController('amber-1-2-0-pane')
+    else operations.beginDrain()
+    await operations.waitForEmpty()
+    expect(operations.summary().total).toBe(0)
+    releaseKey('browser:test')
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    expect(handleCalls).toBe(0)
+
+    if (mode === 'drain') operations.cancelDrain()
+    firstSocket.destroy()
+    const later = await new Promise<Record<string, unknown>>((resolve, reject) => {
+      const socket = connect(socketPath); let buffer = Buffer.alloc(0); let welcomed = false
+      socket.on('error', reject)
+      socket.on('connect', () => socket.write(encode({ token })))
+      socket.on('data', (chunk) => {
+        buffer = Buffer.concat([buffer, chunk])
+        while (buffer.length >= 4 && buffer.length >= buffer.readUInt32BE(0) + 4) {
+          const size = buffer.readUInt32BE(0); const reply = JSON.parse(buffer.subarray(4, 4 + size).toString()) as Record<string, unknown>; buffer = buffer.subarray(4 + size)
+          if (!welcomed) { welcomed = true; socket.write(encode({ version: 1, clientInstanceId: `later-${mode}`, sequence: 1, requestId: 'later', amberSession: 'amber-1-2-0-pane', action: { type: 'status' } })) }
+          else { socket.end(); resolve(reply) }
+        }
+      })
+    })
+    expect(later).toMatchObject({ ok: true, result: { handled: true } })
+    expect(handleCalls).toBe(1)
+    await server.close()
+  })
 })

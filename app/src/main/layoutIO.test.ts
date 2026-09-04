@@ -1,8 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtemp, rm, readFile, lstat, symlink, writeFile } from 'node:fs/promises'
+import { mkdtemp, rm, readFile, lstat, symlink, writeFile, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { loadLayoutFile, saveLayoutFile } from './layoutIO'
+import { LAYOUT_FILE_MAX_BYTES } from '../shared/layoutFile'
 
 let dir: string
 let path: string
@@ -15,6 +16,16 @@ afterEach(async () => {
 })
 
 describe('loadLayoutFile', () => {
+  it('accepts exactly the layout byte limit but rejects an oversized file without reading it', async () => {
+    await writeFile(path, Buffer.alloc(LAYOUT_FILE_MAX_BYTES, 0x78))
+    const boundary = await loadLayoutFile(path)
+    expect(boundary.text).toHaveLength(LAYOUT_FILE_MAX_BYTES)
+    expect(boundary.version).toBe(boundary.text)
+
+    await writeFile(path, Buffer.alloc(LAYOUT_FILE_MAX_BYTES + 1, 0x79))
+    expect(await loadLayoutFile(path)).toEqual({ text: null, version: null, error: 'LAYOUT_FILE_LIMIT' })
+  })
+
   it('returns text and a version equal to it', async () => {
     const { writeFile } = await import('node:fs/promises')
     await writeFile(path, '{"a":1}')
@@ -99,7 +110,15 @@ describe('saveLayoutFile', () => {
     const target = join(dir, 'target')
     await writeFile(target, 'do-not-touch')
     await symlink(target, path)
-    expect(await saveLayoutFile(path, '{}', 'do-not-touch')).toMatchObject({ error: expect.stringContaining('symlink') })
+    expect(await saveLayoutFile(path, '{}', 'do-not-touch')).toEqual({ error: 'LAYOUT_SYMLINK' })
     expect(await readFile(target, 'utf8')).toBe('do-not-touch')
+  })
+
+  it('does not return an oversized sidecar when it swaps in after the caller pre-read', async () => {
+    await saveLayoutFile(path, 'before', null)
+    const loaded = await loadLayoutFile(path)
+    await writeFile(path, Buffer.alloc(LAYOUT_FILE_MAX_BYTES + 1, 0x7a))
+    expect(await saveLayoutFile(path, 'after', loaded.version)).toEqual({ error: 'LAYOUT_FILE_LIMIT' })
+    expect((await stat(path)).size).toBe(LAYOUT_FILE_MAX_BYTES + 1)
   })
 })

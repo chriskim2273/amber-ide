@@ -2,13 +2,14 @@
 //! render-ready mosaic JSON for `amber web`. Read-only: this module never
 //! writes the sidecar (the Electron app is its sole writer).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::time::SystemTime;
 
 use serde::Deserialize;
 
-/// Sidecar file name inside the state root, written by the Electron app.
-pub const LAYOUT_FILE: &str = "ui-layout.json";
+pub use crate::layout_file::LAYOUT_FILE;
+use crate::layout_file::{read_bounded_regular_file, LAYOUT_MAX_MAP_ENTRIES, LAYOUT_MAX_STRING_BYTES, LAYOUT_MAX_TABS_PER_WORKSPACE, LAYOUT_MAX_TREE_DEPTH, LAYOUT_MAX_TREE_NODES, LAYOUT_MAX_WORKSPACES};
 
 /// A node of the app's binary split tree. Mirrors `app/src/renderer/layout.ts`.
 ///
@@ -99,6 +100,80 @@ impl Default for LayoutFile {
     }
 }
 
+fn bounded_string(value: &str) -> bool {
+    value.len() <= LAYOUT_MAX_STRING_BYTES
+}
+
+/// Validate the parsed subset before any tree pruning or JSON projection.
+///
+/// The byte cap protects the file ingress; these structural caps protect the
+/// allocations and recursive work represented by a valid-sized file. Keeping
+/// this check separate from serde makes it reusable by `render` too, so a
+/// caller constructing a `LayoutFile` directly cannot bypass the containment
+/// boundary.
+pub(crate) fn validate_layout(layout: &LayoutFile) -> bool {
+    if !matches!(layout.version, 1 | 2)
+        || layout.workspaces.len() > LAYOUT_MAX_WORKSPACES
+        || layout.frozen.len() > LAYOUT_MAX_MAP_ENTRIES
+    {
+        return false;
+    }
+    let mut tree_nodes = 0usize;
+    for (workspace_id, workspace) in &layout.workspaces {
+        if !bounded_string(workspace_id)
+            || workspace.tabs.len() > LAYOUT_MAX_TABS_PER_WORKSPACE
+            || workspace.tab_order.as_ref().is_some_and(|order| order.len() > LAYOUT_MAX_TABS_PER_WORKSPACE)
+            || workspace.label.as_deref().is_some_and(|label| !bounded_string(label))
+        {
+            return false;
+        }
+        for (tab_id, tab) in &workspace.tabs {
+            if !bounded_string(tab_id) || tab.label.as_deref().is_some_and(|label| !bounded_string(label)) {
+                return false;
+            }
+            if let Some(tree) = tab.tree.as_ref() {
+                if !validate_tree(tree, &mut tree_nodes) {
+                    return false;
+                }
+            }
+        }
+    }
+    for (pane_id, frozen) in &layout.frozen {
+        if !bounded_string(pane_id) || frozen.note.as_deref().is_some_and(|note| !bounded_string(note)) {
+            return false;
+        }
+    }
+    true
+}
+
+fn validate_tree(root: &Node, count: &mut usize) -> bool {
+    let mut pending = vec![(root, 1usize)];
+    while let Some((node, depth)) = pending.pop() {
+        if depth > LAYOUT_MAX_TREE_DEPTH {
+            return false;
+        }
+        *count += 1;
+        if *count > LAYOUT_MAX_TREE_NODES {
+            return false;
+        }
+        match node {
+            Node::Leaf { pane_id } => {
+                if !bounded_string(pane_id) {
+                    return false;
+                }
+            }
+            Node::Split { dir, ratio, a, b } => {
+                if !matches!(dir.as_str(), "h" | "v") || !ratio.is_finite() || !(0.0..=1.0).contains(ratio) {
+                    return false;
+                }
+                pending.push((a, depth + 1));
+                pending.push((b, depth + 1));
+            }
+        }
+    }
+    true
+}
+
 /// Read `<root>/ui-layout.json`. A missing, unreadable or malformed sidecar is
 /// NOT an error: it degrades to empty, which renders as the equal-splits
 /// fallback the desktop app itself uses. Core rule #3 — grouping must be
@@ -106,14 +181,80 @@ impl Default for LayoutFile {
 ///
 /// Version validation: v1 and v2 share the subset this read-only projection
 /// consumes. Unknown or missing versions return empty so a future writer can
-/// never be misinterpreted.
+/// never be misinterpreted. The shared loader rejects symlinks, non-regular
+/// files, oversize files, and in-place growth before serde sees any bytes.
 pub fn load(root: &Path) -> LayoutFile {
-    match std::fs::read_to_string(root.join(LAYOUT_FILE))
+    read_bounded_regular_file(&root.join(LAYOUT_FILE))
         .ok()
-        .and_then(|s| serde_json::from_str::<LayoutFile>(&s).ok())
-    {
-        Some(layout) if matches!(layout.version, 1 | 2) => layout,
-        _ => LayoutFile::default(),
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<LayoutFile>(&raw).ok())
+        .filter(validate_layout)
+        .unwrap_or_default()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LayoutStamp {
+    len: u64,
+    modified: Option<SystemTime>,
+    symlink: bool,
+    regular: bool,
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+}
+
+fn layout_stamp(path: &Path) -> Option<LayoutStamp> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    let file_type = metadata.file_type();
+    Some(LayoutStamp {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+        symlink: file_type.is_symlink(),
+        regular: file_type.is_file(),
+        #[cfg(unix)]
+        dev: {
+            use std::os::unix::fs::MetadataExt;
+            metadata.dev()
+        },
+        #[cfg(unix)]
+        ino: {
+            use std::os::unix::fs::MetadataExt;
+            metadata.ino()
+        },
+    })
+}
+
+/// Poll-side cache for malformed/oversized sidecars. The shared loader still
+/// performs the authoritative descriptor checks whenever this stamp changes;
+/// an unchanged hostile file is not reparsed and recloned every second.
+#[derive(Debug, Clone, Default)]
+pub struct LayoutCache {
+    stamp: Option<LayoutStamp>,
+    layout: LayoutFile,
+}
+
+impl LayoutCache {
+    pub fn load(&mut self, root: &Path) -> LayoutFile {
+        let path = root.join(LAYOUT_FILE);
+        let stamp = layout_stamp(&path);
+        if self.stamp == stamp {
+            return self.layout.clone();
+        }
+        let mut layout = load(root);
+        let mut settled = layout_stamp(&path);
+        // An atomic writer can replace the path between the stamp and the
+        // descriptor read. Retry once when that happens; the shared loader's
+        // identity check prevents caching a fallback produced from the old
+        // inode forever. The retry is deliberately bounded against a writer
+        // that keeps changing the file.
+        if settled != stamp {
+            layout = load(root);
+            settled = layout_stamp(&path);
+        }
+        self.stamp = settled;
+        self.layout = layout.clone();
+        layout
     }
 }
 
@@ -148,12 +289,13 @@ pub fn parse_pane_name(name: &str) -> Option<(u32, u32, u32)> {
     Some((ws, tab, ord))
 }
 
-/// Drop `pane_id` from the tree; a split that loses one child is replaced by
-/// its surviving child. Port of `removeLeaf` in `app/src/renderer/layout.ts`.
-fn remove_leaf(n: &Node, pane_id: &str) -> Option<Node> {
+/// Prune all non-live leaves in one walk; a split that loses one child is
+/// replaced by its surviving child. Doing this as one pass avoids cloning and
+/// walking the whole tree once per stale leaf.
+fn prune_tree(n: &Node, live: &HashSet<&str>) -> Option<Node> {
     match n {
-        Node::Leaf { pane_id: p } => (p != pane_id).then(|| n.clone()),
-        Node::Split { dir, ratio, a, b } => match (remove_leaf(a, pane_id), remove_leaf(b, pane_id)) {
+        Node::Leaf { pane_id } => live.contains(pane_id.as_str()).then(|| n.clone()),
+        Node::Split { dir, ratio, a, b } => match (prune_tree(a, live), prune_tree(b, live)) {
             (None, None) => None,
             (Some(x), None) | (None, Some(x)) => Some(x),
             (Some(x), Some(y)) => Some(Node::Split {
@@ -211,6 +353,11 @@ fn node_json(n: &Node) -> serde_json::Value {
 /// any leaf that is not a live daemon session* — never as a list of known id
 /// prefixes. That is why a future app-local pane kind needs no change here.
 pub fn render(f: &LayoutFile, sessions: &[SessionInfo]) -> serde_json::Value {
+    // Keep the fallback true even for callers that bypass `load` and hand us a
+    // deserialized value directly (for example, a future in-process adapter).
+    if !validate_layout(f) {
+        return render(&LayoutFile::default(), sessions);
+    }
     // Every daemon session whose name parses as a pane, grouped by (ws, tab).
     let mut by_tab: HashMap<(u32, u32), Vec<&str>> = HashMap::new();
     let mut live: Vec<&str> = Vec::new();
@@ -220,6 +367,7 @@ pub fn render(f: &LayoutFile, sessions: &[SessionInfo]) -> serde_json::Value {
             live.push(&s.name);
         }
     }
+    let live_set: HashSet<&str> = live.iter().copied().collect();
     // Deterministic order for appended panes (sessions arrive unordered).
     for v in by_tab.values_mut() {
         v.sort_unstable();
@@ -267,20 +415,11 @@ pub fn render(f: &LayoutFile, sessions: &[SessionInfo]) -> serde_json::Value {
         let mut out_tabs = Vec::new();
         for tab in tab_ids {
             let tl = wl.and_then(|w| w.tabs.get(&tab.to_string()));
-            let mut tree = tl.and_then(|t| t.tree.clone());
 
-            // Prune every leaf that is not a live daemon session.
-            if let Some(t) = tree.as_ref() {
-                let mut ids = Vec::new();
-                leaves(t, &mut ids);
-                let mut cur = Some(t.clone());
-                for id in ids {
-                    if !live.iter().any(|n| *n == id) {
-                        cur = cur.and_then(|c| remove_leaf(&c, &id));
-                    }
-                }
-                tree = cur;
-            }
+            // Prune every leaf that is not a live daemon session in one pass.
+            let mut tree = tl
+                .and_then(|t| t.tree.as_ref())
+                .and_then(|t| prune_tree(t, &live_set));
 
             // Append daemon sessions the sidecar never recorded.
             let placed: Vec<String> = tree.as_ref().map(|t| {
@@ -330,6 +469,8 @@ pub fn render(f: &LayoutFile, sessions: &[SessionInfo]) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::io::Write;
 
     /// A sidecar with the exact shape `app/src/shared/layoutFile.ts` writes:
     /// an internally-tagged split tree, string-keyed ws/tab maps, and the
@@ -623,5 +764,101 @@ mod tests {
         );
         let s = v.to_string();
         assert!(!s.contains("parked"), "note text leaked into the payload: {s}");
+    }
+
+    fn write_layout(dir: &tempfile::TempDir, value: serde_json::Value) {
+        fs::write(dir.path().join(LAYOUT_FILE), serde_json::to_vec(&value).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn rejects_wide_maps_deep_trees_and_large_tree_counts_before_rendering() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspaces = (0..257)
+            .map(|i| (i.to_string(), serde_json::json!({ "tabs": {} })))
+            .collect::<serde_json::Map<_, _>>();
+        write_layout(&dir, serde_json::json!({ "version": 1, "workspaces": workspaces }));
+        assert!(load(dir.path()).workspaces.is_empty());
+
+        let mut deep = serde_json::json!({ "kind": "leaf", "paneId": "amber-1-1-0-x" });
+        for _ in 0..64 {
+            deep = serde_json::json!({ "kind": "split", "dir": "h", "ratio": 0.5, "a": deep, "b": { "kind": "leaf", "paneId": "amber-1-1-0-x" } });
+        }
+        write_layout(&dir, serde_json::json!({ "version": 1, "workspaces": { "1": { "tabs": { "1": { "tree": deep } } } } }));
+        assert!(load(dir.path()).workspaces.is_empty());
+
+        fn balanced(leaves: usize, next: &mut usize) -> serde_json::Value {
+            if leaves == 1 {
+                let id = *next;
+                *next += 1;
+                return serde_json::json!({ "kind": "leaf", "paneId": format!("amber-1-1-{id}-x") });
+            }
+            let left = leaves / 2;
+            let right = leaves - left;
+            serde_json::json!({ "kind": "split", "dir": "v", "ratio": 0.5, "a": balanced(left, next), "b": balanced(right, next) })
+        }
+        let mut next = 0;
+        let tree = balanced(crate::layout_file::LAYOUT_MAX_TREE_NODES / 2 + 1, &mut next);
+        write_layout(&dir, serde_json::json!({ "version": 1, "workspaces": { "1": { "tabs": { "1": { "tree": tree } } } } }));
+        assert!(load(dir.path()).workspaces.is_empty());
+    }
+
+    #[test]
+    fn rejects_oversized_maps_and_relevant_strings() {
+        let dir = tempfile::tempdir().unwrap();
+        let frozen = (0..=crate::layout_file::LAYOUT_MAX_MAP_ENTRIES)
+            .map(|i| (format!("amber-1-1-0-{i}"), serde_json::json!({})))
+            .collect::<serde_json::Map<_, _>>();
+        write_layout(&dir, serde_json::json!({ "version": 1, "frozen": frozen }));
+        assert!(load(dir.path()).frozen.is_empty());
+
+        write_layout(&dir, serde_json::json!({
+            "version": 1,
+            "workspaces": { "1": { "label": "x".repeat(crate::layout_file::LAYOUT_MAX_STRING_BYTES + 1), "tabs": {} } }
+        }));
+        assert!(load(dir.path()).workspaces.is_empty());
+    }
+
+    #[test]
+    fn cached_fallback_refreshes_when_a_sidecar_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cache = LayoutCache::default();
+        assert!(cache.load(dir.path()).workspaces.is_empty());
+        write_layout(&dir, serde_json::json!({
+            "version": 1,
+            "workspaces": { "1": { "tabs": { "1": { "label": "cached" } } } }
+        }));
+        assert_eq!(cache.load(dir.path()).workspaces["1"].tabs["1"].label.as_deref(), Some("cached"));
+        fs::write(dir.path().join(LAYOUT_FILE), vec![b'x'; crate::layout_file::LAYOUT_FILE_MAX_BYTES as usize + 1]).unwrap();
+        assert!(cache.load(dir.path()).workspaces.is_empty());
+    }
+
+    #[test]
+    fn malformed_or_oversized_sidecars_degrade_to_the_default_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(LAYOUT_FILE), vec![b'{'; crate::layout_file::LAYOUT_FILE_MAX_BYTES as usize + 1]).unwrap();
+        let f = load(dir.path());
+        assert!(f.workspaces.is_empty());
+        assert_eq!(f.active_workspace, 1);
+        fs::write(dir.path().join(LAYOUT_FILE), b"{not-json").unwrap();
+        let f = load(dir.path());
+        assert!(f.workspaces.is_empty());
+        assert_eq!(f.active_workspace, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_symlink_and_grown_replacement_are_rejected_by_the_shared_loader() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        fs::write(&target, b"{}\n").unwrap();
+        symlink(&target, dir.path().join(LAYOUT_FILE)).unwrap();
+        assert!(matches!(crate::layout_file::read_bounded_regular_file(&dir.path().join(LAYOUT_FILE)), Err(crate::layout_file::ReadError::Symlink)));
+        fs::remove_file(dir.path().join(LAYOUT_FILE)).unwrap();
+        fs::write(dir.path().join(LAYOUT_FILE), vec![b'x'; crate::layout_file::LAYOUT_FILE_MAX_BYTES as usize]).unwrap();
+        let mut file = std::fs::OpenOptions::new().append(true).open(dir.path().join(LAYOUT_FILE)).unwrap();
+        file.write_all(b"growth").unwrap();
+        drop(file);
+        assert!(matches!(crate::layout_file::read_bounded_regular_file(&dir.path().join(LAYOUT_FILE)), Err(crate::layout_file::ReadError::TooLarge)));
     }
 }

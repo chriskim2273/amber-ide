@@ -1,9 +1,11 @@
 import { describe, it, expect } from 'vitest'
+import { EventEmitter } from 'node:events'
 import { join } from 'node:path'
 import {
   sshTunnelArgv, sshProbeArgv, isValidHost, localSocketPath, hostLabel,
-  REMOTE_SOCKET_PROBE, parseAgentSock, explainSshFailure,
-  isSupportedOnPlatform,
+  REMOTE_SOCKET_PROBE, REMOTE_LAYOUT_PROBE, REMOTE_LAYOUT_PROBE_MAX_BYTES,
+  parseAgentSock, explainSshFailure, isSupportedOnPlatform, runSshProbe,
+  type SshProbeChild,
 } from './sshRemote'
 
 describe('sshTunnelArgv', () => {
@@ -39,6 +41,13 @@ describe('sshTunnelArgv', () => {
   })
 })
 
+class FakeProbeChild extends EventEmitter implements SshProbeChild {
+  readonly stdout = new EventEmitter()
+  readonly stderr = new EventEmitter()
+  readonly killed: Array<NodeJS.Signals | undefined> = []
+  kill(signal?: NodeJS.Signals): boolean { this.killed.push(signal); return true }
+}
+
 describe('sshProbeArgv', () => {
   it('never blocks on an interactive prompt', () => {
     // A probe that sits waiting for a password would hang the window's open.
@@ -46,6 +55,37 @@ describe('sshProbeArgv', () => {
     expect(p.args.join(' ')).toContain('BatchMode=yes')
     expect(p.args.join(' ')).toContain('ConnectTimeout=10')
     expect(p.args[p.args.length - 1]).toBe(REMOTE_SOCKET_PROBE)
+  })
+
+  it('terminates a noncooperative child and forwards no partial layout on overflow', async () => {
+    const child = new FakeProbeChild()
+    const probe = runSshProbe('box', REMOTE_LAYOUT_PROBE, {}, { maxBytes: REMOTE_LAYOUT_PROBE_MAX_BYTES, timeoutMs: 100 }, {
+      spawn: () => child,
+    })
+    child.stdout.emit('data', Buffer.alloc(REMOTE_LAYOUT_PROBE_MAX_BYTES + 1, 0x78))
+    await expect(probe).resolves.toMatchObject({ out: '', err: '', code: -1, error: 'LAYOUT_FILE_LIMIT' })
+    expect(child.killed).toEqual(['SIGKILL'])
+    child.stdout.emit('data', Buffer.from('partial-after-failure'))
+  })
+
+  it('bounds combined stdout and stderr, never just one stream', async () => {
+    const child = new FakeProbeChild()
+    const probe = runSshProbe('box', REMOTE_LAYOUT_PROBE, {}, { maxBytes: 8, timeoutMs: 100 }, {
+      spawn: () => child,
+    })
+    child.stderr.emit('data', Buffer.alloc(8, 0x65))
+    child.stdout.emit('data', Buffer.from('x'))
+    await expect(probe).resolves.toMatchObject({ out: '', err: '', code: -1, error: 'LAYOUT_FILE_LIMIT' })
+    expect(child.killed).toEqual(['SIGKILL'])
+  })
+
+  it('terminates a noncooperative child on the wall-clock timeout', async () => {
+    const child = new FakeProbeChild()
+    const probe = runSshProbe('box', REMOTE_LAYOUT_PROBE, {}, { maxBytes: REMOTE_LAYOUT_PROBE_MAX_BYTES, timeoutMs: 5 }, {
+      spawn: () => child,
+    })
+    await expect(probe).resolves.toMatchObject({ out: '', err: '', code: -1, error: 'SSH_PROBE_TIMEOUT' })
+    expect(child.killed).toEqual(['SIGKILL'])
   })
 })
 

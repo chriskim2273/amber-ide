@@ -60,8 +60,9 @@ import { compatSignature, shouldUseCompat, compatWorthyReason, COMPAT_SWITCHES, 
 import { installBinary } from './installBinary'
 import { repairAgentExtensions } from './agentSetup'
 import {
-  sshTunnelArgv, sshProbeArgv, isValidHost, localSocketPath, hostLabel,
-  REMOTE_SOCKET_PROBE, REMOTE_LAYOUT_PROBE, parseAgentSock, explainSshFailure,
+  sshTunnelArgv, isValidHost, localSocketPath, hostLabel,
+  REMOTE_SOCKET_PROBE, REMOTE_LAYOUT_PROBE, REMOTE_LAYOUT_PROBE_MAX_BYTES,
+  parseAgentSock, explainSshFailure, runSshProbe,
   isSupportedOnPlatform,
 } from './sshRemote'
 import { webCtlArgv, parseWebStatus, redactUrl, type WebStatus } from './webService'
@@ -845,19 +846,6 @@ function sshEnv(): NodeJS.ProcessEnv {
   }
 }
 
-/** Run a one-shot command on the remote and return its stdout (trimmed). */
-function sshProbe(host: string, script: string): Promise<{ out: string; err: string; code: number }> {
-  const a = sshProbeArgv(host, script)
-  return new Promise((resolveProbe) => {
-    const p = spawn(a.cmd, a.args, { stdio: ['ignore', 'pipe', 'pipe'], env: sshEnv() })
-    let out = ''
-    let err = ''
-    p.stdout?.on('data', (d: Buffer) => { out += d.toString() })
-    p.stderr?.on('data', (d: Buffer) => { err += d.toString() })
-    p.on('close', (code) => resolveProbe({ out: out.trim(), err: err.trim(), code: code ?? -1 }))
-    p.on('error', (e) => resolveProbe({ out: '', err: String(e), code: -1 }))
-  })
-}
 
 /**
  * Open a window onto another machine's amber (spec 2026-08-23).
@@ -887,8 +875,8 @@ async function openRemoteWindow(host: string): Promise<void> {
     return
   }
 
-  const probe = await sshProbe(host, REMOTE_SOCKET_PROBE)
-  if (probe.code !== 0) {
+  const probe = await runSshProbe(host, REMOTE_SOCKET_PROBE, sshEnv())
+  if (probe.code !== 0 || probe.error) {
     // ssh's own message is usually better than anything we could invent
     // (unknown host, name resolution, refused). The one case it under-reports
     // is a missing agent, which it can only call "permission denied".
@@ -896,11 +884,12 @@ async function openRemoteWindow(host: string): Promise<void> {
     await dialog.showMessageBox({
       type: 'error',
       message: `Could not reach ${host}`,
-      detail: explained ?? (probe.err || `ssh exited ${probe.code}`),
+      detail: explained ?? (probe.error || probe.err || `ssh exited ${probe.code}`),
     })
     return
   }
-  if (probe.out.length === 0) {
+  const remoteSocket = probe.out.trim()
+  if (remoteSocket.length === 0) {
     await dialog.showMessageBox({
       type: 'error',
       message: `No amber daemon on ${host}`,
@@ -914,7 +903,7 @@ async function openRemoteWindow(host: string): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), 'amber-ssh-'))
   await chmod(dir, 0o700)
   const localSock = localSocketPath(dir)
-  const a = sshTunnelArgv(host, localSock, probe.out)
+  const a = sshTunnelArgv(host, localSock, remoteSocket)
   const proc = spawn(a.cmd, a.args, { stdio: ['ignore', 'pipe', 'pipe'], env: sshEnv() })
   let tunnelErr = ''
   proc.stderr?.on('data', (d: Buffer) => { tunnelErr += d.toString() })
@@ -1926,11 +1915,17 @@ async function main(): Promise<void> {
   ipcMain.handle('layout-load', async (e) => {
     const ctx = ctxFor(e)
     if (ctx?.target.kind === 'remote' && ctx.target.host !== undefined) {
-      const probe = await sshProbe(ctx.target.host, REMOTE_LAYOUT_PROBE)
+      const probe = await runSshProbe(ctx.target.host, REMOTE_LAYOUT_PROBE, sshEnv(), {
+        maxBytes: REMOTE_LAYOUT_PROBE_MAX_BYTES,
+      })
       // A missing or unreadable sidecar is not an error: grouping comes from
       // session names (rule #2), so the window still shows the right panes at
       // default geometry — the same fallback core rule #3 already requires.
-      return { text: probe.out.length > 0 ? probe.out : null, version: null }
+      // Overflow/timeout is different: never hand a partial layout to the
+      // renderer, and surface a stable error instead of treating truncation as
+      // an ordinary missing sidecar.
+      if (probe.error) return { text: null, version: null, error: probe.error }
+      return { text: probe.code === 0 && probe.out.length > 0 ? probe.out : null, version: null }
     }
     return loadLayoutFile(layoutPath())
   })

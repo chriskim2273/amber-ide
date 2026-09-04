@@ -355,17 +355,17 @@ export class TabBrowserBrokerServer {
               if (request.sequence <= previousSequence) throw new Error('ACTION_CANCELLED')
               if (!knownClient && this.highWater.size >= (this.options.maxClientIdentities ?? 1024)) throw new Error('REQUEST_LIMIT')
               this.highWater.set(request.clientInstanceId, request.sequence)
-              const key = this.options.queueKey ? await this.options.queueKey(request) : `session:${request.amberSession}`
-              if (key.length < 1 || key.length > 512) throw new Error('INVALID_REQUEST')
-              const depth = this.queueDepth.get(key) ?? 0
-              if (depth >= 16) throw new Error('REQUEST_LIMIT')
+              // Admission can perform asynchronous authorization before the
+              // request has a queue key. Own the controller first: socket
+              // close, Stop Pi, and broker drain must be able to cancel that
+              // await just like they cancel queued/active work.
               const controller = new AbortController(); active.add(controller); this.activeRequests.set(controller, request.amberSession)
               const unregister = (): void => { active.delete(controller); this.activeRequests.delete(controller) }
               controller.signal.addEventListener('abort', unregister, { once: true })
               let operationBarrier: Promise<void> = Promise.resolve()
               const execute = async (): Promise<unknown> => {
-                if (controller.signal.aborted) { active.delete(controller); this.activeRequests.delete(controller); throw new Error('ACTION_CANCELLED') }
-                if (this.inFlight >= 32) { active.delete(controller); this.activeRequests.delete(controller); throw new Error('REQUEST_LIMIT') }
+                if (controller.signal.aborted) { unregister(); throw new Error('ACTION_CANCELLED') }
+                if (this.inFlight >= 32) { unregister(); throw new Error('REQUEST_LIMIT') }
                 this.inFlight += 1
                 try {
                   const timeoutMs = this.options.requestTimeoutMs ?? (request.action.type === 'wait' ? Math.min(121_000, request.action.timeoutMs + 1_000) : 30_000)
@@ -396,30 +396,94 @@ export class TabBrowserBrokerServer {
                   }
                 } finally { unregister(); this.inFlight -= 1 }
               }
-              this.queueDepth.set(key, depth + 1)
-              const prior = this.queues.get(key) ?? Promise.resolve()
-              const scheduled = this.options.operations
-                ? this.options.operations.run('broker', async (signal) => {
-                    const abortOwned = (): void => controller.abort()
-                    signal.addEventListener('abort', abortOwned, { once: true })
-                    try { await prior.catch(() => {}); this.options.operations!.assertDispatch(signal); return await execute() }
-                    finally { signal.removeEventListener('abort', abortOwned) }
-                  }, controller.signal)
-                : prior.catch(() => {}).then(execute)
-              // The client-facing promise must settle on cancellation even if
-              // it is still waiting behind an older request. The queue tail is
-              // separate and remains FIFO until that older work reaches the
-              // bounded adapter barrier.
-              const promise = depth > 0 ? abortable(scheduled, controller.signal) : scheduled
-              // A timed-out client gets its error immediately, but following
-              // work cannot overtake the still-unwinding operation.
-              const tail = scheduled.then(() => {}, () => {}).then(() => operationBarrier)
-              this.queues.set(key, tail)
-              void tail.finally(() => {
-                const remaining = (this.queueDepth.get(key) ?? 1) - 1
-                if (remaining <= 0) this.queueDepth.delete(key); else this.queueDepth.set(key, remaining)
-                if (this.queues.get(key) === tail) this.queues.delete(key)
-              })
+              // With the default session queue key there is no asynchronous
+              // admission step. Keep this path's scheduling shape unchanged so
+              // replay replies retain their established FIFO ordering.
+              if (!this.options.queueKey) {
+                const key = `session:${request.amberSession}`
+                if (key.length < 1 || key.length > 512) { unregister(); throw new Error('INVALID_REQUEST') }
+                const depth = this.queueDepth.get(key) ?? 0
+                if (depth >= 16) { unregister(); throw new Error('REQUEST_LIMIT') }
+                this.queueDepth.set(key, depth + 1)
+                const prior = this.queues.get(key) ?? Promise.resolve()
+                const scheduled = this.options.operations
+                  ? this.options.operations.run('broker', async (signal) => {
+                      const abortOwned = (): void => controller.abort()
+                      signal.addEventListener('abort', abortOwned, { once: true })
+                      try { await prior.catch(() => {}); this.options.operations!.assertDispatch(signal); return await execute() }
+                      finally { signal.removeEventListener('abort', abortOwned) }
+                    }, controller.signal)
+                  : prior.catch(() => {}).then(execute)
+                const promise = depth > 0 ? abortable(scheduled, controller.signal) : scheduled
+                const tail = scheduled.then(() => {}, () => {}).then(() => operationBarrier)
+                this.queues.set(key, tail)
+                void tail.then(() => {}, () => {}).finally(() => {
+                  const remaining = (this.queueDepth.get(key) ?? 1) - 1
+                  if (remaining <= 0) this.queueDepth.delete(key); else this.queueDepth.set(key, remaining)
+                  if (this.queues.get(key) === tail) this.queues.delete(key)
+                })
+                // A drain may reject the registry before it invokes its work
+                // callback. The request controller was already registered with
+                // the socket/global maps, so clean those maps on that path too.
+                void scheduled.then(() => {}, () => unregister())
+                this.results.set(cacheKey, { digest, promise, acceptedAt: now() })
+                connectionResults.add(cacheKey)
+                if (this.results.size > 256) this.results.delete(this.results.keys().next().value!)
+                deferReply(promise, controller.signal); return
+              }
+              let entered = false
+              let depth = 0
+              const finishRequest = (): void => { unregister() }
+              const afterKey = (key: string, signal: AbortSignal): Promise<unknown> => {
+                if (key.length < 1 || key.length > 512) throw new Error('INVALID_REQUEST')
+                depth = this.queueDepth.get(key) ?? 0
+                if (depth >= 16) throw new Error('REQUEST_LIMIT')
+                this.queueDepth.set(key, depth + 1)
+                const prior = this.queues.get(key) ?? Promise.resolve()
+                // The client-facing promise must settle on cancellation even
+                // if it is still waiting behind an older request. The queue
+                // tail is separate and remains FIFO until that older work
+                // reaches the bounded adapter barrier.
+                const work = prior.catch(() => {}).then(() => {
+                  this.options.operations?.assertDispatch(signal)
+                  return execute()
+                })
+                const tail = work.then(() => {}, () => {}).then(() => operationBarrier)
+                this.queues.set(key, tail)
+                void tail.then(() => {}, () => {}).finally(() => {
+                  const remaining = (this.queueDepth.get(key) ?? 1) - 1
+                  if (remaining <= 0) this.queueDepth.delete(key); else this.queueDepth.set(key, remaining)
+                  if (this.queues.get(key) === tail) this.queues.delete(key)
+                })
+                void work.then(finishRequest, finishRequest)
+                return work
+              }
+              const queueAndExecute = (signal: AbortSignal): Promise<unknown> => {
+                entered = true
+                if (!this.options.queueKey) {
+                  try { return afterKey(`session:${request.amberSession}`, signal) }
+                  catch (error) { finishRequest(); return Promise.reject(error) }
+                }
+                return abortable(Promise.resolve().then(() => this.options.queueKey!(request)), signal)
+                  .then((key) => afterKey(key, signal))
+                  .catch((error) => { finishRequest(); throw error })
+              }
+              let scheduled: Promise<unknown>
+              try {
+                scheduled = this.options.operations
+                  ? this.options.operations.runWithController('broker', controller, queueAndExecute)
+                  : queueAndExecute(controller.signal)
+              } catch (error) {
+                unregister(); throw error
+              }
+              // If drain started in the tiny gap between controller creation
+              // and registration, runWithController rejects before invoking
+              // the callback. Do not leave the broker's own registries behind.
+              void scheduled.then(() => {}, () => { if (!entered) unregister() })
+              // A cancelled client gets its error immediately, even while it
+              // is waiting behind an older request. Following work still uses
+              // the separate queue tail and cannot overtake that operation.
+              const promise = abortable(scheduled, controller.signal)
               this.results.set(cacheKey, { digest, promise, acceptedAt: now() })
               connectionResults.add(cacheKey)
               if (this.results.size > 256) this.results.delete(this.results.keys().next().value!)

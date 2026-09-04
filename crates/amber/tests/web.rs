@@ -169,6 +169,49 @@ fn wait_until(bound: Duration, mut cond: impl FnMut() -> bool) -> bool {
 }
 
 #[test]
+fn malformed_or_oversized_sidecar_polling_keeps_the_mosaic_on_its_fallback() {
+    let f = fixture();
+    let cookie = f.login();
+    f.create_session();
+    assert!(wait_until(Duration::from_secs(3), || {
+        let (_, _, body) = f.get("/api/sessions", Some(&cookie));
+        body.contains("amber-1-1-0-web")
+    }));
+
+    let path = f.dir.path().join("ui-layout.json");
+    std::fs::write(
+        &path,
+        r#"{"version":1,"workspaces":{"1":{"tabs":{"1":{"label":"poll-probe","tree":{"kind":"leaf","paneId":"amber-1-1-0-web"}}}}}}"#,
+    )
+    .unwrap();
+    assert!(wait_until(Duration::from_secs(3), || {
+        let (_, _, body) = f.get("/api/sessions", Some(&cookie));
+        body.contains("poll-probe")
+    }));
+
+    std::fs::write(
+        &path,
+        vec![b'x'; amber::layout_file::LAYOUT_FILE_MAX_BYTES as usize + 1],
+    )
+    .unwrap();
+    assert!(wait_until(Duration::from_secs(3), || {
+        let (status, _, body) = f.get("/api/sessions", Some(&cookie));
+        let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+        status.contains("200") && !body.contains("poll-probe") && payload["layout"].is_object()
+    }));
+
+    // A bounded but malformed file is the other expensive failure mode: it
+    // must still resolve to the same empty/default sidecar, never to null or
+    // an unbounded parser-owned object graph.
+    std::fs::write(&path, vec![b'{'; 2 * 1024 * 1024]).unwrap();
+    assert!(wait_until(Duration::from_secs(3), || {
+        let (_, _, body) = f.get("/api/sessions", Some(&cookie));
+        let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+        !body.contains("poll-probe") && payload["layout"].is_object()
+    }));
+}
+
+#[test]
 fn unauthenticated_data_routes_and_ws_are_refused() {
     let f = fixture();
     let (status, _, _) = f.get("/api/sessions", None);

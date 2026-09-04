@@ -23,7 +23,10 @@
     "legacy migration creates a private fsynced timestamped v1 backup before state/layout writes",
     "future transaction layouts and oversized workspace/layout ingestion fail closed without rewrite",
     "broker timeouts, cancellation, close, and drain release queued work behind a bounded adapter barrier",
-    "migration recovery overflow is preserved and rejected before migration writes"
+    "migration recovery overflow is preserved and rejected before migration writes",
+    "broker requests are registered before asynchronous queue-key admission and abort on socket close, Stop Pi, or drain without dispatching later",
+    "Node CAS rereads and remote SSH layout probes enforce the shared 8 MiB byte bound, bounded stderr/timeout handling, and no partial remote layout",
+    "Rust mosaic and layout CAS share a bounded regular-file loader with symlink/TOCTOU checks, graph/string containment, and cached polling fallback"
   ],
   "remaining": [
     {

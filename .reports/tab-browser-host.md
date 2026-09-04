@@ -234,6 +234,32 @@ Final isolated validation: `npm test` **921 passed / 1 intentional real-daemon s
 
 Independent resident re-review, deployed-reader proof, Linux physical-input evidence, and macOS native-view/focus/IME/accessibility/lifecycle/profile/package gates remain open. `mergeReady: false`.
 
+### Important containment and cancellation fixes (2026-09-03; implementation complete, independent re-review pending)
+
+This pass used tests first and kept the daemon protocol and production daemon
+untouched:
+
+- Broker requests now own an abort controller before asynchronous `queueKey`
+  admission. Socket close, Stop Pi, and operation-registry drain cancel that
+  admission; later FIFO work still runs, while cancelled requests never reach
+  the browser service. The default queue path keeps its prior scheduling shape.
+- Node layout CAS rereads use a regular-file descriptor with an 8 MiB byte
+  bound, symlink/identity checks, and growth detection. Remote SSH probes use
+  the same 8 MiB stdout/stderr budget, a wall-clock timeout, child termination,
+  and suppress partial output on overflow/timeout.
+- Rust `mosaic` and `layout_cas` share a bounded regular-file loader. It rejects
+  symlinks, non-regular files, oversized/growing/replaced files, and invalid
+  UTF-8 before returning text. Parsed mosaic graphs cap workspaces, tabs, maps,
+  strings, total nodes, and depth; the web poller caches an unchanged hostile
+  fallback instead of reparsing it every second.
+
+Focused and repository validation completed in this worktree: app **936
+passed / 1 intentional real-daemon skip**, strict typecheck, Rust workspace
+**800 passed / 1 intentional delegated-cgroup ignore**, warnings-as-errors
+workspace Clippy, Windows GNU cross-target compile, and `git diff --check`. No production daemon or profile
+was contacted. The full packaged Linux/macOS gates, deployed-reader proof,
+and independent resident re-review remain open; `mergeReady` stays false.
+
 ## Open blocking work
 
 1. Obtain independent review of the resident lifecycle/launcher/Quit implementation and remediate every valid finding before changing its P1 status.

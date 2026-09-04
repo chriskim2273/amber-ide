@@ -6,7 +6,8 @@
 // module keeps that: the sidecar stays a plain file with two writers (the
 // Electron main process and `amber web`'s Rust side), made safe by CAS
 // instead of moving ownership into the daemon.
-import { readFile, rename, mkdir, open, lstat, unlink } from 'node:fs/promises'
+import { constants } from 'node:fs'
+import { rename, mkdir, open, lstat, unlink } from 'node:fs/promises'
 import type { FileHandle } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import { dirname } from 'node:path'
@@ -14,11 +15,30 @@ import { layoutUtf8ByteLength, LAYOUT_FILE_MAX_BYTES } from '../shared/layoutFil
 import type { LoadLayoutResult, SaveLayoutResult } from '../shared/layoutFile'
 
 async function readBoundedText(path: string, maxBytes: number): Promise<string> {
-  const handle = await open(path, 'r')
+  const before = await lstat(path)
+  if (before.isSymbolicLink()) throw new Error('LAYOUT_SYMLINK')
+  if (!before.isFile()) throw new Error('LAYOUT_NOT_REGULAR')
+  if (before.size > maxBytes) throw new Error('LAYOUT_FILE_LIMIT')
+
+  // O_NOFOLLOW closes the lstat -> open symlink swap on Unix. The descriptor
+  // is then the object we measure and read; a path replacement cannot redirect
+  // the in-progress read to an attacker-selected target.
+  const flags = constants.O_RDONLY | (process.platform === 'win32' ? 0 : (constants.O_NOFOLLOW ?? 0))
+  let handle: FileHandle
+  try {
+    handle = await open(path, flags)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ELOOP') throw new Error('LAYOUT_SYMLINK')
+    throw error
+  }
   try {
     const metadata = await handle.stat()
     if (!metadata.isFile()) throw new Error('LAYOUT_NOT_REGULAR')
     if (metadata.size > maxBytes) throw new Error('LAYOUT_FILE_LIMIT')
+    // A max-sized allocation on every poll would churn for ordinary small
+    // sidecars. The final descriptor stat below catches any in-place growth,
+    // while this one-byte-over-initial-size read still detects a file that was
+    // already at the contract boundary.
     const buffer = Buffer.alloc(Math.min(maxBytes + 1, Math.max(1, metadata.size + 1)))
     let offset = 0
     while (offset < buffer.length) {
@@ -26,7 +46,20 @@ async function readBoundedText(path: string, maxBytes: number): Promise<string> 
       if (result.bytesRead === 0) break
       offset += result.bytesRead
     }
-    if (offset > maxBytes) throw new Error('LAYOUT_FILE_LIMIT')
+    const after = await handle.stat()
+    if (after.size > maxBytes || offset > maxBytes) throw new Error('LAYOUT_FILE_LIMIT')
+    if (after.size !== metadata.size) throw new Error('LAYOUT_FILE_CHANGED')
+    let pathAfter
+    try { pathAfter = await lstat(path) } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new Error('LAYOUT_FILE_CHANGED')
+      throw error
+    }
+    if (pathAfter.isSymbolicLink()) throw new Error('LAYOUT_SYMLINK')
+    if (!pathAfter.isFile()) throw new Error('LAYOUT_NOT_REGULAR')
+    // A replacement with the same byte length must still invalidate a CAS
+    // read. Atomic writers normally change both inode and mtime; inode is the
+    // decisive check where the platform exposes it.
+    if (pathAfter.dev !== metadata.dev || pathAfter.ino !== metadata.ino) throw new Error('LAYOUT_FILE_CHANGED')
     return buffer.subarray(0, offset).toString('utf8')
   } finally { await handle.close().catch(() => {}) }
 }
@@ -98,10 +131,6 @@ async function atomicWrite(p: string, text: string): Promise<void> {
  * when the file doesn't exist yet. Never throws. */
 export async function loadLayoutFile(path: string): Promise<LoadLayoutResult> {
   try {
-    const stat = await lstat(path)
-    if (stat.isSymbolicLink()) return { text: null, version: null, error: 'LAYOUT_SYMLINK' }
-    if (!stat.isFile()) return { text: null, version: null, error: 'LAYOUT_NOT_REGULAR' }
-    if (stat.size > LAYOUT_FILE_MAX_BYTES) return { text: null, version: null, error: 'LAYOUT_FILE_LIMIT' }
     const text = await readBoundedText(path, LAYOUT_FILE_MAX_BYTES)
     if (layoutUtf8ByteLength(text, LAYOUT_FILE_MAX_BYTES) > LAYOUT_FILE_MAX_BYTES) return { text: null, version: null, error: 'LAYOUT_FILE_LIMIT' }
     return { text, version: text }
@@ -138,9 +167,10 @@ export async function saveLayoutFile(
     if (layoutUtf8ByteLength(text, LAYOUT_FILE_MAX_BYTES) > LAYOUT_FILE_MAX_BYTES) return { error: 'LAYOUT_FILE_LIMIT' }
     await mkdir(dirname(path), { recursive: true, mode: 0o700 })
     lock = await acquireLock(`${path}.lock`)
-    const current = await readFile(path, 'utf8').catch(() => null)
-    if (current !== expectedVersion) {
-      return { conflict: true, text: current, version: current }
+    const current = await loadLayoutFile(path)
+    if (current.error) return { error: current.error }
+    if (current.text !== expectedVersion) {
+      return { conflict: true, text: current.text, version: current.version }
     }
     await atomicWrite(path, text)
     return { ok: true, version: text }
