@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { browserContextMatches, captureBrowserContext, hasExactApprovalSurface, resolveBrowserContext, setBrowserForCurrentContext, type BrowserContextState } from './browserWindowContext'
+import { browserContextMatches, captureBrowserContext, hasExactApprovalSurface, resolveBrowserContext, sameBrowserContextIdentity, setBrowserForCurrentContext, type BrowserContextState } from './browserWindowContext'
 
 const layout = { version: 2, activeWorkspace: 1, workspaces: {
   '1': { activeTab: 1, tabs: { '1': { tree: null } } },
@@ -17,6 +17,12 @@ describe('resolveBrowserContext', () => {
     expect(browserContextMatches(state, lease)).toBe(false)
     expect(setBrowserForCurrentContext(state, lease, 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')).toBe(false)
     expect(state.activeBrowserId).toBe('browser-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')
+  })
+
+  it('recognizes repeated context acknowledgements without invalidating the visible surface', () => {
+    const state: BrowserContextState = { activeWorkspace: 1, activeTab: 1, activeBrowserId: 'browser-a', browserContextGeneration: 4 }
+    expect(sameBrowserContextIdentity(state, { workspace: 1, tab: 1, browserId: 'browser-a' })).toBe(true)
+    expect(sameBrowserContextIdentity(state, { workspace: 1, tab: 2, browserId: 'browser-b' })).toBe(false)
   })
 
   it('requires the exact owning browser to be visible and expanded for approvals', () => {

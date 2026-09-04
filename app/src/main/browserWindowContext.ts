@@ -9,6 +9,10 @@ export function hasExactApprovalSurface(states: ApprovalSurfaceState[], browserI
   return states.some((state) => state.local && !state.destroyed && state.visible && state.expanded && state.browserId === browserId)
 }
 
+export function sameBrowserContextIdentity(state: BrowserContextState, next: ActiveBrowserContext): boolean {
+  return state.activeWorkspace === next.workspace && state.activeTab === next.tab && state.activeBrowserId === next.browserId
+}
+
 export function captureBrowserContext(state: BrowserContextState): BrowserContextLease {
   if (state.activeWorkspace === null || state.activeTab === null) throw new Error('NO_ACTIVE_TAB')
   return { workspace: state.activeWorkspace, tab: state.activeTab, browserId: state.activeBrowserId, generation: state.browserContextGeneration }

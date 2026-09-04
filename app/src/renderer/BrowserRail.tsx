@@ -26,6 +26,12 @@ interface BrowserStatus {
 }
 type BrowserReply = { ok: true; result: BrowserStatus | { closed: true } } | { ok: false; error: string }
 
+export function browserCommandNeedsContext(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return true
+  const type = (value as Record<string, unknown>)['type']
+  return type !== 'resolveApproval' && type !== 'resolveDialog'
+}
+
 export function BrowserRail(props: {
   id: string; width: number; collapsed: boolean; designatedPi?: string; sharedWithPi?: boolean
   controllers: { name: string; label: string }[]; temporarilyHidden?: boolean; occluded?: boolean
@@ -50,7 +56,7 @@ export function BrowserRail(props: {
   const [availableWidth, setAvailableWidth] = useState(1200)
 
   const command = async (value: unknown): Promise<BrowserReply> => {
-    await props.ensureContext()
+    if (browserCommandNeedsContext(value)) await props.ensureContext()
     return window.amber.browserCommand(value) as Promise<BrowserReply>
   }
   const acceptStatus = (next: BrowserStatus): void => {

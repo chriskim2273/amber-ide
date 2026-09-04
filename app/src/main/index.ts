@@ -83,7 +83,7 @@ import { bindRendererBrowserCommand, browserAuthorityChanged } from './browserAs
 import { emptyLayout, layoutUtf8ByteLength, LAYOUT_FILE_MAX_BYTES, parseLayout, serializeLayout, type LayoutFile } from '../shared/layoutFile'
 import { assertWorkspaceFileBytes, parseWorkspaceFile, WORKSPACE_FILE_MAX_BYTES } from '../shared/workspaceFile'
 import { commitPreparedWorkspaceImport, prepareWorkspaceImport } from './workspaceImport'
-import { browserContextMatches, captureBrowserContext, hasExactApprovalSurface, resolveBrowserContext, setBrowserForCurrentContext } from './browserWindowContext'
+import { browserContextMatches, captureBrowserContext, hasExactApprovalSurface, resolveBrowserContext, sameBrowserContextIdentity, setBrowserForCurrentContext } from './browserWindowContext'
 import { createBrowserId } from '../shared/tabBrowser'
 import { isRecoveryId } from '../shared/tabBrowserState'
 import { BrowserOperationRegistry } from './browserOperationRegistry'
@@ -1599,8 +1599,9 @@ async function main(): Promise<void> {
       const context = resolveBrowserContext(parseLayout(loaded.text), request['workspace'], request['tab'])
       if (tabBrowser && sender.activeBrowserId && sender.activeBrowserId !== context.browserId) { tabBrowser.surfaceHidden(sender.activeBrowserId); await tabBrowser.command({ type: 'hide', id: sender.activeBrowserId }).catch(() => {}) }
       browserOperations.assertDispatch(signal)
+      const changed = !sameBrowserContextIdentity(sender, context)
       sender.activeWorkspace = context.workspace; sender.activeTab = context.tab; sender.activeBrowserId = context.browserId
-      sender.activeBrowserExpanded = false
+      if (changed || request['collapsed']) sender.activeBrowserExpanded = false
       if (context.browserId && request['collapsed']) tabBrowser?.surfaceHidden(context.browserId)
       sender.browserContextGeneration += 1
       return { ok: true, ...context }

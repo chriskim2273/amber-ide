@@ -1,7 +1,7 @@
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
-import { BrowserRail } from './BrowserRail'
+import { BrowserRail, browserCommandNeedsContext } from './BrowserRail'
 
 const props = {
   id: '0123456789ABCDEFGHJKMNPQRS', width: 420, collapsed: false,
@@ -9,6 +9,14 @@ const props = {
   onWidth: vi.fn(), onCollapsed: vi.fn(), onClose: vi.fn(), onRecovery: vi.fn(), onPolicy: vi.fn(),
   ensureContext: async () => {},
 }
+
+describe('BrowserRail command context', () => {
+  it('does not re-acknowledge the surface while resolving a visible approval or dialog', () => {
+    expect(browserCommandNeedsContext({ type: 'resolveApproval' })).toBe(false)
+    expect(browserCommandNeedsContext({ type: 'resolveDialog' })).toBe(false)
+    expect(browserCommandNeedsContext({ type: 'navigate' })).toBe(true)
+  })
+})
 
 describe('BrowserRail accessibility contract', () => {
   it('renders keyboard-addressable navigation, focus, viewport, controller, recovery, and resize controls', () => {
