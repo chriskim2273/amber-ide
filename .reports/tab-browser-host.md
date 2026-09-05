@@ -1,5 +1,7 @@
 # Tab browser host implementation report
 
+> **Current acceptance:** [Direct post-reboot final validation](tab-browser-host-direct-final.md) supersedes the historical counts, `/tmp` evidence locations, and pending resident-review statements below. Persistent worktree restored; final production code `e53905e`; 1026 app tests and 821 Rust tests passed; fresh packaged approval/semantic-action and actual Quit-menu-handler/SSH-cleanup smoke passed. Physical menu/IME and external release/platform gates remain open; `mergeReady: false`. The user requested direct execution, so final closure is parent-reviewed, not a new independent full-branch review.
+
 Date: 2026-09-04
 Branch: `feat/tab-browser-host`
 
