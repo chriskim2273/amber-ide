@@ -1526,8 +1526,12 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   behavior or package artifact is silently attributed to the docs commits.
   Fresh isolated gates report app 1003 passed/1 intentional skip, Rust 821
   passed/1 delegated-cgroup ignore, strict typecheck/build/web build/Clippy,
-  and the Pi v7 verifier against a c5-built private Amber binary. Linux
-  package input evidence uses Xvfb/XTest only; it is not physical-hardware
+  and the Pi v7 verifier against a c5-built private Amber binary. The
+  reviewed P2 follow-up is TDD-closed: Pi partial failures are parsed exactly,
+  queued stale-generation dispatch is rejected before the adapter, and drag/
+  type/fill callbacks advance generations monotonically without false stale
+  errors. Linux package input evidence uses Xvfb/XTest only; it is not
+  physical-hardware
   evidence. External deployed-reader, macOS, and physical/manual gates remain
   open; the independent review is PASS WITH FIXES with its P2 follow-ups
   recorded in the validation report.
