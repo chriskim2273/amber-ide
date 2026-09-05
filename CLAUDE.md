@@ -1638,6 +1638,53 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   green. **Live-verified** via CDP against the real daemon: freebuff renders
   its full TUI in /app and Ctrl-C exits cleanly back to the prompt.
 
+- [x] Browser host uniform input generations (2026-09-04) — Electron has no
+  trustworthy physical/CDP source marker, so every `before-input-event` and
+  `before-mouse-event` callback advances generation; signature/token suppression
+  was removed. Host validates the prepared generation immediately before the
+  first irreversible dispatch, increments before it, accepts later input or
+  navigation increments, and reports the final generation plus interleaving.
+  The adapter carries typed `dispatched` state; partial failures become
+  `ACTION_FAILED_NO_ROLLBACK` with current context, `retryable:false`, and a
+  fresh-snapshot instruction through the broker and generated Pi result. The
+  production code validated here is pinned to `c5b87c8`; `e856624` is the
+  documentation/report HEAD from which the follow-up validation started. The
+  follow-up adds tests and verifier/report metadata only—no production daemon
+  behavior or package artifact is silently attributed to the docs commits.
+  Fresh isolated gates report app 1003 passed/1 intentional skip, Rust 821
+  passed/1 delegated-cgroup ignore, strict typecheck/build/web build/Clippy,
+  and the Pi v7 verifier against a c5-built private Amber binary. The
+  reviewed P2 follow-up is TDD-closed: Pi partial failures are parsed exactly,
+  queued stale-generation dispatch is rejected before the adapter, and drag/
+  type/fill callbacks advance generations monotonically without false stale
+  errors. Linux package input evidence uses Xvfb/XTest only; it is not
+  physical-hardware
+  evidence. External deployed-reader, macOS, and physical/manual gates remain
+  open; the independent review is PASS WITH FIXES with its P2 follow-ups
+  recorded in the validation report.
+
+- [x] Resident review follow-up (2026-09-05; implementation complete, direct
+  post-reboot signoff at user request) — remote tunnels register immediately after spawn, including
+  pending opens, and share one bounded cleanup-once promise across window close,
+  compat restart, normal Quit, and force Quit; the quit fence rejects late opens
+  and failed/deferred window creation cannot orphan a child or runtime directory.
+  Host-disabled Linux and Windows Quit skips browser-host inhibit/POSIX UID work
+  while still awaiting tunnel cleanup. Tunnel readiness now owns and clears all
+  timers/listeners on success, failure, and timeout, drains stderr after a fixed
+  cap, and has terminal-outcome tests. README browser/web behavior is current;
+  no physical explicit-Quit proof is claimed. Direct post-reboot validation
+  additionally fixed the approval-panel resize race (`e53905e`): queued show
+  preserves an already acknowledged approval surface, while hide and initial
+  show remain fail-closed. Fresh gates: app 1026/1 skip, Rust 821/1 ignore,
+  typecheck, Clippy, Electron/web/AppImage builds and pinned Pi 0.81 verifier.
+  Private packaged tests prove broker sharing/revocation, visible approval and
+  approved click, close/five concurrent reopens, and real Quit MenuItem callback
+  exit with SSH child/socket cleanup. This is inspector/Xvfb evidence, not a
+  physical menu gesture or a new independent review. All worktrees and essential
+  evidence now live on persistent storage. Current report:
+  `.reports/tab-browser-host-direct-final.md`. Deployed-reader, macOS, physical
+  input, Pi 0.85, and Windows native gates remain open; `mergeReady` stays false.
+
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**
   `std::io::Read` (dedicated thread); `take_writer()` is one-shot;

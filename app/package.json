@@ -11,6 +11,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json",
     "lint": "eslint . --ext .ts,.tsx",
     "test": "vitest run",
+    "test:pi-browser-extension": "node scripts/verify-pi-browser-extension.mjs",
     "package": "electron-vite build && npm run build:web && electron-builder",
     "dist": "bash scripts/dist.sh"
   },
@@ -78,7 +79,7 @@
     "@typescript-eslint/eslint-plugin": "^8.0.0",
     "@typescript-eslint/parser": "^8.0.0",
     "@vitejs/plugin-react": "^4.3.0",
-    "electron": "^43.1.0",
+    "electron": "43.1.0",
     "electron-builder": "^25.0.0",
     "electron-vite": "^5.0.0",
     "eslint": "^9.0.0",

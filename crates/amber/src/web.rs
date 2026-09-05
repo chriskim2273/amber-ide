@@ -774,6 +774,10 @@ pub struct Hub {
     socket: PathBuf,
     root: PathBuf,
     inner: Mutex<HubInner>,
+    /// Sidecar parsing lives on the one-second poll thread. Cache its bounded
+    /// fallback by file identity so a malformed/oversized file is not read,
+    /// parsed, and dropped every tick.
+    layout_cache: Mutex<mosaic::LayoutCache>,
     next_id: AtomicU64,
     /// When this server came up — the only thing `/api/status` reports that is
     /// not derivable from `HubInner`.
@@ -819,6 +823,7 @@ impl Hub {
                 usage: String::new(),
                 borrows: HashMap::new(),
             }),
+            layout_cache: Mutex::new(mosaic::LayoutCache::default()),
             next_id: AtomicU64::new(0),
             started: Instant::now(),
         })
@@ -1531,7 +1536,7 @@ pub fn serve(
         let hub = Arc::clone(&hub);
         thread::spawn(move || loop {
             thread::sleep(GEOMETRY_POLL);
-            let file = mosaic::load(&hub.root);
+            let file = hub.layout_cache.lock().unwrap().load(&hub.root);
             let mut inner = hub.inner.lock().unwrap();
             Hub::prune_title_pending(&mut inner);
             let rendered = Hub::render_layout(&file, &inner.sessions);

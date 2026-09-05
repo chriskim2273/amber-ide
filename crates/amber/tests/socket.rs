@@ -1327,6 +1327,10 @@ fn focus_refreshes_use_and_resumes_only_memory_suspension() {
     ));
     #[cfg(unix)]
     {
+        // Bash/dash can defer a trap while their interactive read is idle. The
+        // empty line is a fixture wake-up only; the assertion below still
+        // requires the Focus-triggered SIGUSR2 to produce its marker.
+        send(&mut stream, &Frame::Data { session: "agent".into(), bytes: b"\n".to_vec() });
         let deadline = Instant::now() + Duration::from_secs(5);
         while !session
             .scrollback()

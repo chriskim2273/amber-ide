@@ -2,15 +2,18 @@
 // Renderer-side, `~/.claude` is unreachable (sandboxed), so this lives in main
 // like every other disk read (editorFiles.ts).
 
-import { readdirSync, readFileSync, existsSync, statSync } from 'node:fs'
+import { readdirSync, existsSync } from 'node:fs'
+import { stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { summarize } from '../shared/claudeSummary'
+import { readSafeTextFile } from './safeFileReader'
 
 /** Only bytes we might need: the label comes from the transcript's HEAD (the
  * summary line, or the first user turn). Reading a multi-MB conversation in
  * full to show one line of UI would stall the cleanup dialog. */
 const HEAD_BYTES = 256 * 1024
+const MAX_TRANSCRIPT_BYTES = 8 * 1024 * 1024
 
 /** A claude session id is a uuid — anything else is not ours to go looking for
  * on disk, and would make this a path-traversal read primitive. */
@@ -49,11 +52,12 @@ function transcriptPath(id: string, cwd: string): string | null {
 }
 
 /** Read at most the first HEAD_BYTES of a file, dropping a trailing partial line. */
-function head(path: string): string[] {
-  const size = statSync(path).size
-  const buf = readFileSync(path)
-  const text = buf.subarray(0, Math.min(size, HEAD_BYTES)).toString('utf8')
+async function head(path: string): Promise<string[]> {
+  const owner = process.getuid?.()
+  const text = await readSafeTextFile(path, { maxBytes: MAX_TRANSCRIPT_BYTES, readBytes: HEAD_BYTES, ...(owner === undefined ? {} : { owner }) })
+  if (text === null) return []
   const lines = text.split('\n')
+  const size = (await stat(path)).size
   if (size > HEAD_BYTES) lines.pop() // truncated mid-line
   return lines
 }
@@ -63,14 +67,14 @@ function head(path: string): string[] {
  * simply absent — the caller falls back to the cwd, which is always known.
  * Never throws: a missing/unreadable transcript must not break the dialog.
  */
-export function claudeNames(entries: { id: string; cwd: string }[]): Record<string, string> {
+export async function claudeNames(entries: { id: string; cwd: string }[]): Promise<Record<string, string>> {
   const out: Record<string, string> = {}
   for (const { id, cwd } of entries) {
     if (!UUID.test(id)) continue
     try {
       const path = transcriptPath(id, typeof cwd === 'string' ? cwd : '')
       if (!path) continue
-      const label = summarize(head(path))
+      const label = summarize(await head(path))
       if (label) out[id] = label
     } catch {
       // unreadable transcript — leave it unnamed

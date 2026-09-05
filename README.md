@@ -101,9 +101,20 @@ single xterm.js emulator.
   trust level is acceptable.
 - Run-state dots: agent / retrying / shell-fallback.
 
-**Browser pane**
-- A web-viewer pane kind (Electron `<webview>` + URL bar); its URL persists and
-  survives reboot via the sidecar. Popups open in the system browser.
+**Browser host**
+- The optional desktop browser host uses a main-owned native `WebContentsView`
+  rail beside the active tab; browser pages never receive Amber IPC, Node,
+  filesystem, daemon, shell, or raw CDP authority.
+- One tab can explicitly share its dedicated Amber browser with its Pi pane.
+  Consequential browser actions require approval, and up to four browser
+  renderers remain live; frozen pages are recreated from durable URL/profile
+  intent after a host restart rather than pretending to preserve JavaScript
+  heaps.
+- Closing the GUI leaves the browser host resident so a later launch can reopen
+  it. **Quit Amber IDE** drains and stops the host; **Quit amber daemon** is a
+  separate action that stops terminal sessions. Browser hosting is currently a
+  Linux/macOS rollout gate and is unavailable in compatibility mode and on
+  Windows.
 
 **Workspaces & continuity tools**
 - Save/load a whole workspace (structure + scrollback) to a portable
@@ -132,8 +143,14 @@ single xterm.js emulator.
 - `ctl doctor` / `status` / `install` / `uninstall` / `snapshot-now`.
 
 **Phone access — `amber web`**
-- `amber web` serves a mobile browser UI for your live sessions: tap a session,
-  get a full-screen terminal, type into it — including driving a running claude.
+- `amber web` serves a mobile mosaic for live daemon sessions: tap a tile for a
+  full-screen terminal, type into it — including driving a running agent — and
+  switch between workspace/tab layouts.
+- The authenticated browser control surface can open, create, kill, move/rename,
+  freeze, unfreeze, and (for the hosted React `/app` build) resize sessions.
+  Requests are validated at the server boundary; internal snapshot and
+  supervisor-report operations remain unavailable. The hand-written `/` client
+  follows the daemon's current grid and does not send resize messages.
 - It is an ordinary daemon **client**; the daemon itself never touches the
   network. The server binds `127.0.0.1` only.
 - Reach it from your phone over Tailscale:
@@ -145,9 +162,9 @@ single xterm.js emulator.
   Open the printed URL on the phone (swap the host for your tailnet name). The
   token rides in the URL **fragment**, so it never reaches the server logs; the
   page exchanges it for an HttpOnly cookie and strips it from history.
-- The phone can open sessions and type. It **cannot** create, kill, rename or
-  resize them — a pty's size is shared with your desktop panes, so a phone-sized
-  resize would reflow your live work.
+- A browser-driven resize is bounded and can reflow a shared pty, so the desktop
+  re-fits its panes when you return. The server still rejects degenerate or
+  hostile dimensions.
 
 **Platform & packaging**
 - Linux AppImage / macOS dmg via electron-builder, with the static `amber`
@@ -289,9 +306,9 @@ amber ctl status            # daemon health
 
 ## Status
 
-Early — `v0.0.1`, single-developer project. The daemon spine, Claude Code,
+Early — `v0.0.2`, single-developer project. The daemon spine, Claude Code,
 Codex, Grok, OpenCode, Hermes, and Pi supervision, reboot restore, and the full Electron IDE surface
-(tabs, workspaces, splits, drag-to-rearrange, browser panes, workspace
+(tabs, workspaces, splits, drag-to-rearrange, browser rail, workspace
 save/load) work through automated coverage; live GUI verification remains
 feature-specific. See the build-status checklist at the bottom of
 [`CLAUDE.md`](CLAUDE.md) for the detailed per-slice state.

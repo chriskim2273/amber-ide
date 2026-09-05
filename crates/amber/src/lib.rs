@@ -15,6 +15,7 @@ use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
 pub mod attach;
+pub mod browser_host_ctl;
 pub mod cgroup;
 pub mod claude;
 pub mod codex;
@@ -24,6 +25,7 @@ pub mod grok;
 pub mod host_pressure;
 pub mod hermes;
 pub mod layout_cas;
+pub mod layout_file;
 pub mod manager;
 pub mod memory_guardian;
 pub mod mosaic;

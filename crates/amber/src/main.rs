@@ -240,6 +240,20 @@ enum CtlAction {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
+    /// Ensure or inspect the resident Electron browser host used by Pi tools.
+    BrowserHost {
+        #[command(subcommand)]
+        action: BrowserHostAction,
+        /// Override the state root (primarily for isolated validation).
+        #[arg(long, global = true)]
+        root: Option<PathBuf>,
+        /// Override the readiness socket (primarily for isolated validation).
+        #[arg(long, global = true)]
+        socket: Option<PathBuf>,
+        /// Emit machine-readable JSON for status.
+        #[arg(long, global = true)]
+        json: bool,
+    },
     /// Control the `amber web` browser/mobile server: service lifecycle, the
     /// phone URL, tailscale mapping, and live status. `--json` is the contract
     /// the desktop app consumes; the human output is for people only.
@@ -312,6 +326,16 @@ enum CtlAction {
 
 fn resolve_socket(explicit: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     explicit.map_or_else(amber::platform::socket_name, Ok)
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum BrowserHostAction {
+    /// Start the registered host if necessary and wait for readiness.
+    Ensure,
+    /// Report registration, inhibit and readiness state.
+    Status,
+    /// Clear the durable explicit-stop inhibit. Does not start the app.
+    Enable,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -404,10 +428,15 @@ fn main() -> anyhow::Result<()> {
             CtlAction::Uninstall { dry_run, purge_binary, purge_state, web } => {
                 run_uninstall(dry_run, purge_binary, purge_state, web)
             }
-            CtlAction::Web { action, port, json, root } => run_ctl_web(action, port, json, root),
-        CtlAction::Router { action, port, json, root } => {
-            run_ctl_router(action, port, json, root)
-        }
+            CtlAction::BrowserHost { action, root, socket, json } => {
+                run_ctl_browser_host(action, root, socket, json)
+            }
+            CtlAction::Web { action, port, json, root } => {
+                run_ctl_web(action, port, json, root)
+            }
+            CtlAction::Router { action, port, json, root } => {
+                run_ctl_router(action, port, json, root)
+            }
             CtlAction::InstallCodexSkill => run_install_codex_skill(),
             CtlAction::PurgeCodexSkill => run_purge_codex_skill(),
             CtlAction::InstallPiExtension => run_install_pi_extension(),
@@ -1054,6 +1083,57 @@ fn run_handoff(session_id: &str) -> anyhow::Result<()> {
     print!("{handoff}");
     if !handoff.ends_with('\n') {
         println!();
+    }
+    Ok(())
+}
+
+fn browser_host_socket(explicit: Option<PathBuf>) -> PathBuf {
+    if let Some(path) = explicit {
+        return path;
+    }
+    if let Some(path) = std::env::var_os("AMBER_BROWSER_HOST_SOCKET") {
+        return PathBuf::from(path);
+    }
+    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR").filter(|value| !value.is_empty()) {
+        return PathBuf::from(runtime).join("amber-ide").join("browser-host.sock");
+    }
+    #[cfg(unix)]
+    let fallback = format!("amber-ide-{}", unsafe { libc::geteuid() });
+    #[cfg(not(unix))]
+    let fallback = "amber-ide-unsupported".to_string();
+    std::env::temp_dir().join(fallback).join("browser-host.sock")
+}
+
+fn run_ctl_browser_host(
+    action: BrowserHostAction,
+    root: Option<PathBuf>,
+    socket: Option<PathBuf>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let root = amber::platform::resolve_state_root(root)?;
+    let socket = browser_host_socket(socket);
+    match action {
+        BrowserHostAction::Ensure => {
+            amber::browser_host_ctl::ensure(&root, &socket, Duration::from_secs(10))?;
+            if json {
+                println!("{}", serde_json::to_string(&amber::browser_host_ctl::status(&root, &socket))?);
+            } else {
+                println!("browser host ready");
+            }
+        }
+        BrowserHostAction::Status => {
+            let status = amber::browser_host_ctl::status(&root, &socket);
+            if json {
+                println!("{}", serde_json::to_string(&status)?);
+            } else {
+                println!("browser host: {:?}", status.state);
+                if let Some(detail) = status.detail { println!("{detail}"); }
+            }
+        }
+        BrowserHostAction::Enable => {
+            amber::browser_host_ctl::enable(&root)?;
+            if json { println!("{{\"enabled\":true}}"); } else { println!("browser host auto-start enabled"); }
+        }
     }
     Ok(())
 }

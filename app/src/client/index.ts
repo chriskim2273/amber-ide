@@ -32,8 +32,12 @@ process.parentPort.on('message', (event) => {
     | { kind: 'control' }
     | { kind: 'pane'; session: string }
     | { kind: 'pane-close'; session: string }
-  // A pane going away carries no port — it releases the one we already hold.
+    | { kind: 'suspend-panes' }
+  // These lifecycle messages carry no port. `suspend-panes` keeps the metadata
+  // control connection alive for BrowserHost authorization while releasing
+  // every PTY subscription owned only by the hidden renderer.
   if (msg.kind === 'pane-close') { router.detach(msg.session); return }
+  if (msg.kind === 'suspend-panes') { router.detachAll(); return }
   const [port] = event.ports
   if (!port) return
   if (msg.kind === 'control') {

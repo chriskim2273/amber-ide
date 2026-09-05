@@ -1,7 +1,6 @@
 import { useRef, useState, useEffect, lazy, Suspense } from 'react'
 import { Pane, type SearchApi, type InputApi } from './Pane'
 import { KeyboardDock } from './KeyBar'
-import { Browser } from './Browser'
 import type { EditorApi } from './Editor'
 import { paneRects, handles, nextPaneInDirection, focusCandidates, ratioAt, leaves, type Node, type Rect, type Zone, type FocusDir } from './layout'
 import { appChord, chordLabel } from './keys'
@@ -39,7 +38,7 @@ export function agentOf(kind: string): 'claude' | 'grok' | 'codex' | 'opencode' 
   return 'claude'
 }
 
-export type PaneKind = 'shell' | 'claude' | 'grok' | 'codex' | 'opencode' | 'hermes' | 'pi' | 'browser' | 'editor'
+export type PaneKind = 'shell' | 'claude' | 'grok' | 'codex' | 'opencode' | 'hermes' | 'pi' | 'editor'
 
 // The window listener below dismisses an open context menu on an outside
 // pointer press. React delivers `click` only after `pointerdown`; treating a
@@ -202,13 +201,9 @@ export function SplitView(props: {
   onMove: (sourceId: string, targetId: string, zone: Zone) => void
   // Cross-group move: the pane was dropped on a tab header (`{ tab }`) or a
   // workspace pill (`{ ws }`). Grouping is name-encoded, so App turns this into a
-  // daemon Rename (or a sidecar edit for browser panes) — never a local tree move.
+  // daemon Rename (or a sidecar edit for editor panes) — never a local tree move.
   onMoveTo: (sourceId: string, target: { ws: number } | { tab: number }) => void
   onClose: (paneId: string) => void
-  // App-local browser panes (kind==='browser'): url keyed by paneId + a nav
-  // callback that persists the current URL to the sidecar. Empty when none.
-  browsers: Record<string, { url: string }>
-  onBrowserNav: (paneId: string, url: string) => void
   // App-local editor panes (kind==='editor'): the sidecar entry IS the pane.
   // `onEditorState` persists path/view changes; `onCloseGuard` lets a pane with
   // unsaved work veto its own close (spec §3.3).
@@ -271,7 +266,7 @@ export function SplitView(props: {
 
   // Custom header context menu, if open: which pane and where (stage-relative,
   // clamped on render). Bound to the pane HEADER only — xterm owns body events.
-  // With `split` set it renders the kind picker instead (shell/claude/browser for
+  // With `split` set it renders the pane-kind picker for
   // that direction) — same state so dismissal/clamping/pruning are shared.
   const [menu, setMenu] = useState<{ paneId: string; x: number; y: number; split?: 'h' | 'v' } | null>(null)
   // Which pane (if any) has the inline freeze-note prompt open (context-menu
@@ -786,11 +781,10 @@ export function SplitView(props: {
       {panes.map(({ paneId, rect }) => {
         const meta = props.meta[paneId]
         const dead = props.deadCodes[paneId]
-        const isBrowser = meta?.kind === 'browser'
         const isEditor = meta?.kind === 'editor'
         // Terminal-only affordances (refresh, scrollback search, claude reload,
         // freeze) are meaningless for a pane that owns no pty.
-        const noTerm = isBrowser || isEditor
+        const noTerm = isEditor
         const surfaceNoun = noTerm ? 'pane' : 'session'
         const dot = paneDot(meta?.kind ?? 'shell', meta?.runState)
         const parkedText = parkedOverlayText(meta?.runState)
@@ -909,9 +903,6 @@ export function SplitView(props: {
                         onTitle={props.onPaneTitle} />
                     </Suspense>
                   })()
-                : isBrowser
-                ? <Browser paneId={paneId} url={props.browsers[paneId]?.url ?? ''}
-                    active={props.active && !hidden} onNav={props.onBrowserNav} onTitle={props.onPaneTitle} />
                 : <Pane key={`${paneId}:${rebuild[paneId] ?? 0}`} session={paneId} kind={meta?.kind ?? 'shell'} epoch={props.epoch} portEpoch={props.portEpoch} activateSeq={activateSeq}
                     fontSize={props.fontSize} cwd={meta?.cwd ?? ''} onTitle={titleCbFor(paneId)} onSearchReady={searchReadyFor(paneId)}
                     onInputReady={inputReadyFor(paneId)}
@@ -1005,10 +996,10 @@ export function SplitView(props: {
         const run = (fn: () => void) => (): void => { fn(); close() }
         const isZoomed = props.zoomedPane === paneId
         const isFrozen = props.frozen[paneId] !== undefined
-        // Browser/editor panes have no terminal, so no terminal refresh or selection.
+        // Editor panes have no terminal, so no terminal refresh or selection.
         const menuMeta = props.meta[paneId]
         const menuKind = menuMeta?.kind
-        const menuHasTerm = menuKind !== 'browser' && menuKind !== 'editor'
+        const menuHasTerm = menuKind !== 'editor'
         const menuNoun = menuHasTerm ? 'session' : 'pane'
         const reload = menuMeta && isAgentKind(menuMeta.kind)
           ? reloadAgentVisibility(agentOf(menuMeta.kind), menuMeta.claudeId ?? null)

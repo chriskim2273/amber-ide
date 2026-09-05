@@ -1,9 +1,14 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtemp, rm, readFile } from 'node:fs/promises'
+import { execFile as execFileCallback } from 'node:child_process'
+import { mkdtemp, rm, readFile, lstat, symlink, writeFile, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { promisify } from 'node:util'
 import { loadLayoutFile, saveLayoutFile } from './layoutIO'
+import { acquireLayoutLock, currentProcessStartIdentity, formatLayoutLockRecord, parseLayoutLockRecord } from './layoutLock'
+import { LAYOUT_FILE_MAX_BYTES } from '../shared/layoutFile'
 
+const execFile = promisify(execFileCallback)
 let dir: string
 let path: string
 beforeEach(async () => {
@@ -15,10 +20,35 @@ afterEach(async () => {
 })
 
 describe('loadLayoutFile', () => {
+  it('accepts exactly the layout byte limit but rejects an oversized file without reading it', async () => {
+    await writeFile(path, Buffer.alloc(LAYOUT_FILE_MAX_BYTES, 0x78))
+    const boundary = await loadLayoutFile(path)
+    expect(boundary.text).toHaveLength(LAYOUT_FILE_MAX_BYTES)
+    expect(boundary.version).toBe(boundary.text)
+
+    await writeFile(path, Buffer.alloc(LAYOUT_FILE_MAX_BYTES + 1, 0x79))
+    expect(await loadLayoutFile(path)).toEqual({ text: null, version: null, error: 'LAYOUT_FILE_LIMIT' })
+  })
+
+  it('rejects a FIFO without waiting for a writer', async () => {
+    if (process.platform === 'win32') return
+    await execFile('mkfifo', [path])
+    const started = Date.now()
+    await expect(loadLayoutFile(path)).resolves.toEqual({ text: null, version: null, error: 'LAYOUT_NOT_REGULAR' })
+    expect(Date.now() - started).toBeLessThan(1000)
+  })
+
   it('returns text and a version equal to it', async () => {
     const { writeFile } = await import('node:fs/promises')
     await writeFile(path, '{"a":1}')
     expect(await loadLayoutFile(path)).toEqual({ text: '{"a":1}', version: '{"a":1}' })
+  })
+
+  it('rejects distinct invalid UTF-8 byte sequences with the same stable error', async () => {
+    await writeFile(path, Buffer.from([0x7b, 0x22, 0xc3, 0x28, 0x22, 0x3a, 0x31, 0x7d]))
+    expect(await loadLayoutFile(path)).toEqual({ text: null, version: null, error: 'LAYOUT_INVALID_UTF8' })
+    await writeFile(path, Buffer.from([0x7b, 0x22, 0xe2, 0x28, 0xa1, 0x22, 0x3a, 0x31, 0x7d]))
+    expect(await loadLayoutFile(path)).toEqual({ text: null, version: null, error: 'LAYOUT_INVALID_UTF8' })
   })
 
   it('returns nulls for a missing file (first run, no sidecar yet)', async () => {
@@ -76,9 +106,134 @@ describe('saveLayoutFile', () => {
     expect(await readFile(path, 'utf8')).toBe('v1-from-b')
   })
 
-  it('creates the parent directory on first write', async () => {
+  it('allows only one of two truly simultaneous writers with the same version', async () => {
+    await saveLayoutFile(path, 'v0', null)
+    const loaded = await loadLayoutFile(path)
+    const results = await Promise.all([
+      saveLayoutFile(path, 'from-a', loaded.version),
+      saveLayoutFile(path, 'from-b', loaded.version),
+    ])
+    expect(results.filter((result) => 'ok' in result)).toHaveLength(1)
+    expect(results.filter((result) => 'conflict' in result)).toHaveLength(1)
+    expect(['from-a', 'from-b']).toContain(await readFile(path, 'utf8'))
+  })
+
+  it('creates the parent directory on first write with private permissions', async () => {
     const nested = join(dir, 'nested', 'ui-layout.json')
     const r = await saveLayoutFile(nested, '{}', null)
     expect(r).toEqual({ ok: true, version: '{}' })
+    if (process.platform !== 'win32') expect((await lstat(nested)).mode & 0o777).toBe(0o600)
+  })
+
+  it('rejects replacing a symlink', async () => {
+    const target = join(dir, 'target')
+    await writeFile(target, 'do-not-touch')
+    await symlink(target, path)
+    expect(await saveLayoutFile(path, '{}', 'do-not-touch')).toEqual({ error: 'LAYOUT_SYMLINK' })
+    expect(await readFile(target, 'utf8')).toBe('do-not-touch')
+  })
+
+  it('does not return an oversized sidecar when it swaps in after the caller pre-read', async () => {
+    await saveLayoutFile(path, 'before', null)
+    const loaded = await loadLayoutFile(path)
+    await writeFile(path, Buffer.alloc(LAYOUT_FILE_MAX_BYTES + 1, 0x7a))
+    expect(await saveLayoutFile(path, 'after', loaded.version)).toEqual({ error: 'LAYOUT_FILE_LIMIT' })
+    expect((await stat(path)).size).toBe(LAYOUT_FILE_MAX_BYTES + 1)
+  })
+
+  it('accepts reordered complete records but rejects every duplicate or unknown field', () => {
+    const record = { pid: 42, start: 'linux:123', token: 'token' }
+    expect(parseLayoutLockRecord(formatLayoutLockRecord(record))).toEqual(record)
+    expect(parseLayoutLockRecord('amber-layout-lock-v1\ntoken=token\nstart=linux:123\npid=42\n')).toEqual(record)
+    expect(parseLayoutLockRecord('amber-layout-lock-v1\npid=42\npid=42\nstart=linux:123\ntoken=token\n')).toBeNull()
+    expect(parseLayoutLockRecord('amber-layout-lock-v1\npid=42\nstart=linux:123\nstart=linux:124\ntoken=token\n')).toBeNull()
+    expect(parseLayoutLockRecord('amber-layout-lock-v1\npid=42\nstart=linux:123\ntoken=token\ntoken=other\n')).toBeNull()
+    expect(parseLayoutLockRecord('amber-layout-lock-v1\npid=42\nstart=linux:123\ntoken=token\ncreated=1\n')).toBeNull()
+    expect(parseLayoutLockRecord('amber-layout-lock-v1\npid=4294967296\nstart=linux:123\ntoken=token\n')).toBeNull()
+    expect(parseLayoutLockRecord('amber-layout-lock-v1\npid=+42\nstart=linux:123\ntoken=token\n')).toBeNull()
+    expect(parseLayoutLockRecord('amber-layout-lock-v1\npid=bad\npid=42\nstart=linux:123\ntoken=token\n')).toBeNull()
+  })
+
+  it('does not classify a duplicate legacy identity by the later dead value', async () => {
+    const start = await currentProcessStartIdentity()
+    if (!start) return
+    const lockPath = `${path}.lock`
+    const duplicate = `amber-layout-lock-v1\npid=${process.pid}\nstart=${start}\npid=4294967000\nstart=linux:missing\n`
+    await writeFile(lockPath, duplicate)
+    await expect(acquireLayoutLock(lockPath, 40)).rejects.toThrow('LAYOUT_LOCK_TIMEOUT')
+    expect(await readFile(lockPath, 'utf8')).toBe(duplicate)
+  })
+
+  it('fails closed on duplicate legacy token and created fields, including identical values', async () => {
+    const lockPath = `${path}.lock`
+    const duplicate = 'amber-layout-lock-v1\npid=4294967000\nstart=linux:missing\ntoken=one\ntoken=one\ncreated=1\ncreated=1\n'
+    await writeFile(lockPath, duplicate)
+    await expect(acquireLayoutLock(lockPath, 40)).rejects.toThrow('LAYOUT_LOCK_TIMEOUT')
+    expect(await readFile(lockPath, 'utf8')).toBe(duplicate)
+  })
+
+  it('does not age-steal a lock held by a live process', async () => {
+    const start = await currentProcessStartIdentity()
+    if (!start) return
+    await writeFile(`${path}.lock`, formatLayoutLockRecord({ pid: process.pid, start, token: 'live-owner' }))
+    const result = await saveLayoutFile(path, '{}', null)
+    expect(result).toMatchObject({ error: 'LAYOUT_LOCK_TIMEOUT' })
+    expect(await readFile(`${path}.lock`, 'utf8')).toContain('token=live-owner')
+  })
+
+  it('reclaims a dead owner and writes after a crash', async () => {
+    await writeFile(`${path}.lock`, formatLayoutLockRecord({ pid: 4_294_967_000, start: 'linux:missing', token: 'dead-owner' }))
+    expect(await saveLayoutFile(path, '{}', null)).toEqual({ ok: true, version: '{}' })
+  })
+
+  it('publishes complete lock records and ignores an orphaned pre-publication temp', async () => {
+    const lockPath = `${path}.lock`
+    await writeFile(`${lockPath}.orphan.tmp`, 'amber-layout-lock-v1\npid=\n')
+    const lock = await acquireLayoutLock(lockPath, 100)
+    expect(parseLayoutLockRecord(await readFile(lockPath, 'utf8'))).not.toBeNull()
+    await lock.release()
+    expect(await saveLayoutFile(path, '{}', null)).toEqual({ ok: true, version: '{}' })
+  })
+
+  it('reclaims a reordered legacy lock with one created field only when its owner is dead', async () => {
+    await writeFile(`${path}.lock`, 'amber-layout-lock-v1\ncreated=1\nstart=linux:missing\npid=4294967000\ntoken=legacy\n')
+    expect(await saveLayoutFile(path, '{}', null)).toEqual({ ok: true, version: '{}' })
+  })
+
+  it('reclaims a malformed legacy lock only when its identifiable owner is dead', async () => {
+    await writeFile(`${path}.lock`, 'amber-layout-lock-v1\npid=4294967000\nstart=linux:missing\n')
+    expect(await saveLayoutFile(path, '{}', null)).toEqual({ ok: true, version: '{}' })
+  })
+
+  it('does not reclaim a malformed legacy lock while its identifiable owner is live', async () => {
+    const start = await currentProcessStartIdentity()
+    if (!start) return
+    const lockPath = `${path}.lock`
+    const partial = `amber-layout-lock-v1\npid=${process.pid}\nstart=${start}\n`
+    await writeFile(lockPath, partial)
+    expect(await saveLayoutFile(path, '{}', null)).toMatchObject({ error: 'LAYOUT_LOCK_TIMEOUT' })
+    expect(await readFile(lockPath, 'utf8')).toBe(partial)
+  })
+
+  it('fails closed on an unidentifiable partial legacy lock', async () => {
+    const lockPath = `${path}.lock`
+    await writeFile(lockPath, 'amber-layout-lock-v1\npid=')
+    expect(await saveLayoutFile(path, '{}', null)).toMatchObject({ error: 'LAYOUT_LOCK_TIMEOUT' })
+    expect(await readFile(lockPath, 'utf8')).toBe('amber-layout-lock-v1\npid=')
+  })
+
+  it('does not reclaim a lock whose owner identity is unknown', async () => {
+    const lockPath = `${path}.lock`
+    await writeFile(lockPath, formatLayoutLockRecord({ pid: process.pid, start: 'unknown:owner', token: 'unknown-owner' }))
+    await expect(acquireLayoutLock(lockPath, 30)).rejects.toThrow('LAYOUT_LOCK_TIMEOUT')
+    expect(await readFile(lockPath, 'utf8')).toContain('token=unknown-owner')
+  })
+
+  it('does not let an old owner release a successor lock', async () => {
+    await saveLayoutFile(path, '{}', null)
+    const loaded = await loadLayoutFile(path)
+    await writeFile(`${path}.lock`, formatLayoutLockRecord({ pid: 4_294_967_000, start: 'linux:missing', token: 'successor' }))
+    expect(await saveLayoutFile(path, '{"next":true}', loaded.version)).toEqual({ ok: true, version: '{"next":true}' })
+    expect(await readFile(path, 'utf8')).toBe('{"next":true}')
   })
 })

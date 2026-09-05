@@ -1,8 +1,9 @@
-import { mkdir, readFile, writeFile, rename, readdir, stat, lstat, open, rm, realpath } from 'node:fs/promises'
+import { mkdir, writeFile, rename, readdir, stat, lstat, rm, realpath } from 'node:fs/promises'
 import { dirname, join, resolve, relative, isAbsolute } from 'node:path'
 import type { LoadProductivityResult, SaveProductivityResult } from '../shared/productivity'
 import { parseProjectProfile, type ProjectProfile } from '../shared/projectProfile'
 import { CHECKPOINT_FILE_MAX, CHECKPOINT_ID, parseCheckpoint, parseCheckpointMeta, type CheckpointSummary } from '../shared/checkpoint'
+import { readSafeTextFile, SafeFileReadError } from './safeFileReader'
 
 async function atomicWrite(path: string, text: string): Promise<void> {
   await mkdir(dirname(path), { recursive: true })
@@ -13,10 +14,9 @@ async function atomicWrite(path: string, text: string): Promise<void> {
 
 export async function loadProductivityFile(path: string): Promise<LoadProductivityResult> {
   try {
-    const info = await lstat(path)
-    if (!info.isFile() || info.isSymbolicLink() || info.size > 4 * 1024 * 1024) return { text: null, version: null }
-    const text = await readFile(path, 'utf8')
-    return { text, version: text }
+    const owner = process.getuid?.()
+    const text = await readSafeTextFile(path, { maxBytes: 4 * 1024 * 1024, ...(owner === undefined ? {} : { owner }) })
+    return text === null ? { text: null, version: null } : { text, version: text }
   } catch { return { text: null, version: null } }
 }
 
@@ -27,7 +27,10 @@ export async function saveProductivityFile(
     if (Buffer.byteLength(text) > 4 * 1024 * 1024) return { error: 'productivity file exceeds 4 MiB' }
     const info = await lstat(path).catch(() => null)
     if (info && (!info.isFile() || info.isSymbolicLink())) return { error: 'productivity path is not a regular file' }
-    const current = await readFile(path, 'utf8').catch(() => null)
+    const owner = process.getuid?.()
+    let current: string | null
+    try { current = await readSafeTextFile(path, { maxBytes: 4 * 1024 * 1024, ...(owner === undefined ? {} : { owner }) }) }
+    catch (error) { return { error: error instanceof SafeFileReadError ? error.code : error instanceof Error ? error.message : String(error) } }
     if (current !== expected) return { conflict: true, text: current, version: current }
     try {
       const raw = JSON.parse(text) as unknown
@@ -50,7 +53,8 @@ export async function readProjectProfile(root: string): Promise<
 > {
   try {
     const canonicalRoot = await realpath(root)
-    const source = await readFile(join(canonicalRoot, '.amber.toml'), 'utf8')
+    const source = await readSafeTextFile(join(canonicalRoot, '.amber.toml'), { maxBytes: 64 * 1024 })
+    if (source === null) throw new Error('.amber.toml is missing')
     if (Buffer.byteLength(source) > 64 * 1024) return { error: '.amber.toml exceeds 64 KiB' }
     const profile = parseProjectProfile(source)
     const resolvedCwds: string[] = []
@@ -84,10 +88,17 @@ export async function writeCheckpoint(root: string, id: string, text: string): P
 
 export async function readCheckpoint(root: string, id: string): Promise<string> {
   const path = checkpointPath(root, id)
-  const info = await lstat(path)
-  if (!info.isFile() || info.isSymbolicLink()) throw new Error('checkpoint is not a regular file')
-  if (info.size > CHECKPOINT_FILE_MAX) throw new Error('checkpoint exceeds 128 MiB')
-  const text = await readFile(path, 'utf8')
+  let text: string | null
+  try { text = await readSafeTextFile(path, { maxBytes: CHECKPOINT_FILE_MAX }) }
+  catch (error) {
+    if (error instanceof SafeFileReadError) {
+      if (error.code === 'SYMLINK' || error.code === 'NOT_REGULAR') throw new Error('checkpoint is not a regular file')
+      if (error.code === 'FILE_TOO_LARGE') throw new Error('checkpoint exceeds 128 MiB')
+      if (error.code === 'INVALID_UTF8') throw new Error('checkpoint is not valid UTF-8')
+    }
+    throw error
+  }
+  if (text === null) throw new Error('checkpoint is not a regular file')
   parseCheckpoint(text)
   return text
 }
@@ -116,16 +127,12 @@ function firstJsonObject(text: string, start: number): string {
 }
 
 async function checkpointSummary(path: string, bytes: number): Promise<CheckpointSummary> {
-  const handle = await open(path, 'r')
-  try {
-    const buffer = Buffer.alloc(Math.min(bytes, CHECKPOINT_META_PREFIX_MAX))
-    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0)
-    const prefix = buffer.subarray(0, bytesRead).toString('utf8')
-    const marker = '{"checkpoint":'
-    if (!prefix.startsWith(marker)) throw new Error('checkpoint metadata is not first')
-    const metaText = firstJsonObject(prefix, marker.length)
-    return { ...parseCheckpointMeta(JSON.parse(metaText) as unknown), bytes }
-  } finally { await handle.close() }
+  const prefix = await readSafeTextFile(path, { maxBytes: CHECKPOINT_FILE_MAX, readBytes: CHECKPOINT_META_PREFIX_MAX })
+  if (prefix === null) throw new Error('checkpoint is not a regular file')
+  const marker = '{"checkpoint":'
+  if (!prefix.startsWith(marker)) throw new Error('checkpoint metadata is not first')
+  const metaText = firstJsonObject(prefix, marker.length)
+  return { ...parseCheckpointMeta(JSON.parse(metaText) as unknown), bytes }
 }
 
 async function checkpointCandidates(root: string): Promise<Array<{ path: string; bytes: number; mtime: number }>> {

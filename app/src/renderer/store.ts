@@ -1,5 +1,5 @@
 import type { SessionInfo } from '../shared/proto'
-import type { BrowserEntry } from '../shared/layoutFile'
+import type { WsLayout } from '../shared/layoutFile'
 import { parseName } from '../shared/names'
 
 export interface AppState {
@@ -211,7 +211,6 @@ export function resourcePressureMessage(pressure: ResourcePressure): string {
 // Shared by the pane header and the tab bar so they downgrade identically:
 // amber = claude, pulsing amber = claude-retrying, gray = shell-fallback.
 export function paneDot(kind: string, runState: string | undefined): KindDot {
-  if (kind === 'browser') return { cls: 'browser', label: 'browser' }
   if (kind === 'editor') return { cls: 'editor', label: 'editor' }
   if (!isAgentKind(kind)) return { cls: 'shell', label: 'shell' }
   switch (runState) {
@@ -256,16 +255,26 @@ export function hasActivity(state: AppState, panes: PaneModel[], frozen?: Set<st
   return panes.some((p) => !frozen?.has(p.name) && (state.lastActivity[p.name] ?? 0) > (state.lastSeen[p.name] ?? 0))
 }
 
-// Inject app-local browser panes (sidecar-owned, no daemon session) into the
-// grouped model so they flow through deriveTab exactly like a daemon pane. A
-// browser pane's {ws,tab} may be a grouping that has no daemon session at all,
-// so ws/tab entries are created on demand. Result stays sorted by ord.
-export function mergeBrowsers(workspaces: WorkspaceModel[], browsers: Record<string, BrowserEntry>, titles?: Record<string, string>): WorkspaceModel[] {
-  return mergeLocalPanes(workspaces, browsers, 'browser', titles)
+export function mergeBrowserRailTabs(workspaces: WorkspaceModel[], layouts: Record<string, WsLayout>): WorkspaceModel[] {
+  const wsMap = new Map(workspaces.map((workspace) => [workspace.ws, new Map(workspace.tabs.map((tab) => [tab.tab, tab]))]))
+  let changed = false
+  for (const [wsKey, workspace] of Object.entries(layouts)) {
+    const ws = Number(wsKey)
+    if (!Number.isSafeInteger(ws)) continue
+    for (const [tabKey, tabLayout] of Object.entries(workspace.tabs)) {
+      if (!tabLayout.browser) continue
+      const tab = Number(tabKey)
+      if (!Number.isSafeInteger(tab)) continue
+      if (!wsMap.has(ws)) { wsMap.set(ws, new Map()); changed = true }
+      if (!wsMap.get(ws)!.has(tab)) { wsMap.get(ws)!.set(tab, { tab, panes: [] }); changed = true }
+    }
+  }
+  if (!changed) return workspaces
+  return [...wsMap.entries()].sort((a, b) => a[0] - b[0]).map(([ws, tabs]) => ({ ws, tabs: [...tabs.values()].sort((a, b) => a.tab - b.tab) }))
 }
 
-// Editor panes (spec 2026-07-19) are the same class as browser panes: app-local,
-// sidecar-owned, no daemon session. `cwd` carries the file's directory so the
+// Editor panes are app-local, sidecar-owned, and have no daemon session.
+// `cwd` carries the file's directory so the
 // pane header/title can show something useful; an unsaved scratch pane has none.
 export function mergeEditors(
   workspaces: WorkspaceModel[],
@@ -275,7 +284,7 @@ export function mergeEditors(
   return mergeLocalPanes(workspaces, editors, 'editor', titles)
 }
 
-// Shared body of the two merges above: fold sidecar-owned panes into the grouped
+// Fold editor panes into the grouped
 // model so they flow through deriveTab exactly like a daemon pane. Such a pane's
 // {ws,tab} may be a grouping with no daemon session at all, so ws/tab entries are
 // created on demand. Result stays sorted by ord.
