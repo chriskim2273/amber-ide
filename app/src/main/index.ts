@@ -780,7 +780,10 @@ const residentIntents = new ResidentIntentLatch()
 // with a latched intent and no handler.
 function quitDuringStartup(): void {
   allowFinalQuit = true
-  app.quit()
+  // Startup failure has no browser host, but use the same bounded tunnel
+  // finalizer before allowing Electron to exit if a future startup phase ever
+  // created one before failing.
+  void killTunnels().then(() => app.quit(), () => app.quit())
 }
 
 /** The window an IPC message came from. */
@@ -931,7 +934,9 @@ async function openRemoteWindow(host: string): Promise<void> {
         if (current !== lease) return
         // Keep registry ownership until cleanup has actually completed. Quit
         // racing this callback receives the same one-shot promise.
-        void lease.cleanup().finally(() => {
+        void lease.cleanup().then(() => {
+          if (tunnels.get(id) === lease) tunnels.delete(id)
+        }, () => {
           if (tunnels.get(id) === lease) tunnels.delete(id)
         })
       })

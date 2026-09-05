@@ -122,6 +122,16 @@ export class TrackedTunnelRegistry {
   fence(): void { this.accepting = false }
   cancelFence(): void { if (this.finalCleanup === null) this.accepting = true }
 
+  private cleanupRecord(key: symbol, record: TrackedTunnelRecord, timeoutMs: number): Promise<void> {
+    if (record.cleanupPromise) return record.cleanupPromise
+    // Cleanup is best effort after the bounded kill attempts. Never let an
+    // unusual ChildProcess implementation turn a window close into an
+    // unhandled rejection or prevent the other tunnels from draining.
+    const cleanup = cleanupTunnel(record.tunnel, timeoutMs).catch(() => {})
+    record.cleanupPromise = cleanup.finally(() => { this.records.delete(key) })
+    return record.cleanupPromise
+  }
+
   register(tunnel: TrackedTunnel): TrackedTunnelHandle | null {
     if (!this.canRegister()) return null
     const key = Symbol('amber tunnel')
@@ -129,12 +139,7 @@ export class TrackedTunnelRegistry {
     this.records.set(key, record)
     return {
       tunnel,
-      cleanup: (timeoutMs = TUNNEL_CLEANUP_TIMEOUT_MS): Promise<void> => {
-        if (record.cleanupPromise) return record.cleanupPromise
-        const cleanup = cleanupTunnel(tunnel, timeoutMs)
-        record.cleanupPromise = cleanup.finally(() => { this.records.delete(key) })
-        return record.cleanupPromise
-      },
+      cleanup: (timeoutMs = TUNNEL_CLEANUP_TIMEOUT_MS): Promise<void> => this.cleanupRecord(key, record, timeoutMs),
     }
   }
 
@@ -142,16 +147,9 @@ export class TrackedTunnelRegistry {
   cleanupAll(timeoutMs = TUNNEL_CLEANUP_TIMEOUT_MS): Promise<void> {
     this.fence()
     if (this.finalCleanup) return this.finalCleanup
-    const handles = [...this.records.entries()].map(([key, record]) => ({
-      key,
-      cleanup: (): Promise<void> => {
-        if (record.cleanupPromise) return record.cleanupPromise
-        const cleanup = cleanupTunnel(record.tunnel, timeoutMs)
-        record.cleanupPromise = cleanup.finally(() => { this.records.delete(key) })
-        return record.cleanupPromise
-      },
-    }))
-    const run = Promise.all(handles.map((handle) => handle.cleanup())).then(() => undefined)
+    const handles = [...this.records.entries()].map(([key, record]) =>
+      this.cleanupRecord(key, record, timeoutMs))
+    const run = Promise.all(handles).then(() => undefined)
     let settled!: Promise<void>
     settled = run.finally(() => { if (this.finalCleanup === settled) this.finalCleanup = null })
     this.finalCleanup = settled
@@ -446,6 +444,23 @@ export interface BrowserHostQuitDeps {
   closeWindows: () => void | Promise<void>
 }
 
+function boundedQuitStep(work: Promise<void>, timeoutMs: number): Promise<void> {
+  const limit = Math.max(1, timeoutMs)
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const timer = setTimeout(() => {
+      if (settled) return
+      settled = true
+      reject(new Error('QUIT_DRAIN_TIMEOUT'))
+    }, limit)
+    timer.unref()
+    work.then(
+      () => { if (!settled) { settled = true; clearTimeout(timer); resolve() } },
+      (error) => { if (!settled) { settled = true; clearTimeout(timer); reject(error) } },
+    )
+  })
+}
+
 export async function coordinateBrowserHostQuit(deps: BrowserHostQuitDeps, timeoutMs = 5_000): Promise<{ ok: true } | { ok: false; error: 'QUIT_DRAIN_TIMEOUT' | 'QUIT_DRAIN_FAILED' }> {
   let flushController: AbortController | undefined
   try {
@@ -462,16 +477,17 @@ export async function coordinateBrowserHostQuit(deps: BrowserHostQuitDeps, timeo
           reject(new Error('QUIT_DRAIN_TIMEOUT'))
         }, timeoutMs)
       })
+      timer?.unref()
       try { await Promise.race([deps.flushAndDestroy(flushController.signal), timeout]) }
       catch (error) { flushController.abort(); throw error }
       finally { if (timer) clearTimeout(timer) }
     }
-    await deps.closeBroker()
+    // Tunnels are process-owned resources, not browser state. Drain them first
+    // so a slow broker close cannot strand an ssh child during finalization.
+    if (deps.cleanupTunnels) await boundedQuitStep(deps.cleanupTunnels(), timeoutMs)
+    await boundedQuitStep(deps.closeBroker(), timeoutMs)
     deps.closeWatcher()
-    // Tunnels are process-owned resources, not browser state. They must be
-    // drained before closeWindows can hand control to app.quit/app.exit.
-    await deps.cleanupTunnels?.()
-    await deps.closeWindows()
+    await boundedQuitStep(Promise.resolve(deps.closeWindows()), timeoutMs)
     return { ok: true }
   } catch (error) {
     flushController?.abort()

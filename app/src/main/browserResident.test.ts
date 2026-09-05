@@ -214,7 +214,7 @@ describe('coordinated resident quit', () => {
       closeWindows: () => { order.push('windows') },
     }, 100)
     expect(result).toEqual({ ok: true })
-    expect(order).toEqual(['inhibit', 'drain', 'persist+destroy', 'broker', 'watcher', 'tunnels', 'windows'])
+    expect(order).toEqual(['inhibit', 'drain', 'persist+destroy', 'tunnels', 'broker', 'watcher', 'windows'])
   })
 
   it('skips host-specific inhibit and drain work when browser hosting is unavailable on Linux', async () => {
@@ -230,7 +230,22 @@ describe('coordinated resident quit', () => {
       closeWindows: () => { order.push('windows') },
     }, 100)
     expect(result).toEqual({ ok: true })
-    expect(order).toEqual(['broker', 'watcher', 'tunnels', 'windows'])
+    expect(order).toEqual(['tunnels', 'broker', 'watcher', 'windows'])
+  })
+
+  it('bounds tunnel cleanup before a host-disabled app exit', async () => {
+    let closed = false
+    const result = await coordinateBrowserHostQuit({
+      hostAvailable: false,
+      beginDrain: () => {},
+      flushAndDestroy: async () => {},
+      closeBroker: async () => { closed = true },
+      closeWatcher: () => { closed = true },
+      cleanupTunnels: () => new Promise<void>(() => {}),
+      closeWindows: () => { closed = true },
+    }, 5)
+    expect(result).toEqual({ ok: false, error: 'QUIT_DRAIN_TIMEOUT' })
+    expect(closed).toBe(false)
   })
 
   it('aborts the timed-out flush so it cannot complete after the caller cancels', async () => {
