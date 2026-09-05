@@ -1,7 +1,12 @@
 import { describe, expect, it, vi } from 'vitest'
-import { createInputEventHandlers, projectInPageNavigation } from './electronTabBrowserPage'
+import { browserWindowCanRemoveChildView, createInputEventHandlers, projectInPageNavigation } from './electronTabBrowserPage'
 
 describe('Electron tab browser page events', () => {
+  it('does not reparent through a BrowserWindow that already closed', () => {
+    expect(browserWindowCanRemoveChildView({ isDestroyed: () => false })).toBe(true)
+    expect(browserWindowCanRemoveChildView({ isDestroyed: () => true })).toBe(false)
+  })
+
   it('advances generation for every keyboard, mouse, drag, and composition callback', () => {
     const input = vi.fn(), blur = vi.fn()
     const handlers = createInputEventHandlers(input, blur)

@@ -19,6 +19,11 @@ export function projectInPageNavigation(url: string, isMainFrame: boolean): TabB
   return isMainFrame ? { type: 'navigation-in-page', url: url.slice(0, 8192) } : null
 }
 
+/** A closed BrowserWindow cannot receive removeChildView during reparenting. */
+export function browserWindowCanRemoveChildView(window: Pick<BrowserWindow, 'isDestroyed'>): boolean {
+  return !window.isDestroyed()
+}
+
 interface PreventableInputEvent { preventDefault(): void }
 
 /**
@@ -119,7 +124,10 @@ export class ElectronTabBrowserPage implements TabBrowserPage {
     this.view.setBounds(this.bounds)
   }
   hide(): void {
-    if (this.attached) { this.window.contentView.removeChildView(this.view); this.attached = false }
+    if (this.attached) {
+      if (browserWindowCanRemoveChildView(this.window)) this.window.contentView.removeChildView(this.view)
+      this.attached = false
+    }
   }
   destroy(): void { this.disposing = true; this.automation.dispose(); this.hide(); if (!this.view.webContents.isDestroyed()) this.view.webContents.close(); this.onDestroy() }
 }
