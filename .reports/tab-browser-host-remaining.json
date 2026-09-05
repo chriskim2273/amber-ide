@@ -141,6 +141,18 @@
       "work": "Validation metadata records CODE_HEAD/CODE_TESTED_COMMIT c5b87c8 separately from REPORT_HEAD/REPORT_BASE_COMMIT e856624 and records current follow-up verifier/test evidence under the same private root; mergeReady remains false for external gates."
     },
     {
+      "id": "P1-resident-review-follow-up",
+      "severity": "important",
+      "status": "partial",
+      "work": "Resident review findings are implemented in a19b97f, 1d97984, 4c50e55, and 2fe2fcc: forced Quit and compat exit await bounded idempotent tracked-tunnel cleanup; resident reopen is single-flight with an in-flight quit fence; closed-window browser reparenting is guarded; windowHidden revokes live, activation, and queue-owner browser work; and a spawned process-level E2E covers watcher epochs plus sidecar CAS-conflict/process-restart/orphan recovery. Exact current code is 2fe2fccfeacab9e134c51ee90dc68d47df30ad22. Independent resident re-review remains required, so this P1 is not promoted. mergeReady remains false for deployed-reader, macOS, physical Linux input, Pi 0.85, and Windows gates."
+    },
+    {
+      "id": "P2-resident-process-e2e",
+      "severity": "important",
+      "status": "completed",
+      "work": "Three deterministic private process-level tests pass: a spawned Unix-socket peer proves BrowserDaemonWatcher drops stale authority across disconnect/reconnect epochs; a spawned sidecar writer wins a real CAS conflict without clobbering state and leaves no orphan record; and a spawned transaction writer exits after journaling, then a fresh helper process recovers the target and clears the pending transaction without duplicate browser records."
+    },
+    {
       "id": "GATE-deployed-reader",
       "severity": "blocking-gate",
       "status": "open",
