@@ -461,6 +461,36 @@ describe('TabBrowserService dispatch authorization', () => {
     expect(automationCalls).toBe(0)
   })
 
+  it('rejects a queued interaction whose expected generation becomes stale before dispatch', async () => {
+    const state = emptyBrowserState(1)
+    let snapshotCalls = 0, input!: () => void, releaseFirst!: () => void
+    let prepareCalls = 0, executeCalls = 0
+    const firstSnapshot = new Promise<void>((resolve) => { releaseFirst = resolve })
+    const automation = {
+      snapshot: vi.fn(async () => { snapshotCalls += 1; await firstSnapshot; return { snapshotId: 'snap', nodes: [], truncated: false, url: 'about:blank' } }),
+      prepareInteraction: vi.fn(async () => { prepareCalls += 1; return {} }),
+      executeInteraction: vi.fn(async () => { executeCalls += 1; return { dispatched: true, rollbackPossible: false } }),
+      invalidate: vi.fn(),
+    }
+    // Use a minimal page shape while retaining the production Host generation
+    // check; the queued service command must fail before this automation runs.
+    const host = new TabBrowserHost(state, { create: (_id, onUserInput) => { input = onUserInput; return { loadURL: async () => {}, show: () => {}, hide: () => {}, stop: () => {}, destroy: () => {}, automation } } })
+    const opened = await host.open({ visible: true })
+    const id = opened.status.id
+    const current = opened.status
+    const Service = TabBrowserService as unknown as new (s: TabBrowserStateStore, p: { setWindow: () => void }, h: TabBrowserHost, i: typeof state) => TabBrowserService
+    const service = new Service({ update: async () => state } as unknown as TabBrowserStateStore, { setWindow: () => {} }, host, state)
+    const first = service.command({ type: 'automation', id, action: { type: 'snapshot', pageIncarnation: current.pageIncarnation, expectedGeneration: current.generation, limits: { maxDepth: 20, maxNodes: 20, maxBytes: 4096 } } })
+    await vi.waitFor(() => expect(snapshotCalls).toBe(1))
+    const queued = service.command({ type: 'automation', id, action: { type: 'interact', pageIncarnation: current.pageIncarnation, expectedGeneration: current.generation, operation: { kind: 'click', target: { snapshotId: 'snap', ref: 'n1' } } } })
+    input()
+    releaseFirst()
+    await expect(first).rejects.toThrow('STALE_GENERATION')
+    await expect(queued).rejects.toThrow('STALE_GENERATION')
+    expect(prepareCalls).toBe(0)
+    expect(executeCalls).toBe(0)
+  })
+
   it('rejects a queued stop after authorization is lost without stopping the page', async () => {
     const state = emptyBrowserState(1); let release!: () => void; let stopped = 0
     const blocked = new Promise<void>((resolve) => { release = resolve })

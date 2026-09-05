@@ -107,9 +107,23 @@ try {
     if (Buffer.byteLength(textResult.content[0].text) > 50000 || textResult.content[0].text.split('\n').length > 2000) throw new Error('labeled text result exceeded bounds')
     const fillResult = await fillTool.execute('verify-fill', { pageIncarnation: 'page', expectedGeneration: 1, target: { snapshotId: 'snap', ref: 'n1' }, text: 'fixture-sensitive-value' }, new AbortController().signal)
     const fillText = fillResult.content?.[0]?.text ?? ''
+    const expectedPartialFailure = {
+      code: 'ACTION_FAILED_NO_ROLLBACK',
+      retryable: false,
+      message: 'Input was dispatched and cannot be rolled back. Take a fresh browser snapshot before retrying.',
+      pageIncarnation: 'page-current',
+      generation: 4,
+      snapshotHint: true,
+      dispatched: true,
+      nextStep: 'Call browser_snapshot with the reported pageIncarnation and generation before retrying.',
+    }
+    let partialFailure
+    try { partialFailure = JSON.parse(fillText.startsWith(`${label}\n`) ? fillText.slice(label.length + 1) : '') }
+    catch { partialFailure = undefined }
     if (JSON.stringify(fillResult).includes('fixture-sensitive-value') || !fillText.startsWith(`${label}\n`)
-      || !fillText.includes('ACTION_FAILED_NO_ROLLBACK') || !fillText.includes('retryable') || !fillText.includes('nextStep')
-      || !fillText.includes('fresh browser snapshot')) throw new Error('structured partial interaction result was lost, leaked, or not actionable')
+      || JSON.stringify(partialFailure) !== JSON.stringify(expectedPartialFailure)) {
+      throw new Error(`structured partial interaction result was lost, leaked, or not actionable: ${JSON.stringify(partialFailure)}`)
+    }
     const imageResult = await screenshotTool.execute('verify-image', { pageIncarnation: 'page', expectedGeneration: 1 }, new AbortController().signal)
     if (!imageResult.content?.[0]?.text?.startsWith(`${label}\n`) || imageResult.content?.[1]?.type !== 'image') throw new Error('binary image lost its untrusted-content label')
   } finally { await new Promise((resolveClose) => server.close(resolveClose)) }

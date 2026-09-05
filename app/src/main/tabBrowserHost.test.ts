@@ -2,7 +2,8 @@ import { describe, expect, it, vi } from 'vitest'
 import { TabBrowserHost, type TabBrowserPage, type TabBrowserPageEvent, type TabBrowserPageFactory } from './tabBrowserHost'
 import { emptyBrowserState, parseBrowserState } from '../shared/tabBrowserState'
 import { BrowserAutomationError } from './browserErrors'
-import type { BrowserAutomation } from './browserAutomation'
+import { BrowserAutomation, type BrowserDebuggerTransport } from './browserAutomation'
+import { createInputEventHandlers } from './electronTabBrowserPage'
 
 class FakePage implements TabBrowserPage {
   url = 'about:blank'; destroyed = false; visible = false; stopped = false
@@ -43,6 +44,81 @@ describe('TabBrowserHost', () => {
     const before = opened.status.generation
     const result = await host.runAutomation(opened.status.id, { type: 'interact', pageIncarnation: opened.status.pageIncarnation, expectedGeneration: before, operation: { kind: 'click', target: { snapshotId: 'snapshot', ref: 'n1' } } }, new AbortController().signal)
     expect(result).toMatchObject({ dispatched: true, generation: before + 2, pageIncarnation: opened.status.pageIncarnation, interleaved: true })
+  })
+
+  it('keeps drag and multi-dispatch typing successful while Electron callbacks advance generation', async () => {
+    let host!: TabBrowserHost
+    const observedGenerations: number[] = []
+    class InputDebugger implements BrowserDebuggerTransport {
+      private attached = false
+      private readonly handlers
+      constructor(onUserInput: () => void) {
+        this.handlers = createInputEventHandlers(onUserInput, () => {})
+      }
+      isAttached(): boolean { return this.attached }
+      attach(): void { this.attached = true }
+      onMessage(): void {}
+      async send(method: string, params: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
+        const preventable = { preventDefault: () => {} }
+        if (method === 'Input.dispatchMouseEvent') {
+          this.handlers.beforeMouseEvent(preventable, params as never)
+          return {}
+        }
+        if (method === 'Input.dispatchKeyEvent' || method === 'Input.insertText') {
+          this.handlers.beforeInputEvent(preventable, {
+            type: String(params['type'] ?? 'keyDown'), key: String(params['key'] ?? params['text'] ?? ''), code: String(params['code'] ?? ''),
+            isAutoRepeat: false, isComposing: false, shift: false, control: false, alt: false, meta: false, location: 0, modifiers: [],
+          })
+          return {}
+        }
+        if (method === 'DOM.getDocument') return { root: { nodeId: 1 } }
+        if (method === 'DOM.performSearch') return { searchId: 'search', resultCount: 1 }
+        if (method === 'DOM.getSearchResults') return { nodeIds: [2] }
+        if (method === 'DOM.describeNode') return { node: { nodeName: 'INPUT', backendNodeId: 2, attributes: ['type', 'text'] } }
+        if (method === 'Accessibility.getPartialAXTree') return { nodes: [{ nodeId: 'ax-input', role: { value: 'textbox' }, name: { value: 'Editor' }, backendDOMNodeId: 2 }] }
+        if (method === 'DOM.pushNodesByBackendIdsToFrontend') return { nodeIds: [22] }
+        if (method === 'CSS.getComputedStyleForNode') return { computedStyle: [{ name: 'display', value: 'block' }, { name: 'visibility', value: 'visible' }, { name: 'opacity', value: '1' }, { name: 'pointer-events', value: 'auto' }] }
+        if (method === 'DOM.getBoxModel') return { model: { border: [10, 10, 110, 10, 110, 30, 10, 30] } }
+        if (method === 'Page.getLayoutMetrics') return { cssVisualViewport: { clientWidth: 800, clientHeight: 600 } }
+        if (method === 'DOM.getNodeForLocation') return { backendNodeId: 2 }
+        return {}
+      }
+    }
+    const factory: TabBrowserPageFactory = {
+      create: (id, onUserInput) => {
+        const transport = new InputDebugger(() => { observedGenerations.push(host.status(id).generation); onUserInput() })
+        const automation = new BrowserAutomation(transport, () => 'about:blank', () => false)
+        return Object.assign(new FakePage(), { automation })
+      },
+    }
+    host = new TabBrowserHost(emptyBrowserState(1), factory)
+    const opened = await host.open({ visible: true }), id = opened.status.id
+    const snapshot = async (): Promise<{ snapshotId: string; ref: string }> => {
+      const status = host.status(id)
+      const result = await host.runAutomation(id, { type: 'snapshot', pageIncarnation: status.pageIncarnation, expectedGeneration: status.generation, limits: { maxDepth: 20, maxNodes: 20, maxBytes: 4096 } }, new AbortController().signal) as { snapshotId: string; nodes: Array<{ ref: string }> }
+      return { snapshotId: result.snapshotId, ref: result.nodes[0]!.ref }
+    }
+    const runInteraction = async (operation: { kind: 'drag'; source: { snapshotId: string; ref: string }; target: { snapshotId: string; ref: string } } | { kind: 'type' | 'fill'; target: { snapshotId: string; ref: string }; text: string }) => {
+      const status = host.status(id)
+      return await host.runAutomation(id, { type: 'interact', pageIncarnation: status.pageIncarnation, expectedGeneration: status.generation, operation }, new AbortController().signal) as { generation: number; pageIncarnation: string; interleaved: boolean }
+    }
+
+    let target = await snapshot(), status = host.status(id), dragStart = status.generation
+    const dragResult = await runInteraction({ kind: 'drag', source: target, target })
+    expect(observedGenerations).toEqual([dragStart + 1, dragStart + 2, dragStart + 3, dragStart + 4])
+    expect(dragResult).toMatchObject({ generation: dragStart + 5, pageIncarnation: status.pageIncarnation, interleaved: true })
+
+    target = await snapshot(); status = host.status(id); const typeStart = status.generation
+    observedGenerations.length = 0
+    const typeResult = await runInteraction({ kind: 'type', target, text: 'multi-key type' })
+    expect(observedGenerations).toEqual([typeStart + 1, typeStart + 2, typeStart + 3])
+    expect(typeResult).toMatchObject({ generation: typeStart + 4, pageIncarnation: status.pageIncarnation, interleaved: true })
+
+    target = await snapshot(); status = host.status(id); const fillStart = status.generation
+    observedGenerations.length = 0
+    const fillResult = await runInteraction({ kind: 'fill', target, text: 'multi-dispatch fill' })
+    expect(observedGenerations).toEqual([fillStart + 1, fillStart + 2, fillStart + 3, fillStart + 4, fillStart + 5])
+    expect(fillResult).toMatchObject({ generation: fillStart + 6, pageIncarnation: status.pageIncarnation, interleaved: true })
   })
 
   it('keeps a late callback from a prior action as a new generation during the next FIFO action', async () => {
