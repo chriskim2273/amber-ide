@@ -1067,20 +1067,24 @@ async function openWindow(target: WindowTarget, options: { show?: boolean } = {}
   // business deciding this machine's GL mode.
   if (!compat && target.kind === 'local') {
     let switching = false
-    const enterCompat = (): void => {
+    const enterCompat = async (): Promise<void> => {
       if (switching) return
       switching = true
       try { mkdirSync(stateRoot(), { recursive: true }); writeFileSync(compatFlagPath, COMPAT_SIGNATURE) } catch { /* ignore */ }
+      // app.exit() bypasses before-quit just like force quit. A remote window
+      // may have a live ssh tunnel even though this local detector owns the
+      // relaunch decision, so drain it before handing off to the new process.
+      await killTunnels()
       app.relaunch()
       app.exit(0)
     }
     const onRendererGone = (_e: unknown, d: { reason: string }): void => {
-      if (compatWorthyReason(d.reason)) enterCompat()
+      if (compatWorthyReason(d.reason)) void enterCompat()
     }
     const onChildGone = (_e: unknown, d: { type: string; reason: string }): void => {
-      if (d.type === 'GPU' && compatWorthyReason(d.reason)) enterCompat()
+      if (d.type === 'GPU' && compatWorthyReason(d.reason)) void enterCompat()
     }
-    const loadTimer = setTimeout(enterCompat, 10000)
+    const loadTimer = setTimeout(() => { void enterCompat() }, 10000)
     win.webContents.once('did-finish-load', () => clearTimeout(loadTimer))
     win.webContents.on('render-process-gone', onRendererGone)
     app.on('child-process-gone', onChildGone)
