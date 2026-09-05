@@ -2587,6 +2587,13 @@ mod tests {
         listed.name = "title-pane".into();
         let server = std::thread::spawn(move || {
             let mut listing = listener.accept().unwrap();
+            // Drain the request before closing: unread Unix-socket input can
+            // reset the reply, leaving this fixture waiting for a second
+            // connection the client will never open.
+            let mut header = [0; 4];
+            listing.read_exact(&mut header).unwrap();
+            let mut request = vec![0; u32::from_be_bytes(header) as usize];
+            listing.read_exact(&mut request).unwrap();
             listing
                 .write_all(&proto::encode(&Frame::Control(ControlMsg::Sessions {
                     sessions: vec![listed],
