@@ -1536,6 +1536,19 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   open; the independent review is PASS WITH FIXES with its P2 follow-ups
   recorded in the validation report.
 
+- [x] Resident review follow-up (2026-09-05; implementation complete, independent
+  signoff pending) — remote tunnels register immediately after spawn, including
+  pending opens, and share one bounded cleanup-once promise across window close,
+  compat restart, normal Quit, and force Quit; the quit fence rejects late opens
+  and failed/deferred window creation cannot orphan a child or runtime directory.
+  Host-disabled Linux and Windows Quit skips browser-host inhibit/POSIX UID work
+  while still awaiting tunnel cleanup. Tunnel readiness now owns and clears all
+  timers/listeners on success, failure, and timeout, drains stderr after a fixed
+  cap, and has terminal-outcome tests. README browser/web behavior is current;
+  no physical explicit-Quit proof is claimed. Independent resident signoff,
+  deployed-reader, macOS, physical input, Pi 0.85, and Windows gates remain open;
+  `mergeReady` stays false.
+
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**
   `std::io::Read` (dedicated thread); `take_writer()` is one-shot;

@@ -144,13 +144,19 @@
       "id": "P1-resident-review-follow-up",
       "severity": "important",
       "status": "partial",
-      "work": "Resident review findings are implemented in a19b97f, 1d97984, 4c50e55, and 2fe2fcc: forced Quit and compat exit await bounded idempotent tracked-tunnel cleanup; resident reopen is single-flight with an in-flight quit fence; closed-window browser reparenting is guarded; windowHidden revokes live, activation, and queue-owner browser work; and a spawned process-level E2E covers watcher epochs plus sidecar CAS-conflict/process-restart/orphan recovery. Exact current code is 2fe2fccfeacab9e134c51ee90dc68d47df30ad22. Independent resident re-review remains required, so this P1 is not promoted. Current exact packaged artifact is `/tmp/amber-tab-browser-validation/resident-followup-20260904T225800-3480221/amber-ide-0.0.2.AppImage` with SHA-256 `fd84fabcb83f5d2321f2053cb1c7bffad9fd5c1c3f92b6576b981168e4cc9cb7`; the tested production commit is `2fe2fccfeacab9e134c51ee90dc68d47df30ad22`, while later report commits are docs-only. mergeReady remains false for deployed-reader, macOS, physical Linux input, Pi 0.85, and Windows gates."
+      "work": "Resident PASS WITH FIXES follow-up is implemented across a19b97f, 1d97984, 4c50e55, 2fe2fcc, 06a4add, 4ed8b8a, and 667ba48: tracked and pending remote tunnels register before awaits, a quit fence rejects late opens, window close/quit share one bounded cleanup-once promise, deferred/rejected openWindow paths clean children and runtime directories, host-disabled Linux/Windows Quit skips inhibit/POSIX UID work while awaiting tunnels, and readiness clears every listener/timer with capped post-ready stderr draining. Exact production code is 4ed8b8a0910efc0d5e84550b84440038af60c4c6; 667ba48ef0b12d85c8f63e2700c98a2697d9394d adds the final readiness-error test. Independent resident re-review remains required, so this P1 is not promoted. Current exact packaged artifact is `/tmp/amber-tab-browser-validation/resident-review-followup-20260905-final/amber-ide-0.0.2.AppImage` with SHA-256 `fc6ffed4bf9ad291afa6c89bb96d62b1bc2abe6ae709e10071a6279470ff9d82`; later report commits are docs-only. Explicit packaged menu Quit remains unproven because bare Xvfb lacks a driveable window-manager menu; mergeReady remains false for deployed-reader, macOS, physical Linux input, Pi 0.85, and Windows gates."
     },
     {
       "id": "P2-resident-process-e2e",
       "severity": "important",
       "status": "completed",
       "work": "Three deterministic private process-level tests pass: a spawned Unix-socket peer proves BrowserDaemonWatcher drops stale authority across disconnect/reconnect epochs; a spawned sidecar writer wins a real CAS conflict without clobbering state and leaves no orphan record; and a spawned transaction writer exits after journaling, then a fresh helper process recovers the target and clears the pending transaction without duplicate browser records."
+    },
+    {
+      "id": "P2-resident-readiness-cleanup",
+      "severity": "important",
+      "status": "completed",
+      "work": "waitForSshTunnelReady owns its interval, timeout, process listeners, and stderr listener; success, exit, spawn error, timeout, listener removal, fixed 64 KiB stderr retention, and post-terminal stream draining are covered by focused tests."
     },
     {
       "id": "GATE-deployed-reader",
@@ -162,7 +168,7 @@
       "id": "GATE-packaging-platforms",
       "severity": "blocking-gate",
       "status": "open",
-      "work": "Linux packaged gate passed in a disposable git-archive source mirror: AppImage hash/evidence, executable static-musl amber and amber-router, no unintended browser executable, hardened WebContentsView hostile fixture, popup/permission/external-scheme denial, semantic observation/screenshot, interaction, visible approval and resident close/reopen/second-instance/explicit-Quit were exercised against private daemon/profile/state. XTest input succeeded only as a substrate on private Xvfb; real hardware/IBus evidence remains unclaimed. macOS native-view/focus/IME/accessibility/lifecycle/profile/package gate is blocked by the configured Mac being unreachable. Windows remains unavailable on this host; mergeReady remains false."
+      "work": "Linux packaged gate passed in a disposable `/tmp` root: current AppImage hash/evidence, executable static-musl amber and amber-router, no unintended browser executable, hardened WebContentsView hostile fixture, popup/permission/external-scheme denial, semantic observation/screenshot, interaction, visible approval, resident close/reopen/second-instance, and fake-SSH remote-window close cleanup were exercised against private daemon/profile/state. Explicit packaged menu Quit was attempted but not claimed because bare Xvfb lacked a driveable window-manager menu; XTest input is only a substrate and real hardware/IBus evidence remains unclaimed. macOS native-view/focus/IME/accessibility/lifecycle/profile/package gate is blocked by the configured Mac being unreachable. Windows remains unavailable on this host; mergeReady remains false."
     }
   ]
 }
