@@ -100,6 +100,17 @@ describe('waitForSshTunnelReady', () => {
     expect(child.resumed).toBe(1)
   })
 
+  it('cleans all listeners when ssh reports a spawn error', async () => {
+    const child = new FakeProbeChild()
+    const waiting = waitForSshTunnelReady(child, '/tmp/remote.sock', { timeoutMs: 100, exists: () => false })
+    child.emit('error', new Error('ENOENT'))
+    await expect(waiting).resolves.toEqual({ ready: false, reason: 'error', stderr: '' })
+    expect(child.listenerCount('exit')).toBe(0)
+    expect(child.listenerCount('error')).toBe(0)
+    expect(child.stderr.listenerCount('data')).toBe(0)
+    expect(child.resumed).toBe(1)
+  })
+
   it('cleans all listeners on timeout and caps retained stderr', async () => {
     vi.useFakeTimers()
     try {
