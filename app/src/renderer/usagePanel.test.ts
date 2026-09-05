@@ -11,6 +11,17 @@ const ok: ProviderUsage = {
 }
 
 describe('panelRows', () => {
+  it('hides an aged Codex snapshot even without a new daemon event', () => {
+    const [row] = panelRows([{ ...ok, provider: 'codex', updated: 1000 }], 1300)
+    expect(row?.lines[0]?.percentUsed).toBeNull()
+    expect(row?.lines[0]?.text).toContain('stale')
+  })
+
+  it('shows the actual live sample age', () => {
+    const [row] = panelRows([{ ...ok, provider: 'codex', updated: 1000, detail: 'Live quota · Codex login' }], 1060)
+    expect(row).toMatchObject({ note: 'Live quota · Codex login · last updated 1m ago' })
+  })
+
   it('renders remaining plus a countdown per gauge', () => {
     const [row] = panelRows([ok], 0)
     expect(row?.plan).toBe('pro')

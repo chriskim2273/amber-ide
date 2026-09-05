@@ -64,6 +64,11 @@ fn get_usage_replies_with_the_cached_snapshot() {
     assert_eq!(providers[0].provider, "codex");
     assert_eq!(providers[0].updated, 42);
     assert_eq!(providers[0].plan.as_deref(), Some("pro"));
+    assert_eq!(providers[0].state, "error", "old sample is not live");
+    let began = std::time::Instant::now();
+    send(&mut w, ControlMsg::RefreshUsage);
+    assert_eq!(read_usage(&mut r)[0].updated, 42);
+    assert!(began.elapsed() < Duration::from_secs(1), "refresh must not fetch on read thread");
 }
 
 #[test]

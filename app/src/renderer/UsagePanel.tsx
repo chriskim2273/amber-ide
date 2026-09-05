@@ -5,7 +5,7 @@
 // and had to undo.
 
 import type { ProviderUsage } from '../shared/proto'
-import { remaining, resetLabel, tone } from '../shared/usageView'
+import { remaining, resetLabel, tone, quotaStale } from '../shared/usageView'
 
 export interface PanelLine {
   label: string
@@ -19,6 +19,7 @@ export interface PanelRow {
   provider: string
   plan: string | null
   lines: PanelLine[]
+  note?: string | undefined
 }
 
 /**
@@ -28,18 +29,25 @@ export interface PanelRow {
  */
 export function panelRows(rows: ProviderUsage[], now: number): PanelRow[] {
   return rows.map((row) => {
-    if (row.state !== 'ok') {
+    const age = Math.max(0, now - row.updated)
+    const ageLabel = age < 60 ? `${Math.floor(age)}s` : `${Math.floor(age / 60)}m`
+    const note = row.provider === 'codex' && row.updated > 0
+      ? `${row.state === 'ok' && !quotaStale(row, now) ? (row.detail ?? 'Codex quota') : 'Codex quota'} · last updated ${ageLabel} ago`
+      : undefined
+    if (row.state !== 'ok' || quotaStale(row, now)) {
       return {
         provider: row.provider,
         plan: row.plan,
-        lines: [{ label: '', text: row.detail ?? row.state, tone: 'muted' as const, percentUsed: null }],
+        note,
+        lines: [{ label: '', text: row.state === 'ok' ? 'Live Codex quota is stale; refresh to retry' : (row.detail ?? row.state), tone: 'muted' as const, percentUsed: null }],
       }
     }
     return {
       provider: row.provider,
       plan: row.plan,
+      note,
       lines: row.gauges.map((g) =>
-        g.stale
+        g.stale || (g.resets_at !== null && g.resets_at <= now)
           ? { label: g.label, text: 'window rolled', tone: 'muted' as const, percentUsed: null }
           : {
               label: g.label,
@@ -56,10 +64,12 @@ export function UsagePanel({
   rows,
   now,
   onClose,
+  onRefresh,
 }: {
   rows: ProviderUsage[]
   now: number
   onClose: () => void
+  onRefresh?: () => void
 }) {
   const model = panelRows(rows, now)
   return (
@@ -72,6 +82,7 @@ export function UsagePanel({
       >
         <div className="help-head">
           <div className="help-title">Plan usage</div>
+          {onRefresh && <button className="btn" onClick={onRefresh}>Refresh usage</button>}
           <button className="icon-btn" aria-label="Close" onClick={onClose}>
             ×
           </button>
@@ -88,6 +99,7 @@ export function UsagePanel({
                 {row.provider}
                 {row.plan ? <span className="usage-plan"> · {row.plan}</span> : null}
               </div>
+              {row.note && <p className="usage-muted">{row.note}</p>}
               {row.lines.map((line, i) => (
                 <div className="usage-line" key={`${row.provider}-${i}`}>
                   <span className="usage-label">{line.label}</span>

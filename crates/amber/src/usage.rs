@@ -6,17 +6,19 @@
 //!   INVOKING `curl`, never by linking a TLS stack: `amber` stays std-only
 //!   (core rule #8 constrains linking, not invoking, as `login_path()` and the
 //!   `systemctl --user show-environment` display-env fix already establish).
-//! - **codex**: the newest non-null `rate_limits` in its rollout JSONL.
+//! - **codex**: live `account/rateLimits/read` through its local app-server.
+//!   Rollout helpers remain diagnostic only; production never calls stale logs
+//!   a live quota. Codex owns its login; Amber never copies its credentials.
 //! - **grok**: nothing exists to read. It gets a row that says so.
 //!
-//! The token is read per poll, passed only as a `curl` argv element, and never
+//! The Claude token is read per poll, passed only as a `curl` argv element, and never
 //! logged, persisted, or placed in any frame. Amber never refreshes it: minting
 //! or rotating a credential as a side effect of a read-only status poll is the
 //! mistake `load_token()` exists to avoid.
 
 use amber_core::proto::{Gauge, ProviderUsage};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 /// What the collectors need from an external command. Deliberately NOT
@@ -385,10 +387,14 @@ pub fn grok_usage(now: i64) -> ProviderUsage {
 }
 
 /// One snapshot per provider, always in this order, always all three rows.
-pub fn collect_all(now: i64, run: &Runner) -> Vec<ProviderUsage> {
+pub fn collect_all(now: i64, run: &Runner, codex_path: Option<&Path>) -> Vec<ProviderUsage> {
+    let began = std::time::Instant::now();
+    let claude = claude_usage_with(None, now, run);
+    let quota_now = now.saturating_add(began.elapsed().as_secs() as i64);
     vec![
-        claude_usage_with(None, now, run),
-        codex_usage(now),
+        claude,
+        codex_path.map(|path| crate::codex_usage::collect(path, quota_now))
+            .unwrap_or_else(|| unavailable("codex", "Codex not installed; live quota unavailable", 0)),
         grok_usage(now),
     ]
 }
@@ -410,6 +416,8 @@ pub fn curl_runner() -> Box<Runner> {
 #[derive(Debug, Default)]
 pub struct UsageCache {
     inner: Mutex<Vec<ProviderUsage>>,
+    refresh: Mutex<bool>,
+    wake: Condvar,
 }
 
 impl UsageCache {
@@ -418,16 +426,47 @@ impl UsageCache {
     }
 
     pub fn snapshot(&self) -> Vec<ProviderUsage> {
-        self.inner
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default()
+        self.snapshot_at(now_secs().max(0) as u64)
     }
 
-    pub fn store(&self, rows: Vec<ProviderUsage>) {
+    fn snapshot_at(&self, now: u64) -> Vec<ProviderUsage> {
+        let mut rows = self.inner.lock().map(|guard| guard.clone()).unwrap_or_default();
+        for row in &mut rows {
+            if row.provider == "codex" && row.state == "ok" && now.saturating_sub(row.updated) > 180 {
+                row.state = "error".into();
+                row.detail = Some("Live Codex quota is stale; refresh to retry".into());
+                for gauge in &mut row.gauges { gauge.stale = true; }
+            }
+        }
+        rows
+    }
+
+    pub fn store(&self, mut rows: Vec<ProviderUsage>) {
         if let Ok(mut guard) = self.inner.lock() {
+            for row in &mut rows {
+                if row.provider == "codex" && row.state != "ok" {
+                    if let Some(previous) = guard.iter().find(|r| r.provider == "codex" && r.updated > 0) {
+                        row.updated = previous.updated;
+                        row.plan = previous.plan.clone();
+                        row.gauges = previous.gauges.clone();
+                        for gauge in &mut row.gauges { gauge.stale = true; }
+                    }
+                }
+            }
             *guard = rows;
         }
+    }
+
+    /// Coalesced wake only: socket handlers never spawn a process or wait on IO.
+    pub fn request_refresh(&self) {
+        *self.refresh.lock().unwrap() = true;
+        self.wake.notify_one();
+    }
+
+    fn wait_for_refresh(&self) {
+        let requested = self.refresh.lock().unwrap();
+        let (mut requested, _) = self.wake.wait_timeout_while(requested, POLL_INTERVAL, |flag| !*flag).unwrap();
+        *requested = false;
     }
 }
 
@@ -440,12 +479,17 @@ pub fn now_secs() -> i64 {
 }
 
 /// Start the poller. Its own thread — never a connection read thread.
-pub fn start(cache: Arc<UsageCache>) {
+pub fn start(cache: Arc<UsageCache>, codex_path: Option<PathBuf>) {
     std::thread::spawn(move || {
         let run = curl_runner();
+        let codex_path = codex_path.filter(|path| path.is_file()).or_else(crate::codex::resolve_codex);
         loop {
-            cache.store(collect_all(now_secs(), run.as_ref()));
-            std::thread::sleep(POLL_INTERVAL);
+            let began = std::time::Instant::now();
+            cache.store(collect_all(now_secs(), run.as_ref(), codex_path.as_deref()));
+            cache.wait_for_refresh();
+            // A held refresh button or many clients must not spawn unbounded
+            // status requests. One poller, at most one fetch per ten seconds.
+            std::thread::sleep(Duration::from_secs(10).saturating_sub(began.elapsed()));
         }
     });
 }
@@ -729,7 +773,7 @@ mod tests {
 
     #[test]
     fn collect_all_returns_one_row_per_provider_in_order() {
-        let rows = collect_all(0, &ok_runner("{}"));
+        let rows = collect_all(0, &ok_runner("{}"), None);
         let names: Vec<&str> = rows.iter().map(|r| r.provider.as_str()).collect();
         assert_eq!(names, vec!["claude", "codex", "grok"]);
     }
@@ -738,11 +782,41 @@ mod tests {
     fn one_providers_failure_never_blanks_the_others() {
         // A runner that always fails stands in for a dead network.
         let boom = |_a: &[&str]| Err(std::io::Error::other("no network"));
-        let rows = collect_all(0, &boom);
+        let rows = collect_all(0, &boom, None);
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].provider, "claude");
         assert!(rows[0].state == "error" || rows[0].state == "unavailable");
         assert_eq!(rows[2].state, "unavailable"); // grok row still present
+    }
+
+    #[test]
+    fn failed_live_poll_retains_sample_time_but_never_live_numbers() {
+        let cache = UsageCache::new();
+        let row = crate::codex_usage::parse_live(&serde_json::json!({"rateLimits":{
+            "primary":{"usedPercent":81,"windowDurationMins":10080}}}), 1000).unwrap();
+        cache.store(vec![row]);
+        cache.store(vec![errored("codex", "offline".into(), 1100)]);
+        let rows = cache.snapshot_at(1100);
+        assert_eq!(rows[0].updated, 1000);
+        assert_eq!(rows[0].state, "error");
+        assert!(rows[0].gauges[0].stale);
+        assert_eq!(rows[0].detail.as_deref(), Some("offline"));
+    }
+
+    #[test]
+    fn old_live_snapshot_expires_even_when_poller_stalls() {
+        let cache = UsageCache::new();
+        let row = crate::codex_usage::parse_live(&serde_json::json!({"rateLimits":{
+            "primary":{"usedPercent":81,"windowDurationMins":10080}}}), 1000).unwrap();
+        cache.store(vec![row]);
+        assert_eq!(cache.snapshot_at(1180)[0].state, "ok");
+        assert_eq!(cache.snapshot_at(1181)[0].state, "error");
+        assert_eq!(cache.snapshot_at(1181)[0].updated, 1000);
+        cache.request_refresh();
+        cache.request_refresh();
+        assert!(*cache.refresh.lock().unwrap(), "requests coalesce into one flag");
+        cache.wait_for_refresh();
+        assert!(!*cache.refresh.lock().unwrap());
     }
 
     #[test]

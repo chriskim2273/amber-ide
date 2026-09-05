@@ -39,8 +39,8 @@ describe('usageView', () => {
       row({ provider: 'claude', gauges: [g({ percent: 15 })] }),
       row({ provider: 'codex', gauges: [g({ percent: 82 })] }),
     ]
-    expect(tightest(rows)?.row.provider).toBe('codex')
-    expect(tightest(rows)?.gauge.percent).toBe(82)
+    expect(tightest(rows, 0)?.row.provider).toBe('codex')
+    expect(tightest(rows, 0)?.gauge.percent).toBe(82)
   })
 
   it('ignores stale gauges and non-ok providers when picking', () => {
@@ -50,6 +50,11 @@ describe('usageView', () => {
       row({ provider: 'grok', state: 'unavailable', gauges: [] }),
     ]
     expect(tightest(rows)?.row.provider).toBe('claude')
+  })
+
+  it('never promotes an old Codex sample to the live pill', () => {
+    expect(pillLabel([row({ provider: 'codex', updated: 1000 })], 1300)).toBeNull()
+    expect(pillLabel([row({ provider: 'codex', updated: 1000 })], 1100)).toBe('85% left')
   })
 
   it('hides the pill entirely when nothing is known', () => {

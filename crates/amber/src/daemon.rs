@@ -901,10 +901,10 @@ fn handle_control(
                 removed: vec![],
             });
         }
-        ControlMsg::GetUsage => {
-            // Cache read only. A live fetch here would put curl and a directory
-            // walk on the connection read thread, behind which every
-            // multiplexed control frame would queue (the backlog HOL lesson).
+        request @ (ControlMsg::GetUsage | ControlMsg::RefreshUsage) => {
+            // Only wake the one background collector. Never put provider IO
+            // on this multiplexed connection's read thread.
+            if matches!(request, ControlMsg::RefreshUsage) { usage.request_refresh(); }
             let providers = usage.snapshot();
             let _ = write_frame(writer, &Frame::Control(ControlMsg::Usage { providers }));
         }

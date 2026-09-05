@@ -433,7 +433,7 @@ export interface AmberDeps {
   routerApi: RouterApi
   // Cookie-gated `GET /api/usage`. Returns the raw body; the shim decodes it
   // with the same tolerant decoder the control wire uses.
-  usageApi: () => Promise<unknown>
+  usageApi: (refresh?: boolean) => Promise<unknown>
 }
 
 export interface RouterApi {
@@ -568,9 +568,9 @@ export function createAmber(deps: AmberDeps): WebAmber {
     // route rather than the pane socket — the browser control whitelist is
     // deliberately not widened — and the reply is pushed into the SAME daemon
     // event stream the desktop uses, so the renderer needs no host branch.
-    getUsage: (): void => {
+    getUsage: (refresh = false): void => {
       void deps
-        .usageApi()
+        .usageApi(refresh)
         .then((body) => {
           const raw = (body as { providers?: unknown } | null)?.providers
           const providers = Array.isArray(raw) ? raw.map(decodeProviderUsage) : []

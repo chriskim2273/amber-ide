@@ -1672,9 +1672,17 @@ fn handle_conn(
         // `/api/sessions`. The browser control whitelist is deliberately NOT
         // widened: the server owns this fetch, so no new ControlMsg becomes
         // reachable from a browser socket.
-        ("GET", "/api/usage") => {
+        ("GET" | "POST", "/api/usage") => {
             if !auth.authorized(peer, &req) {
                 return Ok(respond(&mut stream, "401 Unauthorized", "", &[], b"")?);
+            }
+            if !origin_ok(req.header("origin"), req.header("host"), req.header("x-forwarded-host")) {
+                return Ok(respond(&mut stream, "403 Forbidden", "", &[], b"")?);
+            }
+            {
+                let mut inner = hub.inner.lock().unwrap();
+                let message = if req.method == "POST" { ControlMsg::RefreshUsage } else { ControlMsg::GetUsage };
+                Hub::write_daemon(&mut inner, &Frame::Control(message));
             }
             let body = hub.usage_json();
             Ok(respond(&mut stream, "200 OK", CT_JSON, &[], body.as_bytes())?)

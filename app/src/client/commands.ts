@@ -27,7 +27,7 @@ export type DaemonCommand =
   | { cmd: 'setMemoryBudget'; mb: number }
   | { cmd: 'snapshot' }
   // Agent plan quota; the daemon answers from its poller cache with `Usage`.
-  | { cmd: 'getUsage' }
+  | { cmd: 'getUsage'; refresh?: boolean }
 
 /**
  * Map one renderer gesture onto the control message it sends. Extracted from
@@ -70,6 +70,6 @@ export function handleDaemonCommand(conn: { send: (f: Frame) => void }, cmd: Dae
   } else if (cmd.cmd === 'snapshot') {
     conn.send({ type: 'control', msg: { kind: 'Snapshot' } })
   } else if (cmd.cmd === 'getUsage') {
-    conn.send({ type: 'control', msg: { kind: 'GetUsage' } })
+    conn.send({ type: 'control', msg: { kind: cmd.refresh ? 'RefreshUsage' : 'GetUsage' } })
   }
 }

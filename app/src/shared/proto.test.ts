@@ -406,6 +406,12 @@ describe('proto', () => {
     expect(new TextDecoder().decode(encode(request).slice(5))).toBe('"GetUsage"')
   })
 
+  it('roundtrips the additive RefreshUsage request', () => {
+    const request: Frame = { type: 'control', msg: { kind: 'RefreshUsage' } }
+    expect(roundtrip(request)).toEqual(request)
+    expect(new TextDecoder().decode(encode(request).slice(5))).toBe('"RefreshUsage"')
+  })
+
   it('decodes a Usage reply with all fields', () => {
     expect(
       decodeControlJson(

@@ -82,7 +82,7 @@ declare global {
       getMemoryBudget: () => void
       // Agent plan quota; the `Usage` reply arrives via onDaemonEvent. Optional
       // because the web build answers it over an authenticated HTTP route.
-      getUsage?: () => void
+      getUsage?: (refresh?: boolean) => void
       setMemoryBudget: (mb: number) => void
       // Desktop-only capability. The browser client's security whitelist does
       // not expose Snapshot, so its bridge intentionally omits this method.
@@ -380,6 +380,7 @@ function App(): JSX.Element {
   // own 60 s thread); this is only the last `Usage` reply plus the open flag.
   const [usageOpen, setUsageOpen] = useState(false)
   const [usage, setUsage] = useState<ProviderUsage[]>([])
+  const [usageNow, setUsageNow] = useState(() => Math.floor(Date.now() / 1000))
   const [budgetOpen, setBudgetOpen] = useState(false)
   const [budget, setBudget] = useState<BudgetView | null>(null)
   const [budgetInput, setBudgetInput] = useState('')
@@ -1825,18 +1826,22 @@ function App(): JSX.Element {
   }, [routerOpen])
 
   // Agent plan quota. The pill polls at the daemon's own 60 s refresh — asking
-  // faster only re-reads the same cache; the open dialog polls at 15 s so a
-  // deliberate check feels live. The reply rides onDaemonEvent as `Usage`.
+  // faster only re-reads the same cache; the open dialog polls at 3 s so a
+  // requested background refresh appears promptly. Tick the UI clock even if
+  // disconnected, so an old quota cannot remain visible indefinitely.
   useEffect(() => {
-    const ask = (): void => window.amber?.getUsage?.()
+    const ask = (): void => {
+      setUsageNow(Math.floor(Date.now() / 1000))
+      window.amber?.getUsage?.()
+    }
     ask()
-    const t = setInterval(ask, usageOpen ? 15_000 : 60_000)
+    const t = setInterval(ask, usageOpen ? 3_000 : 60_000)
     return () => clearInterval(t)
   }, [usageOpen])
 
-  // null hides the pill outright: a dead badge over a feature that cannot work
-  // here is the mistake the web build's permanently-red remote pill made.
-  const usagePill = pillLabel(usage)
+  // A missing number leaves a neutral usage action, so offline users can still
+  // inspect the reason and request a refresh. Never paint a stale percentage.
+  const usagePill = pillLabel(usage, usageNow)
   const routerManaged = routerStatus === null || routerStatus.managed
   // Green only when it is actually routing somewhere.
   const routerTone = routerDot(
@@ -2143,12 +2148,12 @@ function App(): JSX.Element {
           onClick={() => setRemoteOpen(true)}>
           <span className="web-dot" /> remote
         </button>}
-        {usagePill !== null && <button
-          className={`btn web-pill usage-pill web-pill-${usageTone(tightest(usage)?.gauge.percent ?? 0)}`}
+        {usage.length > 0 && <button
+          className={`btn web-pill usage-pill web-pill-${usageTone(tightest(usage, usageNow)?.gauge.percent ?? 0)}`}
           title="Agent plan usage — how much of each plan is left"
-          aria-label={`Agent plan usage: ${usagePill}`}
+          aria-label={`Agent plan usage: ${usagePill ?? 'unavailable — refresh'}`}
           onClick={() => setUsageOpen(true)}>
-          <span className="web-dot" /> {usagePill}
+          <span className="web-dot" /> {usagePill ?? 'usage'}
         </button>}
         {routerManaged && <button
           className={`btn web-pill router-pill web-pill-${routerTone}`}
@@ -2770,7 +2775,7 @@ function App(): JSX.Element {
         />
       )}
       {usageOpen && (
-        <UsagePanel rows={usage} now={Math.floor(Date.now() / 1000)} onClose={() => setUsageOpen(false)} />
+        <UsagePanel rows={usage} now={usageNow} onClose={() => setUsageOpen(false)} onRefresh={() => window.amber?.getUsage?.(true)} />
       )}
       {productivityOverlay === 'palette' && <CommandPalette entries={paletteEntries} onClose={() => setProductivityOverlay(null)} />}
       {productivityOverlay === 'pane-picker' && <PanePickerDialog entries={paletteEntries.filter((entry) => entry.id.startsWith('pane:'))} onClose={() => setProductivityOverlay(null)} />}

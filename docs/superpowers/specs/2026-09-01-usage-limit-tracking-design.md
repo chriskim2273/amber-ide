@@ -1,6 +1,65 @@
 # Agent usage-limit tracking — design
 
-**Status:** designed (2026-09-01). Not yet implemented.
+**Status:** initial implementation shipped; live Codex correction implemented
+and tested in an isolated worktree (2026-09-05), pending production activation.
+The amendment below supersedes the Codex source/labels in §1.3 and updates the
+refresh/staleness behavior in §1.5, §2–4.
+
+## 2026-09-05 live Codex correction
+
+Confirmed failure: the newest local rollout sample reported 53% in a
+10,080-minute primary window, while a direct account read reported 81% (83%
+by the later compiled-collector smoke). The old UI labelled primary as 5h and
+stamped old data with each poll's current time. Codex usage from Pi did not
+update those CLI rollout logs.
+
+- Production now invokes the locally installed `codex app-server --listen
+  stdio://` on the daemon's background collector thread. It initializes the
+  connection, reads `account/read` with `refreshToken:false`, checks ChatGPT
+  login, then calls `account/rateLimits/read`. No conversation, model turn,
+  login, reset-credit consumption, TCP listener or token copying is requested.
+  Codex owns its normal authentication behavior; Amber never handles its token.
+- `rateLimitsByLimitId` is preferred over the legacy single bucket. Quota
+  buckets remain distinct (including the separate `codex_bengalfox` bucket).
+  Labels come from actual `windowDurationMins`, never primary/secondary position.
+- Each helper is owned and reaped, capped at 8 seconds plus bounded cleanup and
+  1 MiB of stdout. Raw RPC errors/account metadata are not sent to the UI.
+  Missing Codex/API-key auth/offline/errors produce an explicit unavailable
+  result, never zero usage. Linux is live-tested; macOS uses the same Unix
+  implementation and remains manually unverified. Windows reports unavailable
+  rather than pretending its old logs are live.
+- The normal poll is approximately 60 seconds. Additive `RefreshUsage` only
+  wakes the collector and returns the current cache immediately. Repeated
+  requests coalesce; at most one collection per ten seconds, never concurrent
+  quota-reader subprocesses. `GetUsage` remains a pure cache read.
+- On failure, retain the last successful timestamp but mark all its gauges
+  stale and the row non-ok (no numerical UI). Successful Codex samples also
+  expire after three minutes if the poller or connection stops progressing.
+  The dialog shows source and age, with a Refresh usage action. The action
+  remains accessible when all usage rows are unavailable; the open dialog polls
+  the daemon cache every three seconds, not the provider.
+- Web `POST /api/usage` requests the same background refresh behind existing
+  cookie auth and same-origin validation. `GET` refreshes only the hub's daemon
+  cache. No browser WebSocket control permissions were widened.
+
+Verification: parser and fake stdio-server tests cover window metadata, bucket
+separation, read-only RPC ordering, login gate, sanitized errors, timeout and
+output bounds. Cache/UI tests cover old and failed snapshots; private daemon
+and web tests cover cache-only refresh, 401 unauthenticated and 403 cross-origin
+POST. Explicit opt-in compiled collector smoke used installed Codex 0.149.1:
+`AMBER_CODEX_QUOTA_SMOKE_BIN=/path/to/codex cargo test -p amber --lib
+codex_usage::tests::live_quota_smoke -- --ignored --nocapture`.
+The Codex and Pi login account IDs were compared locally and matched; no IDs,
+emails or tokens were printed. This is a point-in-time check: changing either
+login can make them diverge, so the UI says Codex login, not Pi-account quota.
+
+Official contract: <https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md>.
+Final combined validation: 849 Rust tests passed twice (two explicit opt-in
+ignores), 778 app tests passed (one intentional skip), all five generated Pi
+extension tests passed, warnings-as-errors clippy, TypeScript checks, desktop
+and web builds, and `git diff --check` passed. Web build retains its existing
+large-chunk warning. Native GUI refresh gestures and macOS remain unverified.
+No production binary, extension, daemon or app was replaced during this pass.
 
 ## Context
 

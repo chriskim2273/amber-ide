@@ -21,6 +21,10 @@ describe('handleDaemonCommand', () => {
     ])
   })
 
+  it('maps manual refresh to a background refresh request', () => {
+    expect(sent({ cmd: 'getUsage', refresh: true })).toEqual([{ type: 'control', msg: { kind: 'RefreshUsage' } }])
+  })
+
   it('maps the getUsage gesture to a GetUsage control message', () => {
     expect(sent({ cmd: 'getUsage' })).toEqual([{ type: 'control', msg: { kind: 'GetUsage' } }])
   })

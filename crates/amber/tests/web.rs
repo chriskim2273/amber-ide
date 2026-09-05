@@ -21,6 +21,21 @@ struct Fixture {
     manager: Arc<SessionManager>,
 }
 
+#[test]
+fn quota_refresh_is_authenticated_same_origin_and_nonblocking() {
+    let f = fixture();
+    assert!(f.post("/api/usage", None, "").0.contains("401"));
+    let cookie = f.login();
+    let rejected = f.request(&format!(
+        "POST /api/usage HTTP/1.1\r\nHost: {}\r\nCookie: {}\r\nOrigin: https://evil.invalid\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", f.addr, cookie));
+    assert!(rejected.0.contains("403"));
+    let began = Instant::now();
+    let (status, _, body) = f.post("/api/usage", Some(&cookie), "");
+    assert!(status.contains("200"), "{status}");
+    assert!(began.elapsed() < Duration::from_secs(1));
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["providers"], serde_json::json!([]));
+}
+
 /// Boot a private daemon + an `amber web` bound to an ephemeral port.
 fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();

@@ -18,6 +18,7 @@ pub mod attach;
 pub mod cgroup;
 pub mod claude;
 pub mod codex;
+pub mod codex_usage;
 pub mod codex_skill;
 pub mod daemon;
 pub mod grok;
@@ -78,6 +79,7 @@ pub fn daemon_main(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Re
         .memory
         .budget_kb(procinfo::total_memory_kb(), cgroup_limit_kb);
     cgroups.set_session_high_kb(config.memory.session_high_kb(budget_kb));
+    let codex_path = config.codex_path.clone();
     let memory_config = config.memory.clone();
     let pressure_config = config.pressure.clone();
     let refresh_pi_extension = config.pi_path.as_ref().is_some_and(|path| path.exists())
@@ -163,7 +165,7 @@ pub fn daemon_main(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Re
     eprintln!("amber daemon: listening on {}", socket_path.display());
     // Agent plan quota: its own 60 s thread, never a connection read thread.
     let usage_cache = usage::UsageCache::new();
-    usage::start(Arc::clone(&usage_cache));
+    usage::start(Arc::clone(&usage_cache), codex_path);
 
     let daemon = daemon::Daemon::new(Arc::clone(&manager), Arc::clone(&watchers))
         .with_usage(Arc::clone(&usage_cache));

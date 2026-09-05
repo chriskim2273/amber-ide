@@ -421,6 +421,9 @@ pub enum ControlMsg {
     /// connection read thread, behind which every multiplexed control frame
     /// would queue (the backlog head-of-line lesson).
     GetUsage,
+    /// Queue a coalesced background quota refresh; replies with the current
+    /// cache immediately. Never fetches on the connection thread.
+    RefreshUsage,
     /// Daemon -> client: the cached quota snapshot, one entry per provider.
     /// Never broadcast to watchers — a once-a-minute payload has no business on
     /// the bounded lifecycle queue; this is a poll reply only.

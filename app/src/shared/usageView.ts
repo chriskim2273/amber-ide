@@ -34,13 +34,18 @@ export function resetLabel(g: Gauge, now: number): string {
   return `in ${Math.floor(secs / 3600)}h ${Math.floor((secs % 3600) / 60)}m`
 }
 
+/** Never keep presenting a disconnected Codex snapshot as a live reading. */
+export function quotaStale(row: ProviderUsage, now: number): boolean {
+  return row.provider === 'codex' && now - row.updated > 180
+}
+
 /** The most-consumed live gauge across every ok provider, or null. */
-export function tightest(rows: ProviderUsage[]): { row: ProviderUsage; gauge: Gauge } | null {
+export function tightest(rows: ProviderUsage[], now = Math.floor(Date.now() / 1000)): { row: ProviderUsage; gauge: Gauge } | null {
   let best: { row: ProviderUsage; gauge: Gauge } | null = null
   for (const row of rows) {
-    if (row.state !== 'ok') continue
+    if (row.state !== 'ok' || quotaStale(row, now)) continue
     for (const gauge of row.gauges) {
-      if (gauge.stale) continue
+      if (gauge.stale || (gauge.resets_at !== null && gauge.resets_at <= now)) continue
       if (!best || gauge.percent > best.gauge.percent) best = { row, gauge }
     }
   }
@@ -52,7 +57,7 @@ export function tightest(rows: ProviderUsage[]): { row: ProviderUsage; gauge: Ga
  * build once shipped a permanently-red remote pill by rendering an error state
  * where it should have hidden an unmanaged one.
  */
-export function pillLabel(rows: ProviderUsage[]): string | null {
-  const best = tightest(rows)
+export function pillLabel(rows: ProviderUsage[], now?: number): string | null {
+  const best = tightest(rows, now)
   return best ? `${Math.round(remaining(best.gauge))}% left` : null
 }

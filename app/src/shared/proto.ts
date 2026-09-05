@@ -123,6 +123,7 @@ export type ControlMsg =
   // Agent plan quota (design 2026-09-01). GetUsage is a request; the daemon
   // answers from its 60 s poller cache with Usage.
   | { kind: 'GetUsage' }
+  | { kind: 'RefreshUsage' }
   | { kind: 'Usage'; providers: ProviderUsage[] }
   // Aggregate memory budget (see shared/budget.ts for the display side).
   // `mb` is MiB; 0 = auto (half of physical RAM, capped by the service cap).
@@ -220,6 +221,8 @@ function msgToJson(m: ControlMsg): unknown {
       return { Resize: { name: m.name, cols: m.cols, rows: m.rows } }
     case 'GetUsage':
       return 'GetUsage'
+    case 'RefreshUsage':
+      return 'RefreshUsage'
     case 'Usage':
       return { Usage: { providers: m.providers } }
     case 'SetMemoryBudget':
@@ -280,7 +283,7 @@ function jsonToMsg(v: unknown): ControlMsg | null {
     if (v === 'Hello' || v === 'ListSessions' || v === 'WatchSessions' ||
         v === 'ListSessionsDetailed' || v === 'Snapshot' || v === 'SnapshotOk' ||
         v === 'ClearRecoveryEvents' || v === 'RecoveryEventsCleared' ||
-        v === 'GetUsage') {
+        v === 'GetUsage' || v === 'RefreshUsage') {
       return { kind: v }
     }
     return null
