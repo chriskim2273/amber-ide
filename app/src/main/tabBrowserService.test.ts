@@ -471,7 +471,7 @@ describe('TabBrowserService dispatch authorization', () => {
       prepareInteraction: vi.fn(async () => { prepareCalls += 1; return {} }),
       executeInteraction: vi.fn(async () => { executeCalls += 1; return { dispatched: true, rollbackPossible: false } }),
       invalidate: vi.fn(),
-    }
+    } as unknown as import('./browserAutomation').BrowserAutomation
     // Use a minimal page shape while retaining the production Host generation
     // check; the queued service command must fail before this automation runs.
     const host = new TabBrowserHost(state, { create: (_id, onUserInput) => { input = onUserInput; return { loadURL: async () => {}, show: () => {}, hide: () => {}, stop: () => {}, destroy: () => {}, automation } } })
