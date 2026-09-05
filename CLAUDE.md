@@ -1519,14 +1519,18 @@ connection manager; AI chat UI; themes/settings beyond minimal.
   navigation increments, and reports the final generation plus interleaving.
   The adapter carries typed `dispatched` state; partial failures become
   `ACTION_FAILED_NO_ROLLBACK` with current context, `retryable:false`, and a
-  fresh-snapshot instruction through the broker and generated Pi result. Fresh
-  gates at code HEAD `c5b87c8`: app 1001 passed/1 intentional skip, Rust 821
+  fresh-snapshot instruction through the broker and generated Pi result. The
+  production code validated here is pinned to `c5b87c8`; `e856624` is the
+  documentation/report HEAD from which the follow-up validation started. The
+  follow-up adds tests and verifier/report metadata only—no production daemon
+  behavior or package artifact is silently attributed to the docs commits.
+  Fresh isolated gates report app 1003 passed/1 intentional skip, Rust 821
   passed/1 delegated-cgroup ignore, strict typecheck/build/web build/Clippy,
-  packaged AppImage (SHA-256
-  `9cde8e497113320c32faf00c002850b268a8f678486821d8f66fe7e7e1b6fa2e`) and Pi
-  verifier green. Linux package input evidence uses
-  Xvfb/XTest only; it is not physical-hardware evidence. External deployed-
-  reader, independent-review, macOS, and physical/manual gates remain open.
+  and the Pi v7 verifier against a c5-built private Amber binary. Linux
+  package input evidence uses Xvfb/XTest only; it is not physical-hardware
+  evidence. External deployed-reader, macOS, and physical/manual gates remain
+  open; the independent review is PASS WITH FIXES with its P2 follow-ups
+  recorded in the validation report.
 
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**
