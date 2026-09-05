@@ -1,11 +1,14 @@
-import { chmod, mkdir, mkdtemp, readFile, readdir, stat, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
+import { spawn } from 'node:child_process'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { describe, expect, it } from 'vitest'
 import {
   activationRequest,
+  cleanupTrackedTunnels,
   clearBrowserHostInhibit,
   coordinateBrowserHostQuit,
+  createSingleFlight,
   installStableAppImage,
   parseActivationRequest,
   registerBrowserHostLauncher,
@@ -29,6 +32,65 @@ describe('resident browser host activation', () => {
     expect(parseActivationRequest({ version: 1, mode: 'browser-host', extra: true })).toBeNull()
     expect(parseActivationRequest({ version: 2, mode: 'normal' })).toBeNull()
     expect(parseActivationRequest(null)).toBeNull()
+  })
+})
+
+describe('resident activation and tunnel cleanup', () => {
+  it('coalesces concurrent deferred opens into one completion', async () => {
+    let release!: () => void
+    let opens = 0
+    const blocked = new Promise<void>((resolve) => { release = resolve })
+    const reopen = createSingleFlight(async () => { opens += 1; await blocked })
+    const first = reopen(); const second = reopen()
+    expect(second).toBe(first)
+    release()
+    await Promise.all([first, second])
+    expect(opens).toBe(1)
+  })
+
+  it('resets a rejected open so a later activation can retry', async () => {
+    let shouldFail = true; let opens = 0
+    const reopen = createSingleFlight(async () => { opens += 1; if (shouldFail) throw new Error('OPEN_FAILED') })
+    const first = reopen(); const joined = reopen()
+    expect(joined).toBe(first)
+    await expect(first).rejects.toThrow('OPEN_FAILED')
+    shouldFail = false
+    await expect(reopen()).resolves.toBeUndefined()
+    expect(opens).toBe(2)
+  })
+
+  it('focuses the window found by the in-flight recheck instead of opening another', async () => {
+    let registered = false; let opens = 0; let focuses = 0
+    const reopen = createSingleFlight(async () => {
+      if (registered) { focuses += 1; return }
+      opens += 1
+    })
+    registered = true
+    await reopen()
+    expect({ opens, focuses }).toEqual({ opens: 0, focuses: 1 })
+  })
+
+  it('force cleanup terminates a tracked tunnel and removes its owned runtime state', async () => {
+    if (process.platform === 'win32') return
+    const dir = await mkdtemp(join(tmpdir(), 'amber-tunnel-cleanup-'))
+    const proc = spawn(process.execPath, ['-e', 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000)'], { stdio: 'ignore' })
+    try {
+      await new Promise<void>((resolve, reject) => {
+        proc.once('spawn', () => resolve())
+        proc.once('error', reject)
+      })
+      const tracked = new Map([[1, { proc, dir, socket: join(dir, 'remote.sock') }]])
+      await cleanupTrackedTunnels(tracked, 25)
+      expect(tracked.size).toBe(0)
+      expect(proc.exitCode !== null || proc.signalCode !== null).toBe(true)
+      await expect(stat(dir)).rejects.toThrow()
+      // A second normal/forced cleanup sees the same empty ownership set and
+      // is a no-op, which is the idempotence guarantee used by index.ts.
+      await cleanupTrackedTunnels(tracked, 25)
+    } finally {
+      if (proc.exitCode === null) proc.kill('SIGKILL')
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 })
 

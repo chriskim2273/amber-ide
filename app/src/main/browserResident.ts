@@ -1,4 +1,5 @@
 import { chmod, copyFile, lstat, mkdir, open, realpath, rename, rm, stat } from 'node:fs/promises'
+import type { ChildProcess } from 'node:child_process'
 import { basename, dirname, join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { ensurePrivateRuntimeDirectory } from './browserHostPaths'
@@ -21,6 +22,93 @@ export interface BrowserHostLauncherInput {
 }
 
 export interface BrowserHostActivationRequest { version: 1; mode: 'normal' | 'browser-host' }
+
+/**
+ * Coalesce concurrent resident activations into one open/focus operation.
+ *
+ * The operation itself must re-check the current window inside this single
+ * flight. Keeping that check in the callback matters: a window can register
+ * between the caller's first check and the asynchronous open, and failed
+ * opens must release the flight so a later activation can retry.
+ */
+export function createSingleFlight<T>(operation: () => Promise<T>): () => Promise<T> {
+  let active: Promise<T> | null = null
+  return () => {
+    if (active) return active
+    const run = Promise.resolve().then(operation)
+    const settled = run.finally(() => {
+      if (active === settled) active = null
+    })
+    active = settled
+    return settled
+  }
+}
+
+/** A tracked remote-window tunnel and the directory that owns its socket. */
+export interface TrackedTunnel {
+  proc: ChildProcess
+  dir: string
+  socket: string
+}
+
+/** Bound used while waiting for an ssh process to acknowledge termination. */
+export const TUNNEL_CLEANUP_TIMEOUT_MS = 2_000
+
+function childExited(proc: ChildProcess): boolean {
+  return proc.exitCode !== null || proc.signalCode !== null
+}
+
+function waitForChildExit(proc: ChildProcess, timeoutMs: number): Promise<boolean> {
+  if (childExited(proc)) return Promise.resolve(true)
+  return new Promise((resolve) => {
+    let settled = false
+    let timer: NodeJS.Timeout | undefined
+    const finish = (): void => {
+      if (settled) return
+      settled = true
+      if (timer) clearTimeout(timer)
+      resolve(true)
+    }
+    timer = setTimeout(() => {
+      if (settled) return
+      settled = true
+      resolve(childExited(proc))
+    }, Math.max(0, timeoutMs))
+    timer.unref()
+    proc.once('exit', finish)
+    proc.once('close', finish)
+    // The child may have exited between the first check and listener setup.
+    if (childExited(proc)) finish()
+  })
+}
+
+async function cleanupTunnel(tunnel: TrackedTunnel, timeoutMs: number): Promise<void> {
+  if (!childExited(tunnel.proc)) {
+    try { tunnel.proc.kill() } catch { /* already gone */ }
+    if (!await waitForChildExit(tunnel.proc, timeoutMs) && !childExited(tunnel.proc)) {
+      try { tunnel.proc.kill('SIGKILL') } catch { /* already gone */ }
+      await waitForChildExit(tunnel.proc, timeoutMs)
+    }
+  }
+  // Remove the owned runtime directory even when ssh did not report an exit;
+  // this prevents a stale forwarding socket/control file from being reused on
+  // the next activation. The bounded process wait above keeps quit finite.
+  await rm(tunnel.dir, { recursive: true, force: true }).catch(() => {})
+}
+
+/**
+ * Stop and forget every tracked tunnel before the caller exits.
+ *
+ * The map is cleared before asynchronous work starts, making normal close and
+ * forced close idempotent even when both paths race. Each child gets a bounded
+ * graceful wait followed by a bounded SIGKILL wait; directory cleanup is then
+ * awaited rather than left as fire-and-forget work.
+ */
+export async function cleanupTrackedTunnels(tunnels: Map<unknown, TrackedTunnel>, timeoutMs = TUNNEL_CLEANUP_TIMEOUT_MS): Promise<void> {
+  const tracked = [...tunnels.values()]
+  tunnels.clear()
+  await Promise.all(tracked.map((tunnel) => cleanupTunnel(tunnel, timeoutMs)))
+}
 
 export function activationRequest(argv: readonly string[]): BrowserHostActivationRequest {
   return { version: 1, mode: argv.includes('--browser-host') ? 'browser-host' : 'normal' }
@@ -190,7 +278,7 @@ export interface BrowserHostQuitDeps {
   flushAndDestroy: (signal: AbortSignal) => Promise<void>
   closeBroker: () => Promise<void>
   closeWatcher: () => void
-  closeWindows: () => void
+  closeWindows: () => void | Promise<void>
 }
 
 export async function coordinateBrowserHostQuit(deps: BrowserHostQuitDeps, timeoutMs = 5_000): Promise<{ ok: true } | { ok: false; error: 'QUIT_DRAIN_TIMEOUT' | 'QUIT_DRAIN_FAILED' }> {
@@ -211,7 +299,7 @@ export async function coordinateBrowserHostQuit(deps: BrowserHostQuitDeps, timeo
     finally { if (timer) clearTimeout(timer) }
     await deps.closeBroker()
     deps.closeWatcher()
-    deps.closeWindows()
+    await deps.closeWindows()
     return { ok: true }
   } catch (error) {
     flushController?.abort()

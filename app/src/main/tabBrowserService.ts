@@ -262,12 +262,38 @@ export class TabBrowserService {
   }
 
   setWindow(window: BrowserWindow): void { this.currentWindow = window; this.pages.setWindow(window) }
-  windowHidden(): void {
-    this.currentWindow = null
-    for (const id of this.host.liveIds()) {
+
+  /**
+   * Return every browser currently owned by this presentation surface. A
+   * capacity-waiting thaw has no live runtime yet, so liveIds() alone misses
+   * it; activation controllers and queue owners are the authoritative pending
+   * ownership records for that case.
+   */
+  private surfaceBrowserIds(): Set<string> {
+    const ids = new Set(this.host.liveIds())
+    for (const id of this.activationControllers.keys()) ids.add(id)
+    for (const operation of this.browserQueueOwners) ids.add(operation.id)
+    return ids
+  }
+
+  /** Revoke work for a surface before hiding its native pages. */
+  revokeSurface(browserIds: Iterable<string>): void {
+    const live = new Set(this.host.liveIds())
+    for (const id of new Set(browserIds)) {
       this.surfaceHidden(id)
-      this.host.hide(id)
+      if (live.has(id)) {
+        try { this.host.hide(id) } catch { /* a concurrent crash/close already hid it */ }
+      }
     }
+  }
+
+  windowHidden(browserIds?: Iterable<string>): void {
+    const owned = browserIds ? new Set(browserIds) : this.surfaceBrowserIds()
+    this.currentWindow = null
+    // This includes queued activation ids and their FIFO owners, not only
+    // runtimes already admitted by BrowserCapacity. A later capacity release
+    // therefore cannot create or attach a page behind the hidden window.
+    this.revokeSurface(owned)
   }
   setApprovalSurface(visible: (browserId: string) => boolean, reveal: (browserId: string) => void): void { this.approvalSurfaceVisible = visible; this.approvalSurfaceReveal = reveal }
   private abortQueueOwners(id: string, owner?: string): void {

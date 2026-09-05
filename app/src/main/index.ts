@@ -93,12 +93,15 @@ import { electronPaths } from './electronPaths'
 import {
   activationRequest,
   clearBrowserHostInhibit,
+  cleanupTrackedTunnels,
   coordinateBrowserHostQuit,
+  createSingleFlight,
   installStableAppImage,
   parseActivationRequest,
   registerBrowserHostLauncher,
   ResidentIntentLatch,
   writeBrowserHostInhibit,
+  type TrackedTunnel,
 } from './browserResident'
 import clientPath from '../client/index?modulePath'
 
@@ -821,13 +824,10 @@ function setWindowContextFromLayout(ctx: WindowCtx, layout: LayoutFile): void {
 }
 
 /** A live ssh tunnel backing one remote window. */
-interface Tunnel {
-  proc: ReturnType<typeof spawn>
-  dir: string
-  socket: string
-}
+type Tunnel = TrackedTunnel
 
 const tunnels = new Map<number, Tunnel>()
+let tunnelCleanup: Promise<void> | null = null
 
 /**
  * The environment ssh children run in.
@@ -952,8 +952,9 @@ async function openRemoteWindow(host: string): Promise<void> {
     if (!t) return
     tunnels.delete(id)
     // A leaked `ssh -N` outliving its window is the failure mode to avoid.
-    try { t.proc.kill() } catch { /* already gone */ }
-    void rm(t.dir, { recursive: true, force: true })
+    // The map entry is removed synchronously; the shared cleanup still waits
+    // for process termination and removes the owned runtime directory.
+    void cleanupTrackedTunnels(new Map([[id, t]]))
   })
 }
 
@@ -986,12 +987,15 @@ function promptConnectHost(): void {
 }
 
 /** Kill every tunnel. Called on quit so no `ssh -N` outlives the app. */
-function killTunnels(): void {
-  for (const [, t] of tunnels) {
-    try { t.proc.kill() } catch { /* already gone */ }
-    try { rmSync(t.dir, { recursive: true, force: true }) } catch { /* ignore */ }
-  }
-  tunnels.clear()
+function killTunnels(): Promise<void> {
+  if (tunnelCleanup) return tunnelCleanup
+  const cleanup = cleanupTrackedTunnels(tunnels)
+  let settled!: Promise<void>
+  settled = cleanup.finally(() => {
+    if (tunnelCleanup === settled) tunnelCleanup = null
+  })
+  tunnelCleanup = settled
+  return settled
 }
 
 async function openWindow(target: WindowTarget, options: { show?: boolean } = {}): Promise<WindowCtx> {
@@ -1309,13 +1313,15 @@ async function main(): Promise<void> {
     throw new Error('LAYOUT_CONFLICT')
   }
 
-  reopenLocalWindow = async (): Promise<void> => {
+  reopenLocalWindow = createSingleFlight(async (): Promise<void> => {
+    // Re-check after this caller wins the single flight. A window may have
+    // registered while an earlier activation was awaiting openWindow().
     const existing = [...windowCtxs.values()].find((candidate) => candidate.target.kind === 'local' && !candidate.win.isDestroyed())
     if (existing) { existing.resumeClient(); existing.win.show(); existing.win.focus(); return }
     const reopened = await openWindow({ kind: 'local' })
     tabBrowser?.setWindow(reopened.win)
     reopened.win.show(); reopened.win.focus()
-  }
+  })
 
   let tabBrowserBroker: TabBrowserBrokerServer | null = null
   let browserDaemonWatcher: BrowserDaemonWatcher | null = null
@@ -1448,8 +1454,12 @@ async function main(): Promise<void> {
       flushAndDestroy: (signal) => tabBrowser?.flushAndDestroy(signal) ?? Promise.resolve(),
       closeBroker: () => tabBrowserBroker?.close() ?? Promise.resolve(),
       closeWatcher: () => { browserDaemonWatcher?.close(); browserDaemonWatcher = null },
-      closeWindows: () => {
+      closeWindows: async () => {
         residentTray?.destroy(); residentTray = null
+        // `app.quit()` will synchronously enter before-quit. Awaiting the
+        // shared cleanup here means the normal path and that final callback
+        // both observe an already-drained, idempotent tunnel set.
+        await killTunnels()
         allowFinalQuit = true
         app.quit()
       },
@@ -1469,6 +1479,10 @@ async function main(): Promise<void> {
     await tabBrowserBroker?.close().catch(() => {})
     browserDaemonWatcher?.close(); browserDaemonWatcher = null
     residentTray?.destroy(); residentTray = null
+    // app.exit() bypasses Electron's before-quit event. Force quit therefore
+    // must await the same bounded, idempotent tunnel cleanup explicitly; a
+    // fire-and-forget kill would leave ssh and its runtime socket behind.
+    await killTunnels()
     allowFinalQuit = true
     app.exit(1)
   }
@@ -2099,7 +2113,9 @@ app.on('before-quit', (event) => {
     else residentIntents.requestQuit()
     return
   }
-  killTunnels()
+  // Final normal quit has already awaited this cleanup in closeWindows. Keep
+  // this idempotent backstop for any other allowFinalQuit path.
+  void killTunnels()
 })
 
 // Single-instance lock: a second launch sends only a bounded, versioned

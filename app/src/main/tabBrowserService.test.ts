@@ -254,6 +254,46 @@ describe('TabBrowserService dispatch authorization', () => {
     } finally { vi.useRealTimers() }
   })
 
+  it('revokes queued activation when the owning window hides, then permits an explicit re-show', async () => {
+    const state = emptyBrowserState(1), created: string[] = []
+    const target = 'browser-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+    state.records[target] = {
+      id: target, profileId: 'global', mode: 'browse', safeRestoreUrl: 'about:blank', title: '', viewport: { width: 1280, height: 800 },
+      lifecycle: 'frozen', stateRevision: 1, lastUsedAt: 0, lastFocusedAt: 0,
+    }
+    const pages = {
+      create: (id: string) => {
+        created.push(id)
+        return { loadURL: async () => {}, show: () => {}, hide: () => {}, stop: () => {}, destroy: () => {} }
+      },
+    }
+    const host = new TabBrowserHost(state, pages, Date.now)
+    const Service = TabBrowserService as unknown as new (s: TabBrowserStateStore, p: { setWindow: () => void }, h: TabBrowserHost, i: typeof state) => TabBrowserService
+    const service = new Service({ update: async () => state } as unknown as TabBrowserStateStore, { setWindow: () => {} }, host, state)
+    const live: string[] = []
+    for (let i = 0; i < 4; i++) {
+      const opened = await service.command({ type: 'open' })
+      if (!('id' in opened)) throw new Error('expected browser')
+      live.push(opened.id)
+    }
+    for (const id of live) host.protectApproval(id, true)
+
+    const waiting = service.command({ type: 'show', id: target, bounds: { x: 0, y: 0, width: 100, height: 100 } })
+    await vi.waitFor(() => expect(service.pendingWork().queued).toBeGreaterThanOrEqual(1))
+    service.windowHidden()
+    await expect(waiting).rejects.toThrow('ACTION_CANCELLED')
+    await Promise.resolve()
+    expect(created).toHaveLength(4)
+
+    // Capacity can become available after the hide, but it must not resurrect
+    // the cancelled request. A later user-driven show is allowed to queue and
+    // create the page explicitly.
+    host.protectApproval(live[0]!, false)
+    const requeued = service.command({ type: 'show', id: target, bounds: { x: 0, y: 0, width: 100, height: 100 } })
+    await expect(requeued).resolves.toMatchObject({ id: target, lifecycle: 'live' })
+    expect(created).toHaveLength(5)
+  })
+
   it('closes a browser by aborting its queue owner before disposing the host runtime', async () => {
     vi.useFakeTimers()
     try {
