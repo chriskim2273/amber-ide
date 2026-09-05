@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
+import type { Input, MouseInputEvent } from 'electron'
 import { TabBrowserHost, type TabBrowserPage, type TabBrowserPageEvent, type TabBrowserPageFactory } from './tabBrowserHost'
 import { emptyBrowserState, parseBrowserState } from '../shared/tabBrowserState'
 import { BrowserAutomationError } from './browserErrors'
@@ -61,14 +62,15 @@ describe('TabBrowserHost', () => {
       async send(method: string, params: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
         const preventable = { preventDefault: () => {} }
         if (method === 'Input.dispatchMouseEvent') {
-          this.handlers.beforeMouseEvent(preventable, params as never)
+          this.handlers.beforeMouseEvent(preventable, params as unknown as MouseInputEvent)
           return {}
         }
         if (method === 'Input.dispatchKeyEvent' || method === 'Input.insertText') {
-          this.handlers.beforeInputEvent(preventable, {
+          const input: Input = {
             type: String(params['type'] ?? 'keyDown'), key: String(params['key'] ?? params['text'] ?? ''), code: String(params['code'] ?? ''),
             isAutoRepeat: false, isComposing: false, shift: false, control: false, alt: false, meta: false, location: 0, modifiers: [],
-          })
+          }
+          this.handlers.beforeInputEvent(preventable, input)
           return {}
         }
         if (method === 'DOM.getDocument') return { root: { nodeId: 1 } }
