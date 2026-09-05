@@ -26,11 +26,12 @@ function fixture() {
     };
     return child;
   }
-  const js = stripTypeScriptTypes(source).replace(/import \{ spawn \} from [^\n]+/, '')
+  const js = stripTypeScriptTypes(source).replace(/^import .*$/gm, '')
     .replace('export default function', 'globalThis.factory = function');
-  const sandbox = { process, spawn, setTimeout, clearTimeout, setImmediate, console };
+  const Type = new Proxy({}, { get: () => () => ({}) });
+  const sandbox = { process, spawn, Type, TextDecoder, setTimeout, clearTimeout, setImmediate, console };
   vm.runInNewContext(js, sandbox);
-  sandbox.factory({ on: (event, handler) => handlers.set(event, handler) });
+  sandbox.factory({ on: (event, handler) => handlers.set(event, handler), registerTool: () => {} });
   const ctx = { cwd: '/project', sessionManager: {
     getSessionId: () => 'parent-id', getSessionFile: () => '/project/parent.jsonl',
   }};

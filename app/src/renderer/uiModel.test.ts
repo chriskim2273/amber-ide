@@ -53,7 +53,7 @@ describe('continuityView', () => {
 describe('pane kind picker', () => {
   it('contains every supported pane kind once with human-readable detail', () => {
     expect(PANE_KIND_OPTIONS.map((option) => option.kind)).toEqual([
-      'shell', 'claude', 'grok', 'codex', 'opencode', 'hermes', 'pi', 'browser', 'editor',
+      'shell', 'claude', 'grok', 'codex', 'opencode', 'hermes', 'pi', 'editor',
     ])
     expect(new Set(PANE_KIND_OPTIONS.map((option) => option.kind)).size).toBe(PANE_KIND_OPTIONS.length)
     expect(PANE_KIND_OPTIONS.every((option) => option.label.length > 0 && option.detail.length > 0)).toBe(true)

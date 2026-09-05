@@ -1,8 +1,9 @@
 import net from 'node:net'
 import { encode, Decoder, type Frame } from '../shared/proto'
 
-type FrameCb = (f: Frame) => void
-type VoidCb = () => void
+export type ConnectionEpoch = number
+type FrameCb = (f: Frame, epoch: ConnectionEpoch) => void
+type VoidCb = (epoch: ConnectionEpoch) => void
 
 export class Connection {
   private socket: net.Socket | null = null
@@ -12,6 +13,7 @@ export class Connection {
   private closeCbs: VoidCb[] = []
   private closed = false
   private attempt = 0
+  private epoch = 0
 
   constructor(private readonly path: string) {}
 
@@ -28,36 +30,44 @@ export class Connection {
     if (this.closed) return
     this.decoder = new Decoder()
     const socket = net.createConnection({ path: this.path })
+    const epoch = ++this.epoch
     this.socket = socket
-    socket.on('connect', () => { this.attempt = 0; for (const cb of this.openCbs) cb() })
+    const current = (): boolean => !this.closed && this.socket === socket
+    socket.on('connect', () => {
+      if (!current()) return
+      this.attempt = 0; for (const cb of this.openCbs) cb(epoch)
+    })
     socket.on('data', (chunk: Buffer) => {
+      if (!current()) return
       // Decoder.next() throws on an oversized frame or an unknown tag. An
       // uncaught throw here would kill the whole utilityProcess (control + every
       // pane share this socket). Instead, drop the poisoned connection: destroy
       // the socket so the 'close' handler reconnects with a fresh Decoder.
       try {
         this.decoder.feed(new Uint8Array(chunk))
-        for (let f = this.decoder.next(); f; f = this.decoder.next()) for (const cb of this.frameCbs) cb(f)
+        for (let f = this.decoder.next(); f; f = this.decoder.next()) for (const cb of this.frameCbs) cb(f, epoch)
       } catch (err) {
         console.warn('amber: dropping connection after frame decode error:', err)
         socket.destroy()
       }
     })
     socket.on('close', () => {
-      for (const cb of this.closeCbs) cb()
-      this.scheduleReconnect()
+      if (!current()) return
+      this.socket = null
+      for (const cb of this.closeCbs) cb(epoch)
+      this.scheduleReconnect(epoch)
     })
-    socket.on('error', (err) => { console.warn('amber: socket error:', err) /* 'close' follows */ })
+    socket.on('error', (err) => { if (current()) console.warn('amber: socket error:', err) /* 'close' follows */ })
   }
 
-  private scheduleReconnect(): void {
+  private scheduleReconnect(epoch: ConnectionEpoch): void {
     if (this.closed) return
     const delay = Math.min(2000, 100 * 2 ** this.attempt)
     this.attempt += 1
-    setTimeout(() => this.connect(), delay)
+    setTimeout(() => { if (!this.closed && this.epoch === epoch) this.connect() }, delay)
   }
 
   send(frame: Frame): void { this.socket?.write(encode(frame)) }
 
-  close(): void { this.closed = true; this.socket?.destroy(); this.socket = null }
+  close(): void { this.closed = true; const socket = this.socket; this.socket = null; socket?.destroy() }
 }

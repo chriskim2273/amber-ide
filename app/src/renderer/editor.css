@@ -1,5 +1,5 @@
 /* Editor pane (spec 2026-07-19). Scoped to `.editor-pane` so nothing here can
- * leak into terminal/browser panes; tokens come from theme.css. */
+ * leak into terminal panes; tokens come from theme.css. */
 
 .editor-pane {
   display: flex;

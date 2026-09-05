@@ -124,7 +124,9 @@ platform.
 
 - `app/src/shared/layoutFile.ts` / `.test.ts` — `LoadLayoutResult`/
   `SaveLayoutResult`/`LayoutVersion` types, `mergeLayout`.
-- `app/src/main/layoutIO.ts` (new) / `.test.ts` (new) — Node CAS file IO.
+- `app/src/main/layoutIO.ts` (new) / `.test.ts` (new) /
+  `layoutIORace.test.ts` — Node CAS file IO and deterministic descriptor-race
+  fixtures.
 - `app/src/main/index.ts` — `layout-load`/`layout-save` IPC handlers now thin
   wrappers over `layoutIO.ts`.
 - `app/src/preload/index.ts` — `loadLayout`/`saveLayout` signatures updated.
@@ -159,10 +161,58 @@ platform.
   function instead. If this is not acceptable for this feature specifically,
   it would need a lightweight renderer-level harness that doesn't currently
   exist anywhere in the app.
-- I did not modify `crates/amber/src/mosaic.rs` (the read-only mosaic render
-  path for the old hand-written `assets/app.js` UI) — it's a separate reader of
-  the same file for a different consumer and out of scope for CAS.
+- The original CAS commit did not modify `crates/amber/src/mosaic.rs` because
+  its read-only render path was then out of scope. The 2026-09-03 containment
+  follow-up now does: mosaic and CAS share the bounded regular-file loader,
+  graph/string validation, and cached hostile-file polling fallback. This is a
+  separate hardening pass and not a change to CAS merge semantics.
 - `cargo clippy`/`cargo test` run through this environment's normal shell
   produced a misleading summarized report at one point (see Test summary
   above); I verified directly against the real `cargo` binary before relying on
   the result. Flagging in case it recurs for whoever reviews this next.
+
+## 2026-09-03 containment follow-up
+
+The later tab-browser host review added the bounded ingress work that was
+outside the original CAS commit: `crates/amber/src/layout_file.rs` is now the
+shared Rust regular-file loader used by both `layout_cas` and `mosaic`, with
+8 MiB, symlink, replacement/growth, timeout, exact-byte, and fatal UTF-8
+checks. Mosaic parsing validates
+workspace/tab/map/string/tree bounds and its web poller caches an unchanged
+fallback. The Node CAS reread and SSH remote-layout probe use matching 8 MiB
+limits, fatal UTF-8 decoding, and no partial result on overflow/timeout.
+Deterministic tests cover truncation, truncate-and-regrow, append, FIFO, and
+symlink replacement during descriptor reads, plus shell-expanded XDG/HOME
+paths containing spaces and glob characters. The broker admission fix and
+its queue-key cancellation tests are tracked in `tab-browser-host.md` and the
+machine-readable remaining report. Current validation is recorded there; the
+branch remains `mergeReady: false` because the deployment/package/platform and
+independent resident-review gates are still open.
+
+## 2026-09-04 owner-bound lock and ingress follow-up
+
+The cross-process lock now uses the same versioned owner record on both sides:
+PID, process-start identity, and a unique acquisition token. Node and Rust
+reclaim only a lock whose owner identity is demonstrably dead; unknown process
+state waits until the bounded lock timeout. Release rereads and compares the
+record text plus file metadata before unlinking, preventing an old writer from
+removing a successor lock. Windows process-query failures are treated as
+unknown rather than as proof of a dead owner.
+
+The sidecar and its callers also use bounded, regular-file-only reads with
+fatal UTF-8 and descriptor/path identity checks. Node's shared reader covers
+layout CAS plus browser state, workspace/productivity/checkpoint, editor,
+transcript, token, broker, and service-log ingress. Rust's shared reader is
+used by both layout CAS and mosaic. The original prefix-only checkpoint and
+transcript reads remain bounded while validating the complete file size and
+identity.
+
+Current isolated gates: app **964 passed / 1 intentional real-daemon skip**;
+Rust **811 passed / 1 intentional delegated-cgroup ignore**; warnings-as-errors
+workspace Clippy; strict TypeScript typecheck; Electron/web builds; static
+Linux AppImage packaging containing both `amber` and `amber-router`; shell
+contract tests; and `git diff --check`. Full rustfmt remains blocked only by
+the repository's documented pre-existing formatter drift. Windows GNU
+cross-target compilation could not run on this Linux host because `ring` needs
+`x86_64-w64-mingw32-gcc`. The branch remains `mergeReady: false` pending the
+independent resident review and external deployment/platform gates.

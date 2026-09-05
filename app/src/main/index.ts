@@ -1,12 +1,13 @@
-import { app, BrowserWindow, utilityProcess, MessageChannelMain, Menu, shell, Notification } from 'electron'
+import { app, BrowserWindow, utilityProcess, MessageChannelMain, Menu, shell, Notification, Tray, nativeImage } from 'electron'
 import type { MenuItemConstructorOptions } from 'electron'
 import { ipcMain, dialog, clipboard } from 'electron'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { basename, dirname, join, resolve as resolvePathJoin, isAbsolute } from 'node:path'
 import { homedir, hostname, release as osRelease, tmpdir } from 'node:os'
 import { spawn, execFileSync } from 'node:child_process'
-import { readFile, writeFile, rename, mkdir, copyFile, chmod, realpath, rm, stat, mkdtemp } from 'node:fs/promises'
-import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
+import { readFile, writeFile, rename, mkdir, copyFile, chmod, rm, stat, mkdtemp } from 'node:fs/promises'
+import { existsSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { resolveSocketPath } from '../shared/socketPath'
 import { HANDOFF_FILE_MAX, parseHandoff } from '../shared/handoff'
 import { pathCandidates } from '../shared/pathSel'
@@ -59,8 +60,9 @@ import { compatSignature, shouldUseCompat, compatWorthyReason, COMPAT_SWITCHES, 
 import { installBinary } from './installBinary'
 import { repairAgentExtensions } from './agentSetup'
 import {
-  sshTunnelArgv, sshProbeArgv, isValidHost, localSocketPath, hostLabel,
-  REMOTE_SOCKET_PROBE, REMOTE_LAYOUT_PROBE, parseAgentSock, explainSshFailure,
+  sshTunnelArgv, isValidHost, localSocketPath, hostLabel,
+  REMOTE_SOCKET_PROBE, REMOTE_LAYOUT_PROBE, REMOTE_LAYOUT_PROBE_MAX_BYTES,
+  parseAgentSock, explainSshFailure, runSshProbe, waitForSshTunnelReady,
   isSupportedOnPlatform,
 } from './sshRemote'
 import { webCtlArgv, parseWebStatus, redactUrl, type WebStatus } from './webService'
@@ -71,13 +73,67 @@ import {
   type RouterStatus,
 } from './routerService'
 import { inspectLinuxInputMethod, repairLinuxInputMethod, resolveLinuxInputEnvironment } from './inputMethod'
+import { TabBrowserService, parseTabBrowserCommand, stageWorkspaceBrowserState } from './tabBrowserService'
+import { buildAppMenuTemplate, type BrowserMenuHandlers } from './browserMenu'
+import { TabBrowserBrokerServer, authorizeBrowserRequest, dispatchAttachedBrokerAction, isEligiblePiController, type BrokerRequest } from './tabBrowserBroker'
+import { BrowserDaemonWatcher } from './browserDaemonWatcher'
+import { Connection } from '../client/connection'
+import { TabBrowserStateStore } from './tabBrowserStateStore'
+import { commitBrowserLayoutMutation, coordinateTabBrowserMigration } from './tabBrowserMigrationCoordinator'
+import { bindRendererBrowserCommand, browserAuthorityChanged } from './browserAssociationAuthority'
+import { emptyLayout, layoutUtf8ByteLength, LAYOUT_FILE_MAX_BYTES, parseLayout, serializeLayout, type LayoutFile } from '../shared/layoutFile'
+import { assertWorkspaceFileBytes, parseWorkspaceFile, WORKSPACE_FILE_MAX_BYTES } from '../shared/workspaceFile'
+import { commitPreparedWorkspaceImport, prepareWorkspaceImport } from './workspaceImport'
+import { approvalSurfaceDuringPresentationCommand, browserContextMatches, captureBrowserContext, hasExactApprovalSurface, resolveBrowserContext, sameBrowserContextIdentity, setBrowserForCurrentContext } from './browserWindowContext'
+import { createBrowserId } from '../shared/tabBrowser'
+import { isRecoveryId } from '../shared/tabBrowserState'
+import { BrowserOperationRegistry } from './browserOperationRegistry'
+import { readSafeTextFile, readSafeTextFileSync, SafeFileReadError } from './safeFileReader'
+import { browserHostSocketPath } from './browserHostPaths'
+import { electronPaths } from './electronPaths'
+import {
+  activationRequest,
+  clearBrowserHostInhibit,
+  coordinateBrowserHostQuit,
+  createSingleFlight,
+  openTrackedTunnel,
+  installStableAppImage,
+  TrackedTunnelRegistry,
+  parseActivationRequest,
+  registerBrowserHostLauncher,
+  ResidentIntentLatch,
+  writeBrowserHostInhibit,
+  type TrackedTunnelHandle,
+} from './browserResident'
 import clientPath from '../client/index?modulePath'
 
 // A client child that stays up this long counts as a genuine run; a shorter
 // life is treated as a crash-loop and widens the relaunch backoff.
 const CLIENT_STABLE_MS = 5000
 
+const electronPathConfig = electronPaths(process.env, { userData: app.getPath('userData'), sessionData: app.getPath('sessionData') })
+app.setPath('userData', electronPathConfig.userData)
+app.setPath('sessionData', electronPathConfig.sessionData)
+
 const __dirname = dirname(fileURLToPath(import.meta.url))
+
+async function readBoundedTextFile(path: string, maxBytes: number, limitCode: string): Promise<string> {
+  try {
+    const owner = process.getuid?.()
+    const text = await readSafeTextFile(path, { maxBytes, ...(owner === undefined ? {} : { owner }) })
+    if (text === null) throw new Error('WORKSPACE_FILE_CHANGED')
+    return text
+  } catch (error) {
+    if (!(error instanceof SafeFileReadError)) throw error
+    if (error.code === 'FILE_TOO_LARGE') throw new Error(limitCode)
+    if (error.code === 'SYMLINK') throw new Error('WORKSPACE_SYMLINK')
+    if (error.code === 'NOT_REGULAR') throw new Error('WORKSPACE_NOT_REGULAR')
+    if (error.code === 'INVALID_UTF8') throw new Error('WORKSPACE_INVALID_UTF8')
+    if (error.code === 'READ_TIMEOUT') throw new Error('WORKSPACE_READ_TIMEOUT')
+    if (error.code === 'FILE_CHANGED') throw new Error('WORKSPACE_FILE_CHANGED')
+    throw error
+  }
+}
 
 function stateRoot(): string {
   if (process.platform === 'win32') {
@@ -96,13 +152,23 @@ const COMPAT_SIGNATURE = compatSignature(process.versions.electron ?? 'unknown',
 
 function readCompatFlag(): string | null {
   try {
-    return readFileSync(compatFlagPath, 'utf8')
+    const owner = process.getuid?.()
+    return readSafeTextFileSync(compatFlagPath, { maxBytes: 256, ...(owner === undefined ? {} : { owner }) })
   } catch {
-    return null // absent (or unreadable, which is the same decision)
+    // The marker is only an optimization hint. Any absent, unsafe, oversized,
+    // changed, or malformed marker must fall back to the hardware-GPU probe;
+    // startup must never allocate from attacker-controlled bytes here.
+    return null
   }
 }
 
 const compat = shouldUseCompat(process.env, readCompatFlag(), COMPAT_SIGNATURE)
+
+function tabBrowserHostEnabled(): boolean {
+  return process.env['AMBER_TAB_BROWSER_HOST'] === '1'
+    && process.env['AMBER_TAB_BROWSER_V2_READER_DEPLOYED'] === '1'
+    && !compat && process.platform !== 'win32'
+}
 
 if (compat) {
   for (const [name, value] of COMPAT_SWITCHES) {
@@ -230,7 +296,7 @@ async function preflightLinuxInputMethod(): Promise<boolean> {
 
   if (choice.response === 1) return true
   if (choice.response !== 0) {
-    app.quit()
+    quitDuringStartup()
     return false
   }
 
@@ -262,7 +328,7 @@ async function preflightLinuxInputMethod(): Promise<boolean> {
     noLink: true,
   })
   if (failure.response === 0) return true
-  app.quit()
+  quitDuringStartup()
   return false
 }
 
@@ -494,11 +560,10 @@ async function quitDaemonAndApp(win: BrowserWindow): Promise<void> {
         'The daemon was not installed via the app (dev mode or unmanaged), so it ' +
         'cannot be stopped from here. Quitting the app now — the daemon keeps running.',
     })
-    app.quit()
+    if (requestExplicitQuit) await requestExplicitQuit(); else app.quit()
     return
   }
 
-  const uid = process.getuid?.() ?? 0
   if (process.platform === 'win32') {
     try {
       await stopWindowsDaemon(resolveSocketPath(process.env, process.platform))
@@ -512,9 +577,12 @@ async function quitDaemonAndApp(win: BrowserWindow): Promise<void> {
       })
       return
     }
-    app.quit()
+    if (requestExplicitQuit) await requestExplicitQuit(); else app.quit()
     return
   }
+  // Keep POSIX-only identity lookup out of the Windows branch. In particular,
+  // Electron's Windows process object does not provide getuid().
+  const uid = process.getuid?.() ?? 0
   const stop = stopDaemonCommand(process.platform, uid)
   if (stop !== null) {
     await spawnOk(stop.cmd, stop.args).catch(async () => {
@@ -522,7 +590,7 @@ async function quitDaemonAndApp(win: BrowserWindow): Promise<void> {
       if (fb !== null) await spawnOk(fb.cmd, fb.args).catch(() => {})
     })
   }
-  app.quit()
+  if (requestExplicitQuit) await requestExplicitQuit(); else app.quit()
 }
 
 // Restart the daemon in place. Recovery path for a wedged daemon (and the way
@@ -563,7 +631,6 @@ async function restartDaemon(win: BrowserWindow): Promise<void> {
     return
   }
 
-  const uid = process.getuid?.() ?? 0
   if (process.platform === 'win32') {
     try {
       await stopWindowsDaemon(resolveSocketPath(process.env, process.platform))
@@ -579,6 +646,8 @@ async function restartDaemon(win: BrowserWindow): Promise<void> {
     }
     return
   }
+  // This branch is POSIX-only; do not probe process.getuid on Windows.
+  const uid = process.getuid?.() ?? 0
   const restart = restartDaemonCommand(process.platform, uid)
   if (restart === null) return
   try {
@@ -605,16 +674,14 @@ async function installDesktopShortcut(win: BrowserWindow): Promise<void> {
     const appImage = process.env['APPIMAGE'] ?? ''
     const stable = stableAppImagePath(home)
 
-    // Self-copy guard: skip the copy when already running from the stable path.
-    const [src, dst] = await Promise.all([
-      realpath(appImage),
-      realpath(stable).catch(() => ''),
-    ])
-    if (src !== dst) {
-      await mkdir(dirname(stable), { recursive: true })
-      await copyFile(appImage, stable)
-    }
-    await chmod(stable, 0o755)
+    await installStableAppImage(appImage, stable, async () => {
+      if (!tabBrowserHostEnabled()) return
+      await registerBrowserHostLauncher(stateRoot(), {
+        platform: process.platform, executable: stable,
+        installGeneration: `${app.getVersion()}:${process.versions.electron}`,
+        uid: process.getuid?.(),
+      })
+    })
 
     const icon = iconInstallPath(home)
     await mkdir(dirname(icon), { recursive: true })
@@ -628,7 +695,6 @@ async function installDesktopShortcut(win: BrowserWindow): Promise<void> {
     await spawnOk('gtk-update-icon-cache', [
       join(home, '.local', 'share', 'icons', 'hicolor'),
     ]).catch(() => {})
-
     await dialog.showMessageBox(win, {
       type: 'info',
       buttons: ['OK'],
@@ -651,42 +717,21 @@ async function installDesktopShortcut(win: BrowserWindow): Promise<void> {
 }
 
 // Minimal application menu. Keeps the standard macOS roles (app/Edit/Window) so
-// copy/paste and window management work; adds the explicit "Quit amber daemon"
-// item required by spec §3/§6. On Linux only that item plus the plain quit.
+// copy/paste and window management work; adds explicit daemon and app Quit
+// actions. The pure template builder is platform-injected and unit-testable.
 function buildAppMenu(
   onQuitDaemon: () => void,
+  onQuitApp: () => void,
+  onEnableBrowserHost: (() => void) | null,
   onInstallDesktop: (() => void) | null,
   onRestartDaemon: () => void,
   onConnectHost: () => void,
 ): Menu {
-  const isMac = process.platform === 'darwin'
-  const sshSupport = isSupportedOnPlatform(process.platform)
-  const template: MenuItemConstructorOptions[] = []
-  // macOS appMenu already carries a plain "Quit amber-ide" (quits the app,
-  // leaves the daemon running); on Linux we add that plain quit ourselves.
-  if (isMac) template.push({ role: 'appMenu' })
-  const submenu: MenuItemConstructorOptions[] = [
-    ...(onInstallDesktop !== null
-      ? [
-          { label: 'Install desktop shortcut', click: () => onInstallDesktop() },
-          { type: 'separator' } as MenuItemConstructorOptions,
-        ]
-      : []),
-    sshSupport.ok
-      ? { label: 'Connect to host…', accelerator: 'CmdOrCtrl+Shift+O', click: () => onConnectHost() }
-      : {
-          label: 'Connect to host… (unavailable: named-pipe transport)',
-          enabled: false,
-          toolTip: sshSupport.reason,
-        },
-    { type: 'separator' } as MenuItemConstructorOptions,
-    { label: 'Restart amber daemon', click: () => onRestartDaemon() },
-    { label: 'Quit amber daemon', click: () => onQuitDaemon() },
-  ]
-  if (!isMac) submenu.push({ type: 'separator' }, { role: 'quit' })
-  template.push({ label: isMac ? 'Daemon' : 'File', submenu })
-  if (isMac) template.push({ role: 'editMenu' }, { role: 'windowMenu' })
-  return Menu.buildFromTemplate(template)
+  const handlers: BrowserMenuHandlers = {
+    onQuitDaemon, onQuitApp, onEnableBrowserHost, onInstallDesktop,
+    onRestartDaemon, onConnectHost, appName: app.name,
+  }
+  return Menu.buildFromTemplate(buildAppMenuTemplate(process.platform, handlers))
 }
 
 /**
@@ -710,24 +755,58 @@ interface WindowCtx {
   target: WindowTarget
   controlPort: () => Electron.MessagePortMain | null
   child: () => Electron.UtilityProcess | null
+  resumeClient: () => void
+  activeBrowserId: string | null
+  activeBrowserExpanded: boolean
+  activeWorkspace: number | null
+  activeTab: number | null
+  browserContextGeneration: number
 }
 
 /** Per-window state, keyed by webContents id so IPC can route by sender. */
 const windowCtxs = new Map<number, WindowCtx>()
+let reopenLocalWindow: (() => Promise<void>) | null = null
+let onLocalWindowHidden: (() => void) | null = null
+let residentTray: Tray | null = null
+let allowFinalQuit = false
+let explicitQuitInProgress = false
+let requestExplicitQuit: (() => Promise<void>) | null = null
+const residentIntents = new ResidentIntentLatch()
+
+// Startup can fail before the resident quit coordinator is installed (input
+// method preflight, daemon boot, migration, or window creation). In that phase
+// there is no browser state to drain, so bypass the resident before-quit gate;
+// routing this through requestQuit would otherwise leave the app alive forever
+// with a latched intent and no handler.
+function quitDuringStartup(): void {
+  allowFinalQuit = true
+  // Startup failure has no browser host, but use the same bounded tunnel
+  // finalizer before allowing Electron to exit if a future startup phase ever
+  // created one before failing.
+  void killTunnels().then(() => app.quit(), () => app.quit())
+}
 
 /** The window an IPC message came from. */
 function ctxFor(e: { sender: Electron.WebContents }): WindowCtx | undefined {
   return windowCtxs.get(e.sender.id)
 }
 
-/** A live ssh tunnel backing one remote window. */
-interface Tunnel {
-  proc: ReturnType<typeof spawn>
-  dir: string
-  socket: string
+function setWindowContextFromLayout(ctx: WindowCtx, layout: LayoutFile): void {
+  const workspace = layout.workspaces[String(layout.activeWorkspace)]
+  ctx.activeWorkspace = layout.activeWorkspace
+  ctx.activeTab = workspace?.activeTab ?? null
+  const browser = workspace?.tabs[String(workspace.activeTab)]?.browser
+  ctx.activeBrowserId = browser?.id ?? null
+  ctx.activeBrowserExpanded = !!browser && !browser.collapsed
+  ctx.browserContextGeneration += 1
 }
 
-const tunnels = new Map<number, Tunnel>()
+/** Live and pending ssh tunnels are owned by this registry until cleanup ends. */
+const tunnelRegistry = new TrackedTunnelRegistry()
+const tunnels = new Map<number, TrackedTunnelHandle>()
+
+function fenceTunnelOpens(): void { tunnelRegistry.fence() }
+function cancelTunnelOpenFence(): void { tunnelRegistry.cancelFence() }
 
 /**
  * The environment ssh children run in.
@@ -756,19 +835,6 @@ function sshEnv(): NodeJS.ProcessEnv {
   }
 }
 
-/** Run a one-shot command on the remote and return its stdout (trimmed). */
-function sshProbe(host: string, script: string): Promise<{ out: string; err: string; code: number }> {
-  const a = sshProbeArgv(host, script)
-  return new Promise((resolveProbe) => {
-    const p = spawn(a.cmd, a.args, { stdio: ['ignore', 'pipe', 'pipe'], env: sshEnv() })
-    let out = ''
-    let err = ''
-    p.stdout?.on('data', (d: Buffer) => { out += d.toString() })
-    p.stderr?.on('data', (d: Buffer) => { err += d.toString() })
-    p.on('close', (code) => resolveProbe({ out: out.trim(), err: err.trim(), code: code ?? -1 }))
-    p.on('error', (e) => resolveProbe({ out: '', err: String(e), code: -1 }))
-  })
-}
 
 /**
  * Open a window onto another machine's amber (spec 2026-08-23).
@@ -789,6 +855,10 @@ async function openRemoteWindow(host: string): Promise<void> {
     })
     return
   }
+  // A remote open can begin from a menu/IPC callback while Quit is already
+  // draining. Refuse before probing, and repeat the check after every await so
+  // no child or window can be admitted behind the finalizer.
+  if (allowFinalQuit || explicitQuitInProgress || !tunnelRegistry.canRegister()) return
   if (!isValidHost(host)) {
     await dialog.showMessageBox({
       type: 'error',
@@ -798,8 +868,9 @@ async function openRemoteWindow(host: string): Promise<void> {
     return
   }
 
-  const probe = await sshProbe(host, REMOTE_SOCKET_PROBE)
-  if (probe.code !== 0) {
+  const probe = await runSshProbe(host, REMOTE_SOCKET_PROBE, sshEnv())
+  if (allowFinalQuit || explicitQuitInProgress || !tunnelRegistry.canRegister()) return
+  if (probe.code !== 0 || probe.error) {
     // ssh's own message is usually better than anything we could invent
     // (unknown host, name resolution, refused). The one case it under-reports
     // is a missing agent, which it can only call "permission denied".
@@ -807,11 +878,12 @@ async function openRemoteWindow(host: string): Promise<void> {
     await dialog.showMessageBox({
       type: 'error',
       message: `Could not reach ${host}`,
-      detail: explained ?? (probe.err || `ssh exited ${probe.code}`),
+      detail: explained ?? (probe.error || probe.err || `ssh exited ${probe.code}`),
     })
     return
   }
-  if (probe.out.length === 0) {
+  const remoteSocket = probe.out.trim()
+  if (remoteSocket.length === 0) {
     await dialog.showMessageBox({
       type: 'error',
       message: `No amber daemon on ${host}`,
@@ -820,53 +892,64 @@ async function openRemoteWindow(host: string): Promise<void> {
     return
   }
 
-  // Private per-window directory: 0700 so no other local user can reach the
-  // tunnel, which carries full session control.
-  const dir = await mkdtemp(join(tmpdir(), 'amber-ssh-'))
-  await chmod(dir, 0o700)
-  const localSock = localSocketPath(dir)
-  const a = sshTunnelArgv(host, localSock, probe.out)
-  const proc = spawn(a.cmd, a.args, { stdio: ['ignore', 'pipe', 'pipe'], env: sshEnv() })
-  let tunnelErr = ''
-  proc.stderr?.on('data', (d: Buffer) => { tunnelErr += d.toString() })
-
-  // Wait for the socket to appear rather than guessing a delay: ssh creates it
-  // once the forward is established, and ExitOnForwardFailure means a failure
-  // kills the child instead of leaving us waiting forever.
-  const ready = await new Promise<boolean>((resolveReady) => {
-    let settled = false
-    const finish = (v: boolean): void => { if (!settled) { settled = true; resolveReady(v) } }
-    proc.on('exit', () => finish(false))
-    proc.on('error', () => finish(false))
-    const started = Date.now()
-    const poll = setInterval(() => {
-      if (existsSync(localSock)) { clearInterval(poll); finish(true) }
-      else if (Date.now() - started > 15000) { clearInterval(poll); finish(false) }
-    }, 100)
+  const canOpen = (): boolean => !allowFinalQuit && !explicitQuitInProgress && tunnelRegistry.canRegister()
+  const result = await openTrackedTunnel(tunnelRegistry, {
+    canOpen,
+    // Private per-window directory: 0700 so no other local user can reach the
+    // tunnel, which carries full session control.
+    prepare: async () => {
+      const dir = await mkdtemp(join(tmpdir(), 'amber-ssh-'))
+      try {
+        await chmod(dir, 0o700)
+        return { dir, socket: localSocketPath(dir) }
+      } catch (error) {
+        await rm(dir, { recursive: true, force: true }).catch(() => {})
+        throw error
+      }
+    },
+    spawn: ({ socket }) => {
+      const a = sshTunnelArgv(host, socket, remoteSocket)
+      // `openTrackedTunnel` registers this child synchronously before its next
+      // await. A quit fence can therefore either see it or reject it safely.
+      return spawn(a.cmd, a.args, { stdio: ['ignore', 'pipe', 'pipe'], env: sshEnv() })
+    },
+    // Wait for the socket to appear rather than guessing a delay: ssh creates
+    // it once the forward is established, and ExitOnForwardFailure means a
+    // failure kills the child instead of leaving us waiting forever. The
+    // helper owns all listeners/timers and retains bounded stderr.
+    waitReady: async (tunnel) => {
+      const readiness = await waitForSshTunnelReady(tunnel.proc, tunnel.socket)
+      return {
+        ready: readiness.ready,
+        detail: readiness.stderr || 'ssh exited before the forward was established.',
+      }
+    },
+    openWindow: (socket) => openWindow({ kind: 'remote', host, socket }),
+    attach: (ctx, lease) => {
+      if (ctx.win.isDestroyed()) throw new Error('REMOTE_WINDOW_CLOSED')
+      const id = ctx.win.webContents.id
+      tunnels.set(id, lease)
+      ctx.win.on('closed', () => {
+        const current = tunnels.get(id)
+        if (current !== lease) return
+        // Keep registry ownership until cleanup has actually completed. Quit
+        // racing this callback receives the same one-shot promise.
+        void lease.cleanup().then(() => {
+          if (tunnels.get(id) === lease) tunnels.delete(id)
+        }, () => {
+          if (tunnels.get(id) === lease) tunnels.delete(id)
+        })
+      })
+    },
+    dispose: (ctx) => { if (!ctx.win.isDestroyed()) ctx.win.destroy() },
   })
-
-  if (!ready) {
-    try { proc.kill() } catch { /* already gone */ }
-    await rm(dir, { recursive: true, force: true })
+  if (result.status === 'failed' && !allowFinalQuit && !explicitQuitInProgress) {
     await dialog.showMessageBox({
       type: 'error',
       message: `Could not forward ${host}'s amber socket`,
-      detail: tunnelErr || 'ssh exited before the forward was established.',
+      detail: result.detail || (result.error instanceof Error ? result.error.message : String(result.error)),
     })
-    return
   }
-
-  const ctx = await openWindow({ kind: 'remote', host, socket: localSock })
-  tunnels.set(ctx.win.webContents.id, { proc, dir, socket: localSock })
-  const id = ctx.win.webContents.id
-  ctx.win.on('closed', () => {
-    const t = tunnels.get(id)
-    if (!t) return
-    tunnels.delete(id)
-    // A leaked `ssh -N` outliving its window is the failure mode to avoid.
-    try { t.proc.kill() } catch { /* already gone */ }
-    void rm(t.dir, { recursive: true, force: true })
-  })
 }
 
 /**
@@ -898,16 +981,18 @@ function promptConnectHost(): void {
 }
 
 /** Kill every tunnel. Called on quit so no `ssh -N` outlives the app. */
-function killTunnels(): void {
-  for (const [, t] of tunnels) {
-    try { t.proc.kill() } catch { /* already gone */ }
-    try { rmSync(t.dir, { recursive: true, force: true }) } catch { /* ignore */ }
-  }
-  tunnels.clear()
+function killTunnels(): Promise<void> {
+  const cleanup = tunnelRegistry.cleanupAll()
+  return cleanup.then(() => {
+    // Window ids are only an index into the registry handles. Delete them after
+    // the shared promise settles, never at close-start or quit-start.
+    if (tunnelRegistry.size === 0) tunnels.clear()
+  })
 }
 
-async function openWindow(target: WindowTarget): Promise<WindowCtx> {
+async function openWindow(target: WindowTarget, options: { show?: boolean } = {}): Promise<WindowCtx> {
   const win = new BrowserWindow({
+    show: options.show ?? true,
     title: target.kind === 'remote' ? `amber — ${hostLabel(target.host ?? '')}` : 'amber',
     width: 1100,
     height: 720,
@@ -921,10 +1006,7 @@ async function openWindow(target: WindowTarget): Promise<WindowCtx> {
       preload: join(__dirname, '../preload/index.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
-      // Browser panes (web-viewer): the renderer hosts <webview> tags. Each runs
-      // unprivileged (no nodeIntegration, its own persist partition) — see
-      // Browser.tsx + spec 2026-07-18 §8.
-      webviewTag: true,
+      webviewTag: false,
       // Keep the preload SANDBOXED (default) for security. A sandboxed preload
       // has no node builtins and no `process.env`, so the two values it needs
       // are passed as argv flags (reachable via `process.argv` in sandbox).
@@ -949,6 +1031,8 @@ async function openWindow(target: WindowTarget): Promise<WindowCtx> {
   if (target.kind === 'local') Menu.setApplicationMenu(
     buildAppMenu(
       () => { void quitDaemonAndApp(win) },
+      () => { void requestExplicitQuit?.() },
+      tabBrowserHostEnabled() ? () => { void clearBrowserHostInhibit(stateRoot()) } : null,
       canInstallDesktop ? () => { void installDesktopShortcut(win) } : null,
       () => { void restartDaemon(win) },
       () => promptConnectHost(),
@@ -975,20 +1059,25 @@ async function openWindow(target: WindowTarget): Promise<WindowCtx> {
   // business deciding this machine's GL mode.
   if (!compat && target.kind === 'local') {
     let switching = false
-    const enterCompat = (): void => {
+    const enterCompat = async (): Promise<void> => {
       if (switching) return
       switching = true
+      fenceTunnelOpens()
       try { mkdirSync(stateRoot(), { recursive: true }); writeFileSync(compatFlagPath, COMPAT_SIGNATURE) } catch { /* ignore */ }
+      // app.exit() bypasses before-quit just like force quit. A remote window
+      // may have a live ssh tunnel even though this local detector owns the
+      // relaunch decision, so drain it before handing off to the new process.
+      await killTunnels()
       app.relaunch()
       app.exit(0)
     }
     const onRendererGone = (_e: unknown, d: { reason: string }): void => {
-      if (compatWorthyReason(d.reason)) enterCompat()
+      if (compatWorthyReason(d.reason)) void enterCompat()
     }
     const onChildGone = (_e: unknown, d: { type: string; reason: string }): void => {
-      if (d.type === 'GPU' && compatWorthyReason(d.reason)) enterCompat()
+      if (d.type === 'GPU' && compatWorthyReason(d.reason)) void enterCompat()
     }
-    const loadTimer = setTimeout(enterCompat, 10000)
+    const loadTimer = setTimeout(() => { void enterCompat() }, 10000)
     win.webContents.once('did-finish-load', () => clearTimeout(loadTimer))
     win.webContents.on('render-process-gone', onRendererGone)
     app.on('child-process-gone', onChildGone)
@@ -1038,42 +1127,14 @@ async function openWindow(target: WindowTarget): Promise<WindowCtx> {
   let child: Electron.UtilityProcess | null = null
   let controlPort: Electron.MessagePortMain | null = null
   let relaunchAttempt = 0
-  let quitting = false
-  let windowClosed = false
+  let windowClosed = options.show === false
+  let presentationSuspended = options.show === false
   const stopClient = (): void => {
     try { controlPort?.close() } catch { /* already closed */ }
     controlPort = null
     try { child?.kill() } catch { /* already dead */ }
     child = null
   }
-  // Tear the client utilityProcess down on quit. Spec §7: window close closes
-  // the utilityProcess and leaves the daemon running. Without this kill, the
-  // child outlives the window; combined with the historical darwin skip in
-  // window-all-closed, the red traffic-light left a headless Electron process
-  // in the Dock that required Force Quit.
-  const onBeforeQuit = (): void => {
-    killTunnels()
-    quitting = true
-    stopClient()
-  }
-  app.on('before-quit', onBeforeQuit)
-
-  // Browser panes host <webview> web contents. Route popups (window.open /
-  // target=_blank) to the system browser and refuse in-app popup windows, and
-  // restrict navigation to http/https/about (spec 2026-07-18 §8). Electron 43
-  // removed the renderer <webview> `new-window` event, so this MUST live in the
-  // main process. Non-webview contents (the app window itself) are untouched.
-  app.on('web-contents-created', (_e, contents) => {
-    if (contents.getType() !== 'webview') return
-    contents.setWindowOpenHandler(({ url }) => {
-      if (/^https?:\/\//i.test(url)) void shell.openExternal(url)
-      return { action: 'deny' }
-    })
-    contents.on('will-navigate', (ev, url) => {
-      if (!/^(https?:|about:)/i.test(url)) ev.preventDefault()
-    })
-  })
-
   const notifyRenderer = (data: unknown): void => {
     if (!win.isDestroyed()) win.webContents.send('daemon-event', data)
   }
@@ -1103,14 +1164,14 @@ async function openWindow(target: WindowTarget): Promise<WindowCtx> {
       // (matches the "replace dead ports" intent; nothing will read port1 again).
       port1.close()
       if (child === c) { child = null; controlPort = null }
-      if (!shouldRelaunchClient({ quitting, windowClosed, windowDestroyed: win.isDestroyed() })) return
+      if (!shouldRelaunchClient({ quitting: allowFinalQuit, windowClosed, windowDestroyed: win.isDestroyed() })) return
       // Crash is never silent: flip the renderer to disconnected right away
       // (same shape the daemon uses), even if the window is gone on macOS.
       notifyRenderer({ status: 'disconnected' })
       relaunchAttempt = nextAttempt(relaunchAttempt, Date.now() - spawnedAt, CLIENT_STABLE_MS)
       const delay = backoffDelay(relaunchAttempt, { baseMs: 100, maxMs: 2000 })
       setTimeout(() => {
-        if (!shouldRelaunchClient({ quitting, windowClosed, windowDestroyed: win.isDestroyed() })) return
+        if (!shouldRelaunchClient({ quitting: allowFinalQuit, windowClosed, windowDestroyed: win.isDestroyed() })) return
         wireChild()
         // The renderer's MessagePorts died with the old child. Tell it to
         // re-request pane ports from the NEW child (handled via childEpoch).
@@ -1118,20 +1179,42 @@ async function openWindow(target: WindowTarget): Promise<WindowCtx> {
       }, delay)
     })
   }
-  wireChild()
+  if (options.show !== false) wireChild()
 
   const ctx: WindowCtx = {
     win,
     target,
     controlPort: () => controlPort,
     child: () => child,
+    activeBrowserId: null,
+    activeBrowserExpanded: false,
+    activeWorkspace: null,
+    activeTab: null,
+    browserContextGeneration: 0,
+    resumeClient: () => {
+      if (!presentationSuspended) return
+      presentationSuspended = false
+      windowClosed = false
+      wireChild()
+      notifyRenderer({ childRestart: true })
+    },
   }
   windowCtxs.set(win.webContents.id, ctx)
   const id = win.webContents.id
+  win.on('close', (event) => {
+    if (tabBrowserHostEnabled() && target.kind === 'local' && !allowFinalQuit) {
+      event.preventDefault()
+      presentationSuspended = true
+      windowClosed = true
+      onLocalWindowHidden?.()
+      child?.postMessage({ kind: 'suspend-panes' })
+      stopClient()
+      win.hide()
+    }
+  })
   win.on('closed', () => {
     windowClosed = true
     windowCtxs.delete(id)
-    app.off('before-quit', onBeforeQuit)
     stopClient()
   })
   return ctx
@@ -1139,6 +1222,24 @@ async function openWindow(target: WindowTarget): Promise<WindowCtx> {
 
 async function main(): Promise<void> {
   if (!await preflightLinuxInputMethod()) return
+
+  const launch = activationRequest(process.argv)
+  if (tabBrowserHostEnabled()) {
+    if (launch.mode === 'normal') await clearBrowserHostInhibit(stateRoot())
+    if (app.isPackaged) {
+      try {
+        await registerBrowserHostLauncher(stateRoot(), {
+          platform: process.platform,
+          executable: process.execPath,
+          appImage: process.env['APPIMAGE'],
+          installGeneration: `${app.getVersion()}:${process.versions.electron}`,
+          uid: process.getuid?.(),
+        })
+      } catch (error) {
+        console.error('browser host launcher registration failed', error)
+      }
+    }
+  }
 
   const socket = resolveSocketPath(process.env, process.platform)
   const ensureDeps: EnsureDeps = {
@@ -1152,8 +1253,265 @@ async function main(): Promise<void> {
   }
   await ensureDaemon(socket, ensureDeps)
 
-  const ctx = await openWindow({ kind: 'local' })
+  const ctx = await openWindow({ kind: 'local' }, { show: launch.mode !== 'browser-host' })
   const win = ctx.win
+  // Layout-v2 writes stay behind the deployed-reader barrier from the approved
+  // rollout plan. Source compatibility alone is insufficient: an older
+  // `amber web` process could otherwise rewrite or misread the sidecar.
+  const tabBrowserSupported = tabBrowserHostEnabled()
+  let tabBrowser: TabBrowserService | null = null
+  let tabBrowserStateStore: TabBrowserStateStore | null = null
+  const browserOperations = new BrowserOperationRegistry()
+  const rendererBrowserOperation = <T>(kind: 'association' | 'workspace-import' | 'recovery', work: (signal: AbortSignal) => Promise<T>): Promise<T | { ok: false; error: string }> =>
+    browserOperations.run(kind, work).catch((error) => ({ ok: false, error: error instanceof Error ? error.message : 'INTERNAL_ERROR' }))
+  if (tabBrowserSupported) {
+    try {
+      tabBrowserStateStore = new TabBrowserStateStore(stateRoot())
+      await coordinateTabBrowserMigration(layoutPath(), tabBrowserStateStore)
+      tabBrowser = await TabBrowserService.create(stateRoot(), win, tabBrowserStateStore, browserOperations)
+      onLocalWindowHidden = () => tabBrowser?.windowHidden()
+      tabBrowser.setApprovalSurface(
+        (id) => hasExactApprovalSurface([...windowCtxs.values()].map((context) => ({ local: context.target.kind === 'local', destroyed: context.win.isDestroyed(), visible: context.win.isVisible(), browserId: context.activeBrowserId, expanded: context.activeBrowserExpanded })), id),
+        (id) => {
+          void (async () => {
+            const loaded = await loadLayoutFile(layoutPath()); if (!loaded.text) return
+            const layout = parseLayout(loaded.text)
+            for (const [ws, workspace] of Object.entries(layout.workspaces)) for (const [tab, tabLayout] of Object.entries(workspace.tabs)) {
+              if (tabLayout.browser?.id !== id) continue
+              await reopenLocalWindow?.()
+              const context = [...windowCtxs.values()].find((candidate) => candidate.target.kind === 'local' && !candidate.win.isDestroyed())
+              if (!context) return
+              context.win.show(); context.win.focus()
+              context.win.webContents.send('tab-browser-event', { type: 'approval-reveal', browserId: id, workspace: Number(ws), tab: Number(tab), browser: { ...tabLayout.browser, collapsed: false } })
+              return
+            }
+          })().catch(() => {})
+        },
+      )
+      tabBrowser.setEventSink((event) => {
+        for (const context of windowCtxs.values()) if (context.target.kind === 'local' && !context.win.isDestroyed()) context.win.webContents.send('tab-browser-event', event)
+      })
+    } catch (error) {
+      console.error('tab browser migration failed; browser host remains unavailable', error)
+    }
+  }
+  const rollbackOpenedBrowser = async (workspaceNumber: number, tabNumber: number, id: string): Promise<void> => {
+    if (!tabBrowserStateStore) throw new Error('BROWSER_HOST_UNAVAILABLE')
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const loaded = await loadLayoutFile(layoutPath())
+      if (!loaded.text) return
+      const current = parseLayout(loaded.text); const workspace = current.workspaces[String(workspaceNumber)]; const tab = workspace?.tabs[String(tabNumber)]
+      if (!workspace || tab?.browser?.id !== id) return
+      const cleanTab = { ...tab }; delete cleanTab.browser
+      const next = { ...current, browserRevision: (current.browserRevision ?? 0) + 1, workspaces: { ...current.workspaces, [workspaceNumber]: { ...workspace, tabs: { ...workspace.tabs, [tabNumber]: cleanTab } } } }
+      const saved = await commitBrowserLayoutMutation(layoutPath(), tabBrowserStateStore, serializeLayout(next), loaded.version)
+      if ('ok' in saved) return
+    }
+    throw new Error('LAYOUT_CONFLICT')
+  }
+
+  reopenLocalWindow = createSingleFlight(async (): Promise<void> => {
+    // Re-check after this caller wins the single flight. A window may have
+    // registered while an earlier activation was awaiting openWindow().
+    if (explicitQuitInProgress || allowFinalQuit) return
+    const existing = [...windowCtxs.values()].find((candidate) => candidate.target.kind === 'local' && !candidate.win.isDestroyed())
+    if (existing) { existing.resumeClient(); existing.win.show(); existing.win.focus(); return }
+    const reopened = await openWindow({ kind: 'local' })
+    // Quit can begin while BrowserWindow creation/load is in flight. Do not
+    // attach BrowserHost pages to a window after the drain has destroyed them;
+    // dispose this just-created presentation instead.
+    if (explicitQuitInProgress || allowFinalQuit) { reopened.win.destroy(); return }
+    tabBrowser?.setWindow(reopened.win)
+    reopened.win.show(); reopened.win.focus()
+  })
+
+  let tabBrowserBroker: TabBrowserBrokerServer | null = null
+  let browserDaemonWatcher: BrowserDaemonWatcher | null = null
+  if (tabBrowser) {
+    browserDaemonWatcher = new BrowserDaemonWatcher(new Connection(socket))
+    browserDaemonWatcher.start()
+    if (!(await browserDaemonWatcher.waitForFresh(5_000))) throw new Error('DAEMON_STATE_STALE')
+    const currentBrokerLayout = async (request: BrokerRequest): Promise<ReturnType<typeof parseLayout>> => {
+      const loaded = await loadLayoutFile(layoutPath())
+      const current = loaded.text ? parseLayout(loaded.text) : null
+      if (!current) throw new Error('NO_BROWSER_FOR_TAB')
+      if (current.readOnly) throw new Error('UNSUPPORTED_LAYOUT_VERSION')
+      const location = /^amber-(\d+)-(\d+)-/.exec(request.amberSession)
+      const associatedBrowser = location ? current.workspaces[location[1]!]?.tabs[location[2]!]?.browser : undefined
+      const associatedId = associatedBrowser?.designatedPi === request.amberSession ? associatedBrowser.id : undefined
+      const controller = browserDaemonWatcher?.controller(request.amberSession)
+      if (!controller) { if (associatedId) tabBrowser.revokePi(associatedId); throw new Error('DAEMON_STATE_STALE') }
+      if (!isEligiblePiController(controller)) { if (associatedId) tabBrowser.revokePi(associatedId); throw new Error('NOT_DESIGNATED_CONTROLLER') }
+      try { authorizeBrowserRequest(current, request.amberSession, request.action.type === 'open') }
+      catch (error) { if (associatedId) tabBrowser.revokePi(associatedId); throw error }
+      return current
+    }
+    const handleBrokerInner = async (request: BrokerRequest, signal: AbortSignal): Promise<unknown> => {
+      browserOperations.assertDispatch(signal)
+      const current = await currentBrokerLayout(request)
+      browserOperations.assertDispatch(signal)
+      if (request.action.type === 'open') {
+        const location = authorizeBrowserRequest(current, request.amberSession, true)
+        if (!location.browserId) {
+          const stillOpenTarget = async (): Promise<boolean> => {
+            const latestController = browserDaemonWatcher?.controller(request.amberSession)
+            if (!isEligiblePiController(latestController)) return false
+            const latest = await loadLayoutFile(layoutPath())
+            if (!latest.text) return false
+            try {
+              const candidate = authorizeBrowserRequest(parseLayout(latest.text), request.amberSession, true)
+              return candidate.ws === location.ws && candidate.tab === location.tab && !candidate.browserId
+            } catch { return false }
+          }
+          const opened = await tabBrowser.command({ type: 'open' }, signal, stillOpenTarget)
+          if (!('id' in opened)) throw new Error('INTERNAL_ERROR')
+          const latestLoaded = await loadLayoutFile(layoutPath())
+          if (!latestLoaded.text || !(await stillOpenTarget())) { await tabBrowser.destroyForAssociation(opened.id).catch(() => {}); throw new Error('STALE_BROWSER_CONTEXT') }
+          const latestCurrent = parseLayout(latestLoaded.text)
+          const workspace = latestCurrent.workspaces[String(location.ws)]!
+          const previous = workspace.tabs[String(location.tab)]!
+          const browser = { id: opened.id, width: 420, collapsed: false }
+          const next = { ...latestCurrent, version: 2, browserRevision: (latestCurrent.browserRevision ?? 0) + 1,
+            workspaces: { ...latestCurrent.workspaces, [location.ws]: { ...workspace, tabs: { ...workspace.tabs, [location.tab]: { ...previous, browser } } } } }
+          browserOperations.assertDispatch(signal)
+          const saved = tabBrowserStateStore
+            ? await commitBrowserLayoutMutation(layoutPath(), tabBrowserStateStore, serializeLayout(next), latestLoaded.version)
+            : { error: 'BROWSER_HOST_UNAVAILABLE' as const }
+          if (!('ok' in saved)) {
+            // The record was persisted before the association CAS. Roll it
+            // back immediately so a conflict cannot accumulate unreachable
+            // live renderers for every retry.
+            await tabBrowser.destroyForAssociation(opened.id).catch(() => {})
+            throw new Error('LAYOUT_CONFLICT')
+          }
+          const stillAssociatedToController = async (): Promise<boolean> => {
+            const latestController = browserDaemonWatcher?.controller(request.amberSession)
+            if (!isEligiblePiController(latestController)) return false
+            const latest = await loadLayoutFile(layoutPath())
+            if (!latest.text) return false
+            const candidate = parseLayout(latest.text).workspaces[String(location.ws)]?.tabs[String(location.tab)]?.browser
+            return candidate?.id === opened.id
+          }
+          if (!(await stillAssociatedToController())) {
+            try { await rollbackOpenedBrowser(location.ws, location.tab, opened.id) }
+            finally { await tabBrowser.destroyForAssociation(opened.id).catch(() => {}) }
+            throw new Error('STALE_BROWSER_CONTEXT')
+          }
+          await reopenLocalWindow?.()
+          for (const candidate of windowCtxs.values()) if (candidate.target.kind === 'local' && !candidate.win.isDestroyed()) {
+            candidate.win.webContents.send('tab-browser-association', { ws: location.ws, tab: location.tab, browser })
+          }
+          return { code: 'CREATION_AWAITING_USER', browserId: opened.id }
+        }
+        return tabBrowser.command({ type: 'status', id: location.browserId })
+      }
+      const authorized = authorizeBrowserRequest(current, request.amberSession)
+      const id = authorized.browserId!
+      const stillAuthorized = async (): Promise<boolean> => {
+        let valid = false
+        const latestController = browserDaemonWatcher?.controller(request.amberSession)
+        if (isEligiblePiController(latestController)) {
+          const latest = await loadLayoutFile(layoutPath())
+          if (latest.text) try { valid = authorizeBrowserRequest(parseLayout(latest.text), request.amberSession).browserId === id } catch { valid = false }
+        }
+        if (!valid) tabBrowser.revokePi(id)
+        return valid
+      }
+      return dispatchAttachedBrokerAction(request.action, id, signal, stillAuthorized,
+        (command, actionSignal, validate) => tabBrowser.command(command.type === 'automation' ? { ...command, broker: { requestId: request.requestId, controller: request.amberSession } } : command.type === 'navigate' || command.type === 'stop' ? { ...command, broker: { requestId: request.requestId, controller: request.amberSession } } : command, actionSignal, validate))
+    }
+    const handleBroker = (request: BrokerRequest, signal: AbortSignal): Promise<unknown> =>
+      browserOperations.run('broker', (ownedSignal) => handleBrokerInner(request, ownedSignal), signal)
+    const socketPath = browserHostSocketPath(process.env, process.platform, process.getuid?.() ?? -1, tmpdir())
+    tabBrowserBroker = new TabBrowserBrokerServer(socketPath, join(stateRoot(), 'browser-host-token'), handleBroker, {
+      authorizeReplay: async (request) => { try { await currentBrokerLayout(request); return true } catch { return false } },
+      // Serialize by the authorized browser, or by its tab while the one
+      // first-use solicitation has no browser id yet. Request ids are replay
+      // keys only; they must never decide mutation ordering.
+      queueKey: async (request) => {
+        const current = await currentBrokerLayout(request)
+        const location = authorizeBrowserRequest(current, request.amberSession, request.action.type === 'open')
+        return location.browserId ? `browser:${location.browserId}` : `tab:${location.ws}:${location.tab}`
+      },
+      operations: browserOperations,
+    })
+    await tabBrowserBroker.start()
+  }
+
+  requestExplicitQuit = async (): Promise<void> => {
+    if (allowFinalQuit || explicitQuitInProgress) return
+    explicitQuitInProgress = true
+    // Fence before any confirmation or drain await. A probe/readiness callback
+    // that was already in flight may still resume, but it can only clean up,
+    // never register a child behind finalization.
+    fenceTunnelOpens()
+    const hostAvailable = tabBrowserHostEnabled() && tabBrowser !== null
+    const work = tabBrowser?.pendingWork()
+    if (work && work.total > 0) {
+      const choice = await dialog.showMessageBox({
+        type: 'warning', buttons: ['Cancel', 'Quit anyway'], defaultId: 0, cancelId: 0,
+        title: 'Quit Amber IDE?', message: 'Browser work is still active.',
+        detail: `${work.operations} browser operation(s), ${work.piActions} Pi action(s), ${work.approvals} approval(s), ${work.dialogs} dialog(s), and ${work.pageLoads} page load(s) will be cancelled. The amber daemon and terminal sessions will keep running.`,
+      })
+      if (choice.response !== 1) { explicitQuitInProgress = false; cancelTunnelOpenFence(); return }
+    }
+    const result = await coordinateBrowserHostQuit({
+      hostAvailable,
+      ...(hostAvailable ? { writeInhibit: () => writeBrowserHostInhibit(stateRoot()) } : {}),
+      beginDrain: () => tabBrowser?.beginDrain(),
+      flushAndDestroy: (signal) => tabBrowser?.flushAndDestroy(signal) ?? Promise.resolve(),
+      closeBroker: () => tabBrowserBroker?.close() ?? Promise.resolve(),
+      closeWatcher: () => { browserDaemonWatcher?.close(); browserDaemonWatcher = null },
+      cleanupTunnels: killTunnels,
+      closeWindows: async () => {
+        residentTray?.destroy(); residentTray = null
+        // `app.quit()` will synchronously enter before-quit. Tunnel cleanup has
+        // already been awaited by the platform-independent coordinator.
+        allowFinalQuit = true
+        app.quit()
+      },
+    })
+    if (result.ok) return
+    const failure = await dialog.showMessageBox({
+      type: 'error', buttons: ['Cancel quit', 'Force quit'], defaultId: 0, cancelId: 0,
+      title: 'Browser state could not be saved', message: result.error === 'QUIT_DRAIN_TIMEOUT' ? 'Amber timed out while saving browser state.' : 'Amber could not save browser state.',
+      detail: 'Force quit may lose the latest browser association or restore metadata. The amber daemon and terminal sessions will not be stopped.',
+    })
+    if (failure.response === 0) {
+      tabBrowser?.cancelDrain()
+      if (hostAvailable) await clearBrowserHostInhibit(stateRoot()).catch(() => {})
+      cancelTunnelOpenFence()
+      explicitQuitInProgress = false
+      return
+    }
+    await tabBrowserBroker?.close().catch(() => {})
+    browserDaemonWatcher?.close(); browserDaemonWatcher = null
+    residentTray?.destroy(); residentTray = null
+    // app.exit() bypasses Electron's before-quit event. Force quit therefore
+    // must await the same bounded, idempotent tunnel cleanup explicitly; a
+    // fire-and-forget kill would leave ssh and its runtime socket behind.
+    await killTunnels()
+    allowFinalQuit = true
+    app.exit(1)
+  }
+
+  residentIntents.install({ activate: async () => { await reopenLocalWindow?.() }, quit: async () => { await requestExplicitQuit?.() } })
+  await residentIntents.consume()
+
+  if (tabBrowserSupported && process.platform === 'linux' && !residentTray) {
+    try {
+      const packagedIcon = join(process.resourcesPath, 'icon.png')
+      const devIcon = join(__dirname, '../../build/icon.png')
+      residentTray = new Tray(nativeImage.createFromPath(existsSync(packagedIcon) ? packagedIcon : devIcon))
+      residentTray.setToolTip('Amber IDE — browser host running')
+      residentTray.setContextMenu(Menu.buildFromTemplate([
+        { label: 'Open Amber IDE', click: () => { void reopenLocalWindow?.() } },
+        { type: 'separator' },
+        { label: 'Quit Amber IDE', click: () => { void requestExplicitQuit?.() } },
+      ]))
+      residentTray.on('click', () => { void reopenLocalWindow?.() })
+    } catch (error) { console.error('could not create browser-host tray', error) }
+  }
 
   // These three are the only per-WINDOW handlers: each window has its own
   // client process (a remote window's talks through an ssh tunnel), so they
@@ -1184,6 +1542,197 @@ async function main(): Promise<void> {
   ipcMain.on('close-pane', (e, session: string) => {
     ctxFor(e)?.child()?.postMessage({ kind: 'pane-close', session })
   })
+
+  ipcMain.handle('browser:recovery', (e, raw: unknown) => rendererBrowserOperation('recovery', async (signal) => {
+    browserOperations.assertDispatch(signal)
+    const sender = ctxFor(e)
+    if (!tabBrowser || !tabBrowserStateStore || sender?.target.kind !== 'local') return { ok: false, error: 'BROWSER_HOST_UNAVAILABLE' }
+    try {
+      if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) throw new Error('INVALID_REQUEST')
+      const request = raw as Record<string, unknown>
+      if (request['action'] === 'list' && Object.keys(request).length === 1) return { ok: true, result: tabBrowser.recoveryItems() }
+      if (typeof request['id'] !== 'string' || !isRecoveryId(request['id'])) throw new Error('INVALID_REQUEST')
+      const recoveryId = request['id']
+      const item = tabBrowser.recoveryItems().find((candidate) => candidate.id === recoveryId)
+      if (!item) throw new Error('NO_RECOVERY_ITEM')
+      if (request['action'] === 'copy' && Object.keys(request).length === 2) {
+        clipboard.writeText(item.safeRestoreUrl); return { ok: true }
+      }
+      if (request['action'] === 'delete' && Object.keys(request).length === 2) {
+        await tabBrowser.deleteRecovery(recoveryId); return { ok: true }
+      }
+      if (request['action'] !== 'attach' || Object.keys(request).length !== 2) throw new Error('INVALID_REQUEST')
+      const loaded = await loadLayoutFile(layoutPath())
+      if (!loaded.text) throw new Error('NO_BROWSER_FOR_TAB')
+      if (sender.activeWorkspace === null || sender.activeTab === null) throw new Error('NO_ACTIVE_TAB')
+      const current = parseLayout(loaded.text); const wsKey = String(sender.activeWorkspace); const workspace = current.workspaces[wsKey]
+      const tabKey = String(sender.activeTab); const previous = workspace?.tabs[tabKey]
+      if (!workspace || !previous || previous.browser) throw new Error(previous?.browser ? 'BROWSER_ALREADY_ATTACHED' : 'NO_BROWSER_FOR_TAB')
+      const id = createBrowserId(); const browser = { id, width: 420, collapsed: false }
+      const next = { ...current, version: 2, browserRevision: (current.browserRevision ?? 0) + 1,
+        workspaces: { ...current.workspaces, [wsKey]: { ...workspace, tabs: { ...workspace.tabs, [tabKey]: { ...previous, browser } } } } }
+      browserOperations.assertDispatch(signal)
+      const saved = await commitBrowserLayoutMutation(layoutPath(), tabBrowserStateStore, serializeLayout(next), loaded.version, undefined, undefined, (state) => {
+        const recovery = state.migrationRecovery.find((candidate) => candidate.id === recoveryId)
+        if (!recovery) throw new Error('NO_RECOVERY_ITEM')
+        const without = { ...state, migrationRecovery: state.migrationRecovery.filter((candidate) => candidate.id !== recoveryId) }
+        return stageWorkspaceBrowserState(without, { entries: [{ id, browser: { mode: 'browse', safeRestoreUrl: recovery.safeRestoreUrl } }], recovery: [] })
+      })
+      if (!('ok' in saved)) throw new Error('error' in saved ? saved.error : 'LAYOUT_CONFLICT')
+      await tabBrowser.attachRecoveryCommitted(recoveryId, id)
+      sender.activeBrowserId = id; sender.win.webContents.send('tab-browser-association', { ws: sender.activeWorkspace, tab: sender.activeTab, browser })
+      return { ok: true }
+    } catch (error) { return { ok: false, error: error instanceof Error ? error.message : 'INTERNAL_ERROR' } }
+  }))
+
+  ipcMain.handle('browser:workspace-snapshot', async (e) => {
+    const sender = ctxFor(e)
+    if (!tabBrowser || sender?.target.kind !== 'local') return { ok: false, error: 'BROWSER_HOST_UNAVAILABLE' }
+    try {
+      return { ok: true, result: tabBrowser.workspaceSnapshot() }
+    } catch (error) { return { ok: false, error: error instanceof Error ? error.message : 'INTERNAL_ERROR' } }
+  })
+
+  ipcMain.handle('browser:import-workspace', (e, raw: unknown) => rendererBrowserOperation('workspace-import', async (signal) => {
+    browserOperations.assertDispatch(signal)
+    const sender = ctxFor(e)
+    if (sender?.target.kind !== 'local') return { ok: false, error: 'BROWSER_HOST_UNAVAILABLE' }
+    try {
+      if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) throw new Error('INVALID_REQUEST')
+      const request = raw as Record<string, unknown>
+      if (Object.keys(request).length !== 2 || !Object.hasOwn(request, 'mode') || !Object.hasOwn(request, 'text') || (request['mode'] !== 'new' && request['mode'] !== 'replace') || typeof request['text'] !== 'string') throw new Error('INVALID_REQUEST')
+      if (sender.activeWorkspace === null || sender.activeTab === null) throw new Error('NO_ACTIVE_TAB')
+      const doc = parseWorkspaceFile(request['text'])
+      const loaded = await loadLayoutFile(layoutPath())
+      const current = loaded.text ? parseLayout(loaded.text) : emptyLayout()
+      const state = tabBrowserStateStore ? await tabBrowserStateStore.load() : null
+      const prepared = prepareWorkspaceImport({ current, browserState: state, doc, mode: request['mode'], activeWorkspace: sender.activeWorkspace, mintId: () => randomUUID().replaceAll('-', '') })
+      browserOperations.assertDispatch(signal)
+      const committed = await commitPreparedWorkspaceImport({ prepared, layoutPath: layoutPath(), expectedLayoutVersion: loaded.version, browserStore: tabBrowserStateStore, browserHost: tabBrowser })
+      setWindowContextFromLayout(sender, prepared.next)
+      return { ok: true, layout: serializeLayout(prepared.next), version: committed.version, plan: prepared.plan }
+    } catch (error) { return { ok: false, error: error instanceof Error ? error.message : 'INTERNAL_ERROR' } }
+  }))
+
+  ipcMain.handle('browser:set-context', (e, raw: unknown) => rendererBrowserOperation('association', async (signal) => {
+    browserOperations.assertDispatch(signal)
+    const sender = ctxFor(e)
+    if (sender?.target.kind !== 'local' || !raw || typeof raw !== 'object') return { ok: false, error: 'BROWSER_HOST_UNAVAILABLE' }
+    const request = raw as Record<string, unknown>
+    if (Object.keys(request).length !== 3 || !Object.hasOwn(request, 'workspace') || !Object.hasOwn(request, 'tab') || typeof request['collapsed'] !== 'boolean') return { ok: false, error: 'INVALID_REQUEST' }
+    const loaded = await loadLayoutFile(layoutPath())
+    if (!loaded.text) return { ok: false, error: 'NO_ACTIVE_TAB' }
+    try {
+      const context = resolveBrowserContext(parseLayout(loaded.text), request['workspace'], request['tab'])
+      if (tabBrowser && sender.activeBrowserId && sender.activeBrowserId !== context.browserId) { tabBrowser.surfaceHidden(sender.activeBrowserId); await tabBrowser.command({ type: 'hide', id: sender.activeBrowserId }).catch(() => {}) }
+      browserOperations.assertDispatch(signal)
+      const changed = !sameBrowserContextIdentity(sender, context)
+      sender.activeWorkspace = context.workspace; sender.activeTab = context.tab; sender.activeBrowserId = context.browserId
+      if (changed || request['collapsed']) sender.activeBrowserExpanded = false
+      if (context.browserId && request['collapsed']) tabBrowser?.surfaceHidden(context.browserId)
+      sender.browserContextGeneration += 1
+      return { ok: true, ...context }
+    } catch (error) { return { ok: false, error: error instanceof Error ? error.message : 'INVALID_REQUEST' } }
+  }))
+
+  ipcMain.handle('browser:command', (e, raw: unknown) => rendererBrowserOperation('association', async (signal) => {
+    browserOperations.assertDispatch(signal)
+    const sender = ctxFor(e)
+    if (!tabBrowser || !tabBrowserStateStore || sender?.target.kind !== 'local') return { ok: false, error: 'BROWSER_HOST_UNAVAILABLE' }
+    try {
+      const parsed = parseTabBrowserCommand(raw)
+      if (parsed.type === 'open' || parsed.type === 'close' || parsed.type === 'share' || parsed.type === 'designate') {
+        const loaded = await loadLayoutFile(layoutPath())
+        if (!loaded.text) throw new Error('NO_BROWSER_FOR_TAB')
+        const current = parseLayout(loaded.text)
+        if (sender.activeWorkspace === null || sender.activeTab === null) throw new Error('NO_ACTIVE_TAB')
+        const wsKey = String(sender.activeWorkspace)
+        const workspace = current.workspaces[wsKey]
+        const tabKey = String(sender.activeTab)
+        const previous = workspace?.tabs[tabKey]
+        if (!workspace || !previous) throw new Error('NO_BROWSER_FOR_TAB')
+        const expectedContext = { ...captureBrowserContext(sender), browserId: previous.browser?.id ?? null }
+        const contextMatches = (): boolean => browserContextMatches(sender, expectedContext)
+        const stillAssociated = async (expectedBrowserId: string | null): Promise<boolean> => {
+          if (!contextMatches()) return false
+          const latest = await loadLayoutFile(layoutPath())
+          if (!latest.text) return false
+          return (parseLayout(latest.text).workspaces[String(expectedContext.workspace)]?.tabs[String(expectedContext.tab)]?.browser?.id ?? null) === expectedBrowserId
+        }
+        let workingLoaded = loaded; let workingCurrent = current; let workingWorkspace = workspace; let workingPrevious = previous
+        let openedId: string | null = null
+        let browser = previous.browser
+        if (parsed.type === 'open') {
+          if (browser) return { ok: true, result: await tabBrowser.command({ type: 'status', id: browser.id }) }
+          const opened = await tabBrowser.command({ type: 'open' }, undefined, () => stillAssociated(null))
+          if (!('id' in opened)) throw new Error('INTERNAL_ERROR')
+          openedId = opened.id
+          if (!(await stillAssociated(null))) { await tabBrowser.destroyForAssociation(opened.id).catch(() => {}); throw new Error('STALE_BROWSER_CONTEXT') }
+          workingLoaded = await loadLayoutFile(layoutPath())
+          if (!workingLoaded.text) { await tabBrowser.destroyForAssociation(opened.id).catch(() => {}); throw new Error('STALE_BROWSER_CONTEXT') }
+          workingCurrent = parseLayout(workingLoaded.text)
+          workingWorkspace = workingCurrent.workspaces[wsKey]!
+          workingPrevious = workingWorkspace.tabs[tabKey]!
+          browser = { id: opened.id, width: 420, collapsed: false }
+        } else {
+          if (!browser) throw new Error('NO_BROWSER_FOR_TAB')
+          if (parsed.type === 'close') browser = undefined
+          else if (parsed.type === 'share') {
+            if (parsed.sharedWithPi && !browser.designatedPi) throw new Error('NOT_DESIGNATED_CONTROLLER')
+            browser = { ...browser, sharedWithPi: parsed.sharedWithPi }
+          }
+          else {
+            if (parsed.designatedPi) {
+              const match = /^amber-(\d+)-(\d+)-/.exec(parsed.designatedPi)
+              const controller = browserDaemonWatcher?.controller(parsed.designatedPi)
+              if (!match || Number(match[1]) !== sender.activeWorkspace || Number(match[2]) !== sender.activeTab || !isEligiblePiController(controller)) throw new Error('NOT_DESIGNATED_CONTROLLER')
+            }
+            const { designatedPi: _old, sharedWithPi: _shared, ...base } = browser
+            browser = parsed.designatedPi ? { ...base, designatedPi: parsed.designatedPi, sharedWithPi: false } : { ...base, sharedWithPi: false }
+          }
+        }
+        const nextTab = { ...workingPrevious, ...(browser ? { browser } : {}) }
+        if (!browser) delete nextTab.browser
+        const next = { ...workingCurrent, version: 2, browserRevision: (workingCurrent.browserRevision ?? 0) + 1,
+          workspaces: { ...workingCurrent.workspaces, [wsKey]: { ...workingWorkspace, tabs: { ...workingWorkspace.tabs, [tabKey]: nextTab } } } }
+        browserOperations.assertDispatch(signal)
+        const saved = await commitBrowserLayoutMutation(layoutPath(), tabBrowserStateStore, serializeLayout(next), workingLoaded.version)
+        if (!('ok' in saved)) {
+          if (openedId) await tabBrowser.destroyForAssociation(openedId).catch(() => {})
+          throw new Error('error' in saved ? saved.error : 'LAYOUT_CONFLICT')
+        }
+        if (openedId && !contextMatches()) {
+          try { await rollbackOpenedBrowser(expectedContext.workspace, expectedContext.tab, openedId) }
+          finally { await tabBrowser.destroyForAssociation(openedId).catch(() => {}) }
+          throw new Error('STALE_BROWSER_CONTEXT')
+        }
+        if (previous.browser && (parsed.type === 'close' || parsed.type === 'designate' || (parsed.type === 'share' && !parsed.sharedWithPi))) tabBrowser.revokePi(previous.browser.id)
+        if (parsed.type === 'close' && previous.browser) await tabBrowser.destroyForAssociation(previous.browser.id)
+        setBrowserForCurrentContext(sender, expectedContext, browser?.id ?? null)
+        sender.win.webContents.send('tab-browser-association', { ws: expectedContext.workspace, tab: expectedContext.tab, ...(browser ? { browser } : {}) })
+        return { ok: true, result: parsed.type === 'close' ? { closed: true } : browser ? await tabBrowser.command({ type: 'status', id: browser.id }) : { closed: true } }
+      }
+      const loaded = await loadLayoutFile(layoutPath())
+      if (!loaded.text || sender.activeWorkspace === null || sender.activeTab === null) throw new Error('NO_ACTIVE_TAB')
+      const activeBrowser = parseLayout(loaded.text).workspaces[String(sender.activeWorkspace)]?.tabs[String(sender.activeTab)]?.browser
+      const associated = activeBrowser?.id ?? null
+      if (associated !== sender.activeBrowserId) throw new Error('STALE_BROWSER_CONTEXT')
+      if (parsed.type === 'stopPi' && activeBrowser?.designatedPi) tabBrowserBroker?.cancelController(activeBrowser.designatedPi)
+      const command = bindRendererBrowserCommand(sender.activeBrowserId, parsed)
+      const expected = captureBrowserContext(sender)
+      if ((command.type === 'hide' || command.type === 'show') && expected.browserId) { sender.activeBrowserExpanded = approvalSurfaceDuringPresentationCommand(sender.activeBrowserExpanded, command.type); if (command.type === 'hide') tabBrowser.surfaceHidden(expected.browserId) }
+      const stillAssociated = async (): Promise<boolean> => {
+        if (!browserContextMatches(sender, expected)) return false
+        const latest = await loadLayoutFile(layoutPath())
+        return !!latest.text && parseLayout(latest.text).workspaces[String(expected.workspace)]?.tabs[String(expected.tab)]?.browser?.id === expected.browserId
+      }
+      const result = await tabBrowser.command(command, signal, stillAssociated)
+      if (command.type === 'show' && browserContextMatches(sender, expected) && expected.browserId) sender.activeBrowserExpanded = true
+      return { ok: true, result }
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : 'INTERNAL_ERROR' }
+    }
+  }))
 
   // Resolve a terminal selection to an EXISTING absolute path so the pane's
   // floating "Open" button only shows for real files/dirs. Relative selections
@@ -1251,6 +1800,16 @@ async function main(): Promise<void> {
     return stdout.trim()
   })
 
+  const readBoundedLog = async (path: string): Promise<string> => {
+    try {
+      const owner = process.getuid?.()
+      const text = await readSafeTextFile(path, { maxBytes: 4 * 1024 * 1024, ...(owner === undefined ? {} : { owner }) })
+      return text ?? 'no log available: file not found'
+    } catch (error) {
+      return `no log available: ${error instanceof Error ? error.message : String(error)}`
+    }
+  }
+
   ipcMain.handle('web:logTail', async (): Promise<string> => {
     if (process.platform === 'linux') {
       const { stdout, stderr } = await runCapture('journalctl', [
@@ -1264,11 +1823,7 @@ async function main(): Promise<void> {
       return stdout || stderr
     }
     // launchd has no journal — the agent writes StandardErrorPath here.
-    try {
-      return await readFile(join(homedir(), 'Library', 'Logs', 'amber-web.log'), 'utf8')
-    } catch (e) {
-      return `no log available: ${String(e)}`
-    }
+    return readBoundedLog(join(homedir(), 'Library', 'Logs', 'amber-web.log'))
   })
 
   ipcMain.handle('web:openLocal', async () => {
@@ -1375,11 +1930,7 @@ async function main(): Promise<void> {
       ])
       return stdout || stderr
     }
-    try {
-      return await readFile(join(homedir(), 'Library', 'Logs', 'amber-router.log'), 'utf8')
-    } catch (e) {
-      return `no log available: ${String(e)}`
-    }
+    return readBoundedLog(join(homedir(), 'Library', 'Logs', 'amber-router.log'))
   })
 
   ipcMain.handle('pick-folder', async () => {
@@ -1399,16 +1950,30 @@ async function main(): Promise<void> {
   ipcMain.handle('layout-load', async (e) => {
     const ctx = ctxFor(e)
     if (ctx?.target.kind === 'remote' && ctx.target.host !== undefined) {
-      const probe = await sshProbe(ctx.target.host, REMOTE_LAYOUT_PROBE)
+      const probe = await runSshProbe(ctx.target.host, REMOTE_LAYOUT_PROBE, sshEnv(), {
+        maxBytes: REMOTE_LAYOUT_PROBE_MAX_BYTES,
+      })
       // A missing or unreadable sidecar is not an error: grouping comes from
       // session names (rule #2), so the window still shows the right panes at
       // default geometry — the same fallback core rule #3 already requires.
-      return { text: probe.out.length > 0 ? probe.out : null, version: null }
+      // Overflow/timeout is different: never hand a partial layout to the
+      // renderer, and surface a stable error instead of treating truncation as
+      // an ordinary missing sidecar.
+      if (probe.error) return { text: null, version: null, error: probe.error }
+      return { text: probe.code === 0 && probe.out.length > 0 ? probe.out : null, version: null }
     }
     return loadLayoutFile(layoutPath())
   })
   ipcMain.handle('layout-save', async (e, text: string, version: string | null) => {
     if (ctxFor(e)?.target.kind === 'remote') return { ok: true, version: null }
+    if (typeof text !== 'string' || layoutUtf8ByteLength(text, LAYOUT_FILE_MAX_BYTES) > LAYOUT_FILE_MAX_BYTES) return { error: 'LAYOUT_FILE_LIMIT' }
+    const current = await loadLayoutFile(layoutPath())
+    if (current.error) return { error: current.error }
+    if (current.text && parseLayout(current.text).readOnly) return { error: 'layout belongs to a newer Amber version' }
+    const currentLayout = current.text ? parseLayout(current.text) : null
+    const nextLayout = parseLayout(text)
+    if (nextLayout.readOnly) return { error: 'layout belongs to a newer Amber version' }
+    if (browserAuthorityChanged(currentLayout ?? emptyLayout(), nextLayout)) return { error: 'browser association is main-owned' }
     return saveLayoutFile(layoutPath(), text, version)
   })
 
@@ -1468,7 +2033,7 @@ async function main(): Promise<void> {
     const notification = new Notification({ title: raw['title'].slice(0, 80), body: raw['body'].slice(0, 240) })
     notification.on('click', () => {
       if (ctx.win.isDestroyed()) return
-      ctx.win.show(); ctx.win.focus()
+      ctx.resumeClient(); ctx.win.show(); ctx.win.focus()
       if (session) ctx.win.webContents.send('notification-activate', session)
     })
     notification.show()
@@ -1477,6 +2042,8 @@ async function main(): Promise<void> {
   // Portable workspace file: native save dialog + atomic write (layout-save
   // precedent). Returns true on write, false on cancel.
   ipcMain.handle('workspace-save-file', async (_e, json: string, suggestedName: string) => {
+    if (typeof json !== 'string') throw new Error('WORKSPACE_REQUEST_INVALID')
+    assertWorkspaceFileBytes(json)
     const r = await dialog.showSaveDialog(win, {
       defaultPath: suggestedName,
       filters: [{ name: 'amber workspace', extensions: ['amberws'] }],
@@ -1485,8 +2052,8 @@ async function main(): Promise<void> {
     // showSaveDialog does not reliably append the filter extension on Linux —
     // add it so the open filter finds the file later.
     const p = r.filePath.endsWith('.amberws') ? r.filePath : r.filePath + '.amberws'
-    const tmp = p + '.tmp'
-    await writeFile(tmp, json)
+    const tmp = `${p}.${process.pid}.${randomUUID()}.tmp`
+    await writeFile(tmp, json, { mode: 0o600 })
     await rename(tmp, p)
     return true
   })
@@ -1497,7 +2064,10 @@ async function main(): Promise<void> {
       filters: [{ name: 'amber workspace', extensions: ['amberws'] }, { name: 'All files', extensions: ['*'] }],
     })
     if (r.canceled || r.filePaths.length === 0 || !r.filePaths[0]) return null
-    return readFile(r.filePaths[0], 'utf8')
+    const selected = r.filePaths[0]
+    const text = await readBoundedTextFile(selected, WORKSPACE_FILE_MAX_BYTES, 'WORKSPACE_FILE_LIMIT')
+    assertWorkspaceFileBytes(text)
+    return text
   })
 
   // ---- editor pane file IO (spec §4). Thin wrappers; the guards, the atomic
@@ -1544,21 +2114,41 @@ async function main(): Promise<void> {
     inlineImages(String(mdDir), String(html)))
 }
 
-// Single-instance lock: a second launch (or a dev run whose predecessor didn't
-// fully exit) would open a second window + utilityProcess attaching the same
-// daemon sessions — duplicate subscriptions that read as "input sent twice".
-// Refuse to run a duplicate; the first instance keeps ownership.
-if (!app.requestSingleInstanceLock()) {
-  app.quit()
+app.on('before-quit', (event) => {
+  // The finalizer also covers host-disabled Linux and Windows: those paths skip
+  // browser state/inhibit work but still await remote tunnel cleanup before
+  // allowing Electron to exit. Startup failure has no handler or tunnel yet.
+  if (!allowFinalQuit && requestExplicitQuit) {
+    event.preventDefault()
+    void requestExplicitQuit()
+    return
+  }
+  // The startup failure path sets allowFinalQuit before app.quit. There are no
+  // remote opens before main installs the handler, but retain a best-effort
+  // cleanup backstop for that path.
+  void killTunnels()
+})
+
+// Single-instance lock: a second launch sends only a bounded, versioned
+// activation envelope. The resident owner validates it before showing a local
+// window; arbitrary argv never reaches a shell or a replacement window.
+const launchActivation = activationRequest(process.argv)
+if (!app.requestSingleInstanceLock(launchActivation)) {
+  quitDuringStartup()
 } else {
+  app.on('second-instance', (_event, _argv, _cwd, additionalData) => {
+    if (parseActivationRequest(additionalData) !== null) residentIntents.requestActivation()
+  })
+  app.on('activate', () => { residentIntents.requestActivation() })
   app.whenReady().then(main).catch((e) => {
     console.error(e)
-    app.quit()
+    quitDuringStartup()
   })
 }
-// Single-window app: red traffic-light / window close must quit the process on
-// every platform, including macOS. The common Electron pattern of keeping the
-// app alive with zero windows on darwin left amber-ide headless in the Dock
-// (no activate handler recreates a window) until Force Quit. Spec §6/§7: window
-// close never stops the daemon, but it DOES exit the GUI.
-app.on('window-all-closed', () => { app.quit() })
+// Without the browser host, preserve the existing close-means-exit behavior.
+// With it, the local window's close handler hides presentation and drains pane
+// subscriptions while the metadata watcher and BrowserHost remain resident;
+// second-instance/activate reopens that same window.
+app.on('window-all-closed', () => {
+  if (!tabBrowserHostEnabled()) app.quit()
+})

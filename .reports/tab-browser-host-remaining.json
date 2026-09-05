@@ -1,0 +1,185 @@
+{
+  "schemaVersion": 1,
+  "feature": "tab-browser-host",
+  "branch": "feat/tab-browser-host",
+  "mergeReady": false,
+  "localIntegrationAuthorizedByUser": true,
+  "integrationReport": ".reports/tab-browser-host-merge.md",
+  "integrationNote": "User approved local integration with feature disabled by default despite external acceptance gates. See integrationReport for combined-main tests and final artifact; mergeReady still describes full product acceptance, not Git integration authority.",
+  "currentAcceptanceReport": ".reports/tab-browser-host-direct-final.md",
+  "testedProductionCommit": "e53905ea886c01cbaa11ad794eae52ea69ce0f66",
+  "persistentWorktree": "/home/poyto/worktrees/amber-ide/tab-browser-host",
+  "finalReviewMode": "parent-direct at user request; interrupted parallel review is not claimed",
+  "historicalEvidenceNotice": "Older work descriptions and /tmp references below are historical. The currentAcceptanceReport records fresh durable evidence, 1026 app tests, 821 Rust tests, and the final AppImage hash.",
+  "completedInReviewFixWave": [
+    "cross-process layout CAS lock shared by Node and Rust writers",
+    "unknown future layout versions are read-only and cannot be overwritten",
+    "journaled/idempotent legacy browser migration with stale-coordinate handling and recovery parsing",
+    "serialized BrowserHost commands and durable state writes",
+    "user navigation/loading/title/crash lifecycle projection from WebContents",
+    "strict renderer command parsing and bounded native-view geometry",
+    "visible renderer capacity protection and single-visible-view enforcement",
+    "bounded broker frames/connections/queue/global in-flight work/deadlines",
+    "broker disconnect and timeout cancellation reaches navigation stop",
+    "fresh full daemon session list polling before Pi authorization",
+    "hidden resident window drains all PTY pane subscriptions while keeping metadata control",
+    "functional rail collapse and exact native page-slot geometry",
+    "workspace browser URLs are scheme-validated and secret-redacted on parse/save/load planning",
+    "Pi controller authorization rejects dead and shell-fallback sessions",
+    "WebContents pages use the persisted profile partition descriptor",
+    "startup failures quit through an early-final path before resident handlers exist",
+    "legacy migration creates a private fsynced timestamped v1 backup before state/layout writes",
+    "future transaction layouts and oversized workspace/layout ingestion fail closed without rewrite",
+    "broker timeouts, cancellation, close, and drain release queued work behind a bounded adapter barrier",
+    "migration recovery overflow is preserved and rejected before migration writes",
+    "broker requests are registered before asynchronous queue-key admission and abort on socket close, Stop Pi, or drain without dispatching later",
+    "Node CAS rereads and remote SSH layout probes enforce the shared 8 MiB byte bound, bounded stderr/timeout handling, and no partial remote layout",
+    "Rust mosaic and layout CAS share a bounded regular-file loader with symlink/TOCTOU checks, graph/string containment, and cached polling fallback",
+    "timed-out browser adapter work is quarantined after a bounded FIFO barrier, with page destruction, generation tombstones, and late-event suppression",
+    "Node state, workspace, layout, productivity, editor, transcript, token, and broker ingress reads use bounded regular-file identity checks with fatal UTF-8 decoding",
+    "Node and Rust layout locks use PID start identity plus owner tokens, reclaim only demonstrably dead owners, and release only unchanged records",
+    "per-operation browser FIFO ownership keeps cancelled followers from releasing predecessors or quarantining the wrong incarnation",
+    "startup compatibility markers and browser-host token files use bounded regular-file no-follow reads with fatal UTF-8 and strict token validation",
+    "Node and Rust layout locks publish complete fsynced owner records through cross-language exclusive hard links, with safe legacy recovery",
+    "the generated Pi broker uses a fatal UTF-8 decoder for every JSON frame and rejects invalid token bytes before socket transmission",
+    "independent review remediation gives browser queue barriers explicit cooperative/isolated/poisoned terminal states, aborts distinct queue owners on hide/close/revoke/quit, and bounds quarantine failure without overlap",
+    "independent review remediation makes Node/Rust legacy layout-lock parsing duplicate-safe for pid/start/token/created with reordered-field and cross-language parity coverage",
+    "packaged Linux renderer catches synchronous WebGL2-unavailable addon failure and falls back to xterm DOM rendering",
+    "browser automation uses the CDP Accessibility backendNodeId parameter and preserves DOM target identity",
+    "Electron input callbacks advance browser generation uniformly for CDP, physical, pointer, and composing input; partial dispatched actions return bounded no-rollback context",
+    "approval/dialog resolution preserves the acknowledged visible browser surface",
+    "persisted Pi designation waits for the first complete daemon session list",
+    "Electron main applies private userData/sessionData paths before the single-instance lock"
+  ],
+  "remaining": [
+    {
+      "id": "P1-main-association-authority",
+      "severity": "important",
+      "status": "completed",
+      "work": "Move open/close/share/designation/geometry ownership fully behind a sender-derived main WindowCtx association API; renderer commands must not carry trusted browser ids and renderer layout edits must not be the authorization source."
+    },
+    {
+      "id": "P1-two-store-all-mutations",
+      "severity": "important",
+      "status": "completed",
+      "work": "Generalize the migration journal to every browser association mutation (user open/close, broker creation, workspace import/replacement, recovery attach/delete), including rollback/replay and orphan GC grace."
+    },
+    {
+      "id": "P1-dedicated-daemon-watcher",
+      "severity": "important",
+      "status": "completed",
+      "work": "Replace the temporary 2-second ListSessionsDetailed refresh through the window utility client with a dedicated metadata-only main watcher and tested reconnect/full-list epoch barrier."
+    },
+    {
+      "id": "P1-broker-replay-and-mutation-queues",
+      "severity": "important",
+      "status": "completed",
+      "work": "Add clientInstanceId/sequence high-water replay semantics, payload-digest duplicate handling, per-browser FIFO mutation queues, observation ordering, cancellation ownership, and bounded result cache."
+    },
+    {
+      "id": "P1-capacity-activation-queue",
+      "severity": "important",
+      "status": "completed",
+      "work": "Implement the approved global FIFO activation queue (8 entries/10 seconds), operation/approval protection, cancellation, and capacity-wait UI instead of immediate busy-only behavior."
+    },
+    {
+      "id": "P1-pi-tools-and-approvals",
+      "severity": "important",
+      "status": "completed",
+      "work": "Phase A and Phase B are implemented and independently accepted. Reviewer run 44ad20dd-20fa-48a6-a244-d964d09a11a1 reported no issues and a PASS merge verdict after verifying exact collapse/show/hide/reveal authority, identity- and owner-bound dialogs, bounded last-action retention, pointer confinement, conservative classification and dual-target digests, replay tombstones, approval lifecycle, and strict Pi tool schemas. Generated Pi extension v7 still passes exact production-loader checks. External package/platform gates remain separate blockers, so mergeReady stays false."
+    },
+    {
+      "id": "P1-workspace-contract",
+      "severity": "important",
+      "status": "completed",
+      "work": "Implement .amberws v2 rail save/load/import/recovery and destructive replace transactions; remove all transitional legacy browser-pane branches only after round-trip tests pass."
+    },
+    {
+      "id": "P1-resident-launcher-quit",
+      "severity": "important",
+      "status": "completed",
+      "currentEvidence": "Direct production-wiring review, 52 focused tests, full app/Rust gates and fresh packaged real MenuItem callback Quit prove exit 0, tunnel death/socket removal/inhibit. Physical menu gesture remains GATE-packaging-platforms. See currentAcceptanceReport; historical pre-reboot work record follows.",
+      "work": "Implementation and the resident P1/P2 remediation are complete; this pass fixes all six accepted resident-lifecycle findings: cached broker replies cross the drain barrier, daemon watcher callbacks carry socket epochs, capacity rollback cannot resurrect a closed/crashed victim, recovery records use stable IDs rather than array indexes, stable AppImage replacement uses one atomic pathname swap with a retained rollback artifact, and Windows enable rejects before mutating state. The additional admission fence covers selected victims that close or crash during async validation, and a later open/thaw cannot resurrect them. Quit flushing now carries the quit AbortSignal and a drain generation, so timeout cancellation fences late freeze/destroy work while a later quit can start cleanly. Recovery attach/delete mutations run through one serialized queue and reconcile committed state idempotently, eliminating stale-index/NO_RECOVERY_ITEM races. Independent re-review was PASS WITH FIXES; the three follow-up P2 findings are now closed, and the latest queue/lock review is independently PASS with no blocking findings. One BrowserOperationRegistry now owns commands, broker work (including accepted FIFO entries before dispatch), association/recovery/import transactions, cancellation, warning counts, and the quit empty barrier; post-commit cleanup uses explicit completion paths so drain cannot strand a committed association. Broker readiness waits for a fresh full daemon watcher epoch. Invalid browser-host token files fail closed; valid token rotation is crash-safe, private, fsynced, and bounded. Runtime fallback paths are UID-specific and Node/Rust/Pi validate private directories, regular private tokens, and owned socket endpoints before secrets cross them. Launcher registration now requires current-user ownership metadata, canonical safe executable/bundle ancestry, fixed argv, and fsynced atomic state; stable AppImage replacement keeps and restores the prior artifact until registration succeeds. A startup intent latch preserves activation and Quit requests until handlers exist. Pi extension v7 exercises first-tool cold-start ensure and one retry through the production loader. The production code under test is `c5b87c8`; the documentation/report baseline is `e856624`. Follow-up validation has 1003 app tests pass with one intentional skip; Rust 821 tests pass with one intentional ignore; strict typecheck, Electron/web builds, warnings-as-errors clippy, and all 27 Pi tools pass. A c5-built private Amber binary passed the Pi v7 verifier; the older packaged AppImage evidence is retained only as platform/substrate evidence, not attributed to c5. Historical package approval evidence is `logs/broker-approval-packaged-final.log` under the private validation root; its Xvfb/XTest substrate is not physical-hardware evidence. Follow-up focused tests cover early startup quit, future pending transactions, v1 backup failure/order, broker timeout/queue release, hostile bounded files, and recovery overflow. External macOS and deployed-reader gates remain open; isolated packaged Linux evidence now passes, and mergeReady remains false."
+    },
+    {
+      "id": "P1-rail-product-states",
+      "severity": "important",
+      "status": "completed",
+      "work": "Implementation, six-finding remediation, and independent re-review are complete with a PASS. The accepted rail has parser-compatible immediate Stop cancellation, frozen/crashed show-thaw recovery into a new incarnation, bounded SPA/history projection, centralized Preview/Browse policy, one 200..4096 viewport contract, and one rail-width contract spanning CSS/pointer/keyboard/ARIA/reclamp/persistence. External deployment/platform gates remain separate, so mergeReady remains false."
+    },
+    {
+      "id": "P1-browser-queue-ownership",
+      "severity": "important",
+      "status": "completed",
+      "work": "Each per-browser queue entry owns its controller, dispatch-start boundary, bound page incarnation, one-shot quarantine, and FIFO tail. A cancelled queued follower waits behind its predecessor without touching the active runtime; timed-out active work is isolated before a later show/thaw can create a fresh incarnation. Review remediation gives the barrier explicit cooperative/isolated/poisoned terminal states, falls back to frozen teardown or fails later work closed when quarantine rejects, and aborts both adapter and queue-owner controllers on hide, association close, Pi revoke, and quit. Focused regressions cover A/B/C ordering, isolation rejection, direct hidden work, close/revoke ownership, late settlement, barrier cleanup, and quit completion."
+    },
+    {
+      "id": "P1-fixed-control-file-ingress",
+      "severity": "important",
+      "status": "completed",
+      "work": "Electron startup markers, browser-host tokens, the Rust browser-host readiness probe, launcher metadata, and the generated Pi extension use bounded regular-file/no-follow reads where local, fatal UTF-8, strict token grammar, stable errors, and no allocation/transmission from invalid or oversized token files. FIFOs, symlinks, oversize, and invalid bytes are covered."
+    },
+    {
+      "id": "P1-layout-lock-publication-recovery",
+      "severity": "important",
+      "status": "completed",
+      "work": "Node and Rust prepare and fsync complete lock records, publish them with same-directory exclusive hard links, and clean up only after publication. Valid dead owners and identifiable dead legacy partial records are reclaimed by PID/start identity; live, unknown, or unidentifiable legacy records fail closed, and release compares record/text/metadata before unlinking successors. Review remediation rejects duplicate (including identical) pid/start/token/created fields, invalid/oversized/non-canonical values, and unknown fields in both parsers while preserving unique reordered legacy records; live-then-dead duplicate recovery tests prove ambiguous records are never reclaimed."
+    },
+    {
+      "id": "P1-pi-fatal-broker-frames",
+      "severity": "important",
+      "status": "completed",
+      "work": "The installed Amber Pi extension decodes broker JSON with TextDecoder({fatal:true}) before JSON.parse, closes on malformed UTF-8, and keeps binary images on the separate base64 path. Production-loader verification exercises invalid UTF-8 frames plus invalid/oversized token files and confirms no token is sent."
+    },
+    {
+      "id": "P2-pi-partial-failure-verifier",
+      "severity": "important",
+      "status": "completed",
+      "work": "The production-loader Pi verifier parses the structured partial-dispatch result and asserts exact retryable:false, current pageIncarnation/generation, snapshotHint:true, dispatched:true, stable ACTION_FAILED_NO_ROLLBACK code and fresh-snapshot nextStep, with no secret leakage."
+    },
+    {
+      "id": "P2-queued-generation-input-races",
+      "severity": "important",
+      "status": "completed",
+      "work": "Service coverage proves a queued interaction is rejected before adapter dispatch when its expected generation becomes stale. Host coverage exercises drag, type, and fill while every simulated Electron input callback advances generation monotonically without false stale failures."
+    },
+    {
+      "id": "P2-validation-metadata-consistency",
+      "severity": "important",
+      "status": "completed",
+      "work": "Validation metadata records CODE_HEAD/CODE_TESTED_COMMIT c5b87c8 separately from REPORT_HEAD/REPORT_BASE_COMMIT e856624 and records current follow-up verifier/test evidence under the same private root; mergeReady remains false for external gates."
+    },
+    {
+      "id": "P1-resident-review-follow-up",
+      "severity": "important",
+      "status": "completed",
+      "currentEvidence": "User stopped subagents; parent directly reviewed final pending-tunnel/finalizer wiring and reran 52 focused plus full automated gates. The newly discovered approval resize race was fixed TDD in e53905e and verified twice against a fresh package. This replaces the pending independent re-review requirement under the user's direct-execution instruction, without claiming a new independent review.",
+      "work": "Resident PASS WITH FIXES follow-up is implemented across a19b97f, 1d97984, 4c50e55, 2fe2fcc, 06a4add, 4ed8b8a, and 667ba48: tracked and pending remote tunnels register before awaits, a quit fence rejects late opens, window close/quit share one bounded cleanup-once promise, deferred/rejected openWindow paths clean children and runtime directories, host-disabled Linux/Windows Quit skips inhibit/POSIX UID work while awaiting tunnels, and readiness clears every listener/timer with capped post-ready stderr draining. Exact production code is 4ed8b8a0910efc0d5e84550b84440038af60c4c6; 667ba48ef0b12d85c8f63e2700c98a2697d9394d adds the final readiness-error test. Independent resident re-review remains required, so this P1 is not promoted. Current exact packaged artifact is `/tmp/amber-tab-browser-validation/resident-review-followup-20260905-final/amber-ide-0.0.2.AppImage` with SHA-256 `fc6ffed4bf9ad291afa6c89bb96d62b1bc2abe6ae709e10071a6279470ff9d82`; later report commits are docs-only. Explicit packaged menu Quit remains unproven because bare Xvfb lacks a driveable window-manager menu; mergeReady remains false for deployed-reader, macOS, physical Linux input, Pi 0.85, and Windows gates."
+    },
+    {
+      "id": "P2-resident-process-e2e",
+      "severity": "important",
+      "status": "completed",
+      "work": "Three deterministic private process-level tests pass: a spawned Unix-socket peer proves BrowserDaemonWatcher drops stale authority across disconnect/reconnect epochs; a spawned sidecar writer wins a real CAS conflict without clobbering state and leaves no orphan record; and a spawned transaction writer exits after journaling, then a fresh helper process recovers the target and clears the pending transaction without duplicate browser records."
+    },
+    {
+      "id": "P2-resident-readiness-cleanup",
+      "severity": "important",
+      "status": "completed",
+      "work": "waitForSshTunnelReady owns its interval, timeout, process listeners, and stderr listener; success, exit, spawn error, timeout, listener removal, fixed 64 KiB stderr retention, and post-terminal stream draining are covered by focused tests."
+    },
+    {
+      "id": "GATE-deployed-reader",
+      "severity": "blocking-gate",
+      "status": "open",
+      "work": "CHANNEL_INCOMPLETE. Read-only origin preflight found v0.0.2 contains the v2 reader but publishes only Windows assets; v0.0.1 has Linux/macOS assets without the reader. No Linux/macOS v2-reader artifact is available through the actual channel. AMBER_TAB_BROWSER_V2_READER_DEPLOYED=1 was used only in private validation processes and must not be set in production until a reader-carrying Linux/macOS release is published."
+    },
+    {
+      "id": "GATE-packaging-platforms",
+      "severity": "blocking-gate",
+      "status": "open",
+      "currentEvidence": "Fresh persistent AppImage at /home/poyto/recovery/amber-ide/live-535b362/amber-ide.AppImage hash 8d5728f7f615644d49a63f4fed046cd3919ae983a4e1931b121621b10e33f71c passes static-resource, private hostile-page/broker/visible-approval/revocation/resident and real Quit MenuItem callback/SSH cleanup checks. Physical menu/IBus remains unclaimed. Mac briefly answered SSH true then two preflight attempts timed out. Pi0.81 verifier passes; Pi0.85 missing pi-server and Windows native execution remain open. Historical pre-reboot record follows.",
+      "work": "Linux packaged gate passed in a disposable `/tmp` root: current AppImage hash/evidence, executable static-musl amber and amber-router, no unintended browser executable, hardened WebContentsView hostile fixture, popup/permission/external-scheme denial, semantic observation/screenshot, interaction, visible approval, resident close/reopen/second-instance, and fake-SSH remote-window close cleanup were exercised against private daemon/profile/state. Explicit packaged menu Quit was attempted but not claimed because bare Xvfb lacked a driveable window-manager menu; XTest input is only a substrate and real hardware/IBus evidence remains unclaimed. macOS native-view/focus/IME/accessibility/lifecycle/profile/package gate is blocked by the configured Mac being unreachable. Windows remains unavailable on this host; mergeReady remains false."
+    }
+  ]
+}

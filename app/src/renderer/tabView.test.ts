@@ -129,22 +129,6 @@ describe('deriveTab', () => {
   })
 })
 
-// Cross-tab move of a BROWSER pane: its grouping lives only in the sidecar entry
-// (id kept), so the source tab must drop the leaf purely from reconcile — the
-// per-tab liveIds no longer list it — and the target tab must gain it.
-describe('browser pane cross-tab move', () => {
-  const bid = 'browser-1-1-0-abc'
-  const stored = { kind: 'split', dir: 'h', ratio: 0.5, a: { kind: 'leaf', paneId: 'amber-1-1-0-x' }, b: { kind: 'leaf', paneId: bid } } as never
-  it('source tab prunes the moved browser leaf', () => {
-    const { tree } = deriveTab([pane({ name: 'amber-1-1-0-x' })], stored, {}, {}, '/home/u')
-    expect(leaves(tree!)).toEqual(['amber-1-1-0-x'])
-  })
-  it('target tab gains it', () => {
-    const { tree } = deriveTab([pane({ name: bid, kind: 'browser' })], null, {}, {}, '/home/u')
-    expect(leaves(tree!)).toEqual([bid])
-  })
-})
-
 // The pane header leads with the `amber ls` index so the user can jump to it
 // with `amber attach <n>` from any terminal.
 describe('deriveTab slot prefix', () => {

@@ -2,8 +2,17 @@ import { describe, it, expect } from 'vitest'
 import type { Node } from '../renderer/layout'
 import type { LayoutFile } from './layoutFile'
 import type { DaemonSessionKind } from './proto'
+import { mergeBrowserRailTabs } from '../renderer/store'
 
-import { assembleSave as _asm, planLoad as _pl, parseWorkspaceFile as _parse, serializeWorkspaceFile as _ser } from './workspaceFile'
+import { assembleSave as _asm, planLoad as _pl, parseWorkspaceFile as _parse, requireWorkspaceBrowserSnapshots, serializeWorkspaceFile as _ser } from './workspaceFile'
+
+describe('workspace browser snapshot boundary', () => {
+  it('aborts rather than writing a workspace with missing browser intent', () => {
+    expect(() => requireWorkspaceBrowserSnapshots({ ok: false })).toThrow('browser snapshot unavailable')
+    expect(() => requireWorkspaceBrowserSnapshots({ ok: true, result: {} }, ['browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'])).toThrow('browser snapshot incomplete')
+    expect(requireWorkspaceBrowserSnapshots({ ok: true, result: {} })).toEqual({})
+  })
+})
 
 describe('editor panes in .amberws', () => {
   it('save emits an editor pane with its path, no scrollback and no contents', () => {
@@ -52,25 +61,62 @@ describe('editor panes in .amberws', () => {
 })
 
 describe('browser panes in .amberws', () => {
-  it('save emits a browser pane with url, no scrollback', () => {
-    const doc = _asm('one',
-      [{ ws: 1, tabs: [{ tab: 1, panes: [{ name: 'browser-1-1-0-a', cwd: '', kind: 'browser', ord: 0, url: 'https://x.dev' }] }] }],
-      { version: 1, activeWorkspace: 1, workspaces: { '1': { activeTab: 1, tabs: { '1': { tree: { kind: 'leaf', paneId: 'browser-1-1-0-a' } } } } } },
-      {})
-    const pane = doc.workspaces[0]!.tabs[0]!.panes[0]!
-    expect(pane.kind).toBe('browser')
-    expect(pane.url).toBe('https://x.dev')
-    expect(pane.scrollback).toBe('')
+  it('round-trips a browser-only tab through renderer projection, save, parse, and load plan', () => {
+    const id = 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    const sidecar: LayoutFile = { version: 2, activeWorkspace: 3, workspaces: { '3': { activeTab: 7, tabs: { '7': { tree: null, browser: { id, width: 510, collapsed: true } } } } } }
+    const projected = mergeBrowserRailTabs([], sidecar.workspaces)
+    expect(projected).toEqual([{ ws: 3, tabs: [{ tab: 7, panes: [] }] }])
+    const doc = _asm('one', [{ ws: 3, tabs: [{ tab: 7, panes: [], browser: { mode: 'preview', safeRestoreUrl: 'https://example.test/app?secret=x', width: 510, collapsed: true } }] }], sidecar, {})
+    const parsed = _parse(_ser(doc))
+    const plan = _pl(parsed, { mode: 'new', currentWs: 3, liveWs: [3], mintId: () => 'x', mintBrowserId: () => 'browser-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' })
+    expect(plan.workspaces['4']!.tabs['7']!.browser).toEqual({ id: 'browser-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', width: 510, collapsed: true })
+    expect(plan.browserRails[0]!.browser).toMatchObject({ mode: 'preview', safeRestoreUrl: 'https://example.test/app' })
   })
-  it('load routes a browser pane to browsers, not creates', () => {
-    const doc: WorkspaceDoc = { version: 1, scope: 'one', workspaces: [{ tabs: [{ tab: 1, tree: { kind: 'leaf', paneId: 'p0' },
-      panes: [{ id: 'p0', kind: 'browser', cwd: '', ord: 0, scrollback: '', url: 'https://y.dev' }] }] }] }
+  it('rejects the removed live browser-pane save fallback', () => {
+    expect(() => _asm('one',
+      [{ ws: 1, tabs: [{ tab: 1, panes: [{ name: 'browser-1-1-0-a', cwd: '', kind: 'browser', ord: 0 }] }] }],
+      { version: 1, activeWorkspace: 1, workspaces: { '1': { activeTab: 1, tabs: { '1': { tree: { kind: 'leaf', paneId: 'browser-1-1-0-a' } } } } } },
+      {})).toThrow('unsupported live pane kind: browser')
+  })
+  it('rejects workspace browser URL scheme bypasses and strips persisted secrets', () => {
+    const unsafe = JSON.stringify({ version: 1, scope: 'one', workspaces: [{ tabs: [{ tab: 1, tree: { kind: 'leaf', paneId: 'p0' }, panes: [{ id: 'p0', kind: 'browser', cwd: '', ord: 0, scrollback: '', url: 'javascript:alert(1)' }] }] }] })
+    expect(_parse(unsafe).workspaces[0]!.tabs[0]!.browser!.safeRestoreUrl).toBe('about:blank')
+    const secret = JSON.stringify({ version: 1, scope: 'one', workspaces: [{ tabs: [{ tab: 1, tree: { kind: 'leaf', paneId: 'p0' }, panes: [{ id: 'p0', kind: 'browser', cwd: '', ord: 0, scrollback: '', url: 'https://user:pass@example.test/a?q=secret#token' }] }] }] })
+    expect(_parse(secret).workspaces[0]!.tabs[0]!.browser!.safeRestoreUrl).toBe('https://example.test/a')
+  })
+
+  it('migrates v1 browsers to a collision-safe rail and resets sharing/controller', () => {
+    const doc = _parse(JSON.stringify({ version: 1, scope: 'one', workspaces: [{ tabs: [{ tab: 1, tree: { kind: 'leaf', paneId: 'p0' },
+      panes: [{ id: 'p0', kind: 'browser', cwd: '', ord: 0, scrollback: '', url: 'https://y.dev' }] }] }] }))
+    const ids = ['browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'browser-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'] as const
     let n = 0
-    const plan = _pl(doc, { mode: 'new', currentWs: 1, liveWs: [1], mintId: () => `m${n++}` })
+    const plan = _pl(doc, { mode: 'new', currentWs: 1, liveWs: [1], mintId: () => `m${n++}`, mintBrowserId: () => ids[n++ % 2]!, existingBrowserIds: new Set([ids[0]]) })
     expect(plan.creates).toEqual([])
-    const [name, entry] = Object.entries(plan.browsers)[0]!
-    expect(name.startsWith('browser-2-1-0-')).toBe(true)
-    expect(entry).toEqual({ ws: 2, tab: 1, ord: 0, url: 'https://y.dev' })
+    expect(plan.browserRails[0]).toMatchObject({ id: ids[1], ws: 2, tab: 1, rail: { id: ids[1], width: 420, collapsed: false } })
+    expect(plan.workspaces['2']!.tabs['1']!.browser).not.toHaveProperty('sharedWithPi')
+    expect(plan.workspaces['2']!.tabs['1']!.browser).not.toHaveProperty('designatedPi')
+  })
+
+  it('recovers extra v1 browsers and serializes neither recovery nor sharing secrets', () => {
+    const doc = _parse(JSON.stringify({ version: 1, scope: 'one', workspaces: [{ tabs: [{ tab: 1, tree: { kind: 'split', dir: 'h', ratio: 0.5, a: { kind: 'leaf', paneId: 'p0' }, b: { kind: 'leaf', paneId: 'p1' } }, panes: [
+      { id: 'p0', kind: 'browser', cwd: '', ord: 0, scrollback: '', url: 'https://one.test/?secret=x' },
+      { id: 'p1', kind: 'browser', cwd: '', ord: 1, scrollback: '', url: 'https://two.test/#token' },
+    ] }] }] }))
+    expect(doc.workspaces[0]!.tabs[0]!.browser!.safeRestoreUrl).toBe('https://one.test/')
+    expect(doc.workspaces[0]!.tabs[0]!.browserRecovery).toEqual([{ mode: 'browse', safeRestoreUrl: 'https://two.test/' }])
+    const wire = _ser(doc)
+    expect(wire).not.toContain('browserRecovery')
+    expect(wire).not.toContain('sharedWithPi')
+    expect(wire).not.toContain('designatedPi')
+  })
+
+  it('rejects v2 browser panes, duplicate placeholders, unknown tree leaves, and invalid browser geometry', () => {
+    const base = { version: 2, scope: 'one', workspaces: [{ tabs: [{ tab: 1, tree: null, panes: [] }] }] }
+    expect(() => _parse(JSON.stringify({ ...base, workspaces: [{ tabs: [{ tab: 1, tree: null, panes: [{ id: 'p0', kind: 'browser', cwd: '', ord: 0, scrollback: '' }] }] }] }))).toThrow(/tab-owned/)
+    const pane = { id: 'p0', kind: 'shell', cwd: '', ord: 0, scrollback: '' }
+    expect(() => _parse(JSON.stringify({ ...base, workspaces: [{ tabs: [{ tab: 1, tree: null, panes: [pane, pane] }] }] }))).toThrow(/duplicate/)
+    expect(() => _parse(JSON.stringify({ ...base, workspaces: [{ tabs: [{ tab: 1, tree: { kind: 'leaf', paneId: 'gone' }, panes: [] }] }] }))).toThrow(/unknown placeholder/)
+    expect(() => _parse(JSON.stringify({ ...base, workspaces: [{ tabs: [{ tab: 1, tree: null, panes: [], browser: { mode: 'browse', safeRestoreUrl: 'https://x.test', viewport: { width: 1, height: 600 } } }] }] }))).toThrow(/viewport/)
   })
 })
 
@@ -83,7 +129,7 @@ describe('Pi panes in .amberws', () => {
     expect(plan.creates).toEqual([{ name: 'amber-2-1-0-pi-id', cwd: '/work', kind: 'pi' }])
     const kind: DaemonSessionKind = plan.creates[0]!.kind
     expect(kind).toBe('pi')
-    expect(plan.browsers).toEqual({})
+    expect(plan.browserRails).toEqual([])
     expect(plan.editors).toEqual({})
   })
 
@@ -94,6 +140,10 @@ describe('Pi panes in .amberws', () => {
   })
 })
 import {
+  WORKSPACE_FILE_MAX_BYTES,
+  WORKSPACE_MAX_PANES_PER_TAB,
+  WORKSPACE_MAX_TREE_DEPTH,
+  WORKSPACE_SCROLLBACK_MAX_CHARS,
   WORKSPACE_VERSION,
   parseWorkspaceFile,
   serializeWorkspaceFile,
@@ -176,6 +226,19 @@ describe('parse validation', () => {
   it('throws when a tree is a malformed Node', () => {
     const doc = { version: 1, scope: 'one', workspaces: [{ tabs: [{ tab: 1, tree: { kind: 'bogus' }, panes: [] }] }] }
     expect(() => parseWorkspaceFile(JSON.stringify(doc))).toThrow()
+  })
+  it('rejects bounded hostile files before planning or base64 decode', () => {
+    expect(() => parseWorkspaceFile('x'.repeat(WORKSPACE_FILE_MAX_BYTES + 1))).toThrow('WORKSPACE_FILE_LIMIT')
+    const pane = { id: 'p', kind: 'shell', cwd: '', ord: 0, scrollback: '' }
+    const tooWide = { version: 1, scope: 'one', workspaces: [{ tabs: [{ tab: 1, tree: null, panes: Array.from({ length: WORKSPACE_MAX_PANES_PER_TAB + 1 }, (_, i) => ({ ...pane, id: `p${i}` })) }] }] }
+    expect(() => parseWorkspaceFile(JSON.stringify(tooWide))).toThrow('WORKSPACE_PANE_LIMIT')
+    const tooDeep: Record<string, unknown> = { kind: 'leaf', paneId: 'p' }
+    let node: Record<string, unknown> = tooDeep
+    for (let i = 0; i < WORKSPACE_MAX_TREE_DEPTH + 1; i++) node = { kind: 'split', dir: 'h', ratio: 0.5, a: node, b: { kind: 'leaf', paneId: 'q' } }
+    const deep = { version: 1, scope: 'one', workspaces: [{ tabs: [{ tab: 1, tree: node, panes: [] }] }] }
+    expect(() => parseWorkspaceFile(JSON.stringify(deep))).toThrow('WORKSPACE_TREE_LIMIT')
+    const longDump = { version: 1, scope: 'one', workspaces: [{ tabs: [{ tab: 1, tree: null, panes: [{ ...pane, scrollback: 'A'.repeat(WORKSPACE_SCROLLBACK_MAX_CHARS + 4) }] }] }] }
+    expect(() => parseWorkspaceFile(JSON.stringify(longDump))).toThrow('WORKSPACE_SCROLLBACK_LIMIT')
   })
 })
 
@@ -357,16 +420,20 @@ describe('buildLoadPlan', () => {
     expect(Array.from(plan.scrollback['amber-7-1-0-id0']!)).toEqual([1, 2, 3])
   })
 
-  it('carries daemon titles into create plans and app-local title maps', () => {
+  it('carries daemon/editor titles alongside an independent tab browser rail', () => {
     const doc: WorkspaceDoc = {
-      version: 1, scope: 'one', workspaces: [{ tabs: [{ tab: 1, tree: null, panes: [
+      version: 2, scope: 'one', workspaces: [{ tabs: [{ tab: 1, tree: null,
+        browser: { mode: 'browse', safeRestoreUrl: 'https://example.com/' }, panes: [
         { id: 'p0', kind: 'shell', cwd: '/a', ord: 0, title: 'Build', scrollback: '' },
-        { id: 'p1', kind: 'browser', cwd: '', ord: 1, title: 'Docs', url: 'https://example.com', scrollback: '' },
+        { id: 'p1', kind: 'editor', cwd: '', ord: 1, title: 'Docs', path: '/docs.md', scrollback: '' },
       ] }] }],
     }
     const plan = buildLoadPlan(doc, { mode: 'new', nextWs: 4, mintId: mkMint() })
     expect(plan.creates[0]!.title).toBe('Build')
     expect(Object.values(plan.titles)).toEqual(['Docs'])
+    expect(Object.keys(plan.editors)).toEqual(Object.keys(plan.titles))
+    expect(plan.browserRails).toHaveLength(1)
+    expect(plan.browserRails[0]!.browser.safeRestoreUrl).toBe('https://example.com/')
   })
 
   it('reuses the target ws for mode replace', () => {

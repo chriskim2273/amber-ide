@@ -44,6 +44,12 @@ describe('readEditorFile', () => {
     expect(await readEditorFile(p)).toEqual({ error: 'too large' })
   })
 
+  it('rejects invalid UTF-8 instead of replacing bytes', async () => {
+    const p = join(dir, 'invalid.txt')
+    await writeFile(p, Buffer.from([0x63, 0xc3, 0x28]))
+    expect(await readEditorFile(p)).toEqual({ error: 'invalid UTF-8' })
+  })
+
   it('rejects a binary file (NUL in the first 8 KiB)', async () => {
     const p = join(dir, 'bin')
     await writeFile(p, Buffer.concat([Buffer.alloc(100, 0x61), Buffer.from([0]), Buffer.alloc(100, 0x61)]))

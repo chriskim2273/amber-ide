@@ -283,6 +283,16 @@ describe('proto', () => {
     expect(d.next()).toEqual(f)
   })
 
+  it('rejects invalid UTF-8 in control and session-name ingress', () => {
+    const control = new Uint8Array([0, 0, 0, 2, 0, 0xc3])
+    const controlDecoder = new Decoder(); controlDecoder.feed(control)
+    expect(() => controlDecoder.next()).toThrow()
+
+    const data = new Uint8Array([0, 0, 0, 4, 1, 0, 1, 0xff])
+    const dataDecoder = new Decoder(); dataDecoder.feed(data)
+    expect(() => dataDecoder.next()).toThrow()
+  })
+
   it('rejects an oversized length prefix', () => {
     const d = new Decoder()
     const bad = new Uint8Array(5)

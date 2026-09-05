@@ -86,6 +86,20 @@ describe('Router', () => {
     expect(port.posted).toEqual([])
   })
 
+  it('detachAll drains every pane subscription while leaving the control client usable', () => {
+    const conn = new FakeConn()
+    const router = new Router(conn)
+    const a = new FakePort(); const b = new FakePort()
+    router.attach('a', a); router.attach('b', b); conn.sent.length = 0
+    router.detachAll()
+    expect(a.closed).toBe(true); expect(b.closed).toBe(true)
+    expect(conn.sent).toEqual([
+      { type: 'control', msg: { kind: 'Detach', name: 'a' } },
+      { type: 'control', msg: { kind: 'Detach', name: 'b' } },
+    ])
+    expect(router.attachedCount()).toBe(0)
+  })
+
   it('a detached session is not re-Attached on reconnect', () => {
     // reattachAll() fired for every name the router had ever seen. A closed
     // pane's name draws `Error: no such session` from the daemon, which the app

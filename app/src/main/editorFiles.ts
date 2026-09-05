@@ -1,8 +1,10 @@
 // Editor-pane file IO. All disk access for editor panes lives in main (spec §4);
 // the renderer only ever holds paths and text. Pure Node — no Electron imports —
 // so every guard here is unit-tested against a temp dir.
-import { readFile, writeFile, rename, mkdir, stat, unlink } from 'node:fs/promises'
+import { writeFile, rename, mkdir, stat, unlink } from 'node:fs/promises'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
+import { TextDecoder } from 'node:util'
+import { readSafeFileBytes, readSafeTextFile, SafeFileReadError } from './safeFileReader'
 
 const MAX_BYTES = 8 * 1024 * 1024 // spec §4 size cap
 const SNIFF_BYTES = 8 * 1024 // NUL sniff window
@@ -30,13 +32,18 @@ async function atomicWrite(p: string, text: string): Promise<void> {
 export async function readEditorFile(path: string): Promise<ReadResult> {
   if (!isAbsolute(path)) return { error: 'path must be absolute' }
   try {
-    const st = await stat(path)
-    if (!st.isFile()) return { error: 'not a regular file' }
-    if (st.size > MAX_BYTES) return { error: 'too large' } // gate before reading
-    const buf = await readFile(path)
+    const buf = await readSafeFileBytes(path, { maxBytes: MAX_BYTES })
+    if (buf === null) return { error: 'file not found' }
     if (buf.subarray(0, SNIFF_BYTES).includes(0)) return { error: 'binary file' }
-    return { text: buf.toString('utf8'), mtimeMs: (await stat(path)).mtimeMs }
+    let text: string
+    try { text = new TextDecoder('utf-8', { fatal: true }).decode(buf) }
+    catch { return { error: 'invalid UTF-8' } }
+    return { text, mtimeMs: (await stat(path)).mtimeMs }
   } catch (e) {
+    if (e instanceof SafeFileReadError) {
+      if (e.code === 'FILE_TOO_LARGE') return { error: 'too large' }
+      if (e.code === 'NOT_REGULAR' || e.code === 'SYMLINK') return { error: 'not a regular file' }
+    }
     return { error: msg(e) }
   }
 }
@@ -96,7 +103,10 @@ export async function writeDraft(draftsDir: string, paneId: string, text: string
 export async function readDraft(draftsDir: string, paneId: string): Promise<string | null> {
   const p = draftPath(draftsDir, paneId)
   if (!p) return null
-  try { return await readFile(p, 'utf8') } catch { return null }
+  try {
+    const owner = process.getuid?.()
+    return await readSafeTextFile(p, { maxBytes: MAX_BYTES, ...(owner === undefined ? {} : { owner }) })
+  } catch { return null }
 }
 
 export async function clearDraft(draftsDir: string, paneId: string): Promise<void> {
@@ -155,9 +165,9 @@ async function imageDataUri(mdDir: string, src: string): Promise<string | null> 
   if (!mime) return null
   const abs = absolute ? src : resolve(mdDir, src)
   try {
-    const st = await stat(abs)
-    if (!st.isFile() || st.size > MAX_IMG_BYTES) return null
-    return `data:${mime};base64,${(await readFile(abs)).toString('base64')}`
+    const bytes = await readSafeFileBytes(abs, { maxBytes: MAX_IMG_BYTES })
+    if (bytes === null) return null
+    return `data:${mime};base64,${bytes.toString('base64')}`
   } catch {
     return null
   }

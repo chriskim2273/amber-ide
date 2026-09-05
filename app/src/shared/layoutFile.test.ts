@@ -1,5 +1,19 @@
 import { describe, it, expect } from 'vitest'
-import { emptyLayout, normalizeFriendlyTitle, parseLayout, pruneLocalTitles, serializeLayout, orderTabs, moveTab, pushRecent, mergeLayout, LAYOUT_VERSION, type LayoutFile } from './layoutFile'
+import { emptyLayout, normalizeFriendlyTitle, parseLayout, pruneLocalTitles, serializeLayout, orderTabs, moveTab, pushRecent, mergeLayout, LAYOUT_FILE_MAX_BYTES, LAYOUT_MAX_MAP_ENTRIES, LAYOUT_MAX_TREE_DEPTH, LAYOUT_VERSION, type LayoutFile } from './layoutFile'
+
+describe('layout v2 tab browser compatibility', () => {
+  it('reads tab browser metadata without reintroducing browser leaves', () => {
+    const parsed = parseLayout(JSON.stringify({
+      version: 2, activeWorkspace: 1, browserRevision: 4,
+      workspaces: { '1': { activeTab: 1, tabs: { '1': { tree: null, browser: { id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', width: 420, collapsed: false } } } } },
+    }))
+    expect(parsed.version).toBe(2)
+    expect(parsed.browserRevision).toBe(4)
+    expect(parsed.workspaces['1']!.tabs['1']!.browser?.id).toBe('browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')
+    const clamped = parseLayout(JSON.stringify({ version: 2, activeWorkspace: 1, workspaces: { '1': { activeTab: 1, tabs: { '1': { tree: null, browser: { id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', width: 1200, collapsed: false } } } } } }))
+    expect(clamped.workspaces['1']!.tabs['1']!.browser?.width).toBe(900)
+  })
+})
 
 describe('layout editors map', () => {
   it('round-trips valid entries (incl. all optional fields)', () => {
@@ -59,6 +73,14 @@ describe('layout recentFiles', () => {
   })
 })
 
+describe('layout version safety', () => {
+  it('marks unknown future layouts read-only and never serializes the marker', () => {
+    const parsed = parseLayout(JSON.stringify({ version: 99, activeWorkspace: 7, workspaces: { secret: {} } }))
+    expect(parsed.readOnly).toBe(true)
+    expect(JSON.parse(serializeLayout(parsed))).not.toHaveProperty('readOnly')
+  })
+})
+
 describe('pushRecent', () => {
   it('puts the path first', () => {
     expect(pushRecent(['/a', '/b'], '/c')).toEqual(['/c', '/a', '/b'])
@@ -114,10 +136,11 @@ describe('layout friendly titles', () => {
 })
 
 describe('layout browsers map', () => {
-  it('round-trips valid entries', () => {
-    const l: LayoutFile = { version: 1, activeWorkspace: 1, workspaces: {},
-      browsers: { 'browser-1-1-0-a': { ws: 1, tab: 1, ord: 0, url: 'https://x.dev' } } }
-    expect(parseLayout(serializeLayout(l)).browsers).toEqual(l.browsers)
+  it('decodes v1 entries but never writes them back', () => {
+    const text = JSON.stringify({ version: 1, activeWorkspace: 1, workspaces: {}, browsers: { 'browser-1-1-0-a': { ws: 1, tab: 1, ord: 0, url: 'https://x.dev' } } })
+    const decoded = parseLayout(text)
+    expect(decoded.browsers).toEqual({ 'browser-1-1-0-a': { ws: 1, tab: 1, ord: 0, url: 'https://x.dev' } })
+    expect(parseLayout(serializeLayout(decoded)).browsers).toBeUndefined()
   })
   it('drops malformed entries, keeps valid', () => {
     const text = JSON.stringify({ version: 1, activeWorkspace: 1, workspaces: {}, browsers: {
@@ -142,8 +165,16 @@ describe('layoutFile', () => {
   it('falls back to empty on corrupt json', () => {
     expect(parseLayout('{not json')).toEqual(emptyLayout())
   })
-  it('falls back to empty on version mismatch', () => {
-    expect(parseLayout(JSON.stringify({ version: LAYOUT_VERSION + 99, workspaces: {} }))).toEqual(emptyLayout())
+  it('falls back read-only on version mismatch', () => {
+    expect(parseLayout(JSON.stringify({ version: LAYOUT_VERSION + 99, workspaces: {} }))).toEqual({ ...emptyLayout(), readOnly: true })
+  })
+  it('bounds hostile sidecar bytes, maps, and split depth', () => {
+    expect(parseLayout('x'.repeat(LAYOUT_FILE_MAX_BYTES + 1))).toEqual(emptyLayout())
+    const maps = Object.fromEntries(Array.from({ length: LAYOUT_MAX_MAP_ENTRIES + 1 }, (_, i) => [`k${i}`, { note: '' }]))
+    expect(parseLayout(JSON.stringify({ version: 1, activeWorkspace: 1, workspaces: {}, frozen: maps }))).toEqual(emptyLayout())
+    let tree: Record<string, unknown> = { kind: 'leaf', paneId: 'p' }
+    for (let i = 0; i < LAYOUT_MAX_TREE_DEPTH + 1; i++) tree = { kind: 'split', dir: 'h', ratio: 0.5, a: tree, b: { kind: 'leaf', paneId: 'q' } }
+    expect(parseLayout(JSON.stringify({ version: 1, activeWorkspace: 1, workspaces: { '1': { tabs: { '1': { tree } } } } }))).toEqual(emptyLayout())
   })
   it('round-trips ws label, tab label, and tabOrder', () => {
     const l = emptyLayout()
@@ -287,10 +318,9 @@ describe('mergeLayout (spec §6 CAS conflict retry)', () => {
     expect(merged.workspaces['2']?.tabs['1']?.tree).toEqual(leaf('b-edited'))
   })
 
-  it('never prunes desktop-only browser/editor panes the web build cannot create', () => {
-    // Reproduces the exact risk the spec calls out (§7): a web client's local
-    // tree has no browsers/editors at all (it never created any), and while
-    // its save was in flight the desktop added one of each. A naive
+  it('never prunes desktop-only editor panes the web build cannot create', () => {
+    // A web client's local tree has no editors, and while its save was in
+    // flight the desktop added one. A naive
     // "overwrite with local" retry would silently destroy them.
     const base: LayoutFile = {
       version: 1, activeWorkspace: 1,
@@ -302,12 +332,10 @@ describe('mergeLayout (spec §6 CAS conflict retry)', () => {
     }
     const remote: LayoutFile = {
       ...base,
-      browsers: { 'browser-1-1-1-x': { ws: 1, tab: 1, ord: 1, url: 'https://example.com' } },
       editors: { 'editor-1-1-2-y': { ws: 1, tab: 1, ord: 2, path: '/tmp/notes.md' } },
     }
     const merged = mergeLayout(base, local, remote)
     expect(merged.workspaces['1']?.tabs['1']?.tree).toEqual(leaf('a-edited-by-browser'))
-    expect(merged.browsers).toEqual(remote.browsers)
     expect(merged.editors).toEqual(remote.editors)
   })
 
