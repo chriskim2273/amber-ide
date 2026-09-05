@@ -481,7 +481,7 @@ This follow-up implements the remaining resident P1/P2 findings without changing
 - `coordinateBrowserHostQuit` is a platform-independent bounded finalizer. Host-disabled Linux and Windows skip inhibit/POSIX UID work, still drain tunnels before close/exit, and plain Quit remains actionable through the platform-injected menu template. Readiness owns all poll/process/stderr listeners, clears them on success/exit/error/timeout, resumes stderr after a 64 KiB cap, and has terminal-outcome tests.
 - README now describes the native BrowserHost rail, explicit Share with Pi, resident-vs-daemon Quit, the `/` mobile mosaic allowlist, and bounded `/app` resize behavior. This report and `CLAUDE.md` explicitly retain the physical explicit-Quit limitation.
 
-Fresh isolated gates: app **1024 passed / 1 intentional real-daemon skip** (83 files), strict typecheck, Electron build, hosted-web build, Rust `cargo test --workspace --all-targets` **821 passed / 0 failed / 1 ignored**, and warnings-as-errors Clippy. Focused resident/readiness/menu tests pass **51/51**. The current AppImage was built through `npm run dist` from the production code above at:
+Fresh isolated gates: app **1024 passed / 1 intentional real-daemon skip** (83 files), strict typecheck, Electron build, hosted-web build, Rust `cargo test --workspace --all-targets` **821 passed / 0 failed / 1 ignored**, and warnings-as-errors Clippy. Focused resident/readiness/menu tests pass **52/52**. The current AppImage was built through `npm run dist` from the production code above at:
 
 `/tmp/amber-tab-browser-validation/resident-review-followup-20260905-final/amber-ide-0.0.2.AppImage`
 
