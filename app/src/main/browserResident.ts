@@ -51,6 +51,12 @@ export interface TrackedTunnel {
   socket: string
 }
 
+/** One-shot cleanup handle shared by window-close and process quit. */
+export interface TrackedTunnelHandle {
+  readonly tunnel: TrackedTunnel
+  cleanup(timeoutMs?: number): Promise<void>
+}
+
 /** Bound used while waiting for an ssh process to acknowledge termination. */
 export const TUNNEL_CLEANUP_TIMEOUT_MS = 2_000
 
@@ -63,22 +69,22 @@ function waitForChildExit(proc: ChildProcess, timeoutMs: number): Promise<boolea
   return new Promise((resolve) => {
     let settled = false
     let timer: NodeJS.Timeout | undefined
-    const finish = (): void => {
+    const finish = (exited: boolean): void => {
       if (settled) return
       settled = true
       if (timer) clearTimeout(timer)
-      resolve(true)
+      proc.removeListener('exit', onExit)
+      proc.removeListener('close', onClose)
+      resolve(exited)
     }
-    timer = setTimeout(() => {
-      if (settled) return
-      settled = true
-      resolve(childExited(proc))
-    }, Math.max(0, timeoutMs))
+    const onExit = (): void => finish(true)
+    const onClose = (): void => finish(true)
+    timer = setTimeout(() => finish(childExited(proc)), Math.max(0, timeoutMs))
     timer.unref()
-    proc.once('exit', finish)
-    proc.once('close', finish)
+    proc.once('exit', onExit)
+    proc.once('close', onClose)
     // The child may have exited between the first check and listener setup.
-    if (childExited(proc)) finish()
+    if (childExited(proc)) finish(true)
   })
 }
 
@@ -96,18 +102,172 @@ async function cleanupTunnel(tunnel: TrackedTunnel, timeoutMs: number): Promise<
   await rm(tunnel.dir, { recursive: true, force: true }).catch(() => {})
 }
 
+interface TrackedTunnelRecord {
+  tunnel: TrackedTunnel
+  cleanupPromise: Promise<void> | null
+}
+
 /**
- * Stop and forget every tracked tunnel before the caller exits.
- *
- * The map is cleared before asynchronous work starts, making normal close and
- * forced close idempotent even when both paths race. Each child gets a bounded
- * graceful wait followed by a bounded SIGKILL wait; directory cleanup is then
- * awaited rather than left as fire-and-forget work.
+ * Owns pending and admitted tunnels through their complete cleanup. A tunnel
+ * is registered synchronously immediately after spawn, before the next await;
+ * the quit fence therefore prevents any late child from escaping finalization.
+ */
+export class TrackedTunnelRegistry {
+  private readonly records = new Map<symbol, TrackedTunnelRecord>()
+  private accepting = true
+  private finalCleanup: Promise<void> | null = null
+
+  get size(): number { return this.records.size }
+  canRegister(): boolean { return this.accepting && this.finalCleanup === null }
+  fence(): void { this.accepting = false }
+  cancelFence(): void { if (this.finalCleanup === null) this.accepting = true }
+
+  register(tunnel: TrackedTunnel): TrackedTunnelHandle | null {
+    if (!this.canRegister()) return null
+    const key = Symbol('amber tunnel')
+    const record: TrackedTunnelRecord = { tunnel, cleanupPromise: null }
+    this.records.set(key, record)
+    return {
+      tunnel,
+      cleanup: (timeoutMs = TUNNEL_CLEANUP_TIMEOUT_MS): Promise<void> => {
+        if (record.cleanupPromise) return record.cleanupPromise
+        const cleanup = cleanupTunnel(tunnel, timeoutMs)
+        record.cleanupPromise = cleanup.finally(() => { this.records.delete(key) })
+        return record.cleanupPromise
+      },
+    }
+  }
+
+  /** Fence registration and await every pending/admitted tunnel exactly once. */
+  cleanupAll(timeoutMs = TUNNEL_CLEANUP_TIMEOUT_MS): Promise<void> {
+    this.fence()
+    if (this.finalCleanup) return this.finalCleanup
+    const handles = [...this.records.entries()].map(([key, record]) => ({
+      key,
+      cleanup: (): Promise<void> => {
+        if (record.cleanupPromise) return record.cleanupPromise
+        const cleanup = cleanupTunnel(record.tunnel, timeoutMs)
+        record.cleanupPromise = cleanup.finally(() => { this.records.delete(key) })
+        return record.cleanupPromise
+      },
+    }))
+    const run = Promise.all(handles.map((handle) => handle.cleanup())).then(() => undefined)
+    let settled!: Promise<void>
+    settled = run.finally(() => { if (this.finalCleanup === settled) this.finalCleanup = null })
+    this.finalCleanup = settled
+    return settled
+  }
+}
+
+export interface TrackedTunnelRuntime {
+  dir: string
+  socket: string
+}
+
+export interface TrackedTunnelOpenDeps<T> {
+  canOpen: () => boolean
+  prepare: () => Promise<TrackedTunnelRuntime>
+  spawn: (runtime: TrackedTunnelRuntime) => ChildProcess
+  waitReady: (tunnel: TrackedTunnel) => Promise<{ ready: boolean; detail?: string }>
+  openWindow: (socket: string) => Promise<T>
+  attach: (value: T, lease: TrackedTunnelHandle) => void | Promise<void>
+  dispose?: (value: T) => void | Promise<void>
+}
+
+export type TrackedTunnelOpenResult<T> =
+  | { status: 'opened'; value: T; lease: TrackedTunnelHandle }
+  | { status: 'aborted' }
+  | { status: 'failed'; error: unknown; detail?: string }
+
+/**
+ * Run the asynchronous portion of a remote-window open while preserving the
+ * tunnel ownership boundary. `spawn` is called and registered synchronously;
+ * every later failure or quit fence shares the lease's one cleanup promise.
+ */
+export async function openTrackedTunnel<T>(
+  registry: TrackedTunnelRegistry,
+  deps: TrackedTunnelOpenDeps<T>,
+): Promise<TrackedTunnelOpenResult<T>> {
+  if (!deps.canOpen()) return { status: 'aborted' }
+  let runtime: TrackedTunnelRuntime
+  try {
+    runtime = await deps.prepare()
+  } catch (error) {
+    return { status: 'failed', error }
+  }
+  if (!deps.canOpen()) {
+    await rm(runtime.dir, { recursive: true, force: true }).catch(() => {})
+    return { status: 'aborted' }
+  }
+
+  let proc: ChildProcess
+  try {
+    proc = deps.spawn(runtime)
+  } catch (error) {
+    await rm(runtime.dir, { recursive: true, force: true }).catch(() => {})
+    return { status: 'failed', error }
+  }
+  const tunnel = { proc, dir: runtime.dir, socket: runtime.socket }
+  const lease = registry.register(tunnel)
+  if (!lease) {
+    await cleanupTunnel(tunnel, TUNNEL_CLEANUP_TIMEOUT_MS)
+    return { status: 'aborted' }
+  }
+  try {
+    const readiness = await deps.waitReady(tunnel)
+    if (!readiness.ready) {
+      await lease.cleanup()
+      if (!deps.canOpen()) return { status: 'aborted' }
+      const failure: { status: 'failed'; error: unknown; detail?: string } = {
+        status: 'failed', error: new Error(readiness.detail || 'tunnel readiness failed'),
+      }
+      if (readiness.detail !== undefined) failure.detail = readiness.detail
+      return failure
+    }
+    if (!deps.canOpen()) {
+      await lease.cleanup()
+      return { status: 'aborted' }
+    }
+    let value: T
+    try {
+      value = await deps.openWindow(runtime.socket)
+    } catch (error) {
+      await lease.cleanup()
+      return { status: 'failed', error }
+    }
+    if (!deps.canOpen()) {
+      await lease.cleanup()
+      await Promise.resolve(deps.dispose?.(value)).catch(() => {})
+      return { status: 'aborted' }
+    }
+    try {
+      await deps.attach(value, lease)
+    } catch (error) {
+      await lease.cleanup()
+      await Promise.resolve(deps.dispose?.(value)).catch(() => {})
+      return { status: 'failed', error }
+    }
+    if (!deps.canOpen()) {
+      await lease.cleanup()
+      await Promise.resolve(deps.dispose?.(value)).catch(() => {})
+      return { status: 'aborted' }
+    }
+    return { status: 'opened', value, lease }
+  } catch (error) {
+    await lease.cleanup()
+    return { status: 'failed', error }
+  }
+}
+
+/**
+ * Compatibility helper for callers/tests that already own a map. New lifecycle
+ * code uses TrackedTunnelRegistry so close and quit share one cleanup promise.
  */
 export async function cleanupTrackedTunnels(tunnels: Map<unknown, TrackedTunnel>, timeoutMs = TUNNEL_CLEANUP_TIMEOUT_MS): Promise<void> {
-  const tracked = [...tunnels.values()]
+  const registry = new TrackedTunnelRegistry()
+  for (const tunnel of tunnels.values()) registry.register(tunnel)
   tunnels.clear()
-  await Promise.all(tracked.map((tunnel) => cleanupTunnel(tunnel, timeoutMs)))
+  await registry.cleanupAll(timeoutMs)
 }
 
 export function activationRequest(argv: readonly string[]): BrowserHostActivationRequest {
@@ -273,32 +433,44 @@ export async function clearBrowserHostInhibit(root: string): Promise<void> {
 }
 
 export interface BrowserHostQuitDeps {
-  writeInhibit: () => Promise<void>
+  /** False when BrowserHost is disabled/unavailable on this platform/config. */
+  hostAvailable?: boolean
+  /** Required only when hostAvailable is true. */
+  writeInhibit?: () => Promise<void>
   beginDrain: () => void
   flushAndDestroy: (signal: AbortSignal) => Promise<void>
   closeBroker: () => Promise<void>
   closeWatcher: () => void
+  /** Must include all pending/admitted remote tunnel cleanup. */
+  cleanupTunnels?: () => Promise<void>
   closeWindows: () => void | Promise<void>
 }
 
 export async function coordinateBrowserHostQuit(deps: BrowserHostQuitDeps, timeoutMs = 5_000): Promise<{ ok: true } | { ok: false; error: 'QUIT_DRAIN_TIMEOUT' | 'QUIT_DRAIN_FAILED' }> {
   let flushController: AbortController | undefined
   try {
-    await deps.writeInhibit()
-    deps.beginDrain()
-    flushController = new AbortController()
-    let timer: NodeJS.Timeout | undefined
-    const timeout = new Promise<never>((_resolve, reject) => {
-      timer = setTimeout(() => {
-        flushController?.abort()
-        reject(new Error('QUIT_DRAIN_TIMEOUT'))
-      }, timeoutMs)
-    })
-    try { await Promise.race([deps.flushAndDestroy(flushController.signal), timeout]) }
-    catch (error) { flushController.abort(); throw error }
-    finally { if (timer) clearTimeout(timer) }
+    const hostAvailable = deps.hostAvailable !== false
+    if (hostAvailable) {
+      if (!deps.writeInhibit) throw new Error('BROWSER_HOST_UNAVAILABLE')
+      await deps.writeInhibit()
+      deps.beginDrain()
+      flushController = new AbortController()
+      let timer: NodeJS.Timeout | undefined
+      const timeout = new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          flushController?.abort()
+          reject(new Error('QUIT_DRAIN_TIMEOUT'))
+        }, timeoutMs)
+      })
+      try { await Promise.race([deps.flushAndDestroy(flushController.signal), timeout]) }
+      catch (error) { flushController.abort(); throw error }
+      finally { if (timer) clearTimeout(timer) }
+    }
     await deps.closeBroker()
     deps.closeWatcher()
+    // Tunnels are process-owned resources, not browser state. They must be
+    // drained before closeWindows can hand control to app.quit/app.exit.
+    await deps.cleanupTunnels?.()
     await deps.closeWindows()
     return { ok: true }
   } catch (error) {

@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import { EventEmitter } from 'node:events'
 import { execFile as execFileCallback } from 'node:child_process'
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
@@ -9,7 +9,9 @@ import {
   sshTunnelArgv, sshProbeArgv, isValidHost, localSocketPath, hostLabel,
   REMOTE_SOCKET_PROBE, REMOTE_LAYOUT_PROBE, REMOTE_LAYOUT_PROBE_MAX_BYTES,
   parseAgentSock, explainSshFailure, isSupportedOnPlatform, runSshProbe,
+  waitForSshTunnelReady,
   type SshProbeChild,
+  type SshTunnelReadinessChild,
 } from './sshRemote'
 
 const execFile = promisify(execFileCallback)
@@ -47,12 +49,73 @@ describe('sshTunnelArgv', () => {
   })
 })
 
-class FakeProbeChild extends EventEmitter implements SshProbeChild {
+class FakeProbeChild extends EventEmitter implements SshProbeChild, SshTunnelReadinessChild {
   readonly stdout = new EventEmitter()
-  readonly stderr = new EventEmitter()
+  readonly stderr: EventEmitter & { resume: () => void }
   readonly killed: Array<NodeJS.Signals | undefined> = []
+  resumed = 0
+  constructor() {
+    super()
+    this.stderr = new EventEmitter() as EventEmitter & { resume: () => void }
+    this.stderr.resume = () => { this.resumed += 1 }
+  }
   kill(signal?: NodeJS.Signals): boolean { this.killed.push(signal); return true }
 }
+
+describe('waitForSshTunnelReady', () => {
+  it('cleans the poll, process listeners, and stderr capture after success', async () => {
+    vi.useFakeTimers()
+    try {
+      const child = new FakeProbeChild(); let ready = false; let polls = 0
+      const waiting = waitForSshTunnelReady(child, '/tmp/remote.sock', {
+        timeoutMs: 100,
+        pollMs: 10,
+        maxStderrBytes: 64,
+        exists: () => { polls += 1; return ready },
+      })
+      child.stderr.emit('data', Buffer.from('before-ready\n'))
+      ready = true
+      await vi.advanceTimersByTimeAsync(10)
+      await expect(waiting).resolves.toEqual({ ready: true, reason: 'ready', stderr: 'before-ready\n' })
+      const afterReadyPolls = polls
+      child.stderr.emit('data', Buffer.from('after-ready\n'))
+      await vi.advanceTimersByTimeAsync(100)
+      expect(polls).toBe(afterReadyPolls)
+      expect(child.listenerCount('exit')).toBe(0)
+      expect(child.listenerCount('error')).toBe(0)
+      expect(child.stderr.listenerCount('data')).toBe(0)
+      expect(child.resumed).toBe(1)
+    } finally { vi.useRealTimers() }
+  })
+
+  it('cleans all listeners when ssh exits before the socket appears', async () => {
+    const child = new FakeProbeChild()
+    const waiting = waitForSshTunnelReady(child, '/tmp/remote.sock', { timeoutMs: 100, exists: () => false })
+    child.stderr.emit('data', Buffer.from('forward failed\n'))
+    child.emit('exit', 255)
+    await expect(waiting).resolves.toEqual({ ready: false, reason: 'exit', stderr: 'forward failed\n' })
+    expect(child.listenerCount('exit')).toBe(0)
+    expect(child.listenerCount('error')).toBe(0)
+    expect(child.stderr.listenerCount('data')).toBe(0)
+    expect(child.resumed).toBe(1)
+  })
+
+  it('cleans all listeners on timeout and caps retained stderr', async () => {
+    vi.useFakeTimers()
+    try {
+      const child = new FakeProbeChild()
+      const waiting = waitForSshTunnelReady(child, '/tmp/remote.sock', { timeoutMs: 5, pollMs: 1, maxStderrBytes: 8, exists: () => false })
+      child.stderr.emit('data', Buffer.from('1234567890'))
+      await vi.advanceTimersByTimeAsync(5)
+      await expect(waiting).resolves.toEqual({ ready: false, reason: 'timeout', stderr: '12345678' })
+      child.stderr.emit('data', Buffer.from('late stderr'))
+      expect(child.stderr.listenerCount('data')).toBe(0)
+      expect(child.listenerCount('exit')).toBe(0)
+      expect(child.listenerCount('error')).toBe(0)
+      expect(child.resumed).toBe(1)
+    } finally { vi.useRealTimers() }
+  })
+})
 
 describe('sshProbeArgv', () => {
   it('never blocks on an interactive prompt', () => {

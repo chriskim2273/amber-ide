@@ -62,7 +62,7 @@ import { repairAgentExtensions } from './agentSetup'
 import {
   sshTunnelArgv, isValidHost, localSocketPath, hostLabel,
   REMOTE_SOCKET_PROBE, REMOTE_LAYOUT_PROBE, REMOTE_LAYOUT_PROBE_MAX_BYTES,
-  parseAgentSock, explainSshFailure, runSshProbe,
+  parseAgentSock, explainSshFailure, runSshProbe, waitForSshTunnelReady,
   isSupportedOnPlatform,
 } from './sshRemote'
 import { webCtlArgv, parseWebStatus, redactUrl, type WebStatus } from './webService'
@@ -74,6 +74,7 @@ import {
 } from './routerService'
 import { inspectLinuxInputMethod, repairLinuxInputMethod, resolveLinuxInputEnvironment } from './inputMethod'
 import { TabBrowserService, parseTabBrowserCommand, stageWorkspaceBrowserState } from './tabBrowserService'
+import { buildAppMenuTemplate, type BrowserMenuHandlers } from './browserMenu'
 import { TabBrowserBrokerServer, authorizeBrowserRequest, dispatchAttachedBrokerAction, isEligiblePiController, type BrokerRequest } from './tabBrowserBroker'
 import { BrowserDaemonWatcher } from './browserDaemonWatcher'
 import { Connection } from '../client/connection'
@@ -93,15 +94,16 @@ import { electronPaths } from './electronPaths'
 import {
   activationRequest,
   clearBrowserHostInhibit,
-  cleanupTrackedTunnels,
   coordinateBrowserHostQuit,
   createSingleFlight,
+  openTrackedTunnel,
   installStableAppImage,
+  TrackedTunnelRegistry,
   parseActivationRequest,
   registerBrowserHostLauncher,
   ResidentIntentLatch,
   writeBrowserHostInhibit,
-  type TrackedTunnel,
+  type TrackedTunnelHandle,
 } from './browserResident'
 import clientPath from '../client/index?modulePath'
 
@@ -562,7 +564,6 @@ async function quitDaemonAndApp(win: BrowserWindow): Promise<void> {
     return
   }
 
-  const uid = process.getuid?.() ?? 0
   if (process.platform === 'win32') {
     try {
       await stopWindowsDaemon(resolveSocketPath(process.env, process.platform))
@@ -579,6 +580,9 @@ async function quitDaemonAndApp(win: BrowserWindow): Promise<void> {
     if (requestExplicitQuit) await requestExplicitQuit(); else app.quit()
     return
   }
+  // Keep POSIX-only identity lookup out of the Windows branch. In particular,
+  // Electron's Windows process object does not provide getuid().
+  const uid = process.getuid?.() ?? 0
   const stop = stopDaemonCommand(process.platform, uid)
   if (stop !== null) {
     await spawnOk(stop.cmd, stop.args).catch(async () => {
@@ -627,7 +631,6 @@ async function restartDaemon(win: BrowserWindow): Promise<void> {
     return
   }
 
-  const uid = process.getuid?.() ?? 0
   if (process.platform === 'win32') {
     try {
       await stopWindowsDaemon(resolveSocketPath(process.env, process.platform))
@@ -643,6 +646,8 @@ async function restartDaemon(win: BrowserWindow): Promise<void> {
     }
     return
   }
+  // This branch is POSIX-only; do not probe process.getuid on Windows.
+  const uid = process.getuid?.() ?? 0
   const restart = restartDaemonCommand(process.platform, uid)
   if (restart === null) return
   try {
@@ -712,8 +717,8 @@ async function installDesktopShortcut(win: BrowserWindow): Promise<void> {
 }
 
 // Minimal application menu. Keeps the standard macOS roles (app/Edit/Window) so
-// copy/paste and window management work; adds the explicit "Quit amber daemon"
-// item required by spec §3/§6. On Linux only that item plus the plain quit.
+// copy/paste and window management work; adds explicit daemon and app Quit
+// actions. The pure template builder is platform-injected and unit-testable.
 function buildAppMenu(
   onQuitDaemon: () => void,
   onQuitApp: () => void,
@@ -722,41 +727,11 @@ function buildAppMenu(
   onRestartDaemon: () => void,
   onConnectHost: () => void,
 ): Menu {
-  const isMac = process.platform === 'darwin'
-  const sshSupport = isSupportedOnPlatform(process.platform)
-  const template: MenuItemConstructorOptions[] = []
-  // Keep Quit under our coordinated drain instead of Electron's automatic
-  // role, which would close the broker before browser state is durable.
-  if (isMac) template.push({ label: app.name, submenu: [
-    { role: 'about' }, { type: 'separator' }, { role: 'services' },
-    { type: 'separator' }, { role: 'hide' }, { role: 'hideOthers' }, { role: 'unhide' },
-    { type: 'separator' }, { label: 'Quit Amber IDE', accelerator: 'Cmd+Q', click: () => onQuitApp() },
-  ] })
-  const submenu: MenuItemConstructorOptions[] = [
-    ...(onInstallDesktop !== null
-      ? [
-          { label: 'Install desktop shortcut', click: () => onInstallDesktop() },
-          { type: 'separator' } as MenuItemConstructorOptions,
-        ]
-      : []),
-    sshSupport.ok
-      ? { label: 'Connect to host…', accelerator: 'CmdOrCtrl+Shift+O', click: () => onConnectHost() }
-      : {
-          label: 'Connect to host… (unavailable: named-pipe transport)',
-          enabled: false,
-          toolTip: sshSupport.reason,
-        },
-    { type: 'separator' } as MenuItemConstructorOptions,
-    ...(onEnableBrowserHost
-      ? [{ label: 'Enable browser host', click: () => onEnableBrowserHost() }]
-      : [{ label: 'Browser host unavailable on this configuration', enabled: false }]),
-    { label: 'Restart amber daemon', click: () => onRestartDaemon() },
-    { label: 'Quit amber daemon', click: () => onQuitDaemon() },
-  ]
-  if (!isMac) submenu.push({ type: 'separator' }, { label: 'Quit Amber IDE', accelerator: 'CmdOrCtrl+Q', click: () => onQuitApp() })
-  template.push({ label: isMac ? 'Daemon' : 'File', submenu })
-  if (isMac) template.push({ role: 'editMenu' }, { role: 'windowMenu' })
-  return Menu.buildFromTemplate(template)
+  const handlers: BrowserMenuHandlers = {
+    onQuitDaemon, onQuitApp, onEnableBrowserHost, onInstallDesktop,
+    onRestartDaemon, onConnectHost, appName: app.name,
+  }
+  return Menu.buildFromTemplate(buildAppMenuTemplate(process.platform, handlers))
 }
 
 /**
@@ -823,11 +798,12 @@ function setWindowContextFromLayout(ctx: WindowCtx, layout: LayoutFile): void {
   ctx.browserContextGeneration += 1
 }
 
-/** A live ssh tunnel backing one remote window. */
-type Tunnel = TrackedTunnel
+/** Live and pending ssh tunnels are owned by this registry until cleanup ends. */
+const tunnelRegistry = new TrackedTunnelRegistry()
+const tunnels = new Map<number, TrackedTunnelHandle>()
 
-const tunnels = new Map<number, Tunnel>()
-let tunnelCleanup: Promise<void> | null = null
+function fenceTunnelOpens(): void { tunnelRegistry.fence() }
+function cancelTunnelOpenFence(): void { tunnelRegistry.cancelFence() }
 
 /**
  * The environment ssh children run in.
@@ -876,6 +852,10 @@ async function openRemoteWindow(host: string): Promise<void> {
     })
     return
   }
+  // A remote open can begin from a menu/IPC callback while Quit is already
+  // draining. Refuse before probing, and repeat the check after every await so
+  // no child or window can be admitted behind the finalizer.
+  if (allowFinalQuit || explicitQuitInProgress || !tunnelRegistry.canRegister()) return
   if (!isValidHost(host)) {
     await dialog.showMessageBox({
       type: 'error',
@@ -886,6 +866,7 @@ async function openRemoteWindow(host: string): Promise<void> {
   }
 
   const probe = await runSshProbe(host, REMOTE_SOCKET_PROBE, sshEnv())
+  if (allowFinalQuit || explicitQuitInProgress || !tunnelRegistry.canRegister()) return
   if (probe.code !== 0 || probe.error) {
     // ssh's own message is usually better than anything we could invent
     // (unknown host, name resolution, refused). The one case it under-reports
@@ -908,54 +889,62 @@ async function openRemoteWindow(host: string): Promise<void> {
     return
   }
 
-  // Private per-window directory: 0700 so no other local user can reach the
-  // tunnel, which carries full session control.
-  const dir = await mkdtemp(join(tmpdir(), 'amber-ssh-'))
-  await chmod(dir, 0o700)
-  const localSock = localSocketPath(dir)
-  const a = sshTunnelArgv(host, localSock, remoteSocket)
-  const proc = spawn(a.cmd, a.args, { stdio: ['ignore', 'pipe', 'pipe'], env: sshEnv() })
-  let tunnelErr = ''
-  proc.stderr?.on('data', (d: Buffer) => { tunnelErr += d.toString() })
-
-  // Wait for the socket to appear rather than guessing a delay: ssh creates it
-  // once the forward is established, and ExitOnForwardFailure means a failure
-  // kills the child instead of leaving us waiting forever.
-  const ready = await new Promise<boolean>((resolveReady) => {
-    let settled = false
-    const finish = (v: boolean): void => { if (!settled) { settled = true; resolveReady(v) } }
-    proc.on('exit', () => finish(false))
-    proc.on('error', () => finish(false))
-    const started = Date.now()
-    const poll = setInterval(() => {
-      if (existsSync(localSock)) { clearInterval(poll); finish(true) }
-      else if (Date.now() - started > 15000) { clearInterval(poll); finish(false) }
-    }, 100)
+  const canOpen = (): boolean => !allowFinalQuit && !explicitQuitInProgress && tunnelRegistry.canRegister()
+  const result = await openTrackedTunnel(tunnelRegistry, {
+    canOpen,
+    // Private per-window directory: 0700 so no other local user can reach the
+    // tunnel, which carries full session control.
+    prepare: async () => {
+      const dir = await mkdtemp(join(tmpdir(), 'amber-ssh-'))
+      try {
+        await chmod(dir, 0o700)
+        return { dir, socket: localSocketPath(dir) }
+      } catch (error) {
+        await rm(dir, { recursive: true, force: true }).catch(() => {})
+        throw error
+      }
+    },
+    spawn: ({ socket }) => {
+      const a = sshTunnelArgv(host, socket, remoteSocket)
+      // `openTrackedTunnel` registers this child synchronously before its next
+      // await. A quit fence can therefore either see it or reject it safely.
+      return spawn(a.cmd, a.args, { stdio: ['ignore', 'pipe', 'pipe'], env: sshEnv() })
+    },
+    // Wait for the socket to appear rather than guessing a delay: ssh creates
+    // it once the forward is established, and ExitOnForwardFailure means a
+    // failure kills the child instead of leaving us waiting forever. The
+    // helper owns all listeners/timers and retains bounded stderr.
+    waitReady: async (tunnel) => {
+      const readiness = await waitForSshTunnelReady(tunnel.proc, tunnel.socket)
+      return {
+        ready: readiness.ready,
+        detail: readiness.stderr || 'ssh exited before the forward was established.',
+      }
+    },
+    openWindow: (socket) => openWindow({ kind: 'remote', host, socket }),
+    attach: (ctx, lease) => {
+      if (ctx.win.isDestroyed()) throw new Error('REMOTE_WINDOW_CLOSED')
+      const id = ctx.win.webContents.id
+      tunnels.set(id, lease)
+      ctx.win.on('closed', () => {
+        const current = tunnels.get(id)
+        if (current !== lease) return
+        // Keep registry ownership until cleanup has actually completed. Quit
+        // racing this callback receives the same one-shot promise.
+        void lease.cleanup().finally(() => {
+          if (tunnels.get(id) === lease) tunnels.delete(id)
+        })
+      })
+    },
+    dispose: (ctx) => { if (!ctx.win.isDestroyed()) ctx.win.destroy() },
   })
-
-  if (!ready) {
-    try { proc.kill() } catch { /* already gone */ }
-    await rm(dir, { recursive: true, force: true })
+  if (result.status === 'failed' && !allowFinalQuit && !explicitQuitInProgress) {
     await dialog.showMessageBox({
       type: 'error',
       message: `Could not forward ${host}'s amber socket`,
-      detail: tunnelErr || 'ssh exited before the forward was established.',
+      detail: result.detail || (result.error instanceof Error ? result.error.message : String(result.error)),
     })
-    return
   }
-
-  const ctx = await openWindow({ kind: 'remote', host, socket: localSock })
-  tunnels.set(ctx.win.webContents.id, { proc, dir, socket: localSock })
-  const id = ctx.win.webContents.id
-  ctx.win.on('closed', () => {
-    const t = tunnels.get(id)
-    if (!t) return
-    tunnels.delete(id)
-    // A leaked `ssh -N` outliving its window is the failure mode to avoid.
-    // The map entry is removed synchronously; the shared cleanup still waits
-    // for process termination and removes the owned runtime directory.
-    void cleanupTrackedTunnels(new Map([[id, t]]))
-  })
 }
 
 /**
@@ -988,14 +977,12 @@ function promptConnectHost(): void {
 
 /** Kill every tunnel. Called on quit so no `ssh -N` outlives the app. */
 function killTunnels(): Promise<void> {
-  if (tunnelCleanup) return tunnelCleanup
-  const cleanup = cleanupTrackedTunnels(tunnels)
-  let settled!: Promise<void>
-  settled = cleanup.finally(() => {
-    if (tunnelCleanup === settled) tunnelCleanup = null
+  const cleanup = tunnelRegistry.cleanupAll()
+  return cleanup.then(() => {
+    // Window ids are only an index into the registry handles. Delete them after
+    // the shared promise settles, never at close-start or quit-start.
+    if (tunnelRegistry.size === 0) tunnels.clear()
   })
-  tunnelCleanup = settled
-  return settled
 }
 
 async function openWindow(target: WindowTarget, options: { show?: boolean } = {}): Promise<WindowCtx> {
@@ -1070,6 +1057,7 @@ async function openWindow(target: WindowTarget, options: { show?: boolean } = {}
     const enterCompat = async (): Promise<void> => {
       if (switching) return
       switching = true
+      fenceTunnelOpens()
       try { mkdirSync(stateRoot(), { recursive: true }); writeFileSync(compatFlagPath, COMPAT_SIGNATURE) } catch { /* ignore */ }
       // app.exit() bypasses before-quit just like force quit. A remote window
       // may have a live ssh tunnel even though this local detector owns the
@@ -1448,6 +1436,11 @@ async function main(): Promise<void> {
   requestExplicitQuit = async (): Promise<void> => {
     if (allowFinalQuit || explicitQuitInProgress) return
     explicitQuitInProgress = true
+    // Fence before any confirmation or drain await. A probe/readiness callback
+    // that was already in flight may still resume, but it can only clean up,
+    // never register a child behind finalization.
+    fenceTunnelOpens()
+    const hostAvailable = tabBrowserHostEnabled() && tabBrowser !== null
     const work = tabBrowser?.pendingWork()
     if (work && work.total > 0) {
       const choice = await dialog.showMessageBox({
@@ -1455,20 +1448,20 @@ async function main(): Promise<void> {
         title: 'Quit Amber IDE?', message: 'Browser work is still active.',
         detail: `${work.operations} browser operation(s), ${work.piActions} Pi action(s), ${work.approvals} approval(s), ${work.dialogs} dialog(s), and ${work.pageLoads} page load(s) will be cancelled. The amber daemon and terminal sessions will keep running.`,
       })
-      if (choice.response !== 1) { explicitQuitInProgress = false; return }
+      if (choice.response !== 1) { explicitQuitInProgress = false; cancelTunnelOpenFence(); return }
     }
     const result = await coordinateBrowserHostQuit({
-      writeInhibit: () => writeBrowserHostInhibit(stateRoot()),
+      hostAvailable,
+      ...(hostAvailable ? { writeInhibit: () => writeBrowserHostInhibit(stateRoot()) } : {}),
       beginDrain: () => tabBrowser?.beginDrain(),
       flushAndDestroy: (signal) => tabBrowser?.flushAndDestroy(signal) ?? Promise.resolve(),
       closeBroker: () => tabBrowserBroker?.close() ?? Promise.resolve(),
       closeWatcher: () => { browserDaemonWatcher?.close(); browserDaemonWatcher = null },
+      cleanupTunnels: killTunnels,
       closeWindows: async () => {
         residentTray?.destroy(); residentTray = null
-        // `app.quit()` will synchronously enter before-quit. Awaiting the
-        // shared cleanup here means the normal path and that final callback
-        // both observe an already-drained, idempotent tunnel set.
-        await killTunnels()
+        // `app.quit()` will synchronously enter before-quit. Tunnel cleanup has
+        // already been awaited by the platform-independent coordinator.
         allowFinalQuit = true
         app.quit()
       },
@@ -1481,7 +1474,8 @@ async function main(): Promise<void> {
     })
     if (failure.response === 0) {
       tabBrowser?.cancelDrain()
-      await clearBrowserHostInhibit(stateRoot()).catch(() => {})
+      if (hostAvailable) await clearBrowserHostInhibit(stateRoot()).catch(() => {})
+      cancelTunnelOpenFence()
       explicitQuitInProgress = false
       return
     }
@@ -2116,14 +2110,17 @@ async function main(): Promise<void> {
 }
 
 app.on('before-quit', (event) => {
-  if (tabBrowserHostEnabled() && !allowFinalQuit) {
+  // The finalizer also covers host-disabled Linux and Windows: those paths skip
+  // browser state/inhibit work but still await remote tunnel cleanup before
+  // allowing Electron to exit. Startup failure has no handler or tunnel yet.
+  if (!allowFinalQuit && requestExplicitQuit) {
     event.preventDefault()
-    if (requestExplicitQuit) void requestExplicitQuit()
-    else residentIntents.requestQuit()
+    void requestExplicitQuit()
     return
   }
-  // Final normal quit has already awaited this cleanup in closeWindows. Keep
-  // this idempotent backstop for any other allowFinalQuit path.
+  // The startup failure path sets allowFinalQuit before app.quit. There are no
+  // remote opens before main installs the handler, but retain a best-effort
+  // cleanup backstop for that path.
   void killTunnels()
 })
 

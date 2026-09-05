@@ -10,9 +10,11 @@ import {
   coordinateBrowserHostQuit,
   createSingleFlight,
   installStableAppImage,
+  openTrackedTunnel,
   parseActivationRequest,
   registerBrowserHostLauncher,
   ResidentIntentLatch,
+  TrackedTunnelRegistry,
   writeBrowserHostInhibit,
 } from './browserResident'
 
@@ -92,21 +94,143 @@ describe('resident activation and tunnel cleanup', () => {
       await rm(dir, { recursive: true, force: true })
     }
   })
+
+  it('keeps one cleanup promise for a window-close and quit race', async () => {
+    if (process.platform === 'win32') return
+    const dir = await mkdtemp(join(tmpdir(), 'amber-tunnel-race-'))
+    const proc = spawn(process.execPath, ['-e', 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000)'], { stdio: 'ignore' })
+    const registry = new TrackedTunnelRegistry()
+    try {
+      await new Promise<void>((resolve, reject) => {
+        proc.once('spawn', () => resolve())
+        proc.once('error', reject)
+      })
+      const lease = registry.register({ proc, dir, socket: join(dir, 'remote.sock') })
+      expect(lease).not.toBeNull()
+      const closed = lease!.cleanup(25)
+      // Ownership remains visible while process/dir cleanup is in flight; a
+      // concurrent quit must discover and await this same record.
+      expect(registry.size).toBe(1)
+      const quit = registry.cleanupAll(25)
+      expect(quit).toBeInstanceOf(Promise)
+      expect(lease!.cleanup(25)).toBe(closed)
+      await Promise.all([closed, quit])
+      expect(registry.size).toBe(0)
+      expect(proc.exitCode !== null || proc.signalCode !== null).toBe(true)
+      await expect(stat(dir)).rejects.toThrow()
+    } finally {
+      if (proc.exitCode === null) proc.kill('SIGKILL')
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects a tunnel registration after the quit fence and permits it after cancellation', () => {
+    const registry = new TrackedTunnelRegistry()
+    const tunnel = { proc: {} as never, dir: '/tmp/no-tunnel', socket: '/tmp/no-tunnel/remote.sock' }
+    registry.fence()
+    expect(registry.register(tunnel)).toBeNull()
+    registry.cancelFence()
+    expect(registry.register(tunnel)).not.toBeNull()
+  })
+
+  it('cleans a pending tunnel when Quit fences during deferred window creation', async () => {
+    if (process.platform === 'win32') return
+    const dir = await mkdtemp(join(tmpdir(), 'amber-tunnel-deferred-'))
+    const registry = new TrackedTunnelRegistry()
+    let child: ReturnType<typeof spawn> | undefined
+    let releaseWindow!: () => void
+    let disposeCalls = 0
+    try {
+      const opening = openTrackedTunnel(registry, {
+        canOpen: () => registry.canRegister(),
+        prepare: async () => ({ dir, socket: join(dir, 'remote.sock') }),
+        spawn: () => {
+          child = spawn(process.execPath, ['-e', 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000)'], { stdio: 'ignore' })
+          return child
+        },
+        waitReady: async () => { expect(registry.size).toBe(1); return { ready: true } },
+        openWindow: async () => new Promise<{ id: string }>((resolve) => {
+          releaseWindow = () => resolve({ id: 'late-window' })
+        }),
+        attach: () => {},
+        dispose: () => { disposeCalls += 1 },
+      })
+      await new Promise<void>((resolve) => setImmediate(resolve))
+      expect(releaseWindow).toBeTypeOf('function')
+      registry.fence()
+      const quit = registry.cleanupAll(25)
+      releaseWindow()
+      await expect(opening).resolves.toEqual({ status: 'aborted' })
+      await quit
+      expect(disposeCalls).toBe(1)
+      expect(child && (child.exitCode !== null || child.signalCode !== null)).toBe(true)
+      await expect(stat(dir)).rejects.toThrow()
+    } finally {
+      if (child && child.exitCode === null) child.kill('SIGKILL')
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('cleans the tunnel exactly once when openWindow rejects', async () => {
+    if (process.platform === 'win32') return
+    const dir = await mkdtemp(join(tmpdir(), 'amber-tunnel-open-failure-'))
+    const registry = new TrackedTunnelRegistry()
+    let child: ReturnType<typeof spawn> | undefined
+    try {
+      const result = await openTrackedTunnel(registry, {
+        canOpen: () => registry.canRegister(),
+        prepare: async () => ({ dir, socket: join(dir, 'remote.sock') }),
+        spawn: () => {
+          child = spawn(process.execPath, ['-e', 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000)'], { stdio: 'ignore' })
+          return child
+        },
+        waitReady: async () => ({ ready: true }),
+        openWindow: async () => { throw new Error('WINDOW_OPEN_FAILED') },
+        attach: () => {},
+      })
+      expect(result.status).toBe('failed')
+      expect(result.status === 'failed' && String(result.error)).toContain('WINDOW_OPEN_FAILED')
+      expect(child && (child.exitCode !== null || child.signalCode !== null)).toBe(true)
+      await expect(stat(dir)).rejects.toThrow()
+      expect(registry.size).toBe(0)
+    } finally {
+      if (child && child.exitCode === null) child.kill('SIGKILL')
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
 })
 
 describe('coordinated resident quit', () => {
   it('writes inhibit, drains state, then closes process-owned resources in order', async () => {
     const order: string[] = []
     const result = await coordinateBrowserHostQuit({
+      hostAvailable: true,
       writeInhibit: async () => { order.push('inhibit') },
       beginDrain: () => { order.push('drain') },
       flushAndDestroy: async () => { order.push('persist+destroy') },
       closeBroker: async () => { order.push('broker') },
       closeWatcher: () => { order.push('watcher') },
+      cleanupTunnels: async () => { order.push('tunnels') },
       closeWindows: () => { order.push('windows') },
     }, 100)
     expect(result).toEqual({ ok: true })
-    expect(order).toEqual(['inhibit', 'drain', 'persist+destroy', 'broker', 'watcher', 'windows'])
+    expect(order).toEqual(['inhibit', 'drain', 'persist+destroy', 'broker', 'watcher', 'tunnels', 'windows'])
+  })
+
+  it('skips host-specific inhibit and drain work when browser hosting is unavailable on Linux', async () => {
+    const order: string[] = []
+    const result = await coordinateBrowserHostQuit({
+      hostAvailable: false,
+      writeInhibit: async () => { throw new Error('process.getuid must not be reached') },
+      beginDrain: () => { throw new Error('drain must not be reached') },
+      flushAndDestroy: async () => { throw new Error('flush must not be reached') },
+      closeBroker: async () => { order.push('broker') },
+      closeWatcher: () => { order.push('watcher') },
+      cleanupTunnels: async () => { order.push('tunnels') },
+      closeWindows: () => { order.push('windows') },
+    }, 100)
+    expect(result).toEqual({ ok: true })
+    expect(order).toEqual(['broker', 'watcher', 'tunnels', 'windows'])
   })
 
   it('aborts the timed-out flush so it cannot complete after the caller cancels', async () => {

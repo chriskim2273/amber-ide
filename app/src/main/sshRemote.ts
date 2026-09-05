@@ -12,6 +12,7 @@
 import { EventEmitter } from 'node:events'
 import { spawn as spawnProcess } from 'node:child_process'
 import { TextDecoder } from 'node:util'
+import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { LAYOUT_FILE_MAX_BYTES } from '../shared/layoutFile'
 
@@ -28,6 +29,9 @@ export const REMOTE_LAYOUT_PROBE =
 /** The remote sidecar and the local CAS share one ingress byte contract. */
 export const REMOTE_LAYOUT_PROBE_MAX_BYTES = LAYOUT_FILE_MAX_BYTES
 export const SSH_PROBE_TIMEOUT_MS = 15_000
+export const SSH_TUNNEL_READY_TIMEOUT_MS = 15_000
+export const SSH_TUNNEL_READY_POLL_MS = 100
+export const SSH_TUNNEL_STDERR_MAX_BYTES = 64 * 1024
 const SSH_PROBE_DEFAULT_MAX_BYTES = 64 * 1024
 
 export interface Argv {
@@ -160,6 +164,96 @@ export function runSshProbe(
   } catch (error) {
     return Promise.resolve({ out: '', err: boundedErrorText(error, options.maxBytes ?? SSH_PROBE_DEFAULT_MAX_BYTES), code: -1, error: 'SSH_PROBE_FAILED' })
   }
+}
+
+export interface SshTunnelReadinessStream extends EventEmitter {
+  resume?: () => void
+}
+
+export interface SshTunnelReadinessChild {
+  stderr?: SshTunnelReadinessStream | null
+  on(event: string, listener: (...args: unknown[]) => void): this
+  removeListener(event: string, listener: (...args: unknown[]) => void): this
+}
+
+export interface SshTunnelReadinessOptions {
+  timeoutMs?: number
+  pollMs?: number
+  maxStderrBytes?: number
+  exists?: (path: string) => boolean
+}
+
+export interface SshTunnelReadinessResult {
+  ready: boolean
+  reason: 'ready' | 'exit' | 'error' | 'timeout'
+  stderr: string
+}
+
+/**
+ * Wait for a forwarding child to publish its local socket.
+ *
+ * This owns every listener/timer used while waiting. Once the socket appears,
+ * stderr capture is removed and the stream is resumed in discard mode so a
+ * noisy ssh child cannot fill its pipe after readiness. The retained detail is
+ * byte-bounded for every terminal outcome.
+ */
+export function waitForSshTunnelReady(
+  child: SshTunnelReadinessChild,
+  socket: string,
+  options: SshTunnelReadinessOptions = {},
+): Promise<SshTunnelReadinessResult> {
+  const timeoutMs = Math.max(1, Math.floor(options.timeoutMs ?? SSH_TUNNEL_READY_TIMEOUT_MS))
+  const pollMs = Math.max(1, Math.floor(options.pollMs ?? SSH_TUNNEL_READY_POLL_MS))
+  const maxStderrBytes = Math.max(0, Math.floor(options.maxStderrBytes ?? SSH_TUNNEL_STDERR_MAX_BYTES))
+  const pathExists = options.exists ?? existsSync
+  return new Promise((resolve) => {
+    let settled = false
+    let poll: NodeJS.Timeout | undefined
+    let timer: NodeJS.Timeout | undefined
+    let stderrBytes = 0
+    const stderrChunks: Buffer[] = []
+
+    const onStderr = (chunk: unknown): void => {
+      if (settled || stderrBytes >= maxStderrBytes) return
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk))
+      const keep = Math.min(bytes.byteLength, maxStderrBytes - stderrBytes)
+      if (keep > 0) {
+        stderrChunks.push(bytes.subarray(0, keep))
+        stderrBytes += keep
+      }
+    }
+    const stderrText = (): string => Buffer.concat(stderrChunks).toString('utf8')
+    const cleanup = (): void => {
+      if (poll) clearInterval(poll)
+      if (timer) clearTimeout(timer)
+      child.removeListener('exit', onExit)
+      child.removeListener('error', onError)
+      child.stderr?.removeListener('data', onStderr)
+      // Keep draining the pipe after the bounded capture ends. Without this,
+      // ssh can block on a late diagnostic even though readiness already won.
+      child.stderr?.resume?.()
+    }
+    const finish = (result: Omit<SshTunnelReadinessResult, 'stderr'>): void => {
+      if (settled) return
+      settled = true
+      cleanup()
+      resolve({ ...result, stderr: stderrText() })
+    }
+    const onExit = (): void => finish({ ready: false, reason: 'exit' })
+    const onError = (): void => finish({ ready: false, reason: 'error' })
+    const check = (): void => {
+      if (!settled && pathExists(socket)) finish({ ready: true, reason: 'ready' })
+    }
+
+    child.on('exit', onExit)
+    child.on('error', onError)
+    child.stderr?.on('data', onStderr)
+    poll = setInterval(check, pollMs)
+    timer = setTimeout(() => finish({ ready: false, reason: 'timeout' }), timeoutMs)
+    poll.unref()
+    timer.unref()
+    check()
+  })
 }
 
 export type SshRemoteSupport =
