@@ -2,6 +2,7 @@
 //! wire protocol, and dispatches to the [`SessionManager`].
 
 use std::io::{Read, Write};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -495,6 +496,50 @@ fn handle_control(
                     thread::sleep(std::time::Duration::from_millis(20));
                 }
             });
+        }
+        ControlMsg::PiHook {
+            name,
+            event,
+            session_id,
+            session_file,
+            cwd,
+            pid,
+            pid_start_time,
+        } => {
+            // Pi hooks are deliberately not fire-and-forget: a just-spawned
+            // supervisor may not yet be registered, so the hook client retries
+            // only the explicit "not registered yet" error. Every other
+            // process/cwd/path mismatch fails closed and is acknowledged as an
+            // error without touching state.
+            let result = manager.record_pi_hook(
+                &name,
+                &event,
+                &session_id,
+                session_file.as_deref(),
+                Path::new(&cwd),
+                (pid, pid_start_time),
+            );
+            match result {
+                Ok(()) => {
+                    let _ = write_frame(
+                        writer,
+                        &Frame::Control(ControlMsg::PiHookAck { name: name.clone() }),
+                    );
+                    if let Ok(infos) = manager.session_infos() {
+                        if let Some(info) = infos.into_iter().find(|info| info.name == name) {
+                            watchers.broadcast(&ControlMsg::SessionsChanged {
+                                added: vec![info], removed: vec![],
+                            });
+                        }
+                    }
+                }
+                Err(error) => {
+                    let _ = write_frame(
+                        writer,
+                        &Frame::Control(ControlMsg::Error { msg: error.to_string() }),
+                    );
+                }
+            }
         }
         ControlMsg::ReportRunState { name, state, seq } => {
             // A claude session's supervisor reporting its phase. Store it and

@@ -12,7 +12,7 @@ use std::sync::mpsc::SyncSender;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use amber_core::proto::{ControlMsg, RecoveryEvent, SearchResult, SessionInfo};
-use amber_core::state::{Config, SessionKind, SessionMeta, StateStore};
+use amber_core::state::{ClaudeMeta, Config, SessionKind, SessionMeta, StateStore};
 use portable_pty::CommandBuilder;
 
 use crate::cgroup::{CgroupManager, CgroupRole};
@@ -28,6 +28,14 @@ const CHILD_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// render the value
 /// in a header, picker, CLI row, or JSON response.
 const MAX_TITLE_BYTES: usize = 120;
+/// Process names that can own an Amber agent recording. Hook validation uses
+/// the nearest one, not any arbitrary descendant, to keep nested Pi workers
+/// from overwriting the parent pane's conversation.
+const AGENT_PROCESS_NAMES: [&str; 6] = ["claude", "pi", "codex", "opencode", "hermes", "grok"];
+/// A just-spawned supervisor can beat its SessionManager registration to the
+/// first Pi hook. The hook client retries only this transient condition; other
+/// validation failures are permanent and fail closed.
+const PI_HOOK_NOT_REGISTERED: &str = "Pi hook session is not registered yet";
 
 /// `current_exe()` returns a `<path> (deleted)`-suffixed string, forever, once
 /// this process's own backing binary inode is unlinked (e.g. an in-place
@@ -281,6 +289,7 @@ type CpuReconcileHook = Arc<dyn Fn(CpuReconcilePoint, u32) + Send + Sync>;
 /// with no claude before it stops being restored as claude.
 const CLAUDE_ABSENT_THRESHOLD: u32 = 2;
 
+
 /// The memory-budget truth as one struct — the body of `BudgetApplied` and
 /// what `amber ctl budget` prints. All KiB fields are 0/None when the
 /// corresponding limit does not exist.
@@ -333,6 +342,54 @@ fn require_cgroup_aggregate(current_kb: Option<u64>) -> anyhow::Result<u64> {
     current_kb.ok_or_else(|| {
         anyhow::anyhow!("cgroup containment is enabled but aggregate memory.current is unavailable")
     })
+}
+
+/// Validate the process evidence carried by a Pi hook. The hook's pid and
+/// start-time are untrusted claims; the daemon checks both against a fresh
+/// process table and requires that the named process is the nearest supported
+/// agent below the session's pty child.
+fn validate_pi_hook_process(
+    table: &[crate::procinfo::ProcEntry],
+    root_pid: u32,
+    hook_pid: u32,
+    hook_start_time: u64,
+    cwd: &Path,
+) -> anyhow::Result<()> {
+    if hook_start_time == 0 {
+        anyhow::bail!("Pi hook has no process start identity");
+    }
+    let root = table.iter().find(|entry| entry.pid == root_pid)
+        .ok_or_else(|| anyhow::anyhow!("Pi hook pty child is no longer present"))?;
+    if root.comm != "pi" && AGENT_PROCESS_NAMES.contains(&root.comm.as_str()) {
+        anyhow::bail!("Pi hook belongs to another primary agent");
+    }
+    let Some((nearest_pid, nearest_name)) =
+        table.iter().find(|entry| entry.pid == root_pid && entry.comm == "pi")
+            .map(|entry| (entry.pid, entry.comm.clone()))
+            .or_else(|| crate::procinfo::nearest_named_descendant(table, root_pid, &AGENT_PROCESS_NAMES))
+    else {
+        anyhow::bail!("Pi hook has no supported agent ancestor");
+    };
+    if nearest_pid != hook_pid || nearest_name != "pi" {
+        anyhow::bail!("Pi hook is not from the primary Pi process");
+    }
+    let Some(entry) = table.iter().find(|entry| entry.pid == hook_pid) else {
+        anyhow::bail!("Pi hook process is no longer present");
+    };
+    if entry.comm != "pi" {
+        anyhow::bail!("Pi hook process identity is not Pi");
+    }
+    let actual_start_time = crate::procinfo::process_start_time(hook_pid)
+        .ok_or_else(|| anyhow::anyhow!("Pi hook process start identity is unavailable"))?;
+    if actual_start_time != hook_start_time {
+        anyhow::bail!("Pi hook process identity is stale");
+    }
+    let actual_cwd = crate::procinfo::cwd_of(hook_pid)
+        .ok_or_else(|| anyhow::anyhow!("Pi hook process cwd is unavailable"))?;
+    if actual_cwd != cwd {
+        anyhow::bail!("Pi hook cwd does not match the live Pi process");
+    }
+    Ok(())
 }
 
 impl SessionManager {
@@ -1185,6 +1242,36 @@ impl SessionManager {
     ) -> anyhow::Result<SessionMeta> {
         let mut changed = false;
         let mut kind_changed = false;
+        // Pi's source-tagged exact file is stronger than the historical
+        // id-only Claude marker. Promote only complete, unambiguous recordings;
+        // an absent/invalid optional field stays a shell rather than guessing a
+        // conversation on reboot.
+        if meta.kind == SessionKind::Shell {
+            match self.store.read_claude(&meta.name) {
+                Ok(Some(recording)) if recording.agent_kind == Some(SessionKind::Pi) => {
+                    // A source-tagged Pi record must never be interpreted as
+                    // Claude, even when its file has since been removed.
+                    meta.resume_as_claude = false;
+                    changed = true;
+                    if crate::pi::valid_recording(&recording) {
+                        meta.kind = SessionKind::Pi;
+                        meta.cwd = recording.cwd;
+                        kind_changed = true;
+                    } else {
+                        eprintln!("amber: invalid Pi recovery file for {}; leaving shell", meta.name);
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    eprintln!(
+                        "amber daemon: ignoring unreadable Pi recording for {}: {error}",
+                        meta.name
+                    );
+                    meta.resume_as_claude = false;
+                    changed = true;
+                }
+            }
+        }
         if meta.resume_as_claude {
             kind_changed = true;
             if meta.kind == SessionKind::Shell {
@@ -1280,6 +1367,103 @@ impl SessionManager {
 
     pub fn session(&self, name: &str) -> Option<Arc<PtySession>> {
         self.sessions.lock().unwrap().get(name).cloned()
+    }
+
+    /// Record an exact Pi session file after validating that the hook really
+    /// came from this pane's primary Pi process. This is the only daemon path
+    /// that may promote a plain shell to `SessionKind::Pi` on reboot.
+    pub fn record_pi_hook(
+        &self,
+        name: &str,
+        event: &str,
+        session_id: &str,
+        session_file: Option<&str>,
+        cwd: &Path,
+        hook_identity: (u32, u64),
+    ) -> anyhow::Result<()> {
+        let (hook_pid, hook_start_time) = hook_identity;
+        let _maintenance = self.maintenance.lock().unwrap();
+        let session = self.sessions.lock().unwrap().get(name).cloned().ok_or_else(|| {
+            anyhow::anyhow!("{PI_HOOK_NOT_REGISTERED}: {name}")
+        })?;
+        let root_pid = session
+            .pid()
+            .ok_or_else(|| anyhow::anyhow!("Pi hook session has no live pty child"))?;
+        let table = crate::procinfo::process_table_lite();
+        validate_pi_hook_process(&table, root_pid, hook_pid, hook_start_time, cwd)?;
+
+        let mut meta = self
+            .store
+            .read_session(name)?
+            .ok_or_else(|| anyhow::anyhow!("{PI_HOOK_NOT_REGISTERED}: {name}"))?;
+        if !matches!(meta.kind, SessionKind::Shell | SessionKind::Pi) {
+            anyhow::bail!("Pi hook belongs to a non-Pi session kind");
+        }
+        let path = session_file
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow::anyhow!("Pi hook has no exact session file"))?;
+        if !crate::pi::is_session_file(session_file.unwrap_or_default()) {
+            anyhow::bail!("Pi hook session file is not an absolute JSONL path");
+        }
+        if cwd.as_os_str().is_empty() || !cwd.is_absolute() {
+            anyhow::bail!("Pi hook cwd is not absolute");
+        }
+        if !crate::pi::is_session_id(session_id) {
+            anyhow::bail!("Pi hook session id is invalid");
+        }
+
+        match event {
+            "start" => {
+                let recording = ClaudeMeta {
+                    session_id: session_id.to_string(),
+                    cwd: cwd.to_path_buf(),
+                    updated: Self::now(),
+                    session_file: Some(path),
+                    agent_kind: Some(SessionKind::Pi),
+                };
+                // Write the exact recording first. If the daemon dies before
+                // the session metadata update, restore normalization below can
+                // still recover the Pi kind and cwd from this authoritative
+                // hook record.
+                self.store.write_claude(name, &recording)?;
+                if meta.cwd != cwd {
+                    meta.cwd = cwd.to_path_buf();
+                    meta.updated = Self::now();
+                    self.store.write_session(&meta)?;
+                }
+                Ok(())
+            }
+            "quit" => {
+                let Some(current) = self.store.read_claude(name)? else {
+                    anyhow::bail!("Pi hook quit has no existing recording");
+                };
+                if current.agent_kind != Some(SessionKind::Pi)
+                    || current.session_file.as_deref() != Some(path.as_path())
+                    || current.session_id != session_id
+                {
+                    anyhow::bail!("Pi hook quit does not match the current recording");
+                }
+                let cleared = ClaudeMeta {
+                    session_id: current.session_id,
+                    cwd: current.cwd,
+                    updated: Self::now(),
+                    session_file: None,
+                    agent_kind: None,
+                };
+                self.store.write_claude(name, &cleared)?;
+                if meta.kind == SessionKind::Pi || meta.resume_as_claude {
+                    meta.resume_as_claude = false;
+                    // The pty remains alive and falls back to a shell. Marking
+                    // it now is what prevents the next daemon boot from
+                    // resurrecting a deliberately quit Pi conversation.
+                    meta.kind = SessionKind::Shell;
+                    meta.updated = Self::now();
+                    self.store.write_session(&meta)?;
+                }
+                Ok(())
+            }
+            _ => anyhow::bail!("unknown Pi hook event"),
+        }
     }
 
     #[cfg(windows)]
@@ -2488,7 +2672,7 @@ mod tests {
         mgr.store
             .write_claude(
                 name,
-                &amber_core::state::ClaudeMeta {
+                &amber_core::state::ClaudeMeta { session_file: None, agent_kind: None,
                     session_id: format!("resume-{name}"),
                     cwd: cwd.to_path_buf(),
                     updated: 1,
@@ -3664,7 +3848,7 @@ mod tests {
         mgr.store
             .write_claude(
                 "agent",
-                &amber_core::state::ClaudeMeta {
+                &amber_core::state::ClaudeMeta { session_file: None, agent_kind: None,
                     session_id: "resume-id".into(),
                     cwd: dir.path().to_path_buf(),
                     updated: 1,
@@ -3830,7 +4014,7 @@ mod tests {
         mgr.store
             .write_claude(
                 "agent",
-                &amber_core::state::ClaudeMeta {
+                &amber_core::state::ClaudeMeta { session_file: None, agent_kind: None,
                     session_id: "resume-id".into(),
                     cwd: dir.path().to_path_buf(),
                     updated: 1,
@@ -4251,7 +4435,7 @@ mod tests {
         mgr.store
             .write_claude(
                 "amber-1-1-0-c",
-                &amber_core::state::ClaudeMeta {
+                &amber_core::state::ClaudeMeta { session_file: None, agent_kind: None,
                     session_id: "conv-42".to_string(),
                     cwd: dir.path().to_path_buf(),
                     updated: 1,
@@ -4486,7 +4670,7 @@ mod tests {
         mgr.store
             .write_claude(
                 from,
-                &amber_core::state::ClaudeMeta {
+                &amber_core::state::ClaudeMeta { session_file: None, agent_kind: None,
                     session_id: "conv-partial".to_string(),
                     cwd: dir.path().to_path_buf(),
                     updated: 1,
@@ -4525,7 +4709,7 @@ mod tests {
         mgr.store
             .write_claude(
                 from,
-                &amber_core::state::ClaudeMeta {
+                &amber_core::state::ClaudeMeta { session_file: None, agent_kind: None,
                     session_id: "conv-prepare".to_string(),
                     cwd: dir.path().to_path_buf(),
                     updated: 1,
@@ -4559,7 +4743,7 @@ mod tests {
         mgr.store
             .write_claude(
                 from,
-                &amber_core::state::ClaudeMeta {
+                &amber_core::state::ClaudeMeta { session_file: None, agent_kind: None,
                     session_id: "conv-restore".to_string(),
                     cwd: dir.path().to_path_buf(),
                     updated: 1,
@@ -4615,7 +4799,7 @@ mod tests {
         mgr.store
             .write_claude(
                 from,
-                &amber_core::state::ClaudeMeta {
+                &amber_core::state::ClaudeMeta { session_file: None, agent_kind: None,
                     session_id: "conv-stale".into(),
                     cwd: dir.path().to_path_buf(),
                     updated: 1,

@@ -155,7 +155,7 @@ fn active_pre_recorded_session_is_resumed_again_after_crash() {
     StateStore::new(root)
         .write_claude(
             "work",
-            &ClaudeMeta {
+            &ClaudeMeta { session_file: None, agent_kind: None,
                 session_id: "--last".into(),
                 cwd: root.into(),
                 updated: 0,

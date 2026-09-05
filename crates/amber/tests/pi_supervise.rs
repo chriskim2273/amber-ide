@@ -73,7 +73,7 @@ fn pi_agent_child_is_told_its_session_is_remote() {
 
 #[cfg(unix)]
 #[test]
-fn pi_does_not_inherit_remote_env_when_it_prints_a_fresh_start() {
+fn pi_legacy_id_only_recording_is_not_guessed_or_replaced_with_fresh() {
     // A fresh Pi session (no recorded id) spawns with no `--session` arg, but
     // still carries the remote signal: the OSC 52 lever is about the *client*
     // topology (a pane may be viewed over the socket), not whether the
@@ -83,7 +83,7 @@ fn pi_does_not_inherit_remote_env_when_it_prints_a_fresh_start() {
     let pi = write_fake_pi(root, "pi-session-abc");
     StateStore::new(root).write_claude(
         "work",
-        &ClaudeMeta {
+        &ClaudeMeta { session_file: None, agent_kind: None,
             session_id: "pi-session-abc".into(),
             cwd: root.into(),
             updated: 0,
@@ -104,9 +104,6 @@ fn pi_does_not_inherit_remote_env_when_it_prints_a_fresh_start() {
     )
     .unwrap();
 
-    assert_eq!(outcome, SuperviseOutcome::CleanExit);
-    let argv = fs::read_to_string(root.join("pi_argv.log")).unwrap();
-    assert!(argv.contains("--session pi-session-abc"), "got:\n{argv}");
-    let env = fs::read_to_string(root.join("pi_env.log")).unwrap();
-    assert!(env.contains("ssh_connection=amber-daemon"), "got:\n{env}");
+    assert_eq!(outcome, SuperviseOutcome::Exhausted);
+    assert!(!root.join("pi_argv.log").exists(), "ambiguous recording must not launch Pi");
 }

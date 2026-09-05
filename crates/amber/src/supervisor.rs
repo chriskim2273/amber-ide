@@ -177,13 +177,23 @@ pub fn supervise_agent(
             continue 'sup;
         }
         let recording = store.read_claude(name)?;
+        if matches!(agent, Agent::Pi)
+            && recording.as_ref().is_some_and(|meta| !pi::valid_recording(meta))
+        {
+            eprintln!("amber: Pi recording for {name} is ambiguous, missing, or invalid; leaving a shell (no fresh fallback)");
+            return Ok(SuperviseOutcome::Exhausted);
+        }
         let recording_key = recording.as_ref().map(|meta| {
             (
                 meta.session_id.clone(),
                 if matches!(agent, Agent::Codex | Agent::Pi) {
-                    meta.updated
+                    (
+                        meta.updated,
+                        meta.session_file.clone(),
+                        meta.cwd.clone(),
+                    )
                 } else {
-                    0
+                    (0, None, PathBuf::new())
                 },
             )
         });
@@ -209,7 +219,10 @@ pub fn supervise_agent(
                 opencode::opencode_argv(&select_opencode_start(session_id, escalation))
             }
             Agent::Hermes => hermes::hermes_argv(&select_hermes_start(session_id, escalation)),
-            Agent::Pi => pi::pi_argv(&select_pi_start(session_id, escalation)),
+            Agent::Pi => pi::pi_argv(&select_pi_start(
+                recording.as_ref().and_then(|meta| meta.session_file.as_deref()),
+                escalation,
+            )),
         };
 
         // Spawn (not `.status()`) so the run is interruptible: a SIGUSR1-set
@@ -219,7 +232,9 @@ pub fn supervise_agent(
         // silently dies", spec §6.2).
         let mut command = agent_command(agent_path, &argv, slot)?;
         command
-            .current_dir(cwd)
+            .current_dir(if matches!(agent, Agent::Pi) {
+                recording.as_ref().map_or(cwd, |meta| meta.cwd.as_path())
+            } else { cwd })
             .env("AMBER_SESSION", name)
             .env("AMBER_STATE_DIR", root);
         if let Ok(exe) = crate::manager::resolve_command_exe() {
@@ -502,9 +517,13 @@ fn select_hermes_start(session_id: Option<&str>, escalation: u32) -> hermes::Her
     }
 }
 
-fn select_pi_start(session_id: Option<&str>, escalation: u32) -> pi::PiStart {
-    match (session_id, escalation) {
-        (Some(id), 0) if pi::is_session_id(id) => pi::PiStart::Resume(id.to_string()),
+fn select_pi_start(session_file: Option<&Path>, _escalation: u32) -> pi::PiStart {
+    // A failed resume may retry the SAME file, but must never silently create
+    // a different conversation. The enclosing loop bounds the crash budget.
+    match session_file {
+        Some(path) if pi::is_session_file(&path.to_string_lossy()) => {
+            pi::PiStart::Resume(path.to_string_lossy().into_owned())
+        }
         _ => pi::PiStart::Fresh,
     }
 }
@@ -551,6 +570,8 @@ fn select_grok_start(
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_secs())
                         .unwrap_or(0),
+                    session_file: None,
+                    agent_kind: None,
                 },
             )?;
             Ok(grok::GrokStart::Fresh(id))
@@ -1534,11 +1555,19 @@ mod tests {
     }
 
     #[test]
-    fn pi_resumes_only_a_valid_recording_on_its_first_attempt() {
-        let id = "0198f8ea-9c13-7000-a123-0123456789ab";
-        assert_eq!(select_pi_start(Some(id), 0), crate::pi::PiStart::Resume(id.into()));
-        assert_eq!(select_pi_start(Some(id), 1), crate::pi::PiStart::Fresh);
-        assert_eq!(select_pi_start(Some("--continue"), 0), crate::pi::PiStart::Fresh);
+    fn pi_resumes_only_an_exact_file_on_its_first_attempt() {
+        let path = Path::new(
+            "/home/user/.pi/agent/sessions/--home-user--/2026-08-27_0198f8ea.jsonl",
+        );
+        assert_eq!(
+            select_pi_start(Some(path), 0),
+            crate::pi::PiStart::Resume(path.to_string_lossy().into_owned())
+        );
+        assert_eq!(select_pi_start(Some(path), 1), crate::pi::PiStart::Resume(path.to_string_lossy().into_owned()));
+        assert_eq!(
+            select_pi_start(Some(Path::new("--continue")), 0),
+            crate::pi::PiStart::Fresh
+        );
     }
 
     #[test]

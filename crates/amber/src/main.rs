@@ -10,7 +10,7 @@ use amber::attach;
 use amber::claude;
 use amber::supervisor;
 use amber::transport::{self, LocalStream};
-use amber_core::proto::{self, ControlMsg, Decoder, Frame, ProviderUsage};
+use amber_core::proto::{self, ControlMsg, Decoded, Decoder, Frame, ProviderUsage};
 use amber_core::state::StateStore;
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -1024,29 +1024,163 @@ fn run_supervisor(name: &str, kind: &str, slot: Option<u32>) -> anyhow::Result<(
     supervisor::run_session(&root, name, &socket, kind, slot)
 }
 
-/// `SessionStart` hook: read the hook JSON from stdin and record the
-/// rotating session id. A hook failure must never crash claude, so errors
-/// are reported to stderr and swallowed (always exit 0).
+#[derive(serde::Deserialize)]
+struct HookInput {
+    #[serde(default)]
+    event: Option<String>,
+    #[serde(default)]
+    agent_kind: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    session_file: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[cfg(not(unix))]
+    #[serde(default)]
+    pid: Option<u32>,
+}
+
+/// `SessionStart`/`session_shutdown` hook: legacy agents retain their existing
+/// direct JSON recording, while Pi sends an exact file + process identity to
+/// the daemon. A hook failure must never crash an agent, so errors are reported
+/// to stderr and swallowed (always exit 0).
 fn run_hook() -> anyhow::Result<()> {
     let name = std::env::var("AMBER_SESSION").unwrap_or_default();
-    // No AMBER_SESSION => a claude run outside an amber pane (the global hook
-    // fires for every claude). Nothing to record; exit cleanly.
+    // No AMBER_SESSION => a global hook fired outside an amber pane. Nothing to
+    // record; exit cleanly.
     if name.is_empty() {
         return Ok(());
     }
-    let root = supervisor_root()?;
 
     let mut input = String::new();
     if let Err(e) = std::io::stdin().read_to_string(&mut input) {
         eprintln!("amber hook: failed to read stdin: {e}");
         return Ok(());
     }
+    let parsed: HookInput = match serde_json::from_str(&input) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            eprintln!("amber hook: invalid hook JSON: {error}");
+            return Ok(());
+        }
+    };
 
+    if parsed.agent_kind.as_deref() == Some("pi") {
+        let root = supervisor_root()?;
+        let pid = {
+            #[cfg(unix)]
+            {
+                // The hook payload's pid is only informational. The process
+                // that actually launched `amber hook` is the OS parent; using
+                // getppid prevents a forged JSON field from naming another Pi.
+                // SAFETY: getppid has no preconditions and cannot fail.
+                unsafe { libc::getppid() as u32 }
+            }
+            #[cfg(not(unix))]
+            {
+                parsed.pid.unwrap_or(0)
+            }
+        };
+        let pid_start_time = amber::procinfo::process_start_time(pid).unwrap_or(0);
+        let hook = ControlMsg::PiHook {
+            name,
+            event: parsed.event.unwrap_or_else(|| "start".to_string()),
+            session_id: parsed.session_id.unwrap_or_default(),
+            session_file: parsed.session_file,
+            cwd: parsed.cwd.unwrap_or_default(),
+            pid,
+            pid_start_time,
+        };
+        if let Err(error) = report_pi_hook(&root, hook) {
+            eprintln!("amber hook: Pi recording rejected: {error}");
+        }
+        return Ok(());
+    }
+
+    // Old Pi extensions (and other agent hooks inside Pi workers) still send
+    // untagged JSON. Never let those bypass primary-process validation and
+    // overwrite the shared file through the legacy Claude path.
+    #[cfg(unix)]
+    {
+        let parent = unsafe { libc::getppid() as u32 };
+        if amber::procinfo::argv0_basename(parent).as_deref() == Some("pi") {
+            eprintln!("amber hook: ignored legacy Pi hook; reload the Amber extension");
+            return Ok(());
+        }
+    }
+    let root = supervisor_root()?;
     let store = StateStore::new(root);
+    if store.read_claude(&name)?.is_some_and(|recording| recording.agent_kind == Some(amber_core::state::SessionKind::Pi)) {
+        eprintln!("amber hook: legacy hook cannot replace a validated Pi recording");
+        return Ok(());
+    }
     if let Err(e) = claude::record_session(&store, &name, &input) {
         eprintln!("amber hook: failed to record session: {e}");
     }
     Ok(())
+}
+
+/// Send one Pi hook to the daemon and retry only while the just-created
+/// supervisor has not entered the manager's live table. No Pi hook ever writes
+/// state directly, so daemon ownership and rename/remove serialization remain
+/// authoritative.
+fn report_pi_hook(root: &Path, hook: ControlMsg) -> anyhow::Result<()> {
+    const RETRY_WINDOW: Duration = Duration::from_secs(2);
+    const RETRY_DELAY: Duration = Duration::from_millis(25);
+    let socket = supervisor_socket(root)?;
+    let deadline = std::time::Instant::now() + RETRY_WINDOW;
+    loop {
+        match try_report_pi_hook(&socket, &hook) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let message = error.to_string();
+                if !message.contains("Pi hook session is not registered yet")
+                    && !message.contains("timed out")
+                    && !message.contains("No such file")
+                    && !message.contains("Connection refused")
+                {
+                    return Err(error);
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(error);
+                }
+                std::thread::sleep(RETRY_DELAY);
+            }
+        }
+    }
+}
+
+fn try_report_pi_hook(socket: &Path, hook: &ControlMsg) -> anyhow::Result<()> {
+    let mut stream = transport::connect(socket)?;
+    stream.set_write_timeout(Some(Duration::from_secs(1)))?;
+    let frame = proto::encode(&Frame::Control(hook.clone()));
+    stream.write_all(&frame)?;
+    stream.flush()?;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    let mut decoder = Decoder::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        while let Some(decoded) = decoder.next_decoded()? {
+            match decoded {
+                Decoded::Frame(Frame::Control(ControlMsg::PiHookAck { .. })) => return Ok(()),
+                Decoded::Frame(Frame::Control(ControlMsg::Error { msg })) => {
+                    anyhow::bail!("daemon rejected Pi hook: {msg}")
+                }
+                Decoded::Frame(_) | Decoded::UndecodableControl(_) => {}
+            }
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!("timed out waiting for Pi hook acknowledgement");
+        }
+        let n = stream.read_with_timeout(&mut buf, remaining)?;
+        if n == 0 {
+            anyhow::bail!("daemon closed Pi hook connection");
+        }
+        decoder.feed(&buf[..n]);
+    }
 }
 
 fn run_handoff(session_id: &str) -> anyhow::Result<()> {

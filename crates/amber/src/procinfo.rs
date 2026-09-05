@@ -52,30 +52,77 @@ pub fn subtree_rss_kb(table: &[ProcEntry], root: u32) -> u64 {
     total
 }
 
-/// Is any process named `claude` a descendant of `root` within `table`?
-/// Builds a pid->ppid map and walks each claude's ancestor chain (bounded 64
-/// deep, stopping at pid <= 1). Pure over `table` — no syscalls.
-pub fn claude_descends_from_table(table: &[ProcEntry], root: u32) -> bool {
-    use std::collections::HashMap;
-    let mut ppid_of: HashMap<u32, u32> = HashMap::with_capacity(table.len());
-    let mut claude_pids: Vec<u32> = Vec::new();
+/// Return the nearest named descendant of `root`, together with its pid.
+///
+/// The nearest process is the pane's primary agent. A Pi process may launch a
+/// nested Pi/Claude worker, but that worker must not be allowed to replace the
+/// pane's recording. If two different named agents occur at the same nearest
+/// depth, the result is ambiguous and returns `None` rather than guessing.
+/// Pure over `table`; the bounded breadth-first walk also terminates on malformed
+/// parent cycles.
+pub fn nearest_named_descendant(
+    table: &[ProcEntry],
+    root: u32,
+    names: &[&str],
+) -> Option<(u32, String)> {
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    let mut children: HashMap<u32, Vec<&ProcEntry>> = HashMap::with_capacity(table.len());
     for entry in table {
-        ppid_of.insert(entry.pid, entry.ppid);
-        if entry.comm == "claude" {
-            claude_pids.push(entry.pid);
+        if entry.pid != entry.ppid {
+            children.entry(entry.ppid).or_default().push(entry);
         }
     }
-    for &cp in &claude_pids {
-        let mut cur = cp;
-        for _ in 0..64 {
-            match ppid_of.get(&cur) {
-                Some(&pp) if pp == root => return true,
-                Some(&pp) if pp > 1 => cur = pp,
-                _ => break,
+
+    let mut seen = HashSet::from([root]);
+    let mut queue = VecDeque::from([(root, 0usize)]);
+    let mut nearest_depth = None;
+    let mut nearest: Option<(u32, String)> = None;
+    let mut conflict = false;
+
+    while let Some((pid, depth)) = queue.pop_front() {
+        if nearest_depth.is_some_and(|found| depth >= found) {
+            continue;
+        }
+        for child in children.get(&pid).map(Vec::as_slice).unwrap_or(&[]) {
+            if !seen.insert(child.pid) {
+                continue;
+            }
+            let child_depth = depth + 1;
+            if child_depth > 64 {
+                continue;
+            }
+            if names.contains(&child.comm.as_str()) {
+                match nearest_depth {
+                    None => {
+                        nearest_depth = Some(child_depth);
+                        nearest = Some((child.pid, child.comm.clone()));
+                        conflict = false;
+                    }
+                    Some(found) if child_depth < found => {
+                        nearest_depth = Some(child_depth);
+                        nearest = Some((child.pid, child.comm.clone()));
+                        conflict = false;
+                    }
+                    Some(found) if child_depth == found => {
+                        conflict = true;
+                    }
+                    Some(_) => {}
+                }
+            }
+            if nearest_depth.is_none_or(|found| child_depth < found) {
+                queue.push_back((child.pid, child_depth));
             }
         }
     }
-    false
+
+    (!conflict).then_some(nearest).flatten()
+}
+
+/// Is any process named `claude` a descendant of `root` within `table`?
+/// Kept as the historical broad query for callers that only need presence.
+pub fn claude_descends_from_table(table: &[ProcEntry], root: u32) -> bool {
+    nearest_named_descendant(table, root, &["claude"]).is_some()
 }
 
 /// Every descendant of `root` in `table`, deepest-last, EXCLUDING `root`.
@@ -221,6 +268,15 @@ fn read_ppid_linux(pid: u32) -> Option<u32> {
     stat[close + 1..].split_whitespace().nth(1)?.parse::<u32>().ok()
 }
 
+/// Kernel process-start identity used to reject a stale hook after PID reuse.
+/// Linux reports clock ticks since boot in `/proc/<pid>/stat` field 22.
+#[cfg(target_os = "linux")]
+pub fn process_start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let close = stat.rfind(')')?;
+    stat[close + 1..].split_whitespace().nth(19)?.parse::<u64>().ok()
+}
+
 #[cfg(target_os = "linux")]
 pub fn cwd_of(pid: u32) -> Option<PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
@@ -228,6 +284,11 @@ pub fn cwd_of(pid: u32) -> Option<PathBuf> {
 
 #[cfg(target_os = "linux")]
 pub fn argv0_basename(pid: u32) -> Option<String> {
+    // Pi sets process.title; support its comm without changing the historical
+    // argv0-based detection of other agents (comm can be truncated to 15 bytes).
+    if std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|s| s.trim() == "pi") {
+        return Some("pi".to_string());
+    }
     let bytes = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
     let s = String::from_utf8_lossy(&bytes);
     let argv0 = s.split('\0').next().unwrap_or("");
@@ -356,6 +417,14 @@ fn read_rss_kb_macos(pid: u32) -> u64 {
 }
 
 #[cfg(target_os = "macos")]
+pub fn process_start_time(pid: u32) -> Option<u64> {
+    let info = bsdinfo(pid)?;
+    let seconds = u64::try_from(info.pbi_start_tvsec).ok()?;
+    let micros = u64::try_from(info.pbi_start_tvusec).ok()?;
+    seconds.checked_mul(1_000_000)?.checked_add(micros)
+}
+
+#[cfg(target_os = "macos")]
 pub fn cwd_of(pid: u32) -> Option<PathBuf> {
     let mut vpi: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
     let sz = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
@@ -411,6 +480,11 @@ pub fn process_table() -> Vec<ProcEntry> {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn process_table_lite() -> Vec<ProcEntry> {
     Vec::new()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn process_start_time(_pid: u32) -> Option<u64> {
+    None
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -540,6 +614,36 @@ mod tests {
     }
 
     #[test]
+    fn nearest_agent_prefers_the_parent_over_a_nested_child() {
+        let t = vec![
+            e(100, 1, "bash"),
+            e(101, 100, "pi"),
+            e(102, 101, "pi"),
+            e(103, 101, "claude"),
+        ];
+        assert_eq!(
+            nearest_named_descendant(&t, 100, &["pi", "claude"]),
+            Some((101, "pi".to_string()))
+        );
+    }
+
+    #[test]
+    fn nearest_agent_rejects_equal_depth_ambiguity() {
+        let t = vec![
+            e(100, 1, "bash"),
+            e(101, 100, "pi"),
+            e(102, 100, "claude"),
+        ];
+        assert_eq!(nearest_named_descendant(&t, 100, &["pi", "claude"]), None);
+    }
+
+    #[test]
+    fn two_sibling_pi_processes_are_ambiguous() {
+        let t = vec![e(100, 1, "bash"), e(101, 100, "pi"), e(102, 100, "pi")];
+        assert_eq!(nearest_named_descendant(&t, 100, &["pi"]), None);
+    }
+
+    #[test]
     fn direct_child_claude_is_detected() {
         let t = vec![e(100, 1, "bash"), e(101, 100, "claude")];
         assert!(claude_descends_from_table(&t, 100));
@@ -629,10 +733,11 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn process_table_contains_self_with_a_ppid() {
+    fn process_table_contains_self_with_a_ppid_and_start_identity() {
         let me = std::process::id();
         let table = process_table();
         let mine = table.iter().find(|e| e.pid == me).expect("self in table");
         assert!(mine.ppid >= 1);
+        assert!(process_start_time(me).is_some());
     }
 }

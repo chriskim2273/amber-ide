@@ -92,6 +92,9 @@ fn refreshed_updated(previous: Option<u64>, current: u64) -> u64 {
 /// `record_session_may_reject_a_fast_legitimate_recovery` below.)
 pub fn record_session(store: &StateStore, session_name: &str, hook_stdin: &str) -> anyhow::Result<()> {
     let v: serde_json::Value = serde_json::from_str(hook_stdin)?;
+    if v.get("agent_kind").and_then(|kind| kind.as_str()) == Some("pi") {
+        anyhow::bail!("Pi hooks must be recorded through the daemon");
+    }
     let session_id = v
         .get("session_id")
         .and_then(|s| s.as_str())
@@ -122,6 +125,8 @@ pub fn record_session(store: &StateStore, session_name: &str, hook_stdin: &str) 
             session_id,
             cwd,
             updated,
+            session_file: None,
+            agent_kind: None,
         },
     )
 }
@@ -510,7 +515,7 @@ mod tests {
         store
             .write_claude(
                 "w",
-                &ClaudeMeta {
+                &ClaudeMeta { session_file: None, agent_kind: None,
                     session_id: "same-id".into(),
                     cwd: "/a".into(),
                     updated: previous_updated,
@@ -522,7 +527,7 @@ mod tests {
 
         assert_eq!(
             store.read_claude("w").unwrap().unwrap(),
-            ClaudeMeta {
+            ClaudeMeta { session_file: None, agent_kind: None,
                 session_id: "same-id".into(),
                 cwd: "/a".into(),
                 updated: previous_updated + 1,

@@ -941,7 +941,7 @@ mod tests {
         store
             .write_claude(
                 name,
-                &ClaudeMeta {
+                &ClaudeMeta { session_file: None, agent_kind: None,
                     session_id: "resume-id".into(),
                     cwd: dir.path().to_path_buf(),
                     updated: 1,
@@ -1114,7 +1114,7 @@ mod tests {
         store
             .write_claude(
                 name,
-                &ClaudeMeta {
+                &ClaudeMeta { session_file: None, agent_kind: None,
                     session_id: "resume-id".into(),
                     cwd: PathBuf::from(dir.path()),
                     updated: 1,

@@ -650,13 +650,36 @@ impl PtySession {
     ///
     /// The snapshot asks this for every session, and building the table is the
     /// expensive part (a full `/proc` walk). Taking it once per snapshot instead
-    /// of once per session turns N scans into one — with a dozen panes that was
-    /// the difference between a ~3.5 s freeze and a few tens of milliseconds.
+    /// of once per session turns N scans into one. Only the nearest supported
+    /// agent counts: a Claude/Pi subagent launched by the primary agent must not
+    /// reclassify the pane or replace its restore record.
     pub fn is_running_claude_in(&self, table: &[crate::procinfo::ProcEntry]) -> bool {
-        match self.pid {
-            Some(pid) => crate::procinfo::claude_descends_from_table(table, pid),
-            None => false,
-        }
+        self.primary_agent_in(table) == Some("claude")
+    }
+
+    /// True when Pi is the nearest supported coding agent below this pane's pty
+    /// child. This is deliberately stricter than “any Pi descendant” so a
+    /// nested Pi process cannot overwrite the parent conversation's recording.
+    pub fn is_running_pi_in(&self, table: &[crate::procinfo::ProcEntry]) -> bool {
+        self.primary_agent_in(table) == Some("pi")
+    }
+
+    /// Return the nearest supported agent's process name. The daemon uses the
+    /// same ordering for hand-started detection and hook validation.
+    pub fn primary_agent_in(&self, table: &[crate::procinfo::ProcEntry]) -> Option<&'static str> {
+        const AGENTS: [&str; 6] = ["claude", "pi", "codex", "opencode", "hermes", "grok"];
+        let pid = self.pid?;
+        crate::procinfo::nearest_named_descendant(table, pid, &AGENTS)
+            .map(|(_, name)| name)
+            .and_then(|name| match name.as_str() {
+                "claude" => Some("claude"),
+                "pi" => Some("pi"),
+                "codex" => Some("codex"),
+                "opencode" => Some("opencode"),
+                "hermes" => Some("hermes"),
+                "grok" => Some("grok"),
+                _ => None,
+            })
     }
 
     /// Write bytes to the child's stdin.

@@ -4,7 +4,7 @@
 //! ```text
 //! config.toml
 //! sessions/<name>.json     { name, cwd, kind: "shell"|"claude"|"grok"|"codex"|"opencode"|"hermes"|"pi", updated }
-//! claude/<name>.json       { session_id, cwd, updated }   (all agent ids live here)
+//! claude/<name>.json       { session_id, cwd, updated, session_file?, agent_kind? }   (all agent ids live here)
 //! scrollback/<name>.bin     raw bytes
 //! ```
 //! All writes are atomic: write to a `.tmp` file in the same directory as the
@@ -107,6 +107,15 @@ pub struct ClaudeMeta {
     pub session_id: String,
     pub cwd: PathBuf,
     pub updated: u64,
+    /// Exact persisted Pi JSONL file. A Pi id alone is ambiguous because Pi
+    /// accepts id prefixes and forked sessions share an id-shaped namespace.
+    /// Optional for backward compatibility with older agent recordings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_file: Option<PathBuf>,
+    /// Agent that emitted this recording. Only Pi currently source-tags its
+    /// hook; absent keeps legacy Claude/Codex/OpenCode/Hermes recordings valid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_kind: Option<SessionKind>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1248,7 +1257,7 @@ mod tests {
         // `--resume` id (and memory_candidates would misjudge parkability).
         let dir = tempdir().unwrap();
         let store = StateStore::new(dir.path());
-        let mk = |id: &str| ClaudeMeta {
+        let mk = |id: &str| ClaudeMeta { session_file: None, agent_kind: None,
             session_id: id.to_string(),
             cwd: PathBuf::from("/tmp"),
             updated: 1,
@@ -1539,7 +1548,7 @@ mod tests {
     fn claude_meta_round_trip() {
         let dir = tempdir().unwrap();
         let store = StateStore::new(dir.path());
-        let meta = ClaudeMeta {
+        let meta = ClaudeMeta { session_file: None, agent_kind: None,
             session_id: "sess-123".to_string(),
             cwd: PathBuf::from("/tmp/proj"),
             updated: 1_700_000_001,
@@ -1867,7 +1876,7 @@ mod tests {
         store
             .write_claude(
                 "alpha",
-                &ClaudeMeta {
+                &ClaudeMeta { session_file: None, agent_kind: None,
                     session_id: "sess-1".to_string(),
                     cwd: PathBuf::from("/tmp"),
                     updated: 1,
@@ -1896,7 +1905,7 @@ mod tests {
         store
             .write_claude(
                 "retryable",
-                &ClaudeMeta {
+                &ClaudeMeta { session_file: None, agent_kind: None,
                     session_id: "sess-retry".to_string(),
                     cwd: PathBuf::from("/tmp"),
                     updated: 1,
@@ -1926,7 +1935,7 @@ mod tests {
         store
             .write_claude(
                 "amber-1-1-0-a",
-                &ClaudeMeta {
+                &ClaudeMeta { session_file: None, agent_kind: None,
                     session_id: "sess-1".to_string(),
                     cwd: PathBuf::from("/tmp"),
                     updated: 1,
@@ -2070,7 +2079,7 @@ mod tests {
             store
                 .write_claude(
                     FROM,
-                    &ClaudeMeta {
+                    &ClaudeMeta { session_file: None, agent_kind: None,
                         session_id: "conversation-survives".into(),
                         cwd: PathBuf::from("/tmp/proj"),
                         updated: 1,
@@ -2137,7 +2146,7 @@ mod tests {
             store
                 .write_claude(
                     FROM,
-                    &ClaudeMeta {
+                    &ClaudeMeta { session_file: None, agent_kind: None,
                         session_id: "conversation-survives".to_string(),
                         cwd: PathBuf::from("/tmp/proj"),
                         updated: 1,

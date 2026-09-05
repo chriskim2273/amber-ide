@@ -248,6 +248,24 @@ pub enum ControlMsg {
         #[serde(default, skip_serializing_if = "is_zero")]
         seq: u64,
     },
+    /// A Pi SessionStart/session_shutdown hook report. Unlike the historical
+    /// `amber hook` path, this is validated by the daemon against the live pty
+    /// process tree before the shared recording is changed. The hook process
+    /// supplies its parent Pi pid and start identity; both are claims until
+    /// the daemon matches them to the nearest Pi descendant of this session.
+    PiHook {
+        name: String,
+        event: String,
+        session_id: String,
+        #[serde(default)]
+        session_file: Option<String>,
+        cwd: String,
+        pid: u32,
+        #[serde(default)]
+        pid_start_time: u64,
+    },
+    /// Daemon reply to a validated [`ControlMsg::PiHook`].
+    PiHookAck { name: String },
     /// Supervisor-only registration for the daemon's private control link.
     SupervisorHello { name: String },
     /// Daemon -> registered supervisor only; ignored if a client sends it.

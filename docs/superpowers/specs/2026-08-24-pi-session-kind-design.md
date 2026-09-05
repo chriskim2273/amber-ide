@@ -1,6 +1,53 @@
 # Pi as a session kind — design
 
-**Status:** implemented (2026-08-27).
+**Status:** original Pi-kind support implemented (2026-08-27). Exact-file,
+primary-process reboot correction implemented and privately tested (2026-09-05);
+not yet installed in the running daemon. The correction below supersedes the
+original ID-only hook, resume ladder, and error-handling rules in this document.
+
+## 2026-09-05 reboot correction
+
+The old global hook inherited `AMBER_SESSION` in subagents and overwrote the
+main conversation ID. Shell panes also had no Pi reboot promotion. The fix:
+
+- Adds optional `session_file` and `agent_kind` to the shared recording, keeping
+  old other-agent records readable. Pi hook updates go through daemon `PiHook`
+  requests, validated against the pane's live primary process, process-start
+  identity, and cwd. Nested Pi workers cannot update the record. The CLI uses
+  its actual OS parent rather than trusting the JSON pid. Old untagged Pi hooks
+  are ignored; legacy hooks cannot clobber a validated Pi record.
+- Records the main process's exact file, including legitimate `/fork` or
+  `/resume` switches. No directory-layout heuristic, parent guessing, UUID
+  prefix lookup, or fresh fallback is used to recover an existing recording.
+  Restore checks the bounded JSONL header against the recorded ID. A missing,
+  corrupt, or legacy id-only Pi recording leaves a shell with a diagnostic.
+- A validated Pi recording promotes a shell pane on daemon restore, preserving
+  its recorded cwd. Pi retries the same file within the existing crash budget.
+- The generated hook awaits acknowledgement before Pi can exit. Pi's `quit`
+  shutdown reason also covers TERM/HUP, so separate signal observation (including
+  reversed listener order) prevents reboot from clearing the record. Only a
+  deliberate quit clears it and demotes a supervised Pi pane to shell. Periodic
+  process absence and supervisor exit code 0 are NOT proof of user intent.
+- The daemon publishes changed session metadata through its existing watcher
+  path. No renderer-owned persistence or optimistic grouping is introduced.
+
+Verification: `node --test crates/amber/tests/pi_extension.test.mjs` exercises
+actual generated extension code with stubbed host events/processes. Linux
+`cargo test -p amber --test pi_reboot` runs a real private daemon, socket, hook,
+PTY and supervisor with a fake Pi process: nested current and legacy hooks,
+main fork switch, TERM before daemon shutdown, exact file/cwd restoration, and
+explicit quit followed by immediate restart. It launches no real agent or
+provider calls and isolates HOME/config/state. Full workspace Rust tests and
+warnings-as-errors clippy are required before handoff. Real macOS validation
+and an installed-Pi reboot remain manual, not claimed by the fake fixture.
+
+Activation requires a coordinated daemon upgrade AND refreshed/reloaded Pi
+extensions. Existing contaminated ID-only records are deliberately not
+migrated automatically. Do not restart production expecting this patch alone
+to infer those conversations. Pi run without the extension cannot record a
+new file or deliberate quit; use the extension normally. Signal-killing Pi is
+classified as interruption (resume retained), not deliberate quit.
+
 
 ## Goal
 

@@ -750,7 +750,7 @@ fn resume_after_first_run() {
     store
         .write_claude(
             "work",
-            &ClaudeMeta {
+            &ClaudeMeta { session_file: None, agent_kind: None,
                 session_id: "sid-9".to_string(),
                 cwd: cwd.to_path_buf(),
                 updated: 1,
@@ -894,7 +894,7 @@ fn suspend_then_resume_parks_and_relaunches_claude() {
     StateStore::new(&root)
         .write_claude(
             "work",
-            &ClaudeMeta { session_id: "sid-frozen".to_string(), cwd: root.clone(), updated: 1 },
+            &ClaudeMeta { session_file: None, agent_kind: None, session_id: "sid-frozen".to_string(), cwd: root.clone(), updated: 1 },
         )
         .unwrap();
     let ctl = SuspendControl::new();
@@ -957,7 +957,7 @@ fn duplicate_suspend_while_parked_does_not_repark_after_resume() {
     StateStore::new(&root)
         .write_claude(
             "work",
-            &ClaudeMeta {
+            &ClaudeMeta { session_file: None, agent_kind: None,
                 session_id: "sid-double-suspend".to_string(),
                 cwd: root.clone(),
                 updated: 1,
@@ -1136,7 +1136,7 @@ fi
     StateStore::new(&root)
         .write_claude(
             "work",
-            &ClaudeMeta {
+            &ClaudeMeta { session_file: None, agent_kind: None,
                 session_id: "conv-42".to_string(),
                 cwd: root.clone(),
                 updated: 1,
