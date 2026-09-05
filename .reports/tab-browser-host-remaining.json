@@ -138,7 +138,7 @@
       "id": "P2-validation-metadata-consistency",
       "severity": "important",
       "status": "completed",
-      "work": "Validation metadata distinguishes production code commit c5b87c8 from documentation/report baseline e856624 and records current follow-up verifier/test evidence under the same private root; mergeReady remains false for external gates."
+      "work": "Validation metadata records CODE_HEAD/CODE_TESTED_COMMIT c5b87c8 separately from REPORT_HEAD/REPORT_BASE_COMMIT e856624 and records current follow-up verifier/test evidence under the same private root; mergeReady remains false for external gates."
     },
     {
       "id": "GATE-deployed-reader",
