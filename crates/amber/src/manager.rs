@@ -4940,6 +4940,17 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn killing_an_already_exited_shell_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        let shell = mgr.create("exited", "/tmp", SessionKind::Shell).unwrap();
+        mgr.write("exited", b"exit\n").unwrap();
+        shell.wait_exit().unwrap();
+        shell.kill().expect("an already-dead child is a successful kill");
+    }
+
     #[test]
     fn a_dead_but_unreaped_session_keeps_its_slot_reserved() {
         // `ls`/`attach` have no alive filter, so a dead-but-listed session is

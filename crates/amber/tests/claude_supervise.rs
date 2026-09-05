@@ -846,6 +846,9 @@ fn successful_slotted_inner_exec_reports_a_running_agent() {
 #[cfg(target_os = "linux")]
 #[test]
 fn ambient_exec_status_env_cannot_hijack_a_generic_cgroup_launcher() {
+    // Participate in the same fork/write-fd exclusion as the fake-agent tests.
+    // Otherwise this fork can inherit their open script and cause ETXTBSY.
+    let _exec_guard = exec_guard();
     let output = Command::new(env!("CARGO_BIN_EXE_amber"))
         .args([
             "__cgroup-exec",

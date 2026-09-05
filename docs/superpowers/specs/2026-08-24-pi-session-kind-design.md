@@ -40,6 +40,10 @@ explicit quit followed by immediate restart. It launches no real agent or
 provider calls and isolates HOME/config/state. Full workspace Rust tests and
 warnings-as-errors clippy are required before handoff. Real macOS validation
 and an installed-Pi reboot remain manual, not claimed by the fake fixture.
+The fixture waits for the actual quit-hook acknowledgement, not an intermediate
+atomic file write. Validation also exposed an existing double-kill race:
+portable-pty can return ESRCH after the process-tree kill already succeeded;
+that absence is now treated as successful teardown, with a regression test.
 
 Activation requires a coordinated daemon upgrade AND refreshed/reloaded Pi
 extensions. Existing contaminated ID-only records are deliberately not

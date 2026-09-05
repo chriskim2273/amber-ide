@@ -51,6 +51,7 @@ def fake_pi():
             (root / 'switched').touch()
         elif line.strip() == 'quit':
             hook('quit')
+            (root / 'quit-acknowledged').touch()
             return
 
 
@@ -141,7 +142,8 @@ def proof(binary):
             assert recording()['session_id'] == 'selected-main-session'
             # Explicit quit must synchronously clear before an immediate restart.
             input_line('quit')
-            wait(lambda: recording().get('agent_kind') is None, 'intentional quit recording')
+            wait(lambda: (root / 'quit-acknowledged').exists(), 'intentional quit acknowledgement')
+            assert recording().get('agent_kind') is None
             assert json.loads((root / 'sessions/work.json').read_text())['kind'] == 'shell'
             stop()
             start()

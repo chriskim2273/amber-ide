@@ -893,8 +893,14 @@ impl PtySession {
         if let Some(pid) = self.pid {
             kill_process_tree(pid);
         }
-        self.killer.lock().unwrap().kill()?;
-        Ok(())
+        match self.killer.lock().unwrap().kill() {
+            Ok(()) => Ok(()),
+            // kill_process_tree may already have killed/reaped the child before
+            // portable-pty's second signal. Absence is success, not a kill error.
+            #[cfg(unix)]
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 }
 
