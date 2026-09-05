@@ -1316,9 +1316,14 @@ async function main(): Promise<void> {
   reopenLocalWindow = createSingleFlight(async (): Promise<void> => {
     // Re-check after this caller wins the single flight. A window may have
     // registered while an earlier activation was awaiting openWindow().
+    if (explicitQuitInProgress || allowFinalQuit) return
     const existing = [...windowCtxs.values()].find((candidate) => candidate.target.kind === 'local' && !candidate.win.isDestroyed())
     if (existing) { existing.resumeClient(); existing.win.show(); existing.win.focus(); return }
     const reopened = await openWindow({ kind: 'local' })
+    // Quit can begin while BrowserWindow creation/load is in flight. Do not
+    // attach BrowserHost pages to a window after the drain has destroyed them;
+    // dispose this just-created presentation instead.
+    if (explicitQuitInProgress || allowFinalQuit) { reopened.win.destroy(); return }
     tabBrowser?.setWindow(reopened.win)
     reopened.win.show(); reopened.win.focus()
   })
