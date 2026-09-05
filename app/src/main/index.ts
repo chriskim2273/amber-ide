@@ -84,7 +84,7 @@ import { bindRendererBrowserCommand, browserAuthorityChanged } from './browserAs
 import { emptyLayout, layoutUtf8ByteLength, LAYOUT_FILE_MAX_BYTES, parseLayout, serializeLayout, type LayoutFile } from '../shared/layoutFile'
 import { assertWorkspaceFileBytes, parseWorkspaceFile, WORKSPACE_FILE_MAX_BYTES } from '../shared/workspaceFile'
 import { commitPreparedWorkspaceImport, prepareWorkspaceImport } from './workspaceImport'
-import { browserContextMatches, captureBrowserContext, hasExactApprovalSurface, resolveBrowserContext, sameBrowserContextIdentity, setBrowserForCurrentContext } from './browserWindowContext'
+import { approvalSurfaceDuringPresentationCommand, browserContextMatches, captureBrowserContext, hasExactApprovalSurface, resolveBrowserContext, sameBrowserContextIdentity, setBrowserForCurrentContext } from './browserWindowContext'
 import { createBrowserId } from '../shared/tabBrowser'
 import { isRecoveryId } from '../shared/tabBrowserState'
 import { BrowserOperationRegistry } from './browserOperationRegistry'
@@ -1720,7 +1720,7 @@ async function main(): Promise<void> {
       if (parsed.type === 'stopPi' && activeBrowser?.designatedPi) tabBrowserBroker?.cancelController(activeBrowser.designatedPi)
       const command = bindRendererBrowserCommand(sender.activeBrowserId, parsed)
       const expected = captureBrowserContext(sender)
-      if ((command.type === 'hide' || command.type === 'show') && expected.browserId) { sender.activeBrowserExpanded = false; if (command.type === 'hide') tabBrowser.surfaceHidden(expected.browserId) }
+      if ((command.type === 'hide' || command.type === 'show') && expected.browserId) { sender.activeBrowserExpanded = approvalSurfaceDuringPresentationCommand(sender.activeBrowserExpanded, command.type); if (command.type === 'hide') tabBrowser.surfaceHidden(expected.browserId) }
       const stillAssociated = async (): Promise<boolean> => {
         if (!browserContextMatches(sender, expected)) return false
         const latest = await loadLayoutFile(layoutPath())

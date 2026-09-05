@@ -9,6 +9,12 @@ export function hasExactApprovalSurface(states: ApprovalSurfaceState[], browserI
   return states.some((state) => state.local && !state.destroyed && state.visible && state.expanded && state.browserId === browserId)
 }
 
+/** A queued resize/show does not hide an existing approval surface. Initial
+ * activation still becomes visible only after successful show completion. */
+export function approvalSurfaceDuringPresentationCommand(expanded: boolean, type: 'show' | 'hide'): boolean {
+  return type === 'show' && expanded
+}
+
 export function sameBrowserContextIdentity(state: BrowserContextState, next: ActiveBrowserContext): boolean {
   return state.activeWorkspace === next.workspace && state.activeTab === next.tab && state.activeBrowserId === next.browserId
 }

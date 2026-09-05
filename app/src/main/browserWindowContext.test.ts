@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { browserContextMatches, captureBrowserContext, hasExactApprovalSurface, resolveBrowserContext, sameBrowserContextIdentity, setBrowserForCurrentContext, type BrowserContextState } from './browserWindowContext'
+import { approvalSurfaceDuringPresentationCommand, browserContextMatches, captureBrowserContext, hasExactApprovalSurface, resolveBrowserContext, sameBrowserContextIdentity, setBrowserForCurrentContext, type BrowserContextState } from './browserWindowContext'
 
 const layout = { version: 2, activeWorkspace: 1, workspaces: {
   '1': { activeTab: 1, tabs: { '1': { tree: null } } },
@@ -29,6 +29,20 @@ describe('resolveBrowserContext', () => {
     const exact = { local: true, destroyed: false, visible: true, expanded: true, browserId: 'browser-a' }
     expect(hasExactApprovalSurface([exact], 'browser-a')).toBe(true)
     for (const changed of [{ visible: false }, { expanded: false }, { destroyed: true }, { local: false }, { browserId: 'browser-b' }]) expect(hasExactApprovalSurface([{ ...exact, ...changed }], 'browser-a')).toBe(false)
+  })
+
+  it('keeps an already-visible approval surface while a resize show is queued behind the action', () => {
+    // An approval panel resizes the page slot. Its ResizeObserver queues show
+    // behind the very action waiting for approval: that queue must not revoke
+    // the already-visible approval UI before the user can resolve it.
+    const expanded = approvalSurfaceDuringPresentationCommand(true, 'show')
+    expect(hasExactApprovalSurface([{ local: true, destroyed: false, visible: true, expanded, browserId: 'browser-a' }], 'browser-a')).toBe(true)
+  })
+
+  it('never grants initial show visibility early and immediately revokes on hide', () => {
+    expect(approvalSurfaceDuringPresentationCommand(false, 'show')).toBe(false)
+    expect(approvalSurfaceDuringPresentationCommand(true, 'hide')).toBe(false)
+    expect(approvalSurfaceDuringPresentationCommand(false, 'hide')).toBe(false)
   })
 
   it('rejects coordinates that main cannot resolve', () => {
