@@ -98,6 +98,16 @@ try {
     })
   })
   await new Promise((resolveListen, rejectListen) => { server.once('error', rejectListen); server.listen(socketPath, resolveListen) })
+  const expectedPartialFailure = {
+    code: 'ACTION_FAILED_NO_ROLLBACK',
+    retryable: false,
+    message: 'Input was dispatched and cannot be rolled back. Take a fresh browser snapshot before retrying.',
+    pageIncarnation: 'page-current',
+    generation: 4,
+    snapshotHint: true,
+    dispatched: true,
+    nextStep: 'Call browser_snapshot with the reported pageIncarnation and generation before retrying.',
+  }
   try {
     const fillTool = tools.find((tool) => tool.name === 'browser_fill')
     const screenshotTool = tools.find((tool) => tool.name === 'browser_screenshot')
@@ -107,16 +117,6 @@ try {
     if (Buffer.byteLength(textResult.content[0].text) > 50000 || textResult.content[0].text.split('\n').length > 2000) throw new Error('labeled text result exceeded bounds')
     const fillResult = await fillTool.execute('verify-fill', { pageIncarnation: 'page', expectedGeneration: 1, target: { snapshotId: 'snap', ref: 'n1' }, text: 'fixture-sensitive-value' }, new AbortController().signal)
     const fillText = fillResult.content?.[0]?.text ?? ''
-    const expectedPartialFailure = {
-      code: 'ACTION_FAILED_NO_ROLLBACK',
-      retryable: false,
-      message: 'Input was dispatched and cannot be rolled back. Take a fresh browser snapshot before retrying.',
-      pageIncarnation: 'page-current',
-      generation: 4,
-      snapshotHint: true,
-      dispatched: true,
-      nextStep: 'Call browser_snapshot with the reported pageIncarnation and generation before retrying.',
-    }
     let partialFailure
     try { partialFailure = JSON.parse(fillText.startsWith(`${label}\n`) ? fillText.slice(label.length + 1) : '') }
     catch { partialFailure = undefined }
@@ -169,7 +169,7 @@ try {
   await new Promise((resolveClose) => invalidFrameServer.close(resolveClose))
   if (invalidFrameError !== 'Amber browser host sent invalid JSON') throw new Error(`invalid UTF-8 frame was normalized or misclassified: ${invalidFrameError}`)
 
-  process.stdout.write(`${JSON.stringify({ installedBytes: Buffer.byteLength(first), compiled: true, loaded: true, labeledResults: true, fatalTokenAndFrameChecks: true, tools: names.sort() })}\n`)
+  process.stdout.write(`${JSON.stringify({ installedBytes: Buffer.byteLength(first), compiled: true, loaded: true, labeledResults: true, fatalTokenAndFrameChecks: true, partialFailureChecked: expectedPartialFailure, tools: names.sort() })}\n`)
 } finally {
   await rm(root, { recursive: true, force: true })
 }
