@@ -43,6 +43,19 @@ class FakeDebugger implements BrowserDebuggerTransport {
 const lease = { browserId: 'browser-1', pageIncarnation: 'page-1', generation: 7 }
 
 describe('browser automation', () => {
+  it('keeps x and y axes separate in inspected geometry', async () => {
+    class OffsetBoxDebugger extends FakeDebugger {
+      override async send(method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>> {
+        if (method === 'DOM.getBoxModel') return { model: { border: [400, 20, 500, 20, 500, 60, 400, 60] } }
+        return super.send(method, params)
+      }
+    }
+    const automation = new BrowserAutomation(new OffsetBoxDebugger(), () => 'about:blank', () => false)
+    const signal = new AbortController().signal
+    const snapshot = await automation.snapshot(lease, { maxDepth: 20, maxNodes: 20, maxBytes: 262144 }, signal)
+    const result = await automation.inspect(lease, { snapshotId: snapshot.snapshotId, ref: snapshot.nodes[1]!.ref }, signal)
+    expect(result.box).toEqual({ x: 400, y: 20, width: 100, height: 40 })
+  })
   it('creates accessibility-first bounded snapshots and scoped opaque references', async () => {
     const debuggerTransport = new FakeDebugger()
     const automation = new BrowserAutomation(debuggerTransport, () => 'https://example.test/path?token=secret#x', () => false)

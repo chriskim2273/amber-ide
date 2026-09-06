@@ -3,6 +3,8 @@ import type { BrowserElementRef, BrowserInteraction, BrowserTarget, BrowserViewp
 import type { InteractionTargetMetadata } from './browserApproval'
 import { parseBrowserViewport } from '../shared/browserViewport'
 import { BrowserAutomationError, safeBrowserCode } from './browserErrors'
+import { BrowserDomRelations } from './browserDomRelations'
+import { quadBounds } from './browserGeometry'
 export { BrowserAutomationError } from './browserErrors'
 
 const SCREENSHOT_MAX_BYTES = 10 * 1024 * 1024
@@ -135,6 +137,7 @@ export class BrowserAutomation {
   private domainsEnabled = false
   private setupPromise: Promise<void> | null = null
   private snapshotCache: SnapshotCache | null = null
+  private readonly domRelations = new BrowserDomRelations()
   private readonly consoleRing: BoundedRing
   private readonly networkRing: BoundedRing
   private readonly requests = new Map<string, { url: string; method: string; type: string; started: number; status?: number }>()
@@ -157,7 +160,7 @@ export class BrowserAutomation {
   }
   invalidate(): void { this.snapshotCache = null }
   dispose(): void {
-    this.disposed = true; this.snapshotCache = null; this.requests.clear(); this.activeRequests = 0
+    this.disposed = true; this.snapshotCache = null; this.domRelations.clear(); this.requests.clear(); this.activeRequests = 0
     if (this.diagnosticsTimer) clearTimeout(this.diagnosticsTimer); this.diagnosticsTimer = null
     if (this.attachedByUs && this.transport.isAttached()) { try { this.transport.detach?.() } catch { /* page teardown is best-effort */ } }
   }
@@ -186,6 +189,7 @@ export class BrowserAutomation {
   }
   private onMessage(method: string, params: Record<string, unknown>): void {
     if (this.disposed) return
+    this.domRelations.onMessage(method, params)
     if (method === 'Page.javascriptDialogOpening') {
       const type = text(params['type'], 32), message = redactBrowserText(text(params['message'], 1024)).slice(0, 1024)
       const decision = this.controls.dialog?.({ type, message }) ?? Promise.reject(new Error('DIALOG_UNAVAILABLE'))
@@ -252,6 +256,7 @@ export class BrowserAutomation {
     const snapshotId = randomBytes(12).toString('base64url'), entries = new Map<string, SnapshotEntry>(), nodes: AccessibilityNodeResult[] = []
     const depthByNodeId = new Map<number, number>(), seenAXNodes = new Set<string>()
     const safeUrl = sanitizeBrowserUrl(this.currentUrl()), inputLimit = Math.min(512 * 1024, Math.max(16 * 1024, limits.maxBytes * 2))
+    this.domRelations.clear()
     const document = await this.transport.send('DOM.getDocument', { depth: 0, pierce: false }); abort(signal)
     let inputBytes = Buffer.byteLength(JSON.stringify(document))
     if (inputBytes > inputLimit) {
@@ -278,7 +283,7 @@ export class BrowserAutomation {
           inputBytes += Buffer.byteLength(JSON.stringify(described))
           if (inputBytes > inputLimit) { truncated = true; break outer }
           const domNode = described['node'] as Record<string, unknown> | undefined
-          const parentId = typeof domNode?.['parentId'] === 'number' ? domNode['parentId'] : undefined
+          const parentId = typeof domNode?.['parentId'] === 'number' ? domNode['parentId'] : this.domRelations.parentOf(nodeId)
           const depth = parentId === undefined ? 0 : (depthByNodeId.get(parentId) ?? -1) + 1
           depthByNodeId.set(nodeId, depth)
           if (depth > limits.maxDepth) { truncated = true; continue }
@@ -342,7 +347,7 @@ export class BrowserAutomation {
       } catch { /* a detached node may have no computed style */ }
     }
     const ancestry: Array<{ tag: string; id?: string; role?: string }> = []
-    let parentId = typeof node?.['parentId'] === 'number' ? node['parentId'] : undefined
+    let parentId = typeof node?.['parentId'] === 'number' ? node['parentId'] : nodeId === undefined ? undefined : this.domRelations.parentOf(nodeId)
     for (let depth = 0; parentId !== undefined && depth < 8; depth++) {
       try {
         const parent = (await this.transport.send('DOM.describeNode', { nodeId: parentId, depth: 0, pierce: false }))['node'] as Record<string, unknown> | undefined
@@ -355,11 +360,11 @@ export class BrowserAutomation {
           if (key === 'role') summary.role = value
         }
         ancestry.push(summary)
-        parentId = typeof parent['parentId'] === 'number' ? parent['parentId'] : undefined
+        parentId = typeof parent['parentId'] === 'number' ? parent['parentId'] : this.domRelations.parentOf(parentId)
       } catch { break }
     }
     let box: Record<string, number> | undefined
-    try { const result = await this.transport.send('DOM.getBoxModel', { backendNodeId: entry.backendDOMNodeId }); const border = (result['model'] as Record<string, unknown> | undefined)?.['border']; if (Array.isArray(border) && border.length === 8 && border.every((n) => typeof n === 'number')) box = { x: Math.min(...border as number[]), y: Math.min((border as number[])[1]!, (border as number[])[3]!, (border as number[])[5]!, (border as number[])[7]!), width: Math.max(...border as number[]) - Math.min(...border as number[]), height: Math.max((border as number[])[1]!, (border as number[])[3]!, (border as number[])[5]!, (border as number[])[7]!) - Math.min((border as number[])[1]!, (border as number[])[3]!, (border as number[])[5]!, (border as number[])[7]!) } } catch { /* detached nodes have no box */ }
+    try { const result = await this.transport.send('DOM.getBoxModel', { backendNodeId: entry.backendDOMNodeId }); const border = (result['model'] as Record<string, unknown> | undefined)?.['border']; if (Array.isArray(border) && border.length === 8 && border.every((n) => typeof n === 'number')) box = { ...quadBounds(border as number[]) } } catch { /* detached nodes have no box */ }
     return { snapshotId: target.snapshotId, ref: target.ref, tag: text(node?.['nodeName'], 128).toLocaleLowerCase(), role: entry.role, name: entry.name, attributes, computedStyle, ancestry, ...(box ? { box } : {}) }
   }
   private resolveTarget(lease: BrowserAutomationLease, target: BrowserTarget): SnapshotEntry {
@@ -407,11 +412,10 @@ export class BrowserAutomation {
     const box = boundedResponse(await this.transport.send('DOM.getBoxModel', { backendNodeId: entry.backendDOMNodeId })); abort(signal)
     const border = (box['model'] as Record<string, unknown> | undefined)?.['border']
     if (!Array.isArray(border) || border.length !== 8 || !border.every((value) => typeof value === 'number' && Number.isFinite(value))) throw new Error('TARGET_NOT_ACTIONABLE')
-    const xs = [border[0], border[2], border[4], border[6]] as number[], ys = [border[1], border[3], border[5], border[7]] as number[]
-    const width = Math.max(...xs) - Math.min(...xs), height = Math.max(...ys) - Math.min(...ys)
+    const { x, y, width, height } = quadBounds(border as number[])
     if (width < 1 || height < 1 || width > 16_384 || height > 16_384) throw new Error('TARGET_NOT_ACTIONABLE')
     const checked = property(node, 'checked')
-    return { x: Math.min(...xs) + width / 2, y: Math.min(...ys) + height / 2, ...(checked === undefined ? {} : { checked }), metadata: current }
+    return { x: x + width / 2, y: y + height / 2, ...(checked === undefined ? {} : { checked }), metadata: current }
   }
   async prepareInteraction(lease: BrowserAutomationLease, operation: BrowserInteraction, signal: AbortSignal): Promise<PreparedBrowserInteraction> {
     abort(signal); await this.ensureAttached(); abort(signal)
@@ -436,17 +440,17 @@ export class BrowserAutomation {
     const height = typeof viewport?.['clientHeight'] === 'number' ? viewport['clientHeight'] : viewport?.['height']
     if (typeof width !== 'number' || typeof height !== 'number' || !Number.isFinite(width) || !Number.isFinite(height) || width < 1 || height < 1 || width > 16_384 || height > 16_384 || point.x < 0 || point.y < 0 || point.x >= width || point.y >= height) throw new Error('TARGET_NOT_ACTIONABLE')
     const exactPoint = { x: Math.floor(point.x), y: Math.floor(point.y) }
-    const hit = boundedResponse(await this.transport.send('DOM.getNodeForLocation', { ...exactPoint, includeUserAgentShadowDOM: true, ignorePointerEventsNone: false })); abort(signal)
+    const hit = boundedResponse(await this.transport.send('DOM.getNodeForLocation', { ...exactPoint, includeUserAgentShadowDOM: false, ignorePointerEventsNone: false })); abort(signal)
     let backend = typeof hit['backendNodeId'] === 'number' ? hit['backendNodeId'] : undefined
     let nodeId = typeof hit['nodeId'] === 'number' ? hit['nodeId'] : undefined
     for (let depth = 0; depth < 32 && (backend !== undefined || nodeId !== undefined); depth++) {
-      if (backend === entry.backendDOMNodeId) return exactPoint
+      if (backend === entry.backendDOMNodeId || (nodeId !== undefined && this.domRelations.isWithin(nodeId, entry.backendDOMNodeId))) return exactPoint
       const described = boundedResponse(await this.transport.send('DOM.describeNode', { ...(nodeId !== undefined ? { nodeId } : { backendNodeId: backend }), depth: 0, pierce: false })); abort(signal)
       const node = described['node'] as Record<string, unknown> | undefined
       if (!node) break
       backend = typeof node['backendNodeId'] === 'number' ? node['backendNodeId'] : undefined
       if (backend === entry.backendDOMNodeId) return exactPoint
-      nodeId = typeof node['parentId'] === 'number' ? node['parentId'] : undefined
+      nodeId = typeof node['parentId'] === 'number' ? node['parentId'] : nodeId === undefined ? undefined : this.domRelations.parentOf(nodeId)
       backend = undefined
     }
     throw new Error('TARGET_OCCLUDED')
@@ -534,7 +538,7 @@ export class BrowserAutomation {
   }
   async screenshot(lease: BrowserAutomationLease, target: BrowserElementRef | undefined, fullPage: boolean, signal: AbortSignal): Promise<BrowserBinaryAttachment> {
     abort(signal); await this.ensureAttached(); let clip: { x: number; y: number; width: number; height: number; scale: number } | undefined
-    if (target) { const entry = this.resolve(lease, target); if (!entry.backendDOMNodeId) throw new Error('UNSUPPORTED_PAGE'); const box = await this.transport.send('DOM.getBoxModel', { backendNodeId: entry.backendDOMNodeId }); const border = (box['model'] as Record<string, unknown> | undefined)?.['border'] as number[] | undefined; if (!border || border.length !== 8) throw new Error('UNSUPPORTED_PAGE'); clip = { x: Math.min(border[0]!, border[2]!, border[4]!, border[6]!), y: Math.min(border[1]!, border[3]!, border[5]!, border[7]!), width: Math.max(border[0]!, border[2]!, border[4]!, border[6]!) - Math.min(border[0]!, border[2]!, border[4]!, border[6]!), height: Math.max(border[1]!, border[3]!, border[5]!, border[7]!) - Math.min(border[1]!, border[3]!, border[5]!, border[7]!), scale: 1 } }
+    if (target) { const entry = this.resolve(lease, target); if (!entry.backendDOMNodeId) throw new Error('UNSUPPORTED_PAGE'); const box = await this.transport.send('DOM.getBoxModel', { backendNodeId: entry.backendDOMNodeId }); const border = (box['model'] as Record<string, unknown> | undefined)?.['border'] as number[] | undefined; if (!border || border.length !== 8) throw new Error('UNSUPPORTED_PAGE'); clip = { ...quadBounds(border), scale: 1 } }
     else {
       const metrics = await this.transport.send('Page.getLayoutMetrics')
       const size = (fullPage ? metrics['cssContentSize'] : (metrics['cssVisualViewport'] ?? metrics['cssLayoutViewport'] ?? metrics['cssContentSize'])) as Record<string, unknown> | undefined
