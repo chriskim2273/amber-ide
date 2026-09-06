@@ -58,7 +58,7 @@ export interface BrowserRuntimeStatus extends BrowserRecord {
 }
 export type TabBrowserHostEvent = { type: 'capacity-wait'; id: BrowserId; waiting: boolean } | { type: 'runtime'; id: BrowserId; status: BrowserRuntimeStatus } | { type: 'dialog-request'; id: BrowserId; pageIncarnation: string; dialogType: string; message: string; generation: number; respond: (decision: { accept: boolean; promptText?: string }) => void }
 interface Runtime {
-  page: TabBrowserPage; incarnation: string; generation: number; loading: boolean; automationNavigationPending: boolean; visible: boolean
+  page: TabBrowserPage; incarnation: string; generation: number; documentEpoch: number; loading: boolean; automationNavigationPending: boolean; visible: boolean
   currentUrl: string; focused: boolean; restoredAfterFreeze: boolean; diagnostics: { consoleIssues: number; networkFailures: number }
   pendingOperations: Set<symbol>; suppressEvents: boolean
 }
@@ -104,7 +104,7 @@ export class TabBrowserHost {
       (event) => this.pageEvent(id, runtime, event),
       (url) => this.navigationAllowed(id, url),
     )
-    runtime = { page, incarnation: randomUUID(), generation: this.generationFloor.get(id) ?? 0, loading: false, automationNavigationPending: false, visible: false,
+    runtime = { page, incarnation: randomUUID(), generation: this.generationFloor.get(id) ?? 0, documentEpoch: 0, loading: false, automationNavigationPending: false, visible: false,
       currentUrl: this.record(id).safeRestoreUrl, focused: false, restoredAfterFreeze, diagnostics: { consoleIssues: 0, networkFailures: 0 },
       pendingOperations: new Set<symbol>(), suppressEvents: false }
     this.runtimes.set(id, runtime)
@@ -121,11 +121,13 @@ export class TabBrowserHost {
     if (this.runtimes.get(id) !== runtime || runtime.suppressEvents) return
     const record = this.record(id)
     if (event.type === 'navigation-started') {
+      runtime.documentEpoch += 1
       if (runtime.automationNavigationPending) runtime.automationNavigationPending = false
       else if (!runtime.loading) runtime.generation += 1
       runtime.page.automation?.invalidate()
       runtime.loading = true
     } else if (event.type === 'navigation-committed' || event.type === 'navigation-in-page') {
+      runtime.documentEpoch += 1
       const currentUrl = event.url.slice(0, 8192)
       if (!this.navigationAllowed(id, currentUrl)) {
         this.runtimes.delete(id); runtime.suppressEvents = true; runtime.pendingOperations.clear(); runtime.page.automation?.invalidate()
@@ -361,6 +363,7 @@ export class TabBrowserHost {
     if (signal.aborted) throw new Error('ACTION_CANCELLED')
     const automation = runtime.page.automation
     const lease = { browserId: record.id, pageIncarnation: runtime.incarnation, generation: runtime.generation }
+    const documentEpoch = runtime.documentEpoch
     let result: unknown; let generationDelta = 0; let interactionDispatched = false; let interactionDispatchGeneration: number | undefined
     const pending = this.beginPending(runtime)
     this.capacity.protectFor(record.id, 'operation', true)
@@ -384,7 +387,8 @@ export class TabBrowserHost {
         if (this.runtimes.get(record.id) !== runtime || runtime.incarnation !== action.pageIncarnation || runtime.generation !== action.expectedGeneration) throw new Error('STALE_GENERATION')
         runtime.generation += 1; generationDelta = 1; interactionDispatchGeneration = runtime.generation; automation.invalidate()
         this.onStateChange(); this.emitRuntime(record.id)
-        result = await automation.executeInteraction(prepared, signal, (dispatched) => this.runtimes.get(record.id) === runtime && runtime.incarnation === action.pageIncarnation
+        result = await automation.executeInteraction(prepared, signal, (dispatched, phase = 'dispatch') => this.runtimes.get(record.id) === runtime && runtime.incarnation === action.pageIncarnation
+          && (phase !== 'dispatch' || runtime.documentEpoch === documentEpoch)
           && (dispatched || runtime.generation === interactionDispatchGeneration))
         interactionDispatched = typeof result === 'object' && result !== null && (result as { dispatched?: unknown }).dispatched === true
       } else if (action.type === 'reload' || action.type === 'history') {

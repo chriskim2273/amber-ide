@@ -153,6 +153,43 @@ describe('browser automation', () => {
     expect((failure as Error).message).toBe('INTERNAL_ERROR')
   })
 
+  it('releases a mouse button when cancellation arrives after mouse-down', async () => {
+    const controller = new AbortController()
+    let held = false
+    class CancelOnMouseDown extends FakeDebugger {
+      override async send(method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>> {
+        if (method === 'Input.dispatchMouseEvent' && params?.['type'] === 'mousePressed') { held = true; controller.abort() }
+        if (method === 'Input.dispatchMouseEvent' && params?.['type'] === 'mouseReleased') held = false
+        if (method === 'DOM.describeNode' && params?.['backendNodeId'] === 2) return { node: { nodeName: 'BUTTON', parentId: 101, backendNodeId: 2 } }
+        if (method === 'Accessibility.getPartialAXTree' && params?.['backendNodeId'] === 2) return { nodes: [{ role: { value: 'button' }, name: { value: 'Submit' }, backendDOMNodeId: 2 }] }
+        return super.send(method, params)
+      }
+    }
+    const automation = new BrowserAutomation(new CancelOnMouseDown(), () => 'about:blank', () => false)
+    const snapshot = await automation.snapshot(lease, { maxDepth: 20, maxNodes: 20, maxBytes: 262144 }, controller.signal)
+    const prepared = await automation.prepareInteraction(lease, { kind: 'click', target: { snapshotId: snapshot.snapshotId, ref: snapshot.nodes[1]!.ref } }, controller.signal)
+    const failure = await automation.executeInteraction(prepared, controller.signal).catch((error: unknown) => error)
+    expect(failure).toMatchObject({ code: 'ACTION_CANCELLED', dispatched: true })
+    expect(held).toBe(false)
+  })
+
+  it('releases an operation-owned key after cancellation without erasing partial dispatch', async () => {
+    const controller = new AbortController(), held = new Set<string>()
+    class CancelOnKeyDown extends FakeDebugger {
+      override async send(method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>> {
+        if (method === 'Input.dispatchKeyEvent' && params?.['type'] === 'keyDown') { held.add(String(params['key'])); controller.abort() }
+        if (method === 'Input.dispatchKeyEvent' && params?.['type'] === 'keyUp') held.delete(String(params['key']))
+        return super.send(method, params)
+      }
+    }
+    const automation = new BrowserAutomation(new CancelOnKeyDown(), () => 'about:blank', () => false)
+    await automation.ensureAttached()
+    const prepared = { lease, operation: { kind: 'press' as const, key: 'Enter' }, target: { role: 'document', name: '', tag: 'body', type: '', fingerprint: 'document' } }
+    const failure = await automation.executeInteraction(prepared, controller.signal).catch((error: unknown) => error)
+    expect(failure).toMatchObject({ code: 'ACTION_CANCELLED', dispatched: true })
+    expect(held.size).toBe(0)
+  })
+
   it('keeps a pre-dispatch cancellation or stale-generation failure rollback-safe', async () => {
     const automation = new BrowserAutomation(new FakeDebugger(), () => 'about:blank', () => false)
     const prepared = {

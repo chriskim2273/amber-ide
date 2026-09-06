@@ -22,6 +22,12 @@ Evidence under `~/recovery/amber-ide/browser-interaction/`:
 
 The first new quad test had a test-table argument-expansion error (Vitest treated array entries as separate arguments); the table was corrected to object rows rather than changing the production expectations. Xvfb may emit private-session DBus diagnostics; the run verdict comes from asserted fixture results and exit code, not absence of platform stderr.
 
+## Task 2 — partial: document continuation fences and input release
+
+A separate runtime document epoch now changes on navigation start/commit/in-page transitions. Host tests prove that a surviving WebContents incarnation cannot authorize a later activating/text event in a different document; final observation of an already completed navigation-producing click is still allowed. The adapter distinguishes dispatch, finish and owned-input cleanup guards, and attempts key/button release after cancellation or failure. A transport error after an input request is conservatively treated as possible dispatch, not proof of rollback safety.
+
+Red tests: `document-epoch-red.log`, `key-cleanup-red.log`, `mouse-cleanup-red.log`. Current combined suite: **1101 passed, 1 intentional skip** (`task2-app.log`); typecheck passes (`task2-typecheck.log`). The six original real-Electron target fixtures still pass (`task2-fixture.log`). Navigation/cleanup assertions in this milestone are adapter/host tests, not yet the required real navigation-race fixture. Task 2 is not complete.
+
 ## Still pending
 
-Actionability deadlines/scrolling, stronger snapshot budgeting, document epoch fences, screenshot coordinate tokens, coordinate approval/dispatch, browser-local agent cursor, keyboard/focused input, new generated Pi tools and full package/20-run acceptance matrix remain unimplemented. This report does not claim the entire feature or general Codex parity is complete.
+Actionability deadlines/scrolling, stronger snapshot budgeting, real navigation-race fixtures, screenshot coordinate tokens, coordinate approval/dispatch, browser-local agent cursor, expanded keyboard/focused input, new generated Pi tools and full package/20-run acceptance matrix remain unimplemented. This report does not claim the entire feature or general Codex parity is complete.

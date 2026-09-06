@@ -32,6 +32,50 @@ describe('TabBrowserHost', () => {
     expect(host.status('browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa').lifecycle).toBe('frozen')
   })
 
+  it.each(['navigation-started', 'navigation-committed', 'navigation-in-page'] as const)('stops later activating input after %s even in the same WebContents', async (eventType) => {
+    const host = new TabBrowserHost(emptyBrowserState(1), factory)
+    const opened = await host.open({ visible: true })
+    const target = { role: 'textbox', name: 'Search', tag: 'textarea', type: '', fingerprint: 'field' }
+    let inserted = false
+    ;(opened.page as FakePage).automation = {
+      invalidate: vi.fn(),
+      prepareInteraction: async (_lease, operation) => ({ lease: _lease, operation, target }),
+      executeInteraction: async (_prepared, _signal, current) => {
+        pageEvents.get(opened.status.id)!(eventType === 'navigation-started' ? { type: eventType } : { type: eventType, url: 'https://example.test/replaced' })
+        if (!current!(true, 'dispatch')) throw new BrowserAutomationError('STALE_GENERATION', true)
+        inserted = true
+        return { dispatched: true, rollbackPossible: false }
+      },
+    } as Pick<BrowserAutomation, 'invalidate' | 'prepareInteraction' | 'executeInteraction'> as BrowserAutomation
+    const failure = await host.runAutomation(opened.status.id, {
+      type: 'interact', pageIncarnation: opened.status.pageIncarnation, expectedGeneration: opened.status.generation,
+      operation: { kind: 'fill', target: { snapshotId: 's', ref: 'n1' }, text: 'private query' },
+    }, new AbortController().signal).catch((error: unknown) => error)
+    expect(inserted).toBe(false)
+    expect(failure).toMatchObject({ code: 'ACTION_FAILED_NO_ROLLBACK', dispatched: true })
+  })
+
+  it('allows finishing a completed navigation-producing click, but not another dispatch', async () => {
+    const host = new TabBrowserHost(emptyBrowserState(1), factory)
+    const opened = await host.open({ visible: true })
+    const target = { role: 'link', name: 'Next', tag: 'a', type: '', fingerprint: 'link' }
+    ;(opened.page as FakePage).automation = {
+      invalidate: vi.fn(),
+      prepareInteraction: async (_lease, operation) => ({ lease: _lease, operation, target }),
+      executeInteraction: async (_prepared, _signal, current) => {
+        pageEvents.get(opened.status.id)!({ type: 'navigation-committed', url: 'https://example.test/next' })
+        expect(current!(true, 'dispatch')).toBe(false)
+        expect(current!(true, 'finish')).toBe(true)
+        return { dispatched: true, rollbackPossible: false }
+      },
+    } as Pick<BrowserAutomation, 'invalidate' | 'prepareInteraction' | 'executeInteraction'> as BrowserAutomation
+    const result = await host.runAutomation(opened.status.id, {
+      type: 'interact', pageIncarnation: opened.status.pageIncarnation, expectedGeneration: opened.status.generation,
+      operation: { kind: 'click', target: { snapshotId: 's', ref: 'n1' } },
+    }, new AbortController().signal)
+    expect(result).toMatchObject({ dispatched: true, pageIncarnation: opened.status.pageIncarnation })
+  })
+
   it('reports the final generation when input overlaps a dispatched interaction', async () => {
     const host = new TabBrowserHost(emptyBrowserState(1), factory)
     const opened = await host.open({ visible: true })

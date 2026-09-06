@@ -455,25 +455,33 @@ export class BrowserAutomation {
     }
     throw new Error('TARGET_OCCLUDED')
   }
-  async executeInteraction(prepared: PreparedBrowserInteraction, signal: AbortSignal, stillCurrent: (dispatched: boolean) => boolean = () => true): Promise<{ dispatched: true; rollbackPossible: false }> {
+  async executeInteraction(prepared: PreparedBrowserInteraction, signal: AbortSignal, stillCurrent: (dispatched: boolean, phase?: 'dispatch' | 'finish' | 'cleanup') => boolean = () => true): Promise<{ dispatched: true; rollbackPossible: false }> {
     let dispatched = false
+    const heldKeys = new Map<string, Record<string, unknown>>()
+    const heldButtons = new Map<string, Record<string, unknown>>()
     const asAutomationError = (error: unknown): BrowserAutomationError => {
       if (error instanceof BrowserAutomationError) return error
       const code = safeBrowserCode(error instanceof Error ? error.message : undefined)
       return new BrowserAutomationError(code, dispatched)
     }
-    const ensure = (): void => {
+    const ensure = (phase: 'dispatch' | 'finish' = 'dispatch'): void => {
       if (signal.aborted) throw new BrowserAutomationError('ACTION_CANCELLED', dispatched)
-      // Before the first irreversible command, the host requires the exact
-      // prepared generation. Once one command succeeds, only page identity is
-      // required: user input and navigation may legitimately advance it.
-      if (!stillCurrent(dispatched)) throw new BrowserAutomationError('STALE_GENERATION', dispatched)
+      // Input callbacks may advance generation after dispatch. Further input
+      // must nevertheless remain in the same document, not merely WebContents.
+      if (!stillCurrent(dispatched, phase)) throw new BrowserAutomationError('STALE_GENERATION', dispatched)
     }
     const sendIrreversible = async (method: 'Input.dispatchMouseEvent' | 'Input.dispatchKeyEvent' | 'Input.insertText', params: Record<string, unknown>): Promise<void> => {
       ensure()
+      const keyId = String(params['code'] ?? params['key'] ?? '')
+      const button = String(params['button'] ?? 'none')
+      if (method === 'Input.dispatchMouseEvent' && params['type'] === 'mousePressed' && button !== 'none') heldButtons.set(button, { ...params, type: 'mouseReleased' })
+      if (method === 'Input.dispatchKeyEvent' && params['type'] === 'keyDown') heldKeys.set(keyId, { ...params, type: 'keyUp' })
+      // A lost/error response does not prove that Chromium ignored the input.
+      dispatched = true
       try {
         await this.transport.send(method, params)
-        dispatched = true
+        if (method === 'Input.dispatchKeyEvent' && params['type'] === 'keyUp') heldKeys.delete(keyId)
+        if (method === 'Input.dispatchMouseEvent' && params['type'] === 'mouseReleased') heldButtons.delete(button)
       } catch (error) {
         throw asAutomationError(error)
       }
@@ -530,10 +538,17 @@ export class BrowserAutomation {
       // so disconnect/cancel remains the dialog's cancellation owner.
       await new Promise<void>((resolve) => setImmediate(resolve))
       const dialogBarrier = this.dialogBarrier; if (dialogBarrier) await dialogBarrier
-      ensure()
+      ensure('finish')
       return { dispatched: true, rollbackPossible: false }
     } catch (error) {
       throw asAutomationError(error)
+    } finally {
+      // Release only this operation's inputs, even after cancellation/navigation.
+      // No text, activation retry or freshly resolved target is allowed here.
+      if (stillCurrent(dispatched, 'cleanup') && this.transport.isAttached()) {
+        for (const params of heldButtons.values()) await this.transport.send('Input.dispatchMouseEvent', params).catch(() => {})
+        for (const params of [...heldKeys.values()].reverse()) await this.transport.send('Input.dispatchKeyEvent', params).catch(() => {})
+      }
     }
   }
   async screenshot(lease: BrowserAutomationLease, target: BrowserElementRef | undefined, fullPage: boolean, signal: AbortSignal): Promise<BrowserBinaryAttachment> {
