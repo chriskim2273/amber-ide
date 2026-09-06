@@ -1,6 +1,6 @@
 # Reliable semantic targeting and screenshot-grounded pointer control
 
-Status: proposed detailed design; user approved the hybrid approach, detailed-spec review pending.
+Status: hybrid approach approved; user requested the strongest practical implementation. Direct quality review incorporated below; implementation must still earn the acceptance evidence.
 
 Base: `3ad9a0b9f515545bb5db2f05d6c7161a5578b42d`. Work directly, without subagents, in persistent `~/worktrees/amber-ide/browser-interaction` (`feat/browser-interaction`). No production restart, installation, merge, or permission relaxation is part of implementation authority.
 
@@ -8,7 +8,7 @@ Base: `3ad9a0b9f515545bb5db2f05d6c7161a5578b42d`. Work directly, without subagen
 
 On the user's shared Google home page, both `browser_fill` and `browser_type` targeting the visible Search combobox returned `TARGET_OCCLUDED`. The screenshot showed the search field unobstructed. Navigation worked; a direct search URL subsequently loaded `potatoes - Google Search`, but that did not validate typing or submission.
 
-The current adapter (`app/src/main/browserAutomation.ts`) computes a border-box center, requests `DOM.getNodeForLocation` with `includeUserAgentShadowDOM:true`, then follows `DOM.describeNode.parentId`. Chromium documents `false` as resolving to the nearest non-user-agent-shadow ancestor. Native text controls can expose internal editing nodes when `true` is used. This is a root-cause hypothesis, not yet a reproduced diagnosis; the first implementation milestone must prove or reject it in a real private Electron fixture.
+The current adapter (`app/src/main/browserAutomation.ts`) computes a border-box center, requests `DOM.getNodeForLocation` with `includeUserAgentShadowDOM:true`, then follows `DOM.describeNode.parentId`. Chromium documents `false` as resolving to the nearest non-user-agent-shadow ancestor. Native text controls can expose internal editing nodes when `true` is used. This is now reproduced in a private Electron 43 fixture using the unmodified adapter. With native-shadow hits enabled, both textarea and input fail `TARGET_OCCLUDED`; changing only that probe transport argument to false lets both receive the literal `potatoes`. A button containing a span fails under both settings, proving a separate ancestry defect. No production code was patched for this experiment. Probe and evidence: `~/recovery/amber-ide/browser-interaction/probe-native-hit.cjs` and `native-hit-probe.log`. The first probe launch had a test-harness Electron import error; it was corrected before these measurements, and only the private test process was terminated.
 
 Other observed/source-confirmed weaknesses relevant to this work:
 
@@ -40,6 +40,7 @@ All new actions retain:
 - Current active-surface/visibility and approval validity checks.
 - Bounded parser, queue, cancellation and host-drain behavior.
 - Uniform generation increments for every observed input callback. Do not restore synthetic-input suppression or pretend physical and synthetic input can be distinguished.
+- A separate internal document/navigation epoch guards multi-event continuation. Renderer/page incarnation can survive navigation, so incarnation alone is not proof that subsequent typing is still aimed at the original document. After a navigation or frame replacement, stop remaining typing/activating events and perform only owned-input release cleanup. Return the observed final context; a single completed navigation-producing click is not an automatic failure.
 - `ACTION_FAILED_NO_ROLLBACK` after partial dispatch, with actual final page context, `retryable:false`, and fresh-observation guidance.
 
 No changes to daemon session ownership, terminal transport, layout grouping, profile persistence, renderer-capacity limit, external network binding, or production startup flags.
@@ -48,7 +49,7 @@ No changes to daemon session ownership, terminal transport, layout grouping, pro
 
 ### 4.1 Hit testing
 
-Measure native input/textarea, ordinary nested element and author shadow-root cases in real Electron. Normalize native-control hits to the actual control rather than treating a UA editing implementation node as an unrelated overlay. Resolve ancestry using supported bounded protocol data; do not assume `parentId` is present in every `describeNode` response. Distinguish native shadow trees from author shadow trees and unrelated covering elements.
+Turn the measured native input/textarea and nested-span failures into permanent real-Electron regressions; extend them to author shadow-root cases. Normalize native-control hits to the actual control rather than treating a UA editing implementation node as an unrelated overlay. Resolve ancestry using supported bounded protocol data; do not assume `parentId` is present in every `describeNode` response. Distinguish native shadow trees from author shadow trees and unrelated covering elements.
 
 A real overlay must continue to fail. No `force:true`, disabled hit test, blind untargeted typing fallback, or accepting any geometrically overlapping element. For partially exposed controls, select a point in their visible clipped quad that actually hits the requested target/descendant; use a bounded set of candidates, not an unbounded pixel search. Avoid centers outside rotated/transformed quads.
 
@@ -86,7 +87,7 @@ Only viewport screenshots are coordinate-actionable in this version. Element/ful
 Add four clear tools, using the existing broker operation pipeline:
 
 1. `browser_mouse_move`: screenshotId, x, y; optional bounded path ending at x/y. Moves the browser-local pointer and triggers hover behavior.
-2. `browser_mouse_click`: screenshotId, x, y; button left/right; clickCount 1 or 2; optional supported modifiers.
+2. `browser_mouse_click`: screenshotId, x, y; button left/right; clickCount 1 or 2; optional supported modifiers and bounded approach path ending at the click point. Move-and-click can be one observed/approved operation rather than forcing an extra screenshot merely because mouse movement itself advances generation.
 3. `browser_mouse_scroll`: screenshotId, x, y, deltaX, deltaY. Wheel input at the chosen receiver, allowing nested-scroller operation.
 4. `browser_mouse_drag`: screenshotId, ordered path of 2..64 points; left button; optional supported modifiers. Down, intermediate moves, up are one operation.
 
@@ -114,7 +115,7 @@ Hide the marker during screenshot capture and restore it only if its owning page
 
 Extend `browser_press` with a bounded modifier array while retaining existing single-key calls. Initial supported editing/navigation chords: Shift plus arrows/Home/End/PageUp/PageDown/Tab; Control/Meta plus A/Z/Y and word-navigation arrows/Backspace/Delete; Shift combined with supported selection/redo/navigation combinations. Modifier order is canonicalized for digests; duplicates and unknown combinations are rejected.
 
-Add `browser_type_focused` with a current page lease, viewport `screenshotId`, and text capped at 8192 characters for controls selected visually. Re-read the focused receiver and apply the same credential/payment/read-only/file restrictions and approval classification used by semantic type. Unknown/canvas focus is not silently treated as a benign textarea; require approve-once with current visual context. Never expose typed values from credential/payment fields in results, diagnostics or logs.
+Add `browser_type_focused` with a current page lease, viewport `screenshotId`, and text capped at 8192 characters for controls selected visually. Re-read the focused receiver and apply the same credential/payment/read-only/file restrictions and approval classification used by semantic type. Unknown/canvas focus is not silently treated as a benign textarea; require approve-once with current visual context and conservatively redact the entire text argument in approval summaries, errors and logs. If frame/focus identity cannot be established, fail before sending text rather than guessing the top-level receiver. Never expose typed values from credential/payment fields in results, diagnostics or logs.
 
 Ctrl/Meta clipboard, save/open/print, browser-chrome shortcuts and developer-tool shortcuts remain outside this change. Do not gain filesystem or clipboard access through key combinations. Enter retains consequential-submit approval; modifier Enter is not a loophole.
 
@@ -156,7 +157,24 @@ Each milestone uses red-before-green unit tests and real private Electron fixtur
 9. New generated extension compile/load tests against the proven Pi baseline, correct image metadata and exact failure fields; preserve recovery hooks.
 10. Full app suite/typecheck/build; Rust tests and warnings-as-errors Clippy for changed Pi installer/generator; private packaged smoke. Then a user-visible Google typed-search test with approval. Production upgrade remains separately authorized; manual Mac/IME/native gestures must be labeled honestly when unavailable.
 
-## 12. Primary references consulted
+## 12. Direct quality-review additions and release scorecard
+
+Quality is measured by task success and diagnosability, not the number of tools. The original adapter's fixture-only event assertions were insufficient evidence of general interaction capability. For this change:
+
+- **Primary golden flow:** focus an ordinary native textarea, enter potatoes, submit using keyboard or the semantic Search button, and verify the resulting page state. A direct search URL, a programmatic DOM value assignment, or a `dispatched:true` reply cannot count as passing this flow.
+- **Receiver truth:** assert which element receives events, not only which CDP command was sent. Cover nested descendants, UA-shadow controls, author shadow trees, supported frame boundaries and real overlays. State exactly which cross-origin/OOPIF paths work; never label an untested frame path universally supported.
+- **Visual ground truth:** coordinate tests use pixels from the actual returned screenshot at DPR 1, fractional DPI and DPR 2, with document scrolling, rail resizing and zoom/emulation where supported. Do not accept a correct pure mapping test while the real browser clicks the wrong receiver.
+- **Navigation race:** a click/focus handler navigating during a fill/drag must not redirect subsequent text into the next page, even when the WebContents incarnation is unchanged. Cover same-origin replacement as well as cross-origin navigation.
+- **Native keyboard behavior:** demonstrate actual Enter submission, Tab focus traversal, selection replacement, modifier editing and non-ASCII text. Verify default browser behavior as well as JS handlers; merely observing a `keydown` with the right string is insufficient.
+- **No hidden fallback:** every test records the actual strategy used. Semantic failure followed by a successful coordinate action is useful recovery, not evidence that semantic targeting was fixed.
+- **Repeatability:** run the local critical-flow matrix 20 consecutive times with zero unexplained failures; report per-case results, CDP request counts and p50/p95 durations. Exclude human approval dwell time from execution latency, but record approval counts separately. Timeouts are failures, not silently retried green runs.
+- **Usability:** preserve prompt-free benign semantic interactions and allow a move-and-click gesture under one approval. Measure the cost of conservative coordinate approvals; do not weaken the safety policy or add broad permanent grants just to improve benchmark numbers.
+- **Read budget:** retain hard host/CDP memory and work limits while exposing useful late-page controls. Tests must distinguish emitted output bytes, scanned node/input budget and actual useful nodes returned.
+- **Evidence honesty:** record Linux Xvfb versus physical Linux versus native macOS separately. Test tooling cannot certify hardware focus/IME or Mac behavior it did not exercise. No claim of complete Codex parity.
+
+The scorecard belongs in the implementation report. A capability row needs evidence and an explicit supported/blocked/not-tested verdict. Any critical safety regression blocks integration, even if task-completion metrics improve.
+
+## 13. Primary references consulted
 
 - OpenAI in-app browser docs: https://developers.openai.com/codex/app/browser (currently renders Browser / ChatGPT Learn; documents shared browsing, confirmations and separately approved full-CDP developer access).
 - OpenAI computer-use integration recipes: https://developers.openai.com/api/docs/guides/tools-computer-use-integration (structured pointer actions, held-modifier cleanup, screenshot loop and resized-coordinate remapping).
