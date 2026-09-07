@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use amber_core::proto::{self, ControlMsg, Decoded, Decoder, Frame, PiCommand};
+use amber_core::proto::{self, validate_pi_command, ControlMsg, Decoded, Decoder, Frame};
+#[cfg(test)]
+use amber_core::proto::PiCommand;
 use amber_core::state::SessionKind;
 
 use crate::manager::{ResumeCause, SessionManager};
@@ -230,28 +232,7 @@ fn suppress_backlog(raw_client: bool, kind: Option<SessionKind>) -> bool {
     raw_client && kind.is_some_and(|k| k.is_agent())
 }
 
-const PI_PROMPT_MAX_BYTES: usize = 64 * 1024;
 const PI_EVENT_MAX_BYTES: usize = 4 * 1024 * 1024;
-
-fn validate_pi_command(command: &PiCommand) -> anyhow::Result<()> {
-    match command {
-        PiCommand::Prompt { message, .. } => {
-            if message.trim().is_empty() {
-                anyhow::bail!("Pi prompt must not be empty");
-            }
-            if message.len() > PI_PROMPT_MAX_BYTES {
-                anyhow::bail!("Pi prompt exceeds the 64 KiB limit");
-            }
-        }
-        PiCommand::SetThinkingLevel { level } => {
-            if !matches!(level.as_str(), "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max") {
-                anyhow::bail!("unsupported Pi thinking level: {level}");
-            }
-        }
-        PiCommand::Snapshot | PiCommand::Abort => {}
-    }
-    Ok(())
-}
 
 fn validate_pi_event(event: &serde_json::Value) -> anyhow::Result<()> {
     let Some(kind) = event.get("kind").and_then(serde_json::Value::as_str) else {
@@ -1191,7 +1172,7 @@ mod tests {
             delivery: amber_core::proto::PiDelivery::Now,
         }).is_err());
         assert!(validate_pi_command(&PiCommand::Prompt {
-            message: "x".repeat(PI_PROMPT_MAX_BYTES + 1),
+            message: "x".repeat(proto::PI_PROMPT_MAX_BYTES + 1),
             delivery: amber_core::proto::PiDelivery::Now,
         }).is_err());
         assert!(validate_pi_command(&PiCommand::SetThinkingLevel { level: "extreme".into() }).is_err());

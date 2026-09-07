@@ -451,6 +451,36 @@ export class PiPaneLink {
             t: 'piPrompt', name: this.session, message: command.message, delivery: command.delivery,
           }))
           break
+        case 'PromptWithAttachments':
+          this.socket.send(JSON.stringify({
+            t: 'piPromptWithAttachments', name: this.session, requestId: command.requestId,
+            message: command.message, delivery: command.delivery, attachments: command.attachments,
+          }))
+          break
+        case 'UploadBegin':
+          this.socket.send(JSON.stringify({
+            t: 'piUploadBegin', name: this.session, requestId: command.requestId,
+            filename: command.filename, mimeType: command.mimeType, size: command.size,
+          }))
+          break
+        case 'UploadChunk':
+          this.socket.send(JSON.stringify({
+            t: 'piUploadChunk', name: this.session, requestId: command.requestId,
+            attachmentId: command.attachmentId, offset: command.offset, data: command.data,
+          }))
+          break
+        case 'UploadFinish':
+          this.socket.send(JSON.stringify({
+            t: 'piUploadFinish', name: this.session, requestId: command.requestId,
+            attachmentId: command.attachmentId,
+          }))
+          break
+        case 'UploadCancel':
+          this.socket.send(JSON.stringify({
+            t: 'piUploadCancel', name: this.session, requestId: command.requestId,
+            attachmentId: command.attachmentId,
+          }))
+          break
         case 'Abort':
           this.socket.send(JSON.stringify({ t: 'piAbort', name: this.session }))
           break

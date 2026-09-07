@@ -284,9 +284,19 @@ describe('PiPaneLink', () => {
     }])
 
     port.fromRenderer({ command: { kind: 'Prompt', message: 'hello', delivery: 'steer' } })
+    port.fromRenderer({ command: { kind: 'PromptWithAttachments', requestId: 'prompt-1', message: '', delivery: 'now', attachments: ['att-1'] } })
+    port.fromRenderer({ command: { kind: 'UploadBegin', requestId: 'begin-1', filename: 'notes.bin', mimeType: 'application/octet-stream', size: 3 } })
+    port.fromRenderer({ command: { kind: 'UploadChunk', requestId: 'chunk-1', attachmentId: 'att-1', offset: 0, data: 'YWJj' } })
+    port.fromRenderer({ command: { kind: 'UploadFinish', requestId: 'finish-1', attachmentId: 'att-1' } })
+    port.fromRenderer({ command: { kind: 'UploadCancel', requestId: 'cancel-1', attachmentId: 'att-1' } })
     port.fromRenderer({ command: { kind: 'Abort' } })
     expect(socket.sent.slice(1)).toEqual([
       JSON.stringify({ t: 'piPrompt', name: 'pi', message: 'hello', delivery: 'steer' }),
+      JSON.stringify({ t: 'piPromptWithAttachments', name: 'pi', requestId: 'prompt-1', message: '', delivery: 'now', attachments: ['att-1'] }),
+      JSON.stringify({ t: 'piUploadBegin', name: 'pi', requestId: 'begin-1', filename: 'notes.bin', mimeType: 'application/octet-stream', size: 3 }),
+      JSON.stringify({ t: 'piUploadChunk', name: 'pi', requestId: 'chunk-1', attachmentId: 'att-1', offset: 0, data: 'YWJj' }),
+      JSON.stringify({ t: 'piUploadFinish', name: 'pi', requestId: 'finish-1', attachmentId: 'att-1' }),
+      JSON.stringify({ t: 'piUploadCancel', name: 'pi', requestId: 'cancel-1', attachmentId: 'att-1' }),
       JSON.stringify({ t: 'piAbort', name: 'pi' }),
     ])
 

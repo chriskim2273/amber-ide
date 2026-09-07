@@ -249,6 +249,29 @@ pub enum BrowserMsg {
     PiOpen { name: String },
     PiClose { name: String },
     PiPrompt { name: String, message: String, delivery: amber_core::proto::PiDelivery },
+    PiPromptWithAttachments {
+        name: String,
+        request_id: String,
+        message: String,
+        delivery: amber_core::proto::PiDelivery,
+        attachments: Vec<String>,
+    },
+    PiUploadBegin {
+        name: String,
+        request_id: String,
+        filename: String,
+        mime_type: String,
+        size: u64,
+    },
+    PiUploadChunk {
+        name: String,
+        request_id: String,
+        attachment_id: String,
+        offset: u64,
+        data: String,
+    },
+    PiUploadFinish { name: String, request_id: String, attachment_id: String },
+    PiUploadCancel { name: String, request_id: String, attachment_id: String },
     PiAbort { name: String },
     PiThinking { name: String, level: String },
     /// The browser is done looking at its open session (un-zoom, tab hidden,
@@ -265,6 +288,9 @@ pub fn parse_browser_msg(text: &str) -> Option<BrowserMsg> {
     let optional_text = |k: &str| match v.get(k) {
         None | Some(serde_json::Value::Null) => Some(None),
         Some(value) => value.as_str().map(|s| Some(s.to_string())),
+    };
+    let text_array = |k: &str| {
+        v.get(k)?.as_array()?.iter().map(|value| value.as_str().map(str::to_string)).collect::<Option<Vec<_>>>()
     };
     match v.get("t")?.as_str()? {
         "open" => Some(BrowserMsg::Open { name: f("name")? }),
@@ -293,6 +319,38 @@ pub fn parse_browser_msg(text: &str) -> Option<BrowserMsg> {
                 "follow_up" => amber_core::proto::PiDelivery::FollowUp,
                 _ => return None,
             },
+        }),
+        "piPromptWithAttachments" => Some(BrowserMsg::PiPromptWithAttachments {
+            name: f("name")?,
+            request_id: f("requestId")?,
+            message: f("message")?,
+            delivery: match f("delivery")?.as_str() {
+                "now" => amber_core::proto::PiDelivery::Now,
+                "steer" => amber_core::proto::PiDelivery::Steer,
+                "follow_up" => amber_core::proto::PiDelivery::FollowUp,
+                _ => return None,
+            },
+            attachments: text_array("attachments")?,
+        }),
+        "piUploadBegin" => Some(BrowserMsg::PiUploadBegin {
+            name: f("name")?,
+            request_id: f("requestId")?,
+            filename: f("filename")?,
+            mime_type: f("mimeType")?,
+            size: v.get("size")?.as_u64()?,
+        }),
+        "piUploadChunk" => Some(BrowserMsg::PiUploadChunk {
+            name: f("name")?,
+            request_id: f("requestId")?,
+            attachment_id: f("attachmentId")?,
+            offset: v.get("offset")?.as_u64()?,
+            data: f("data")?,
+        }),
+        "piUploadFinish" => Some(BrowserMsg::PiUploadFinish {
+            name: f("name")?, request_id: f("requestId")?, attachment_id: f("attachmentId")?,
+        }),
+        "piUploadCancel" => Some(BrowserMsg::PiUploadCancel {
+            name: f("name")?, request_id: f("requestId")?, attachment_id: f("attachmentId")?,
         }),
         "piAbort" => Some(BrowserMsg::PiAbort { name: f("name")? }),
         "piThinking" => Some(BrowserMsg::PiThinking { name: f("name")?, level: f("level")? }),
@@ -455,7 +513,7 @@ pub fn map_browser_msg(
         }
         BrowserMsg::PiClose { .. } => Vec::new(),
         BrowserMsg::PiPrompt { name, message, delivery } => {
-            if !is_pi(name) || message.trim().is_empty() || message.len() > 64 * 1024 {
+            if !is_pi(name) || message.trim().is_empty() || message.len() > proto::PI_PROMPT_MAX_BYTES {
                 return Vec::new();
             }
             vec![ControlMsg::PiBridgeCommand {
@@ -465,6 +523,56 @@ pub fn map_browser_msg(
                     delivery: *delivery,
                 },
             }]
+        }
+        BrowserMsg::PiPromptWithAttachments { name, request_id, message, delivery, attachments } => {
+            let command = amber_core::proto::PiCommand::PromptWithAttachments {
+                request_id: request_id.clone(),
+                message: message.clone(),
+                delivery: *delivery,
+                attachments: attachments.clone(),
+            };
+            if !is_pi(name) || proto::validate_pi_command(&command).is_err() {
+                return Vec::new();
+            }
+            vec![ControlMsg::PiBridgeCommand { name: name.clone(), command }]
+        }
+        BrowserMsg::PiUploadBegin { name, request_id, filename, mime_type, size } => {
+            let command = amber_core::proto::PiCommand::UploadBegin {
+                request_id: request_id.clone(), filename: filename.clone(),
+                mime_type: mime_type.clone(), size: *size,
+            };
+            if !is_pi(name) || proto::validate_pi_command(&command).is_err() {
+                return Vec::new();
+            }
+            vec![ControlMsg::PiBridgeCommand { name: name.clone(), command }]
+        }
+        BrowserMsg::PiUploadChunk { name, request_id, attachment_id, offset, data } => {
+            let command = amber_core::proto::PiCommand::UploadChunk {
+                request_id: request_id.clone(), attachment_id: attachment_id.clone(),
+                offset: *offset, data: data.clone(),
+            };
+            if !is_pi(name) || proto::validate_pi_command(&command).is_err() {
+                return Vec::new();
+            }
+            vec![ControlMsg::PiBridgeCommand { name: name.clone(), command }]
+        }
+        BrowserMsg::PiUploadFinish { name, request_id, attachment_id } => {
+            let command = amber_core::proto::PiCommand::UploadFinish {
+                request_id: request_id.clone(), attachment_id: attachment_id.clone(),
+            };
+            if !is_pi(name) || proto::validate_pi_command(&command).is_err() {
+                return Vec::new();
+            }
+            vec![ControlMsg::PiBridgeCommand { name: name.clone(), command }]
+        }
+        BrowserMsg::PiUploadCancel { name, request_id, attachment_id } => {
+            let command = amber_core::proto::PiCommand::UploadCancel {
+                request_id: request_id.clone(), attachment_id: attachment_id.clone(),
+            };
+            if !is_pi(name) || proto::validate_pi_command(&command).is_err() {
+                return Vec::new();
+            }
+            vec![ControlMsg::PiBridgeCommand { name: name.clone(), command }]
         }
         BrowserMsg::PiAbort { name } => {
             if !is_pi(name) {
@@ -1258,6 +1366,11 @@ impl Hub {
         // confusion when several phone panes are connected concurrently.
         let command_name = match &msg {
             BrowserMsg::PiPrompt { name, .. }
+            | BrowserMsg::PiPromptWithAttachments { name, .. }
+            | BrowserMsg::PiUploadBegin { name, .. }
+            | BrowserMsg::PiUploadChunk { name, .. }
+            | BrowserMsg::PiUploadFinish { name, .. }
+            | BrowserMsg::PiUploadCancel { name, .. }
             | BrowserMsg::PiAbort { name }
             | BrowserMsg::PiThinking { name, .. } => Some(name.as_str()),
             _ => None,
@@ -1321,6 +1434,11 @@ impl Hub {
             | BrowserMsg::DumpBacklog { .. }
             | BrowserMsg::PiClose { .. }
             | BrowserMsg::PiPrompt { .. }
+            | BrowserMsg::PiPromptWithAttachments { .. }
+            | BrowserMsg::PiUploadBegin { .. }
+            | BrowserMsg::PiUploadChunk { .. }
+            | BrowserMsg::PiUploadFinish { .. }
+            | BrowserMsg::PiUploadCancel { .. }
             | BrowserMsg::PiAbort { .. }
             | BrowserMsg::PiThinking { .. }
             | BrowserMsg::Release
@@ -2542,6 +2660,24 @@ mod tests {
             })
         );
         assert_eq!(
+            parse_browser_msg(r#"{"t":"piPromptWithAttachments","name":"pi","requestId":"req-1","message":"","delivery":"now","attachments":["att-1"]}"#),
+            Some(BrowserMsg::PiPromptWithAttachments {
+                name: "pi".into(), request_id: "req-1".into(), message: "".into(),
+                delivery: amber_core::proto::PiDelivery::Now, attachments: vec!["att-1".into()],
+            })
+        );
+        assert_eq!(
+            parse_browser_msg(r#"{"t":"piUploadChunk","name":"pi","requestId":"req-2","attachmentId":"att-1","offset":0,"data":"YWJj"}"#),
+            Some(BrowserMsg::PiUploadChunk {
+                name: "pi".into(), request_id: "req-2".into(), attachment_id: "att-1".into(), offset: 0,
+                data: "YWJj".into(),
+            })
+        );
+        assert_eq!(
+            parse_browser_msg(r#"{"t":"piUploadFinish","name":"pi","requestId":"req-3","attachmentId":"att-1"}"#),
+            Some(BrowserMsg::PiUploadFinish { name: "pi".into(), request_id: "req-3".into(), attachment_id: "att-1".into() })
+        );
+        assert_eq!(
             parse_browser_msg(r#"{"t":"piAbort","name":"pi"}"#),
             Some(BrowserMsg::PiAbort { name: "pi".into() })
         );
@@ -2645,6 +2781,48 @@ mod tests {
             &BrowserMsg::PiPrompt {
                 name: "pi".into(), message: "x".repeat(64 * 1024 + 1),
                 delivery: amber_core::proto::PiDelivery::Now,
+            },
+            None,
+            &live,
+        ).is_empty());
+        assert_eq!(
+            map_browser_msg(
+                &BrowserMsg::PiPromptWithAttachments {
+                    name: "pi".into(), request_id: "req-1".into(), message: "".into(),
+                    delivery: amber_core::proto::PiDelivery::Now, attachments: vec!["att-1".into()],
+                },
+                None,
+                &live,
+            ),
+            vec![ControlMsg::PiBridgeCommand {
+                name: "pi".into(),
+                command: amber_core::proto::PiCommand::PromptWithAttachments {
+                    request_id: "req-1".into(), message: "".into(),
+                    delivery: amber_core::proto::PiDelivery::Now, attachments: vec!["att-1".into()],
+                },
+            }]
+        );
+        assert_eq!(
+            map_browser_msg(
+                &BrowserMsg::PiUploadChunk {
+                    name: "pi".into(), request_id: "req-2".into(), attachment_id: "att-1".into(),
+                    offset: 0, data: "YWJj".into(),
+                },
+                None,
+                &live,
+            ),
+            vec![ControlMsg::PiBridgeCommand {
+                name: "pi".into(),
+                command: amber_core::proto::PiCommand::UploadChunk {
+                    request_id: "req-2".into(), attachment_id: "att-1".into(), offset: 0,
+                    data: "YWJj".into(),
+                },
+            }]
+        );
+        assert!(map_browser_msg(
+            &BrowserMsg::PiPromptWithAttachments {
+                name: "shell".into(), request_id: "req".into(), message: "x".into(),
+                delivery: amber_core::proto::PiDelivery::Now, attachments: vec!["att".into()],
             },
             None,
             &live,

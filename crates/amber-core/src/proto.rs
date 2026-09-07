@@ -192,8 +192,213 @@ pub enum PiDelivery {
 pub enum PiCommand {
     Snapshot,
     Prompt { message: String, delivery: PiDelivery },
+    /// Correlated prompt submission. Attachment ids refer only to completed
+    /// artifacts owned by the current Pi session; the extension resolves them
+    /// before calling Pi's public `sendUserMessage` API.
+    PromptWithAttachments {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        message: String,
+        delivery: PiDelivery,
+        attachments: Vec<String>,
+    },
+    /// Start one bounded upload. The extension allocates the opaque id; the
+    /// client must use the id returned in the command receipt for later chunks.
+    UploadBegin {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        filename: String,
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+        size: u64,
+    },
+    UploadChunk {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        #[serde(rename = "attachmentId")]
+        attachment_id: String,
+        offset: u64,
+        data: String,
+    },
+    UploadFinish {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        #[serde(rename = "attachmentId")]
+        attachment_id: String,
+    },
+    UploadCancel {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        #[serde(rename = "attachmentId")]
+        attachment_id: String,
+    },
     Abort,
     SetThinkingLevel { level: String },
+}
+
+/// Bounds shared by the daemon, authenticated web adapter, and the generated
+/// Pi extension. Keep these in the core protocol so a new ingress cannot
+/// accidentally accept a larger command than the existing one.
+pub const PI_PROMPT_MAX_BYTES: usize = 64 * 1024;
+pub const PI_REQUEST_ID_MAX_BYTES: usize = 128;
+pub const PI_ATTACHMENT_ID_MAX_BYTES: usize = 128;
+pub const PI_FILENAME_MAX_CHARS: usize = 255;
+pub const PI_MIME_TYPE_MAX_BYTES: usize = 128;
+pub const PI_ATTACHMENT_MAX_BYTES: u64 = 16 * 1024 * 1024;
+pub const PI_ATTACHMENTS_PER_PROMPT: usize = 8;
+pub const PI_PROMPT_ATTACHMENTS_MAX_BYTES: u64 = 32 * 1024 * 1024;
+pub const PI_PENDING_UPLOADS_MAX: usize = 4;
+pub const PI_ARTIFACTS_MAX_BYTES: u64 = 256 * 1024 * 1024;
+pub const PI_UPLOAD_CHUNK_MAX_BYTES: usize = 48 * 1024;
+pub const PI_UPLOAD_CHUNK_MAX_ENCODED_BYTES: usize = PI_UPLOAD_CHUNK_MAX_BYTES.div_ceil(3) * 4;
+
+fn validate_pi_identifier(value: &str, max: usize, label: &str) -> anyhow::Result<()> {
+    if value.is_empty() {
+        anyhow::bail!("Pi {label} must not be empty");
+    }
+    if value.len() > max {
+        anyhow::bail!("Pi {label} exceeds the {max}-byte limit");
+    }
+    if value.chars().any(char::is_control) {
+        anyhow::bail!("Pi {label} contains a control character");
+    }
+    Ok(())
+}
+
+fn validate_pi_attachment_id(value: &str) -> anyhow::Result<()> {
+    validate_pi_identifier(value, PI_ATTACHMENT_ID_MAX_BYTES, "attachment id")?;
+    if !value.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_') {
+        anyhow::bail!("Pi attachment id contains an invalid character");
+    }
+    Ok(())
+}
+
+fn validate_pi_filename(value: &str) -> anyhow::Result<()> {
+    if value.is_empty() {
+        anyhow::bail!("Pi attachment filename must not be empty");
+    }
+    if value.chars().count() > PI_FILENAME_MAX_CHARS {
+        anyhow::bail!("Pi attachment filename exceeds the 255-character limit");
+    }
+    if value.chars().any(|c| c.is_control() || c == '/' || c == '\\') {
+        anyhow::bail!("Pi attachment filename contains a control or path-separator character");
+    }
+    Ok(())
+}
+
+fn validate_pi_mime_type(value: &str) -> anyhow::Result<()> {
+    validate_pi_identifier(value, PI_MIME_TYPE_MAX_BYTES, "attachment MIME type")
+}
+
+/// Validate every Pi bridge command before it reaches either the daemon's
+/// registered extension or the browser adapter. Attachment sizes whose values
+/// live in the extension's metadata are checked again when a prompt resolves
+/// the ids; this boundary enforces all limits knowable from the command alone.
+pub fn validate_pi_command(command: &PiCommand) -> anyhow::Result<()> {
+    match command {
+        PiCommand::Snapshot | PiCommand::Abort => {}
+        PiCommand::Prompt { message, .. } => {
+            if message.trim().is_empty() {
+                anyhow::bail!("Pi prompt must not be empty");
+            }
+            if message.len() > PI_PROMPT_MAX_BYTES {
+                anyhow::bail!("Pi prompt exceeds the 64 KiB limit");
+            }
+        }
+        PiCommand::PromptWithAttachments { request_id, message, attachments, .. } => {
+            validate_pi_identifier(request_id, PI_REQUEST_ID_MAX_BYTES, "request id")?;
+            if message.trim().is_empty() && attachments.is_empty() {
+                anyhow::bail!("Pi prompt must contain text or an attachment");
+            }
+            if message.len() > PI_PROMPT_MAX_BYTES {
+                anyhow::bail!("Pi prompt exceeds the 64 KiB limit");
+            }
+            if attachments.len() > PI_ATTACHMENTS_PER_PROMPT {
+                anyhow::bail!("Pi prompt exceeds the 8-attachment limit");
+            }
+            let mut seen = std::collections::HashSet::with_capacity(attachments.len());
+            for attachment in attachments {
+                validate_pi_attachment_id(attachment)?;
+                if !seen.insert(attachment) {
+                    anyhow::bail!("Pi prompt contains a duplicate attachment id");
+                }
+            }
+        }
+        PiCommand::UploadBegin { request_id, filename, mime_type, size } => {
+            validate_pi_identifier(request_id, PI_REQUEST_ID_MAX_BYTES, "request id")?;
+            validate_pi_filename(filename)?;
+            validate_pi_mime_type(mime_type)?;
+            if *size > PI_ATTACHMENT_MAX_BYTES {
+                anyhow::bail!("Pi attachment exceeds the 16 MiB limit");
+            }
+        }
+        PiCommand::UploadChunk { request_id, attachment_id, offset, data } => {
+            validate_pi_identifier(request_id, PI_REQUEST_ID_MAX_BYTES, "request id")?;
+            validate_pi_attachment_id(attachment_id)?;
+            if *offset > PI_ATTACHMENT_MAX_BYTES {
+                anyhow::bail!("Pi attachment offset exceeds the 16 MiB limit");
+            }
+            decode_pi_upload_chunk(data)?;
+        }
+        PiCommand::UploadFinish { request_id, attachment_id }
+        | PiCommand::UploadCancel { request_id, attachment_id } => {
+            validate_pi_identifier(request_id, PI_REQUEST_ID_MAX_BYTES, "request id")?;
+            validate_pi_attachment_id(attachment_id)?;
+        }
+        PiCommand::SetThinkingLevel { level } => {
+            if !matches!(level.as_str(), "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max") {
+                anyhow::bail!("unsupported Pi thinking level: {level}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn base64_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+/// Decode a standard padded base64 upload chunk, rejecting every noncanonical
+/// spelling before allocating the decoded buffer. This is deliberately local
+/// rather than a general-purpose base64 utility: the browser ingress needs
+/// exactly one bounded encoding and no permissive decoder variants.
+pub fn decode_pi_upload_chunk(data: &str) -> anyhow::Result<Vec<u8>> {
+    if data.is_empty() || data.len() > PI_UPLOAD_CHUNK_MAX_ENCODED_BYTES || !data.len().is_multiple_of(4) {
+        anyhow::bail!("Pi upload chunk is not canonical base64");
+    }
+    let bytes = data.as_bytes();
+    let padding = bytes.iter().rev().take_while(|&&byte| byte == b'=').count();
+    if padding > 2 || bytes[..bytes.len() - padding].contains(&b'=') {
+        anyhow::bail!("Pi upload chunk is not canonical base64");
+    }
+    let decoded_len = bytes.len() / 4 * 3 - padding;
+    if decoded_len == 0 || decoded_len > PI_UPLOAD_CHUNK_MAX_BYTES {
+        anyhow::bail!("Pi upload chunk exceeds the 48 KiB limit");
+    }
+    let mut output = Vec::with_capacity(decoded_len);
+    let (groups, _) = bytes.as_chunks::<4>();
+    for group in groups {
+        let a = base64_value(group[0]).ok_or_else(|| anyhow::anyhow!("Pi upload chunk is not canonical base64"))? as u32;
+        let b = base64_value(group[1]).ok_or_else(|| anyhow::anyhow!("Pi upload chunk is not canonical base64"))? as u32;
+        let c = if group[2] == b'=' { 0 } else { base64_value(group[2]).ok_or_else(|| anyhow::anyhow!("Pi upload chunk is not canonical base64"))? as u32 };
+        let d = if group[3] == b'=' { 0 } else { base64_value(group[3]).ok_or_else(|| anyhow::anyhow!("Pi upload chunk is not canonical base64"))? as u32 };
+        if group[2] == b'=' && group[3] != b'=' || group[2] == b'=' && (b & 0x0f) != 0 || group[3] == b'=' && (c & 0x03) != 0 {
+            anyhow::bail!("Pi upload chunk is not canonical base64");
+        }
+        let n = (a << 18) | (b << 12) | (c << 6) | d;
+        output.push((n >> 16) as u8);
+        if group[2] != b'=' { output.push((n >> 8) as u8); }
+        if group[3] != b'=' { output.push(n as u8); }
+    }
+    if output.len() != decoded_len { anyhow::bail!("Pi upload chunk is not canonical base64"); }
+    Ok(output)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -854,6 +1059,74 @@ mod tests {
             });
             assert_eq!(roundtrip(&frame), frame);
         }
+    }
+
+    #[test]
+    fn pi_attachment_commands_use_camel_case_fields_and_roundtrip() {
+        let command = PiCommand::PromptWithAttachments {
+            request_id: "req-1".into(),
+            message: "look".into(),
+            delivery: PiDelivery::Now,
+            attachments: vec!["att-1".into()],
+        };
+        let json = serde_json::to_string(&command).unwrap();
+        assert_eq!(
+            json,
+            r#"{"PromptWithAttachments":{"requestId":"req-1","message":"look","delivery":"now","attachments":["att-1"]}}"#
+        );
+        assert_eq!(serde_json::from_str::<PiCommand>(&json).unwrap(), command);
+        let upload = PiCommand::UploadChunk {
+            request_id: "req-2".into(),
+            attachment_id: "att-1".into(),
+            offset: 3,
+            data: "aGk=".into(),
+        };
+        assert_eq!(serde_json::from_str::<PiCommand>(&serde_json::to_string(&upload).unwrap()).unwrap(), upload);
+    }
+
+    #[test]
+    fn pi_command_validator_enforces_prompt_attachment_and_chunk_bounds() {
+        assert!(validate_pi_command(&PiCommand::PromptWithAttachments {
+            request_id: "r".into(), message: String::new(), delivery: PiDelivery::Now,
+            attachments: vec!["a".into()],
+        }).is_ok(), "image-only prompts are valid");
+        assert!(validate_pi_command(&PiCommand::PromptWithAttachments {
+            request_id: "r".into(), message: String::new(), delivery: PiDelivery::Now,
+            attachments: Vec::new(),
+        }).is_err());
+        assert!(validate_pi_command(&PiCommand::UploadBegin {
+            request_id: "r".into(), filename: "photo.png".into(), mime_type: "image/png".into(),
+            size: PI_ATTACHMENT_MAX_BYTES + 1,
+        }).is_err());
+        assert!(validate_pi_command(&PiCommand::UploadBegin {
+            request_id: "r\u{80}".into(), filename: "photo.png".into(), mime_type: "image/png".into(), size: 0,
+        }).is_err(), "C1 controls must match char::is_control at the TS boundary");
+        assert!(validate_pi_command(&PiCommand::UploadChunk {
+            request_id: "r".into(), attachment_id: "a".into(), offset: 0, data: "aGk=".into(),
+        }).is_ok());
+        for bad in ["aGk", "aG!k", "aGk=\n", "ab=="] {
+            assert!(decode_pi_upload_chunk(bad).is_err(), "{bad:?} must be rejected");
+        }
+        assert_eq!(decode_pi_upload_chunk("AA==").unwrap(), [0]);
+        assert_eq!(decode_pi_upload_chunk("AAE=").unwrap(), [0, 1]);
+        assert_eq!(decode_pi_upload_chunk("AAEC").unwrap(), [0, 1, 2]);
+        assert_eq!(decode_pi_upload_chunk("YWJj").unwrap(), b"abc");
+        let bytes = vec![b'x'; PI_UPLOAD_CHUNK_MAX_BYTES];
+        let mut encoded = String::new();
+        const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        for chunk in bytes.chunks(3) {
+            let a = chunk[0] as u32;
+            let b = *chunk.get(1).unwrap_or(&0) as u32;
+            let c = *chunk.get(2).unwrap_or(&0) as u32;
+            let n = (a << 16) | (b << 8) | c;
+            encoded.push(ALPHABET[((n >> 18) & 63) as usize] as char);
+            encoded.push(ALPHABET[((n >> 12) & 63) as usize] as char);
+            encoded.push(if chunk.len() > 1 { ALPHABET[((n >> 6) & 63) as usize] as char } else { '=' });
+            encoded.push(if chunk.len() > 2 { ALPHABET[(n & 63) as usize] as char } else { '=' });
+        }
+        assert_eq!(decode_pi_upload_chunk(&encoded).unwrap().len(), PI_UPLOAD_CHUNK_MAX_BYTES);
+        let too_large = format!("{encoded}AAAA");
+        assert!(decode_pi_upload_chunk(&too_large).is_err());
     }
 
     #[test]
