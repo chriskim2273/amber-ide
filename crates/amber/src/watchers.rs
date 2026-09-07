@@ -66,6 +66,7 @@ struct Entry {
     writer_key: usize,
     session_events: bool,
     pressure_version: u16,
+    pi_version: u16,
     tx: SyncSender<QueuedFrame>,
 }
 
@@ -101,13 +102,20 @@ impl Watchers {
     /// dedicated forwarder thread. Holds only a `Weak` to the writer, so a
     /// vanished connection is pruned automatically.
     pub fn register(&self, writer: &Arc<Mutex<LocalWriter>>) {
-        self.register_capability(writer, true, None);
+        self.register_capability(writer, true, None, None);
     }
 
     /// Opt a connection in to versioned memory-pressure controls without
     /// changing what legacy `WatchSessions` means.
     pub fn register_pressure(&self, writer: &Arc<Mutex<LocalWriter>>, version: u16) {
-        self.register_capability(writer, false, Some(version));
+        self.register_capability(writer, false, Some(version), None);
+    }
+
+    /// Opt a connection into Pi semantic events. Kept separate from session
+    /// watching because old strict clients would disconnect on an unknown
+    /// PiEvent variant.
+    pub fn register_pi(&self, writer: &Arc<Mutex<LocalWriter>>, version: u16) {
+        self.register_capability(writer, false, None, Some(version));
     }
 
     /// Register a session watcher before building its full snapshot. Its
@@ -154,6 +162,7 @@ impl Watchers {
                     writer_key,
                     session_events: true,
                     pressure_version: 0,
+                    pi_version: 0,
                     tx,
                 });
                 Some((id, rx, Arc::downgrade(writer), Arc::clone(&self.entries)))
@@ -175,6 +184,7 @@ impl Watchers {
         writer: &Arc<Mutex<LocalWriter>>,
         session_events: bool,
         pressure_version: Option<u16>,
+        pi_version: Option<u16>,
     ) {
         let writer_key = Arc::as_ptr(writer) as usize;
         let mut entries = self.entries.lock().unwrap();
@@ -182,6 +192,9 @@ impl Watchers {
             entry.session_events |= session_events;
             if let Some(version) = pressure_version {
                 entry.pressure_version = entry.pressure_version.max(version);
+            }
+            if let Some(version) = pi_version {
+                entry.pi_version = entry.pi_version.max(version);
             }
             return;
         }
@@ -192,6 +205,7 @@ impl Watchers {
             writer_key,
             session_events,
             pressure_version: pressure_version.unwrap_or(0),
+            pi_version: pi_version.unwrap_or(0),
             tx: tx.clone(),
         });
         drop(entries);
@@ -221,6 +235,12 @@ impl Watchers {
     pub fn broadcast_resource_pressure(&self, msg: &ControlMsg) {
         debug_assert!(matches!(msg, ControlMsg::ResourcePressure { .. }));
         self.broadcast_where(msg, |entry| entry.pressure_version >= 2);
+    }
+
+    /// Queue Pi bridge events/status only for explicitly compatible clients.
+    pub fn broadcast_pi(&self, msg: &ControlMsg) {
+        debug_assert!(matches!(msg, ControlMsg::PiEvent { .. } | ControlMsg::PiBridgeStatus { .. }));
+        self.broadcast_where(msg, |entry| entry.pi_version >= 1);
     }
 
     fn broadcast_where(&self, msg: &ControlMsg, include: impl Fn(&Entry) -> bool) {
@@ -497,6 +517,34 @@ mod tests {
             read_next(&mut version_two_client, &mut version_two_decoder),
             Some(Frame::Control(resource))
         );
+    }
+
+    #[test]
+    fn pi_events_are_delivered_only_to_explicit_pi_watchers() {
+        let watchers = Watchers::new();
+        let (mut legacy_client, legacy_server) = pair();
+        let (mut pi_client, pi_server) = pair();
+        let legacy = Arc::new(Mutex::new(legacy_server));
+        let pi = Arc::new(Mutex::new(pi_server));
+        watchers.register(&legacy);
+        watchers.register_pi(&pi, 1);
+
+        let event = ControlMsg::PiEvent {
+            name: "amber-1-1-0-pi".into(),
+            seq: 1,
+            event: serde_json::json!({"kind":"snapshot"}),
+        };
+        let status = ControlMsg::PiBridgeStatus {
+            name: "amber-1-1-0-pi".into(),
+            available: true,
+        };
+        watchers.broadcast_pi(&event);
+        watchers.broadcast_pi(&status);
+
+        assert_eq!(read_one(&mut legacy_client), None, "legacy watcher received Pi event");
+        let mut decoder = Decoder::new();
+        assert_eq!(read_next(&mut pi_client, &mut decoder), Some(Frame::Control(event)));
+        assert_eq!(read_next(&mut pi_client, &mut decoder), Some(Frame::Control(status)));
     }
 
     #[test]

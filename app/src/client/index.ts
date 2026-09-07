@@ -9,7 +9,11 @@ const router = new Router(conn)
 let controlPort: Electron.MessagePortMain | null = null
 
 conn.on('frame', (f: Frame) => {
-  if (f.type === 'control') controlPort?.postMessage({ frame: f })
+  // Pi semantic payloads have dedicated per-pane ports. Do not duplicate large
+  // message/tool events onto the window-global control channel.
+  if (f.type === 'control' && f.msg.kind !== 'PiEvent' && f.msg.kind !== 'PiBridgeStatus') {
+    controlPort?.postMessage({ frame: f })
+  }
   // A scrollback dump now arrives on its own BINARY tag (no JSON numeric array
   // on the wire), but the renderer's dump-correlation path is unchanged: hand it
   // over in the shape it already matches on. This hop is a MessagePort, so the
@@ -33,10 +37,11 @@ process.parentPort.on('message', (event) => {
     | { kind: 'pane'; session: string }
     | { kind: 'pane-close'; session: string }
     | { kind: 'suspend-panes' }
-  // These lifecycle messages carry no port. `suspend-panes` keeps the metadata
-  // control connection alive for BrowserHost authorization while releasing
-  // every PTY subscription owned only by the hidden renderer.
+    | { kind: 'pi-pane'; session: string }
+    | { kind: 'pi-pane-close'; session: string }
+  // Lifecycle messages carry no port; hidden renderers release their views.
   if (msg.kind === 'pane-close') { router.detach(msg.session); return }
+  if (msg.kind === 'pi-pane-close') { router.closePi(msg.session); return }
   if (msg.kind === 'suspend-panes') { router.detachAll(); return }
   const [port] = event.ports
   if (!port) return
@@ -48,6 +53,8 @@ process.parentPort.on('message', (event) => {
     })
     port.start()
     conn.connect()
+  } else if (msg.kind === 'pi-pane') {
+    router.attachPi(msg.session, port as unknown as PortLike)
   } else {
     // MessagePortMain matches PortLike structurally (postMessage/on/start).
     router.attach(msg.session, port as unknown as PortLike)
