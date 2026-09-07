@@ -67,6 +67,8 @@ declare global {
       openPane: (session: string) => void
       closePane: (session: string) => void
       createSession: (name: string, cwd: string, sessionKind: string, title?: string) => void
+      openPiPane: (session: string) => void
+      closePiPane: (session: string) => void
       killSession: (name: string) => void
       renameSession: (from: string, to: string) => void
       setSessionTitle: (name: string, title: string | null) => void
@@ -194,6 +196,7 @@ const EMPTY_FROZEN: Record<string, { note?: string }> = {}
 // render would defeat SplitView's memoized children.
 const EMPTY_EDITORS: NonNullable<LayoutFile['editors']> = {}
 const EMPTY_TITLES: NonNullable<LayoutFile['titles']> = {}
+const EMPTY_PI_VIEWS: NonNullable<LayoutFile['piViews']> = {}
 // App-wide terminal font size, clamped to a sane range (integer px).
 function clampFont(n: number): number {
   return Math.max(8, Math.min(32, Math.round(n)))
@@ -496,6 +499,7 @@ function App(): JSX.Element {
   // when absent so SplitView's memo'd children don't churn.
   const frozen = layout.frozen ?? EMPTY_FROZEN
   const frozenSet = new Set(Object.keys(frozen))
+  const piViews = layout.piViews ?? EMPTY_PI_VIEWS
 
   // Stable dispatcher for OSC pane titles (referential stability keeps Pane's
   // memo effective — SplitView caches a per-pane wrapper around this). Caps the
@@ -1264,6 +1268,24 @@ function App(): JSX.Element {
     })
   }, [sessions, loaded, sawSessions])
 
+  // Pi view preferences are keyed by daemon session name. Remove dead and
+  // non-Pi keys, and omit the map entirely when every pane uses the default
+  // terminal view.
+  useEffect(() => {
+    if (!loaded || !sawSessions) return
+    setLayout((l) => {
+      if (!l.piViews) return l
+      const livePi = new Set(sessions.filter((session) => session.kind === 'pi').map((session) => session.name))
+      const next = Object.fromEntries(Object.entries(l.piViews).filter(([name]) => livePi.has(name))) as Record<string, 'gui'>
+      if (Object.keys(next).length === Object.keys(l.piViews).length) return l
+      if (Object.keys(next).length === 0) {
+        const { piViews: _removed, ...rest } = l
+        return rest
+      }
+      return { ...l, piViews: next }
+    })
+  }, [sessions, loaded, sawSessions])
+
   useEffect(() => {
     if (!loaded) return
     if (tree && JSON.stringify(tree) !== JSON.stringify(storedTree)) putTree(tree)
@@ -1495,6 +1517,20 @@ function App(): JSX.Element {
     })
   }, [])
 
+  const setPiView = useCallback((paneId: string, view: 'terminal' | 'gui'): void => {
+    setLayout((l) => {
+      if (view === 'gui') return { ...l, piViews: { ...(l.piViews ?? {}), [paneId]: 'gui' } }
+      if (!l.piViews?.[paneId]) return l
+      const next = { ...l.piViews }
+      delete next[paneId]
+      if (Object.keys(next).length === 0) {
+        const { piViews: _removed, ...rest } = l
+        return rest
+      }
+      return { ...l, piViews: next }
+    })
+  }, [])
+
   const closePane = (paneId: string): void => {
     // Unsaved editor buffer: ask first. This covers ✕, the tab close button,
     // and workspace-replace, because they all route through closePane.
@@ -1562,7 +1598,17 @@ function App(): JSX.Element {
       })
     } else {
       const to = retargetPane(paneId, { ws: destWs, tab: destTab, ord })
-      if (to && to !== paneId) window.amber.renameSession(paneId, to)
+      if (to && to !== paneId) {
+        if (layoutRef.current.piViews?.[paneId] === 'gui') {
+          setLayout((l) => {
+            const next = { ...(l.piViews ?? {}) }
+            delete next[paneId]
+            next[to] = 'gui'
+            return { ...l, piViews: next }
+          })
+        }
+        window.amber.renameSession(paneId, to)
+      }
     }
     clearZoom()
   }
@@ -2385,6 +2431,8 @@ function App(): JSX.Element {
                           focusRequest={isActive ? focusRequest : null}
                           zoomedPane={isActive ? zoomedPane : null}
                           frozen={frozen}
+                          piViews={piViews}
+                          onPiView={setPiView}
                           onFreeze={freezePane}
                           onUnfreeze={unfreezePane}
                           {...(productivityAvailable ? {

@@ -245,6 +245,12 @@ pub enum BrowserMsg {
     /// are untrusted wire input — [`map_browser_msg`] is what bounds-checks
     /// them before they can become a [`ControlMsg::Resize`].
     Resize { name: String, cols: u16, rows: u16 },
+    /// Open/close an event-only Pi view. This never attaches or resizes a PTY.
+    PiOpen { name: String },
+    PiClose { name: String },
+    PiPrompt { name: String, message: String, delivery: amber_core::proto::PiDelivery },
+    PiAbort { name: String },
+    PiThinking { name: String, level: String },
     /// The browser is done looking at its open session (un-zoom, tab hidden,
     /// page unload). Maps to NO daemon control message of its own — it only
     /// tells the [`Hub`] to hand a borrowed pty grid back (spec §2.3).
@@ -276,6 +282,20 @@ pub fn parse_browser_msg(text: &str) -> Option<BrowserMsg> {
         "suspend" => Some(BrowserMsg::Suspend { name: f("name")? }),
         "resume" => Some(BrowserMsg::Resume { name: f("name")? }),
         "dumpBacklog" => Some(BrowserMsg::DumpBacklog { name: f("name")? }),
+        "piOpen" => Some(BrowserMsg::PiOpen { name: f("name")? }),
+        "piClose" => Some(BrowserMsg::PiClose { name: f("name")? }),
+        "piPrompt" => Some(BrowserMsg::PiPrompt {
+            name: f("name")?,
+            message: f("message")?,
+            delivery: match f("delivery")?.as_str() {
+                "now" => amber_core::proto::PiDelivery::Now,
+                "steer" => amber_core::proto::PiDelivery::Steer,
+                "follow_up" => amber_core::proto::PiDelivery::FollowUp,
+                _ => return None,
+            },
+        }),
+        "piAbort" => Some(BrowserMsg::PiAbort { name: f("name")? }),
+        "piThinking" => Some(BrowserMsg::PiThinking { name: f("name")?, level: f("level")? }),
         "release" => Some(BrowserMsg::Release),
         "resize" => Some(BrowserMsg::Resize {
             name: f("name")?,
@@ -322,6 +342,7 @@ pub fn map_browser_msg(
     sessions: &[SessionInfo],
 ) -> Vec<ControlMsg> {
     let live = |n: &str| sessions.iter().any(|s| s.name == n);
+    let is_pi = |n: &str| sessions.iter().any(|s| s.name == n && s.kind == "pi");
     let is_agent = |n: &str| {
         sessions.iter().any(|s| {
             s.name == n
@@ -413,6 +434,57 @@ pub fn map_browser_msg(
                 return Vec::new();
             }
             vec![ControlMsg::DumpBacklog { name: name.clone() }]
+        }
+        BrowserMsg::PiOpen { name } => {
+            if !is_pi(name) {
+                return Vec::new();
+            }
+            let mut out = Vec::new();
+            // Semantic and terminal modes are mutually exclusive on one pane
+            // WebSocket. A malformed/racing client may still send piOpen while
+            // its terminal mode is open; release that subscription before the
+            // semantic mode is recorded, without ever attaching the PTY.
+            if let Some(previous) = open {
+                out.push(ControlMsg::Detach { name: previous.to_string() });
+            }
+            out.extend([
+                ControlMsg::WatchPiEvents { version: 1 },
+                ControlMsg::PiBridgeCommand { name: name.clone(), command: amber_core::proto::PiCommand::Snapshot },
+            ]);
+            out
+        }
+        BrowserMsg::PiClose { .. } => Vec::new(),
+        BrowserMsg::PiPrompt { name, message, delivery } => {
+            if !is_pi(name) || message.trim().is_empty() || message.len() > 64 * 1024 {
+                return Vec::new();
+            }
+            vec![ControlMsg::PiBridgeCommand {
+                name: name.clone(),
+                command: amber_core::proto::PiCommand::Prompt {
+                    message: message.clone(),
+                    delivery: *delivery,
+                },
+            }]
+        }
+        BrowserMsg::PiAbort { name } => {
+            if !is_pi(name) {
+                return Vec::new();
+            }
+            vec![ControlMsg::PiBridgeCommand {
+                name: name.clone(),
+                command: amber_core::proto::PiCommand::Abort,
+            }]
+        }
+        BrowserMsg::PiThinking { name, level } => {
+            if !is_pi(name)
+                || !matches!(level.as_str(), "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max")
+            {
+                return Vec::new();
+            }
+            vec![ControlMsg::PiBridgeCommand {
+                name: name.clone(),
+                command: amber_core::proto::PiCommand::SetThinkingLevel { level: level.clone() },
+            }]
         }
         // Release carries no authority of its own: the Hub turns it into a
         // restore `Resize` built by this same function, so a browser can never
@@ -718,8 +790,10 @@ struct PendingTitle {
 
 struct Client {
     id: u64,
-    /// The one session this WebSocket has open, if any.
+    /// The one terminal session this WebSocket has open, if any.
     open: Option<String>,
+    /// The one semantic Pi session this socket observes, if any.
+    pi: Option<String>,
     tx: SyncSender<Out>,
 }
 
@@ -859,6 +933,7 @@ impl Hub {
                 serde_json::json!({
                     "id": c.id,
                     "open": c.open,
+                    "pi": c.pi,
                     // Phase B (spec §2.2) fills this with the borrowed grid.
                     "borrow": serde_json::Value::Null,
                 })
@@ -915,7 +990,7 @@ impl Hub {
         if inner.daemon.is_none() {
             let _ = tx.try_send(Self::error_msg("daemon unreachable"));
         }
-        inner.clients.push(Client { id, open: None, tx });
+        inner.clients.push(Client { id, open: None, pi: None, tx });
         (id, rx)
     }
 
@@ -1178,11 +1253,25 @@ impl Hub {
         let mut inner = self.inner.lock().unwrap();
         let Some(pos) = inner.clients.iter().position(|c| c.id == id) else { return };
         let previous = inner.clients[pos].open.clone();
+        // A semantic command may target only the Pi session this WebSocket
+        // opened. Authentication grants Amber access, not cross-pane message
+        // confusion when several phone panes are connected concurrently.
+        let command_name = match &msg {
+            BrowserMsg::PiPrompt { name, .. }
+            | BrowserMsg::PiAbort { name }
+            | BrowserMsg::PiThinking { name, .. } => Some(name.as_str()),
+            _ => None,
+        };
+        if command_name.is_some_and(|name| inner.clients[pos].pi.as_deref() != Some(name)) {
+            let err = Self::error_msg("Pi command does not match this semantic pane");
+            Self::queue(&mut inner, |client| client.id == id, err);
+            return;
+        }
         let controls = map_browser_msg(&msg, previous.as_deref(), &inner.sessions);
         if controls.is_empty() {
             // `Release` legitimately maps to no control message — it acts on
             // Hub state only (handled below), so it is not "no such session".
-            if !matches!(msg, BrowserMsg::Release) {
+            if !matches!(msg, BrowserMsg::Release | BrowserMsg::PiClose { .. }) {
                 let err = Self::error_msg("no such session");
                 Self::queue(&mut inner, |c| c.id == id, err);
                 return;
@@ -1213,9 +1302,15 @@ impl Hub {
             }
             _ => {}
         }
+        inner.clients[pos].pi = match &msg {
+            BrowserMsg::PiOpen { name } => Some(name.clone()),
+            BrowserMsg::PiClose { name }
+                if inner.clients[pos].pi.as_deref() == Some(name.as_str()) => None,
+            _ => inner.clients[pos].pi.clone(),
+        };
         inner.clients[pos].open = match &msg {
             BrowserMsg::Open { name } => Some(name.clone()),
-            BrowserMsg::Close { .. } => None,
+            BrowserMsg::Close { .. } | BrowserMsg::PiOpen { .. } => None,
             BrowserMsg::Focus { .. }
             | BrowserMsg::Create { .. }
             | BrowserMsg::SetTitle { .. }
@@ -1224,6 +1319,10 @@ impl Hub {
             | BrowserMsg::Suspend { .. }
             | BrowserMsg::Resume { .. }
             | BrowserMsg::DumpBacklog { .. }
+            | BrowserMsg::PiClose { .. }
+            | BrowserMsg::PiPrompt { .. }
+            | BrowserMsg::PiAbort { .. }
+            | BrowserMsg::PiThinking { .. }
             | BrowserMsg::Release
             | BrowserMsg::Resize { .. } => previous,
         };
@@ -1347,6 +1446,20 @@ impl Hub {
                 let out = Self::error_msg(&msg);
                 Self::queue(&mut inner, |_| true, out);
             }
+            Frame::Control(ControlMsg::PiEvent { name, seq, event }) => {
+                let out = Out::Text(Arc::new(
+                    serde_json::json!({ "t": "piEvent", "name": name, "seq": seq, "event": event })
+                        .to_string(),
+                ));
+                Self::queue(&mut inner, |c| c.pi.as_deref() == Some(name.as_str()), out);
+            }
+            Frame::Control(ControlMsg::PiBridgeStatus { name, available }) => {
+                let out = Out::Text(Arc::new(
+                    serde_json::json!({ "t": "piStatus", "name": name, "available": available })
+                        .to_string(),
+                ));
+                Self::queue(&mut inner, |c| c.pi.as_deref() == Some(name.as_str()), out);
+            }
             // Broadcast like Sessions/Error. The web-app shim (spec 2026-08-01
             // §3 "the same event stream the Electron client emits") only lets
             // its ONE control connection forward these into `onDaemonEvent` —
@@ -1448,6 +1561,25 @@ fn run_daemon_link(hub: Arc<Hub>) {
                         &mut inner,
                         &Frame::Control(ControlMsg::WatchMemoryPressure { version: 2 }),
                     );
+                    let mut pi_sessions: Vec<String> =
+                        inner.clients.iter().filter_map(|c| c.pi.clone()).collect();
+                    pi_sessions.sort();
+                    pi_sessions.dedup();
+                    if !pi_sessions.is_empty() {
+                        Hub::write_daemon(
+                            &mut inner,
+                            &Frame::Control(ControlMsg::WatchPiEvents { version: 1 }),
+                        );
+                    }
+                    for name in pi_sessions {
+                        Hub::write_daemon(
+                            &mut inner,
+                            &Frame::Control(ControlMsg::PiBridgeCommand {
+                                name,
+                                command: amber_core::proto::PiCommand::Snapshot,
+                            }),
+                        );
+                    }
                     let mut reattach: Vec<String> =
                         inner.clients.iter().filter_map(|c| c.open.clone()).collect();
                     reattach.sort();
@@ -2397,6 +2529,26 @@ mod tests {
             parse_browser_msg(r#"{"t":"resize","name":"s","cols":80,"rows":24}"#),
             Some(BrowserMsg::Resize { name: "s".into(), cols: 80, rows: 24 })
         );
+        assert_eq!(
+            parse_browser_msg(r#"{"t":"piOpen","name":"pi"}"#),
+            Some(BrowserMsg::PiOpen { name: "pi".into() })
+        );
+        assert_eq!(
+            parse_browser_msg(r#"{"t":"piPrompt","name":"pi","message":"hi","delivery":"follow_up"}"#),
+            Some(BrowserMsg::PiPrompt {
+                name: "pi".into(),
+                message: "hi".into(),
+                delivery: amber_core::proto::PiDelivery::FollowUp,
+            })
+        );
+        assert_eq!(
+            parse_browser_msg(r#"{"t":"piAbort","name":"pi"}"#),
+            Some(BrowserMsg::PiAbort { name: "pi".into() })
+        );
+        assert_eq!(
+            parse_browser_msg(r#"{"t":"piThinking","name":"pi","level":"high"}"#),
+            Some(BrowserMsg::PiThinking { name: "pi".into(), level: "high".into() })
+        );
         for junk in [
             "",
             "not json",
@@ -2414,6 +2566,7 @@ mod tests {
             r#"{"t":"resize","name":"s","cols":"wide","rows":24}"#,
             r#"{"t":"resize","name":"s","cols":999999,"rows":24}"#,
             r#"{"t":"resize","name":"s","rows":24}"#,
+            r#"{"t":"piPrompt","name":"pi","message":"hi","delivery":"later"}"#,
         ] {
             assert_eq!(parse_browser_msg(junk), None, "must ignore {junk:?}");
         }
@@ -2437,6 +2590,88 @@ mod tests {
                 | ControlMsg::SupervisorHello { .. }
                 | ControlMsg::SupervisorCommand { .. }
         )
+    }
+
+    #[test]
+    fn pi_browser_commands_are_pi_only_bounded_and_never_attach_the_pty() {
+        let live = [s("pi", "pi"), s("shell", "shell")];
+        assert_eq!(
+            map_browser_msg(&BrowserMsg::PiOpen { name: "pi".into() }, None, &live),
+            vec![
+                ControlMsg::WatchPiEvents { version: 1 },
+                ControlMsg::PiBridgeCommand {
+                    name: "pi".into(),
+                    command: amber_core::proto::PiCommand::Snapshot,
+                },
+            ]
+        );
+        assert_eq!(
+            map_browser_msg(&BrowserMsg::PiOpen { name: "pi".into() }, Some("pi"), &live),
+            vec![
+                ControlMsg::Detach { name: "pi".into() },
+                ControlMsg::WatchPiEvents { version: 1 },
+                ControlMsg::PiBridgeCommand {
+                    name: "pi".into(),
+                    command: amber_core::proto::PiCommand::Snapshot,
+                },
+            ]
+        );
+        assert!(map_browser_msg(&BrowserMsg::PiOpen { name: "shell".into() }, None, &live).is_empty());
+        assert_eq!(
+            map_browser_msg(
+                &BrowserMsg::PiPrompt {
+                    name: "pi".into(), message: "hello".into(),
+                    delivery: amber_core::proto::PiDelivery::Now,
+                },
+                None,
+                &live,
+            ),
+            vec![ControlMsg::PiBridgeCommand {
+                name: "pi".into(),
+                command: amber_core::proto::PiCommand::Prompt {
+                    message: "hello".into(), delivery: amber_core::proto::PiDelivery::Now,
+                },
+            }]
+        );
+        assert!(map_browser_msg(
+            &BrowserMsg::PiPrompt {
+                name: "pi".into(), message: " ".into(),
+                delivery: amber_core::proto::PiDelivery::Now,
+            },
+            None,
+            &live,
+        ).is_empty());
+        assert!(map_browser_msg(
+            &BrowserMsg::PiPrompt {
+                name: "pi".into(), message: "x".repeat(64 * 1024 + 1),
+                delivery: amber_core::proto::PiDelivery::Now,
+            },
+            None,
+            &live,
+        ).is_empty());
+        assert!(map_browser_msg(
+            &BrowserMsg::PiThinking { name: "pi".into(), level: "extreme".into() },
+            None,
+            &live,
+        ).is_empty());
+    }
+
+    #[test]
+    fn pi_commands_require_the_same_clients_semantic_open() {
+        let hub = borrow_hub(vec![s("pi", "pi")]);
+        let (id, rx) = hub.add_client();
+        let _ = recv_out(&rx);
+        let _ = recv_out(&rx);
+
+        hub.handle_browser(id, r#"{"t":"piPrompt","name":"pi","message":"hi","delivery":"now"}"#);
+        let Out::Text(error) = recv_out(&rx) else { panic!("expected text error") };
+        assert!(error.contains("does not match"), "{error}");
+
+        hub.handle_browser(id, r#"{"t":"piOpen","name":"pi"}"#);
+        let inner = hub.inner.lock().unwrap();
+        let client = inner.clients.iter().find(|client| client.id == id).unwrap();
+        assert_eq!(client.pi.as_deref(), Some("pi"));
+        assert!(client.open.is_none(), "semantic Pi open attached the PTY");
     }
 
     #[test]
@@ -2724,7 +2959,7 @@ mod tests {
         // Snapshot/ReportRunState, and every message it DOES produce is one of
         // the widened whitelist's variants — Resize included, but ONLY within
         // `map_browser_msg`'s bounds (checked in the loop below).
-        let live = [s("s", "shell"), s("t", "shell")];
+        let live = [s("s", "shell"), s("t", "shell"), s("pi", "pi")];
         let texts = [
             r#"{"t":"open","name":"s"}"#,
             r#"{"t":"open","name":"ghost"}"#,
@@ -2740,6 +2975,10 @@ mod tests {
             r#"{"t":"resume","name":"s"}"#,
             r#"{"t":"dumpbacklog","name":"s"}"#,
             r#"{"t":"dumpBacklog","name":"s"}"#,
+            r#"{"t":"piOpen","name":"pi"}"#,
+            r#"{"t":"piPrompt","name":"pi","message":"hi","delivery":"now"}"#,
+            r#"{"t":"piAbort","name":"pi"}"#,
+            r#"{"t":"piThinking","name":"pi","level":"high"}"#,
             r#"{"t":"snapshot"}"#,
             r#"{"t":"input","name":"s","data":"eA=="}"#,
             "garbage",
@@ -2763,6 +3002,8 @@ mod tests {
                                     | ControlMsg::Resume { .. }
                                     | ControlMsg::DumpBacklog { .. }
                                     | ControlMsg::Resize { .. }
+                                    | ControlMsg::WatchPiEvents { .. }
+                                    | ControlMsg::PiBridgeCommand { .. }
                             ),
                             "{text:?} produced non-whitelisted {out:?}"
                         );
@@ -2830,6 +3071,35 @@ mod tests {
 
         assert_eq!(token.len(), 43);
         assert!(crate::platform::is_user_private(&root.path().join(TOKEN_FILE)).unwrap());
+    }
+
+    #[test]
+    fn pi_events_are_routed_only_to_the_matching_semantic_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = Hub::new(dir.path().join("daemon.sock"), dir.path().to_path_buf());
+        let (a, rx_a) = hub.add_client();
+        let (b, rx_b) = hub.add_client();
+        for rx in [&rx_a, &rx_b] {
+            let _ = recv_out(rx);
+            let _ = recv_out(rx);
+        }
+        {
+            let mut inner = hub.inner.lock().unwrap();
+            inner.clients.iter_mut().find(|c| c.id == a).unwrap().pi = Some("pi-a".into());
+            inner.clients.iter_mut().find(|c| c.id == b).unwrap().pi = Some("pi-b".into());
+        }
+
+        hub.on_frame(Frame::Control(ControlMsg::PiEvent {
+            name: "pi-a".into(),
+            seq: 3,
+            event: serde_json::json!({"kind":"agent_start"}),
+        }));
+
+        let Out::Text(text) = recv_out(&rx_a) else { panic!("expected text event") };
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(json["t"], "piEvent");
+        assert_eq!(json["name"], "pi-a");
+        assert!(rx_b.try_recv().is_err(), "event leaked to another Pi pane");
     }
 
     #[test]
@@ -3202,7 +3472,7 @@ mod tests {
             .lock()
             .unwrap()
             .clients
-            .push(Client { id: 1, open: Some("a".into()), tx });
+            .push(Client { id: 1, open: Some("a".into()), pi: None, tx });
         hub.on_frame(Frame::Control(ControlMsg::Usage { providers: vec![] }));
         // Nothing was queued at the client, and the cache took the value.
         assert!(rx.try_recv().is_err(), "a Usage frame must not reach a browser");

@@ -1,5 +1,6 @@
 import { useRef, useState, useEffect, lazy, Suspense } from 'react'
 import { Pane, type SearchApi, type InputApi } from './Pane'
+import { PiPane } from './PiPane'
 import { KeyboardDock } from './KeyBar'
 import type { EditorApi } from './Editor'
 import { paneRects, handles, nextPaneInDirection, focusCandidates, ratioAt, leaves, type Node, type Rect, type Zone, type FocusDir } from './layout'
@@ -214,6 +215,9 @@ export function SplitView(props: {
   // Imperative per-pane handle (same pattern as Pane's onSearchReady): the close
   // guard needs a synchronous dirty read and an awaitable save.
   onEditorReady: (paneId: string, api: EditorApi | null) => void
+  // Optional Pi-only semantic view. Absence means the unchanged terminal.
+  piViews: Record<string, 'gui'>
+  onPiView: (paneId: string, view: 'terminal' | 'gui') => void
   // Zoom is transient per-tab renderer state owned by App (never persisted); this
   // view is presentational — it renders the zoomed pane full-stage and toggles.
   zoomedPane: string | null
@@ -773,7 +777,12 @@ export function SplitView(props: {
 
   // The key bar is mounted only on a coarse-pointer, phone-width viewport —
   // that is the whole of its host-awareness (spec §0.1: capability, not host).
-  const keyBarTarget = mobile && props.active && focused !== null ? (inputApis.current.get(focused) ?? null) : null
+  const focusedIsPiGui = focused !== null
+    && props.meta[focused]?.kind === 'pi'
+    && props.piViews[focused] === 'gui'
+  const keyBarTarget = mobile && props.active && focused !== null && !focusedIsPiGui
+    ? (inputApis.current.get(focused) ?? null)
+    : null
 
   return (
     <div ref={ref} style={{ position: 'absolute', inset: 0 }}>
@@ -782,9 +791,10 @@ export function SplitView(props: {
         const meta = props.meta[paneId]
         const dead = props.deadCodes[paneId]
         const isEditor = meta?.kind === 'editor'
-        // Terminal-only affordances (refresh, scrollback search, claude reload,
-        // freeze) are meaningless for a pane that owns no pty.
-        const noTerm = isEditor
+        const isPiGui = meta?.kind === 'pi' && props.piViews[paneId] === 'gui'
+        // Terminal-only affordances are meaningless for app-local panes and
+        // must not attach/resize the hidden PTY while a Pi GUI is selected.
+        const noTerm = isEditor || isPiGui
         const surfaceNoun = noTerm ? 'pane' : 'session'
         const dot = paneDot(meta?.kind ?? 'shell', meta?.runState)
         const parkedText = parkedOverlayText(meta?.runState)
@@ -877,6 +887,12 @@ export function SplitView(props: {
                 </span>
               )}
               <div className="pane-actions">
+                {meta?.kind === 'pi' && dead === undefined &&
+                  <button className="pane-view-toggle" aria-label={isPiGui ? 'Show Pi terminal' : 'Show Pi chat'}
+                    title={isPiGui ? 'Switch to Terminal' : 'Switch to graphical Chat'}
+                    onClick={() => props.onPiView(paneId, isPiGui ? 'terminal' : 'gui')}>
+                    {isPiGui ? 'Terminal' : 'Chat'}
+                  </button>}
                 {!noTerm && dead === undefined && !isFrozen && props.hasPresetInputs && props.onPresetInputs &&
                   <button className="icon-btn pane-presets" aria-label="insert preset input" title="Insert preset input"
                     onClick={() => props.onPresetInputs?.(paneId)}><Icon name="preset" /></button>}
@@ -888,7 +904,9 @@ export function SplitView(props: {
               </div>
             </div>
             <div className="pane-body" ref={(el) => { if (el) bodyEls.current.set(paneId, el); else bodyEls.current.delete(paneId) }}>
-              {isEditor
+              {isPiGui
+                ? <PiPane session={paneId} portEpoch={props.portEpoch} />
+                : isEditor
                 ? (() => {
                     const e = props.editors[paneId] ?? { path: null }
                     return <Suspense fallback={<div className="editor-loading">loading editor…</div>}>
@@ -999,8 +1017,9 @@ export function SplitView(props: {
         // Editor panes have no terminal, so no terminal refresh or selection.
         const menuMeta = props.meta[paneId]
         const menuKind = menuMeta?.kind
-        const menuHasTerm = menuKind !== 'editor'
-        const menuNoun = menuHasTerm ? 'session' : 'pane'
+        const menuPiGui = menuKind === 'pi' && props.piViews[paneId] === 'gui'
+        const menuHasTerm = menuKind !== 'editor' && !menuPiGui
+        const menuNoun = menuKind === 'editor' ? 'pane' : 'session'
         const reload = menuMeta && isAgentKind(menuMeta.kind)
           ? reloadAgentVisibility(agentOf(menuMeta.kind), menuMeta.claudeId ?? null)
           : null
@@ -1022,11 +1041,15 @@ export function SplitView(props: {
         return (
           <div className="ctx-menu pane-menu" role="menu" aria-label="Pane actions" style={{ left: x, top: y }}
             onMouseDown={(e) => e.stopPropagation()}>
+            {menuKind === 'pi' && <button className="ctx-item" role="menuitem"
+              onClick={run(() => props.onPiView(paneId, menuPiGui ? 'terminal' : 'gui'))}>
+              <span>{menuPiGui ? 'Open terminal view' : 'Open graphical view'}</span>
+            </button>}
             {menuHasTerm && <button className="ctx-item" role="menuitem" onClick={run(() =>
               setRebuild((value) => ({ ...value, [paneId]: (value[paneId] ?? 0) + 1 })))}>
               <Icon name="refresh" /><span>Refresh terminal</span>
             </button>}
-            {reload?.show && menuMeta && <button className="ctx-item" role="menuitem" onClick={run(() => setReloadPane(paneId))}>
+            {menuHasTerm && reload?.show && menuMeta && <button className="ctx-item" role="menuitem" onClick={run(() => setReloadPane(paneId))}>
               <Icon name="reload" /><span>Reload {agentOf(menuMeta.kind)}…</span>
             </button>}
             <button className="ctx-item" role="menuitem" onClick={run(() => props.onSetTitle(paneId))}>

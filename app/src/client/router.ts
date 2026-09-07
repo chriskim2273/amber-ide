@@ -10,10 +10,12 @@ export interface PortLike {
 interface ConnLike {
   send(f: Frame): void
   on(e: 'frame', cb: (f: Frame) => void): void
+  on(e: 'open', cb: () => void): void
 }
 
 // Renderer -> utility messages over a pane port.
 type Outbound = { data: Uint8Array } | { resize: { cols: number; rows: number } }
+type PiOutbound = { command: import('../shared/proto').PiCommand }
 
 /** The client's delta-replay watermark: ring epoch + absolute byte position. */
 export interface Watermark {
@@ -31,6 +33,7 @@ type PendingReplay = 'awaiting-ack' | 'full' | 'delta'
 
 export class Router {
   private readonly ports = new Map<string, PortLike>()
+  private readonly piPorts = new Map<string, PortLike>()
   // Per-session delta-replay watermarks, set by every AttachBacklog ack.
   // Consulted ONLY by reattachAll() — whose terminals are ALIVE and already
   // hold their history, so they want just the missing tail. A fresh mount
@@ -44,6 +47,10 @@ export class Router {
 
   constructor(private readonly conn: ConnLike) {
     this.conn.on('frame', (f) => {
+      if (f.type === 'control' && (f.msg.kind === 'PiEvent' || f.msg.kind === 'PiBridgeStatus')) {
+        this.piPorts.get(f.msg.name)?.postMessage({ msg: f.msg })
+        return
+      }
       if (f.type === 'control' && f.msg.kind === 'AttachBacklog') {
         const { name, epoch, end_offset, full } = f.msg
         this.watermarks.set(name, { epoch, offset: end_offset })
@@ -75,9 +82,15 @@ export class Router {
         if (wm) wm.offset += f.bytes.length
       }
     })
+    this.conn.on('open', () => {
+      if (this.piPorts.size === 0) return
+      this.conn.send({ type: 'control', msg: { kind: 'WatchPiEvents', version: 1 } })
+      for (const session of this.piPorts.keys()) this.requestPiSnapshot(session)
+    })
   }
 
   attach(session: string, port: PortLike): void {
+    this.closePi(session)
     // Every re-acquire (client relaunch, workspace switch) brokers a NEW
     // MessageChannelMain, so overwriting the entry without closing the old port
     // leaked one per re-acquire. The superseded port has no reader left — the
@@ -94,6 +107,36 @@ export class Router {
     })
     port.start()
     this.sendAttach(session)
+  }
+
+  attachPi(session: string, port: PortLike): void {
+    // Mode replacement is exclusive: release any PTY subscription before the
+    // semantic view becomes active, so a GUI pane never drives hidden terminal
+    // replay or resize work.
+    this.detach(session)
+    this.piPorts.get(session)?.close()
+    this.piPorts.set(session, port)
+    port.on('message', (e) => {
+      const msg = e.data as PiOutbound
+      if (msg?.command) {
+        this.conn.send({ type: 'control', msg: { kind: 'PiBridgeCommand', name: session, command: msg.command } })
+      }
+    })
+    port.start()
+    this.conn.send({ type: 'control', msg: { kind: 'WatchPiEvents', version: 1 } })
+    this.requestPiSnapshot(session)
+  }
+
+  closePi(session: string): void {
+    this.piPorts.get(session)?.close()
+    this.piPorts.delete(session)
+  }
+
+  private requestPiSnapshot(session: string): void {
+    this.conn.send({
+      type: 'control',
+      msg: { kind: 'PiBridgeCommand', name: session, command: { kind: 'Snapshot' } },
+    })
   }
 
   reattachAll(): void {
@@ -135,13 +178,18 @@ export class Router {
     this.conn.send({ type: 'control', msg: { kind: 'Detach', name: session } })
   }
 
-  /** Drain terminal subscriptions when the resident browser host hides its UI. */
+  /** Release renderer views when the resident browser host hides its UI. */
   detachAll(): void {
     for (const session of [...this.ports.keys()]) this.detach(session)
+    for (const session of [...this.piPorts.keys()]) this.closePi(session)
   }
 
   /** Live pane count. Daemon-state-free observable for the leak regression test. */
   attachedCount(): number {
     return this.ports.size
+  }
+
+  attachedPiCount(): number {
+    return this.piPorts.size
   }
 }

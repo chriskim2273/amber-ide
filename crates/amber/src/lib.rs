@@ -32,6 +32,7 @@ pub mod memory_guardian;
 pub mod mosaic;
 pub mod opencode;
 pub mod pi;
+pub mod pi_bridge;
 pub mod platform;
 pub mod procinfo;
 pub mod pty;
