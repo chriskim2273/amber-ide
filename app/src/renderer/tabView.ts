@@ -74,7 +74,7 @@ export function deriveTab(
     const idx = p.slot
     paneMeta[p.name] = {
       kind: p.kind, title: `${idx ? `#${idx} ` : ''}${lead} · ${suffix}`, cwd: p.cwd,
-      friendlyTitle: friendly, runState: p.runState,
+      alive: p.alive, friendlyTitle: friendly, runState: p.runState,
       rssKb: m?.rssKb, growing: m?.growing, claudeId: p.claudeId,
     }
   })

@@ -462,13 +462,15 @@ select:focus-visible {
 .pane-header .kind-dot.suspended { background: var(--accent-3, #4dd6c8); }
 .pane-header .kind-dot.memory-suspended { background: var(--accent-2); }
 .pane-title {
+  min-width: 0;
   font-family: var(--font-mono);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  flex: 1;
+  flex: 1 1 auto;
 }
 .pane-actions {
+  flex: 0 0 auto;
   display: flex;
   gap: 2px;
   opacity: 0.62;
@@ -1554,6 +1556,8 @@ select:focus-visible {
    tokens and compact pane geometry. It is an alternate rendering of one live
    Pi session, not a second application shell. */
 .pane-view-toggle {
+  flex: 0 0 auto;
+  min-width: max-content;
   min-height: 24px;
   padding: 2px 8px;
   border: 1px solid var(--border-strong);
@@ -1570,7 +1574,7 @@ select:focus-visible {
   min-height: 0;
   height: 100%;
   display: grid;
-  grid-template-rows: auto auto auto minmax(0, 1fr) auto;
+  grid-template-rows: auto auto auto auto minmax(0, 1fr) auto;
   background: var(--bg);
   color: var(--text);
 }
@@ -1734,6 +1738,56 @@ select:focus-visible {
   border-top: 1px solid var(--border);
   background: var(--surface);
 }
+.pi-attachments {
+  width: min(100%, 820px);
+  margin: 0 auto 8px;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  color: var(--text-faint);
+  font-size: 10px;
+}
+.pi-attach-button { position: relative; overflow: hidden; }
+.pi-attach-button input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  cursor: pointer;
+}
+.pi-attachment-chip {
+  max-width: min(100%, 260px);
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 7px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  color: var(--text-dim);
+}
+.pi-attachment-chip > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pi-attachment-chip button {
+  border: 0;
+  background: transparent;
+  color: var(--text-faint);
+  cursor: pointer;
+  line-height: 1;
+}
+.pi-attachment-chip button:hover { color: var(--danger); }
+.pi-attachment-hint { margin-left: auto; }
+.pi-attachment-error {
+  width: min(100%, 820px);
+  margin: 0 auto 7px;
+  color: var(--danger);
+  font-size: 11px;
+}
 .pi-composer textarea {
   display: block;
   width: min(100%, 820px);
@@ -1759,6 +1813,96 @@ select:focus-visible {
   gap: 7px;
 }
 
+.pi-markdown a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+.pi-markdown blockquote {
+  margin: 8px 0;
+  padding-left: 12px;
+  border-left: 2px solid var(--border-strong);
+  color: var(--text-dim);
+}
+.pi-markdown code {
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: var(--surface-2);
+  font: 0.92em var(--font-mono);
+}
+.pi-markdown pre { position: relative; padding-right: 58px; }
+.pi-copy {
+  float: right;
+  min-height: 24px;
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  color: var(--text-faint);
+  font: 10px var(--font-ui);
+  cursor: pointer;
+}
+.pi-copy:hover { color: var(--text); border-color: var(--accent); }
+.pi-inline-tool-wrap .pi-tool-card { width: auto; margin: 4px 0 8px; }
+.pi-unknown-content { margin: 8px 0; color: var(--text-faint); }
+.pi-jump-latest {
+  position: sticky;
+  bottom: 10px;
+  display: block;
+  margin: 0 auto 8px;
+  min-height: 32px;
+  padding: 5px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  background: var(--surface-2);
+  color: var(--text);
+  cursor: pointer;
+}
+.pi-composer { position: relative; }
+.pi-composer.dragging { outline: 2px dashed var(--accent); outline-offset: -4px; }
+.pi-attachment-chip img { width: 24px; height: 24px; object-fit: cover; border-radius: 3px; }
+.pi-delivery-unknown { width: min(100%, 820px); margin: 0 auto 7px; color: var(--warn); font-size: 11px; }
+.pi-composer-help { margin-right: auto; color: var(--text-faint); font-size: 10px; }
+.pi-composer-offline, .pi-stop-confirm { color: var(--warn); font-size: 11px; }
+.pi-subagents {
+  min-width: 0;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+.pi-subagents-toggle {
+  width: 100%;
+  min-height: 30px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 12px;
+  border: 0;
+  background: transparent;
+  color: var(--text-dim);
+  text-align: left;
+  font: 600 11px var(--font-ui);
+  cursor: pointer;
+}
+.pi-subagents-toggle > span:last-child { margin-left: auto; }
+.pi-subagents-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--text-faint); }
+.pi-subagents-panel { max-height: min(38vh, 320px); overflow: auto; padding: 0 12px 8px; }
+.pi-subagent-run { margin: 4px auto; padding: 7px 8px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-2); }
+.pi-subagent-heading, .pi-subagent-actions, .pi-subagent-steer, .pi-subagent-fleet-row { display: flex; align-items: center; gap: 6px; }
+.pi-subagent-heading { min-width: 0; }
+.pi-subagent-heading strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pi-subagent-state { width: 7px; height: 7px; flex: 0 0 7px; border-radius: 50%; background: var(--text-faint); }
+.pi-subagent-state[data-state="running"] { background: var(--ok); }
+.pi-subagent-state-label, .pi-subagent-activity, .pi-subagents-muted { color: var(--text-faint); font-size: 10px; }
+.pi-subagent-state-label { margin-left: auto; }
+.pi-subagent-activity { margin: 5px 0 0 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pi-subagent-actions { margin-top: 6px; flex-wrap: wrap; }
+.pi-subagent-actions .btn { min-height: 26px; padding: 3px 7px; font-size: 10px; }
+.pi-subagent-steer { margin-top: 6px; }
+.pi-subagent-steer input { min-width: 0; flex: 1; min-height: 28px; padding: 4px 7px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg); color: var(--text); font: 11px var(--font-ui); }
+.pi-subagent-steer .btn { min-height: 28px; }
+.pi-subagent-receipt { margin-top: 5px; color: var(--accent-2); font-size: 10px; }
+.pi-subagent-transcript { margin-top: 6px; color: var(--text-dim); font-size: 11px; }
+.pi-subagent-result { padding: 5px 0; border-top: 1px solid var(--border); }
+.pi-subagent-result p { margin: 3px 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.pi-subagent-fleet-row { padding: 4px 2px; color: var(--text-dim); font-size: 10px; }
+.pi-subagent-fleet-row span:nth-child(3) { margin-left: auto; color: var(--text-faint); }
+
 @media (max-width: 700px), (pointer: coarse) {
   .pane-view-toggle { min-height: 44px; padding-inline: 10px; }
   .pi-chat-status { min-height: 42px; padding-inline: 10px; }
@@ -1770,4 +1914,8 @@ select:focus-visible {
   .pi-composer textarea { min-height: 64px; font-size: 16px; }
   .pi-composer-actions .btn,
   .pi-composer-actions select { min-height: 44px; }
+  .pi-composer-help { display: none; }
+  .pi-subagents-toggle { min-height: 44px; }
+  .pi-subagent-actions .btn, .pi-subagent-steer .btn { min-height: 44px; }
+  .pi-subagent-steer input { min-height: 44px; font-size: 16px; }
 }

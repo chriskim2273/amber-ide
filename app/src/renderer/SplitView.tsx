@@ -5,7 +5,7 @@ import { KeyboardDock } from './KeyBar'
 import type { EditorApi } from './Editor'
 import { paneRects, handles, nextPaneInDirection, focusCandidates, ratioAt, leaves, type Node, type Rect, type Zone, type FocusDir } from './layout'
 import { appChord, chordLabel } from './keys'
-import { isAgentKind, paneDot, parkedOverlayText, shouldHintTerminalFocus, shouldResumeMemoryParked } from './store'
+import { isAgentKind, paneDot, parkedOverlayText, piChatAvailable, shouldHintTerminalFocus, shouldResumeMemoryParked } from './store'
 import { ParkedOverlay } from './PressureBanners'
 import { reloadAgentCommand, reloadAgentVisibility } from './reloadAgent'
 import { Icon } from './Icon'
@@ -24,6 +24,8 @@ export interface PaneMeta {
   kind: string
   title: string
   cwd: string
+  /** Latest daemon-owned liveness. App-local panes are always live. */
+  alive?: boolean | undefined
   friendlyTitle?: string | undefined
   runState?: string | undefined
   rssKb?: number | undefined
@@ -887,7 +889,7 @@ export function SplitView(props: {
                 </span>
               )}
               <div className="pane-actions">
-                {meta?.kind === 'pi' && dead === undefined &&
+                {piChatAvailable(meta, dead) &&
                   <button className="pane-view-toggle" aria-label={isPiGui ? 'Show Pi terminal' : 'Show Pi chat'}
                     title={isPiGui ? 'Switch to Terminal' : 'Switch to graphical Chat'}
                     onClick={() => props.onPiView(paneId, isPiGui ? 'terminal' : 'gui')}>
@@ -1041,7 +1043,7 @@ export function SplitView(props: {
         return (
           <div className="ctx-menu pane-menu" role="menu" aria-label="Pane actions" style={{ left: x, top: y }}
             onMouseDown={(e) => e.stopPropagation()}>
-            {menuKind === 'pi' && <button className="ctx-item" role="menuitem"
+            {piChatAvailable(menuMeta, props.deadCodes[paneId]) && <button className="ctx-item" role="menuitem"
               onClick={run(() => props.onPiView(paneId, menuPiGui ? 'terminal' : 'gui'))}>
               <span>{menuPiGui ? 'Open terminal view' : 'Open graphical view'}</span>
             </button>}

@@ -442,6 +442,19 @@ describe('createAmber', () => {
     expect(amber.softwareGl).toBe(true)
   })
 
+  it('exposes the semantic Pi chat entrypoint to the mobile web renderer', () => {
+    const sockets: FakeSocket[] = []
+    const posted: Array<{ session: string; mode?: 'terminal' | 'pi' }> = []
+    const amber = createAmber(deps({
+      connectSocket: () => { const socket = new FakeSocket(); sockets.push(socket); return socket },
+      postPanePort: (session, _port, mode) => posted.push({ session, ...(mode === undefined ? {} : { mode }) }),
+    }))
+    amber.openPiPane('amber-1-1-0-pi')
+    expect(posted).toEqual([{ session: 'amber-1-1-0-pi', mode: 'pi' }])
+    sockets[1]!.open()
+    expect(sockets[1]!.sent).toEqual([JSON.stringify({ t: 'piOpen', name: 'amber-1-1-0-pi' })])
+  })
+
   it('openPane wires a real port through postPanePort and routes each pane to its own socket', () => {
     const sockets: FakeSocket[] = []
     const posted: { session: string; port2: unknown }[] = []
