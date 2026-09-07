@@ -37,7 +37,9 @@ const { BrowserAutomation } = require(path.join(run, 'adapter.cjs'))
 const cases = [
   { name: 'overlay removal between hit and ancestry inspection is recoverable', html: '<button aria-label="Search" onclick="document.body.dataset.clicked=\'yes\'">Search</button><div id="cover" style="position:fixed;inset:0;background:white;z-index:999"></div>', removeOnHit: true, role: 'button', label: 'Search', kind: 'click', verify: 'document.body.dataset.clicked', want: 'yes' },
   { name: 'cancelled hover clears its queued agent cursor', html: '<button aria-label="Search" onmouseover="document.body.dataset.hovered=\'yes\'">Search</button>', pointer: { kind: 'mouseMove', x: 250, y: 60 }, cancelAfterAnyMove: true, cursorHiddenOnCancel: true, error: 'ACTION_CANCELLED', verify: 'document.body.dataset.hovered', want: 'yes' },
-  { name: 'Control A and Backspace preserve native selection', html: '<input aria-label="Search" value="potatoes" autofocus>', role: 'textbox', label: 'Search', kind: 'press', key: 'a', modifiers: ['Control'], followups: [{ kind: 'press', key: 'Backspace' }], verify: 'document.querySelector("input").value', want: '' },
+  { name: 'Control A and Backspace preserve native selection', html: '<input aria-label="Search" value="potatoes" autofocus>', role: 'textbox', label: 'Search', kind: 'press', key: 'a', modifiers: [process.platform === 'darwin' ? 'Meta' : 'Control'], followups: [{ kind: 'press', key: 'Backspace' }], verify: 'document.querySelector("input").value', want: '' },
+  { name: 'cancelled editing shortcut releases without replaying its command', html: '<input aria-label="Search" value="potatoes" autofocus>', role: 'textbox', label: 'Search', kind: 'press', key: 'a', modifiers: [process.platform === 'darwin' ? 'Meta' : 'Control'], cancelAfterKey: true, error: 'ACTION_CANCELLED', verify: 'document.querySelector("input").value', want: 'potatoes' },
+  { name: 'failed semantic drag releases away from its source', html: '<button aria-label="Search" onmousedown="document.querySelector(\'#drop\').remove()" onclick="document.body.dataset.clicked=\'yes\'">Source</button><button id="drop" aria-label="Drop">Drop</button>', role: 'button', label: 'Search', kind: 'drag', error: 'TARGET_NOT_ACTIONABLE', verify: 'Boolean(document.body.dataset.clicked)', want: false },
   { name: 'Tab performs native focus traversal', html: '<input aria-label="Search" autofocus><input aria-label="Next">', role: 'textbox', label: 'Search', kind: 'press', key: 'Tab', verify: 'document.activeElement.getAttribute("aria-label")', want: 'Next' },
   { name: 'Shift Tab performs reverse native focus traversal', html: '<input aria-label="Search"><input aria-label="Next" autofocus>', role: 'textbox', label: 'Next', kind: 'press', key: 'Tab', modifiers: ['Shift'], verify: 'document.activeElement.getAttribute("aria-label")', want: 'Search' },
   { name: 'coordinate wheel scrolls its nested receiver', html: '<div id="scroll" style="margin:40px;width:420px;height:200px;overflow:auto"><div style="height:900px">Scrollable</div></div>', pointer: { kind: 'mouseScroll', x: 100, y: 100, deltaX: 0, deltaY: 300 }, settleMs: 100, verify: 'document.querySelector("#scroll").scrollTop>0', want: true },
@@ -62,6 +64,7 @@ const cases = [
   { name: 'focused typing reaches visually selected field', html: '<input aria-label="Search" autofocus>', pointer: { kind: 'typeFocused', text: 'potatoes' }, verify: 'document.querySelector("input").value', want: 'potatoes' },
   { name: 'Enter performs native form submission', html: '<form onsubmit="event.preventDefault();document.body.dataset.submitted=document.querySelector(\'input\').value"><input aria-label="Search" value="potatoes"></form>', role: 'textbox', label: 'Search', kind: 'press', key: 'Enter', verify: 'document.body.dataset.submitted', want: 'potatoes' },
   { name: 'late useful control survives generic-node budget pressure', assertTruncation: true, html: '<div></div>'.repeat(600) + '<input aria-label="Search">', role: 'textbox', label: 'Search', kind: 'fill', verify: 'document.querySelector("input").value', want: 'potatoes' },
+  { name: 'fill replaces existing text rather than appending', html: '<input aria-label="Search" value="old value">', role: 'textbox', label: 'Search', kind: 'fill', verify: 'document.querySelector("input").value', want: 'potatoes' },
   { name: 'readonly field rejects typing', html: '<input aria-label="Search" readonly>', role: 'textbox', label: 'Search', kind: 'fill', error: 'TARGET_NOT_ACTIONABLE', verify: 'document.querySelector("input").value', want: '' },
   { name: 'offscreen field scrolls into view', html: '<input aria-label="Search" style="margin-top:1400px">', role: 'textbox', label: 'Search', kind: 'fill', verify: 'document.querySelector("input").value', want: 'potatoes' },
   { name: 'transient overlay disappears before click', html: '<button aria-label="Search" onclick="document.body.dataset.clicked=\'yes\'">Search</button><div id="cover" style="position:fixed;inset:0;background:white;z-index:999"></div><script>setTimeout(()=>document.querySelector("#cover").remove(),300)</script>', role: 'button', label: 'Search', kind: 'click', verify: 'document.body.dataset.clicked', want: 'yes' },
@@ -99,6 +102,7 @@ app.whenReady().then(async () => {
       try {
         const result = await debuggerApi.sendCommand(method, params)
         if (activeTest?.removeOnHit && method === 'DOM.getNodeForLocation') await wc.executeJavaScript('document.querySelector("#cover")?.remove()')
+        if (activeTest?.cancelAfterKey && method === 'Input.dispatchKeyEvent' && params.type === 'keyDown') activeController.abort()
         if (activeTest?.cancelAfterPress && method === 'Input.dispatchMouseEvent' && params.type === 'mousePressed') activeController.abort()
         if (activeTest?.cancelAfterAnyMove && method === 'Input.dispatchMouseEvent' && params.type === 'mouseMoved') activeController.abort()
         if (activeTest?.cancelAfterHeldMove && method === 'Input.dispatchMouseEvent' && params.type === 'mouseMoved' && params.buttons === 1) activeController.abort()
@@ -111,7 +115,7 @@ app.whenReady().then(async () => {
       }
     },
   }
-  const automation = new BrowserAutomation(transport, () => wc.getURL(), () => wc.isLoading())
+  const automation = new BrowserAutomation(transport, () => wc.getURL(), () => wc.isLoading(), {}, { deviceScaleFactor: () => require('electron').screen.getDisplayMatching(win.getBounds()).scaleFactor })
   const results = []
   try {
     for (const [index, test] of cases.entries()) {
@@ -122,7 +126,7 @@ app.whenReady().then(async () => {
       const signal = activeController.signal
       const lease = { browserId: 'private-fixture', pageIncarnation: 'fixture', generation: index }
       const started = Date.now()
-      let error
+      let error, errorMessage
       try {
         await automation.setViewport({ width: 1000, height: 772, deviceScaleFactor: test.dpr ?? 1 }, signal)
         if (test.before) await wc.executeJavaScript(test.before)
@@ -134,7 +138,12 @@ app.whenReady().then(async () => {
           if (test.pixel) {
             const image = require('electron').nativeImage.createFromBuffer(capture.data), bitmap = image.toBitmap()
             const offset = (Math.floor(test.pointer.y) * image.getSize().width + Math.floor(test.pointer.x)) * 4
-            assert.deepStrictEqual([...bitmap.subarray(offset, offset + 3)], [0x34, 0xab, 0x12], 'requested delivered-image pixel must picture the green target')
+            fs.writeFileSync(path.join(run, `pixels-${index}.png`), capture.data)
+            fs.writeFileSync(path.join(run, `pixels-${index}.json`), JSON.stringify({ png: [capture.data.readUInt32BE(16), capture.data.readUInt32BE(20)], native: image.getSize(), bitmapLength: bitmap.length, pixel: [...bitmap.subarray(offset, offset + 3)] }))
+            // Display-P3 encodes the CSS green differently on fractional-DPR macOS
+            // captures. Require the unique green region, not one RGB encoding.
+            const [b, g, r] = bitmap.subarray(offset, offset + 3)
+            assert(g > 150 && r < 100 && b < 100, 'requested delivered-image pixel must picture the green target')
           }
           operation = { ...test.pointer, screenshotId: capture.observation.screenshotId }
         } else {
@@ -143,6 +152,12 @@ app.whenReady().then(async () => {
           const node = snapshot.nodes.find(item => item.role === test.role && item.name === test.label)
           assert(node, 'fixture target missing')
           operation = { kind: test.kind, target: { snapshotId: snapshot.snapshotId, ref: node.ref }, ...(test.kind === 'fill' ? { text: 'potatoes' } : {}), ...(test.key ? { key: test.key } : {}), ...(test.modifiers ? { modifiers: test.modifiers } : {}) }
+        }
+        if (test.kind === 'drag') {
+          const snapshot = await automation.snapshot(lease, { maxDepth: 20, maxNodes: 100, maxBytes: 262144 }, signal)
+          const source = snapshot.nodes.find(item => item.name === 'Search'), target = snapshot.nodes.find(item => item.name === 'Drop')
+          assert(source && target)
+          operation = { kind: 'drag', source: { snapshotId: snapshot.snapshotId, ref: source.ref }, target: { snapshotId: snapshot.snapshotId, ref: target.ref } }
         }
         const prepared = await automation.prepareInteraction(lease, operation, signal)
         if (test.formMethod) assert.equal(prepared.target.formMethod, test.formMethod)
@@ -154,20 +169,26 @@ app.whenReady().then(async () => {
         }
         if (test.cursorVisible) {
           const amberPixel = image => {
-            const bitmap = image.toBitmap(), offset = ((test.pointer.y + 3) * image.getSize().width + test.pointer.x + 3) * 4
+            const bitmap = image.toBitmap(), size = image.getSize()
+            const offset = (Math.floor((test.pointer.y + 3) * size.height / 772) * size.width + Math.floor((test.pointer.x + 3) * size.width / 1000)) * 4
             const [b, g, r] = bitmap.subarray(offset, offset + 3)
             return r > 220 && g > 120 && g < 210 && b < 110
           }
-          await new Promise(resolve => setTimeout(resolve, 60))
-          const visible = await wc.capturePage()
+          const waitForCursor = async () => {
+            const until = Date.now() + 500
+            let image
+            do { await new Promise(resolve => setTimeout(resolve, 25)); image = await wc.capturePage() }
+            while (!amberPixel(image) && Date.now() < until)
+            return image
+          }
+          const visible = await waitForCursor()
           fs.writeFileSync(path.join(run, 'visible-cursor.png'), visible.toPNG())
           assert(amberPixel(visible), 'native page capture must visibly contain the agent cursor')
           const hidden = await automation.screenshot(lease, undefined, false, signal)
           assert(!amberPixel(require('electron').nativeImage.createFromBuffer(hidden.data)), 'observation must omit the agent cursor')
-          await new Promise(resolve => setTimeout(resolve, 60))
-          assert(amberPixel(await wc.capturePage()), 'same-owner cursor must return after capture')
+          assert(amberPixel(await waitForCursor()), 'same-owner cursor must return after capture')
         }
-      } catch (failure) { error = failure.code || failure.message }
+      } catch (failure) { error = failure.code || failure.message; errorMessage = failure.message }
       // Evaluation is confined to our own fixture for outcome assertions, never exposed through the adapter/tools.
       if (test.navigationRace) {
         const until = Date.now() + 3000
@@ -176,15 +197,20 @@ app.whenReady().then(async () => {
       if (test.cursorHiddenOnCancel) {
         await new Promise(resolve => setTimeout(resolve, 250))
         const image = await wc.capturePage(), bitmap = image.toBitmap()
-        const offset = ((test.pointer.y + 3) * image.getSize().width + test.pointer.x + 3) * 4
+        const size = image.getSize()
+        const offset = (Math.floor((test.pointer.y + 3) * size.height / 772) * size.width + Math.floor((test.pointer.x + 3) * size.width / 1000)) * 4
         const [b, g, r] = bitmap.subarray(offset, offset + 3)
         if (r > 220 && g > 120 && g < 210 && b < 110) error = 'CURSOR_NOT_CLEARED'
+      }
+      if (test.cancelAfterKey) {
+        const release = trace.findLast(item => item.method === 'Input.dispatchKeyEvent' && item.params?.type === 'keyUp')
+        if (JSON.stringify(release?.params?.commands) !== '[]') error = 'EDIT_COMMAND_REPLAY_ON_RELEASE'
       }
       if (test.settleMs) await new Promise(resolve => setTimeout(resolve, test.settleMs))
       const actual = await wc.executeJavaScript(test.verify)
       const pass = error === test.error && actual === test.want
       const diagnostics = pass ? undefined : await wc.executeJavaScript('({url:location.href,focus:document.activeElement.tagName,selection:document.activeElement.selectionStart})')
-      results.push({ name: test.name, pass, error: error ?? null, actual: actual ?? null, expected: test.want, elapsedMs: Date.now() - started, adapterRequests: requestCount, diagnostics })
+      results.push({ name: test.name, pass, error: error ?? null, actual: actual ?? null, expected: test.want, elapsedMs: Date.now() - started, adapterRequests: requestCount, diagnostics, ...(errorMessage ? { errorMessage } : {}) })
       fs.writeFileSync(path.join(run, `trace-${index}.json`), JSON.stringify(trace, null, 2))
       console.log(JSON.stringify(results.at(-1)))
     }

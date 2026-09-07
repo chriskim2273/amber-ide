@@ -3,7 +3,7 @@ import { isPointerInteraction, type BrowserPoint, type BrowserElementRef, type B
 import { BrowserObservations, mapScreenshotPoint, sameViewport, type ScreenshotObservation, type EffectiveBrowserViewport } from './browserObservations'
 import { BrowserAgentCursor } from './browserAgentCursor'
 import { dispatchPointer } from './browserPointer'
-import { modifierMask, virtualKey, keyText } from './browserKeyboard'
+import { modifierMask, virtualKey, keyText, editingCommands } from './browserKeyboard'
 import type { InteractionTargetMetadata } from './browserApproval'
 import { parseBrowserViewport } from '../shared/browserViewport'
 import { BrowserAutomationError, safeBrowserCode } from './browserErrors'
@@ -171,7 +171,7 @@ export class BrowserAutomation {
     options: BrowserAutomationOptions = {},
     private readonly controls: BrowserAutomationControls = {},
   ) {
-    this.cursor = new BrowserAgentCursor(transport)
+    this.cursor = new BrowserAgentCursor(transport, () => this.controls.deviceScaleFactor?.() ?? 1)
     this.consoleRing = new BoundedRing(options.ringItems ?? 1_000, options.ringBytes ?? 1024 * 1024)
     this.networkRing = new BoundedRing(options.ringItems ?? 1_000, options.ringBytes ?? 1024 * 1024)
   }
@@ -581,7 +581,7 @@ export class BrowserAutomation {
       const keyId = String(params['code'] ?? params['key'] ?? '')
       const button = String(params['button'] ?? 'none')
       if (method === 'Input.dispatchMouseEvent' && params['type'] === 'mousePressed' && button !== 'none') heldButtons.set(button, { ...params, type: 'mouseReleased', buttons: 0, clickCount: 0 })
-      if (method === 'Input.dispatchKeyEvent' && params['type'] === 'keyDown') heldKeys.set(keyId, { ...params, type: 'keyUp', text: '' })
+      if (method === 'Input.dispatchKeyEvent' && params['type'] === 'keyDown') heldKeys.set(keyId, { ...params, type: 'keyUp', text: '', commands: [] })
       if (method === 'Input.dispatchMouseEvent' && params['type'] === 'mouseMoved') {
         for (const [held, release] of heldButtons) heldButtons.set(held, { ...release, x: params['x'], y: params['y'] })
       }
@@ -632,7 +632,7 @@ export class BrowserAutomation {
     const key = async (type: 'keyDown' | 'keyUp', value: string, modifiers = 0): Promise<void> => {
       const text = keyText(value, modifiers)
       const key = value === 'Space' ? ' ' : (text && /^[A-Za-z0-9]$/.test(value) ? text : value)
-      await sendIrreversible('Input.dispatchKeyEvent', { type, key, code: keyCodeFor(value), modifiers, windowsVirtualKeyCode: virtualKey(value), ...(type === 'keyDown' && text !== undefined ? { text } : {}) })
+      await sendIrreversible('Input.dispatchKeyEvent', { type, key, code: keyCodeFor(value), modifiers, windowsVirtualKeyCode: virtualKey(value), ...(type === 'keyDown' ? { commands: editingCommands(value, modifiers), ...(text !== undefined ? { text } : {}) } : {}) })
     }
     const operation = prepared.operation
     try {
@@ -686,13 +686,9 @@ export class BrowserAutomation {
         const point = primaryPoint ?? { x: 1, y: 1 }; await mouse('mouseWheel', point, { deltaX: operation.deltaX, deltaY: operation.deltaY })
       } else if (operation.kind === 'drag' && primaryPoint && prepared.secondary && prepared.secondaryTarget) {
         await mouse('mouseMoved', primaryPoint); await mouse('mousePressed', primaryPoint, { button: 'left', clickCount: 1 })
-        let secondaryPoint: { x: number; y: number }
-        try { secondaryPoint = await pointFor(prepared.secondary, prepared.secondaryTarget) }
-        catch (error) {
-          const params = { type: 'mouseReleased', x: primaryPoint.x, y: primaryPoint.y, button: 'left', clickCount: 1 }
-          await sendIrreversible('Input.dispatchMouseEvent', params).catch(() => {})
-          throw asAutomationError(error)
-        }
+        // A failed destination must use the owned-input cleanup below. Releasing
+        // over the source would turn a failed drag into an activation click.
+        const secondaryPoint = await pointFor(prepared.secondary, prepared.secondaryTarget)
         await mouse('mouseMoved', secondaryPoint, { button: 'left' }); await mouse('mouseReleased', secondaryPoint, { button: 'left', clickCount: 1 })
       } else throw new BrowserAutomationError('TARGET_NOT_ACTIONABLE', dispatched)
       }

@@ -5,7 +5,7 @@ export class BrowserAgentCursor {
   private point: { x: number; y: number } | null = null
   private revision = 0
   private disposed = false
-  constructor(private readonly transport: CursorTransport) {}
+  constructor(private readonly transport: CursorTransport, private readonly nativeDeviceScale: () => number = () => 1) {}
   show(point: { x: number; y: number }): void {
     if (this.disposed) return
     this.point = { ...point }
@@ -18,7 +18,11 @@ export class BrowserAgentCursor {
       void this.transport.send('Overlay.enable').then(() => {
         if (this.disposed || revision !== this.revision) return
         const { x, y } = current
-        return this.transport.send('Overlay.highlightQuad', { quad: [x, y, x + 10, y + 4, x + 4, y + 10, x, y],
+        // Chromium Overlay quads multiply native display DPR again (crbug.com/437807128).
+        // Compensate only the marker; input remains in viewport CSS coordinates.
+        const dpr = this.nativeDeviceScale(), scale = Number.isFinite(dpr) && dpr > 0 ? dpr : 1
+        const quad = [x, y, x + 10, y + 4, x + 4, y + 10, x, y].map(value => value / scale)
+        return this.transport.send('Overlay.highlightQuad', { quad,
           color: { r: 255, g: 172, b: 40, a: 0.9 }, outlineColor: { r: 35, g: 25, b: 10, a: 1 } })
       }).catch(() => {})
     }, 17)
