@@ -46,4 +46,4 @@ After the intervening reboot the global Pi extension was the exact legacy payloa
 
 Current live Pi processes require an extension reload to acquire the new tool definitions/GUI sideband. They must not be silently killed or restarted. Final full Mac validation still needs the Mac awake/reachable; physical keyboard/IME and human gestures remain manual.
 
-The final installation receipt is recorded separately after the guarded install. No daemon/web/router restart is authorized or required for these browser-only native fixes.
+The guarded final installation completed; see `browser-interaction-install.md` for backup paths, hashes and service/session preservation. A fresh production rail now awaits the user's controller/sharing consent. No daemon/web/router restart is authorized or required for these browser-only native fixes.
