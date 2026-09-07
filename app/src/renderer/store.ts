@@ -53,6 +53,8 @@ export type DaemonEvent =
   | { kind: 'MarkSeen'; names: string[] }
   // UI-originated: the user dismissed the daemon-error banner.
   | { kind: 'ClearError' }
+  // Daemon: persisted friendly title for an existing session (TitleSet ack).
+  | { kind: 'TitleSet'; name: string; title: string | null }
 export interface PaneModel {
   name: string
   cwd: string
@@ -75,6 +77,22 @@ export function initialState(): AppState {
 
 // Keep only the keys present in `live` (prunes per-session state for removed
 // sessions so the maps don't grow without bound in a long-lived renderer).
+function incomingFriendlyTitle(session: SessionInfo): string | undefined {
+  return typeof session.title === 'string' && session.title.trim() !== '' ? session.title : undefined
+}
+
+/** A metadata-only SessionsChanged (run_state, geometry) may omit `title`.
+ *  That must not erase a rename the user already landed. TitleSet is how a
+ *  title is cleared. */
+function keepFriendlyTitle(prev: SessionInfo | undefined, next: SessionInfo): SessionInfo {
+  const incoming = incomingFriendlyTitle(next)
+  if (incoming !== undefined) return { ...next, title: incoming }
+  if (prev?.title) return { ...next, title: prev.title }
+  if (!('title' in next) || next.title) return next
+  const { title: _title, ...rest } = next
+  return rest
+}
+
 function keepLive<T>(map: Record<string, T>, live: Set<string>): Record<string, T> {
   const out: Record<string, T> = {}
   for (const [n, v] of Object.entries(map)) if (live.has(n)) out[n] = v
@@ -99,7 +117,7 @@ export function reduce(state: AppState, ev: DaemonEvent): AppState {
       const removed = new Set(ev.removed)
       const byName = new Map<string, SessionInfo>()
       for (const x of state.sessions) if (!removed.has(x.name)) byName.set(x.name, x)
-      for (const x of ev.added) byName.set(x.name, x)
+      for (const x of ev.added) byName.set(x.name, keepFriendlyTitle(byName.get(x.name), x))
       const live = new Set(byName.keys())
       return {
         ...state,
@@ -153,6 +171,21 @@ export function reduce(state: AppState, ev: DaemonEvent): AppState {
       return { ...state, error: ev.msg }
     case 'ClearError':
       return state.error === null ? state : { ...state, error: null }
+    case 'TitleSet': {
+      let changed = false
+      const sessions = state.sessions.map((session) => {
+        if (session.name !== ev.name) return session
+        const nextTitle = ev.title ?? undefined
+        if (session.title === nextTitle) return session
+        changed = true
+        if (nextTitle === undefined) {
+          const { title: _title, ...rest } = session
+          return rest
+        }
+        return { ...session, title: nextTitle }
+      })
+      return changed ? { ...state, sessions } : state
+    }
   }
 }
 

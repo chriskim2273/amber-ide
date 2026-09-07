@@ -24,6 +24,33 @@ describe('BrowserRail command context', () => {
 })
 
 describe('BrowserRail accessibility contract', () => {
+  it('replaces controller option text when a pane is renamed after the rail is open', () => {
+    const html = renderToStaticMarkup(createElement(BrowserRail, {
+      ...props,
+      controllers: [{ name: 'amber-1-1-0-pi', label: '#4 IOTNation' }],
+    }))
+    expect(html).toContain('#4 IOTNation')
+    const renamed = renderToStaticMarkup(createElement(BrowserRail, {
+      ...props,
+      controllers: [{ name: 'amber-1-1-0-pi', label: '#4 Auth refactor' }],
+    }))
+    expect(renamed).toContain('#4 Auth refactor')
+    expect(renamed).not.toContain('#4 IOTNation')
+  })
+
+  it('renders each Pi controller option with the identity label, not a colliding brand', () => {
+    const html = renderToStaticMarkup(createElement(BrowserRail, {
+      ...props,
+      controllers: [
+        { name: 'amber-1-1-0-a', label: '#3 Auth refactor' },
+        { name: 'amber-1-1-1-b', label: '#7 Tests' },
+      ],
+    }))
+    expect(html).toContain('#3 Auth refactor')
+    expect(html).toContain('#7 Tests')
+    expect(html).not.toContain('>Pi<')
+  })
+
   it('renders keyboard-addressable navigation, focus, viewport, controller, recovery, and resize controls', () => {
     const html = renderToStaticMarkup(createElement(BrowserRail, { ...props, designatedPi: 'amber-1-1-0-pi', sharedWithPi: true }))
     expect(html).toContain('aria-label="Browser navigation"')

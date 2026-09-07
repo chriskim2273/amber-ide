@@ -13,7 +13,7 @@ import { commandCenterModel, type CommandCenterItem } from './commandCenter'
 import { DesktopAttention, attentionNames } from './DesktopAttention'
 import { PocketCommandCenter, PocketFocusHeader, PocketNav, pocketSessionTitle } from './PocketCommandCenter'
 import { PocketNewSessionSheet, PocketSessionSheet, type PocketSessionKind } from './PocketSheets'
-import { deriveTab, shortCwd } from './tabView'
+import { deriveTab, paneDisplayLabel, piControllerOptions, shortCwd } from './tabView'
 import { RemoteAccess } from './RemoteAccess'
 import { RouterPanel } from './RouterPanel'
 import { UsagePanel } from './UsagePanel'
@@ -181,6 +181,7 @@ function toEvent(d: unknown): DaemonEvent | null {
   }
   if (m.kind === 'Exit') return { kind: 'Exit', name: m['name'] as string, code: m['code'] as number }
   if (m.kind === 'Error') return { kind: 'Error', msg: m['msg'] as string }
+  if (m.kind === 'TitleSet') return { kind: 'TitleSet', name: m.name, title: m.title }
   return null
 }
 
@@ -691,7 +692,6 @@ function App(): JSX.Element {
           if (current && titleUpdateMatches(current.request, { name: msg.name, title: msg.title })) {
             markTitleCreate(msg.name, (entry) => { entry.acknowledged = true })
           }
-          return
         }
         if (msg.kind === 'Sessions') {
           for (const session of msg.sessions) settleTitle(session.name, session.title)
@@ -1844,7 +1844,7 @@ function App(): JSX.Element {
       const tabLabel = layout.workspaces[String(workspace.ws)]?.tabs[String(paneTab.tab)]?.label ?? `Tab ${paneTab.tab}`
       return {
         id: `pane:${pane.name}`,
-        label: `${pane.slot ? `#${pane.slot} ` : ''}${pane.title || titles[pane.name] || shortCwd(pane.cwd, window.amber.homeDir) || pane.kind}`,
+        label: paneDisplayLabel(pane, titles[pane.name], window.amber.homeDir),
         detail: panePickerDetail(workspaceLabel, tabLabel, pane.kind, pane.cwd, pane.name),
         keywords: pane.name,
         run: () => navigateTo(pane.name),
@@ -2480,7 +2480,7 @@ function App(): JSX.Element {
           temporarilyHidden={!!zoom[`${wsKey}:${tabKey}`]} occluded={browserUiOccluded}
           {...(tabBrowser.designatedPi ? { designatedPi: tabBrowser.designatedPi } : {})}
           {...(tabBrowser.sharedWithPi !== undefined ? { sharedWithPi: tabBrowser.sharedWithPi } : {})}
-          controllers={(tab?.panes ?? []).filter((pane) => pane.kind === 'pi').map((pane) => ({ name: pane.name, label: titles[pane.name] || pane.name }))}
+          controllers={piControllerOptions(tab?.panes ?? [], titles, window.amber.homeDir)}
           controllersReady={sawSessions}
           onPolicy={(policy) => { void ensureBrowserContext().then(() => {
             if (policy.designatedPi !== tabBrowser.designatedPi) return window.amber.browserCommand({ type: 'designate', ...(policy.designatedPi ? { designatedPi: policy.designatedPi } : {}) })
@@ -2960,7 +2960,7 @@ function App(): JSX.Element {
         onSave={(value) => { onSetPaneTitle(titleEditPane, value); setTitleEditPane(null) }} onClose={() => setTitleEditPane(null)} />}
       {productivityOverlay === 'search' && <GlobalSearchDialog results={searchResults} loading={searchLoading} error={searchError}
         onClose={() => setProductivityOverlay(null)} onSearch={runGlobalSearch}
-        describe={(name) => { const info = sessions.find((session) => session.name === name); const parsed = parseName(name); return `${info?.slot ? `#${info.slot} · ` : ''}${info?.title || titles[name] || shortCwd(info?.cwd ?? '', window.amber.homeDir) || name}${parsed ? ` · ws ${parsed.ws} · tab ${parsed.tab}` : ''}` }}
+        describe={(name) => { const info = sessions.find((session) => session.name === name); const parsed = parseName(name); return `${paneDisplayLabel({ title: info?.title, kind: info?.kind ?? '', cwd: info?.cwd ?? '', slot: info?.slot }, titles[name], window.amber.homeDir)}${parsed ? ` · ws ${parsed.ws} · tab ${parsed.tab}` : ''}` }}
         onPick={(result, query) => navigateTo(result.name, query)} />}
       {productivityOverlay === 'recovery' && <RecoveryCenter events={recoveryEvents} sessions={sessions} loading={recoveryLoading} error={recoveryError}
         onClose={() => setProductivityOverlay(null)} onRefresh={refreshRecovery}

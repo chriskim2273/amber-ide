@@ -1686,13 +1686,12 @@ select:focus-visible {
 }
 .pi-list-item { display: flex; gap: 7px; margin: 3px 0; }
 .pi-thinking,
-.pi-inline-tool,
-.pi-tool-card {
+.pi-inline-tool {
+  margin: 8px 0;
+  padding-left: 10px;
   border-left: 2px solid var(--border-strong);
   color: var(--text-dim);
 }
-.pi-thinking,
-.pi-inline-tool { margin: 8px 0; padding-left: 10px; }
 .pi-thinking summary,
 .pi-inline-tool summary,
 .pi-tool-card summary { cursor: pointer; color: var(--text-dim); }
@@ -1701,12 +1700,12 @@ select:focus-visible {
   margin: 0 auto 10px;
   padding: 7px 10px;
   border: 1px solid var(--border);
-  border-left: 2px solid var(--border-strong);
   border-radius: var(--radius);
   background: var(--surface);
+  color: var(--text-dim);
   content-visibility: auto;
 }
-.pi-tool-card.error { border-left-color: var(--danger); }
+.pi-tool-card.error { border-color: var(--danger); }
 .pi-tool-card summary { display: flex; align-items: center; gap: 8px; font: 600 11px var(--font-mono); }
 .pi-tool-card summary > span:last-child { margin-left: auto; color: var(--text-faint); font: 10px var(--font-ui); }
 .pi-stream-caret {

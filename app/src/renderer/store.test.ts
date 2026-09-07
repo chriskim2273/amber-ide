@@ -112,6 +112,36 @@ describe('store', () => {
     st = reduce(st, { kind: 'SessionsChanged', added: [claude('amber-1-1-0-c', 'claude-retrying')], removed: [] })
     expect(groupSessions(st)[0]!.tabs[0]!.panes[0]!.runState).toBe('claude-retrying')
   })
+
+  it('TitleSet patches an already-listed session so pickers see the rename immediately', () => {
+    const pi: SessionInfo = { name: 'amber-1-1-0-pi', cwd: '/w', kind: 'pi', alive: true, slot: 4 }
+    let st = reduce(initialState(), { kind: 'Sessions', sessions: [pi] })
+    st = reduce(st, { kind: 'TitleSet', name: 'amber-1-1-0-pi', title: 'IOTNation' })
+    expect(groupSessions(st)[0]!.tabs[0]!.panes[0]!.title).toBe('IOTNation')
+    st = reduce(st, { kind: 'TitleSet', name: 'amber-1-1-0-pi', title: null })
+    expect(groupSessions(st)[0]!.tabs[0]!.panes[0]!.title).toBeUndefined()
+  })
+
+  it('SessionsChanged upserts a friendly title onto an existing session', () => {
+    let st = reduce(initialState(), { kind: 'Sessions', sessions: [s('amber-1-1-0-pi')] })
+    st = reduce(st, { kind: 'SessionsChanged', added: [{ ...s('amber-1-1-0-pi'), kind: 'pi', title: 'Auth refactor', slot: 3 }], removed: [] })
+    expect(groupSessions(st)[0]!.tabs[0]!.panes[0]!.title).toBe('Auth refactor')
+  })
+
+  it('keeps a renamed title when a later SessionsChanged omits it', () => {
+    const pi: SessionInfo = { name: 'amber-1-1-0-pi', cwd: '/w', kind: 'pi', alive: true, slot: 4, title: 'Auth' }
+    let st = reduce(initialState(), { kind: 'Sessions', sessions: [pi] })
+    st = reduce(st, { kind: 'SessionsChanged', added: [{ name: 'amber-1-1-0-pi', cwd: '/w', kind: 'pi', alive: true, slot: 4 }], removed: [] })
+    expect(groupSessions(st)[0]!.tabs[0]!.panes[0]!.title).toBe('Auth')
+  })
+
+  it('does not resurrect a title after TitleSet clears it', () => {
+    const pi: SessionInfo = { name: 'amber-1-1-0-pi', cwd: '/w', kind: 'pi', alive: true, slot: 4, title: 'Auth' }
+    let st = reduce(initialState(), { kind: 'Sessions', sessions: [pi] })
+    st = reduce(st, { kind: 'TitleSet', name: 'amber-1-1-0-pi', title: null })
+    st = reduce(st, { kind: 'SessionsChanged', added: [{ name: 'amber-1-1-0-pi', cwd: '/w', kind: 'pi', alive: true, slot: 4 }], removed: [] })
+    expect(groupSessions(st)[0]!.tabs[0]!.panes[0]!.title).toBeUndefined()
+  })
 })
 
 describe('activity', () => {

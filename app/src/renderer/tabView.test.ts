@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { cleanOscTitle, deriveTab, shortCwd } from './tabView'
+import { cleanOscTitle, deriveTab, piControllerOptions, shortCwd } from './tabView'
 import { leaves } from './layout'
 import type { PaneModel } from './store'
 
@@ -151,5 +151,65 @@ describe('deriveTab slot prefix', () => {
     expect(paneMeta['amber-9-9-9-new']!.title).toBe('~/proj · shell')
     const zero = deriveTab([pane({ name: 'amber-9-9-9-zero', slot: 0 })], null, {}, {}, '/home/u')
     expect(zero.paneMeta['amber-9-9-9-zero']!.title).toBe('~/proj · shell')
+  })
+})
+
+describe('piControllerOptions', () => {
+  const home = '/home/u'
+
+  it('lets a renamed title beat a later pi - IOTNation OSC title', () => {
+    const options = piControllerOptions([
+      pane({ name: 'amber-1-1-0-a', kind: 'pi', slot: 4, title: 'Auth', cwd: '/home/u/IOTNation' }),
+    ], { 'amber-1-1-0-a': 'pi - IOTNation' }, home)
+    expect(options).toEqual([{ name: 'amber-1-1-0-a', label: '#4 Auth' }])
+  })
+
+  it('labels each Pi with its amber slot and renamed title, not the colliding OSC brand', () => {
+    const options = piControllerOptions([
+      pane({ name: 'amber-1-1-0-a', kind: 'pi', slot: 3, title: 'Auth refactor', cwd: '/home/u/proj' }),
+      pane({ name: 'amber-1-1-1-b', kind: 'pi', slot: 7, title: 'Tests', cwd: '/home/u/proj' }),
+    ], { 'amber-1-1-0-a': 'π - proj', 'amber-1-1-1-b': 'π - proj' }, home)
+    expect(options).toEqual([
+      { name: 'amber-1-1-0-a', label: '#3 Auth refactor' },
+      { name: 'amber-1-1-1-b', label: '#7 Tests' },
+    ])
+  })
+
+  it('falls back to cleaned OSC then cwd, still unique by slot when names collide', () => {
+    const options = piControllerOptions([
+      pane({ name: 'amber-1-1-0-a', kind: 'pi', slot: 3, cwd: '/home/u/proj' }),
+      pane({ name: 'amber-1-1-1-b', kind: 'pi', slot: 8, cwd: '/home/u/proj' }),
+      pane({ name: 'amber-1-1-2-c', kind: 'pi', slot: 12, cwd: '/home/u/other' }),
+    ], { 'amber-1-1-0-a': 'π - refactor-auth - proj', 'amber-1-1-1-b': 'π - proj' }, home)
+    expect(options.map((option) => option.label)).toEqual([
+      '#3 refactor-auth',
+      '#8 proj',
+      '#12 ~/other',
+    ])
+  })
+
+  it('strips a lowercase or unicode-dash Pi brand so the picker never shows "pi - IOTNation"', () => {
+    const options = piControllerOptions([
+      pane({ name: 'amber-1-1-0-a', kind: 'pi', slot: 4, cwd: '/home/u/IOTNation' }),
+      pane({ name: 'amber-1-1-1-b', kind: 'pi', slot: 9, cwd: '/home/u/IOTNation' }),
+      pane({ name: 'amber-1-1-2-c', kind: 'pi', slot: 11, cwd: '/home/u/other' }),
+    ], {
+      'amber-1-1-0-a': 'pi - IOTNation',
+      'amber-1-1-1-b': 'PI – IOTNation',
+      'amber-1-1-2-c': 'pi — notes',
+    }, home)
+    expect(options.map((option) => option.label)).toEqual([
+      '#4 IOTNation',
+      '#9 IOTNation',
+      '#11 notes',
+    ])
+  })
+
+  it('lists only Pi panes and omits a slot prefix when the daemon has none', () => {
+    const options = piControllerOptions([
+      pane({ name: 'amber-1-1-0-sh', kind: 'shell', slot: 1 }),
+      pane({ name: 'amber-1-1-1-pi', kind: 'pi', cwd: '/home/u/proj' }),
+    ], {}, home)
+    expect(options).toEqual([{ name: 'amber-1-1-1-pi', label: '~/proj' }])
   })
 })

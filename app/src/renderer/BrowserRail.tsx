@@ -181,7 +181,7 @@ export function BrowserRail(props: {
       <label>Mode <select aria-label="Browser mode" value={status?.mode ?? 'browse'} onChange={(event) => { void command({ type: 'mode', id: props.id, mode: event.target.value }).then((reply) => { if (reply.ok && 'id' in reply.result) acceptStatus(reply.result); else if (!reply.ok) setError(reply.error) }) }}><option value="preview">Preview</option><option value="browse">Browse</option></select></label>
       <button className="btn" aria-haspopup="menu" aria-expanded={viewportOpen} onClick={() => setViewportOpen((value) => !value)}>Viewport</button>
       <select aria-label="Pi browser controller" value={props.designatedPi ?? ''} onChange={(event) => props.onPolicy({ ...(event.target.value ? { designatedPi: event.target.value } : {}), sharedWithPi: false })}>
-        <option value="">Private</option>{props.controllers.map((controller) => <option key={controller.name} value={controller.name}>{controller.label}</option>)}
+        <option value="">Private</option>{props.controllers.map((controller) => <option key={`${controller.name}:${controller.label}`} value={controller.name}>{controller.label}</option>)}
       </select>
       <label className="tab-browser-share" title="Share this global Amber browser profile with the designated Pi">
         <input type="checkbox" checked={!!props.sharedWithPi} disabled={!props.designatedPi} onChange={(event) => {
