@@ -1,5 +1,9 @@
 # Browser Interaction Implementation Plan
 
+**Latest receipt:** `.reports/browser-interaction-rollout.md` records the authorized
+rollout, integration with newer main, native Mac fixes, 800-check Linux matrix,
+and real public-tool Google search. It also records the remaining external limits.
+
 **Execution receipt (2026-09-06):** implementation and isolated validation are recorded in
 `.reports/browser-interaction.md` and `.reports/browser-interaction-scorecard.md`:
 1126 app tests, 893 Rust tests, 740 native matrix checks, generated Pi verification

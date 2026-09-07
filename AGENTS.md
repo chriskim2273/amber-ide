@@ -108,6 +108,18 @@ exception is core rule 9); themes/settings beyond minimal.
 
 ## Build status
 
+- [x] Browser native-input follow-up (2026-09-07) — preserves the Pi GUI
+  integration while fixing Retina cursor placement, macOS editing-command
+  dispatch and failed semantic-drag cleanup. Combined gates: app 1144 passed/
+  1 skipped, Rust 902 passed/2 ignored, Clippy, typecheck, Pi 0.85.1 verifier
+  and AppImage build passed. Linux: 40 native cases ×20 runs plus a run on
+  the real display. Public Pi tools typed `potatoes` into real Google and
+  submitted successfully in a private packaged profile, with an actual
+  approval dialog and zero input retries. Mac tests reproduced and verified
+  the editing/Retina fixes; final full Mac matrix remains blocked by SSH
+  availability. Hardware IME and human approval gestures are not certified.
+  Receipt: `.reports/browser-interaction-rollout.md`.
+
 - [x] Slice 0 — daemon spine: pty ownership, ring, proto, state, save/restore,
   socket daemon + `attach`/`ls`/`create`. Proven: restart → sessions restored.
 - [x] Slice 1 — full control protocol + multi-client fan-out (folded into 0).
