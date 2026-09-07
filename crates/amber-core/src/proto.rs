@@ -185,6 +185,18 @@ pub enum PiDelivery {
     FollowUp,
 }
 
+/// Closed action set for the optional Pi subagent bridge. These names map to
+/// the public pi-subagents RPC methods; they are deliberately not a generic
+/// extension method selector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PiSubagentAction {
+    Stop,
+    Steer,
+    Interrupt,
+    Resume,
+}
+
 /// Commands the optional Pi semantic pane can send to the public extension
 /// bridge inside the existing interactive Pi process. Kept closed and small:
 /// browser input must never become an arbitrary extension method invocation.
@@ -232,6 +244,34 @@ pub enum PiCommand {
         #[serde(rename = "attachmentId")]
         attachment_id: String,
     },
+    /// Request a bounded, read-only current-session fleet snapshot.
+    SubagentStatus {
+        #[serde(rename = "requestId")]
+        request_id: String,
+    },
+    /// Request a bounded transcript projection for one package-owned run.
+    SubagentTranscript {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        #[serde(rename = "runId")]
+        run_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        index: Option<u32>,
+    },
+    /// Request one of the explicitly supported package-owned controls.
+    SubagentControl {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        action: PiSubagentAction,
+        #[serde(rename = "runId")]
+        run_id: String,
+        #[serde(rename = "childId", default, skip_serializing_if = "Option::is_none")]
+        child_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        index: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
     Abort,
     SetThinkingLevel { level: String },
 }
@@ -241,6 +281,8 @@ pub enum PiCommand {
 /// accidentally accept a larger command than the existing one.
 pub const PI_PROMPT_MAX_BYTES: usize = 64 * 1024;
 pub const PI_REQUEST_ID_MAX_BYTES: usize = 128;
+pub const PI_SUBAGENT_ID_MAX_BYTES: usize = 256;
+pub const PI_SUBAGENT_INDEX_MAX: u32 = 500;
 pub const PI_ATTACHMENT_ID_MAX_BYTES: usize = 128;
 pub const PI_FILENAME_MAX_CHARS: usize = 255;
 pub const PI_MIME_TYPE_MAX_BYTES: usize = 128;
@@ -261,6 +303,23 @@ fn validate_pi_identifier(value: &str, max: usize, label: &str) -> anyhow::Resul
     }
     if value.chars().any(char::is_control) {
         anyhow::bail!("Pi {label} contains a control character");
+    }
+    Ok(())
+}
+
+fn validate_pi_subagent_id(value: &str, label: &str) -> anyhow::Result<()> {
+    validate_pi_identifier(value, PI_SUBAGENT_ID_MAX_BYTES, label)?;
+    if value.chars().any(|character| character == '/' || character == '\\' || character.is_whitespace()) {
+        anyhow::bail!("Pi {label} contains a path separator or whitespace");
+    }
+    Ok(())
+}
+
+fn validate_pi_subagent_index(index: Option<u32>) -> anyhow::Result<()> {
+    if let Some(index) = index {
+        if index > PI_SUBAGENT_INDEX_MAX {
+            anyhow::bail!("Pi subagent index exceeds the {PI_SUBAGENT_INDEX_MAX}-child limit");
+        }
     }
     Ok(())
 }
@@ -344,6 +403,39 @@ pub fn validate_pi_command(command: &PiCommand) -> anyhow::Result<()> {
         | PiCommand::UploadCancel { request_id, attachment_id } => {
             validate_pi_identifier(request_id, PI_REQUEST_ID_MAX_BYTES, "request id")?;
             validate_pi_attachment_id(attachment_id)?;
+        }
+        PiCommand::SubagentStatus { request_id } => {
+            validate_pi_identifier(request_id, PI_REQUEST_ID_MAX_BYTES, "request id")?;
+        }
+        PiCommand::SubagentTranscript { request_id, run_id, index } => {
+            validate_pi_identifier(request_id, PI_REQUEST_ID_MAX_BYTES, "request id")?;
+            validate_pi_subagent_id(run_id, "subagent run id")?;
+            validate_pi_subagent_index(*index)?;
+        }
+        PiCommand::SubagentControl { request_id, action, run_id, child_id, index, message } => {
+            validate_pi_identifier(request_id, PI_REQUEST_ID_MAX_BYTES, "request id")?;
+            validate_pi_subagent_id(run_id, "subagent run id")?;
+            if child_id.is_some() || index.is_some() {
+                anyhow::bail!("Pi subagent child targets are not supported");
+            }
+            match action {
+                PiSubagentAction::Steer | PiSubagentAction::Resume => {
+                    let Some(message) = message else {
+                        anyhow::bail!("Pi subagent {action:?} requires a message");
+                    };
+                    if message.trim().is_empty() {
+                        anyhow::bail!("Pi subagent {action:?} message must not be empty");
+                    }
+                    if message.len() > PI_PROMPT_MAX_BYTES {
+                        anyhow::bail!("Pi subagent message exceeds the 64 KiB limit");
+                    }
+                }
+                PiSubagentAction::Stop | PiSubagentAction::Interrupt => {
+                    if message.is_some() {
+                        anyhow::bail!("Pi subagent {action:?} does not accept a message");
+                    }
+                }
+            }
         }
         PiCommand::SetThinkingLevel { level } => {
             if !matches!(level.as_str(), "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max") {
@@ -1082,6 +1174,61 @@ mod tests {
             data: "aGk=".into(),
         };
         assert_eq!(serde_json::from_str::<PiCommand>(&serde_json::to_string(&upload).unwrap()).unwrap(), upload);
+    }
+
+    #[test]
+    fn pi_subagent_commands_roundtrip_with_closed_rpc_fields() {
+        let status = PiCommand::SubagentStatus { request_id: "status-1".into() };
+        assert_eq!(serde_json::to_string(&status).unwrap(), r#"{"SubagentStatus":{"requestId":"status-1"}}"#);
+        assert_eq!(serde_json::from_str::<PiCommand>(&serde_json::to_string(&status).unwrap()).unwrap(), status);
+
+        let transcript = PiCommand::SubagentTranscript {
+            request_id: "transcript-1".into(), run_id: "run-1".into(), index: Some(2),
+        };
+        assert_eq!(serde_json::to_string(&transcript).unwrap(), r#"{"SubagentTranscript":{"requestId":"transcript-1","runId":"run-1","index":2}}"#);
+        assert_eq!(serde_json::from_str::<PiCommand>(&serde_json::to_string(&transcript).unwrap()).unwrap(), transcript);
+
+        let control = PiCommand::SubagentControl {
+            request_id: "control-1".into(), action: PiSubagentAction::Steer,
+            run_id: "run-1".into(), child_id: None, index: None, message: Some("continue".into()),
+        };
+        assert_eq!(serde_json::to_string(&control).unwrap(), r#"{"SubagentControl":{"requestId":"control-1","action":"steer","runId":"run-1","message":"continue"}}"#);
+        assert_eq!(serde_json::from_str::<PiCommand>(&serde_json::to_string(&control).unwrap()).unwrap(), control);
+    }
+
+    #[test]
+    fn pi_subagent_validator_rejects_unsupported_targets_and_action_shapes() {
+        assert!(validate_pi_command(&PiCommand::SubagentStatus { request_id: "status".into() }).is_ok());
+        assert!(validate_pi_command(&PiCommand::SubagentTranscript {
+            request_id: "transcript".into(), run_id: "run-1".into(), index: None,
+        }).is_ok());
+        assert!(validate_pi_command(&PiCommand::SubagentControl {
+            request_id: "stop".into(), action: PiSubagentAction::Stop,
+            run_id: "run-1".into(), child_id: Some("child-1".into()), index: None, message: None,
+        }).is_err(), "child controls remain read-only until canonical identity resolution exists");
+        assert!(validate_pi_command(&PiCommand::SubagentControl {
+            request_id: "steer".into(), action: PiSubagentAction::Steer,
+            run_id: "run-1".into(), child_id: None, index: None, message: None,
+        }).is_err(), "steer requires an explicit message");
+        assert!(validate_pi_command(&PiCommand::SubagentControl {
+            request_id: "resume".into(), action: PiSubagentAction::Resume,
+            run_id: "run-1".into(), child_id: None, index: None, message: Some(" ".into()),
+        }).is_err(), "resume rejects blank messages");
+        assert!(validate_pi_command(&PiCommand::SubagentControl {
+            request_id: "interrupt".into(), action: PiSubagentAction::Interrupt,
+            run_id: "run-1".into(), child_id: Some("child-1".into()), index: None, message: None,
+        }).is_err(), "child targets are unsupported until canonical identity resolution exists");
+        assert!(validate_pi_command(&PiCommand::SubagentControl {
+            request_id: "index".into(), action: PiSubagentAction::Stop,
+            run_id: "run-1".into(), child_id: None, index: Some(0), message: None,
+        }).is_err(), "index targets are unsupported until canonical identity resolution exists");
+        assert!(validate_pi_command(&PiCommand::SubagentTranscript {
+            request_id: "bad\nrequest".into(), run_id: "run-1".into(), index: None,
+        }).is_err());
+        assert!(serde_json::from_str::<PiCommand>(r#"{"SubagentControl":{"requestId":"x","action":"spawn","runId":"run"}}"#).is_err());
+        assert!(validate_pi_command(&PiCommand::SubagentTranscript {
+            request_id: "transcript".into(), run_id: "run\u{2003}1".into(), index: None,
+        }).is_err(), "Unicode whitespace must not cross the RPC boundary");
     }
 
     #[test]

@@ -481,6 +481,24 @@ export class PiPaneLink {
             attachmentId: command.attachmentId,
           }))
           break
+        case 'SubagentStatus':
+          this.socket.send(JSON.stringify({ t: 'piSubagentStatus', name: this.session, requestId: command.requestId }))
+          break
+        case 'SubagentTranscript':
+          this.socket.send(JSON.stringify({
+            t: 'piSubagentTranscript', name: this.session, requestId: command.requestId,
+            runId: command.runId, ...(command.index === undefined ? {} : { index: command.index }),
+          }))
+          break
+        case 'SubagentControl':
+          this.socket.send(JSON.stringify({
+            t: 'piSubagentControl', name: this.session, requestId: command.requestId,
+            action: command.action, runId: command.runId,
+            ...(command.childId === undefined ? {} : { childId: command.childId }),
+            ...(command.index === undefined ? {} : { index: command.index }),
+            ...(command.message === undefined ? {} : { message: command.message }),
+          }))
+          break
         case 'Abort':
           this.socket.send(JSON.stringify({ t: 'piAbort', name: this.session }))
           break

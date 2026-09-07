@@ -496,6 +496,29 @@ const MAX_TEXT = 64 * 1024
 const MAX_BUFFERED = 1024 * 1024
 const UPDATE_INTERVAL_MS = 80
 
+// pi-subagents is optional. This closed event-bus adapter is intentionally
+// independent of its internal modules and only speaks the documented RPC
+// envelope/methods.
+const SUBAGENT_RPC_VERSION = 1
+const SUBAGENT_RPC_REQUEST_EVENT = "subagents:rpc:v1:request"
+const SUBAGENT_RPC_READY_EVENT = "subagents:rpc:v1:ready"
+const SUBAGENT_RPC_REPLY_EVENT_PREFIX = "subagents:rpc:v1:reply:"
+const SUBAGENT_RPC_TIMEOUT_MS = 2_000
+// The documented async steering path may wait 3 seconds before returning a
+// queued receipt. Keep mutation calls separately bounded with scheduling
+// margin; read-only polling and transcript requests stay on the short limit.
+const SUBAGENT_RPC_MUTATION_TIMEOUT_MS = 5_000
+const SUBAGENT_RPC_POLL_MS = 2_000
+const SUBAGENT_RPC_METHODS = ["status", "steer", "interrupt", "stop", "resume"]
+const SUBAGENT_STATUS_MAX_RUNS = 20
+const SUBAGENT_STATUS_MAX_CHILDREN = 8
+const SUBAGENT_STATUS_MAX_FLEET = 16
+const SUBAGENT_STATUS_MAX_TEXT = 8_192
+const SUBAGENT_STATUS_MAX_ID = 256
+const SUBAGENT_STATUS_MAX_BYTES = 64 * 1024
+const SUBAGENT_TRANSCRIPT_MAX_BYTES = 32 * 1024
+const SUBAGENT_NODE_KINDS = ["subagent", "workflow", "step", "host-step"]
+
 // Pi chat attachment limits mirror amber-core::proto. The extension repeats
 // every check because this is the only component that can inspect attachment
 // metadata and bytes; the daemon/web checks stop oversized commands earlier.
@@ -512,6 +535,7 @@ const PI_ARTIFACTS_MAX_BYTES = 256 * 1024 * 1024
 const PI_UPLOAD_CHUNK_MAX_BYTES = 48 * 1024
 const PI_UPLOAD_CHUNK_MAX_ENCODED_BYTES = Math.ceil(PI_UPLOAD_CHUNK_MAX_BYTES / 3) * 4
 const PI_REQUEST_CACHE_MAX = 4096
+const PI_IN_FLIGHT_MAX = 64
 const PI_ATTACHMENT_EXPIRY_MS = 24 * 60 * 60 * 1000
 const ATTACHMENT_ID_RE = /^[A-Za-z0-9_-]{1,128}$/
 const SESSION_ID_RE = /^[A-Za-z0-9_-]{1,128}$/
@@ -914,6 +938,23 @@ function installSemanticBridge(pi: ExtensionAPI) {
   let attachmentOperationTail: Promise<void> = Promise.resolve()
   const acceptedRequestIds = new Set<string>()
   const inFlightRequestIds = new Set<string>()
+  const readOnlyInFlightRequestIds = new Set<string>()
+  type SubagentEventBus = {
+    on(event: string, handler: (data: unknown) => void): (() => void) | void
+    emit(event: string, data: unknown): void
+  }
+  const subagentEvents = (pi as ExtensionAPI & { events?: SubagentEventBus }).events
+  let subagentStatusPromise: Promise<unknown> | undefined
+  const subagentRpcCancels = new Set<() => void>()
+  let subagentPollTimer: ReturnType<typeof setInterval> | undefined
+  let subagentReadyUnsubscribe: (() => void) | undefined
+  let subagentReady = false
+  let subagentUnavailableUntil = 0
+  let subagentStatusEpoch = 0
+  let subagentStatusCache: Record<string, unknown> | undefined
+  let subagentRequestCounter = 0
+  let subagentCapabilities: Record<string, unknown> = { methods: [] }
+  let subagentRunIds = new Set<string>()
 
   function isCurrent(epoch: number): boolean {
     return !stopped && lifetimeEpoch === epoch
@@ -984,25 +1025,576 @@ function installSemanticBridge(pi: ExtensionAPI) {
     })
   }
 
-  function claimRequest(requestId: string, command: string): boolean {
+  function subagentRecord(value: unknown): Record<string, unknown> | undefined {
+    return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined
+  }
+
+  function subagentText(value: unknown, max = SUBAGENT_STATUS_MAX_TEXT): string | undefined {
+    if (typeof value !== "string") return undefined
+    const safe = value.slice(0, max * 4).replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "�")
+    return safe.length > max ? `${safe.slice(0, max)}\n[truncated by Amber]` : safe
+  }
+
+  function subagentId(value: unknown): string | undefined {
+    if (typeof value !== "string" || value.length === 0 || Buffer.byteLength(value, "utf8") > SUBAGENT_STATUS_MAX_ID
+      || /[\u0000-\u001F\/\\\s]/.test(value)) return undefined
+    return value
+  }
+
+  function subagentNumber(value: unknown, maximum = Number.MAX_SAFE_INTEGER): number | undefined {
+    return typeof value === "number" && Number.isFinite(value) && Number.isSafeInteger(value) && value >= 0
+      ? Math.min(value, maximum) : undefined
+  }
+
+  function normalizeSubagentTokens(value: unknown): Record<string, number> {
+    const record = subagentRecord(value)
+    const number = (key: string): number => subagentNumber(record?.[key]) ?? 0
+    return {
+      input: number("input"), output: number("output"), total: number("total"),
+      ...(subagentNumber(record?.window) === undefined ? {} : { window: number("window") }),
+      ...(subagentNumber(record?.windowPeak) === undefined ? {} : { windowPeak: number("windowPeak") }),
+    }
+  }
+
+  type SubagentOmissionCounts = { runs: number; children: number; fleet: number; byteLimitExceeded: boolean }
+
+  function addSubagentOmission(current: number, amount: number): number {
+    return Math.min(Number.MAX_SAFE_INTEGER, current + Math.max(0, amount))
+  }
+
+  function normalizeSubagentFleet(value: unknown, omissions: SubagentOmissionCounts): Record<string, unknown> {
+    const record = subagentRecord(value)
+    const rawEntries = Array.isArray(record?.entries) ? record.entries : []
+    const entries: Array<Record<string, unknown>> = []
+    for (const raw of rawEntries.slice(0, SUBAGENT_STATUS_MAX_FLEET)) {
+      const candidate = subagentRecord(raw)
+      const agent = subagentText(candidate?.agent, 96)
+      const startedAt = subagentNumber(candidate?.startedAt)
+      if (!agent || startedAt === undefined) {
+        omissions.fleet = addSubagentOmission(omissions.fleet, 1)
+        continue
+      }
+      entries.push({
+        agent, startedAt, tokens: normalizeSubagentTokens(candidate?.tokens),
+        ...(subagentText(candidate?.role, 96) ? { role: subagentText(candidate?.role, 96) } : {}),
+        ...(subagentText(candidate?.model, 128) ? { model: subagentText(candidate?.model, 128) } : {}),
+        ...(subagentText(candidate?.effort, 128) ? { effort: subagentText(candidate?.effort, 128) } : {}),
+        ...(subagentText(candidate?.goal, 512) ? { goal: subagentText(candidate?.goal, 512) } : {}),
+      })
+    }
+    omissions.fleet = addSubagentOmission(omissions.fleet, rawEntries.length - Math.min(rawEntries.length, SUBAGENT_STATUS_MAX_FLEET))
+    const capacity = subagentRecord(record?.topLevelAsyncCapacity)
+    return {
+      entries,
+      totalActive: subagentNumber(record?.totalActive) ?? entries.length,
+      topLevelAsyncCapacity: {
+        used: subagentNumber(capacity?.used) ?? 0,
+        limit: subagentNumber(capacity?.limit) ?? 0,
+      },
+      omitted: addSubagentOmission(subagentNumber(record?.omitted) ?? 0, omissions.fleet),
+    }
+  }
+
+  function normalizeSubagentActivity(value: unknown): Record<string, unknown> | undefined {
+    const record = subagentRecord(value)
+    if (!record) return undefined
+    const activity: Record<string, unknown> = {}
+    for (const key of ["state", "currentTool"] as const) {
+      const text = subagentText(record[key], 128)
+      if (text) activity[key] = text
+    }
+    for (const key of ["lastActivityAt", "currentToolStartedAt", "turnCount", "toolCount"] as const) {
+      const number = subagentNumber(record[key])
+      if (number !== undefined) activity[key] = number
+    }
+    return Object.keys(activity).length > 0 ? activity : undefined
+  }
+
+  function normalizeSubagentNode(value: unknown, depth = 0, omissions?: SubagentOmissionCounts): Record<string, unknown> | undefined {
+    const record = subagentRecord(value)
+    const id = subagentId(record?.id)
+    const label = subagentText(record?.label, 160)
+    const state = subagentText(record?.state, 32)
+    if (!id || !label || !state) return undefined
+    const node: Record<string, unknown> = { id, label, state }
+    const kind = subagentText(record?.kind, 32)
+    if (kind && SUBAGENT_NODE_KINDS.includes(kind)) node.kind = kind
+    const activity = normalizeSubagentActivity(record?.activity)
+    if (activity) node.activity = activity
+    for (const key of ["startedAt", "updatedAt", "endedAt"] as const) {
+      const number = subagentNumber(record?.[key])
+      if (number !== undefined) node[key] = number
+    }
+    if (Array.isArray(record?.children)) {
+      const rawChildren = record.children
+      const boundedChildren = rawChildren.slice(0, SUBAGENT_STATUS_MAX_CHILDREN)
+      if (omissions) {
+        omissions.children = addSubagentOmission(omissions.children, rawChildren.length)
+      }
+      if (depth < 3) {
+        const children = boundedChildren.map((child) => {
+          const normalized = normalizeSubagentNode(child, depth + 1, omissions)
+          if (normalized && omissions) omissions.children = Math.max(0, omissions.children - 1)
+          return normalized
+        }).filter((child): child is Record<string, unknown> => child !== undefined)
+        if (children.length > 0) node.children = children
+      }
+    }
+    return node
+  }
+
+  function normalizeSubagentOmitted(value: unknown, local: SubagentOmissionCounts): Record<string, unknown> {
+    const record = subagentRecord(value)
+    return {
+      runs: addSubagentOmission(subagentNumber(record?.runs) ?? 0, local.runs),
+      children: addSubagentOmission(subagentNumber(record?.children) ?? 0, local.children),
+      byteLimitExceeded: record?.byteLimitExceeded === true || local.byteLimitExceeded,
+    }
+  }
+
+  function normalizeSubagentCapabilities(value: unknown): Record<string, unknown> {
+    const record = subagentRecord(value)
+    const rawMethods = Array.isArray(record?.methods) ? record.methods : []
+    const advertised = subagentRecord(record?.capabilities)
+    const methods = SUBAGENT_RPC_METHODS.filter((method) => rawMethods.includes(method) || advertised?.[method] === true)
+    return {
+      methods,
+      status: methods.includes("status"), steer: methods.includes("steer"),
+      interrupt: methods.includes("interrupt"), stop: methods.includes("stop"), resume: methods.includes("resume"),
+      nonRecoveringSteer: advertised?.nonRecoveringSteer === true,
+    }
+  }
+
+  function subagentFits(value: unknown, maximum: number): boolean {
+    try { return Buffer.byteLength(JSON.stringify(value), "utf8") <= maximum } catch { return false }
+  }
+
+  function countSubagentDescendants(node: Record<string, unknown>): number {
+    const children = Array.isArray(node.children) ? node.children as Array<Record<string, unknown>> : []
+    return children.length + children.reduce((total, child) => total + countSubagentDescendants(child), 0)
+  }
+
+  function trimSubagentRuns(runs: Array<Record<string, unknown>>, omissions: SubagentOmissionCounts): void {
+    const removeChild = (node: Record<string, unknown>): boolean => {
+      const children = Array.isArray(node.children) ? node.children as Array<Record<string, unknown>> : []
+      for (let index = children.length - 1; index >= 0; index -= 1) {
+        const child = children[index]
+        if (!child) continue
+        if (removeChild(child)) return true
+        children.splice(index, 1)
+        omissions.children = addSubagentOmission(omissions.children, 1)
+        omissions.byteLimitExceeded = true
+        return true
+      }
+      return false
+    }
+    while (runs.length > 0) {
+      const candidate = { asyncRuns: runs }
+      if (subagentFits(candidate, SUBAGENT_STATUS_MAX_BYTES)) return
+      if (removeChild(runs[runs.length - 1]!)) continue
+      if (runs.length > 1) {
+        runs.pop()
+        omissions.runs = addSubagentOmission(omissions.runs, 1)
+        omissions.byteLimitExceeded = true
+        continue
+      }
+      // A single malformed-but-valid node can still carry large labels. Keep
+      // the identity and state, but make the projection fit its hard ceiling.
+      const only = runs[0]
+      if (only && typeof only.label === "string" && only.label.length > 32) {
+        only.label = only.label.slice(0, 32)
+        omissions.byteLimitExceeded = true
+      } else if (only && typeof only.state === "string" && only.state.length > 32) {
+        only.state = only.state.slice(0, 32)
+        omissions.byteLimitExceeded = true
+      } else break
+    }
+  }
+
+  function normalizeSubagentStatus(value: unknown, requestId: string): Record<string, unknown> {
+    const record = subagentRecord(value)
+    const snapshot = subagentRecord(record?.asyncSnapshot)
+    const omissions: SubagentOmissionCounts = { runs: 0, children: 0, fleet: 0, byteLimitExceeded: false }
+    const snapshotValid = snapshot?.kind === "pi-subagents.async-status-snapshot" && snapshot?.version === 1
+    const rawRuns = snapshotValid && Array.isArray(snapshot.runs) ? snapshot.runs : []
+    const boundedRuns = rawRuns.slice(0, SUBAGENT_STATUS_MAX_RUNS)
+    omissions.runs = addSubagentOmission(omissions.runs, rawRuns.length - boundedRuns.length)
+    const runs: Array<Record<string, unknown>> = []
+    for (const raw of boundedRuns) {
+      const normalized = normalizeSubagentNode(raw, 0, omissions)
+      if (normalized) runs.push(normalized)
+      else omissions.runs = addSubagentOmission(omissions.runs, 1)
+    }
+    const result: Record<string, unknown> = {
+      kind: "subagent_status", requestId, available: true, stale: false,
+      capabilities: subagentCapabilities,
+      fleet: normalizeSubagentFleet(record?.fleet, omissions),
+      asyncRuns: runs,
+    }
+    trimSubagentRuns(runs, omissions)
+    result.asyncOmitted = normalizeSubagentOmitted(snapshot?.omitted, omissions)
+    while (!subagentFits(result, SUBAGENT_STATUS_MAX_BYTES)) {
+      result.asyncOmitted = normalizeSubagentOmitted(snapshot?.omitted, omissions)
+      const fleet = result.fleet as Record<string, unknown>
+      const entries = Array.isArray(fleet.entries) ? fleet.entries : []
+      if (entries.length > 0) {
+        entries.pop()
+        omissions.fleet = addSubagentOmission(omissions.fleet, 1)
+        fleet.omitted = addSubagentOmission(typeof fleet.omitted === "number" ? fleet.omitted : 0, 1)
+        omissions.byteLimitExceeded = true
+        continue
+      }
+      if (runs.length > 0) {
+        const removed = runs.pop()
+        omissions.runs = addSubagentOmission(omissions.runs, 1)
+        omissions.children = addSubagentOmission(omissions.children, removed ? countSubagentDescendants(removed) : 0)
+        omissions.byteLimitExceeded = true
+        continue
+      }
+      break
+    }
+    result.asyncOmitted = normalizeSubagentOmitted(snapshot?.omitted, omissions)
+    // Only top-level async run IDs are control targets. Nested snapshot node
+    // IDs are display identities (workflow keys, step IDs, or synthesized
+    // labels), not proven childId/index bindings.
+    subagentRunIds = new Set(runs.map((run) => run.id).filter((id): id is string => typeof id === "string"))
+    return result
+  }
+
+  function subagentError(error: unknown): Error {
+    const detail = String(error instanceof Error ? error.message : error).slice(0, 512)
+    return new Error(/unavailable/i.test(detail) ? detail : `pi-subagents extension unavailable: ${detail}`)
+  }
+
+  function subagentUnavailable(requestId: string, error: unknown): Record<string, unknown> {
+    const reason = subagentError(error).message
+    return {
+      kind: "subagent_status", requestId, available: false, stale: true,
+      capabilities: subagentCapabilities, reason,
+    }
+  }
+
+  function sendSubagentStatus(event: Record<string, unknown>): void {
+    // Keep one bounded normalized projection for socket reconnects. Never cache
+    // raw RPC data or a user-provided path/identifier.
+    subagentStatusCache = event
+    sendEvent(event)
+  }
+
+  function nextSubagentRequestId(prefix: string): string {
+    subagentRequestCounter += 1
+    return `amber-${prefix}-${process.pid}-${Date.now()}-${subagentRequestCounter}`
+  }
+
+  function subagentRpc(requestId: string, method: string, params?: Record<string, unknown>, timeoutMs = SUBAGENT_RPC_TIMEOUT_MS): Promise<unknown> {
+    if (!subagentEvents) return Promise.reject(new Error("pi-subagents extension is unavailable"))
+    return new Promise((resolve, reject) => {
+      let settled = false
+      let timer: ReturnType<typeof setTimeout> | undefined
+      let unsubscribe: (() => void) | undefined
+      let cancel: (() => void) | undefined
+      const finish = (error?: Error, value?: unknown): void => {
+        if (settled) return
+        settled = true
+        if (timer) clearTimeout(timer)
+        unsubscribe?.()
+        if (cancel) subagentRpcCancels.delete(cancel)
+        if (error) reject(error); else resolve(value)
+      }
+      const onReply = (raw: unknown): void => {
+        const reply = subagentRecord(raw)
+        if (!reply || reply.requestId !== requestId) return
+        if (reply.success !== true) {
+          const error = subagentRecord(reply.error)
+          finish(new Error(subagentText(error?.message, 1_024) ?? "pi-subagents RPC failed"))
+          return
+        }
+        finish(undefined, reply.data)
+      }
+      try {
+        const maybeUnsubscribe = subagentEvents.on(`${SUBAGENT_RPC_REPLY_EVENT_PREFIX}${requestId}`, onReply)
+        unsubscribe = typeof maybeUnsubscribe === "function" ? maybeUnsubscribe : undefined
+        timer = setTimeout(() => finish(new Error(`pi-subagents RPC ${method} timed out`)), timeoutMs)
+        timer.unref?.()
+        cancel = () => finish(new Error("pi-subagents RPC canceled during session shutdown"))
+        subagentRpcCancels.add(cancel)
+        subagentEvents.emit(SUBAGENT_RPC_REQUEST_EVENT, {
+          version: SUBAGENT_RPC_VERSION, requestId, method,
+          ...(params === undefined ? {} : { params }), source: { extension: "amber" },
+        })
+      } catch (error) {
+        finish(error instanceof Error ? error : new Error(String(error)))
+      }
+    })
+  }
+
+  async function ensureSubagentReady(epoch?: number): Promise<void> {
+    if (subagentReady) return
+    if (Date.now() < subagentUnavailableUntil) throw new Error("pi-subagents extension unavailable")
+    try {
+      const data = await subagentRpc(nextSubagentRequestId("ping"), "ping")
+      if (epoch !== undefined) assertCurrent(epoch)
+      subagentCapabilities = normalizeSubagentCapabilities(data)
+      subagentReady = true
+      subagentUnavailableUntil = 0
+    } catch (error) {
+      subagentUnavailableUntil = Date.now() + 5_000
+      throw subagentError(error)
+    }
+  }
+
+  async function fetchSubagentStatus(epoch?: number): Promise<unknown> {
+    if (subagentStatusPromise) return subagentStatusPromise
+    const operation = (async () => {
+      await ensureSubagentReady(epoch)
+      if (epoch !== undefined) assertCurrent(epoch)
+      // An untargeted status lets pi-subagents use its current-session
+      // in-memory projection; rich/targeted views are reserved for explicit
+      // transcript requests.
+      return subagentRpc(nextSubagentRequestId("status"), "status")
+    })()
+    let tracked: Promise<unknown>
+    tracked = operation.finally(() => {
+      // A ready notification can supersede an in-flight request. Do not let
+      // that old request clear the replacement promise.
+      if (subagentStatusPromise === tracked) subagentStatusPromise = undefined
+    })
+    subagentStatusPromise = tracked
+    return tracked
+  }
+
+  async function publishSubagentStatus(requestId: string): Promise<boolean> {
+    if (stopped) return false
+    const statusEpoch = subagentStatusEpoch
+    const epoch = lifetimeEpoch
+    try {
+      const data = await fetchSubagentStatus(epoch)
+      if (isCurrent(epoch) && statusEpoch === subagentStatusEpoch) sendSubagentStatus(normalizeSubagentStatus(data, requestId))
+      return isCurrent(epoch) && statusEpoch === subagentStatusEpoch
+    } catch (error) {
+      if (statusEpoch !== subagentStatusEpoch || !isCurrent(epoch)) return false
+      subagentReady = false
+      subagentUnavailableUntil = Date.now() + 5_000
+      sendSubagentStatus(subagentUnavailable(requestId, error))
+      return false
+    }
+  }
+
+  function trimSubagentTranscript(result: Record<string, unknown>): void {
+    const results = Array.isArray(result.results) ? result.results as Array<Record<string, unknown>> : []
+    while (!subagentFits(result, SUBAGENT_TRANSCRIPT_MAX_BYTES)) {
+      const last = results[results.length - 1]
+      const messages = last && Array.isArray(last.messages) ? last.messages as Array<Record<string, unknown>> : []
+      if (messages.length > 0) { messages.pop(); continue }
+      if (typeof last?.finalOutput === "string" && last.finalOutput.length > 256) { last.finalOutput = last.finalOutput.slice(0, 256); continue }
+      if (results.length > 1) { results.pop(); continue }
+      if (typeof result.text === "string" && result.text.length > 256) { result.text = result.text.slice(0, 256); continue }
+      if (results.length > 0) { results.pop(); continue }
+      break
+    }
+  }
+
+  function normalizeSubagentTranscript(value: unknown, requestId: string, runId: string, index: number | undefined): Record<string, unknown> {
+    const record = subagentRecord(value)
+    const details = subagentRecord(record?.details)
+    const rawResults = Array.isArray(details?.results) ? details.results : []
+    const results: Array<Record<string, unknown>> = []
+    for (const raw of rawResults.slice(0, SUBAGENT_STATUS_MAX_CHILDREN)) {
+      const child = subagentRecord(raw)
+      if (!child) continue
+      const result: Record<string, unknown> = {}
+      const agent = subagentText(child.agent, 96)
+      const state = subagentText(child.status, 32)
+      if (agent) result.agent = agent
+      if (state) result.status = state
+      const finalOutput = subagentText(child.finalOutput, SUBAGENT_STATUS_MAX_TEXT)
+      if (finalOutput) result.finalOutput = finalOutput
+      if (Array.isArray(child.messages)) {
+        const messages: Array<Record<string, unknown>> = []
+        for (const rawMessage of child.messages.slice(0, 50)) {
+          const message = subagentRecord(rawMessage)
+          const text = subagentText(message?.text, 2_048)
+          if (!message || !text) continue
+          const normalized: Record<string, unknown> = { text }
+          const role = subagentText(message.role, 32)
+          const kind = subagentText(message.kind, 32)
+          const messageName = subagentText(message.name, 96)
+          if (role) normalized.role = role
+          if (kind) normalized.kind = kind
+          if (messageName) normalized.name = messageName
+          if (message.isError === true) normalized.isError = true
+          messages.push(normalized)
+        }
+        if (messages.length > 0) result.messages = messages
+      }
+      results.push(result)
+    }
+    const result: Record<string, unknown> = {
+      requestId, runId, ...(index === undefined ? {} : { index }),
+      text: subagentText(record?.text) ?? "", results,
+    }
+    trimSubagentTranscript(result)
+    return result
+  }
+
+  function normalizeSubagentReceipt(value: unknown, action: string, runId: string): Record<string, unknown> {
+    const record = subagentRecord(value)
+    const details = subagentRecord(record?.details)
+    const steering = subagentRecord(details?.steering)
+    const receipt: Record<string, unknown> = { action, runId }
+    const state = subagentText(record?.state, 32) ?? subagentText(steering?.state, 32)
+    const childId = subagentId(record?.childId)
+    const message = subagentText(record?.message, 1_024)
+    const text = subagentText(record?.text, 1_024)
+    const deliveryStatus = subagentText(record?.deliveryStatus, 32) ?? subagentText(steering?.deliveryStatus, 32)
+    const sourceRunId = subagentId(steering?.sourceRunId)
+    const replacementRunId = subagentId(steering?.replacementRunId)
+    if (state) receipt.state = state
+    if (childId) receipt.childId = childId
+    if (message) receipt.message = message
+    if (text) receipt.text = text
+    if (deliveryStatus === "queued" || deliveryStatus === "delivered") receipt.deliveryStatus = deliveryStatus
+    if (sourceRunId) receipt.sourceRunId = sourceRunId
+    if (replacementRunId) receipt.replacementRunId = replacementRunId
+    const rawTargets = Array.isArray(steering?.targets) ? steering.targets : []
+    const targets: Array<Record<string, unknown>> = []
+    for (const rawTarget of rawTargets.slice(0, SUBAGENT_STATUS_MAX_CHILDREN)) {
+      const target = subagentRecord(rawTarget)
+      if (!target) continue
+      const normalized: Record<string, unknown> = {}
+      const index = subagentNumber(target.index, 500)
+      const targetState = subagentText(target.state, 32)
+      const reason = subagentText(target.reason, 512)
+      if (index !== undefined) normalized.index = index
+      if (targetState) normalized.state = targetState
+      if (reason) normalized.reason = reason
+      if (Object.keys(normalized).length > 0) targets.push(normalized)
+    }
+    if (targets.length > 0) receipt.targets = targets
+    return receipt
+  }
+
+  function claimReadOnlyRequest(requestId: unknown, command: string): requestId is string {
+    if (!validRequestId(requestId)) {
+      commandResult(typeof requestId === "string" ? requestId : "invalid", command, false, "invalid Pi request id")
+      return false
+    }
+    if (readOnlyInFlightRequestIds.has(requestId) || inFlightRequestIds.has(requestId) || acceptedRequestIds.has(requestId)) {
+      commandResult(requestId, command, false, "request id is already in use")
+      return false
+    }
+    if (readOnlyInFlightRequestIds.size >= PI_IN_FLIGHT_MAX) {
+      commandResult(requestId, command, false, "Pi request execution capacity is full")
+      return false
+    }
+    readOnlyInFlightRequestIds.add(requestId)
+    return true
+  }
+
+  async function subagentReadOnly(requestId: unknown, command: string, work: (epoch: number) => Promise<unknown>): Promise<void> {
+    if (stopped || !claimReadOnlyRequest(requestId, command)) return
+    const id = requestId as string
+    const epoch = lifetimeEpoch
+    try {
+      assertCurrent(epoch)
+      const data = await work(epoch)
+      assertCurrent(epoch)
+      commandResult(id, command, true, undefined, data)
+    } catch (error) {
+      if (isCurrent(epoch)) commandResult(id, command, false, subagentError(error))
+    } finally {
+      readOnlyInFlightRequestIds.delete(id)
+    }
+  }
+
+  function subagentUnknownDelivery(method: string, error: unknown): Error {
+    const detail = String(error instanceof Error ? error.message : error).slice(0, 512)
+    return new Error(`Pi subagent ${method} delivery is unknown after dispatch: ${detail}`)
+  }
+
+  async function subagentControl(requestId: unknown, action: unknown, runId: unknown, childId: unknown, index: unknown, message: unknown): Promise<void> {
+    const validRequestIdValue = typeof requestId === "string" && validRequestId(requestId) ? requestId : undefined
+    const validRunId = subagentId(runId)
+    if (!validRequestIdValue || !['stop', 'steer', 'interrupt', 'resume'].includes(action as string)
+      || !validRunId || childId !== undefined || index !== undefined
+      || (message !== undefined && (typeof message !== 'string' || Buffer.byteLength(message, "utf8") > PI_PROMPT_MAX_BYTES))
+      || (action !== 'stop' && action !== 'interrupt' && (typeof message !== 'string' || !message.trim()))
+      || ((action === 'stop' || action === 'interrupt') && message !== undefined)) {
+      commandResult(typeof requestId === "string" ? requestId : "invalid", "SubagentControl", false, "invalid Pi subagent control or unsupported child target")
+      return
+    }
+    const id = validRequestIdValue
+    const target = validRunId
+    if (stopped) return
+    if (!claimRequest(id, "SubagentControl")) return
+    const epoch = lifetimeEpoch
+    let claimOwned = true
+    let rpcDispatched = false
+    try {
+      assertCurrent(epoch)
+      await ensureSubagentReady()
+      assertCurrent(epoch)
+      const status = await fetchSubagentStatus()
+      assertCurrent(epoch)
+      normalizeSubagentStatus(status, nextSubagentRequestId("control-targets"))
+      if (!subagentRunIds.has(target)) throw new Error(`subagent run '${target}' is not a current-session target`)
+      if (subagentCapabilities[action as string] !== true) throw new Error(`pi-subagents does not support ${action as string}`)
+      if (action === 'steer' && subagentCapabilities.nonRecoveringSteer !== true) {
+        throw new Error("pi-subagents does not advertise non-recovering steer")
+      }
+      const params: Record<string, unknown> = { runId: target }
+      if (message !== undefined) params.message = message
+      // Keep the Amber command id for its user-facing receipt, but use a
+      // bridge-owned RPC id so an external id cannot alias a status request's
+      // reply channel.
+      assertCurrent(epoch)
+      rpcDispatched = true
+      const data = await subagentRpc(nextSubagentRequestId(`control-${action as string}`), action as string, params, SUBAGENT_RPC_MUTATION_TIMEOUT_MS)
+      assertCurrent(epoch)
+      inFlightRequestIds.delete(id)
+      acceptedRequestIds.add(id)
+      claimOwned = false
+      commandResult(id, "SubagentControl", true, undefined, normalizeSubagentReceipt(data, action as string, target))
+      void publishSubagentStatus(nextSubagentRequestId("control-refresh"))
+    } catch (error) {
+      if (claimOwned) {
+        inFlightRequestIds.delete(id)
+        if (rpcDispatched) acceptedRequestIds.add(id)
+        claimOwned = false
+      }
+      if (isCurrent(epoch)) {
+        commandResult(id, "SubagentControl", false, rpcDispatched ? subagentUnknownDelivery(action as string, error) : subagentError(error))
+      }
+    }
+  }
+
+  function claimRequest(requestId: string, command: string, remember = true): boolean {
     if (!validRequestId(requestId)) {
       commandError("invalid Pi request id")
       return false
     }
-    if (acceptedRequestIds.has(requestId) || inFlightRequestIds.has(requestId)) {
+    if (acceptedRequestIds.has(requestId) || inFlightRequestIds.has(requestId) || readOnlyInFlightRequestIds.has(requestId)) {
       commandResult(requestId, command, false, "request id was already accepted")
       return false
     }
-    if (acceptedRequestIds.size + inFlightRequestIds.size >= PI_REQUEST_CACHE_MAX) {
+    // Read-only requests and successful UploadChunk operations occupy only the
+    // bounded execution window. They must never consume the lifetime receipt
+    // slots reserved for non-idempotent mutations: an upload with thousands of
+    // monotonic chunks must not eventually disable text/control commands.
+    if (remember && acceptedRequestIds.size + inFlightRequestIds.size >= PI_REQUEST_CACHE_MAX) {
       commandResult(requestId, command, false, "Pi request receipt cache is full")
+      return false
+    }
+    if (!remember && inFlightRequestIds.size >= PI_IN_FLIGHT_MAX) {
+      commandResult(requestId, command, false, "Pi request execution capacity is full")
       return false
     }
     inFlightRequestIds.add(requestId)
     return true
   }
 
-  async function correlated<T>(requestId: string, command: string, work: (epoch: number) => Promise<T> | T): Promise<void> {
-    if (stopped || !claimRequest(requestId, command)) return
+  async function correlated<T>(requestId: string, command: string, work: (epoch: number) => Promise<T> | T, remember = true): Promise<void> {
+    if (stopped || !claimRequest(requestId, command, remember)) return
     const epoch = lifetimeEpoch
     const operation = attachmentOperationTail.then(async () => {
       try {
@@ -1010,7 +1602,7 @@ function installSemanticBridge(pi: ExtensionAPI) {
         const data = await work(epoch)
         assertCurrent(epoch)
         inFlightRequestIds.delete(requestId)
-        acceptedRequestIds.add(requestId)
+        if (remember) acceptedRequestIds.add(requestId)
         commandResult(requestId, command, true, undefined, data)
       } catch (error) {
         inFlightRequestIds.delete(requestId)
@@ -1224,7 +1816,7 @@ function installSemanticBridge(pi: ExtensionAPI) {
         if (!validRequestId(requestId) || !validAttachmentId(attachmentId) || !validSize(offset) || !validCanonicalBase64(data)) throw new Error("invalid Pi upload chunk")
         await correlated(requestId, "UploadChunk", async (epoch) => ({
           acknowledgedOffset: await writeChunk(await getAttachmentStore(epoch), attachmentId, offset, data, epoch, assertCurrent),
-        }))
+        }), false)
         return
       }
       if (record.UploadFinish && typeof record.UploadFinish === "object") {
@@ -1245,6 +1837,49 @@ function installSemanticBridge(pi: ExtensionAPI) {
           await removePending(await getAttachmentStore(epoch), attachmentId, epoch, assertCurrent)
           return { attachmentId }
         })
+        return
+      }
+      if (record.SubagentStatus && typeof record.SubagentStatus === "object") {
+        const requestId = (record.SubagentStatus as Record<string, unknown>).requestId
+        if (!validRequestId(requestId)) throw new Error("invalid Pi subagent status request")
+        if (!subagentEvents) {
+          sendSubagentStatus(subagentUnavailable(requestId, "pi-subagents extension is unavailable"))
+          return
+        }
+        if (!claimReadOnlyRequest(requestId, "SubagentStatus")) return
+        const statusEpoch = subagentStatusEpoch
+        const epoch = lifetimeEpoch
+        try {
+          const data = await fetchSubagentStatus(epoch)
+          if (isCurrent(epoch) && statusEpoch === subagentStatusEpoch) sendSubagentStatus(normalizeSubagentStatus(data, requestId))
+        } catch (error) {
+          if (statusEpoch !== subagentStatusEpoch || !isCurrent(epoch)) return
+          subagentReady = false
+          subagentUnavailableUntil = Date.now() + 5_000
+          sendSubagentStatus(subagentUnavailable(requestId, error))
+        } finally {
+          readOnlyInFlightRequestIds.delete(requestId)
+        }
+        return
+      }
+      if (record.SubagentTranscript && typeof record.SubagentTranscript === "object") {
+        const request = record.SubagentTranscript as Record<string, unknown>
+        const requestId = request.requestId, runId = request.runId, index = request.index
+        const validRequestIdValue = typeof requestId === "string" && validRequestId(requestId) ? requestId : undefined
+        const validRunId = subagentId(runId)
+        if (!validRequestIdValue || !validRunId
+          || (index !== undefined && (!Number.isSafeInteger(index) || (index as number) < 0 || (index as number) > 500))) throw new Error("invalid Pi subagent transcript request")
+        await subagentReadOnly(validRequestIdValue, "SubagentTranscript", async (epoch) => {
+          await ensureSubagentReady(epoch)
+          assertCurrent(epoch)
+          const data = await subagentRpc(nextSubagentRequestId("transcript"), "status", { runId: validRunId, view: "transcript", ...(index === undefined ? {} : { index }) })
+          return normalizeSubagentTranscript(data, validRequestIdValue, validRunId, index as number | undefined)
+        })
+        return
+      }
+      if (record.SubagentControl && typeof record.SubagentControl === "object") {
+        const request = record.SubagentControl as Record<string, unknown>
+        await subagentControl(request.requestId, request.action, request.runId, request.childId, request.index, request.message)
         return
       }
       if (record.SetThinkingLevel && typeof record.SetThinkingLevel === "object") {
@@ -1299,6 +1934,10 @@ function installSemanticBridge(pi: ExtensionAPI) {
       reconnectDelay = 250
       writeControl({ PiBridgeHello: { name } })
       sendSnapshot()
+      if (subagentStatusCache) {
+        sendEvent({ ...subagentStatusCache, requestId: nextSubagentRequestId("reconnect") })
+      }
+      void publishSubagentStatus(nextSubagentRequestId("connect"))
     })
     next.on("data", decodeFrames)
     next.on("error", () => {})
@@ -1353,8 +1992,42 @@ function installSemanticBridge(pi: ExtensionAPI) {
     updateTimer = setTimeout(flushUpdate, UPDATE_INTERVAL_MS)
   }
 
+  function startSubagentBridge(): void {
+    if (!subagentEvents) return
+    if (!subagentReadyUnsubscribe) {
+      const maybeUnsubscribe = subagentEvents.on(SUBAGENT_RPC_READY_EVENT, () => {
+        subagentReady = false
+        subagentUnavailableUntil = 0
+        subagentStatusEpoch += 1
+        subagentStatusPromise = undefined
+        void publishSubagentStatus(nextSubagentRequestId("ready"))
+      })
+      subagentReadyUnsubscribe = typeof maybeUnsubscribe === "function" ? maybeUnsubscribe : undefined
+    }
+    if (!subagentPollTimer) {
+      void publishSubagentStatus(nextSubagentRequestId("start"))
+      subagentPollTimer = setInterval(() => {
+        void publishSubagentStatus(nextSubagentRequestId("poll"))
+      }, SUBAGENT_RPC_POLL_MS)
+      subagentPollTimer.unref?.()
+    }
+  }
+
+  function stopSubagentBridge(): void {
+    if (subagentPollTimer) clearInterval(subagentPollTimer)
+    subagentPollTimer = undefined
+    subagentReadyUnsubscribe?.()
+    subagentReadyUnsubscribe = undefined
+    subagentStatusEpoch += 1
+    subagentStatusPromise = undefined
+    subagentStatusCache = undefined
+    for (const cancel of [...subagentRpcCancels]) cancel()
+    subagentRpcCancels.clear()
+  }
+
   pi.on("session_start", (event, ctx) => {
     latestContext = ctx
+    startSubagentBridge()
     // Start the store from the session lifecycle, not at module evaluation:
     // the Pi session id is the containment boundary and the timer must die
     // with this supervised process. A missing/unsafe store degrades uploads;
@@ -1400,6 +2073,7 @@ function installSemanticBridge(pi: ExtensionAPI) {
   pi.on("session_shutdown", async (_event, ctx) => {
     latestContext = ctx
     stopped = true
+    stopSubagentBridge()
     lifetimeEpoch += 1
     if (reconnectTimer) clearTimeout(reconnectTimer)
     if (updateTimer) clearTimeout(updateTimer)

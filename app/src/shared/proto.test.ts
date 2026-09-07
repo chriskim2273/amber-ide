@@ -52,6 +52,9 @@ describe('proto', () => {
       { type: 'control', msg: { kind: 'PiBridgeCommand', name: 'amber-1-1-0-pi', command: { kind: 'UploadCancel', requestId: 'req-5', attachmentId: 'att-1' } } },
       { type: 'control', msg: { kind: 'PiBridgeCommand', name: 'amber-1-1-0-pi', command: { kind: 'Abort' } } },
       { type: 'control', msg: { kind: 'PiBridgeCommand', name: 'amber-1-1-0-pi', command: { kind: 'SetThinkingLevel', level: 'high' } } },
+      { type: 'control', msg: { kind: 'PiBridgeCommand', name: 'amber-1-1-0-pi', command: { kind: 'SubagentStatus', requestId: 'status-1' } } },
+      { type: 'control', msg: { kind: 'PiBridgeCommand', name: 'amber-1-1-0-pi', command: { kind: 'SubagentTranscript', requestId: 'transcript-1', runId: 'run-1', index: 2 } } },
+      { type: 'control', msg: { kind: 'PiBridgeCommand', name: 'amber-1-1-0-pi', command: { kind: 'SubagentControl', requestId: 'control-1', action: 'steer', runId: 'run-1', message: 'continue' } } },
       { type: 'control', msg: { kind: 'PiEvent', name: 'amber-1-1-0-pi', seq: 8, event: { kind: 'snapshot', idle: true } } },
       { type: 'control', msg: { kind: 'PiBridgeStatus', name: 'amber-1-1-0-pi', available: true } },
     ]
@@ -61,6 +64,9 @@ describe('proto', () => {
     )
     expect(new TextDecoder().decode(encode(frames[6]!).slice(5))).toBe(
       '{"PiBridgeCommand":{"name":"amber-1-1-0-pi","command":{"UploadChunk":{"requestId":"req-3","attachmentId":"att-1","offset":0,"data":"YWJj"}}}}',
+    )
+    expect(new TextDecoder().decode(encode(frames[13]!).slice(5))).toBe(
+      '{"PiBridgeCommand":{"name":"amber-1-1-0-pi","command":{"SubagentControl":{"requestId":"control-1","action":"steer","runId":"run-1","message":"continue"}}}}',
     )
   })
 
@@ -80,6 +86,12 @@ describe('proto', () => {
     )).toThrow('no frame')
     expect(() => decodeControlJson(
       '{"PiBridgeCommand":{"name":"pi","command":{"UploadBegin":{"requestId":"r\\u0080","filename":"x","mimeType":"text/plain","size":0}}}}',
+    )).toThrow('no frame')
+    expect(() => decodeControlJson(
+      '{"PiBridgeCommand":{"name":"pi","command":{"SubagentControl":{"requestId":"r","action":"spawn","runId":"run"}}}}',
+    )).toThrow('no frame')
+    expect(() => decodeControlJson(
+      '{"PiBridgeCommand":{"name":"pi","command":{"SubagentControl":{"requestId":"r","action":"steer","runId":"fleet-1","message":"go","childId":"not-allowed"}}}}',
     )).toThrow('no frame')
   })
 

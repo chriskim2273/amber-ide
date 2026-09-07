@@ -289,6 +289,9 @@ describe('PiPaneLink', () => {
     port.fromRenderer({ command: { kind: 'UploadChunk', requestId: 'chunk-1', attachmentId: 'att-1', offset: 0, data: 'YWJj' } })
     port.fromRenderer({ command: { kind: 'UploadFinish', requestId: 'finish-1', attachmentId: 'att-1' } })
     port.fromRenderer({ command: { kind: 'UploadCancel', requestId: 'cancel-1', attachmentId: 'att-1' } })
+    port.fromRenderer({ command: { kind: 'SubagentStatus', requestId: 'status-1' } })
+    port.fromRenderer({ command: { kind: 'SubagentTranscript', requestId: 'transcript-1', runId: 'run-1', index: 2 } })
+    port.fromRenderer({ command: { kind: 'SubagentControl', requestId: 'control-1', action: 'steer', runId: 'run-1', message: 'continue' } })
     port.fromRenderer({ command: { kind: 'Abort' } })
     expect(socket.sent.slice(1)).toEqual([
       JSON.stringify({ t: 'piPrompt', name: 'pi', message: 'hello', delivery: 'steer' }),
@@ -297,6 +300,9 @@ describe('PiPaneLink', () => {
       JSON.stringify({ t: 'piUploadChunk', name: 'pi', requestId: 'chunk-1', attachmentId: 'att-1', offset: 0, data: 'YWJj' }),
       JSON.stringify({ t: 'piUploadFinish', name: 'pi', requestId: 'finish-1', attachmentId: 'att-1' }),
       JSON.stringify({ t: 'piUploadCancel', name: 'pi', requestId: 'cancel-1', attachmentId: 'att-1' }),
+      JSON.stringify({ t: 'piSubagentStatus', name: 'pi', requestId: 'status-1' }),
+      JSON.stringify({ t: 'piSubagentTranscript', name: 'pi', requestId: 'transcript-1', runId: 'run-1', index: 2 }),
+      JSON.stringify({ t: 'piSubagentControl', name: 'pi', requestId: 'control-1', action: 'steer', runId: 'run-1', message: 'continue' }),
       JSON.stringify({ t: 'piAbort', name: 'pi' }),
     ])
 

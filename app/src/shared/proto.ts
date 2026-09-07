@@ -86,6 +86,8 @@ export type PiDelivery = 'now' | 'steer' | 'follow_up'
 // base64 string, while the daemon remains the authoritative second check.
 export const PI_PROMPT_MAX_BYTES = 64 * 1024
 export const PI_REQUEST_ID_MAX_BYTES = 128
+export const PI_SUBAGENT_ID_MAX_BYTES = 256
+export const PI_SUBAGENT_INDEX_MAX = 500
 export const PI_ATTACHMENT_ID_MAX_BYTES = 128
 export const PI_FILENAME_MAX_CHARS = 255
 export const PI_MIME_TYPE_MAX_BYTES = 128
@@ -105,6 +107,9 @@ export type PiCommand =
   | { kind: 'UploadChunk'; requestId: string; attachmentId: string; offset: number; data: string }
   | { kind: 'UploadFinish'; requestId: string; attachmentId: string }
   | { kind: 'UploadCancel'; requestId: string; attachmentId: string }
+  | { kind: 'SubagentStatus'; requestId: string }
+  | { kind: 'SubagentTranscript'; requestId: string; runId: string; index?: number }
+  | { kind: 'SubagentControl'; requestId: string; action: 'stop' | 'steer' | 'interrupt' | 'resume'; runId: string; childId?: string; index?: number; message?: string }
   | { kind: 'Abort' }
   | { kind: 'SetThinkingLevel'; level: string }
 
@@ -358,6 +363,24 @@ function piCommandToJson(command: PiCommand): unknown {
     case 'UploadCancel': return {
       UploadCancel: { requestId: command.requestId, attachmentId: command.attachmentId },
     }
+    case 'SubagentStatus': return { SubagentStatus: { requestId: command.requestId } }
+    case 'SubagentTranscript': return {
+      SubagentTranscript: {
+        requestId: command.requestId,
+        runId: command.runId,
+        ...(command.index === undefined ? {} : { index: command.index }),
+      },
+    }
+    case 'SubagentControl': return {
+      SubagentControl: {
+        requestId: command.requestId,
+        action: command.action,
+        runId: command.runId,
+        ...(command.childId === undefined ? {} : { childId: command.childId }),
+        ...(command.index === undefined ? {} : { index: command.index }),
+        ...(command.message === undefined ? {} : { message: command.message }),
+      },
+    }
     case 'SetThinkingLevel': return { SetThinkingLevel: { level: command.level } }
   }
 }
@@ -378,6 +401,15 @@ function isPiControl(char: string): boolean {
 function validPiRequestId(value: string): boolean {
   return value.length > 0 && new TextEncoder().encode(value).length <= PI_REQUEST_ID_MAX_BYTES
     && ![...value].some(isPiControl)
+}
+
+function validPiSubagentId(value: string): boolean {
+  return value.length > 0 && new TextEncoder().encode(value).length <= PI_SUBAGENT_ID_MAX_BYTES
+    && ![...value].some((char) => isPiControl(char) || /[\\/\s]/.test(char))
+}
+
+function validPiSubagentIndex(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && value <= PI_SUBAGENT_INDEX_MAX
 }
 
 function validPiAttachmentId(value: string): boolean {
@@ -467,6 +499,40 @@ function jsonToPiCommand(v: unknown): PiCommand | null {
     return kind === 'UploadFinish'
       ? { kind: 'UploadFinish', requestId, attachmentId }
       : { kind: 'UploadCancel', requestId, attachmentId }
+  }
+  if (kind === 'SubagentStatus') {
+    const requestId = piString(body, 'requestId')
+    if (requestId === null || !validPiRequestId(requestId)) return null
+    return { kind: 'SubagentStatus', requestId }
+  }
+  if (kind === 'SubagentTranscript') {
+    const requestId = piString(body, 'requestId')
+    const runId = piString(body, 'runId')
+    const rawIndex = body['index']
+    if (requestId === null || !validPiRequestId(requestId) || runId === null || !validPiSubagentId(runId)
+      || (rawIndex !== undefined && !validPiSubagentIndex(rawIndex))) return null
+    return { kind: 'SubagentTranscript', requestId, runId, ...(rawIndex === undefined ? {} : { index: rawIndex }) }
+  }
+  if (kind === 'SubagentControl') {
+    const requestId = piString(body, 'requestId')
+    const action = body['action']
+    const runId = piString(body, 'runId')
+    const childId = body['childId']
+    const rawIndex = body['index']
+    const message = body['message']
+    if (requestId === null || !validPiRequestId(requestId) || !['stop', 'steer', 'interrupt', 'resume'].includes(action as string)
+      || runId === null || !validPiSubagentId(runId)
+      || (childId !== undefined && (typeof childId !== 'string' || !validPiSubagentId(childId)))
+      || (rawIndex !== undefined && !validPiSubagentIndex(rawIndex))
+      || (message !== undefined && (typeof message !== 'string' || new TextEncoder().encode(message).length > PI_PROMPT_MAX_BYTES))) return null
+    if (action !== 'stop' && action !== 'interrupt' && (typeof message !== 'string' || message.trim().length === 0)) return null
+    if (childId !== undefined || rawIndex !== undefined) return null
+    if ((action === 'stop' || action === 'interrupt') && message !== undefined) return null
+    return {
+      kind: 'SubagentControl', requestId, action: action as 'stop' | 'steer' | 'interrupt' | 'resume', runId,
+      ...(childId === undefined ? {} : { childId }), ...(rawIndex === undefined ? {} : { index: rawIndex }),
+      ...(message === undefined ? {} : { message }),
+    }
   }
   if (kind === 'SetThinkingLevel') {
     const level = piString(body, 'level')
