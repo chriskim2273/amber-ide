@@ -1,21 +1,21 @@
 import { createHash, randomUUID } from 'node:crypto'
-import type { BrowserInteraction } from './browserToolProtocol'
+import { isPointerInteraction, type BrowserInteraction } from './browserToolProtocol'
 
 export type ApprovalCategory = 'credential' | 'financial' | 'destructive' | 'communication' | 'file-transfer' | 'form-submit' | 'confirmation' | 'benign'
 export type ValueCategory = 'none' | 'text' | 'credential' | 'payment'
-export interface InteractionTargetMetadata { role: string; name: string; tag: string; type: string; fingerprint: string; autocomplete?: string; formAction?: string; formMethod?: string }
+export interface InteractionTargetMetadata { role: string; name: string; tag: string; type: string; fingerprint: string; autocomplete?: string; formAction?: string; formMethod?: string; visualPreview?: string; receiverFingerprint?: string }
 export interface InteractionClassification { consequential: boolean; category: ApprovalCategory; valueCategory: ValueCategory; canGrantOrigin: boolean; argumentSummary: string }
 export interface ApprovalDigestInput {
   requestId: string; controller: string; browserId: string; pageIncarnation: string; generation: number; origin: string
   action: string; targetFingerprint: string; valueCategory: ValueCategory; valueDigest: string; expiresAt?: number
 }
 export interface ApprovalProposal extends ApprovalDigestInput {
-  category: Exclude<ApprovalCategory, 'benign'>; canGrantOrigin: boolean; targetLabel: string; argumentSummary: string
+  category: Exclude<ApprovalCategory, 'benign'>; canGrantOrigin: boolean; targetLabel: string; argumentSummary: string; visualPreview?: string
 }
 export type ApprovalDecision = 'approve-once' | 'reject' | 'allow-origin'
 export interface BrowserApprovalEvent {
   type: 'approval-request' | 'approval-resolved'; browserId: string; approvalId: string; digest: string; controller?: string; origin?: string
-  category?: string; targetLabel?: string; argumentSummary?: string; expiresAt?: number; canGrantOrigin?: boolean; decision?: ApprovalDecision | 'expired' | 'revoked'; headless?: boolean
+  category?: string; targetLabel?: string; argumentSummary?: string; visualPreview?: string | undefined; expiresAt?: number; canGrantOrigin?: boolean; decision?: ApprovalDecision | 'expired' | 'revoked'; headless?: boolean
 }
 
 const FINANCIAL = /\b(?:pay|purchase|buy|checkout|subscribe|transfer|bank|card|billing|donat|order)\b/i
@@ -27,7 +27,7 @@ const PAYMENT_FIELD = /\b(?:card|cvv|cvc|expiry|routing|account number|payment)\
 const FILE_TRANSFER = /\b(?:upload|download|attach file|choose file)\b/i
 
 function interactionText(operation: BrowserInteraction): string {
-  if (operation.kind === 'fill' || operation.kind === 'type') return operation.text
+  if (operation.kind === 'fill' || operation.kind === 'type' || operation.kind === 'typeFocused') return operation.text
   if (operation.kind === 'select') return operation.values.join('\u0000')
   if (operation.kind === 'press') return operation.key
   return ''
@@ -38,17 +38,22 @@ export function classifyInteraction(operation: Pick<BrowserInteraction, 'kind'> 
   const credential = target?.type === 'password' || CREDENTIAL.test(semantic) || /(?:current|new)-password/i.test(target?.autocomplete ?? '')
   const payment = PAYMENT_FIELD.test(semantic)
   const valueCategory: ValueCategory = raw ? (credential ? 'credential' : payment ? 'payment' : 'text') : 'none'
-  const secretSummary = valueCategory === 'credential' || valueCategory === 'payment' ? `[${valueCategory} value omitted]` : raw.slice(0, 256)
-  if (operation.kind === 'hover' || operation.kind === 'scroll') return { consequential: false, category: 'benign', valueCategory, canGrantOrigin: false, argumentSummary: '' }
+  const pointer = operation as BrowserInteraction
+  let pointerSummary = ''
+  if (pointer.kind === 'mouseClick') pointerSummary = `${pointer.button ?? 'left'} ${pointer.clickCount === 2 ? 'double click' : 'click'} at (${pointer.x}, ${pointer.y}) image pixels · ${(pointer.modifiers ?? []).join('+') || 'no modifiers'}`
+  if (pointer.kind === 'mouseDrag' && pointer.path?.length) { const first = pointer.path[0]!, last = pointer.path.at(-1)!; pointerSummary = `Drag ${pointer.path.length} points: (${first.x}, ${first.y}) → (${last.x}, ${last.y}) image pixels · ${(pointer.modifiers ?? []).join('+') || 'no modifiers'}` }
+  const secretSummary = valueCategory === 'credential' || valueCategory === 'payment' ? `[${valueCategory} value omitted]` : raw ? raw.slice(0, 256) : pointerSummary
+  if (operation.kind === 'hover' || operation.kind === 'scroll' || operation.kind === 'mouseMove' || operation.kind === 'mouseScroll') return { consequential: false, category: 'benign', valueCategory, canGrantOrigin: false, argumentSummary: '' }
   if (credential) return { consequential: true, category: 'credential', valueCategory, canGrantOrigin: false, argumentSummary: secretSummary }
   if (payment || FINANCIAL.test(semantic)) return { consequential: true, category: 'financial', valueCategory, canGrantOrigin: false, argumentSummary: secretSummary }
-  if ([target, secondary].some((item) => item?.type === 'file') || FILE_TRANSFER.test(semantic)) return { consequential: true, category: 'file-transfer', valueCategory, canGrantOrigin: false, argumentSummary: '' }
+  if ([target, secondary].some((item) => item?.type === 'file') || FILE_TRANSFER.test(semantic)) return { consequential: true, category: 'file-transfer', valueCategory, canGrantOrigin: false, argumentSummary: pointerSummary }
   if (DESTRUCTIVE.test(semantic)) return { consequential: true, category: 'destructive', valueCategory, canGrantOrigin: false, argumentSummary: secretSummary }
   if (COMMUNICATION.test(semantic)) return { consequential: true, category: 'communication', valueCategory, canGrantOrigin: false, argumentSummary: secretSummary }
   const activating = operation.kind === 'click' || operation.kind === 'doubleClick' || operation.kind === 'press' || operation.kind === 'drag'
   const submitLike = /\b(?:submit|save|apply|create|update|commit)\b/i.test(semantic) || [target, secondary].some((item) => item?.type === 'submit' || item?.role.toLocaleLowerCase() === 'form' || ((item?.tag === 'button' || item?.role.toLocaleLowerCase() === 'button') && item?.formMethod?.toLocaleLowerCase() === 'post'))
   if ((operation.kind === 'press' && operation.key === 'Enter') || (activating && submitLike)) return { consequential: true, category: 'form-submit', valueCategory, canGrantOrigin: false, argumentSummary: secretSummary }
   if ((operation.kind === 'click' || operation.kind === 'doubleClick') && CONFIRMATION.test(semantic)) return { consequential: true, category: 'confirmation', valueCategory, canGrantOrigin: true, argumentSummary: '' }
+  if (operation.kind === 'mouseClick' || operation.kind === 'mouseDrag') return { consequential: true, category: 'confirmation', valueCategory, canGrantOrigin: false, argumentSummary: pointerSummary }
   return { consequential: false, category: 'benign', valueCategory, canGrantOrigin: false, argumentSummary: '' }
 }
 
@@ -56,7 +61,7 @@ export function interactionTargetDigest(primary: InteractionTargetMetadata, seco
   return createHash('sha256').update(JSON.stringify([primary.fingerprint, secondary?.fingerprint ?? ''])).digest('hex')
 }
 export function interactionValueDigest(operation: BrowserInteraction): string {
-  const value = interactionText(operation)
+  const value = isPointerInteraction(operation) || (operation.kind === 'press' && operation.modifiers?.length) ? JSON.stringify(operation) : interactionText(operation)
   return value ? createHash('sha256').update(value).digest('hex') : ''
 }
 export function approvalDigest(input: ApprovalDigestInput): string {
@@ -74,7 +79,7 @@ export class BrowserApprovalCoordinator {
   async request(proposal: ApprovalProposal, signal: AbortSignal): Promise<void> {
     const approvalId = randomUUID(), expiresAt = this.now() + this.ttlMs, digest = approvalDigest({ ...proposal, expiresAt })
     if (!this.visible(proposal.browserId)) {
-      this.onEvent({ type: 'approval-request', browserId: proposal.browserId, approvalId, digest, controller: proposal.controller, origin: proposal.origin, category: proposal.category, targetLabel: proposal.targetLabel, argumentSummary: proposal.argumentSummary, expiresAt, canGrantOrigin: proposal.canGrantOrigin, headless: true })
+      this.onEvent({ type: 'approval-request', browserId: proposal.browserId, approvalId, digest, controller: proposal.controller, origin: proposal.origin, category: proposal.category, targetLabel: proposal.targetLabel, argumentSummary: proposal.argumentSummary, visualPreview: proposal.visualPreview, expiresAt, canGrantOrigin: proposal.canGrantOrigin, headless: true })
       this.reveal(proposal.browserId); throw new Error('APPROVAL_REQUIRED')
     }
     if (signal.aborted) throw new Error('ACTION_CANCELLED')
@@ -86,7 +91,7 @@ export class BrowserApprovalCoordinator {
       this.pending.set(approvalId, { proposal, digest, expiresAt, resolve, reject, timer, signal, abort })
       signal.addEventListener('abort', abort, { once: true })
       if (signal.aborted || !this.visible(proposal.browserId)) { this.finish(approvalId, 'revoked', new Error(signal.aborted ? 'ACTION_CANCELLED' : 'APPROVAL_DENIED')); return }
-      this.onEvent({ type: 'approval-request', browserId: proposal.browserId, approvalId, digest, controller: proposal.controller, origin: proposal.origin, category: proposal.category, targetLabel: proposal.targetLabel, argumentSummary: proposal.argumentSummary, expiresAt, canGrantOrigin: proposal.canGrantOrigin })
+      this.onEvent({ type: 'approval-request', browserId: proposal.browserId, approvalId, digest, controller: proposal.controller, origin: proposal.origin, category: proposal.category, targetLabel: proposal.targetLabel, argumentSummary: proposal.argumentSummary, visualPreview: proposal.visualPreview, expiresAt, canGrantOrigin: proposal.canGrantOrigin })
     })
   }
   resolve(browserId: string, approvalId: string, digest: string, decision: ApprovalDecision): boolean {

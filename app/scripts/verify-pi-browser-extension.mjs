@@ -23,6 +23,7 @@ const expectedTools = [
   'browser_back', 'browser_forward', 'browser_set_viewport',
   'browser_click', 'browser_double_click', 'browser_hover', 'browser_fill', 'browser_type',
   'browser_press', 'browser_select', 'browser_check', 'browser_uncheck', 'browser_scroll', 'browser_drag',
+  'browser_mouse_move', 'browser_mouse_click', 'browser_mouse_scroll', 'browser_mouse_drag', 'browser_type_focused',
 ]
 
 try {
@@ -31,7 +32,7 @@ try {
   await exec(resolvedAmber, ['ctl', 'install-pi-extension'], { env })
   const extension = join(agentDir, 'extensions', 'amber-hook.ts')
   const first = await readFile(extension, 'utf8')
-  if (!first.startsWith('// amber-owned-extension:v8\n')) throw new Error('installed source is not the expected owned version')
+  if (!first.startsWith('// amber-owned-extension:v9\n')) throw new Error('installed source is not the expected owned version')
   await exec(resolvedAmber, ['ctl', 'install-pi-extension'], { env })
   if (await readFile(extension, 'utf8') !== first) throw new Error('second install changed the exact generated source')
 
@@ -79,6 +80,9 @@ try {
   process.env.AMBER_BROWSER_HOST_SOCKET = socketPath
   const frame = (value) => { const body = Buffer.from(JSON.stringify(value)); const out = Buffer.allocUnsafe(body.length + 4); out.writeUInt32BE(body.length); body.copy(out, 4); return out }
   const image = Buffer.alloc(24); Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(image); image.write('IHDR', 12, 'ascii'); image.writeUInt32BE(1, 16); image.writeUInt32BE(1, 20)
+  const pointerRequests = []
+  const observation = { screenshotId: 'grounded-image', browserId: 'browser-fixture', controller: 'amber-1-1-0-verify', pageIncarnation: 'page', generation: 1,
+    documentEpoch: 1, viewportRevision: 1, imageWidth: 1, imageHeight: 1, viewport: { width: 1, height: 1, pageX: 0, pageY: 0 }, capturedAt: 1, coordinateSpace: 'image-pixels', coordinateActionable: true }
   const server = createServer((socket) => {
     let buffer = Buffer.alloc(0), authenticated = false
     socket.on('data', (chunk) => {
@@ -87,8 +91,9 @@ try {
         const length = buffer.readUInt32BE(0), body = buffer.subarray(4, length + 4); buffer = buffer.subarray(length + 4)
         const value = JSON.parse(body.toString('utf8'))
         if (!authenticated) { if (value.token !== token) return socket.destroy(); authenticated = true; socket.write(frame({ ok: true })); continue }
-        if (value.action?.type === 'screenshot') {
-          socket.write(frame({ ok: true, result: { contentTrust: 'untrusted-browser-content', mediaType: 'image/png', attachment: { encoding: 'binary-frame', byteLength: image.length } } }))
+        if (value.action?.type === 'screenshot' || value.action?.operation?.kind === 'mouseClick') {
+          if (value.action.operation) pointerRequests.push(value.action.operation)
+          socket.write(frame({ ok: true, result: { contentTrust: 'untrusted-browser-content', mediaType: 'image/png', observation: value.action.operation ? { ...observation, screenshotId: 'after-image', generation: 2 } : observation, ...(value.action.operation ? { dispatched: true, actionResult: { dispatched: true, rollbackPossible: false, generation: 2 } } : {}), attachment: { encoding: 'binary-frame', byteLength: image.length } } }))
           const header = Buffer.allocUnsafe(4); header.writeUInt32BE(image.length); socket.write(header); socket.write(image)
         } else if (value.action?.type === 'interact') {
           socket.write(frame({ ok: false, error: 'ACTION_FAILED_NO_ROLLBACK', code: 'ACTION_FAILED_NO_ROLLBACK', retryable: false,
@@ -126,6 +131,14 @@ try {
     }
     const imageResult = await screenshotTool.execute('verify-image', { pageIncarnation: 'page', expectedGeneration: 1 }, new AbortController().signal)
     if (!imageResult.content?.[0]?.text?.startsWith(`${label}\n`) || imageResult.content?.[1]?.type !== 'image') throw new Error('binary image lost its untrusted-content label')
+    const imageMetadata = JSON.parse(imageResult.content[0].text.slice(label.length + 1))
+    if (JSON.stringify(imageMetadata.observation) !== JSON.stringify(observation) || imageResult.content[1].data !== image.toString('base64')) throw new Error('delivered pixels or coordinate observation changed in Pi output')
+    const mouseTool = tools.find(tool => tool.name === 'browser_mouse_click')
+    const mouseResult = await mouseTool.execute('verify-pointer', { pageIncarnation: 'page', expectedGeneration: 1, screenshotId: 'grounded-image', x: 0.25, y: 0.75, button: 'right', clickCount: 2, modifiers: ['Shift'] }, new AbortController().signal)
+    const mouseMetadata = JSON.parse(mouseResult.content[0].text.slice(label.length + 1))
+    if (mouseMetadata.actionResult?.dispatched !== true || mouseMetadata.observation?.screenshotId !== 'after-image' || mouseResult.content[1]?.type !== 'image') throw new Error('post-action image lost the completed action or observation')
+    const sent = pointerRequests[0]
+    if (pointerRequests.length !== 1 || sent.kind !== 'mouseClick' || sent.x !== 0.25 || sent.y !== 0.75 || sent.button !== 'right' || sent.clickCount !== 2 || sent.modifiers[0] !== 'Shift' || sent.afterScreenshot !== true) throw new Error('grounded gesture was altered or retried by the generated tool')
   } finally { await new Promise((resolveClose) => server.close(resolveClose)) }
 
   // The production-loaded extension must reject malformed token bytes before

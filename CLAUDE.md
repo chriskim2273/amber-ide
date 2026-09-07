@@ -101,6 +101,17 @@ connection manager; AI chat UI; themes/settings beyond minimal.
 
 ## Build status
 
+- [x] Grounded browser interaction (2026-09-06, isolated branch) — native target
+  matching, bounded scroll/stability preparation and document fences; expiring
+  controller-bound screenshot coordinates; approve-once mouse click/drag plus
+  hover/wheel; browser-local cursor; focused Unicode typing and editing chords;
+  Pi extension v9 with 31 browser tools. Full app: 1126 passed/1 skip; Rust:
+  893 passed/2 ignored; typecheck, Clippy, builds, Pi verifier and static-musl
+  AppImage passed. Real Electron matrix: 740/740 checks across 20 runs. Private
+  packaged broker/approval/focused-typing/resident/Quit smoke passed. Report:
+  `.reports/browser-interaction.md`. Not merged or deployed; installed Google
+  typing and physical Linux/macOS/IME checks remain separate acceptance gates.
+
 - [x] Slice 0 — daemon spine: pty ownership, ring, proto, state, save/restore,
   socket daemon + `attach`/`ls`/`create`. Proven: restart → sessions restored.
 - [x] Slice 1 — full control protocol + multi-client fan-out (folded into 0).

@@ -1,10 +1,14 @@
 import { createHash, randomBytes } from 'node:crypto'
-import type { BrowserElementRef, BrowserInteraction, BrowserTarget, BrowserViewport, ConsoleLevel, FindQuery, SnapshotLimits, WaitCondition } from './browserToolProtocol'
+import { isPointerInteraction, type BrowserPoint, type BrowserElementRef, type BrowserInteraction, type BrowserTarget, type BrowserViewport, type ConsoleLevel, type FindQuery, type SnapshotLimits, type WaitCondition } from './browserToolProtocol'
+import { BrowserObservations, mapScreenshotPoint, sameViewport, type ScreenshotObservation, type EffectiveBrowserViewport } from './browserObservations'
+import { BrowserAgentCursor } from './browserAgentCursor'
+import { dispatchPointer } from './browserPointer'
+import { modifierMask, virtualKey, keyText } from './browserKeyboard'
 import type { InteractionTargetMetadata } from './browserApproval'
 import { parseBrowserViewport } from '../shared/browserViewport'
 import { BrowserAutomationError, safeBrowserCode } from './browserErrors'
 import { BrowserDomRelations } from './browserDomRelations'
-import { quadBounds } from './browserGeometry'
+import { quadBounds, visibleQuadPoints } from './browserGeometry'
 export { BrowserAutomationError } from './browserErrors'
 
 const SCREENSHOT_MAX_BYTES = 10 * 1024 * 1024
@@ -13,6 +17,7 @@ const SCREENSHOT_MAX_DIMENSION = 4096
 // non-content containers before CDP returns any node ids. CSS/ARIA-hidden nodes
 // are filtered again by their ignored accessibility projection.
 const SNAPSHOT_SEARCH_XPATH = "//*[not(self::script or self::style or self::noscript or self::template) and not(ancestor::script or ancestor::style or ancestor::noscript or ancestor::template)] | //text()[normalize-space(.) != '' and not(ancestor::script or ancestor::style or ancestor::noscript or ancestor::template)]"
+const INTERACTIVE_SEARCH_XPATH = "//input | //textarea | //select | //button | //a[@href] | //*[@role and @role != 'generic' and @role != 'presentation'] | //*[@contenteditable='true'] | //*[@tabindex]"
 const SAFE_ATTRIBUTES = new Set(['id', 'class', 'role', 'aria-label', 'aria-labelledby', 'aria-describedby', 'name', 'type', 'placeholder', 'title', 'alt'])
 const SAFE_COMPUTED_STYLES = new Set(['display', 'visibility', 'position', 'color', 'background-color', 'font-family', 'font-size', 'font-weight', 'line-height', 'width', 'height', 'overflow', 'opacity'])
 const ENABLE_METHODS = ['Accessibility.enable', 'DOM.enable', 'CSS.enable', 'Page.enable', 'Runtime.enable', 'Network.enable'] as const
@@ -31,17 +36,18 @@ export interface BrowserDebuggerTransport {
   send(method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>>
   onMessage(listener: (method: string, params: Record<string, unknown>) => void): void
 }
-export interface BrowserAutomationLease { browserId: string; pageIncarnation: string; generation: number }
+export interface BrowserAutomationLease { browserId: string; pageIncarnation: string; generation: number; controller?: string; documentEpoch?: number }
 export interface BrowserAutomationOptions { ringItems?: number; ringBytes?: number }
 export interface BrowserAutomationControls {
+  deviceScaleFactor?: () => number
   reload?(ignoreCache: boolean): boolean | void
   history?(direction: 'back' | 'forward'): boolean | void
   dialog?(dialog: { type: string; message: string }): Promise<{ accept: boolean; promptText?: string }>
   onDiagnostics?(diagnostics: { consoleIssues: number; networkFailures: number }): void
 }
 export interface AccessibilityNodeResult { ref: string; depth: number; role: string; name: string; disabled?: boolean; focused?: boolean }
-export interface SnapshotResult { snapshotId: string; url: string; nodes: AccessibilityNodeResult[]; truncated: boolean }
-export interface BrowserBinaryAttachment { mediaType: 'image/png'; data: Buffer; width?: number; height?: number; browserId?: string; pageIncarnation?: string; generation?: number }
+export interface SnapshotResult { snapshotId: string; url: string; nodes: AccessibilityNodeResult[]; truncated: boolean; truncationReasons: string[]; ordering: 'interactive-first'; depthIsApproximate: true }
+export interface BrowserBinaryAttachment { mediaType: 'image/png'; data: Buffer; width?: number; height?: number; browserId?: string; pageIncarnation?: string; generation?: number; observation?: ScreenshotObservation; actionResult?: Record<string, unknown> }
 
 type AXNode = {
   nodeId?: string; parentId?: string; backendDOMNodeId?: number; ignored?: boolean
@@ -50,7 +56,7 @@ type AXNode = {
 }
 type SnapshotEntry = AccessibilityNodeResult & { backendDOMNodeId?: number; metadata: InteractionTargetMetadata }
 interface SnapshotCache { lease: BrowserAutomationLease; snapshotId: string; entries: Map<string, SnapshotEntry>; nodes: AccessibilityNodeResult[] }
-export interface PreparedBrowserInteraction { lease: BrowserAutomationLease; operation: BrowserInteraction; primary?: SnapshotEntry; secondary?: SnapshotEntry; target: InteractionTargetMetadata; secondaryTarget?: InteractionTargetMetadata }
+export interface PreparedBrowserInteraction { lease: BrowserAutomationLease; operation: BrowserInteraction; primary?: SnapshotEntry; secondary?: SnapshotEntry; target: InteractionTargetMetadata; secondaryTarget?: InteractionTargetMetadata; grounded?: { observation: ScreenshotObservation; points: BrowserPoint[]; fingerprints: string[]; receiverFingerprints: string[] } }
 interface RingEntry { cursor: number; bytes: number; value: Record<string, unknown> }
 
 class BoundedRing {
@@ -112,7 +118,7 @@ function domAttributes(node: Record<string, unknown> | undefined): Record<string
   const raw = Array.isArray(node?.['attributes']) ? node!['attributes'] as unknown[] : [], out: Record<string, string> = {}
   for (let index = 0; index + 1 < raw.length; index += 2) {
     const key = text(raw[index], 64).toLocaleLowerCase()
-    if (['type', 'autocomplete', 'formaction', 'formmethod', 'action', 'method'].includes(key)) out[key] = text(raw[index + 1], 1024)
+    if (['type', 'autocomplete', 'formaction', 'formmethod', 'action', 'method', 'readonly'].includes(key)) out[key] = text(raw[index + 1], 1024)
   }
   return out
 }
@@ -122,7 +128,7 @@ function targetMetadata(node: AXNode, domNode: Record<string, unknown> | undefin
   return { role, name, tag, type, fingerprint: createHash('sha256').update(JSON.stringify(basis)).digest('hex'), ...(basis.autocomplete ? { autocomplete: basis.autocomplete } : {}), ...(basis.formAction ? { formAction: basis.formAction } : {}), ...(basis.formMethod ? { formMethod: basis.formMethod } : {}) }
 }
 function sameLease(a: BrowserAutomationLease, b: BrowserAutomationLease): boolean {
-  return a.browserId === b.browserId && a.pageIncarnation === b.pageIncarnation && a.generation === b.generation
+  return a.browserId === b.browserId && a.pageIncarnation === b.pageIncarnation && a.generation === b.generation && a.controller === b.controller && a.documentEpoch === b.documentEpoch
 }
 function pngDimensions(data: Buffer): { width: number; height: number } | null {
   const signature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
@@ -138,6 +144,16 @@ export class BrowserAutomation {
   private setupPromise: Promise<void> | null = null
   private snapshotCache: SnapshotCache | null = null
   private readonly domRelations = new BrowserDomRelations()
+  private readonly observations = new BrowserObservations()
+  private measuredViewport: EffectiveBrowserViewport | undefined
+  private viewportRevision = 0
+  private emulatedScaleFactor: number | undefined
+  private captureScale(width: number, height: number, limit = 2048): number {
+    const dpr = this.emulatedScaleFactor ?? this.controls.deviceScaleFactor?.() ?? 1
+    if (!Number.isFinite(dpr) || dpr <= 0) throw new Error('REQUEST_LIMIT')
+    return Math.min(1, limit / (Math.max(width, height) * dpr))
+  }
+  private readonly cursor: BrowserAgentCursor
   private readonly consoleRing: BoundedRing
   private readonly networkRing: BoundedRing
   private readonly requests = new Map<string, { url: string; method: string; type: string; started: number; status?: number }>()
@@ -155,12 +171,14 @@ export class BrowserAutomation {
     options: BrowserAutomationOptions = {},
     private readonly controls: BrowserAutomationControls = {},
   ) {
+    this.cursor = new BrowserAgentCursor(transport)
     this.consoleRing = new BoundedRing(options.ringItems ?? 1_000, options.ringBytes ?? 1024 * 1024)
     this.networkRing = new BoundedRing(options.ringItems ?? 1_000, options.ringBytes ?? 1024 * 1024)
   }
-  invalidate(): void { this.snapshotCache = null }
+  invalidate(): void { this.snapshotCache = null; this.observations.clear() }
+  hideCursor(): void { void this.cursor.hide() }
   dispose(): void {
-    this.disposed = true; this.snapshotCache = null; this.domRelations.clear(); this.requests.clear(); this.activeRequests = 0
+    this.disposed = true; this.cursor.dispose(); this.observations.clear(); this.snapshotCache = null; this.domRelations.clear(); this.requests.clear(); this.activeRequests = 0
     if (this.diagnosticsTimer) clearTimeout(this.diagnosticsTimer); this.diagnosticsTimer = null
     if (this.attachedByUs && this.transport.isAttached()) { try { this.transport.detach?.() } catch { /* page teardown is best-effort */ } }
   }
@@ -261,12 +279,16 @@ export class BrowserAutomation {
     let inputBytes = Buffer.byteLength(JSON.stringify(document))
     if (inputBytes > inputLimit) {
       this.snapshotCache = { lease: { ...lease }, snapshotId, entries, nodes }
-      return { snapshotId, url: safeUrl, nodes, truncated: true }
+      return { snapshotId, url: safeUrl, nodes, truncated: true, truncationReasons: ['input-byte-budget'], ordering: 'interactive-first', depthIsApproximate: true }
     }
-    const search = await this.transport.send('DOM.performSearch', { query: SNAPSHOT_SEARCH_XPATH, includeUserAgentShadowDOM: false }); abort(signal)
+    const truncationReasons = new Set<string>()
+    let used = 512 + Buffer.byteLength(safeUrl), scanned = 0, truncated = false
+    for (const query of [INTERACTIVE_SEARCH_XPATH, SNAPSHOT_SEARCH_XPATH]) {
+    if (truncated || scanned >= limits.maxNodes) { truncated = true; break }
+    const search = await this.transport.send('DOM.performSearch', { query, includeUserAgentShadowDOM: false }); abort(signal)
     const searchId = text(search['searchId'], 256), resultCount = typeof search['resultCount'] === 'number' && Number.isSafeInteger(search['resultCount']) ? Math.max(0, search['resultCount']) : 0
     if (!searchId) throw new Error('UNSUPPORTED_PAGE')
-    let used = 512 + Buffer.byteLength(safeUrl), scanned = 0, truncated = false
+    let searchScanned = 0
     inputBytes += Buffer.byteLength(JSON.stringify(search))
     try {
       if (inputBytes > inputLimit) truncated = true
@@ -278,7 +300,7 @@ export class BrowserAutomation {
         const nodeIds = Array.isArray(page['nodeIds']) ? page['nodeIds'].filter((id): id is number => typeof id === 'number').slice(0, 32) : []
         for (const nodeId of nodeIds) {
           if (scanned >= limits.maxNodes) { truncated = true; break outer }
-          scanned += 1; abort(signal)
+          scanned += 1; searchScanned += 1; abort(signal)
           const described = await this.transport.send('DOM.describeNode', { nodeId, depth: 0, pierce: false }); abort(signal)
           inputBytes += Buffer.byteLength(JSON.stringify(described))
           if (inputBytes > inputLimit) { truncated = true; break outer }
@@ -286,7 +308,7 @@ export class BrowserAutomation {
           const parentId = typeof domNode?.['parentId'] === 'number' ? domNode['parentId'] : this.domRelations.parentOf(nodeId)
           const depth = parentId === undefined ? 0 : (depthByNodeId.get(parentId) ?? -1) + 1
           depthByNodeId.set(nodeId, depth)
-          if (depth > limits.maxDepth) { truncated = true; continue }
+          if (depth > limits.maxDepth) { truncationReasons.add('depth-limit'); continue }
           const partial = await this.transport.send('Accessibility.getPartialAXTree', { nodeId, fetchRelatives: false }); abort(signal)
           inputBytes += Buffer.byteLength(JSON.stringify(partial))
           if (inputBytes > inputLimit) { truncated = true; break outer }
@@ -304,15 +326,19 @@ export class BrowserAutomation {
           const disabled = property(node, 'disabled'), focused = property(node, 'focused')
           const publicNode: AccessibilityNodeResult = { ref, depth, role, name, ...(disabled === undefined ? {} : { disabled }), ...(focused === undefined ? {} : { focused }) }
           const estimated = Buffer.byteLength(JSON.stringify(publicNode)) + 1
-          if (nodes.length >= limits.maxNodes || used + estimated > limits.maxBytes) { truncated = true; break outer }
+          if (nodes.length >= limits.maxNodes || used + estimated > limits.maxBytes) { truncationReasons.add(nodes.length >= limits.maxNodes ? 'node-budget' : 'output-byte-budget'); truncated = true; break outer }
           if (identity) seenAXNodes.add(identity)
           entries.set(ref, { ...publicNode, ...(backendDOMNodeId === undefined ? {} : { backendDOMNodeId }), metadata: targetMetadata(node, domNode, role, name, backendDOMNodeId) }); nodes.push(publicNode); used += estimated
         }
       }
-      if (scanned < resultCount) truncated = true
+      if (searchScanned < resultCount) truncated = true
     } finally { await this.transport.send('DOM.discardSearchResults', { searchId }).catch(() => {}) }
+    }
     this.snapshotCache = { lease: { ...lease }, snapshotId, entries, nodes }
-    return { snapshotId, url: safeUrl, nodes, truncated }
+    if (inputBytes > inputLimit) truncationReasons.add('input-byte-budget')
+    if (scanned >= limits.maxNodes) truncationReasons.add('node-scan-budget')
+    if (truncated && !truncationReasons.size) truncationReasons.add('search-results-remaining')
+    return { snapshotId, url: safeUrl, nodes, truncated: truncated || truncationReasons.size > 0, truncationReasons: [...truncationReasons], ordering: 'interactive-first', depthIsApproximate: true }
   }
   private resolve(lease: BrowserAutomationLease, target: BrowserElementRef): SnapshotEntry {
     const cache = this.snapshotCache
@@ -377,7 +403,7 @@ export class BrowserAutomation {
     return matches[0]!
   }
   private async formSemantics(domNode: Record<string, unknown> | undefined, signal: AbortSignal): Promise<{ action?: string; method?: string }> {
-    let parentId = typeof domNode?.['parentId'] === 'number' ? domNode['parentId'] : undefined
+    let parentId = typeof domNode?.['parentId'] === 'number' ? domNode['parentId'] : this.domRelations.parentOf(Number(domNode?.['nodeId']))
     for (let depth = 0; parentId !== undefined && depth < 8; depth++) {
       abort(signal)
       const described = boundedResponse(await this.transport.send('DOM.describeNode', { nodeId: parentId, depth: 0, pierce: false })); abort(signal)
@@ -387,11 +413,11 @@ export class BrowserAutomation {
         const attributes = domAttributes(parent)
         return { ...(attributes['formaction'] || attributes['action'] ? { action: attributes['formaction'] ?? attributes['action'] } : {}), ...(attributes['formmethod'] || attributes['method'] ? { method: attributes['formmethod'] ?? attributes['method'] } : {}) }
       }
-      parentId = typeof parent['parentId'] === 'number' ? parent['parentId'] : undefined
+      parentId = typeof parent['parentId'] === 'number' ? parent['parentId'] : this.domRelations.parentOf(parentId)
     }
     return {}
   }
-  private async actionable(entry: SnapshotEntry, signal: AbortSignal): Promise<{ x: number; y: number; checked?: boolean; metadata: InteractionTargetMetadata }> {
+  private async actionable(entry: SnapshotEntry, signal: AbortSignal, editable = false, scroll = false): Promise<{ x: number; y: number; quad: number[]; focused: boolean; checked?: boolean; metadata: InteractionTargetMetadata }> {
     abort(signal)
     if (!entry.backendDOMNodeId) throw new Error('UNSUPPORTED_PAGE')
     const described = boundedResponse(await this.transport.send('DOM.describeNode', { backendNodeId: entry.backendDOMNodeId, depth: 0, pierce: false })); abort(signal)
@@ -399,6 +425,7 @@ export class BrowserAutomation {
     const partial = boundedResponse(await this.transport.send('Accessibility.getPartialAXTree', { backendNodeId: entry.backendDOMNodeId, fetchRelatives: false })); abort(signal)
     const node = Array.isArray(partial['nodes']) ? (partial['nodes'] as AXNode[]).find((candidate) => !candidate.ignored) : undefined
     if (!node || property(node, 'disabled') === true) throw new Error('TARGET_NOT_ACTIONABLE')
+    if (editable && (property(node, 'readonly') === true || 'readonly' in domAttributes(domNode))) throw new Error('TARGET_NOT_ACTIONABLE')
     const role = text(node.role?.value, 256), name = redactBrowserText(text(node.name?.value, 4096))
     const base = targetMetadata(node, domNode, role, name, entry.backendDOMNodeId)
     if (base.fingerprint !== entry.metadata.fingerprint) throw new Error('STALE_GENERATION')
@@ -409,20 +436,73 @@ export class BrowserAutomation {
     const styles = boundedResponse(await this.transport.send('CSS.getComputedStyleForNode', { nodeId })); abort(signal)
     const style = new Map((Array.isArray(styles['computedStyle']) ? styles['computedStyle'] as Array<Record<string, unknown>> : []).map((item) => [text(item['name'], 64), text(item['value'], 128)]))
     if (style.get('display') === 'none' || style.get('visibility') === 'hidden' || style.get('pointer-events') === 'none' || Number(style.get('opacity') ?? '1') <= 0) throw new Error('TARGET_NOT_ACTIONABLE')
+    if (scroll) { await this.transport.send('DOM.scrollIntoViewIfNeeded', { backendNodeId: entry.backendDOMNodeId }); abort(signal) }
     const box = boundedResponse(await this.transport.send('DOM.getBoxModel', { backendNodeId: entry.backendDOMNodeId })); abort(signal)
     const border = (box['model'] as Record<string, unknown> | undefined)?.['border']
     if (!Array.isArray(border) || border.length !== 8 || !border.every((value) => typeof value === 'number' && Number.isFinite(value))) throw new Error('TARGET_NOT_ACTIONABLE')
     const { x, y, width, height } = quadBounds(border as number[])
     if (width < 1 || height < 1 || width > 16_384 || height > 16_384) throw new Error('TARGET_NOT_ACTIONABLE')
     const checked = property(node, 'checked')
-    return { x: x + width / 2, y: y + height / 2, ...(checked === undefined ? {} : { checked }), metadata: current }
+    return { x: x + width / 2, y: y + height / 2, quad: border as number[], focused: property(node, 'focused') === true, ...(checked === undefined ? {} : { checked }), metadata: current }
+  }
+  private async effectiveViewport(signal: AbortSignal): Promise<EffectiveBrowserViewport> {
+    const metrics = boundedResponse(await this.transport.send('Page.getLayoutMetrics')); abort(signal)
+    const view = (metrics['cssVisualViewport'] ?? metrics['cssLayoutViewport']) as Record<string, unknown> | undefined
+    const result = { width: Number(view?.['clientWidth'] ?? view?.['width']), height: Number(view?.['clientHeight'] ?? view?.['height']), pageX: Number(view?.['pageX'] ?? 0), pageY: Number(view?.['pageY'] ?? 0) }
+    if (!Object.values(result).every(Number.isFinite) || result.width < 1 || result.height < 1 || result.width > 4096 || result.height > 4096) throw new Error('REQUEST_LIMIT')
+    if (!this.measuredViewport || !sameViewport(this.measuredViewport, result)) { this.measuredViewport = { ...result }; this.viewportRevision++ }
+    return result
+  }
+  private async verifyObservation(observation: ScreenshotObservation, signal: AbortSignal): Promise<void> {
+    if (!this.observations.isFresh(observation) || !sameViewport(observation.viewport, await this.effectiveViewport(signal)) || observation.viewportRevision !== this.viewportRevision) throw new Error('STALE_GENERATION')
+  }
+  private async pointerReceiver(point: BrowserPoint, viewport: EffectiveBrowserViewport, signal: AbortSignal, pixels = true): Promise<InteractionTargetMetadata> {
+    const hit = await this.transport.send('DOM.getNodeForLocation', { x: Math.floor(point.x + viewport.pageX), y: Math.floor(point.y + viewport.pageY), includeUserAgentShadowDOM: false, ignorePointerEventsNone: false }); abort(signal)
+    const backend = hit['backendNodeId']
+    if (typeof backend !== 'number') throw new Error('TARGET_NOT_ACTIONABLE')
+    const described = boundedResponse(await this.transport.send('DOM.describeNode', { backendNodeId: backend, depth: 0, pierce: false })); abort(signal)
+    const partial = boundedResponse(await this.transport.send('Accessibility.getPartialAXTree', { backendNodeId: backend, fetchRelatives: false })); abort(signal)
+    const node = (partial['nodes'] as AXNode[] | undefined)?.find(item => !item.ignored) ?? {}
+    const dom = described['node'] as Record<string, unknown> | undefined
+    const metadata = targetMetadata(node, dom, text(node.role?.value, 256), redactBrowserText(text(node.name?.value, 4096)), backend)
+    if (!pixels) return { ...metadata, receiverFingerprint: metadata.fingerprint }
+    await this.cursor.hide()
+    const width = Math.min(64, viewport.width), height = Math.min(64, viewport.height)
+    const x = Math.min(Math.max(0, point.x - width / 2), viewport.width - width), y = Math.min(Math.max(0, point.y - height / 2), viewport.height - height)
+    const crop = await this.transport.send('Page.captureScreenshot', { format: 'png', fromSurface: true, captureBeyondViewport: false,
+      clip: { x: viewport.pageX + x, y: viewport.pageY + y, width, height, scale: this.captureScale(width, height, 256) } }); abort(signal)
+    if (typeof crop['data'] !== 'string' || crop['data'].length > 512 * 1024) throw new Error('REQUEST_LIMIT')
+    const digest = createHash('sha256').update(crop['data']).digest('hex')
+    const semantic = ['button', 'link', 'textbox', 'searchbox', 'combobox', 'checkbox', 'radio', 'switch', 'option', 'menuitem', 'tab'].includes(metadata.role.toLowerCase())
+    return { ...metadata, receiverFingerprint: metadata.fingerprint, fingerprint: semantic ? metadata.fingerprint : createHash('sha256').update(metadata.fingerprint + digest).digest('hex'), visualPreview: `data:image/png;base64,${crop['data']}` }
+  }
+  private async preparePointer(lease: BrowserAutomationLease, operation: Extract<BrowserInteraction, { screenshotId: string }>, signal: AbortSignal): Promise<PreparedBrowserInteraction> {
+    const observation = this.observations.resolve(lease, operation.screenshotId)
+    await this.verifyObservation(observation, signal)
+    if (operation.kind === 'typeFocused') {
+      await this.snapshot(lease, { maxDepth: 20, maxNodes: 1000, maxBytes: 128 * 1024 }, signal)
+      const focused = [...(this.snapshotCache?.entries.values() ?? [])].filter(entry => entry.focused && ['textbox', 'searchbox', 'combobox'].includes(entry.role.toLowerCase()))
+      if (focused.length !== 1) throw new Error('TARGET_NOT_ACTIONABLE')
+      const primary = focused[0]!, current = await this.actionable(primary, signal, true)
+      if (current.metadata.type === 'file') throw new Error('TARGET_NOT_ACTIONABLE')
+      return { lease: { ...lease }, operation, primary, target: current.metadata, grounded: { observation, points: [], fingerprints: [], receiverFingerprints: [] } }
+    }
+    const points = (operation.kind === 'mouseDrag' ? operation.path : ('path' in operation && operation.path ? operation.path : [{ x: operation.x, y: operation.y }])).map(point => mapScreenshotPoint(observation, point))
+    if (operation.kind === 'mouseClick' || operation.kind === 'mouseDrag') {
+      const endpoints = operation.kind === 'mouseDrag' ? [points[0]!, points.at(-1)!] : [points.at(-1)!]
+      const targets: InteractionTargetMetadata[] = []
+      for (const point of endpoints) targets.push(await this.pointerReceiver(point, observation.viewport, signal))
+      return { lease: { ...lease }, operation, target: targets[0]!, ...(targets[1] ? { secondaryTarget: targets[1] } : {}), grounded: { observation, points, fingerprints: targets.map(target => target.fingerprint), receiverFingerprints: targets.map(target => target.receiverFingerprint!) } }
+    }
+    return { lease: { ...lease }, operation, target: { role: 'document', name: 'Browser pointer', tag: 'body', type: '', fingerprint: createHash('sha256').update(JSON.stringify(points)).digest('hex') }, grounded: { observation, points, fingerprints: [], receiverFingerprints: [] } }
   }
   async prepareInteraction(lease: BrowserAutomationLease, operation: BrowserInteraction, signal: AbortSignal): Promise<PreparedBrowserInteraction> {
     abort(signal); await this.ensureAttached(); abort(signal)
+    if (isPointerInteraction(operation)) return this.preparePointer(lease, operation, signal)
     const primaryTarget = operation.kind === 'drag' ? operation.source : ('target' in operation ? operation.target : undefined)
     const primary = primaryTarget ? this.resolveTarget(lease, primaryTarget) : undefined
     const secondary = operation.kind === 'drag' ? this.resolveTarget(lease, operation.target) : undefined
-    const primaryCurrent = primary ? await this.actionable(primary, signal) : undefined
+    const primaryCurrent = primary ? await this.actionable(primary, signal, operation.kind === 'fill' || operation.kind === 'type', true) : undefined
     const secondaryCurrent = secondary ? await this.actionable(secondary, signal) : undefined
     const metadata = primaryCurrent?.metadata
     if ((operation.kind === 'fill' || operation.kind === 'type') && (!metadata || (!['textbox', 'searchbox', 'combobox'].includes(metadata.role.toLocaleLowerCase()) && !['input', 'textarea'].includes(metadata.tag)) || metadata.type === 'file')) throw new Error('TARGET_NOT_ACTIONABLE')
@@ -432,20 +512,36 @@ export class BrowserAutomation {
     const target = metadata ?? { role: 'document', name: '', tag: 'body', type: '', fingerprint: createHash('sha256').update('document').digest('hex') }
     return { lease: { ...lease }, operation, ...(primary ? { primary } : {}), ...(secondary ? { secondary } : {}), target, ...(secondaryCurrent ? { secondaryTarget: secondaryCurrent.metadata } : {}) }
   }
-  private async hitTest(entry: SnapshotEntry, point: { x: number; y: number }, signal: AbortSignal): Promise<{ x: number; y: number }> {
+  private async hitTest(entry: SnapshotEntry, point: { x: number; y: number; quad?: number[] }, signal: AbortSignal): Promise<{ x: number; y: number }> {
     if (!entry.backendDOMNodeId || !Number.isFinite(point.x) || !Number.isFinite(point.y)) throw new Error('TARGET_NOT_ACTIONABLE')
     const metrics = boundedResponse(await this.transport.send('Page.getLayoutMetrics')); abort(signal)
     const viewport = (metrics['cssVisualViewport'] ?? metrics['cssLayoutViewport']) as Record<string, unknown> | undefined
     const width = typeof viewport?.['clientWidth'] === 'number' ? viewport['clientWidth'] : viewport?.['width']
     const height = typeof viewport?.['clientHeight'] === 'number' ? viewport['clientHeight'] : viewport?.['height']
-    if (typeof width !== 'number' || typeof height !== 'number' || !Number.isFinite(width) || !Number.isFinite(height) || width < 1 || height < 1 || width > 16_384 || height > 16_384 || point.x < 0 || point.y < 0 || point.x >= width || point.y >= height) throw new Error('TARGET_NOT_ACTIONABLE')
-    const exactPoint = { x: Math.floor(point.x), y: Math.floor(point.y) }
-    const hit = boundedResponse(await this.transport.send('DOM.getNodeForLocation', { ...exactPoint, includeUserAgentShadowDOM: false, ignorePointerEventsNone: false })); abort(signal)
+    if (typeof width !== 'number' || typeof height !== 'number' || !Number.isFinite(width) || !Number.isFinite(height) || width < 1 || height < 1 || width > 16_384 || height > 16_384) throw new Error('TARGET_NOT_ACTIONABLE')
+    const candidates = point.quad ? visibleQuadPoints(point.quad, width, height) : [point]
+    for (const candidate of candidates) {
+    if (candidate.x < 0 || candidate.y < 0 || candidate.x >= width || candidate.y >= height) continue
+    const exactPoint = { x: Math.floor(candidate.x), y: Math.floor(candidate.y) }
+    // DOM hit locations use document coordinates; Input dispatch uses viewport
+    // coordinates. A scrolled native fixture proves these are not interchangeable.
+    const layout = (metrics['cssLayoutViewport'] ?? viewport) as Record<string, unknown>
+    const pageX = Number(layout['pageX'] ?? 0), pageY = Number(layout['pageY'] ?? 0)
+    if (!Number.isFinite(pageX) || !Number.isFinite(pageY)) throw new Error('TARGET_NOT_ACTIONABLE')
+    const hit = boundedResponse(await this.transport.send('DOM.getNodeForLocation', { x: Math.floor(exactPoint.x + pageX), y: Math.floor(exactPoint.y + pageY), includeUserAgentShadowDOM: false, ignorePointerEventsNone: false })); abort(signal)
     let backend = typeof hit['backendNodeId'] === 'number' ? hit['backendNodeId'] : undefined
     let nodeId = typeof hit['nodeId'] === 'number' ? hit['nodeId'] : undefined
     for (let depth = 0; depth < 32 && (backend !== undefined || nodeId !== undefined); depth++) {
       if (backend === entry.backendDOMNodeId || (nodeId !== undefined && this.domRelations.isWithin(nodeId, entry.backendDOMNodeId))) return exactPoint
-      const described = boundedResponse(await this.transport.send('DOM.describeNode', { ...(nodeId !== undefined ? { nodeId } : { backendNodeId: backend }), depth: 0, pierce: false })); abort(signal)
+      let described: Record<string, unknown>
+      try { described = boundedResponse(await this.transport.send('DOM.describeNode', { ...(nodeId !== undefined ? { nodeId } : { backendNodeId: backend }), depth: 0, pierce: false })) }
+      catch (error) {
+        // A transient covering node can disappear after the hit reply. Only
+        // this measured missing-node error is recoverable; never replay input.
+        if (error instanceof Error && error.message === 'Could not find node with given id') break
+        throw error
+      }
+      abort(signal)
       const node = described['node'] as Record<string, unknown> | undefined
       if (!node) break
       backend = typeof node['backendNodeId'] === 'number' ? node['backendNodeId'] : undefined
@@ -453,19 +549,29 @@ export class BrowserAutomation {
       nodeId = typeof node['parentId'] === 'number' ? node['parentId'] : nodeId === undefined ? undefined : this.domRelations.parentOf(nodeId)
       backend = undefined
     }
-    throw new Error('TARGET_OCCLUDED')
+    }
+    throw new BrowserAutomationError('TARGET_OCCLUDED', false, { reason: 'occluded', targetRef: entry.ref, attemptedPoints: candidates.length })
   }
-  async executeInteraction(prepared: PreparedBrowserInteraction, signal: AbortSignal, stillCurrent: (dispatched: boolean, phase?: 'dispatch' | 'finish' | 'cleanup') => boolean = () => true): Promise<{ dispatched: true; rollbackPossible: false }> {
+  private pause(ms: number, signal: AbortSignal): Promise<void> {
+    abort(signal)
+    return new Promise((resolve, reject) => {
+      const onAbort = (): void => { clearTimeout(timer); signal.removeEventListener('abort', onAbort); reject(new Error('ACTION_CANCELLED')) }
+      const timer = setTimeout(() => { signal.removeEventListener('abort', onAbort); resolve() }, ms)
+      signal.addEventListener('abort', onAbort, { once: true })
+    })
+  }
+  async executeInteraction(prepared: PreparedBrowserInteraction, signal: AbortSignal, stillCurrent: (dispatched: boolean, phase?: 'dispatch' | 'finish' | 'cleanup') => boolean = () => true): Promise<{ dispatched: true; rollbackPossible: false; receiver?: { role: string; tag: string; point?: BrowserPoint } }> {
     let dispatched = false
+    let gestureStartedAt: number | undefined
     const heldKeys = new Map<string, Record<string, unknown>>()
     const heldButtons = new Map<string, Record<string, unknown>>()
     const asAutomationError = (error: unknown): BrowserAutomationError => {
-      if (error instanceof BrowserAutomationError) return error
+      if (error instanceof BrowserAutomationError) return dispatched && !error.dispatched ? new BrowserAutomationError(error.code, true, error.diagnostics) : error
       const code = safeBrowserCode(error instanceof Error ? error.message : undefined)
       return new BrowserAutomationError(code, dispatched)
     }
     const ensure = (phase: 'dispatch' | 'finish' = 'dispatch'): void => {
-      if (signal.aborted) throw new BrowserAutomationError('ACTION_CANCELLED', dispatched)
+      if (signal.aborted || (phase === 'dispatch' && gestureStartedAt !== undefined && performance.now() - gestureStartedAt >= 2000)) throw new BrowserAutomationError('ACTION_CANCELLED', dispatched)
       // Input callbacks may advance generation after dispatch. Further input
       // must nevertheless remain in the same document, not merely WebContents.
       if (!stillCurrent(dispatched, phase)) throw new BrowserAutomationError('STALE_GENERATION', dispatched)
@@ -474,8 +580,12 @@ export class BrowserAutomation {
       ensure()
       const keyId = String(params['code'] ?? params['key'] ?? '')
       const button = String(params['button'] ?? 'none')
-      if (method === 'Input.dispatchMouseEvent' && params['type'] === 'mousePressed' && button !== 'none') heldButtons.set(button, { ...params, type: 'mouseReleased' })
-      if (method === 'Input.dispatchKeyEvent' && params['type'] === 'keyDown') heldKeys.set(keyId, { ...params, type: 'keyUp' })
+      if (method === 'Input.dispatchMouseEvent' && params['type'] === 'mousePressed' && button !== 'none') heldButtons.set(button, { ...params, type: 'mouseReleased', buttons: 0, clickCount: 0 })
+      if (method === 'Input.dispatchKeyEvent' && params['type'] === 'keyDown') heldKeys.set(keyId, { ...params, type: 'keyUp', text: '' })
+      if (method === 'Input.dispatchMouseEvent' && params['type'] === 'mouseMoved') {
+        for (const [held, release] of heldButtons) heldButtons.set(held, { ...release, x: params['x'], y: params['y'] })
+      }
+      if (isPointerInteraction(prepared.operation) && gestureStartedAt === undefined) gestureStartedAt = performance.now()
       // A lost/error response does not prove that Chromium ignored the input.
       dispatched = true
       try {
@@ -486,33 +596,85 @@ export class BrowserAutomation {
         throw asAutomationError(error)
       }
     }
-    const pointFor = async (entry: SnapshotEntry, expected: InteractionTargetMetadata): Promise<{ x: number; y: number; checked?: boolean }> => {
-      const point = await this.actionable(entry, signal)
-      if (point.metadata.fingerprint !== expected.fingerprint) throw new BrowserAutomationError('STALE_GENERATION', dispatched)
-      ensure(); const exactPoint = await this.hitTest(entry, point, signal); ensure()
-      return { ...point, ...exactPoint }
+    const pointFor = async (entry: SnapshotEntry, expected: InteractionTargetMetadata): Promise<{ x: number; y: number; focused?: boolean; checked?: boolean }> => {
+      const deadline = performance.now() + 2000
+      for (;;) {
+        ensure()
+        try {
+          const editable = prepared.operation.kind === 'fill' || prepared.operation.kind === 'type'
+          const first = await this.actionable(entry, signal, editable)
+          if (!dispatched) {
+            await this.pause(25, signal)
+            // DOM geometry can precede compositor hit regions after navigation.
+            // A one-pixel readback fences the frame without injecting page code;
+            // the real HTTP fixture otherwise silently drops every input event.
+            const viewport = await this.effectiveViewport(signal)
+            await this.transport.send('Page.captureScreenshot', { format: 'png', fromSurface: true, captureBeyondViewport: false,
+              clip: { x: viewport.pageX, y: viewport.pageY, width: 1, height: 1, scale: 1 } })
+            ensure()
+          }
+          const point = dispatched ? first : await this.actionable(entry, signal, editable)
+          if (point.metadata.fingerprint !== expected.fingerprint) throw new BrowserAutomationError('STALE_GENERATION', dispatched)
+          if (Math.abs(first.x - point.x) > 0.5 || Math.abs(first.y - point.y) > 0.5) throw new BrowserAutomationError('TARGET_UNSTABLE', dispatched, { reason: 'unstable', targetRef: entry.ref, attemptedPoints: 0 })
+          ensure(); const exactPoint = await this.hitTest(entry, point, signal); ensure()
+          return { ...point, ...exactPoint }
+        } catch (error) {
+          const code = error instanceof Error ? error.message : ''
+          if (dispatched || !['TARGET_OCCLUDED', 'TARGET_UNSTABLE'].includes(code) || performance.now() >= deadline) throw error
+          await this.pause(Math.min(100, Math.max(1, deadline - performance.now())), signal)
+        }
+      }
     }
     const mouse = async (type: CdpMouseInputType, point: { x: number; y: number }, extra: Record<string, unknown> = {}): Promise<void> => {
-      const params = { type, x: point.x, y: point.y, button: 'none', clickCount: 0, ...extra }
+      const params = { type, x: point.x, y: point.y, button: 'none', clickCount: 0, modifiers: 0, buttons: type === 'mousePressed' ? 1 : 0, ...extra }
       await sendIrreversible('Input.dispatchMouseEvent', params)
     }
     const key = async (type: 'keyDown' | 'keyUp', value: string, modifiers = 0): Promise<void> => {
-      const key = value === 'Space' ? ' ' : value
-      await sendIrreversible('Input.dispatchKeyEvent', { type, key, code: keyCodeFor(value), modifiers })
+      const text = keyText(value, modifiers)
+      const key = value === 'Space' ? ' ' : (text && /^[A-Za-z0-9]$/.test(value) ? text : value)
+      await sendIrreversible('Input.dispatchKeyEvent', { type, key, code: keyCodeFor(value), modifiers, windowsVirtualKeyCode: virtualKey(value), ...(type === 'keyDown' && text !== undefined ? { text } : {}) })
     }
     const operation = prepared.operation
     try {
+      if (isPointerInteraction(operation)) {
+        const grounded = prepared.grounded
+        if (!grounded) throw new Error('STALE_GENERATION')
+        const verify = async (release = false): Promise<void> => {
+          ensure()
+          await this.verifyObservation(grounded.observation, signal)
+          if (prepared.primary) {
+            const current = await this.actionable(prepared.primary, signal, true)
+            if (current.metadata.fingerprint !== prepared.target.fingerprint) throw new Error('STALE_GENERATION')
+            const partial = await this.transport.send('Accessibility.getPartialAXTree', { backendNodeId: prepared.primary.backendDOMNodeId, fetchRelatives: false })
+            if (!(partial['nodes'] as AXNode[] | undefined)?.some(node => property(node, 'focused') === true)) throw new Error('STALE_GENERATION')
+          } else if (grounded.fingerprints.length) {
+            const endpoints = operation.kind === 'mouseDrag' && !release ? [grounded.points[0]!, grounded.points.at(-1)!] : [grounded.points.at(-1)!]
+            for (let i = 0; i < endpoints.length; i++) {
+              const receiver = await this.pointerReceiver(endpoints[i]!, grounded.observation.viewport, signal, !release)
+              const expected = release ? grounded.receiverFingerprints.at(-1) : grounded.fingerprints[i]
+              if ((release ? receiver.receiverFingerprint : receiver.fingerprint) !== expected) throw new Error('STALE_GENERATION')
+            }
+          }
+          ensure()
+        }
+        await this.verifyObservation(grounded.observation, signal)
+        await dispatchPointer(operation, grounded.points, {
+          mouse: async (type, point, extra) => { await mouse(type, point, extra); this.cursor.show(point) },
+          text: async value => { await sendIrreversible('Input.insertText', { text: value }) },
+          verify, pause: ms => this.pause(ms, signal),
+        })
+      } else {
       const click = async (point: { x: number; y: number }, count = 1): Promise<void> => { await mouse('mousePressed', point, { button: 'left', clickCount: count }); await mouse('mouseReleased', point, { button: 'left', clickCount: count }) }
       const primaryPoint = prepared.primary ? await pointFor(prepared.primary, prepared.target) : undefined
       if ((operation.kind === 'click' || operation.kind === 'doubleClick') && primaryPoint) await click(primaryPoint, operation.kind === 'doubleClick' ? 2 : 1)
       else if (operation.kind === 'hover' && primaryPoint) await mouse('mouseMoved', primaryPoint)
       else if ((operation.kind === 'fill' || operation.kind === 'type') && primaryPoint) {
-        await click(primaryPoint)
+        if (!primaryPoint.focused) await click(primaryPoint)
         if (operation.kind === 'fill') { const modifier = process.platform === 'darwin' ? 4 : 2; await key('keyDown', 'a', modifier); await key('keyUp', 'a', modifier) }
         await sendIrreversible('Input.insertText', { text: operation.text })
       } else if (operation.kind === 'press') {
-        if (primaryPoint) await click(primaryPoint)
-        await key('keyDown', operation.key); await key('keyUp', operation.key)
+        if (primaryPoint && !primaryPoint.focused) await click(primaryPoint)
+        await key('keyDown', operation.key, modifierMask(operation.modifiers)); await key('keyUp', operation.key, modifierMask(operation.modifiers))
       } else if (operation.kind === 'select' && primaryPoint) {
         if (operation.values.length !== 1) throw new BrowserAutomationError('UNSUPPORTED_PAGE', dispatched)
         await click(primaryPoint); await sendIrreversible('Input.insertText', { text: operation.values[0] }); await key('keyDown', 'Enter'); await key('keyUp', 'Enter')
@@ -533,26 +695,34 @@ export class BrowserAutomation {
         }
         await mouse('mouseMoved', secondaryPoint, { button: 'left' }); await mouse('mouseReleased', secondaryPoint, { button: 'left', clickCount: 1 })
       } else throw new BrowserAutomationError('TARGET_NOT_ACTIONABLE', dispatched)
+      }
       // CDP may deliver javascriptDialogOpening immediately after the Input
       // command resolves. Keep the owning broker request alive through that task
       // so disconnect/cancel remains the dialog's cancellation owner.
       await new Promise<void>((resolve) => setImmediate(resolve))
       const dialogBarrier = this.dialogBarrier; if (dialogBarrier) await dialogBarrier
       ensure('finish')
-      return { dispatched: true, rollbackPossible: false }
+      const receiver = prepared.secondaryTarget ?? prepared.target
+      const point = prepared.grounded?.points.at(-1)
+      return { dispatched: true, rollbackPossible: false, ...(isPointerInteraction(operation) && (prepared.primary || prepared.grounded?.fingerprints.length) ? { receiver: { role: receiver.role, tag: receiver.tag, ...(point ? { point } : {}) } } : {}) }
     } catch (error) {
       throw asAutomationError(error)
     } finally {
       // Release only this operation's inputs, even after cancellation/navigation.
       // No text, activation retry or freshly resolved target is allowed here.
       if (stillCurrent(dispatched, 'cleanup') && this.transport.isAttached()) {
-        for (const params of heldButtons.values()) await this.transport.send('Input.dispatchMouseEvent', params).catch(() => {})
+        // Releasing at the pressed control completes a native click, even with
+        // clickCount:0 (real Electron regression). Release outside web content;
+        // these are renderer-local CDP coordinates, never desktop coordinates.
+        for (const params of heldButtons.values()) await this.transport.send('Input.dispatchMouseEvent', { ...params, x: -1, y: -1, buttons: 0, clickCount: 0 }).catch(() => {})
+        if (signal.aborted || heldButtons.size || heldKeys.size) await this.cursor.hide()
         for (const params of [...heldKeys.values()].reverse()) await this.transport.send('Input.dispatchKeyEvent', params).catch(() => {})
       }
     }
   }
   async screenshot(lease: BrowserAutomationLease, target: BrowserElementRef | undefined, fullPage: boolean, signal: AbortSignal): Promise<BrowserBinaryAttachment> {
     abort(signal); await this.ensureAttached(); let clip: { x: number; y: number; width: number; height: number; scale: number } | undefined
+    let viewport: EffectiveBrowserViewport | undefined
     if (target) { const entry = this.resolve(lease, target); if (!entry.backendDOMNodeId) throw new Error('UNSUPPORTED_PAGE'); const box = await this.transport.send('DOM.getBoxModel', { backendNodeId: entry.backendDOMNodeId }); const border = (box['model'] as Record<string, unknown> | undefined)?.['border'] as number[] | undefined; if (!border || border.length !== 8) throw new Error('UNSUPPORTED_PAGE'); clip = { ...quadBounds(border), scale: 1 } }
     else {
       const metrics = await this.transport.send('Page.getLayoutMetrics')
@@ -561,15 +731,22 @@ export class BrowserAutomation {
       const height = typeof size?.['clientHeight'] === 'number' ? size['clientHeight'] : size?.['height']
       if (typeof width !== 'number' || typeof height !== 'number' || width < 1 || height < 1 || width > SCREENSHOT_MAX_DIMENSION || height > SCREENSHOT_MAX_DIMENSION) throw new Error('REQUEST_LIMIT')
       if (fullPage) clip = { x: 0, y: 0, width, height, scale: 1 }
+      else { viewport = await this.effectiveViewport(signal); clip = { x: viewport.pageX, y: viewport.pageY, width: viewport.width, height: viewport.height, scale: 1 } }
     }
     if (clip && (clip.width < 1 || clip.height < 1 || clip.width > SCREENSHOT_MAX_DIMENSION || clip.height > SCREENSHOT_MAX_DIMENSION)) throw new Error('REQUEST_LIMIT')
-    const result = await this.transport.send('Page.captureScreenshot', { format: 'png', fromSurface: true, captureBeyondViewport: fullPage, ...(clip ? { clip } : {}) }); abort(signal)
+    if (clip) clip.scale = this.captureScale(clip.width, clip.height)
+    const restoreCursor = await this.cursor.suspend()
+    let result: Record<string, unknown>
+    try { result = await this.transport.send('Page.captureScreenshot', { format: 'png', fromSurface: true, captureBeyondViewport: fullPage, ...(clip ? { clip } : {}) }); abort(signal) }
+    finally { if (!signal.aborted) restoreCursor() }
     if (typeof result['data'] !== 'string') throw new Error('INTERNAL_ERROR')
     const data = Buffer.from(result['data'], 'base64'); if (data.length > SCREENSHOT_MAX_BYTES) throw new Error('REQUEST_LIMIT')
     const dimensions = pngDimensions(data)
     if (!dimensions) throw new Error('INTERNAL_ERROR')
     if (dimensions.width > SCREENSHOT_MAX_DIMENSION || dimensions.height > SCREENSHOT_MAX_DIMENSION) throw new Error('REQUEST_LIMIT')
-    return { mediaType: 'image/png', data, ...dimensions }
+    if (viewport && !sameViewport(viewport, await this.effectiveViewport(signal))) throw new Error('STALE_GENERATION')
+    const observation = viewport ? this.observations.issue({ ...lease, imageWidth: dimensions.width, imageHeight: dimensions.height, viewport, viewportRevision: this.viewportRevision }) : undefined
+    return { mediaType: 'image/png', data, ...dimensions, ...(observation ? { observation } : {}) }
   }
   consoleSince(cursor: string | undefined, levels: ConsoleLevel[] | undefined, limit: number): { cursor: string; items: Record<string, unknown>[]; dropped: number; truncated: boolean } { const wanted = levels ? new Set(levels) : null; return this.consoleRing.since(cursor, limit, wanted ? (entry) => wanted.has(entry['level'] as ConsoleLevel) : undefined) }
   networkSince(cursor: string | undefined, limit: number, failedOnly: boolean): { cursor: string; items: Record<string, unknown>[]; dropped: number; truncated: boolean } { return this.networkRing.since(cursor, limit, failedOnly ? (entry) => entry['failed'] === true : undefined) }
@@ -596,5 +773,5 @@ export class BrowserAutomation {
   }
   reload(ignoreCache: boolean): { accepted: boolean } { this.invalidate(); return { accepted: this.controls.reload?.(ignoreCache) !== false } }
   history(direction: 'back' | 'forward'): { accepted: boolean } { this.invalidate(); return { accepted: this.controls.history?.(direction) !== false } }
-  async setViewport(viewport: BrowserViewport, signal: AbortSignal): Promise<{ viewport: BrowserViewport }> { const size = parseBrowserViewport(viewport); if (!size) throw new Error('INVALID_REQUEST'); abort(signal); await this.ensureAttached(); await this.transport.send('Emulation.setDeviceMetricsOverride', { width: size.width, height: size.height, deviceScaleFactor: viewport.deviceScaleFactor ?? 1, mobile: viewport.mobile ?? false, screenWidth: size.width, screenHeight: size.height }); abort(signal); this.invalidate(); return { viewport: { ...viewport, ...size } } }
+  async setViewport(viewport: BrowserViewport, signal: AbortSignal): Promise<{ viewport: BrowserViewport }> { const size = parseBrowserViewport(viewport); if (!size) throw new Error('INVALID_REQUEST'); abort(signal); await this.ensureAttached(); const scale = viewport.deviceScaleFactor ?? 1; this.emulatedScaleFactor = Math.max(this.emulatedScaleFactor ?? this.controls.deviceScaleFactor?.() ?? 1, scale); await this.transport.send('Emulation.setDeviceMetricsOverride', { width: size.width, height: size.height, deviceScaleFactor: scale, mobile: viewport.mobile ?? false, screenWidth: size.width, screenHeight: size.height }); this.emulatedScaleFactor = scale; abort(signal); this.invalidate(); return { viewport: { ...viewport, ...size } } }
 }

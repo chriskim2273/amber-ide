@@ -6,9 +6,9 @@ import type { WsBrowser } from '../shared/workspaceFile'
 import type { BrowserRecord, BrowserStateFile } from '../shared/tabBrowserState'
 import { parseBrowserViewport } from '../shared/browserViewport'
 import type { BrowserAutomation, BrowserBinaryAttachment } from './browserAutomation'
-import type { BrowserInteraction, BrowserToolAction } from './browserToolProtocol'
+import { isPointerInteraction, type BrowserInteraction, type BrowserToolAction } from './browserToolProtocol'
 import { classifyInteraction, type InteractionClassification, type InteractionTargetMetadata } from './browserApproval'
-import { ACTION_FAILED_NO_ROLLBACK, BrowserActionError, BrowserAutomationError, FRESH_SNAPSHOT_MESSAGE } from './browserErrors'
+import { ACTION_FAILED_NO_ROLLBACK, BrowserActionError, BrowserAutomationError, FRESH_SNAPSHOT_MESSAGE, type BrowserInteractionDiagnostics } from './browserErrors'
 
 export type TabBrowserPageEvent =
   | { type: 'navigation-started' }
@@ -122,12 +122,14 @@ export class TabBrowserHost {
     const record = this.record(id)
     if (event.type === 'navigation-started') {
       runtime.documentEpoch += 1
+      runtime.page.automation?.hideCursor?.()
       if (runtime.automationNavigationPending) runtime.automationNavigationPending = false
       else if (!runtime.loading) runtime.generation += 1
       runtime.page.automation?.invalidate()
       runtime.loading = true
     } else if (event.type === 'navigation-committed' || event.type === 'navigation-in-page') {
       runtime.documentEpoch += 1
+      runtime.page.automation?.hideCursor?.()
       const currentUrl = event.url.slice(0, 8192)
       if (!this.navigationAllowed(id, currentUrl)) {
         this.runtimes.delete(id); runtime.suppressEvents = true; runtime.pendingOperations.clear(); runtime.page.automation?.invalidate()
@@ -234,7 +236,7 @@ export class TabBrowserHost {
     const status = this.status(record.id); this.emitRuntime(record.id); return status
   }
 
-  hide(id: string): void { const record = this.record(id); const runtime = this.runtimes.get(record.id); runtime?.page.hide(); if (runtime) { runtime.visible = false; runtime.focused = false }; this.capacity.protect(record.id, false); this.emitRuntime(record.id) }
+  hide(id: string): void { const record = this.record(id); const runtime = this.runtimes.get(record.id); runtime?.page.hide(); runtime?.page.automation?.hideCursor?.(); if (runtime) { runtime.visible = false; runtime.focused = false }; this.capacity.protect(record.id, false); this.emitRuntime(record.id) }
   isVisible(id: string): boolean { return isOpaqueBrowserId(id) && this.runtimes.get(id)?.visible === true }
 
   setMode(id: string, mode: 'preview' | 'browse', source: 'user' | 'broker' = 'user'): BrowserRuntimeStatus {
@@ -342,7 +344,7 @@ export class TabBrowserHost {
     const status = this.status(record.id); this.onStateChange(); this.emitRuntime(record.id); return status
   }
 
-  private noRollbackFailure(id: BrowserId, runtime: Runtime): BrowserActionError {
+  private noRollbackFailure(id: BrowserId, runtime: Runtime, diagnostics?: BrowserInteractionDiagnostics): BrowserActionError {
     const current = this.runtimes.get(id)
     return new BrowserActionError({
       code: ACTION_FAILED_NO_ROLLBACK,
@@ -352,17 +354,18 @@ export class TabBrowserHost {
       generation: current?.generation ?? this.generationFloor.get(id) ?? runtime.generation,
       snapshotHint: true,
       dispatched: true,
+      ...(diagnostics ? { diagnostics } : {}),
     })
   }
 
-  async runAutomation(id: string, action: BrowserToolAction, signal: AbortSignal, approve?: (request: InteractionApprovalRequest, signal: AbortSignal) => Promise<void>): Promise<unknown | BrowserBinaryAttachment> {
+  async runAutomation(id: string, action: BrowserToolAction, signal: AbortSignal, approve?: (request: InteractionApprovalRequest, signal: AbortSignal) => Promise<void>, controller?: string): Promise<unknown | BrowserBinaryAttachment> {
     const record = this.record(id)
     const runtime = this.runtimes.get(record.id)
     if (!runtime || !runtime.page.automation) throw new Error('BROWSER_FROZEN')
     if (runtime.incarnation !== action.pageIncarnation || runtime.generation !== action.expectedGeneration) throw new Error('STALE_GENERATION')
     if (signal.aborted) throw new Error('ACTION_CANCELLED')
     const automation = runtime.page.automation
-    const lease = { browserId: record.id, pageIncarnation: runtime.incarnation, generation: runtime.generation }
+    const lease = { browserId: record.id, pageIncarnation: runtime.incarnation, generation: runtime.generation, documentEpoch: runtime.documentEpoch, ...(controller ? { controller } : {}) }
     const documentEpoch = runtime.documentEpoch
     let result: unknown; let generationDelta = 0; let interactionDispatched = false; let interactionDispatchGeneration: number | undefined
     const pending = this.beginPending(runtime)
@@ -405,7 +408,7 @@ export class TabBrowserHost {
         runtime.generation += 1; generationDelta = 1; record.viewport = viewport; record.stateRevision += 1
       }
     } catch (error) {
-      if (action.type === 'interact' && (interactionDispatched || adapterDispatched(error))) throw this.noRollbackFailure(record.id, runtime)
+      if (action.type === 'interact' && (interactionDispatched || adapterDispatched(error))) throw this.noRollbackFailure(record.id, runtime, error instanceof BrowserAutomationError ? error.diagnostics : undefined)
       throw error
     } finally {
       this.endPending(runtime, pending)
@@ -425,6 +428,21 @@ export class TabBrowserHost {
     this.onStateChange(); this.emitRuntime(record.id)
     const context = { browserId: record.id, pageIncarnation: runtime.incarnation, generation: runtime.generation,
       ...(action.type === 'interact' ? { interleaved: runtime.generation !== interactionDispatchGeneration } : {}) }
+    if (action.type === 'interact' && isPointerInteraction(action.operation) && action.operation.afterScreenshot) {
+      const observationPending = this.beginPending(runtime)
+      this.capacity.protectFor(record.id, 'operation', true)
+      try {
+        const capture = await automation.screenshot({ ...lease, generation: runtime.generation, documentEpoch: runtime.documentEpoch }, undefined, false, signal)
+        if (signal.aborted || this.runtimes.get(record.id) !== runtime || runtime.generation !== context.generation) throw new Error('STALE_GENERATION')
+        return { ...capture, ...(result as Record<string, unknown>), ...context, actionResult: { ...(result as Record<string, unknown>), ...context } }
+      } catch {
+        const current = this.runtimes.get(record.id)
+        return { ...(result as Record<string, unknown>), ...context, ...(current ? { generation: current.generation, pageIncarnation: current.incarnation } : {}), observationError: 'POST_ACTION_OBSERVATION_UNAVAILABLE' }
+      } finally {
+        this.endPending(runtime, observationPending)
+        this.capacity.protectFor(record.id, 'operation', false)
+      }
+    }
     if (typeof result === 'object' && result !== null) return { ...result, ...context }
     return { value: result, ...context }
   }
@@ -494,7 +512,7 @@ export class TabBrowserHost {
 
   revokePi(id: string): void {
     const record = this.record(id), runtime = this.runtimes.get(record.id)
-    if (runtime) { runtime.generation += 1; runtime.page.automation?.invalidate(); this.emitRuntime(record.id) }
+    if (runtime) { runtime.generation += 1; runtime.page.automation?.invalidate(); runtime.page.automation?.hideCursor?.(); this.emitRuntime(record.id) }
   }
 
   protectApproval(id: string, protectedValue: boolean): void {

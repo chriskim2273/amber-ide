@@ -252,7 +252,7 @@ describe('tab browser broker boundary', () => {
     if (process.platform === 'win32') return
     const dir = await mkdtemp(join(tmpdir(), 'amber-browser-broker-')); cleanup.push(dir)
     const socketPath = join(dir, 'broker.sock'); const tokenPath = join(dir, 'token'); const image = Buffer.from([0x89, 0x50, 0x4e, 0x47])
-    const server = new TabBrowserBrokerServer(socketPath, tokenPath, async () => ({ mediaType: 'image/png' as const, data: image, width: 1, height: 1 }))
+    const server = new TabBrowserBrokerServer(socketPath, tokenPath, async () => ({ mediaType: 'image/png' as const, data: image, width: 1, height: 1, observation: { screenshotId: 'grounded', imageWidth: 1, imageHeight: 1 }, actionResult: { dispatched: true, generation: 2 } }))
     await server.start(); const token = (await readFile(tokenPath, 'utf8')).trim()
     const encode = (value: unknown): Buffer => { const body = Buffer.from(JSON.stringify(value)); const out = Buffer.alloc(body.length + 4); out.writeUInt32BE(body.length); body.copy(out, 4); return out }
     const received = await new Promise<{ meta: Record<string, unknown>; bytes: Buffer }>((resolve, reject) => {
@@ -269,7 +269,7 @@ describe('tab browser broker boundary', () => {
       })
     })
     expect(received.bytes).toEqual(image)
-    expect(received.meta).toMatchObject({ ok: true, result: { contentTrust: 'untrusted-browser-content', mediaType: 'image/png', attachment: { encoding: 'binary-frame', byteLength: 4 } } })
+    expect(received.meta).toMatchObject({ ok: true, result: { contentTrust: 'untrusted-browser-content', mediaType: 'image/png', observation: { screenshotId: 'grounded', imageWidth: 1, imageHeight: 1 }, actionResult: { dispatched: true, generation: 2 }, dispatched: true, attachment: { encoding: 'binary-frame', byteLength: 4 } } })
     expect(JSON.stringify(received.meta)).not.toMatch(/path|"data"/)
     const replay = await new Promise<Record<string, unknown>>((resolve, reject) => {
       const socket = connect(socketPath); let buffer = Buffer.alloc(0); let authenticated = false

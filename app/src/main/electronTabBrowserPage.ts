@@ -1,4 +1,4 @@
-import { WebContentsView, session, type BrowserWindow, type Input, type MouseInputEvent, type Rectangle, type Session } from 'electron'
+import { WebContentsView, session, screen, type BrowserWindow, type Input, type MouseInputEvent, type Rectangle, type Session } from 'electron'
 import { browserWebPreferences, isAllowedBrowserUrl } from './tabBrowserPolicy'
 import type { BrowserId } from '../shared/tabBrowser'
 import type { TabBrowserPage, TabBrowserPageEvent, TabBrowserPageFactory } from './tabBrowserHost'
@@ -67,6 +67,7 @@ export class ElectronTabBrowserPage implements TabBrowserPage {
       onMessage: (listener) => { contents.debugger.on('message', (_event, method, params) => listener(method, (params ?? {}) as Record<string, unknown>)) },
     }
     this.automation = new BrowserAutomation(debuggerTransport, () => contents.getURL(), () => contents.isLoading(), {}, {
+      deviceScaleFactor: () => screen.getDisplayMatching(this.window.getBounds()).scaleFactor,
       reload: (ignoreCache) => { if (ignoreCache) contents.reloadIgnoringCache(); else contents.reload(); return true },
       history: (direction) => {
         const history = contents.navigationHistory

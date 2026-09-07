@@ -22,6 +22,33 @@ const pagePolicies = new Map<string, (url: string) => boolean>()
 const factory: TabBrowserPageFactory = { create: (id, onUserInput, onPageEvent, allowNavigation) => { userInputs.set(id, onUserInput); pageEvents.set(id, onPageEvent); pagePolicies.set(id, allowNavigation); return new FakePage() } }
 
 describe('TabBrowserHost', () => {
+  it.each(['image', 'capture-failure', 'revoked'] as const)('keeps post-action observation %s separate from completed dispatch', async mode => {
+    const host = new TabBrowserHost(emptyBrowserState(1), factory)
+    const opened = await host.open({ visible: true })
+    const target = { role: 'document', name: '', tag: 'body', type: '', fingerprint: 'page' }
+    const dispatch = vi.fn(async () => { userInputs.get(opened.status.id)!(); return { dispatched: true as const, rollbackPossible: false as const } })
+    ;(opened.page as FakePage).automation = {
+      invalidate: vi.fn(), prepareInteraction: async (lease, operation) => ({ lease, operation, target }), executeInteraction: dispatch,
+      screenshot: async lease => {
+        expect(host.hasPendingOperation(opened.status.id, opened.status.pageIncarnation)).toBe(true)
+        if (mode === 'capture-failure') throw new Error('private diagnostic must not escape')
+        if (mode === 'revoked') host.revokePi(opened.status.id)
+        return { mediaType: 'image/png', data: Buffer.from('fixture'), width: 1, height: 1,
+          observation: { ...lease, screenshotId: 'next-image', imageWidth: 1, imageHeight: 1, capturedAt: 1,
+            coordinateSpace: 'image-pixels', coordinateActionable: true, viewportRevision: 1, viewport: { width: 1, height: 1, pageX: 0, pageY: 0 } } }
+      },
+    } as Pick<BrowserAutomation, 'invalidate' | 'prepareInteraction' | 'executeInteraction' | 'screenshot'> as BrowserAutomation
+    const result = await host.runAutomation(opened.status.id, { type: 'interact', pageIncarnation: opened.status.pageIncarnation,
+      expectedGeneration: opened.status.generation, operation: { kind: 'mouseMove', screenshotId: 'image', x: 1, y: 1, afterScreenshot: true } }, new AbortController().signal, undefined, 'controller')
+    expect(dispatch).toHaveBeenCalledTimes(1)
+    if (mode === 'image') expect(result).toMatchObject({ dispatched: true, observation: { screenshotId: 'next-image', controller: 'controller', generation: host.status(opened.status.id).generation }, actionResult: { dispatched: true } })
+    else {
+      expect(result).toMatchObject({ dispatched: true, observationError: 'POST_ACTION_OBSERVATION_UNAVAILABLE' })
+      expect(result).not.toHaveProperty('data')
+      expect(JSON.stringify(result)).not.toContain('private diagnostic')
+    }
+  })
+
   it('normalizes persisted live records to frozen until a renderer is recreated', () => {
     const state = emptyBrowserState(1)
     state.records['browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'] = {

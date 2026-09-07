@@ -1,5 +1,13 @@
 # Browser Interaction Implementation Plan
 
+**Execution receipt (2026-09-06):** implementation and isolated validation are recorded in
+`.reports/browser-interaction.md` and `.reports/browser-interaction-scorecard.md`:
+1126 app tests, 893 Rust tests, 740 native matrix checks, generated Pi verification
+and private packaged smoke passed. No production deployment occurred. The original
+checklist below is retained as the design checklist, not a blanket completion
+attestation: installed Google typing, physical-platform/IME checks, and uncertified
+frame/select paths are explicitly distinguished in the receipt.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. The user explicitly selected direct work: do not launch subagents. Steps use checkbox syntax for tracking.
 
 **Goal:** Reliably type/search through native controls and provide screenshot-grounded mouse interaction without weakening browser authority.

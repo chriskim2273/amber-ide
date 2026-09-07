@@ -7,17 +7,24 @@ export function safeBrowserCode(value: unknown, fallback = 'INTERNAL_ERROR'): st
   return typeof value === 'string' && SAFE_CODE.test(value) ? value : fallback
 }
 
+export interface BrowserInteractionDiagnostics { reason: 'occluded' | 'unstable'; targetRef: string; attemptedPoints: number }
+function boundedDiagnostics(input: BrowserInteractionDiagnostics): BrowserInteractionDiagnostics {
+  return { reason: input.reason === 'unstable' ? 'unstable' : 'occluded', targetRef: /^n[0-9]{1,4}$/.test(input.targetRef) ? input.targetRef : '', attemptedPoints: Math.max(0, Math.min(5, Math.floor(input.attemptedPoints) || 0)) }
+}
+
 /** A bounded adapter failure that records whether an irreversible input was accepted. */
 export class BrowserAutomationError extends Error {
   readonly code: string
   readonly dispatched: boolean
+  readonly diagnostics?: BrowserInteractionDiagnostics
 
-  constructor(code: string, dispatched: boolean) {
+  constructor(code: string, dispatched: boolean, diagnostics?: BrowserInteractionDiagnostics) {
     const safeCode = safeBrowserCode(code)
     super(safeCode)
     this.name = 'BrowserAutomationError'
     this.code = safeCode
     this.dispatched = dispatched
+    if (diagnostics) this.diagnostics = boundedDiagnostics(diagnostics)
   }
 }
 
@@ -29,6 +36,7 @@ export interface BrowserFailureDetails {
   generation?: number
   snapshotHint?: boolean
   dispatched?: boolean
+  diagnostics?: BrowserInteractionDiagnostics
 }
 
 /** A safe broker-facing failure with optional current page identity. */
@@ -39,6 +47,7 @@ export class BrowserActionError extends Error {
   readonly generation?: number
   readonly snapshotHint?: boolean
   readonly dispatched?: boolean
+  readonly diagnostics?: BrowserInteractionDiagnostics
 
   constructor(details: Omit<BrowserFailureDetails, 'code'> & { code: string }) {
     const code = safeBrowserCode(details.code)
@@ -50,6 +59,7 @@ export class BrowserActionError extends Error {
     if (details.generation !== undefined && Number.isSafeInteger(details.generation) && details.generation >= 0) this.generation = details.generation
     if (details.snapshotHint !== undefined) this.snapshotHint = details.snapshotHint
     if (details.dispatched !== undefined) this.dispatched = details.dispatched
+    if (details.diagnostics) this.diagnostics = boundedDiagnostics(details.diagnostics)
   }
 }
 

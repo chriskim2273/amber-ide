@@ -35,6 +35,37 @@ app.commandLine.appendSwitch('disable-background-networking')
 const deadline = setTimeout(() => app.exit(2), 30000)
 const { BrowserAutomation } = require(path.join(run, 'adapter.cjs'))
 const cases = [
+  { name: 'overlay removal between hit and ancestry inspection is recoverable', html: '<button aria-label="Search" onclick="document.body.dataset.clicked=\'yes\'">Search</button><div id="cover" style="position:fixed;inset:0;background:white;z-index:999"></div>', removeOnHit: true, role: 'button', label: 'Search', kind: 'click', verify: 'document.body.dataset.clicked', want: 'yes' },
+  { name: 'cancelled hover clears its queued agent cursor', html: '<button aria-label="Search" onmouseover="document.body.dataset.hovered=\'yes\'">Search</button>', pointer: { kind: 'mouseMove', x: 250, y: 60 }, cancelAfterAnyMove: true, cursorHiddenOnCancel: true, error: 'ACTION_CANCELLED', verify: 'document.body.dataset.hovered', want: 'yes' },
+  { name: 'Control A and Backspace preserve native selection', html: '<input aria-label="Search" value="potatoes" autofocus>', role: 'textbox', label: 'Search', kind: 'press', key: 'a', modifiers: ['Control'], followups: [{ kind: 'press', key: 'Backspace' }], verify: 'document.querySelector("input").value', want: '' },
+  { name: 'Tab performs native focus traversal', html: '<input aria-label="Search" autofocus><input aria-label="Next">', role: 'textbox', label: 'Search', kind: 'press', key: 'Tab', verify: 'document.activeElement.getAttribute("aria-label")', want: 'Next' },
+  { name: 'Shift Tab performs reverse native focus traversal', html: '<input aria-label="Search"><input aria-label="Next" autofocus>', role: 'textbox', label: 'Next', kind: 'press', key: 'Tab', modifiers: ['Shift'], verify: 'document.activeElement.getAttribute("aria-label")', want: 'Search' },
+  { name: 'coordinate wheel scrolls its nested receiver', html: '<div id="scroll" style="margin:40px;width:420px;height:200px;overflow:auto"><div style="height:900px">Scrollable</div></div>', pointer: { kind: 'mouseScroll', x: 100, y: 100, deltaX: 0, deltaY: 300 }, settleMs: 100, verify: 'document.querySelector("#scroll").scrollTop>0', want: true },
+  { name: 'cancelled drag stops intermediate movement and releases', html: '<canvas style="display:block;margin:40px;width:420px;height:200px" onmousemove="if(event.buttons===1)document.body.dataset.moves=1+Number(document.body.dataset.moves||0)" onmouseup="document.body.dataset.completed=\'yes\'"></canvas>', pointer: { kind: 'mouseDrag', path: [{ x: 250, y: 60 }, { x: 280, y: 80 }, { x: 310, y: 100 }] }, cancelAfterHeldMove: true, error: 'ACTION_CANCELLED', verify: 'Number(document.body.dataset.moves||0)<=1 && !document.body.dataset.completed', want: true },
+  { name: 'partially clipped rotated control uses a visible interior point', html: '<button aria-label="Search" style="position:fixed;left:-380px;top:40px;margin:0;transform:rotate(8deg)" onclick="document.body.dataset.clicked=\'yes\'">Search</button>', role: 'button', label: 'Search', kind: 'click', verify: 'document.body.dataset.clicked', want: 'yes' },
+  { name: 'moving control settles before activation', html: '<style>@keyframes slide{from{transform:translateX(0)}to{transform:translateX(200px)}}button{animation:slide .3s linear forwards}</style><button aria-label="Search" onclick="document.body.dataset.settled=String(Date.now()-window.started>=250)">Search</button><script>window.started=Date.now()</script>', role: 'button', label: 'Search', kind: 'click', verify: 'document.body.dataset.settled', want: 'true' },
+  { name: 'disabled native control rejects activation', html: '<button aria-label="Search" disabled onclick="document.body.dataset.clicked=\'yes\'">Search</button>', role: 'button', label: 'Search', kind: 'click', error: 'TARGET_NOT_ACTIONABLE', verify: 'document.body.dataset.clicked', want: undefined },
+  { name: 'unresolved frame focus fails closed for text', html: '<iframe tabindex="0" srcdoc="<input>"></iframe>', before: 'document.querySelector("iframe").focus()', pointer: { kind: 'typeFocused', text: 'potatoes' }, error: 'TARGET_NOT_ACTIONABLE', verify: 'document.querySelector("iframe").contentDocument.querySelector("input").value', want: '' },
+  { name: 'native letter key inserts text', html: '<input aria-label="Search" autofocus>', role: 'textbox', label: 'Search', kind: 'press', key: 'a', verify: 'document.querySelector("input").value', want: 'a' },
+  { name: 'Unicode focused input preserves combining and astral characters', html: '<input aria-label="Search" autofocus>', pointer: { kind: 'typeFocused', text: 'café 🥔 漢字 e\u0301' }, verify: 'document.querySelector("input").value', want: 'café 🥔 漢字 e\u0301' },
+  { name: 'nested scroll container reveals its editable target', html: '<div style="height:120px;overflow:auto;margin:40px"><input aria-label="Search" style="margin-top:600px"></div>', role: 'textbox', label: 'Search', kind: 'fill', verify: 'document.querySelector("input").value', want: 'potatoes' },
+  { name: 'opaque target pixel changes invalidate approval before dispatch', html: '<canvas style="display:block;margin:40px;width:420px;height:200px;background:red" onclick="document.body.dataset.clicked=\'yes\'"></canvas>', pointer: { kind: 'mouseClick', x: 250, y: 60 }, afterPrepare: 'document.querySelector("canvas").style.background="blue"', error: 'STALE_GENERATION', verify: 'document.body.dataset.clicked', want: undefined },
+  { name: 'known button hover styling does not invalidate coordinate approval', html: '<style>button:hover{background:#ff3333}</style><button aria-label="Search" onclick="document.body.dataset.clicked=\'yes\'">Search</button>', pointer: { kind: 'mouseClick', x: 250, y: 60 }, verify: 'document.body.dataset.clicked', want: 'yes' },
+  { name: 'cancelled click releases without an activation click', html: '<button aria-label="Search" onclick="document.body.dataset.clicked=\'yes\'">Search</button>', pointer: { kind: 'mouseClick', x: 250, y: 60 }, cancelAfterPress: true, error: 'ACTION_CANCELLED', verify: 'document.body.dataset.clicked', want: undefined },
+  { name: 'navigation during focus cannot receive trailing fill text', html: '<input aria-label="Search">', role: 'textbox', label: 'Search', kind: 'fill', navigationRace: true, error: 'STALE_GENERATION', verify: 'document.querySelector("input").value', want: '' },
+  { name: 'DPR 2 delivered pixels reach the pictured button', html: '<button aria-label="Search" style="background:#12ab34" onclick="document.body.dataset.clicked=\'yes\'">Search</button>', dpr: 2, pixel: true, pointer: { kind: 'mouseClick', x: 200, y: 120 }, verify: 'document.body.dataset.clicked', want: 'yes' },
+  { name: 'fractional DPR delivered pixels reach the pictured button', html: '<button aria-label="Search" style="background:#12ab34" onclick="document.body.dataset.clicked=\'yes\'">Search</button>', dpr: 1.25, pixel: true, pointer: { kind: 'mouseClick', x: 125, y: 75 }, verify: 'document.body.dataset.clicked', want: 'yes' },
+  { name: 'scrolled viewport screenshot coordinates stay viewport relative', html: '<button aria-label="Search" style="margin-top:1400px;background:#12ab34" onclick="document.body.dataset.clicked=\'yes\'">Search</button>', before: 'window.scrollTo(0,10000)', pixel: true, pointer: { kind: 'mouseClick', x: 100, y: 700 }, verify: 'document.body.dataset.clicked', want: 'yes' },
+  { name: 'coordinate mouse click reaches native button', html: '<button aria-label="Search" onclick="document.body.dataset.clicked=\'yes\'">Search</button>', pointer: { kind: 'mouseClick', x: 250, y: 60 }, verify: 'document.body.dataset.clicked', want: 'yes' },
+  { name: 'coordinate hover triggers page behavior', cursorVisible: true, html: '<button aria-label="Search" onmouseover="document.body.dataset.hovered=\'yes\'">Search</button>', pointer: { kind: 'mouseMove', x: 250, y: 60 }, verify: 'document.body.dataset.hovered', want: 'yes' },
+  { name: 'canvas drag receives intermediate held-button moves', html: '<canvas style="display:block;margin:40px;width:420px;height:200px" onmousemove="if(event.buttons===1){document.body.dataset.moves=1+Number(document.body.dataset.moves||0);document.body.dataset.x=event.clientX;document.body.dataset.y=event.clientY}"></canvas>', pointer: { kind: 'mouseDrag', path: [{ x: 250, y: 60 }, { x: 280, y: 80 }, { x: 310, y: 100 }] }, verify: 'document.body.dataset.x+","+document.body.dataset.y+","+(Number(document.body.dataset.moves)>=2)', want: '310,100,true' },
+  { name: 'focused typing reaches visually selected field', html: '<input aria-label="Search" autofocus>', pointer: { kind: 'typeFocused', text: 'potatoes' }, verify: 'document.querySelector("input").value', want: 'potatoes' },
+  { name: 'Enter performs native form submission', html: '<form onsubmit="event.preventDefault();document.body.dataset.submitted=document.querySelector(\'input\').value"><input aria-label="Search" value="potatoes"></form>', role: 'textbox', label: 'Search', kind: 'press', key: 'Enter', verify: 'document.body.dataset.submitted', want: 'potatoes' },
+  { name: 'late useful control survives generic-node budget pressure', assertTruncation: true, html: '<div></div>'.repeat(600) + '<input aria-label="Search">', role: 'textbox', label: 'Search', kind: 'fill', verify: 'document.querySelector("input").value', want: 'potatoes' },
+  { name: 'readonly field rejects typing', html: '<input aria-label="Search" readonly>', role: 'textbox', label: 'Search', kind: 'fill', error: 'TARGET_NOT_ACTIONABLE', verify: 'document.querySelector("input").value', want: '' },
+  { name: 'offscreen field scrolls into view', html: '<input aria-label="Search" style="margin-top:1400px">', role: 'textbox', label: 'Search', kind: 'fill', verify: 'document.querySelector("input").value', want: 'potatoes' },
+  { name: 'transient overlay disappears before click', html: '<button aria-label="Search" onclick="document.body.dataset.clicked=\'yes\'">Search</button><div id="cover" style="position:fixed;inset:0;background:white;z-index:999"></div><script>setTimeout(()=>document.querySelector("#cover").remove(),300)</script>', role: 'button', label: 'Search', kind: 'click', verify: 'document.body.dataset.clicked', want: 'yes' },
+  { name: 'post form semantics survive missing describeNode parentId', html: '<form method="post"><button type="button" aria-label="Search" onclick="document.body.dataset.clicked=\'yes\'">Search</button></form>', role: 'button', label: 'Search', kind: 'click', formMethod: 'post', verify: 'document.body.dataset.clicked', want: 'yes' },
   { name: 'native textarea receives text', html: '<textarea aria-label="Search"></textarea>', role: 'textbox', label: 'Search', kind: 'fill',
     verify: 'document.querySelector("textarea").value', want: 'potatoes' },
   { name: 'native input receives text', html: '<input aria-label="Search">', role: 'textbox', label: 'Search', kind: 'fill',
@@ -49,43 +80,116 @@ const cases = [
     verify: 'document.body.dataset.submitted', want: 'yes' },
 ]
 app.whenReady().then(async () => {
+  const server = require('node:http').createServer((request, response) => {
+    const index = Number(request.url.split('?')[0].slice(1))
+    response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+    response.end('<!doctype html><style>textarea,input,button,x-button{display:block;margin:40px;width:420px;height:44px}</style>' + (request.url.includes('?next=1') ? '<input aria-label="New page" autofocus>' : cases[index]?.html ?? ''))
+  })
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+  const origin = 'http://127.0.0.1:' + server.address().port
   const win = new BrowserWindow({ width: 1000, height: 800, webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false } })
   const wc = win.webContents, debuggerApi = wc.debugger, trace = []
+  let activeTest, activeController, documentEpoch = 0, requestCount = 0
+  wc.on('did-start-navigation', (_event, _url, _inPlace, isMainFrame) => { if (_event.isMainFrame ?? isMainFrame) documentEpoch++ })
   const transport = {
     isAttached: () => debuggerApi.isAttached(), attach: version => debuggerApi.attach(version), detach: () => debuggerApi.detach(),
     onMessage: listener => debuggerApi.on('message', (_event, method, params) => { if (method.startsWith('DOM.')) trace.push({ method, params }); listener(method, params) }),
     send: async (method, params) => {
-      const result = await debuggerApi.sendCommand(method, params)
-      if (method === 'DOM.getNodeForLocation' || method === 'DOM.describeNode') trace.push({ method, params, result })
-      return result
+      requestCount++
+      try {
+        const result = await debuggerApi.sendCommand(method, params)
+        if (activeTest?.removeOnHit && method === 'DOM.getNodeForLocation') await wc.executeJavaScript('document.querySelector("#cover")?.remove()')
+        if (activeTest?.cancelAfterPress && method === 'Input.dispatchMouseEvent' && params.type === 'mousePressed') activeController.abort()
+        if (activeTest?.cancelAfterAnyMove && method === 'Input.dispatchMouseEvent' && params.type === 'mouseMoved') activeController.abort()
+        if (activeTest?.cancelAfterHeldMove && method === 'Input.dispatchMouseEvent' && params.type === 'mouseMoved' && params.buttons === 1) activeController.abort()
+        if (activeTest?.navigationRace && method === 'Input.dispatchMouseEvent' && params.type === 'mousePressed') await wc.loadURL(origin + '/' + cases.indexOf(activeTest) + '?next=1')
+        if (method.startsWith('Input.') || ['DOM.getNodeForLocation', 'DOM.describeNode', 'DOM.getBoxModel', 'Page.getLayoutMetrics'].includes(method)) trace.push({ method, params, result })
+        return result
+      } catch (error) {
+        trace.push({ method, params, error: error.message })
+        throw error
+      }
     },
   }
   const automation = new BrowserAutomation(transport, () => wc.getURL(), () => wc.isLoading())
   const results = []
   try {
     for (const [index, test] of cases.entries()) {
-      trace.length = 0
-      await wc.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent('<!doctype html><style>textarea,input,button,x-button{display:block;margin:40px;width:420px;height:44px}</style>' + test.html))
-      const signal = new AbortController().signal
+      trace.length = 0; requestCount = 0
+      activeTest = test
+      await wc.loadURL(origin + '/' + index)
+      activeController = new AbortController()
+      const signal = activeController.signal
       const lease = { browserId: 'private-fixture', pageIncarnation: 'fixture', generation: index }
       const started = Date.now()
       let error
       try {
-        const snapshot = await automation.snapshot(lease, { maxDepth: 20, maxNodes: 100, maxBytes: 262144 }, signal)
-        const node = snapshot.nodes.find(item => item.role === test.role && item.name === test.label)
-        assert(node, 'fixture target missing')
-        const operation = { kind: test.kind, target: { snapshotId: snapshot.snapshotId, ref: node.ref }, ...(test.kind === 'fill' ? { text: 'potatoes' } : {}) }
-        await automation.executeInteraction(await automation.prepareInteraction(lease, operation, signal), signal)
+        await automation.setViewport({ width: 1000, height: 772, deviceScaleFactor: test.dpr ?? 1 }, signal)
+        if (test.before) await wc.executeJavaScript(test.before)
+        const startEpoch = documentEpoch
+        let operation
+        if (test.pointer) {
+          const capture = await automation.screenshot(lease, undefined, false, signal)
+          assert(capture.observation, 'missing screenshot coordinate observation')
+          if (test.pixel) {
+            const image = require('electron').nativeImage.createFromBuffer(capture.data), bitmap = image.toBitmap()
+            const offset = (Math.floor(test.pointer.y) * image.getSize().width + Math.floor(test.pointer.x)) * 4
+            assert.deepStrictEqual([...bitmap.subarray(offset, offset + 3)], [0x34, 0xab, 0x12], 'requested delivered-image pixel must picture the green target')
+          }
+          operation = { ...test.pointer, screenshotId: capture.observation.screenshotId }
+        } else {
+          const snapshot = await automation.snapshot(lease, { maxDepth: 20, maxNodes: 100, maxBytes: 262144 }, signal)
+          if (test.assertTruncation) assert(snapshot.truncated && snapshot.truncationReasons?.length, 'a bounded partial snapshot must explain its truncation')
+          const node = snapshot.nodes.find(item => item.role === test.role && item.name === test.label)
+          assert(node, 'fixture target missing')
+          operation = { kind: test.kind, target: { snapshotId: snapshot.snapshotId, ref: node.ref }, ...(test.kind === 'fill' ? { text: 'potatoes' } : {}), ...(test.key ? { key: test.key } : {}), ...(test.modifiers ? { modifiers: test.modifiers } : {}) }
+        }
+        const prepared = await automation.prepareInteraction(lease, operation, signal)
+        if (test.formMethod) assert.equal(prepared.target.formMethod, test.formMethod)
+        if (test.afterPrepare) await wc.executeJavaScript(test.afterPrepare)
+        await automation.executeInteraction(prepared, signal, (_dispatched, phase) => documentEpoch === startEpoch || phase === 'cleanup' || phase === 'finish')
+        for (const followup of test.followups ?? []) {
+          const next = await automation.prepareInteraction(lease, { ...followup, target: operation.target }, signal)
+          await automation.executeInteraction(next, signal, (_dispatched, phase) => documentEpoch === startEpoch || phase === 'cleanup' || phase === 'finish')
+        }
+        if (test.cursorVisible) {
+          const amberPixel = image => {
+            const bitmap = image.toBitmap(), offset = ((test.pointer.y + 3) * image.getSize().width + test.pointer.x + 3) * 4
+            const [b, g, r] = bitmap.subarray(offset, offset + 3)
+            return r > 220 && g > 120 && g < 210 && b < 110
+          }
+          await new Promise(resolve => setTimeout(resolve, 60))
+          const visible = await wc.capturePage()
+          fs.writeFileSync(path.join(run, 'visible-cursor.png'), visible.toPNG())
+          assert(amberPixel(visible), 'native page capture must visibly contain the agent cursor')
+          const hidden = await automation.screenshot(lease, undefined, false, signal)
+          assert(!amberPixel(require('electron').nativeImage.createFromBuffer(hidden.data)), 'observation must omit the agent cursor')
+          await new Promise(resolve => setTimeout(resolve, 60))
+          assert(amberPixel(await wc.capturePage()), 'same-owner cursor must return after capture')
+        }
       } catch (failure) { error = failure.code || failure.message }
       // Evaluation is confined to our own fixture for outcome assertions, never exposed through the adapter/tools.
+      if (test.navigationRace) {
+        const until = Date.now() + 3000
+        while ((!wc.getURL().includes('?next=1') || wc.isLoadingMainFrame()) && Date.now() < until) await new Promise(resolve => setTimeout(resolve, 20))
+      }
+      if (test.cursorHiddenOnCancel) {
+        await new Promise(resolve => setTimeout(resolve, 250))
+        const image = await wc.capturePage(), bitmap = image.toBitmap()
+        const offset = ((test.pointer.y + 3) * image.getSize().width + test.pointer.x + 3) * 4
+        const [b, g, r] = bitmap.subarray(offset, offset + 3)
+        if (r > 220 && g > 120 && g < 210 && b < 110) error = 'CURSOR_NOT_CLEARED'
+      }
+      if (test.settleMs) await new Promise(resolve => setTimeout(resolve, test.settleMs))
       const actual = await wc.executeJavaScript(test.verify)
       const pass = error === test.error && actual === test.want
-      results.push({ name: test.name, pass, error: error ?? null, actual: actual ?? null, expected: test.want, elapsedMs: Date.now() - started })
+      const diagnostics = pass ? undefined : await wc.executeJavaScript('({url:location.href,focus:document.activeElement.tagName,selection:document.activeElement.selectionStart})')
+      results.push({ name: test.name, pass, error: error ?? null, actual: actual ?? null, expected: test.want, elapsedMs: Date.now() - started, adapterRequests: requestCount, diagnostics })
       fs.writeFileSync(path.join(run, `trace-${index}.json`), JSON.stringify(trace, null, 2))
       console.log(JSON.stringify(results.at(-1)))
     }
   } finally {
-    automation.dispose(); win.destroy(); clearTimeout(deadline)
+    automation.dispose(); win.destroy(); server.close(); clearTimeout(deadline)
     fs.writeFileSync(path.join(run, 'results.json'), JSON.stringify(results, null, 2))
   }
   app.exit(results.length === cases.length && results.every(result => result.pass) ? 0 : 1)

@@ -638,9 +638,9 @@ export class TabBrowserService {
                 pageIncarnation: request.pageIncarnation, generation: request.generation, origin: request.origin, action: request.operation.kind,
                 targetFingerprint: interactionTargetDigest(request.target, request.secondaryTarget), valueCategory: classification.valueCategory, valueDigest: interactionValueDigest(request.operation),
                 category: classification.category as Exclude<typeof classification.category, 'benign'>, canGrantOrigin: classification.canGrantOrigin,
-                targetLabel: [request.target, request.secondaryTarget].filter((target): target is NonNullable<typeof target> => !!target).map((target) => `${target.role} ${target.name}`.trim()).join(' → ').slice(0, 512), argumentSummary: classification.argumentSummary }, approvalSignal)
+                targetLabel: [request.target, request.secondaryTarget].filter((target): target is NonNullable<typeof target> => !!target).map((target) => `${target.role} ${target.name}`.trim()).join(' → ').slice(0, 512), argumentSummary: classification.argumentSummary, ...(request.target.visualPreview ? { visualPreview: request.target.visualPreview } : {}) }, approvalSignal)
             } finally { try { this.host.protectApproval(command.id, false) } catch { /* record may close while approval is pending */ } }
-          } : undefined)
+          } : undefined, command.broker?.controller)
           this.operations.assertDispatch(signal)
           if (command.action.type === 'setViewport') await this.schedulePersist()
           if (command.broker) this.piAction(command.id, command.broker.controller, command.action.type === 'interact' ? command.action.operation.kind : command.action.type, 'completed')

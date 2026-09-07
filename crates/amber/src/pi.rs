@@ -20,7 +20,7 @@ pub enum PiStart {
 const EXTENSION_FILE: &str = "amber-hook.ts";
 
 /// Owned Pi browser tools and exact primary-session recovery hooks.
-const EXTENSION_TS: &str = r#"// amber-owned-extension:v8
+const EXTENSION_TS: &str = r#"// amber-owned-extension:v9
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent"
 import { Type } from "typebox"
 import { spawn } from "node:child_process"
@@ -182,6 +182,7 @@ type BrowserFailure = {
   generation?: number
   snapshotHint?: boolean
   dispatched?: boolean
+  diagnostics?: { reason: "occluded" | "unstable"; targetRef: string; attemptedPoints: number }
 }
 
 function browserFailureMessage(code: string) {
@@ -197,8 +198,11 @@ function browserFailure(reply: any): BrowserFailure {
   const pageIncarnation = typeof reply?.pageIncarnation === "string" && reply.pageIncarnation.length > 0 && reply.pageIncarnation.length <= 256 ? reply.pageIncarnation : undefined
   const generation = typeof reply?.generation === "number" && Number.isSafeInteger(reply.generation) && reply.generation >= 0 ? reply.generation : undefined
   const dispatched = reply?.dispatched === true || legacy || code === ACTION_FAILED_NO_ROLLBACK
+  const d = reply?.diagnostics
+  const diagnostics = d && ["occluded", "unstable"].includes(d.reason) && typeof d.targetRef === "string" && /^n[0-9]{1,4}$/.test(d.targetRef) && Number.isInteger(d.attemptedPoints) && d.attemptedPoints >= 0 && d.attemptedPoints <= 5
+    ? { reason: d.reason as "occluded" | "unstable", targetRef: d.targetRef as string, attemptedPoints: d.attemptedPoints as number } : undefined
   return { __browserFailure: true, code, retryable: code === ACTION_FAILED_NO_ROLLBACK ? false : reply?.retryable === true, message: browserFailureMessage(code),
-    ...(pageIncarnation === undefined ? {} : { pageIncarnation }), ...(generation === undefined ? {} : { generation }),
+    ...(pageIncarnation === undefined ? {} : { pageIncarnation }), ...(generation === undefined ? {} : { generation }), ...(diagnostics ? { diagnostics } : {}),
     ...(code === ACTION_FAILED_NO_ROLLBACK ? { snapshotHint: true, dispatched: true } : dispatched ? { dispatched: true } : {}) }
 }
 
@@ -341,7 +345,7 @@ export default function (pi: ExtensionAPI) {
   })
   pi.registerTool({
     name: "browser_snapshot", label: "Snapshot browser accessibility",
-    description: "Capture a bounded accessibility-first tree. References are valid only for this page incarnation, generation, and snapshot.",
+    description: "Capture a bounded interactive-first accessibility projection with truncation reasons; depth is approximate, not a full DOM tree. Prefer semantic references for normal controls; use screenshots and grounded mouse tools for custom widgets. References require this current page, generation and snapshot.",
     parameters: Type.Object({ ...pageLease, limits: Type.Optional(Type.Object({
       maxDepth: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
       maxNodes: Type.Optional(Type.Integer({ minimum: 1, maximum: 2000 })),
@@ -369,7 +373,7 @@ export default function (pi: ExtensionAPI) {
   })
   pi.registerTool({
     name: "browser_screenshot", label: "Screenshot browser",
-    description: "Capture a bounded in-memory PNG. The image may contain secrets visibly present on the shared page.",
+    description: "Capture a bounded PNG. Viewport captures include observation.screenshotId and delivered image-pixel coordinates for mouse tools, valid only for the current page/generation. Full-page/element captures are not coordinate bases. Images may contain visible secrets.",
     parameters: Type.Object({ ...pageLease,
       snapshotId: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
       ref: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })),
@@ -437,10 +441,11 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({ ...pageLease, target: browserTarget, text: Type.String({ maxLength: 8192 }) }, { additionalProperties: false }),
     async execute(_id, params, signal) { return result(await browserRequest({ type: "interact", pageIncarnation: params.pageIncarnation, expectedGeneration: params.expectedGeneration, operation: { kind, target: params.target, text: params.text } }, signal)) },
   })
+  const browserModifiers = Type.Array(Type.Union([Type.Literal("Control"), Type.Literal("Meta"), Type.Literal("Shift"), Type.Literal("Alt")]), { maxItems: 4, uniqueItems: true })
   pi.registerTool({
-    name: "browser_press", label: "browser press", description: "Press one allowlisted key, optionally on a current snapshot target.",
-    parameters: Type.Object({ ...pageLease, target: Type.Optional(browserTarget), key: Type.String({ minLength: 1, maxLength: 64, pattern: "^(Enter|Tab|Escape|Backspace|Delete|Space|Arrow(Up|Down|Left|Right)|Home|End|Page(Up|Down)|[A-Za-z0-9])$" }) }, { additionalProperties: false }),
-    async execute(_id, params, signal) { return result(await browserRequest({ type: "interact", pageIncarnation: params.pageIncarnation, expectedGeneration: params.expectedGeneration, operation: { kind: "press", key: params.key, ...(params.target ? { target: params.target } : {}) } }, signal)) },
+    name: "browser_press", label: "browser press", description: "Press one key or bounded editing/navigation chord. Control/Meta+A/Z/Y, word/line movement and selection are allowed; clipboard, browser-chrome, filesystem and system shortcuts are refused.",
+    parameters: Type.Object({ ...pageLease, target: Type.Optional(browserTarget), modifiers: Type.Optional(browserModifiers), key: Type.String({ minLength: 1, maxLength: 64, pattern: "^(Enter|Tab|Escape|Backspace|Delete|Space|Arrow(Up|Down|Left|Right)|Home|End|Page(Up|Down)|[A-Za-z0-9])$" }) }, { additionalProperties: false }),
+    async execute(_id, params, signal) { return result(await browserRequest({ type: "interact", pageIncarnation: params.pageIncarnation, expectedGeneration: params.expectedGeneration, operation: { kind: "press", key: params.key, ...(params.modifiers ? { modifiers: params.modifiers } : {}), ...(params.target ? { target: params.target } : {}) } }, signal)) },
   })
   pi.registerTool({
     name: "browser_select", label: "browser select", description: "Select one bounded native option on a current snapshot target.",
@@ -456,6 +461,24 @@ export default function (pi: ExtensionAPI) {
     name: "browser_drag", label: "browser drag", description: "Drag between two current snapshot targets with actionability and fingerprint revalidation.",
     parameters: Type.Object({ ...pageLease, source: browserTarget, target: browserTarget }, { additionalProperties: false }),
     async execute(_id, params, signal) { return result(await browserRequest({ type: "interact", pageIncarnation: params.pageIncarnation, expectedGeneration: params.expectedGeneration, operation: { kind: "drag", source: params.source, target: params.target } }, signal)) },
+  })
+  const pointerPoint = Type.Object({ x: Type.Number({ minimum: 0, exclusiveMaximum: 4096 }), y: Type.Number({ minimum: 0, exclusiveMaximum: 4096 }) }, { additionalProperties: false })
+  const pointerPath = Type.Array(pointerPoint, { minItems: 2, maxItems: 64 })
+  for (const [name, kind] of [["browser_mouse_move", "mouseMove"], ["browser_mouse_click", "mouseClick"], ["browser_mouse_scroll", "mouseScroll"], ["browser_mouse_drag", "mouseDrag"], ["browser_type_focused", "typeFocused"]] as const) pi.registerTool({
+    name, label: name.replaceAll("_", " "),
+    description: kind === "typeFocused"
+      ? "Type bounded Unicode text into the current verified editable focus, using a fresh viewport screenshotId. Sensitive entry waits for approval. Returns an updated screenshot by default."
+      : "Move/click/scroll/drag only inside this shared browser, grounded in a fresh viewport screenshotId and delivered PNG pixels. Click/drag always require approve-once. Paths have 2–64 points; a move/click approach path must end at x,y. No desktop pointer or raw down/up. Returns an updated screenshot by default; afterScreenshot:false skips it. Never retry possibly dispatched input blindly.",
+    parameters: Type.Object({ ...pageLease, screenshotId: Type.String({ minLength: 1, maxLength: 128 }), afterScreenshot: Type.Optional(Type.Boolean()),
+      ...(kind === "typeFocused" ? { text: Type.String({ maxLength: 8192 }) } : { modifiers: Type.Optional(browserModifiers),
+        ...(kind === "mouseDrag" ? { path: pointerPath } : { ...pointerPoint.properties,
+          ...(kind === "mouseScroll" ? { deltaX: Type.Integer({ minimum: -10000, maximum: 10000 }), deltaY: Type.Integer({ minimum: -10000, maximum: 10000 }) }
+            : { path: Type.Optional(pointerPath), ...(kind === "mouseClick" ? { button: Type.Optional(Type.Union([Type.Literal("left"), Type.Literal("right")])), clickCount: Type.Optional(Type.Union([Type.Literal(1), Type.Literal(2)])) } : {}) }) }) }),
+    }, { additionalProperties: false }),
+    async execute(_id, params, signal) {
+      const { pageIncarnation, expectedGeneration, ...operation } = params
+      return result(await browserRequest({ type: "interact", pageIncarnation, expectedGeneration, operation: { kind, ...operation, afterScreenshot: operation.afterScreenshot ?? true } }, signal))
+    },
   })
   pi.registerTool({
     name: "browser_set_viewport", label: "Set browser viewport",
@@ -589,7 +612,7 @@ pub fn ensure_global_pi_extension() {
 fn is_owned_extension_source(source: &str) -> bool {
     matches!(
         source.lines().next(),
-        Some("// amber-owned-extension:v2" | "// amber-owned-extension:v3" | "// amber-owned-extension:v4" | "// amber-owned-extension:v5" | "// amber-owned-extension:v6" | "// amber-owned-extension:v7" | "// amber-owned-extension:v8")
+        Some("// amber-owned-extension:v2" | "// amber-owned-extension:v3" | "// amber-owned-extension:v4" | "// amber-owned-extension:v5" | "// amber-owned-extension:v6" | "// amber-owned-extension:v7" | "// amber-owned-extension:v8" | "// amber-owned-extension:v9")
     )
 }
 
@@ -735,7 +758,7 @@ mod tests {
         let path = extensions.join("amber-hook.ts");
         let first = fs::read_to_string(&path).unwrap();
         assert_eq!(first, EXTENSION_TS);
-        assert!(first.starts_with("// amber-owned-extension:v8\n"));
+        assert!(first.starts_with("// amber-owned-extension:v9\n"));
         assert!(first.contains("amber-ide-${uid}"));
         assert!(first.contains("metadata.isSymbolicLink()"));
         assert!(first.contains("[\"ctl\", \"browser-host\", \"ensure\", \"--root\", state]"));
@@ -865,7 +888,7 @@ mod tests {
         let extensions = dir.path().join("extensions");
         fs::create_dir_all(&extensions).unwrap();
         let path = extensions.join(EXTENSION_FILE);
-        let future = "// amber-owned-extension:v9\n// future payload\n";
+        let future = "// amber-owned-extension:v10\n// future payload\n";
         fs::write(&path, future).unwrap();
 
         assert!(install_extension_in(&extensions).is_err());

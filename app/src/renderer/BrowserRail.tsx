@@ -47,7 +47,7 @@ export function BrowserRail(props: {
   const [status, setStatus] = useState<BrowserStatus | null>(null)
   const [address, setAddress] = useState('')
   const [error, setError] = useState('')
-  const [approval, setApproval] = useState<null | { approvalId: string; digest: string; controller: string; origin: string; category: string; targetLabel: string; argumentSummary: string; expiresAt: number; canGrantOrigin: boolean }>(null)
+  const [approval, setApproval] = useState<null | { approvalId: string; digest: string; controller: string; origin: string; category: string; targetLabel: string; argumentSummary: string; visualPreview?: string; expiresAt: number; canGrantOrigin: boolean }>(null)
   const [dialog, setDialog] = useState<null | { dialogId: string; digest: string; dialogType: string; message: string; expiresAt: number }>(null)
   const [promptText, setPromptText] = useState('')
   const [lastAction, setLastAction] = useState<null | { action: string; phase: string; error?: string }>(null)
@@ -212,7 +212,8 @@ export function BrowserRail(props: {
     {approval && <div className="tab-browser-approval" role="alertdialog" aria-modal="true" aria-label="Pi browser action approval">
       <strong>Pi requests a consequential browser action</strong><div>{approval.category} · {approval.origin}</div><div>Controller: {approval.controller}</div>
       <div>Expires in {secondsRemaining(approval.expiresAt, clock)}s · dispatch not started</div><div>Target (untrusted browser content): {approval.targetLabel || 'page'}</div>
-      {approval.argumentSummary && <div>Value: {approval.argumentSummary}</div>}<div className="tab-browser-approval-actions">
+      {approval.visualPreview?.startsWith('data:image/png;base64,') && approval.visualPreview.length <= 512 * 1024 + 32 && <img src={approval.visualPreview} alt="Untrusted browser target preview" style={{ maxWidth: 256, maxHeight: 256, objectFit: 'contain' }} />}
+      {approval.argumentSummary && <div>Action details: {approval.argumentSummary}</div>}<div className="tab-browser-approval-actions">
         <button className="btn" onClick={() => void command({ type: 'resolveApproval', approvalId: approval.approvalId, digest: approval.digest, decision: 'approve-once' })}>Approve once</button>
         {approval.canGrantOrigin && <button className="btn" onClick={() => void command({ type: 'resolveApproval', approvalId: approval.approvalId, digest: approval.digest, decision: 'allow-origin' })}>Allow this confirmation for origin</button>}
         <button className="btn" onClick={() => void command({ type: 'resolveApproval', approvalId: approval.approvalId, digest: approval.digest, decision: 'reject' })}>Reject</button>

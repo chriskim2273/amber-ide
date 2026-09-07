@@ -1,5 +1,13 @@
 import { describe, expect, it } from 'vitest'
-import { quadBounds } from './browserGeometry'
+import { quadBounds, visibleQuadPoints } from './browserGeometry'
+
+it('chooses interior points from the visible part of a clipped or transformed quad', () => {
+  expect(visibleQuadPoints([-100, 0, 10, 0, 10, 10, -100, 10], 100, 100)[0]).toEqual({ x: 5, y: 5 })
+  const points = visibleQuadPoints([50, -50, 150, 50, 50, 150, -50, 50], 100, 100)
+  expect(points.length).toBeLessThanOrEqual(5)
+  expect(points.every(p => p.x >= 0 && p.y >= 0 && p.x < 100 && p.y < 100)).toBe(true)
+  expect(() => visibleQuadPoints([-100, 0, -90, 0, -90, 10, -100, 10], 100, 100)).toThrow('TARGET_NOT_ACTIONABLE')
+})
 
 describe('quad bounds', () => {
   it.each([

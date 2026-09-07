@@ -1,4 +1,13 @@
 import { parseBrowserViewport } from '../shared/browserViewport'
+import { parseModifiers, type BrowserModifier } from './browserKeyboard'
+export interface BrowserPoint { x: number; y: number }
+interface PointerBase { screenshotId: string; afterScreenshot?: boolean; modifiers?: BrowserModifier[] }
+export type BrowserPointerInteraction =
+  | (PointerBase & BrowserPoint & { kind: 'mouseMove' | 'mouseClick'; path?: BrowserPoint[]; button?: 'left' | 'right'; clickCount?: 1 | 2 })
+  | (PointerBase & BrowserPoint & { kind: 'mouseScroll'; deltaX: number; deltaY: number })
+  | (PointerBase & { kind: 'mouseDrag'; path: BrowserPoint[] })
+  | (PointerBase & { kind: 'typeFocused'; text: string })
+export function isPointerInteraction(operation: BrowserInteraction): operation is BrowserPointerInteraction { return 'screenshotId' in operation }
 
 export interface BrowserPageLease { pageIncarnation: string; expectedGeneration: number }
 export interface BrowserElementRef { snapshotId: string; ref: string }
@@ -7,10 +16,11 @@ export type BrowserTarget = BrowserElementRef | BrowserRoleLocator
 export type BrowserInteraction =
   | { kind: 'click' | 'doubleClick' | 'hover' | 'check' | 'uncheck'; target: BrowserTarget }
   | { kind: 'fill' | 'type'; target: BrowserTarget; text: string }
-  | { kind: 'press'; target?: BrowserTarget; key: string }
+  | { kind: 'press'; target?: BrowserTarget; key: string; modifiers?: BrowserModifier[] }
   | { kind: 'select'; target: BrowserTarget; values: string[] }
   | { kind: 'scroll'; target?: BrowserTarget; deltaX: number; deltaY: number }
   | { kind: 'drag'; source: BrowserTarget; target: BrowserTarget }
+  | BrowserPointerInteraction
 export interface SnapshotLimits { maxDepth: number; maxNodes: number; maxBytes: number }
 export interface FindQuery { text?: string; regex?: string; role?: string; name?: string; limit: number }
 export type ConsoleLevel = 'log' | 'info' | 'warning' | 'error'
@@ -69,9 +79,35 @@ function browserTarget(value: unknown): BrowserTarget {
 function interaction(value: unknown): BrowserInteraction {
   const operation = record(value)
   if (!operation || !boundedString(operation['kind'], 32)) throw new Error('INVALID_REQUEST')
+  if (['mouseMove', 'mouseClick', 'mouseScroll', 'mouseDrag', 'typeFocused'].includes(operation['kind'])) {
+    const kind = operation['kind']
+    const shared = ['kind', 'screenshotId', 'afterScreenshot', 'modifiers']
+    const fields = kind === 'mouseDrag' ? ['path'] : kind === 'typeFocused' ? ['text'] : kind === 'mouseScroll' ? ['x', 'y', 'deltaX', 'deltaY'] : ['x', 'y', 'path', ...(kind === 'mouseClick' ? ['button', 'clickCount'] : [])]
+    if (!exact(operation, [...shared, ...fields], ['kind', 'screenshotId']) || !boundedString(operation['screenshotId'], 128) || (operation['afterScreenshot'] !== undefined && typeof operation['afterScreenshot'] !== 'boolean')) throw new Error('INVALID_REQUEST')
+    const modifiers = parseModifiers(operation['modifiers'])
+    const point = (raw: unknown): BrowserPoint => {
+      const p = record(raw)
+      if (!p || !exact(p, ['x', 'y']) || typeof p['x'] !== 'number' || typeof p['y'] !== 'number' || !Number.isFinite(p['x']) || !Number.isFinite(p['y']) || p['x'] < 0 || p['y'] < 0 || p['x'] >= 4096 || p['y'] >= 4096) throw new Error('INVALID_REQUEST')
+      return { x: p['x'], y: p['y'] }
+    }
+    const base = { screenshotId: operation['screenshotId'], ...(operation['afterScreenshot'] === undefined ? {} : { afterScreenshot: operation['afterScreenshot'] }), ...(operation['modifiers'] === undefined ? {} : { modifiers }) }
+    if (kind === 'typeFocused') { if (!boundedString(operation['text'], 8192, true) || modifiers.length) throw new Error('INVALID_REQUEST'); return { kind, ...base, text: operation['text'] } }
+    let path: BrowserPoint[] | undefined
+    if (kind === 'mouseDrag' || operation['path'] !== undefined) {
+      if (!Array.isArray(operation['path']) || operation['path'].length < 2 || operation['path'].length > 64) throw new Error('INVALID_REQUEST')
+      path = operation['path'].map(point)
+    }
+    if (kind === 'mouseDrag') return { kind, ...base, path: path! }
+    const p = point({ x: operation['x'], y: operation['y'] })
+    if (path && (path.at(-1)!.x !== p.x || path.at(-1)!.y !== p.y)) throw new Error('INVALID_REQUEST')
+    if (kind === 'mouseScroll') { if (!boundedInt(operation['deltaX'], -10000, 10000) || !boundedInt(operation['deltaY'], -10000, 10000)) throw new Error('INVALID_REQUEST'); return { kind, ...base, ...p, deltaX: operation['deltaX'], deltaY: operation['deltaY'] } }
+    if (operation['button'] !== undefined && !['left', 'right'].includes(String(operation['button']))) throw new Error('INVALID_REQUEST')
+    if (operation['clickCount'] !== undefined && operation['clickCount'] !== 1 && operation['clickCount'] !== 2) throw new Error('INVALID_REQUEST')
+    return { kind: kind as 'mouseMove' | 'mouseClick', ...base, ...p, ...(path ? { path } : {}), ...(operation['button'] === undefined ? {} : { button: operation['button'] as 'left' | 'right' }), ...(operation['clickCount'] === undefined ? {} : { clickCount: operation['clickCount'] as 1 | 2 }) }
+  }
   if (['click', 'doubleClick', 'hover', 'check', 'uncheck'].includes(operation['kind']) && exact(operation, ['kind', 'target'])) return { kind: operation['kind'] as 'click', target: browserTarget(operation['target']) }
   if ((operation['kind'] === 'fill' || operation['kind'] === 'type') && exact(operation, ['kind', 'target', 'text']) && boundedString(operation['text'], 8192, true)) return { kind: operation['kind'], target: browserTarget(operation['target']), text: operation['text'] }
-  if (operation['kind'] === 'press' && exact(operation, ['kind', 'target', 'key'], ['kind', 'key']) && boundedString(operation['key'], 64) && /^(?:Enter|Tab|Escape|Backspace|Delete|Space|Arrow(?:Up|Down|Left|Right)|Home|End|Page(?:Up|Down)|[A-Za-z0-9])$/.test(operation['key'])) return { kind: 'press', ...(operation['target'] === undefined ? {} : { target: browserTarget(operation['target']) }), key: operation['key'] }
+  if (operation['kind'] === 'press' && exact(operation, ['kind', 'target', 'key', 'modifiers'], ['kind', 'key']) && boundedString(operation['key'], 64) && /^(?:Enter|Tab|Escape|Backspace|Delete|Space|Arrow(?:Up|Down|Left|Right)|Home|End|Page(?:Up|Down)|[A-Za-z0-9])$/.test(operation['key'])) return { kind: 'press', ...(operation['target'] === undefined ? {} : { target: browserTarget(operation['target']) }), key: operation['key'], ...(operation['modifiers'] === undefined ? {} : { modifiers: parseModifiers(operation['modifiers'], operation['key']) }) }
   if (operation['kind'] === 'select' && exact(operation, ['kind', 'target', 'values']) && Array.isArray(operation['values']) && operation['values'].length === 1 && operation['values'].every((item) => boundedString(item, 256))) return { kind: 'select', target: browserTarget(operation['target']), values: operation['values'] as string[] }
   if (operation['kind'] === 'scroll' && exact(operation, ['kind', 'target', 'deltaX', 'deltaY'], ['kind', 'deltaX', 'deltaY']) && boundedInt(operation['deltaX'], -10_000, 10_000) && boundedInt(operation['deltaY'], -10_000, 10_000)) return { kind: 'scroll', ...(operation['target'] === undefined ? {} : { target: browserTarget(operation['target']) }), deltaX: operation['deltaX'], deltaY: operation['deltaY'] }
   if (operation['kind'] === 'drag' && exact(operation, ['kind', 'source', 'target'])) return { kind: 'drag', source: browserTarget(operation['source']), target: browserTarget(operation['target']) }

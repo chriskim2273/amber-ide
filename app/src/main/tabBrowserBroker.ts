@@ -10,7 +10,7 @@ import type { BrowserBinaryAttachment } from './browserAutomation'
 import { ensurePrivateRuntimeDirectory } from './browserHostPaths'
 import type { BrowserOperationRegistry } from './browserOperationRegistry'
 import { readSafeTextFile, SafeFileReadError } from './safeFileReader'
-import { ACTION_FAILED_NO_ROLLBACK, BrowserActionError, FRESH_SNAPSHOT_MESSAGE, isBrowserActionError, safeBrowserCode } from './browserErrors'
+import { ACTION_FAILED_NO_ROLLBACK, BrowserActionError, FRESH_SNAPSHOT_MESSAGE, isBrowserActionError, isBrowserAutomationError, safeBrowserCode, type BrowserInteractionDiagnostics } from './browserErrors'
 
 export type BrokerAction =
   | { type: 'open' }
@@ -145,7 +145,7 @@ export function brokerRequestDigest(request: Pick<BrokerRequest, 'sequence' | 'a
 const RETRYABLE_BROWSER_ERRORS = new Set([
   'ACTION_CANCELLED', 'ACTION_TIMEOUT', 'BROWSER_CAPACITY_BUSY', 'BROWSER_FROZEN', 'BROWSER_HOST_UNAVAILABLE',
   'INTERNAL_ERROR', 'PAGE_CLOSED', 'STALE_GENERATION', 'TARGET_AMBIGUOUS', 'TARGET_NOT_ACTIONABLE', 'TARGET_NOT_FOUND',
-  'TARGET_OCCLUDED', 'UNSUPPORTED_PAGE',
+  'TARGET_OCCLUDED', 'TARGET_UNSTABLE', 'UNSUPPORTED_PAGE',
 ])
 
 function brokerMessage(code: string): string {
@@ -164,6 +164,7 @@ export interface BrokerFailureDetails {
   generation?: number
   snapshotHint?: boolean
   dispatched?: boolean
+  diagnostics?: BrowserInteractionDiagnostics
 }
 
 function isNoRollbackCode(code: string): boolean {
@@ -172,6 +173,7 @@ function isNoRollbackCode(code: string): boolean {
 
 export function safeBrokerFailure(error: unknown): BrokerFailureDetails {
   const actionError = isBrowserActionError(error) ? error : null
+  const diagnostics = actionError?.diagnostics ?? (isBrowserAutomationError(error) ? error.diagnostics : undefined)
   const rawValue = error as { code?: unknown; dispatched?: unknown; pageIncarnation?: unknown; generation?: unknown } | null
   const rawCode = actionError?.code ?? rawValue?.code ?? (error instanceof Error ? error.message : undefined)
   const normalized = safeBrowserCode(rawCode)
@@ -181,6 +183,7 @@ export function safeBrokerFailure(error: unknown): BrokerFailureDetails {
     code,
     retryable: code === ACTION_FAILED_NO_ROLLBACK ? false : actionError?.retryable ?? RETRYABLE_BROWSER_ERRORS.has(code),
     message: brokerMessage(code),
+    ...(diagnostics ? { diagnostics } : {}),
     ...(typeof (actionError?.pageIncarnation ?? rawValue?.pageIncarnation) === 'string' && (actionError?.pageIncarnation ?? rawValue?.pageIncarnation) ? { pageIncarnation: String(actionError?.pageIncarnation ?? rawValue?.pageIncarnation).slice(0, 256) } : {}),
     ...(actionError?.generation !== undefined ? { generation: actionError.generation } : typeof rawValue?.generation === 'number' && Number.isSafeInteger(rawValue.generation) && rawValue.generation >= 0 ? { generation: rawValue.generation } : {}),
     ...(code === ACTION_FAILED_NO_ROLLBACK ? { snapshotHint: true, dispatched: true } : dispatched ? { dispatched: true } : {}),
@@ -201,6 +204,7 @@ function brokerErrorEnvelope(requestId: string | undefined, error: unknown): Rec
     ...(details.generation === undefined ? {} : { generation: details.generation }),
     ...(details.snapshotHint === undefined ? {} : { snapshotHint: details.snapshotHint }),
     ...(details.dispatched === undefined ? {} : { dispatched: details.dispatched }),
+    ...(details.diagnostics ? { diagnostics: details.diagnostics } : {}),
   }
 }
 function binaryAttachment(value: unknown): value is BrowserBinaryAttachment {
@@ -371,7 +375,7 @@ export class TabBrowserBrokerServer {
     const safeWrite = (value: unknown): void => { if (!socket.destroyed && socket.writable) socket.write(frame(value)) }
     const safeWriteResult = (requestId: string, result: unknown): void => {
       if (binaryAttachment(result)) {
-        safeWrite({ version: 1, requestId, ok: true, result: { contentTrust: 'untrusted-browser-content', mediaType: result.mediaType, ...(result.width === undefined ? {} : { width: result.width }), ...(result.height === undefined ? {} : { height: result.height }), ...(result.browserId === undefined ? {} : { browserId: result.browserId }), ...(result.pageIncarnation === undefined ? {} : { pageIncarnation: result.pageIncarnation }), ...(result.generation === undefined ? {} : { generation: result.generation }), attachment: { encoding: 'binary-frame', byteLength: result.data.length } } })
+        safeWrite({ version: 1, requestId, ok: true, result: { contentTrust: 'untrusted-browser-content', mediaType: result.mediaType, ...(result.width === undefined ? {} : { width: result.width }), ...(result.height === undefined ? {} : { height: result.height }), ...(result.browserId === undefined ? {} : { browserId: result.browserId }), ...(result.pageIncarnation === undefined ? {} : { pageIncarnation: result.pageIncarnation }), ...(result.generation === undefined ? {} : { generation: result.generation }), ...(result.observation ? { observation: result.observation } : {}), ...(result.actionResult ? { actionResult: result.actionResult, dispatched: result.actionResult.dispatched === true, rollbackPossible: false } : {}), attachment: { encoding: 'binary-frame', byteLength: result.data.length } } })
         if (!socket.destroyed && socket.writable) { socket.write(binaryFrameHeader(result.data)); socket.write(result.data) }
       } else safeWrite({ version: 1, requestId, ok: true, result })
     }
