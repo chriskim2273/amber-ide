@@ -69,6 +69,16 @@ describe('BrowserDialogCoordinator', () => {
 })
 
 describe('BrowserApprovalCoordinator', () => {
+  it('skips prompting when the user enabled Full access for that browser', async () => {
+    const events: unknown[] = []
+    const coordinator = new BrowserApprovalCoordinator(() => 1000, () => false, (event) => events.push(event))
+    coordinator.setFullAccess(base.browserId, true)
+    await expect(coordinator.request({ ...base, category: 'destructive', canGrantOrigin: false, targetLabel: 'Delete', argumentSummary: '' }, new AbortController().signal)).resolves.toBeUndefined()
+    expect(events).toEqual([])
+    coordinator.setFullAccess(base.browserId, false)
+    await expect(coordinator.request({ ...base, category: 'financial', canGrantOrigin: false, targetLabel: 'Pay', argumentSummary: '' }, new AbortController().signal)).rejects.toThrow('APPROVAL_REQUIRED')
+  })
+
   it('uses the 60 second contract by default', async () => {
     const events: unknown[] = [], coordinator = new BrowserApprovalCoordinator(() => 1000, () => true, (event) => events.push(event))
     const pending = coordinator.request({ ...base, category: 'destructive', canGrantOrigin: false, targetLabel: 'Delete', argumentSummary: '' }, new AbortController().signal)

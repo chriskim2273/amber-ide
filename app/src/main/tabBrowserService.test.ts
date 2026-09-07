@@ -16,6 +16,7 @@ describe('parseTabBrowserCommand', () => {
     expect(parseTabBrowserCommand({ type: 'open' })).toEqual({ type: 'open' })
     expect(parseTabBrowserCommand({ type: 'close' })).toEqual({ type: 'close' })
     expect(parseTabBrowserCommand({ type: 'share', sharedWithPi: true })).toEqual({ type: 'share', sharedWithPi: true })
+    expect(parseTabBrowserCommand({ type: 'fullAccess', fullAccess: true })).toEqual({ type: 'fullAccess', fullAccess: true })
     expect(parseTabBrowserCommand({ type: 'designate', designatedPi: 'amber-1-1-0-pi' })).toEqual({ type: 'designate', designatedPi: 'amber-1-1-0-pi' })
     expect(parseTabBrowserCommand({ type: 'show', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', bounds: { x: 1, y: 2, width: 3, height: 4 } })).toEqual({ type: 'show', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', bounds: { x: 1, y: 2, width: 3, height: 4 } })
     expect(parseTabBrowserCommand({ type: 'reload', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', pageIncarnation: 'page', expectedGeneration: 2 })).toMatchObject({ type: 'reload', expectedGeneration: 2 })
@@ -30,6 +31,7 @@ describe('parseTabBrowserCommand', () => {
     expect(parseTabBrowserCommand({ type: 'resolveDialog', dialogId: 'd', digest: 'b'.repeat(64), accept: true, promptText: 'ok' }).type).toBe('resolveDialog')
   })
   it('rejects generic methods, unknown keys, invalid ids, and unsafe geometry', () => {
+    expect(() => parseTabBrowserCommand({ type: 'fullAccess', fullAccess: true, id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' })).toThrow('INVALID_REQUEST')
     expect(() => parseTabBrowserCommand({ type: 'cdp', method: 'Runtime.evaluate' })).toThrow('INVALID_REQUEST')
     expect(() => parseTabBrowserCommand({ type: 'open', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' })).toThrow('INVALID_REQUEST')
     expect(() => parseTabBrowserCommand({ type: 'close', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' })).toThrow('INVALID_REQUEST')

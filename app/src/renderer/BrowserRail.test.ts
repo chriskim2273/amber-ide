@@ -62,6 +62,19 @@ describe('BrowserRail accessibility contract', () => {
     expect(html).toContain('role="separator"')
     expect(html).toContain('aria-orientation="vertical"')
     expect(html).toContain('aria-valuenow="420"')
+    expect(html).toContain('aria-label="Full access"')
+    expect(html).not.toMatch(/aria-label="Full access"[^>]*disabled/)
+    expect(html).not.toMatch(/aria-label="Full access"[^>]*checked/)
+  })
+
+  it('enables Full access only after Share with Pi and does not let the agent self-grant', () => {
+    const unshared = renderToStaticMarkup(createElement(BrowserRail, { ...props, designatedPi: 'amber-1-1-0-pi' }))
+    expect(unshared).toMatch(/aria-label="Full access"[^>]*disabled/)
+    const shared = renderToStaticMarkup(createElement(BrowserRail, { ...props, designatedPi: 'amber-1-1-0-pi', sharedWithPi: true, fullAccess: true }))
+    expect(shared).toContain('aria-label="Full access"')
+    expect(shared).toContain('Full access')
+    expect(shared).not.toMatch(/aria-label="Full access"[^>]*disabled/)
+    expect(shared).toMatch(/aria-label="Full access"[^>]*checked/)
   })
 
   it('renders style and ARIA from the same clamped width metrics', () => {

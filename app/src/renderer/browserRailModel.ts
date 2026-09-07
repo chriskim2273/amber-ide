@@ -72,6 +72,7 @@ export interface RailStatusInput {
   focused: boolean
   diagnostics: { consoleIssues: number; networkFailures: number }
   sharedWithPi: boolean
+  fullAccess?: boolean
 }
 
 export function railStatusLines(input: RailStatusInput): string[] {
@@ -84,6 +85,7 @@ export function railStatusLines(input: RailStatusInput): string[] {
   if (input.diagnostics.consoleIssues > 0) lines.push(`Console issues: ${input.diagnostics.consoleIssues}`)
   if (input.diagnostics.networkFailures > 0) lines.push(`Network failures: ${input.diagnostics.networkFailures}`)
   if (input.sharedWithPi) lines.push('Shared with Pi')
+  if (input.fullAccess) lines.push('Full access')
   if (input.focused) lines.push('Browser page focused')
   return lines
 }

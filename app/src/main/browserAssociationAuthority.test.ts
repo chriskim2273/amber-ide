@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { browserAuthorityChanged, deriveActiveBrowserId, bindRendererBrowserCommand, removedBrowserIds } from './browserAssociationAuthority'
+import { applyBrowserRailAssociation, browserAuthorityChanged, deriveActiveBrowserId, bindRendererBrowserCommand, removedBrowserIds } from './browserAssociationAuthority'
 import type { LayoutFile } from '../shared/layoutFile'
 
 const id = 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
@@ -36,5 +36,23 @@ describe('renderer browser association authority', () => {
   })
   it('fails closed without an active association', () => {
     expect(() => bindRendererBrowserCommand(null, { type: 'status', id: other })).toThrow('NO_BROWSER_FOR_TAB')
+  })
+  it('does not treat Full access as a broker authority change', () => {
+    const changed = structuredClone(layout)
+    changed.workspaces['1']!.tabs['2']!.browser!.fullAccess = true
+    expect(browserAuthorityChanged(layout, changed)).toBe(false)
+  })
+  it('applies Full access only for a designated shared controller and clears it on unshare or redesignate', () => {
+    const privateRail = { id, width: 420, collapsed: false }
+    expect(() => applyBrowserRailAssociation(privateRail, { type: 'fullAccess', fullAccess: true })).toThrow('NOT_DESIGNATED_CONTROLLER')
+    expect(() => applyBrowserRailAssociation({ ...privateRail, designatedPi: 'amber-1-1-0-pi' }, { type: 'fullAccess', fullAccess: true })).toThrow('NOT_SHARED')
+    const shared = applyBrowserRailAssociation({ ...privateRail, designatedPi: 'amber-1-1-0-pi' }, { type: 'share', sharedWithPi: true })
+    expect(shared).toMatchObject({ designatedPi: 'amber-1-1-0-pi', sharedWithPi: true })
+    expect(shared).not.toHaveProperty('fullAccess')
+    const granted = applyBrowserRailAssociation(shared, { type: 'fullAccess', fullAccess: true })
+    expect(granted.fullAccess).toBe(true)
+    expect(applyBrowserRailAssociation(granted, { type: 'share', sharedWithPi: false })).not.toHaveProperty('fullAccess')
+    expect(applyBrowserRailAssociation(granted, { type: 'designate' })).not.toHaveProperty('fullAccess')
+    expect(bindRendererBrowserCommand(id, { type: 'fullAccess', fullAccess: true })).toEqual({ type: 'fullAccess', fullAccess: true })
   })
 })

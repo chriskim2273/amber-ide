@@ -29,6 +29,7 @@ describe('tab browser broker boundary', () => {
   it('strictly parses bounded typed requests', () => {
     expect(parseBrokerRequest({ version: 1, clientInstanceId: 'client-01', sequence: 1, requestId: 'r1', amberSession: 'amber-1-2-0-pane', action: { type: 'status' } }).action).toEqual({ type: 'status' })
     expect(parseBrokerRequest({ version: 1, clientInstanceId: 'client-01', sequence: 2, requestId: 'r2', amberSession: 'amber-1-2-0-pane', action: { type: 'snapshot', pageIncarnation: 'page', expectedGeneration: 1 } }).action).toMatchObject({ type: 'snapshot', limits: { maxNodes: 2000 } })
+    expect(() => parseBrokerRequest({ version: 1, clientInstanceId: 'client-01', sequence: 1, requestId: 'r1', amberSession: 'amber-1-2-0-pane', action: { type: 'fullAccess', fullAccess: true } })).toThrow('INVALID_REQUEST')
     expect(() => parseBrokerRequest({ version: 1, clientInstanceId: 'client-01', sequence: 1, requestId: 'r1', amberSession: 'amber-1-2-0-pane', action: { type: 'cdp' } })).toThrow('INVALID_REQUEST')
     expect(() => parseBrokerRequest({ version: 1, clientInstanceId: 'client-01', sequence: 1, requestId: 'r1', amberSession: 'amber-1-2-0-pane', action: { type: 'stop' } })).toThrow('INVALID_REQUEST')
     expect(() => parseBrokerRequest({ version: 1, clientInstanceId: 'client-01', sequence: 1, requestId: 'r1', amberSession: '', action: { type: 'status' } })).toThrow('INVALID_REQUEST')

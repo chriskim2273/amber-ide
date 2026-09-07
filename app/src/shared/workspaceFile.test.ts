@@ -95,6 +95,7 @@ describe('browser panes in .amberws', () => {
     expect(plan.browserRails[0]).toMatchObject({ id: ids[1], ws: 2, tab: 1, rail: { id: ids[1], width: 420, collapsed: false } })
     expect(plan.workspaces['2']!.tabs['1']!.browser).not.toHaveProperty('sharedWithPi')
     expect(plan.workspaces['2']!.tabs['1']!.browser).not.toHaveProperty('designatedPi')
+    expect(plan.workspaces['2']!.tabs['1']!.browser).not.toHaveProperty('fullAccess')
   })
 
   it('recovers extra v1 browsers and serializes neither recovery nor sharing secrets', () => {
@@ -108,6 +109,7 @@ describe('browser panes in .amberws', () => {
     expect(wire).not.toContain('browserRecovery')
     expect(wire).not.toContain('sharedWithPi')
     expect(wire).not.toContain('designatedPi')
+    expect(wire).not.toContain('fullAccess')
   })
 
   it('rejects v2 browser panes, duplicate placeholders, unknown tree leaves, and invalid browser geometry', () => {

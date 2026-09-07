@@ -74,9 +74,16 @@ interface Pending { proposal: ApprovalProposal; digest: string; expiresAt: numbe
 export class BrowserApprovalCoordinator {
   private readonly pending = new Map<string, Pending>()
   private readonly grants = new Set<string>()
+  private readonly fullAccess = new Set<string>()
   constructor(private readonly now = Date.now, private readonly visible: (browserId: string) => boolean = () => false, private readonly onEvent: (event: BrowserApprovalEvent) => void = () => {}, private readonly ttlMs = 60_000, private readonly reveal: (browserId: string) => void = () => {}) {}
   private grantKey(proposal: ApprovalProposal): string { return `${proposal.controller}\u0000${proposal.browserId}\u0000${proposal.origin}\u0000${proposal.category}` }
+  setFullAccess(browserId: string, enabled: boolean): void {
+    if (enabled) this.fullAccess.add(browserId)
+    else this.fullAccess.delete(browserId)
+  }
+  hasFullAccess(browserId: string): boolean { return this.fullAccess.has(browserId) }
   async request(proposal: ApprovalProposal, signal: AbortSignal): Promise<void> {
+    if (this.fullAccess.has(proposal.browserId)) return
     const approvalId = randomUUID(), expiresAt = this.now() + this.ttlMs, digest = approvalDigest({ ...proposal, expiresAt })
     if (!this.visible(proposal.browserId)) {
       this.onEvent({ type: 'approval-request', browserId: proposal.browserId, approvalId, digest, controller: proposal.controller, origin: proposal.origin, category: proposal.category, targetLabel: proposal.targetLabel, argumentSummary: proposal.argumentSummary, visualPreview: proposal.visualPreview, expiresAt, canGrantOrigin: proposal.canGrantOrigin, headless: true })

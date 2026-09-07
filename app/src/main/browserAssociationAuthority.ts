@@ -1,4 +1,4 @@
-import type { LayoutFile } from '../shared/layoutFile'
+import type { BrowserRailLayout, LayoutFile } from '../shared/layoutFile'
 import type { TabBrowserCommand } from './tabBrowserService'
 
 function browserIds(layout: LayoutFile): Set<string> {
@@ -25,9 +25,34 @@ export function deriveActiveBrowserId(layout: LayoutFile): string | null {
   return workspace?.tabs[String(workspace.activeTab)]?.browser?.id ?? null
 }
 
+export function applyBrowserRailAssociation(
+  browser: BrowserRailLayout,
+  command: Extract<TabBrowserCommand, { type: 'share' } | { type: 'designate' } | { type: 'fullAccess' }>,
+): BrowserRailLayout {
+  if (command.type === 'share') {
+    if (command.sharedWithPi && !browser.designatedPi) throw new Error('NOT_DESIGNATED_CONTROLLER')
+    if (!command.sharedWithPi) {
+      const { fullAccess: _fullAccess, ...rest } = browser
+      return { ...rest, sharedWithPi: false }
+    }
+    return { ...browser, sharedWithPi: true }
+  }
+  if (command.type === 'designate') {
+    const { designatedPi: _old, sharedWithPi: _shared, fullAccess: _fullAccess, ...base } = browser
+    return command.designatedPi ? { ...base, designatedPi: command.designatedPi, sharedWithPi: false } : { ...base, sharedWithPi: false }
+  }
+  if (command.fullAccess) {
+    if (!browser.designatedPi) throw new Error('NOT_DESIGNATED_CONTROLLER')
+    if (!browser.sharedWithPi) throw new Error('NOT_SHARED')
+    return { ...browser, fullAccess: true }
+  }
+  const { fullAccess: _fullAccess, ...rest } = browser
+  return rest
+}
+
 /** Bind a parsed renderer command to the browser associated with its sender's WindowCtx. */
 export function bindRendererBrowserCommand(activeBrowserId: string | null, command: TabBrowserCommand): TabBrowserCommand {
-  if (command.type === 'open' || command.type === 'close' || command.type === 'share' || command.type === 'designate') return command
+  if (command.type === 'open' || command.type === 'close' || command.type === 'share' || command.type === 'designate' || command.type === 'fullAccess') return command
   if (!activeBrowserId) throw new Error('NO_BROWSER_FOR_TAB')
   return { ...command, id: activeBrowserId }
 }

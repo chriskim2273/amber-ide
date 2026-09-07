@@ -135,6 +135,7 @@ export type TabBrowserCommand =
   | { type: 'open' }
   | { type: 'close' }
   | { type: 'share'; sharedWithPi: boolean }
+  | { type: 'fullAccess'; fullAccess: boolean }
   | { type: 'designate'; designatedPi?: string }
   | { type: 'show'; id: string; bounds: Rectangle }
   | { type: 'hide'; id: string }
@@ -440,7 +441,7 @@ export class TabBrowserService {
       const immediate = this.runCommand(command, signal, validate)
       return signal ? abortable(immediate, signal) : immediate
     }
-    if (command.type === 'close' || command.type === 'share' || command.type === 'designate') return Promise.reject(new Error('ASSOCIATION_COMMAND_REQUIRES_MAIN'))
+    if (command.type === 'close' || command.type === 'share' || command.type === 'designate' || command.type === 'fullAccess') return Promise.reject(new Error('ASSOCIATION_COMMAND_REQUIRES_MAIN'))
     const key = command.id
     const prior = this.browserQueues.get(key) ?? Promise.resolve()
     const controller = new AbortController()
@@ -630,7 +631,7 @@ export class TabBrowserService {
           onDispatch?.()
           result = await this.host.runAutomation(command.id, command.action, controller.signal, command.broker ? async (request, approvalSignal) => {
             const classification = request.classification
-            if (!classification.consequential) return
+            if (!classification.consequential || this.approvals.hasFullAccess(command.id)) return
             this.observedGeneration.set(command.id, request.generation)
             this.host.protectApproval(command.id, true)
             try {
@@ -670,7 +671,7 @@ export class TabBrowserService {
         this.host.close(command.id); this.poisonedBrowsers.delete(command.id)
         await this.schedulePersist(); return { closed: true }
       }
-      case 'close': case 'share': case 'designate': throw new Error('ASSOCIATION_COMMAND_REQUIRES_MAIN')
+      case 'close': case 'share': case 'designate': case 'fullAccess': throw new Error('ASSOCIATION_COMMAND_REQUIRES_MAIN')
     }
   }
 
@@ -728,7 +729,12 @@ export class TabBrowserService {
     this.pendingRuntimeEvents.clear()
   }
 
+  setFullAccess(id: string, enabled: boolean): void {
+    this.approvals.setFullAccess(id, enabled)
+  }
+
   revokePi(id: string): void {
+    this.approvals.setFullAccess(id, false)
     const firstRevocation = !this.revokedPi.has(id)
     this.revokedPi.add(id)
     if (firstRevocation) {
@@ -755,6 +761,7 @@ export function parseTabBrowserCommand(value: unknown): TabBrowserCommand {
     return { type: v['type'] }
   }
   if (v['type'] === 'share' && exact(v, ['type', 'sharedWithPi']) && typeof v['sharedWithPi'] === 'boolean') return { type: 'share', sharedWithPi: v['sharedWithPi'] }
+  if (v['type'] === 'fullAccess' && exact(v, ['type', 'fullAccess']) && typeof v['fullAccess'] === 'boolean') return { type: 'fullAccess', fullAccess: v['fullAccess'] }
   if (v['type'] === 'resolveApproval' && exact(v, ['type', 'approvalId', 'digest', 'decision']) && typeof v['approvalId'] === 'string' && v['approvalId'].length <= 128
       && typeof v['digest'] === 'string' && /^[a-f0-9]{64}$/.test(v['digest']) && (v['decision'] === 'approve-once' || v['decision'] === 'reject' || v['decision'] === 'allow-origin')) return { type: 'resolveApproval', id: '' as never, approvalId: v['approvalId'], digest: v['digest'], decision: v['decision'] }
   if (v['type'] === 'stopPi' && exact(v, ['type'])) return { type: 'stopPi', id: '' as never }

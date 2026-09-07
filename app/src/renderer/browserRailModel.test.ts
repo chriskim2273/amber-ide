@@ -73,12 +73,12 @@ describe('browser rail product state', () => {
 
   it('projects loading, capacity, frozen, restore, diagnostics, sharing, and focus states', () => {
     expect(railStatusLines({ lifecycle: 'frozen', loading: false, capacityWaiting: true, restoredAfterFreeze: false,
-      restoreError: 'Page crashed', focused: false, diagnostics: { consoleIssues: 2, networkFailures: 1 }, sharedWithPi: true })).toEqual([
+      restoreError: 'Page crashed', focused: false, diagnostics: { consoleIssues: 2, networkFailures: 1 }, sharedWithPi: true, fullAccess: true })).toEqual([
       'Frozen · reload to continue', 'Waiting for browser capacity', 'Restore issue: Page crashed',
-      'Console issues: 2', 'Network failures: 1', 'Shared with Pi',
+      'Console issues: 2', 'Network failures: 1', 'Shared with Pi', 'Full access',
     ])
     expect(railStatusLines({ lifecycle: 'live', loading: true, capacityWaiting: false, restoredAfterFreeze: true,
-      focused: true, diagnostics: { consoleIssues: 0, networkFailures: 0 }, sharedWithPi: false })).toEqual([
+      focused: true, diagnostics: { consoleIssues: 0, networkFailures: 0 }, sharedWithPi: false, fullAccess: false })).toEqual([
       'Loading', 'Reloaded after background freeze', 'Browser page focused',
     ])
   })

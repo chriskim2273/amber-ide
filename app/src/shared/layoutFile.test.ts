@@ -13,6 +13,21 @@ describe('layout v2 tab browser compatibility', () => {
     const clamped = parseLayout(JSON.stringify({ version: 2, activeWorkspace: 1, workspaces: { '1': { activeTab: 1, tabs: { '1': { tree: null, browser: { id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', width: 1200, collapsed: false } } } } } }))
     expect(clamped.workspaces['1']!.tabs['1']!.browser?.width).toBe(900)
   })
+
+  it('round-trips a user-owned Full access flag and drops malformed values', () => {
+    const id = 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    const parsed = parseLayout(JSON.stringify({
+      version: 2, activeWorkspace: 1,
+      workspaces: { '1': { activeTab: 1, tabs: { '1': { tree: null, browser: { id, width: 420, collapsed: false, designatedPi: 'amber-1-1-0-pi', sharedWithPi: true, fullAccess: true } } } } },
+    }))
+    expect(parsed.workspaces['1']!.tabs['1']!.browser).toMatchObject({ designatedPi: 'amber-1-1-0-pi', sharedWithPi: true, fullAccess: true })
+    expect(JSON.parse(serializeLayout(parsed)).workspaces['1'].tabs['1'].browser.fullAccess).toBe(true)
+    const dropped = parseLayout(JSON.stringify({
+      version: 2, activeWorkspace: 1,
+      workspaces: { '1': { activeTab: 1, tabs: { '1': { tree: null, browser: { id, width: 420, collapsed: false, fullAccess: 'yes' } } } } },
+    }))
+    expect(dropped.workspaces['1']!.tabs['1']!.browser).not.toHaveProperty('fullAccess')
+  })
 })
 
 describe('layout Pi views', () => {

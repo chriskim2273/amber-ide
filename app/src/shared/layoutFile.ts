@@ -14,7 +14,7 @@ export const LAYOUT_MAX_MAP_ENTRIES = 4096
 export const LAYOUT_MAX_TREE_DEPTH = 64
 export const LAYOUT_MAX_TREE_NODES = 4096
 export const LAYOUT_MAX_STRING_BYTES = 16 * 1024
-export interface BrowserRailLayout { id: string; width: number; collapsed: boolean; designatedPi?: string; sharedWithPi?: boolean }
+export interface BrowserRailLayout { id: string; width: number; collapsed: boolean; designatedPi?: string; sharedWithPi?: boolean; fullAccess?: boolean }
 // `label` is app-owned display metadata ONLY (never touches daemon session
 // names). All added fields are OPTIONAL — old sidecars parse fine (missing →
 // undefined) and old readers ignore unknown-but-additive keys.
@@ -240,6 +240,7 @@ function parseBrowserRail(v: unknown): BrowserRailLayout | undefined {
     id: v['id'], width: clampStoredRailWidth(v['width']), collapsed: v['collapsed'],
     ...(typeof v['designatedPi'] === 'string' ? { designatedPi: layoutString(v['designatedPi']) } : {}),
     ...(typeof v['sharedWithPi'] === 'boolean' ? { sharedWithPi: v['sharedWithPi'] } : {}),
+    ...(v['fullAccess'] === true && v['sharedWithPi'] === true && typeof v['designatedPi'] === 'string' ? { fullAccess: true } : {}),
   }
 }
 

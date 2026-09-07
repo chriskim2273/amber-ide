@@ -37,10 +37,10 @@ export function shouldRevokeDesignatedPi(designatedPi: string | undefined, contr
 }
 
 export function BrowserRail(props: {
-  id: string; width: number; collapsed: boolean; designatedPi?: string; sharedWithPi?: boolean
+  id: string; width: number; collapsed: boolean; designatedPi?: string; sharedWithPi?: boolean; fullAccess?: boolean
   controllers: { name: string; label: string }[]; controllersReady?: boolean; temporarilyHidden?: boolean; occluded?: boolean
   onWidth: (width: number) => void; onCollapsed: (collapsed: boolean) => void; onClose: () => void; onRecovery: () => void
-  onPolicy: (policy: { designatedPi?: string; sharedWithPi: boolean }) => void
+  onPolicy: (policy: { designatedPi?: string; sharedWithPi: boolean; fullAccess?: boolean }) => void
   ensureContext: () => Promise<void>
 }): JSX.Element {
   const host = useRef<HTMLDivElement>(null), addressInput = useRef<HTMLInputElement>(null)
@@ -157,7 +157,7 @@ export function BrowserRail(props: {
   const security = railSecurity(status?.currentUrl ?? '')
   const statusLines = status ? railStatusLines({ lifecycle: status.lifecycle, loading: status.loading, capacityWaiting: capacityWaiting || !!status.capacityWaiting,
     restoredAfterFreeze: status.restoredAfterFreeze, ...(status.restoreError ? { restoreError: status.restoreError } : {}), focused: status.focused,
-    diagnostics: status.diagnostics, sharedWithPi: !!props.sharedWithPi }) : []
+    diagnostics: status.diagnostics, sharedWithPi: !!props.sharedWithPi, fullAccess: !!props.fullAccess }) : []
 
   if (props.collapsed || props.temporarilyHidden || autoCollapsed) return <aside className="tab-browser-rail collapsed" aria-label={props.temporarilyHidden ? 'Tab browser hidden while terminal is zoomed' : autoCollapsed ? 'Tab browser collapsed for narrow window' : 'Tab browser collapsed'}>
     {!props.temporarilyHidden && <button className="icon-btn" aria-label="Expand tab browser" onClick={() => props.onCollapsed(false)}>‹</button>}
@@ -188,6 +188,12 @@ export function BrowserRail(props: {
           if (event.target.checked && !window.confirm('Share this tab browser with the designated Pi? It can access any origin where Amber’s global browser profile is signed in.')) return
           props.onPolicy({ ...(props.designatedPi ? { designatedPi: props.designatedPi } : {}), sharedWithPi: event.target.checked })
         }} /> Share with Pi
+      </label>
+      <label className="tab-browser-share" title="Let the designated Pi act in this browser without approval prompts. Page hardening stays in place.">
+        <input type="checkbox" aria-label="Full access" checked={!!props.fullAccess} disabled={!props.sharedWithPi} onChange={(event) => {
+          if (event.target.checked && !window.confirm('Allow the designated Pi to act in this browser without approval prompts?')) return
+          props.onPolicy({ ...(props.designatedPi ? { designatedPi: props.designatedPi } : {}), sharedWithPi: true, fullAccess: event.target.checked })
+        }} /> Full access
       </label>
       {props.sharedWithPi && <button className="btn" onClick={() => void command({ type: 'stopPi' })}>Stop Pi</button>}
       <button className="btn" aria-label="Focus browser page" disabled={!status || status.lifecycle === 'frozen'} onClick={() => void command({ type: 'focusPage', id: props.id })}>Focus page</button>

@@ -806,10 +806,11 @@ function App(): JSX.Element {
       if (typeof association.ws !== 'number' || typeof association.tab !== 'number') return
       const rawBrowser = association.browser
       if (rawBrowser !== undefined && (typeof rawBrowser !== 'object' || rawBrowser === null)) return
-      const browser = rawBrowser as { id?: unknown; width?: unknown; collapsed?: unknown; designatedPi?: unknown; sharedWithPi?: unknown } | undefined
+      const browser = rawBrowser as { id?: unknown; width?: unknown; collapsed?: unknown; designatedPi?: unknown; sharedWithPi?: unknown; fullAccess?: unknown } | undefined
       if (browser && (typeof browser.id !== 'string' || typeof browser.width !== 'number' || typeof browser.collapsed !== 'boolean')) return
       const browserLayout = browser ? { id: browser.id as string, width: browser.width as number, collapsed: browser.collapsed as boolean,
-        ...(typeof browser.designatedPi === 'string' ? { designatedPi: browser.designatedPi } : {}), ...(typeof browser.sharedWithPi === 'boolean' ? { sharedWithPi: browser.sharedWithPi } : {}) } : undefined
+        ...(typeof browser.designatedPi === 'string' ? { designatedPi: browser.designatedPi } : {}), ...(typeof browser.sharedWithPi === 'boolean' ? { sharedWithPi: browser.sharedWithPi } : {}),
+        ...(typeof browser.fullAccess === 'boolean' ? { fullAccess: browser.fullAccess } : {}) } : undefined
       setLayout((current) => {
         const workspace = current.workspaces[String(association.ws)] ?? { activeTab: association.tab as number, tabs: {} }
         const previous = workspace.tabs[String(association.tab)] ?? { tree: null }
@@ -2480,11 +2481,13 @@ function App(): JSX.Element {
           temporarilyHidden={!!zoom[`${wsKey}:${tabKey}`]} occluded={browserUiOccluded}
           {...(tabBrowser.designatedPi ? { designatedPi: tabBrowser.designatedPi } : {})}
           {...(tabBrowser.sharedWithPi !== undefined ? { sharedWithPi: tabBrowser.sharedWithPi } : {})}
+          {...(tabBrowser.fullAccess !== undefined ? { fullAccess: tabBrowser.fullAccess } : {})}
           controllers={piControllerOptions(tab?.panes ?? [], titles, window.amber.homeDir)}
           controllersReady={sawSessions}
           onPolicy={(policy) => { void ensureBrowserContext().then(() => {
             if (policy.designatedPi !== tabBrowser.designatedPi) return window.amber.browserCommand({ type: 'designate', ...(policy.designatedPi ? { designatedPi: policy.designatedPi } : {}) })
             if (policy.sharedWithPi !== !!tabBrowser.sharedWithPi) return window.amber.browserCommand({ type: 'share', sharedWithPi: policy.sharedWithPi })
+            if (policy.fullAccess !== undefined && policy.fullAccess !== !!tabBrowser.fullAccess) return window.amber.browserCommand({ type: 'fullAccess', fullAccess: policy.fullAccess })
           }).catch((error) => setNotice(error instanceof Error ? error.message : 'STALE_BROWSER_CONTEXT')) }}
           ensureContext={ensureBrowserContext}
           onWidth={(width) => updateTabBrowser({ ...tabBrowser, width })}

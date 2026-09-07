@@ -80,7 +80,7 @@ import { BrowserDaemonWatcher } from './browserDaemonWatcher'
 import { Connection } from '../client/connection'
 import { TabBrowserStateStore } from './tabBrowserStateStore'
 import { commitBrowserLayoutMutation, coordinateTabBrowserMigration } from './tabBrowserMigrationCoordinator'
-import { bindRendererBrowserCommand, browserAuthorityChanged } from './browserAssociationAuthority'
+import { applyBrowserRailAssociation, bindRendererBrowserCommand, browserAuthorityChanged } from './browserAssociationAuthority'
 import { emptyLayout, layoutUtf8ByteLength, LAYOUT_FILE_MAX_BYTES, parseLayout, serializeLayout, type LayoutFile } from '../shared/layoutFile'
 import { assertWorkspaceFileBytes, parseWorkspaceFile, WORKSPACE_FILE_MAX_BYTES } from '../shared/workspaceFile'
 import { commitPreparedWorkspaceImport, prepareWorkspaceImport } from './workspaceImport'
@@ -1269,6 +1269,16 @@ async function main(): Promise<void> {
       tabBrowserStateStore = new TabBrowserStateStore(stateRoot())
       await coordinateTabBrowserMigration(layoutPath(), tabBrowserStateStore)
       tabBrowser = await TabBrowserService.create(stateRoot(), win, tabBrowserStateStore, browserOperations)
+      {
+        const loaded = await loadLayoutFile(layoutPath())
+        if (loaded.text) {
+          for (const workspace of Object.values(parseLayout(loaded.text).workspaces)) {
+            for (const tab of Object.values(workspace.tabs)) {
+              if (tab.browser?.fullAccess && tab.browser.sharedWithPi) tabBrowser.setFullAccess(tab.browser.id, true)
+            }
+          }
+        }
+      }
       onLocalWindowHidden = () => tabBrowser?.windowHidden()
       tabBrowser.setApprovalSurface(
         (id) => hasExactApprovalSurface([...windowCtxs.values()].map((context) => ({ local: context.target.kind === 'local', destroyed: context.win.isDestroyed(), visible: context.win.isVisible(), browserId: context.activeBrowserId, expanded: context.activeBrowserExpanded })), id),
@@ -1650,7 +1660,7 @@ async function main(): Promise<void> {
     if (!tabBrowser || !tabBrowserStateStore || sender?.target.kind !== 'local') return { ok: false, error: 'BROWSER_HOST_UNAVAILABLE' }
     try {
       const parsed = parseTabBrowserCommand(raw)
-      if (parsed.type === 'open' || parsed.type === 'close' || parsed.type === 'share' || parsed.type === 'designate') {
+      if (parsed.type === 'open' || parsed.type === 'close' || parsed.type === 'share' || parsed.type === 'designate' || parsed.type === 'fullAccess') {
         const loaded = await loadLayoutFile(layoutPath())
         if (!loaded.text) throw new Error('NO_BROWSER_FOR_TAB')
         const current = parseLayout(loaded.text)
@@ -1686,18 +1696,13 @@ async function main(): Promise<void> {
         } else {
           if (!browser) throw new Error('NO_BROWSER_FOR_TAB')
           if (parsed.type === 'close') browser = undefined
-          else if (parsed.type === 'share') {
-            if (parsed.sharedWithPi && !browser.designatedPi) throw new Error('NOT_DESIGNATED_CONTROLLER')
-            browser = { ...browser, sharedWithPi: parsed.sharedWithPi }
-          }
           else {
-            if (parsed.designatedPi) {
+            if (parsed.type === 'designate' && parsed.designatedPi) {
               const match = /^amber-(\d+)-(\d+)-/.exec(parsed.designatedPi)
               const controller = browserDaemonWatcher?.controller(parsed.designatedPi)
               if (!match || Number(match[1]) !== sender.activeWorkspace || Number(match[2]) !== sender.activeTab || !isEligiblePiController(controller)) throw new Error('NOT_DESIGNATED_CONTROLLER')
             }
-            const { designatedPi: _old, sharedWithPi: _shared, ...base } = browser
-            browser = parsed.designatedPi ? { ...base, designatedPi: parsed.designatedPi, sharedWithPi: false } : { ...base, sharedWithPi: false }
+            browser = applyBrowserRailAssociation(browser, parsed)
           }
         }
         const nextTab = { ...workingPrevious, ...(browser ? { browser } : {}) }
@@ -1716,6 +1721,7 @@ async function main(): Promise<void> {
           throw new Error('STALE_BROWSER_CONTEXT')
         }
         if (previous.browser && (parsed.type === 'close' || parsed.type === 'designate' || (parsed.type === 'share' && !parsed.sharedWithPi))) tabBrowser.revokePi(previous.browser.id)
+        if (browser) tabBrowser.setFullAccess(browser.id, !!browser.fullAccess && !!browser.sharedWithPi)
         if (parsed.type === 'close' && previous.browser) await tabBrowser.destroyForAssociation(previous.browser.id)
         setBrowserForCurrentContext(sender, expectedContext, browser?.id ?? null)
         sender.win.webContents.send('tab-browser-association', { ws: expectedContext.workspace, tab: expectedContext.tab, ...(browser ? { browser } : {}) })
@@ -1727,6 +1733,17 @@ async function main(): Promise<void> {
       const associated = activeBrowser?.id ?? null
       if (associated !== sender.activeBrowserId) throw new Error('STALE_BROWSER_CONTEXT')
       if (parsed.type === 'stopPi' && activeBrowser?.designatedPi) tabBrowserBroker?.cancelController(activeBrowser.designatedPi)
+      if (parsed.type === 'stopPi' && activeBrowser?.fullAccess) {
+        const current = parseLayout(loaded.text)
+        const wsKey = String(sender.activeWorkspace), tabKey = String(sender.activeTab)
+        const tab = current.workspaces[wsKey]!.tabs[tabKey]!
+        const nextBrowser = applyBrowserRailAssociation(activeBrowser, { type: 'fullAccess', fullAccess: false })
+        const next = { ...current, version: 2, browserRevision: (current.browserRevision ?? 0) + 1,
+          workspaces: { ...current.workspaces, [wsKey]: { ...current.workspaces[wsKey]!, tabs: { ...current.workspaces[wsKey]!.tabs, [tabKey]: { ...tab, browser: nextBrowser } } } } }
+        const saved = await commitBrowserLayoutMutation(layoutPath(), tabBrowserStateStore, serializeLayout(next), loaded.version)
+        if (!('ok' in saved)) throw new Error('error' in saved ? saved.error : 'LAYOUT_CONFLICT')
+        sender.win.webContents.send('tab-browser-association', { ws: sender.activeWorkspace, tab: sender.activeTab, browser: nextBrowser })
+      }
       const command = bindRendererBrowserCommand(sender.activeBrowserId, parsed)
       const expected = captureBrowserContext(sender)
       if ((command.type === 'hide' || command.type === 'show') && expected.browserId) { sender.activeBrowserExpanded = approvalSurfaceDuringPresentationCommand(sender.activeBrowserExpanded, command.type); if (command.type === 'hide') tabBrowser.surfaceHidden(expected.browserId) }
