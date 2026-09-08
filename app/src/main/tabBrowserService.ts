@@ -283,6 +283,7 @@ export class TabBrowserService {
   revokeSurface(browserIds: Iterable<string>): void {
     const live = new Set(this.host.liveIds())
     for (const id of new Set(browserIds)) {
+      this.abortBrowserWork(id)
       this.surfaceHidden(id)
       if (live.has(id)) {
         try { this.host.hide(id) } catch { /* a concurrent crash/close already hid it */ }
@@ -319,8 +320,9 @@ export class TabBrowserService {
   }
   private poisonBrowser(id: string): void { this.poisonedBrowsers.add(id) }
   surfaceHidden(id: string): void {
+    // Presentation changes revoke unseen approval UI, not an authorized
+    // controller's ongoing work. Explicit close/unshare/shutdown still abort.
     this.approvals.invalidateBrowser(id); this.dialogs.clearBrowser(id)
-    this.abortBrowserWork(id)
   }
   setEventSink(sink: (event: unknown) => void): void { this.eventSink = sink }
   private queueRuntimeEvent(id: string, event: unknown): void {

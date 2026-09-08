@@ -106,12 +106,15 @@ export class ElectronTabBrowserPage implements TabBrowserPage {
   readonly automation: BrowserAutomation
   private readonly contents: WebContents
   private attached = false
+  private actualWindow: BrowserWindow
+  private backgroundWindow: BrowserWindow | null = null
   private disposing = false
   private explicitlyLoadedBlank = false
   private bounds: Rectangle = { x: 0, y: 0, width: 1, height: 1 }
   private lastEncoded: BrowserBinaryAttachment | null = null
   private capturing: Promise<BrowserBinaryAttachment | null> | null = null
   constructor(private window: BrowserWindow, partition: string, onUserInput: () => void, onPageEvent: (event: TabBrowserPageEvent) => void, allowNavigation: (url: string) => boolean, private readonly onDestroy: () => void) {
+    this.actualWindow = window
     const browserSession = session.fromPartition(partition)
     hardenBrowserSession(browserSession)
     this.view = new WebContentsView({ webPreferences: browserWebPreferences(partition) })
@@ -142,7 +145,7 @@ export class ElectronTabBrowserPage implements TabBrowserPage {
       onMessage: (listener) => { contents.debugger.on('message', (_event, method, params) => listener(method, (params ?? {}) as Record<string, unknown>)) },
     }
     this.automation = new BrowserAutomation(debuggerTransport, () => contents.getURL(), () => contents.isLoading(), {}, {
-      deviceScaleFactor: () => screen.getDisplayMatching(this.window.getBounds()).scaleFactor,
+      deviceScaleFactor: () => screen.getDisplayMatching(this.actualWindow.getBounds()).scaleFactor,
       reload: (ignoreCache) => { if (ignoreCache) contents.reloadIgnoringCache(); else contents.reload(); return true },
       history: (direction) => {
         const history = contents.navigationHistory
@@ -188,10 +191,10 @@ export class ElectronTabBrowserPage implements TabBrowserPage {
     // Keep the EventEmitter escape hatch local to this verified lifecycle hook.
     // https://github.com/electron/electron/blob/v43.0.0/shell/browser/api/electron_api_web_contents.cc
     ;(contents as EventEmitter).on('close', () => {
-      if (this.window.isDestroyed() || ownerWindowCloseIsFromGuest(this.window)) return
-      noteGuestWebContentsClosing(this.window)
+      if (this.actualWindow.isDestroyed() || ownerWindowCloseIsFromGuest(this.actualWindow)) return
+      noteGuestWebContentsClosing(this.actualWindow)
     })
-    contents.on('destroyed', () => { if (!this.window.isDestroyed()) guestWebContentsCloseFinished(this.window) })
+    contents.on('destroyed', () => { if (!this.actualWindow.isDestroyed()) guestWebContentsCloseFinished(this.actualWindow) })
   }
   async loadURL(url: string, signal?: AbortSignal): Promise<void> {
     if (!isAllowedBrowserUrl(url)) throw new Error('NAVIGATION_BLOCKED')
@@ -214,12 +217,19 @@ export class ElectronTabBrowserPage implements TabBrowserPage {
   }
   stop(): void { this.view.webContents.stop() }
   focus(): void { this.view.webContents.focus() }
-  blur(): void { this.window.webContents.focus() }
+  blur(): void { if (!this.backgroundWindow && !this.window.isDestroyed()) this.window.webContents.focus() }
   setWindow(window: BrowserWindow): void {
     if (window === this.window) return
-    this.hide(); this.window = window
+    this.window = window
+    if (!this.backgroundWindow && this.attached) this.attachTo(window, this.bounds)
   }
-  setBounds(bounds: Rectangle): void { this.bounds = bounds; if (this.attached) this.view.setBounds(bounds) }
+  setBounds(bounds: Rectangle): void {
+    this.bounds = bounds
+    if (this.backgroundWindow) {
+      this.backgroundWindow.setContentSize(Math.max(2, bounds.width), Math.max(2, bounds.height))
+      this.view.setBounds({ ...bounds, x: 0, y: 0 })
+    } else if (this.attached) this.view.setBounds(bounds)
+  }
   async captureFrame(signal?: AbortSignal): Promise<BrowserBinaryAttachment> {
     if (signal?.aborted) throw new Error('ACTION_CANCELLED')
     if (!this.attached) this.show()
@@ -235,9 +245,9 @@ export class ElectronTabBrowserPage implements TabBrowserPage {
     const height = Math.max(2, this.bounds.height)
     if (this.bounds.width < 2 || this.bounds.height < 2) this.setBounds({ ...this.bounds, width, height })
     const view = { width: this.bounds.width, height: this.bounds.height, pageX: 0, pageY: 0 }
-    const shot = await this.window.capturePage({
-      x: Math.max(0, this.bounds.x),
-      y: Math.max(0, this.bounds.y),
+    const shot = await this.actualWindow.capturePage({
+      x: this.backgroundWindow ? 0 : Math.max(0, this.bounds.x),
+      y: this.backgroundWindow ? 0 : Math.max(0, this.bounds.y),
       width,
       height,
     })
@@ -264,21 +274,59 @@ export class ElectronTabBrowserPage implements TabBrowserPage {
       })
     }
   }
+  private detachView(): void {
+    if (this.attached && browserWindowCanRemoveChildView(this.actualWindow)) this.actualWindow.contentView.removeChildView(this.view)
+    this.attached = false
+  }
+  private attachTo(window: BrowserWindow, bounds: Rectangle): void {
+    if (!this.attached || window !== this.actualWindow) {
+      this.detachView()
+      window.contentView.addChildView(this.view)
+      this.actualWindow = window
+      this.attached = true
+    }
+    this.view.setBounds(bounds)
+  }
   show(): void {
-    if (!this.attached) { this.window.contentView.addChildView(this.view); this.attached = true }
-    this.view.setBounds(this.bounds)
+    this.attachTo(this.window, this.bounds)
+    this.backgroundWindow?.destroy()
+    this.backgroundWindow = null
   }
   hide(): void {
-    if (this.attached) {
-      if (browserWindowCanRemoveChildView(this.window)) this.window.contentView.removeChildView(this.view)
-      this.attached = false
+    if (this.disposing || this.contents.isDestroyed()) { this.detachView(); return }
+    if (!this.backgroundWindow) {
+      const surface = new BrowserWindow({ ...remoteSurfaceOptions(this.bounds.width, this.bounds.height), focusable: false,
+        webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false, backgroundThrottling: false } })
+      surface.setMenuBarVisibility(false)
+      // Keep the compositor alive without putting a window on any monitor or
+      // giving it focus. One surface per background live page, capacity-bounded.
+      const positionOutsideDesktop = (): void => {
+        if (surface.isDestroyed()) return
+        const left = Math.min(...screen.getAllDisplays().map(display => display.bounds.x))
+        surface.setPosition(left - surface.getBounds().width - 100, 0)
+      }
+      positionOutsideDesktop()
+      surface.on('resize', positionOutsideDesktop)
+      screen.on('display-added', positionOutsideDesktop)
+      screen.on('display-removed', positionOutsideDesktop)
+      screen.on('display-metrics-changed', positionOutsideDesktop)
+      surface.once('closed', () => {
+        screen.removeListener('display-added', positionOutsideDesktop)
+        screen.removeListener('display-removed', positionOutsideDesktop)
+        screen.removeListener('display-metrics-changed', positionOutsideDesktop)
+      })
+      surface.showInactive()
+      this.backgroundWindow = surface
     }
+    this.attachTo(this.backgroundWindow, { ...this.bounds, x: 0, y: 0 })
   }
   destroy(): void {
     this.disposing = true
     this.automation.dispose()
-    this.hide()
-    closeGuestWebContents(this.window, this.contents)
+    this.detachView()
+    closeGuestWebContents(this.actualWindow, this.contents)
+    this.backgroundWindow?.destroy()
+    this.backgroundWindow = null
     this.onDestroy()
   }
 }

@@ -38,9 +38,70 @@ const deadline = setTimeout(() => app.exit(2), 20000)
 const { ElectronTabBrowserPage, ownerWindowCloseIsFromGuest } = require(path.join(run, 'page.cjs'))
 const { encodeRemoteFrame } = require(path.join(run, 'frame.cjs'))
 app.whenReady().then(async () => {
+  const server = require('node:http').createServer((request, response) => {
+    response.setHeader('Content-Type', 'text/html')
+    response.end('<title>' + (request.url === '/next' ? 'Background navigation' : 'Private fixture') + '</title><input aria-label="Search" style="position:absolute;left:40px;top:40px;width:300px;height:40px">')
+  })
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+  const origin = 'http://127.0.0.1:' + server.address().port
   const owner = new BrowserWindow({ width: 800, height: 600, webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false } })
   const results = []
   try {
+    const backgroundPage = new ElectronTabBrowserPage(owner, 'persist:amber-browser-background', () => {}, () => {}, () => true, () => {})
+    backgroundPage.setBounds({ x: 0, y: 0, width: 500, height: 400 }); backgroundPage.show()
+    await backgroundPage.loadURL(origin + '/start')
+    const contents = backgroundPage.view.webContents
+    // Outcome evaluation below is confined to our private local fixture.
+    const foreground = new BrowserWindow({ x: 0, y: 0, width: 1600, height: 1200 })
+    foreground.show(); foreground.focus()
+    const focusDeadline = Date.now() + 2000
+    while (BrowserWindow.getFocusedWindow()?.id !== foreground.id && Date.now() < focusDeadline) await new Promise(resolve => setTimeout(resolve, 10))
+    const focusedId = BrowserWindow.getFocusedWindow()?.id
+    assert.equal(focusedId, foreground.id, 'fixture must establish a real foreground before testing focus preservation')
+    const windowCount = BrowserWindow.getAllWindows().length
+    const contentsId = contents.id
+    backgroundPage.hide()
+    const lease = { browserId: 'background-fixture', pageIncarnation: 'fixture', generation: 1 }
+    const signal = new AbortController().signal
+    const capture = await backgroundPage.automation.screenshot(lease, undefined, false, signal)
+    assert.equal(capture.width, 500); assert.equal(capture.height, 400)
+    const snapshot = await backgroundPage.automation.snapshot(lease, { maxDepth: 20, maxNodes: 50, maxBytes: 262144 }, signal)
+    const prepared = await backgroundPage.automation.prepareInteraction(lease, { kind: 'fill', target: { snapshotId: snapshot.snapshotId, role: 'textbox', name: 'Search' }, text: 'background potatoes' }, signal)
+    await backgroundPage.automation.executeInteraction(prepared, signal)
+    assert.equal(await contents.executeJavaScript('document.querySelector("input").value'), 'background potatoes')
+    assert.equal(BrowserWindow.getFocusedWindow()?.id, focusedId, 'background work must not steal focus')
+    assert.equal(BrowserWindow.getAllWindows().length, windowCount + 1, 'one bounded background surface')
+    backgroundPage.show()
+    assert.equal(backgroundPage.view.webContents.id, contentsId)
+    assert.equal(await contents.executeJavaScript('document.querySelector("input").value'), 'background potatoes')
+    assert.equal(BrowserWindow.getAllWindows().length, windowCount, 'show releases the background surface')
+    assert.equal(BrowserWindow.getFocusedWindow()?.id, focusedId, 'reparent must not steal focus')
+    const unfocusedCapture = await backgroundPage.automation.screenshot(lease, undefined, false, signal)
+    assert.equal(unfocusedCapture.width, 500, 'fully covered owner remains capturable')
+    const unfocusedInput = await backgroundPage.automation.prepareInteraction(lease, { kind: 'fill', target: { snapshotId: snapshot.snapshotId, role: 'textbox', name: 'Search' }, text: 'unfocused potatoes' }, signal)
+    await backgroundPage.automation.executeInteraction(unfocusedInput, signal)
+    assert.equal(await contents.executeJavaScript('document.querySelector("input").value'), 'unfocused potatoes')
+    assert.equal(BrowserWindow.getFocusedWindow()?.id, focusedId)
+    for (let cycle = 0; cycle < 3; cycle++) {
+      backgroundPage.hide(); backgroundPage.hide()
+      assert.equal(BrowserWindow.getAllWindows().length, windowCount + 1)
+      const surface = BrowserWindow.getAllWindows().find(window => window !== owner && window !== foreground)
+      assert(surface && !surface.isFocusable(), 'background surface cannot acquire native focus')
+      const left = Math.min(...require('electron').screen.getAllDisplays().map(display => display.bounds.x))
+      assert(surface.getBounds().x + surface.getBounds().width < left)
+      backgroundPage.show()
+      assert.equal(BrowserWindow.getAllWindows().length, windowCount)
+    }
+    backgroundPage.hide()
+    await backgroundPage.loadURL(origin + '/next')
+    assert.equal(contents.getURL(), origin + '/next')
+    assert.equal(await contents.executeJavaScript('document.title'), 'Background navigation')
+    assert.equal((await backgroundPage.automation.screenshot(lease, undefined, false, signal)).width, 500)
+    assert.equal(BrowserWindow.getFocusedWindow()?.id, focusedId, 'background navigation must not steal focus')
+    backgroundPage.destroy()
+    assert.equal(BrowserWindow.getAllWindows().length, windowCount, 'destroy releases parked surface')
+    foreground.destroy()
+    results.push({ name: 'background and unfocused captures/input preserve page, focus and surface bounds', pass: true })
     for (const mode of ['native', 'renderer']) {
       const page = new ElectronTabBrowserPage(owner, 'persist:amber-browser-lifecycle-' + mode, () => {}, () => {}, () => true, () => {})
       page.setBounds({ x: 0, y: 0, width: 500, height: 400 }); page.show()
@@ -64,6 +125,6 @@ app.whenReady().then(async () => {
     results.push({ name: 'real NativeImage resize and frame encoding', pass: true })
     console.log(JSON.stringify({ electron: process.versions.electron, results }))
     fs.writeFileSync(path.join(run, 'results.json'), JSON.stringify(results, null, 2))
-  } finally { owner.destroy(); clearTimeout(deadline) }
+  } finally { owner.destroy(); server.close(); clearTimeout(deadline) }
   app.exit(0)
 }).catch(error => { console.error(error); app.exit(1) })

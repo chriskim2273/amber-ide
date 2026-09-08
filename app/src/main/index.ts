@@ -85,6 +85,7 @@ import { applyBrowserRailAssociation, bindRendererBrowserCommand, browserAuthori
 import { emptyLayout, layoutUtf8ByteLength, LAYOUT_FILE_MAX_BYTES, parseLayout, serializeLayout, type LayoutFile } from '../shared/layoutFile'
 import { assertWorkspaceFileBytes, parseWorkspaceFile, WORKSPACE_FILE_MAX_BYTES } from '../shared/workspaceFile'
 import { commitPreparedWorkspaceImport, prepareWorkspaceImport } from './workspaceImport'
+import { requestBrowserAttention } from './browserAttention'
 import { approvalSurfaceDuringPresentationCommand, browserContextMatches, captureBrowserContext, hasExactApprovalSurface, resolveBrowserContext, sameBrowserContextIdentity, setBrowserForCurrentContext } from './browserWindowContext'
 import { ownerWindowCloseIsFromGuest, shouldHideLocalWindowOnClose } from './electronTabBrowserPage'
 import { createBrowserId } from '../shared/tabBrowser'
@@ -977,7 +978,9 @@ function promptConnectHost(): void {
     })
     return
   }
-  const win = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0]
+  const focused = BrowserWindow.getFocusedWindow()
+  const win = (focused && windowCtxs.has(focused.id) ? focused : undefined)
+    ?? [...windowCtxs.values()].find(context => !context.win.isDestroyed())?.win
   if (!win || win.isDestroyed()) return
   win.webContents.send('connect-host-prompt')
 }
@@ -1296,21 +1299,7 @@ async function main(): Promise<void> {
       onLocalWindowHidden = () => tabBrowser?.windowHidden()
       tabBrowser.setApprovalSurface(
         (id) => hasExactApprovalSurface([...windowCtxs.values()].map((context) => ({ local: context.target.kind === 'local', destroyed: context.win.isDestroyed(), visible: context.win.isVisible(), browserId: context.activeBrowserId, expanded: context.activeBrowserExpanded })), id),
-        (id) => {
-          void (async () => {
-            const loaded = await loadLayoutFile(layoutPath()); if (!loaded.text) return
-            const layout = parseLayout(loaded.text)
-            for (const [ws, workspace] of Object.entries(layout.workspaces)) for (const [tab, tabLayout] of Object.entries(workspace.tabs)) {
-              if (tabLayout.browser?.id !== id) continue
-              await reopenLocalWindow?.()
-              const context = [...windowCtxs.values()].find((candidate) => candidate.target.kind === 'local' && !candidate.win.isDestroyed())
-              if (!context) return
-              context.win.show(); context.win.focus()
-              context.win.webContents.send('tab-browser-event', { type: 'approval-reveal', browserId: id, workspace: Number(ws), tab: Number(tab), browser: { ...tabLayout.browser, collapsed: false } })
-              return
-            }
-          })().catch(() => {})
-        },
+        () => requestBrowserAttention([...windowCtxs.values()].map(context => ({ local: context.target.kind === 'local', window: context.win }))),
       )
       tabBrowser.setEventSink((event) => {
         for (const context of windowCtxs.values()) if (context.target.kind === 'local' && !context.win.isDestroyed()) context.win.webContents.send('tab-browser-event', event)

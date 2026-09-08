@@ -227,7 +227,7 @@ describe('TabBrowserService dispatch authorization', () => {
     } finally { vi.useRealTimers() }
   })
 
-  it('aborts queued direct work when its browser is hidden, without releasing a live predecessor', async () => {
+  it('preserves queued direct work when its tab is hidden, without releasing a live predecessor', async () => {
     vi.useFakeTimers()
     try {
       const state = emptyBrowserState(1), id = 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'; let release!: () => void; let calls = 0; let signal!: AbortSignal
@@ -245,14 +245,15 @@ describe('TabBrowserService dispatch authorization', () => {
       const service = new Service({ update: async () => state } as unknown as TabBrowserStateStore, { setWindow: () => {} }, host, state)
       const command = (url: string) => ({ type: 'navigate' as const, id, url, pageIncarnation: 'page', expectedGeneration: 1 })
       const first = service.command(command('https://example.test/a'))
-      const firstResult = expect(first).rejects.toThrow('ACTION_CANCELLED')
       await vi.waitFor(() => expect(calls).toBe(1))
       const hidden = service.command(command('https://example.test/b'))
       service.surfaceHidden(id)
-      await expect(hidden).rejects.toThrow('ACTION_CANCELLED')
-      expect(signal.aborted).toBe(true)
+      expect(signal.aborted).toBe(false)
       expect(calls).toBe(1)
-      release(); await firstResult
+      release()
+      await expect(first).resolves.toMatchObject({ id })
+      await expect(hidden).resolves.toMatchObject({ id })
+      expect(calls).toBe(2)
       await vi.advanceTimersByTimeAsync(TAB_BROWSER_QUEUE_BARRIER_TIMEOUT_MS)
       expect(service.pendingWork()).toMatchObject({ queued: 0, quarantined: 0, total: 0 })
     } finally { vi.useRealTimers() }
@@ -562,6 +563,31 @@ describe('TabBrowserService dispatch authorization', () => {
     expect(boundsCalls).toBe(0)
   })
 
+  it.each(['navigate', 'snapshot'] as const)('keeps in-flight broker %s alive across a tab presentation change', async type => {
+    const state = emptyBrowserState(1), id = 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    let signal: AbortSignal | undefined, release!: () => void
+    const wait = (ownedSignal: AbortSignal): Promise<{ id: string; accepted: boolean }> => {
+      signal = ownedSignal
+      return new Promise(resolve => { release = () => resolve({ id, accepted: true }) })
+    }
+    const host = {
+      navigate: (_id: string, _url: string, _page: string, _generation: number, ownedSignal: AbortSignal) => wait(ownedSignal),
+      runAutomation: (_id: string, _action: unknown, ownedSignal: AbortSignal) => wait(ownedSignal),
+      snapshot: () => state,
+    }
+    const Service = TabBrowserService as unknown as new (s: TabBrowserStateStore, p: { setWindow: () => void }, h: typeof host, i: typeof state) => TabBrowserService
+    const service = new Service({ update: async () => state } as unknown as TabBrowserStateStore, { setWindow: () => {} }, host, state)
+    const broker = { requestId: 'background-1', controller: 'amber-1-1-0-pi' }
+    const pending = type === 'navigate'
+      ? service.command({ type: 'navigate', id, url: 'https://example.test', pageIncarnation: 'page', expectedGeneration: 1, broker })
+      : service.command({ type: 'automation', id, broker, action: { type: 'snapshot', pageIncarnation: 'page', expectedGeneration: 1, limits: { maxDepth: 20, maxNodes: 20, maxBytes: 262144 } } })
+    await vi.waitFor(() => expect(signal).toBeDefined())
+    service.surfaceHidden(id)
+    expect(signal!.aborted).toBe(false)
+    release()
+    await expect(pending).resolves.toMatchObject({ accepted: true })
+  })
+
   it('reports broker navigation start and completion without exposing its URL', async () => {
     const state = emptyBrowserState(1), id = 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', events: Array<Record<string, unknown>> = [], sources: string[] = []
     const host = { navigate: async (...args: unknown[]) => { sources.push(String(args[5])); return { id, stateRevision: 1 } }, snapshot: () => state }
@@ -661,7 +687,7 @@ describe('TabBrowserService approvals and Stop Pi', () => {
     await expect(service.command({ type: 'automation', id, broker: { requestId: 'request-hidden', controller: 'amber-1-1-0-pi' }, action: { type: 'interact', pageIncarnation: 'page', expectedGeneration: 1, operation: { kind: 'click', target: { snapshotId: 'snap', ref: 'n1' } } } })).rejects.toThrow('APPROVAL_REQUIRED')
   })
 
-  it('collapse invalidates an already-visible approval and aborts its owning action', async () => {
+  it('collapse invalidates an already-visible approval and denies its owning action', async () => {
     const state = emptyBrowserState(1), id = 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', events: Array<Record<string, unknown>> = []
     const host = {
       runAutomation: async (_id: string, action: { operation: unknown }, signal: AbortSignal, approve: (request: unknown, signal: AbortSignal) => Promise<void>) => {
@@ -674,7 +700,7 @@ describe('TabBrowserService approvals and Stop Pi', () => {
     const action = service.command({ type: 'automation', id, broker: { requestId: 'request-collapse', controller: 'amber-1-1-0-pi' }, action: { type: 'interact', pageIncarnation: 'page', expectedGeneration: 1, operation: { kind: 'click', target: { snapshotId: 'snap', ref: 'n1' } } } })
     await vi.waitFor(() => expect(events.some((event) => event['type'] === 'approval-request')).toBe(true))
     await service.command({ type: 'hide', id })
-    await expect(action).rejects.toThrow('ACTION_CANCELLED')
+    await expect(action).rejects.toThrow('APPROVAL_DENIED')
     expect(events.some((event) => event['type'] === 'approval-resolved')).toBe(true)
   })
 

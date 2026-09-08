@@ -9,6 +9,7 @@ export function browserWebPreferences(partition: string): WebPreferences {
     sandbox: true,
     webSecurity: true,
     allowRunningInsecureContent: false,
+    backgroundThrottling: false,
   }
 }
 

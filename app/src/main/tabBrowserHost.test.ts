@@ -25,21 +25,20 @@ const pagePolicies = new Map<string, (url: string) => boolean>()
 const factory: TabBrowserPageFactory = { create: (id, onUserInput, onPageEvent, allowNavigation) => { userInputs.set(id, onUserInput); pageEvents.set(id, onPageEvent); pagePolicies.set(id, allowNavigation); return new FakePage() } }
 
 describe('TabBrowserHost', () => {
-  it('rejects hidden screenshots without losing the live page, then captures after reveal', async () => {
+  it('captures a hidden browser without revealing it or changing page identity', async () => {
     const host = new TabBrowserHost(emptyBrowserState(1), factory)
     const opened = await host.open({ visible: false })
     ;(opened.page as FakePage).automation = {
       invalidate() {},
       screenshot: async () => {
-        if (!(opened.page as FakePage).visible) throw new Error('HIDDEN_CAPTURE_WOULD_STALL')
         return { mediaType: 'image/png', data: Buffer.from('fixture'), width: 1, height: 1 }
       },
     } as Pick<BrowserAutomation, 'invalidate' | 'screenshot'> as BrowserAutomation
     const action = { type: 'screenshot' as const, pageIncarnation: opened.status.pageIncarnation,
       expectedGeneration: opened.status.generation, fullPage: false }
     await expect(host.runAutomation(opened.status.id, action, new AbortController().signal))
-      .rejects.toMatchObject({ code: 'BROWSER_NOT_VISIBLE', retryable: true, dispatched: false })
-    expect(host.status(opened.status.id)).toMatchObject({ lifecycle: 'live', pageIncarnation: opened.status.pageIncarnation, generation: opened.status.generation })
+      .resolves.toMatchObject({ mediaType: 'image/png', width: 1, height: 1 })
+    expect(host.status(opened.status.id)).toMatchObject({ lifecycle: 'live', visible: false, pageIncarnation: opened.status.pageIncarnation, generation: opened.status.generation })
     expect(host.hasPendingOperation(opened.status.id, opened.status.pageIncarnation)).toBe(false)
     host.show(opened.status.id)
     await expect(host.runAutomation(opened.status.id, action, new AbortController().signal))

@@ -108,6 +108,15 @@ exception is core rule 9); themes/settings beyond minimal.
 
 ## Build status
 
+- [x] Background browser operation (2026-09-08) — isolated implementation,
+  not deployed. Hidden live pages retain their WebContents in bounded,
+  non-focusable off-desktop rendering surfaces. Tab changes no longer cancel
+  benign agent work; unseen approvals remain denied and request attention
+  without foreground/tab switching. Full app 1252 passed / 1 skipped,
+  typecheck, desktop/web builds, 43 native cases and private background/focus/
+  lifecycle verification passed. No real-Mac or hardware hotplug certification.
+  Receipt: `docs/superpowers/specs/2026-09-08-background-browser-verification.md`.
+
 - [ ] Connected-browser experiments (2026-09-08) — isolated, not deployed.
   Wikipedia's transparent native menu checkbox was exposed in snapshots but
   rejected by the opacity actionability gate. Native checkbox/radio targets
@@ -117,7 +126,7 @@ exception is core rule 9); themes/settings beyond minimal.
   and desktop/web builds now pass after repairing inherited declarations.
   Three private Electron lifecycle/image cases also pass: native/page-initiated
   close cleanup guards destroyed WebContents and preserves the owner window.
-  Background tab/unfocus operation remains explicitly deferred. Evidence:
+  Background tab/unfocus operation is covered by the separate entry below. Evidence:
   `/home/poyto/worktrees/amber-ide/browser-experiments-evidence/receipt.md`.
 
 - [x] Browser native-input follow-up (2026-09-07) — preserves the Pi GUI
