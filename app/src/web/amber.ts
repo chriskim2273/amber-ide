@@ -513,10 +513,15 @@ export class PiPaneLink {
   private wire(): void {
     const socket = this.socket
     socket.onopen = (): void => {
+      if (this.closed || this.socket !== socket) return
       socket.send(JSON.stringify({ t: 'piOpen', name: this.session }))
     }
     socket.onclose = (): void => {
-      if (this.closed || this.reconnectTimer !== null) return
+      // A replaced socket may still deliver a late close callback. It must not
+      // invalidate the replacement transport or schedule a second reconnect.
+      if (this.closed || this.socket !== socket) return
+      this.port.postMessage({ msg: { kind: 'PiBridgeStatus', name: this.session, available: false } })
+      if (this.reconnectTimer !== null) return
       this.reconnectTimer = setTimeout(() => {
         this.reconnectTimer = null
         if (this.closed) return
@@ -525,10 +530,11 @@ export class PiPaneLink {
       }, RECONNECT_MS)
     }
     socket.onerror = (): void => {
+      if (this.closed || this.socket !== socket) return
       try { socket.close() } catch { /* onclose handles retry */ }
     }
     socket.onmessage = (e: { data: unknown }): void => {
-      if (typeof e.data !== 'string') return
+      if (this.closed || this.socket !== socket || typeof e.data !== 'string') return
       const msg = parseServerMsg(e.data)
       if (!msg || (msg.t !== 'piEvent' && msg.t !== 'piStatus') || msg.name !== this.session) return
       this.port.postMessage({

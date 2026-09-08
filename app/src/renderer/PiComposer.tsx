@@ -71,6 +71,7 @@ export function PiComposer({
   }, [])
 
   const addFiles = (incoming: Iterable<File>): void => {
+    if (uploading) return
     const additions = [...incoming]
     if (additions.length === 0) return
     const existing = new Set(files.map(fileKey))

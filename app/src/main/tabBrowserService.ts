@@ -142,6 +142,7 @@ export type TabBrowserCommand =
   | { type: 'reload'; id: string; pageIncarnation: string; expectedGeneration: number }
   | { type: 'history'; id: string; direction: 'back' | 'forward'; pageIncarnation: string; expectedGeneration: number }
   | { type: 'mode'; id: string; mode: 'preview' | 'browse' }
+  | { type: 'fitViewport'; id: string; pageIncarnation: string; expectedGeneration: number }
   | { type: 'viewport'; id: string; pageIncarnation: string; expectedGeneration: number; width: number; height: number }
   | { type: 'focusPage' | 'focusChrome'; id: string }
   | { type: 'navigate'; id: string; url: string; pageIncarnation: string; expectedGeneration: number; broker?: { requestId: string; controller: string } }
@@ -163,7 +164,7 @@ export function stageWorkspaceBrowserState(state: BrowserStateFile, input: Works
     if (!viewport) throw new Error('INVALID_REQUEST')
     const previewOrigins = browser.mode === 'preview' && restoreUrl !== 'about:blank' && !navigationPolicyAllows('preview', [], restoreUrl) ? selectPreviewOrigin([], restoreUrl) : undefined
     records[id] = { id, profileId: 'global', mode: browser.mode, safeRestoreUrl: restoreUrl, title: '',
-      viewport, ...(previewOrigins ? { previewOrigins } : {}), lifecycle: 'frozen', stateRevision: 1, lastUsedAt: now, lastFocusedAt: 0 }
+      viewport, viewportMode: browser.viewportMode === 'fixed' ? 'fixed' : 'fit', ...(previewOrigins ? { previewOrigins } : {}), lifecycle: 'frozen', stateRevision: 1, lastUsedAt: now, lastFocusedAt: 0 }
   }
   if (state.migrationRecovery.length + input.recovery.length > BROWSER_RECOVERY_MAX) throw new Error('BROWSER_RECOVERY_LIMIT')
   const recoveryIds = new Set(state.migrationRecovery.map((item) => item.id))
@@ -501,7 +502,7 @@ export class TabBrowserService {
   }
 
   private browserOperationIdentity(command: TabBrowserCommand): { id: string; pageIncarnation: string } | undefined {
-    if (command.type === 'navigate' || command.type === 'reload' || command.type === 'history' || command.type === 'viewport') return { id: command.id, pageIncarnation: command.pageIncarnation }
+    if (command.type === 'navigate' || command.type === 'reload' || command.type === 'history' || command.type === 'viewport' || command.type === 'fitViewport') return { id: command.id, pageIncarnation: command.pageIncarnation }
     if (command.type === 'automation') return { id: command.id, pageIncarnation: command.action.pageIncarnation }
     return undefined
   }
@@ -597,6 +598,13 @@ export class TabBrowserService {
         return this.withLatestAction(command.id, this.host.status(command.id))
       }
       case 'mode': { const status = this.host.setMode(command.id, command.mode, 'user'); await this.schedulePersist(); return this.withLatestAction(command.id, status) }
+      case 'fitViewport': {
+        onDispatch?.()
+        const status = await this.host.fitViewport(command.id, command.pageIncarnation, command.expectedGeneration, signal ?? new AbortController().signal)
+        this.operations.assertDispatch(signal)
+        await this.schedulePersist()
+        return this.withLatestAction(command.id, status)
+      }
       case 'focusPage': return this.withLatestAction(command.id, this.host.focusPage(command.id))
       case 'focusChrome': return this.withLatestAction(command.id, this.host.focusChrome(command.id))
       case 'navigate': {
@@ -798,6 +806,11 @@ export function parseTabBrowserCommand(value: unknown): TabBrowserCommand {
       : { type: 'history', id: v['id'], direction: v['direction'] as 'back' | 'forward', pageIncarnation: v['pageIncarnation'], expectedGeneration: v['expectedGeneration'] }
   }
   if (v['type'] === 'mode' && exact(v, ['type', 'id', 'mode']) && (v['mode'] === 'preview' || v['mode'] === 'browse')) return { type: 'mode', id: v['id'], mode: v['mode'] }
+  if (v['type'] === 'fitViewport' && exact(v, ['type', 'id', 'pageIncarnation', 'expectedGeneration'])
+      && typeof v['pageIncarnation'] === 'string' && v['pageIncarnation'].length >= 1 && v['pageIncarnation'].length <= 128
+      && typeof v['expectedGeneration'] === 'number' && Number.isSafeInteger(v['expectedGeneration']) && v['expectedGeneration'] >= 0) {
+    return { type: 'fitViewport', id: v['id'], pageIncarnation: v['pageIncarnation'], expectedGeneration: v['expectedGeneration'] }
+  }
   const viewport = v['type'] === 'viewport' ? parseBrowserViewport({ width: v['width'], height: v['height'] }) : null
   if (v['type'] === 'viewport' && viewport && exact(v, ['type', 'id', 'pageIncarnation', 'expectedGeneration', 'width', 'height'])
       && typeof v['pageIncarnation'] === 'string' && v['pageIncarnation'].length >= 1 && v['pageIncarnation'].length <= 128

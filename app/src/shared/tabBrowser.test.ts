@@ -58,6 +58,27 @@ describe('legacy migration', () => {
 })
 
 describe('browser state parser', () => {
+  it('defaults legacy records to fit viewport mode and preserves an explicit fixed mode', () => {
+    const base = {
+      version: 1,
+      revision: 0,
+      layoutRevision: 0,
+      profiles: { global: { id: 'global', partition: 'persist:amber-browser', createdAt: 1 } },
+      records: {
+        'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa': {
+          id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', profileId: 'global', mode: 'browse', safeRestoreUrl: 'about:blank', title: '', viewport: { width: 800, height: 600 }, lifecycle: 'frozen', stateRevision: 1, lastUsedAt: 1, lastFocusedAt: 1,
+        },
+        'browser-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb': {
+          id: 'browser-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', profileId: 'global', mode: 'browse', safeRestoreUrl: 'about:blank', title: '', viewport: { width: 800, height: 600 }, viewportMode: 'fixed', lifecycle: 'frozen', stateRevision: 1, lastUsedAt: 1, lastFocusedAt: 1,
+        },
+      },
+      migrationRecovery: [],
+    }
+    const parsed = parseBrowserState(JSON.stringify(base))
+    expect(parsed.records['browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa']?.viewportMode).toBe('fit')
+    expect(parsed.records['browser-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb']?.viewportMode).toBe('fixed')
+  })
+
   it('keeps valid records individually, requires the global profile, and drops corrupt records', () => {
     const parsed = parseBrowserState(JSON.stringify({
       version: 1,

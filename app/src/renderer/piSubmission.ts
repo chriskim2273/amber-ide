@@ -34,6 +34,46 @@ export function resetPiSubmissionOnReconnect(): { pendingRequestId: null; upload
   return { pendingRequestId: null, uploading: false }
 }
 
+export interface PiCompletedAttachment {
+  conversationId: string
+  attachmentId: string
+}
+
+/** Keep the completed-upload cache local to currently selected File objects.
+ * This only drops browser references; server-side attachment artifacts are
+ * intentionally untouched. */
+export function pruneCompletedAttachments<T>(
+  cache: Map<T, PiCompletedAttachment>,
+  selected: readonly T[],
+): void {
+  const current = new Set(selected)
+  for (const file of cache.keys()) if (!current.has(file)) cache.delete(file)
+}
+
+/** A completed upload is reusable only for the same browser File object and
+ * authoritative Pi conversation. The cache is intentionally in-memory: an
+ * attachment id restored without the original File/session proof is not safe
+ * to send. */
+export function rememberCompletedAttachment<T>(
+  cache: Map<T, PiCompletedAttachment>,
+  file: T,
+  conversationId: string | null,
+  attachmentId: string,
+): void {
+  if (!conversationId) return
+  cache.set(file, { conversationId, attachmentId })
+}
+
+export function reuseCompletedAttachment<T>(
+  cache: ReadonlyMap<T, PiCompletedAttachment>,
+  file: T,
+  conversationId: string | null,
+): string | undefined {
+  if (!conversationId) return undefined
+  const completed = cache.get(file)
+  return completed?.conversationId === conversationId ? completed.attachmentId : undefined
+}
+
 /** Sequentially finish acknowledged uploads and dispatch the prompt only if
  * the same session/view/port is still current immediately before dispatch. */
 export async function uploadThenPrompt<T>(

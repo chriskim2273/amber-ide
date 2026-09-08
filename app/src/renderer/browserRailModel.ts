@@ -1,6 +1,7 @@
 import { railWidthMetrics, MIN_RAIL_WIDTH, MAX_RAIL_WIDTH, MIN_TERMINAL_WIDTH } from '../shared/browserRail'
-import { parseBrowserViewport } from '../shared/browserViewport'
+import { parseBrowserViewport, type BrowserViewportMode, type BrowserViewportSize } from '../shared/browserViewport'
 export { railWidthMetrics, MIN_RAIL_WIDTH, MAX_RAIL_WIDTH, MIN_TERMINAL_WIDTH }
+export type { BrowserViewportMode }
 
 export interface BrowserLastAction { action: string; phase: string; error?: string }
 export const BROWSER_VIEWPORT_PRESETS = [
@@ -28,7 +29,16 @@ export function reclampedRailWidth(requested: number, availableWidth: number): n
 }
 
 interface RailPageStatus { id: string; pageIncarnation: string; generation: number; lifecycle: 'live' | 'frozen' }
+export function viewportModeLabel(mode: BrowserViewportMode, viewport: BrowserViewportSize): string {
+  return mode === 'fit' ? 'Fit to rail' : `Fixed viewport · ${viewport.width} × ${viewport.height}`
+}
+export function rotateViewport(viewport: BrowserViewportSize): BrowserViewportSize {
+  return { width: viewport.height, height: viewport.width }
+}
 interface RailBounds { x: number; y: number; width: number; height: number }
+export function railFitViewportCommand(status: RailPageStatus): { type: 'fitViewport'; id: string; pageIncarnation: string; expectedGeneration: number } {
+  return { type: 'fitViewport', id: status.id, pageIncarnation: status.pageIncarnation, expectedGeneration: status.generation }
+}
 export function railStopCommand(status: RailPageStatus): { type: 'stop'; id: string; pageIncarnation: string; expectedGeneration: number } {
   return { type: 'stop', id: status.id, pageIncarnation: status.pageIncarnation, expectedGeneration: status.generation }
 }

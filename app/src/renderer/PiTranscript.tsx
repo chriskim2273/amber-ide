@@ -13,19 +13,57 @@ function displayText(value: unknown): string {
 }
 
 export type MarkdownBlock =
-  | { kind: 'paragraph' | 'heading' | 'quote' | 'list'; value: string; level?: number }
+  | { kind: 'paragraph' | 'heading' | 'quote'; value: string; level?: number }
+  | { kind: 'list'; ordered: boolean; items: string[]; start?: number }
+  | { kind: 'table'; headers: string[]; rows: string[][] }
   | { kind: 'code'; value: string; language?: string }
+
+function tableCells(value: string): string[] | null {
+  const trimmed = value.trim()
+  if (!trimmed.includes('|')) return null
+  let content = trimmed
+  if (content.startsWith('|')) content = content.slice(1)
+  if (content.endsWith('|') && !content.endsWith('\\|')) content = content.slice(0, -1)
+  const cells: string[] = []
+  let start = 0
+  let escaped = false
+  for (let index = 0; index < content.length; index += 1) {
+    const character = content[index]!
+    if (character === '\\' && !escaped) { escaped = true; continue }
+    if (character === '|' && !escaped) {
+      cells.push(content.slice(start, index).replace(/\\([|\\])/g, '$1').trim())
+      start = index + 1
+    }
+    escaped = false
+  }
+  cells.push(content.slice(start).replace(/\\([|\\])/g, '$1').trim())
+  return cells.length >= 2 ? cells : null
+}
+
+function isTableSeparator(cells: string[]): boolean {
+  return cells.length >= 2 && cells.every((cell) => /^:?-{3,}:?$/.test(cell))
+}
 
 /** Parse only the presentation subset used by Pi. HTML is kept as text because
  * this function never returns markup from untrusted content. */
 export function markdownBlocks(value: string): MarkdownBlock[] {
   const result: MarkdownBlock[] = []
   let paragraph: string[] = []
+  let list: { ordered: boolean; start?: number; items: string[] } | null = null
+  let table: { headers: string[]; rows: string[][] } | null = null
   let code: string[] | null = null
   let language: string | undefined
-  const flush = (): void => {
+  const flushParagraph = (): void => {
     if (paragraph.length > 0) result.push({ kind: 'paragraph', value: paragraph.join('\n') })
     paragraph = []
+  }
+  const flushList = (): void => {
+    if (list) result.push({ kind: 'list', ordered: list.ordered, ...(list.start === undefined ? {} : { start: list.start }), items: list.items })
+    list = null
+  }
+  const flushTable = (): void => {
+    if (table) result.push({ kind: 'table', headers: table.headers, rows: table.rows })
+    table = null
   }
   for (const line of value.split('\n')) {
     const fence = /^\s*```\s*([^`]*)$/.exec(line)
@@ -35,24 +73,48 @@ export function markdownBlocks(value: string): MarkdownBlock[] {
         code = null
         language = undefined
       } else {
-        flush()
+        flushTable(); flushList(); flushParagraph()
         code = []
         language = fence[1]!.trim() || undefined
       }
       continue
     }
     if (code) { code.push(line); continue }
-    if (line.trim() === '') { flush(); continue }
+    if (table) {
+      const row = tableCells(line)
+      if (row) { table.rows.push(row); continue }
+      flushTable()
+    }
+    if (line.trim() === '') { flushList(); flushParagraph(); continue }
+    const header = paragraph.length === 1 ? tableCells(paragraph[0]!) : null
+    const separator = tableCells(line)
+    if (header && separator && isTableSeparator(separator)) {
+      paragraph = []
+      table = { headers: header, rows: [] }
+      continue
+    }
     const heading = /^(#{1,4})\s+(.*)$/.exec(line)
-    if (heading) { flush(); result.push({ kind: 'heading', value: heading[2]!, level: heading[1]!.length }); continue }
+    if (heading) { flushList(); flushParagraph(); result.push({ kind: 'heading', value: heading[2]!, level: heading[1]!.length }); continue }
     const quote = /^\s*>\s?(.*)$/.exec(line)
-    if (quote) { flush(); result.push({ kind: 'quote', value: quote[1]! }); continue }
-    const list = /^\s*(?:[-*+] |\d+[.)] )(.*)$/.exec(line)
-    if (list) { flush(); result.push({ kind: 'list', value: list[1]! }); continue }
+    if (quote) { flushList(); flushParagraph(); result.push({ kind: 'quote', value: quote[1]! }); continue }
+    const listMatch = /^\s*(?:(\d+)[.)]|[-*+])\s+(.*)$/.exec(line)
+    if (listMatch) {
+      flushParagraph()
+      const ordered = listMatch[1] !== undefined
+      if (!list || list.ordered !== ordered) {
+        flushList()
+        list = { ordered, ...(ordered ? { start: Number(listMatch[1]) } : {}), items: [] }
+      }
+      list.items.push(listMatch[2]!)
+      continue
+    }
+    flushList()
     paragraph.push(line)
   }
   if (code) result.push({ kind: 'code', value: code.join('\n'), ...(language ? { language } : {}) })
-  flush()
+  flushTable()
+  flushList()
+  flushParagraph()
   return result
 }
 
@@ -113,7 +175,18 @@ export function SafeMarkdown({ value }: { value: string }): JSX.Element {
         return <Heading key={index}><SafeInline value={block.value} /></Heading>
       }
       if (block.kind === 'quote') return <blockquote key={index}><SafeInline value={block.value} /></blockquote>
-      if (block.kind === 'list') return <div className="pi-list-item" key={index}>• <span><SafeInline value={block.value} /></span></div>
+      if (block.kind === 'list') {
+        const List = block.ordered ? 'ol' : 'ul'
+        return <List key={index} {...(block.ordered && block.start !== undefined ? { start: block.start } : {})}>
+          {block.items.map((item, itemIndex) => <li key={itemIndex}><SafeInline value={item} /></li>)}
+        </List>
+      }
+      if (block.kind === 'table') return <table key={index}>
+        <thead><tr>{block.headers.map((header, headerIndex) => <th scope="col" key={headerIndex}><SafeInline value={header} /></th>)}</tr></thead>
+        <tbody>{block.rows.map((row, rowIndex) => <tr key={rowIndex}>
+          {block.headers.map((_, cellIndex) => <td key={cellIndex}><SafeInline value={row[cellIndex] ?? ''} /></td>)}
+        </tr>)}</tbody>
+      </table>
       return <p key={index}><SafeInline value={block.value} /></p>
     })}
   </div>

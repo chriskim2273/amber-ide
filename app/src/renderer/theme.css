@@ -1688,7 +1688,13 @@ select:focus-visible {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
-.pi-list-item { display: flex; gap: 7px; margin: 3px 0; }
+.pi-markdown ul,
+.pi-markdown ol { margin: 6px 0 10px; padding-left: 22px; }
+.pi-markdown li { margin: 3px 0; }
+.pi-markdown table { width: 100%; margin: 8px 0 12px; border-collapse: collapse; font-size: 12px; }
+.pi-markdown th,
+.pi-markdown td { padding: 5px 7px; border: 1px solid var(--border); text-align: left; vertical-align: top; }
+.pi-markdown th { color: var(--text); background: var(--surface-2); font-weight: 650; }
 .pi-thinking,
 .pi-inline-tool,
 .pi-tool-card {
@@ -1891,6 +1897,12 @@ select:focus-visible {
 .pi-subagent-state-label, .pi-subagent-activity, .pi-subagents-muted { color: var(--text-faint); font-size: 10px; }
 .pi-subagent-state-label { margin-left: auto; }
 .pi-subagent-activity { margin: 5px 0 0 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pi-subagent-children { list-style: none; margin: 6px 0 0 13px; padding: 0 0 0 9px; border-left: 1px solid var(--border); }
+.pi-subagent-child { margin: 4px 0; min-width: 0; }
+.pi-subagent-child-heading { display: flex; align-items: center; min-width: 0; gap: 6px; }
+.pi-subagent-child-heading strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; font-weight: 600; }
+.pi-subagent-readonly { margin-left: auto; color: var(--text-faint); font-size: 9px; white-space: nowrap; }
+.pi-subagent-child-activity { margin: 3px 0 0 13px; color: var(--text-faint); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pi-subagent-actions { margin-top: 6px; flex-wrap: wrap; }
 .pi-subagent-actions .btn { min-height: 26px; padding: 3px 7px; font-size: 10px; }
 .pi-subagent-steer { margin-top: 6px; }
@@ -1916,6 +1928,7 @@ select:focus-visible {
   .pi-composer-actions select { min-height: 44px; }
   .pi-composer-help { display: none; }
   .pi-subagents-toggle { min-height: 44px; }
+  .pi-subagent-children { margin-left: 6px; padding-left: 7px; }
   .pi-subagent-actions .btn, .pi-subagent-steer .btn { min-height: 44px; }
   .pi-subagent-steer input { min-height: 44px; font-size: 16px; }
 }

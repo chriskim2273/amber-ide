@@ -1648,7 +1648,7 @@ function App(): JSX.Element {
   const resetFont = (): void => setLayout((l) =>
     clampFont(l.fontSize ?? DEFAULT_FONT_SIZE) === DEFAULT_FONT_SIZE ? l : { ...l, fontSize: DEFAULT_FONT_SIZE })
 
-  const saveModel = (wsList: typeof workspaces, browserSnapshots: Record<string, { mode: 'preview' | 'browse'; safeRestoreUrl: string; viewport: { width: number; height: number } }>): SaveWorkspace[] => wsList.map((w) => ({
+  const saveModel = (wsList: typeof workspaces, browserSnapshots: Record<string, { mode: 'preview' | 'browse'; viewportMode: 'fit' | 'fixed'; safeRestoreUrl: string; viewport: { width: number; height: number } }>): SaveWorkspace[] => wsList.map((w) => ({
     ws: w.ws,
     tabs: w.tabs.map((t) => {
       const rail = layoutRef.current.workspaces[String(w.ws)]?.tabs[String(t.tab)]?.browser
@@ -1657,7 +1657,7 @@ function App(): JSX.Element {
       name: p.name, cwd: p.cwd, kind: p.kind, ord: p.ord,
       ...(p.title ? { title: p.title } : {}),
       ...(p.kind === 'editor' ? { path: layoutRef.current.editors?.[p.name]?.path ?? null } : {}),
-    })), ...(rail && snapshot ? { browser: { ...snapshot, width: rail.width, collapsed: rail.collapsed } } : {}) }
+    })), ...(rail && snapshot ? { browser: { ...snapshot, viewportMode: snapshot.viewportMode, width: rail.width, collapsed: rail.collapsed } } : {}) }
     }),
   }))
   const captureWorkspace = async (scope: 'one' | 'all', withScrollback: boolean): Promise<{ doc: WorkspaceDoc; stragglers: string[] }> => {
@@ -1677,7 +1677,7 @@ function App(): JSX.Element {
     const hasBrowserRails = expectedBrowserIds.length > 0
     const snapshotReply = hasBrowserRails
       ? window.amber.snapshotWorkspaceBrowsers
-        ? await window.amber.snapshotWorkspaceBrowsers() as { ok?: boolean; result?: Record<string, { mode: 'preview' | 'browse'; safeRestoreUrl: string; viewport: { width: number; height: number } }> }
+        ? await window.amber.snapshotWorkspaceBrowsers() as { ok?: boolean; result?: Record<string, { mode: 'preview' | 'browse'; viewportMode: 'fit' | 'fixed'; safeRestoreUrl: string; viewport: { width: number; height: number } }> }
         : { ok: false }
       : { ok: true, result: {} }
     const browserSnapshots = requireWorkspaceBrowserSnapshots(snapshotReply, expectedBrowserIds)
@@ -2061,12 +2061,17 @@ function App(): JSX.Element {
       )}
       {mobile && pocketFocused && focusedPocketItem && (() => {
         const focusTitle = pocketSessionTitle(focusedPocketItem, titles, home)
+        const focusPiView = focusedPocketItem.pane.kind === 'pi'
+          ? (piViews[focusedPocketItem.pane.name] === 'gui' ? 'gui' : 'terminal')
+          : undefined
         return <PocketFocusHeader
           title={focusTitle}
           machineName={window.amber.machineName}
           stateLabel={focusedPocketItem.stateLabel}
+          {...(focusPiView === undefined ? {} : { piView: focusPiView })}
           onBack={clearZoom}
           onActions={() => setPocketAction(focusedPocketItem)}
+          {...(focusedPocketItem.pane.kind === 'pi' ? { onPiView: (view: 'terminal' | 'gui') => setPiView(focusedPocketItem.pane.name, view) } : {})}
         />
       })()}
       {mobile && !pocketCommandActive && (!pocketFocused || !focusedPocketItem) && (

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { clampBrowserViewport } from '../shared/browserViewport'
+import type { BrowserViewportMode } from '../shared/browserViewport'
 import {
   BROWSER_VIEWPORT_PRESETS,
   MIN_RAIL_WIDTH,
@@ -7,19 +7,22 @@ import {
   clampRailWidth,
   formatLastPiAction,
   keyboardRailWidth,
+  railFitViewportCommand,
   railReloadCommand,
   railStopCommand,
   railWidthMetrics,
   reclampedRailWidth,
   railSecurity,
   railStatusLines,
+  rotateViewport,
+  viewportModeLabel,
   secondsRemaining,
   validateCustomViewport,
 } from './browserRailModel'
 
 interface BrowserStatus {
   id: string; safeRestoreUrl: string; currentUrl: string; pageIncarnation: string; generation: number
-  lifecycle: 'live' | 'frozen'; loading: boolean; capacityWaiting?: boolean; mode: 'preview' | 'browse'
+  lifecycle: 'live' | 'frozen'; loading: boolean; capacityWaiting?: boolean; mode: 'preview' | 'browse'; viewportMode?: BrowserViewportMode
   title: string; restoreError?: string; restoredAfterFreeze: boolean; focused: boolean; visible: boolean
   viewport: { width: number; height: number }; diagnostics: { consoleIssues: number; networkFailures: number }
   lastAction?: { action: string; phase: string; error?: string }
@@ -45,6 +48,7 @@ export function BrowserRail(props: {
 }): JSX.Element {
   const host = useRef<HTMLDivElement>(null), addressInput = useRef<HTMLInputElement>(null)
   const [status, setStatus] = useState<BrowserStatus | null>(null)
+  const statusRef = useRef<BrowserStatus | null>(null)
   const [address, setAddress] = useState('')
   const [error, setError] = useState('')
   const [approval, setApproval] = useState<null | { approvalId: string; digest: string; controller: string; origin: string; category: string; targetLabel: string; argumentSummary: string; visualPreview?: string; expiresAt: number; canGrantOrigin: boolean }>(null)
@@ -53,8 +57,8 @@ export function BrowserRail(props: {
   const [lastAction, setLastAction] = useState<null | { action: string; phase: string; error?: string }>(null)
   const [clock, setClock] = useState(Date.now())
   const [viewportOpen, setViewportOpen] = useState(false)
-  const [responsiveViewport, setResponsiveViewport] = useState(false)
   const [customWidth, setCustomWidth] = useState('1280'), [customHeight, setCustomHeight] = useState('800')
+  const viewportIntentRef = useRef(0)
   const [autoCollapsed, setAutoCollapsed] = useState(false)
   const [capacityWaiting, setCapacityWaiting] = useState(false)
   const [availableWidth, setAvailableWidth] = useState(1200)
@@ -64,6 +68,9 @@ export function BrowserRail(props: {
     return window.amber.browserCommand(value) as Promise<BrowserReply>
   }
   const acceptStatus = (next: BrowserStatus): void => {
+    const current = statusRef.current
+    if (current && current.pageIncarnation === next.pageIncarnation && next.generation < current.generation) return
+    statusRef.current = next
     setStatus(next)
     if (next.lastAction) setLastAction(next.lastAction)
     if (document.activeElement !== addressInput.current) setAddress(next.currentUrl === 'about:blank' ? '' : next.currentUrl)
@@ -103,24 +110,30 @@ export function BrowserRail(props: {
   }, [props.id, props.collapsed])
 
   const widthMetrics = railWidthMetrics(props.width, availableWidth)
+  const activeViewportMode = status?.viewportMode ?? 'fit'
+  const canonicalViewport = status?.viewport ?? { width: 1280, height: 800 }
   useEffect(() => { const persisted = reclampedRailWidth(props.width, availableWidth); if (!autoCollapsed && persisted !== null) props.onWidth(persisted) }, [autoCollapsed, availableWidth, props.onWidth, props.width])
 
   const presentationHidden = props.collapsed || props.temporarilyHidden || props.occluded || viewportOpen || autoCollapsed
   useEffect(() => {
     let stopped = false, frame = 0, settled = 0
-    if (presentationHidden) { void command({ type: 'hide', id: props.id }); return () => { stopped = true } }
+    if (presentationHidden) { viewportIntentRef.current += 1; void command({ type: 'hide', id: props.id }); return () => { stopped = true } }
     const element = host.current
     if (!element) return
     const update = async (): Promise<void> => {
       const rect = element.getBoundingClientRect()
       const bounds = { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.max(1, Math.round(rect.width)), height: Math.max(1, Math.round(rect.height)) }
+      const intent = viewportIntentRef.current
       const reply = await command({ type: 'show', id: props.id, bounds })
-      if (!stopped && reply.ok && 'id' in reply.result) {
-        acceptStatus(reply.result); setError('')
-        if (responsiveViewport) {
-          const current = reply.result, viewport = clampBrowserViewport(bounds.width, bounds.height)
-          const resized = await command({ type: 'viewport', id: props.id, pageIncarnation: current.pageIncarnation, expectedGeneration: current.generation, ...viewport })
-          if (!stopped && resized.ok && 'id' in resized.result) acceptStatus(resized.result)
+      if (intent !== viewportIntentRef.current || stopped) return
+      if (reply.ok && 'id' in reply.result) {
+        const current = reply.result
+        acceptStatus(current); setError('')
+        if ((current.viewportMode ?? 'fit') === 'fit') {
+          const fitIntent = ++viewportIntentRef.current
+          const fitted = await command(railFitViewportCommand(current))
+          if (!stopped && fitIntent === viewportIntentRef.current && fitted.ok && 'id' in fitted.result) acceptStatus(fitted.result)
+          else if (!stopped && fitIntent === viewportIntentRef.current && !fitted.ok) setError(fitted.error)
         }
       } else if (!stopped && !reply.ok) setError(reply.error)
     }
@@ -131,18 +144,22 @@ export function BrowserRail(props: {
     void update()
     const observer = new ResizeObserver(schedule); observer.observe(element); window.addEventListener('resize', schedule)
     return () => { stopped = true; observer.disconnect(); window.removeEventListener('resize', schedule); cancelAnimationFrame(frame); clearTimeout(settled) }
-  }, [props.id, presentationHidden, responsiveViewport])
+  }, [props.id, presentationHidden])
 
   const withLease = async (request: (lease: BrowserStatus) => unknown): Promise<void> => {
-    if (!status || status.lifecycle !== 'live') return
-    const reply = await command(request(status))
+    const currentStatus = statusRef.current ?? status
+    if (!currentStatus || currentStatus.lifecycle !== 'live') return
+    const intent = viewportIntentRef.current
+    const reply = await command(request(currentStatus))
+    if (intent !== viewportIntentRef.current) return
     if (reply.ok && 'id' in reply.result) { acceptStatus(reply.result); setError('') } else if (!reply.ok) setError(reply.error)
   }
   const reloadOrRestore = async (): Promise<void> => {
-    if (!status) return
+    const currentStatus = statusRef.current ?? status
+    if (!currentStatus) return
     const rect = host.current?.getBoundingClientRect()
     const bounds = { x: Math.round(rect?.x ?? 0), y: Math.round(rect?.y ?? 0), width: Math.max(1, Math.round(rect?.width ?? widthMetrics.width)), height: Math.max(1, Math.round(rect?.height ?? 1)) }
-    const reply = await command(railReloadCommand(status, bounds))
+    const reply = await command(railReloadCommand(currentStatus, bounds))
     if (reply.ok && 'id' in reply.result) { acceptStatus(reply.result); setError('') } else if (!reply.ok) setError(reply.error)
   }
   const navigate = async (): Promise<void> => {
@@ -150,9 +167,24 @@ export function BrowserRail(props: {
     await withLease((lease) => ({ type: 'navigate', id: props.id, url: /^[a-z][a-z0-9+.-]*:\/\//i.test(address) ? address : `https://${address}`, pageIncarnation: lease.pageIncarnation, expectedGeneration: lease.generation }))
   }
   const setViewport = async (width: number, height: number): Promise<void> => {
-    setResponsiveViewport(false)
-    await withLease((lease) => ({ type: 'viewport', id: props.id, pageIncarnation: lease.pageIncarnation, expectedGeneration: lease.generation, width, height }))
-    setViewportOpen(false)
+    const intent = ++viewportIntentRef.current
+    const currentStatus = statusRef.current ?? status
+    if (!currentStatus || currentStatus.lifecycle !== 'live') return
+    const reply = await command({ type: 'viewport', id: props.id, pageIncarnation: currentStatus.pageIncarnation, expectedGeneration: currentStatus.generation, width, height })
+    if (intent !== viewportIntentRef.current) return
+    if (reply.ok && 'id' in reply.result) {
+      acceptStatus(reply.result); setError(''); setViewportOpen(false)
+    } else if (!reply.ok) setError(reply.error)
+  }
+  const fitViewport = async (): Promise<void> => {
+    const currentStatus = statusRef.current ?? status
+    if (!currentStatus || currentStatus.lifecycle !== 'live') return
+    const intent = ++viewportIntentRef.current
+    const reply = await command(railFitViewportCommand(currentStatus))
+    if (intent !== viewportIntentRef.current) return
+    if (reply.ok && 'id' in reply.result) {
+      acceptStatus(reply.result); setError(''); setViewportOpen(false)
+    } else if (!reply.ok) setError(reply.error)
   }
   const security = railSecurity(status?.currentUrl ?? '')
   const statusLines = status ? railStatusLines({ lifecycle: status.lifecycle, loading: status.loading, capacityWaiting: capacityWaiting || !!status.capacityWaiting,
@@ -177,9 +209,14 @@ export function BrowserRail(props: {
       <button className="icon-btn" aria-label="Collapse tab browser" onClick={() => { void command({ type: 'hide', id: props.id }).then((reply) => { if (reply.ok) props.onCollapsed(true); else setError(reply.error) }) }}>›</button>
       <button className="icon-btn" aria-label="Close tab browser" onClick={props.onClose}>×</button>
     </div>
-    <div className="tab-browser-tools">
+    <div className="tab-browser-tools tab-browser-dock-strip">
       <label>Mode <select aria-label="Browser mode" value={status?.mode ?? 'browse'} onChange={(event) => { void command({ type: 'mode', id: props.id, mode: event.target.value }).then((reply) => { if (reply.ok && 'id' in reply.result) acceptStatus(reply.result); else if (!reply.ok) setError(reply.error) }) }}><option value="preview">Preview</option><option value="browse">Browse</option></select></label>
-      <button className="btn" aria-haspopup="menu" aria-expanded={viewportOpen} onClick={() => setViewportOpen((value) => !value)}>Viewport</button>
+      <label className="tab-browser-viewport-mode">Viewport <select aria-label="Viewport mode" value={activeViewportMode} disabled={!status || status.lifecycle !== 'live'} onChange={(event) => {
+        if (event.target.value === 'fit') void fitViewport()
+        else void setViewport(canonicalViewport.width, canonicalViewport.height)
+      }}><option value="fit">Fit to rail</option><option value="fixed">Fixed viewport</option></select></label>
+      <span className="tab-browser-viewport-label" title="Viewport size simulation; not real-device, browser, OS, or IME testing">{viewportModeLabel(activeViewportMode, canonicalViewport)}</span>
+      <button className="btn" aria-haspopup="menu" aria-expanded={viewportOpen} onClick={() => setViewportOpen((value) => !value)}>Viewport size</button>
       <select aria-label="Pi browser controller" value={props.designatedPi ?? ''} onChange={(event) => props.onPolicy({ ...(event.target.value ? { designatedPi: event.target.value } : {}), sharedWithPi: false })}>
         <option value="">Private</option>{props.controllers.map((controller) => <option key={controller.name} value={controller.name}>{controller.label}</option>)}
       </select>
@@ -194,12 +231,10 @@ export function BrowserRail(props: {
       <button className="btn" onClick={props.onRecovery}>Recovery</button>
     </div>
     {viewportOpen && <div className="tab-browser-viewport" role="menu" aria-label="Browser viewport">
+      <div className="tab-browser-viewport-summary"><strong>{viewportModeLabel(activeViewportMode, canonicalViewport)}</strong><span>Viewport size simulation only — not real-device, browser, OS, or IME testing.</span></div>
       {BROWSER_VIEWPORT_PRESETS.filter((preset) => preset.viewport).map((preset) => <button role="menuitem" className="btn" key={preset.id} onClick={() => void setViewport(preset.viewport!.width, preset.viewport!.height)}>{preset.label}</button>)}
-      <div className="tab-browser-custom-viewport"><input aria-label="Custom viewport width" inputMode="numeric" value={customWidth} onChange={(event) => setCustomWidth(event.target.value.slice(0, 4))} /><span>×</span><input aria-label="Custom viewport height" inputMode="numeric" value={customHeight} onChange={(event) => setCustomHeight(event.target.value.slice(0, 4))} /><button className="btn" disabled={!validateCustomViewport(customWidth, customHeight)} onClick={() => { const value = validateCustomViewport(customWidth, customHeight); if (value) void setViewport(value.width, value.height) }}>Apply</button></div>
-      <button className="btn" aria-pressed={responsiveViewport} onClick={() => {
-        const rect = host.current?.getBoundingClientRect(); setResponsiveViewport(true); setViewportOpen(false)
-        if (rect && status?.lifecycle === 'live') void command({ type: 'viewport', id: props.id, pageIncarnation: status.pageIncarnation, expectedGeneration: status.generation, ...clampBrowserViewport(rect.width, rect.height) }).then((reply) => { if (reply.ok && 'id' in reply.result) acceptStatus(reply.result) })
-      }}>Responsive to rail</button>
+      <div className="tab-browser-custom-viewport"><input aria-label="Custom viewport width" inputMode="numeric" value={customWidth} onChange={(event) => setCustomWidth(event.target.value.slice(0, 4))} /><span>×</span><input aria-label="Custom viewport height" inputMode="numeric" value={customHeight} onChange={(event) => setCustomHeight(event.target.value.slice(0, 4))} /><button className="btn" disabled={!validateCustomViewport(customWidth, customHeight)} onClick={() => { const value = validateCustomViewport(customWidth, customHeight); if (value) void setViewport(value.width, value.height) }}>Apply fixed</button><button className="btn" disabled={!status || activeViewportMode !== 'fixed'} onClick={() => { const rotated = rotateViewport(canonicalViewport); void setViewport(rotated.width, rotated.height) }}>Rotate</button></div>
+      <button className="btn" aria-pressed={activeViewportMode === 'fit'} onClick={() => void fitViewport()}>Fit to rail</button>
     </div>}
     <div className="tab-browser-state" role="status" aria-live="polite">
       <span className={`tab-browser-focus ${status?.focused ? 'active' : ''}`}>{status?.focused ? 'Page focus · Ctrl+Shift+B returns to Amber' : 'Chrome focus'}</span>

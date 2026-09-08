@@ -21,6 +21,7 @@ describe('parseTabBrowserCommand', () => {
     expect(parseTabBrowserCommand({ type: 'reload', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', pageIncarnation: 'page', expectedGeneration: 2 })).toMatchObject({ type: 'reload', expectedGeneration: 2 })
     expect(parseTabBrowserCommand({ type: 'history', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', direction: 'back', pageIncarnation: 'page', expectedGeneration: 2 })).toMatchObject({ type: 'history', direction: 'back' })
     expect(parseTabBrowserCommand({ type: 'mode', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', mode: 'preview' })).toMatchObject({ type: 'mode', mode: 'preview' })
+    expect(parseTabBrowserCommand({ type: 'fitViewport', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', pageIncarnation: 'page', expectedGeneration: 2 })).toEqual({ type: 'fitViewport', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', pageIncarnation: 'page', expectedGeneration: 2 })
     expect(parseTabBrowserCommand({ type: 'viewport', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', pageIncarnation: 'page', expectedGeneration: 2, width: 390, height: 844 })).toMatchObject({ type: 'viewport', width: 390, height: 844 })
     expect(parseTabBrowserCommand({ type: 'focusPage', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' })).toMatchObject({ type: 'focusPage' })
     const stop = railStopCommand({ id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', pageIncarnation: 'page', generation: 2, lifecycle: 'live' })
@@ -38,6 +39,7 @@ describe('parseTabBrowserCommand', () => {
     expect(() => parseTabBrowserCommand({ type: 'bounds', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', bounds: { x: 0, y: 0, width: 100_000, height: 2 } })).toThrow('INVALID_REQUEST')
     expect(() => parseTabBrowserCommand({ type: 'viewport', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', pageIncarnation: 'page', expectedGeneration: 2, width: 1, height: 844 })).toThrow('INVALID_REQUEST')
     expect(() => parseTabBrowserCommand({ type: 'mode', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', mode: 'unsafe' })).toThrow('INVALID_REQUEST')
+    expect(() => parseTabBrowserCommand({ type: 'fitViewport', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', pageIncarnation: 'page', expectedGeneration: -1 })).toThrow('INVALID_REQUEST')
   })
 })
 

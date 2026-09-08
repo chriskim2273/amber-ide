@@ -6,7 +6,11 @@ import { PiComposer, type PiAttachmentProgress } from './PiComposer'
 import { PiSubagents } from './PiSubagents'
 import { PiTranscript } from './PiTranscript'
 import { canClearPiDraft, clearPiDraft, readPiDraft, writePiDraft } from './piDraft'
-import { legacyPiDeliveryMessage, piOperationCurrent, piSubmitAllowed, releasePiOperation, resetPiSubmissionOnReconnect, uploadThenPrompt } from './piSubmission'
+import {
+  legacyPiDeliveryMessage, piOperationCurrent, piSubmitAllowed, pruneCompletedAttachments, releasePiOperation,
+  rememberCompletedAttachment, resetPiSubmissionOnReconnect, reuseCompletedAttachment, uploadThenPrompt,
+  type PiCompletedAttachment,
+} from './piSubmission'
 
 type PiReceipt = { success: boolean; error?: string; data?: unknown }
 type ReceiptWaiter = {
@@ -43,7 +47,15 @@ export const PiPane = memo(function PiPane({ session, portEpoch }: { session: st
   const [follow, setFollow] = useState(true)
   const portRef = useRef<MessagePort | null>(null)
   const waitersRef = useRef(new Map<string, ReceiptWaiter>())
+  // Port generations identify the MessagePort listener. Operation generations
+  // are intentionally separate: a semantic socket can reconnect on the same
+  // port and must invalidate sends without making the replacement port stale.
+  const portGenerationRef = useRef(0)
   const generationRef = useRef(0)
+  const bridgeAvailableRef = useRef(false)
+  const conversationIdRef = useRef<string | null>(null)
+  const completedAttachmentsRef = useRef(new Map<File, PiCompletedAttachment>())
+  const mountedSessionRef = useRef(session)
   const transcriptRef = useRef<HTMLDivElement>(null)
   const endRef = useRef<HTMLDivElement>(null)
   const draftRef = useRef(draft)
@@ -52,6 +64,13 @@ export const PiPane = memo(function PiPane({ session, portEpoch }: { session: st
   const pendingSubmitRef = useRef<string | null>(null)
 
   draftRef.current = draft
+  mountedSessionRef.current = session
+
+  // File objects are strong map keys. Keep completed-upload reuse local to the
+  // current tray without deleting any server-side attachment artifacts.
+  useEffect(() => {
+    pruneCompletedAttachments(completedAttachmentsRef.current, files)
+  }, [files])
 
   // Draft persistence is guarded and debounced. It is never used to replay a
   // prompt, and a receipt only clears the exact version that was submitted.
@@ -60,12 +79,57 @@ export const PiPane = memo(function PiPane({ session, portEpoch }: { session: st
     return () => clearTimeout(timer)
   }, [session, draft])
 
+  // The debounce cleanup above deliberately drops its timer on an immediate
+  // view switch. Flush the newest in-memory edit at the lifecycle boundary,
+  // but only while this component still owns the same Amber session key. That
+  // guard prevents a late cleanup from writing one pane's draft into another
+  // pane after a retarget.
+  useEffect(() => {
+    const mountedSession = session
+    const flush = (): void => {
+      if (mountedSessionRef.current === mountedSession) writePiDraft(mountedSession, draftRef.current)
+    }
+    window.addEventListener('pagehide', flush)
+    return () => {
+      window.removeEventListener('pagehide', flush)
+      flush()
+    }
+  }, [session])
+
   useEffect(() => {
     if (follow) endRef.current?.scrollIntoView({ block: 'end' })
   }, [follow, state.messages, state.liveMessage, state.tools])
 
+  const invalidateLiveOperations = (reason: string, clearAttachments: boolean): void => {
+    const hadOperation = waitersRef.current.size > 0
+      || pendingSubmitRef.current !== null
+      || uploadAbortRef.current !== null
+    generationRef.current += 1
+    for (const waiter of waitersRef.current.values()) {
+      clearTimeout(waiter.timer)
+      waiter.detachAbort?.()
+      waiter.reject(new Error(reason))
+    }
+    waitersRef.current.clear()
+    setPendingRequests(new Set())
+    uploadAbortRef.current?.abort()
+    uploadAbortRef.current = null
+    pendingSubmitRef.current = null
+    setPendingSubmit(null)
+    setUploading(false)
+    if (clearAttachments) {
+      completedAttachmentsRef.current.clear()
+      setFiles([])
+      setUploadProgress({})
+      setAttachmentError(null)
+    }
+    if (hadOperation || draftRef.current.trim() || files.length > 0) {
+      setUncertainDelivery(`${reason}; your draft was kept.`)
+    }
+  }
+
   useEffect(() => {
-    const generation = ++generationRef.current
+    const portGeneration = ++portGenerationRef.current
     const onPort = (event: MessageEvent): void => {
       const data = event.data as { amberPanePort?: boolean; session?: string; mode?: string }
       if (!data?.amberPanePort || data.session !== session || data.mode !== 'pi' || !event.ports[0]) return
@@ -74,14 +138,16 @@ export const PiPane = memo(function PiPane({ session, portEpoch }: { session: st
       const port = event.ports[0]
       portRef.current = port
       port.onmessage = (incoming) => {
-        if (generation !== generationRef.current) return
+        if (portGeneration !== portGenerationRef.current) return
         const msg = (incoming.data as { msg?: ControlMsg })?.msg
         if (!msg) return
+        let matchedReceipt = false
         if (msg.kind === 'PiEvent' && msg.event['kind'] === 'command_result'
           && typeof msg.event['requestId'] === 'string') {
           const requestId = msg.event['requestId']
           const waiter = waitersRef.current.get(requestId)
-          if (waiter && waiter.generation === generation) {
+          if (waiter && waiter.generation === generationRef.current) {
+            matchedReceipt = true
             clearTimeout(waiter.timer)
             waiter.detachAbort?.()
             waitersRef.current.delete(requestId)
@@ -97,6 +163,24 @@ export const PiPane = memo(function PiPane({ session, portEpoch }: { session: st
             else waiter.reject(new Error(receipt.error ?? 'Pi command failed'))
           }
         }
+        // A receipt with no current waiter belongs to an invalidated operation
+        // (often an old socket or conversation). Do not hydrate it into the
+        // replacement conversation.
+        if (msg.kind === 'PiEvent' && msg.event['kind'] === 'command_result' && !matchedReceipt) return
+        if (msg.kind === 'PiBridgeStatus') {
+          bridgeAvailableRef.current = msg.available
+          if (!msg.available) invalidateLiveOperations('Delivery unknown because the Pi bridge disconnected', false)
+        } else if (msg.kind === 'PiEvent') {
+          bridgeAvailableRef.current = true
+          if (msg.event['kind'] === 'snapshot') {
+            const nextConversationId = typeof msg.event['sessionId'] === 'string' ? msg.event['sessionId'] : null
+            const previousConversationId = conversationIdRef.current
+            if (previousConversationId !== null && previousConversationId !== nextConversationId) {
+              invalidateLiveOperations('Pi conversation changed', true)
+            }
+            conversationIdRef.current = nextConversationId
+          }
+        }
         dispatch(msg)
       }
       port.start()
@@ -104,7 +188,10 @@ export const PiPane = memo(function PiPane({ session, portEpoch }: { session: st
     window.addEventListener('message', onPort)
     window.amber.openPiPane(session)
     return () => {
+      portGenerationRef.current += 1
       generationRef.current += 1
+      bridgeAvailableRef.current = false
+      conversationIdRef.current = null
       window.removeEventListener('message', onPort)
       for (const waiter of waitersRef.current.values()) {
         clearTimeout(waiter.timer)
@@ -131,7 +218,7 @@ export const PiPane = memo(function PiPane({ session, portEpoch }: { session: st
 
   const send = (command: PiCommand): boolean => {
     const port = portRef.current
-    if (!port) {
+    if (!port || !bridgeAvailableRef.current) {
       setUncertainDelivery('Delivery unknown because the Pi bridge is unavailable; your draft was kept.')
       return false
     }
@@ -146,7 +233,8 @@ export const PiPane = memo(function PiPane({ session, portEpoch }: { session: st
   const sendRequest = (command: PiCommand & { requestId: string }, options: RequestOptions = {}): Promise<PiReceipt> => {
     const port = portRef.current
     const generation = generationRef.current
-    if (!port || (options.generation !== undefined && options.generation !== generation)) return Promise.reject(new Error('Pi bridge is not connected'))
+    if (!port || !bridgeAvailableRef.current
+      || (options.generation !== undefined && options.generation !== generation)) return Promise.reject(new Error('Pi bridge is not connected'))
     if (options.signal?.aborted) return Promise.reject(new Error('Pi operation canceled'))
     return new Promise<PiReceipt>((resolve, reject) => {
       let settled = false
@@ -187,8 +275,16 @@ export const PiPane = memo(function PiPane({ session, portEpoch }: { session: st
   }
 
   const uploadFile = async (file: File, signal: AbortSignal, operationGeneration: number): Promise<string> => {
-    const current = (): boolean => piOperationCurrent(signal, operationGeneration, generationRef.current, portRef.current !== null)
+    const current = (): boolean => piOperationCurrent(
+      signal, operationGeneration, generationRef.current,
+      portRef.current !== null && bridgeAvailableRef.current,
+    )
     const ensureCurrent = (): void => { if (!current()) throw new Error(signal.aborted ? 'Pi upload canceled' : 'Pi bridge replaced') }
+    const cached = reuseCompletedAttachment(completedAttachmentsRef.current, file, conversationIdRef.current)
+    if (cached) {
+      updateProgress(file, { state: 'done', acknowledged: file.size })
+      return cached
+    }
     updateProgress(file, { state: 'uploading', acknowledged: 0 })
     ensureCurrent()
     const begin = await sendRequest({
@@ -211,21 +307,23 @@ export const PiPane = memo(function PiPane({ session, portEpoch }: { session: st
       ensureCurrent()
       await sendRequest({ kind: 'UploadFinish', requestId: newPiRequestId('upload-finish'), attachmentId }, { signal, generation: operationGeneration })
       ensureCurrent()
+      rememberCompletedAttachment(completedAttachmentsRef.current, file, conversationIdRef.current, attachmentId)
       updateProgress(file, { state: 'done', acknowledged: file.size })
       return attachmentId
     } catch (error) {
       // Never send a cleanup mutation over a replacement port/session. A
       // cancellation on the same live operation is safe and keeps the server
       // from retaining a partial artifact.
-      if (generationRef.current === operationGeneration && portRef.current !== null) {
+      if (generationRef.current === operationGeneration && portRef.current !== null && bridgeAvailableRef.current) {
         void sendRequest({ kind: 'UploadCancel', requestId: newPiRequestId('upload-cancel'), attachmentId }, { generation: operationGeneration }).catch(() => {})
       }
-      updateProgress(file, { state: signal.aborted ? 'canceled' : 'error', error: errorText(error) })
+      if (current()) updateProgress(file, { state: signal.aborted ? 'canceled' : 'error', error: errorText(error) })
       throw error
     }
   }
 
   const clearSubmittedDraft = (value: string, version: number): void => {
+    if (mountedSessionRef.current !== session) return
     if (canClearPiDraft(draftRef.current, value, draftVersionRef.current, version)) {
       setDraft('')
       clearPiDraft(session)
@@ -255,16 +353,19 @@ export const PiPane = memo(function PiPane({ session, portEpoch }: { session: st
     const commandDelivery: PiDelivery = state.idle ? 'now' : delivery
     if (selected.length === 0 && state.capabilities.promptReceipts) {
       const requestId = newPiRequestId('prompt')
+      const operationGeneration = generationRef.current
       pendingSubmitRef.current = requestId
       setPendingSubmit(requestId)
-      void sendRequest({ kind: 'PromptWithAttachments', requestId, message, delivery: commandDelivery, attachments: [] })
+      void sendRequest({ kind: 'PromptWithAttachments', requestId, message, delivery: commandDelivery, attachments: [] }, { generation: operationGeneration })
         .then(() => {
           releasePendingSubmit(requestId)
-          clearSubmittedDraft(submittedDraft, submittedVersion)
+          if (generationRef.current === operationGeneration) clearSubmittedDraft(submittedDraft, submittedVersion)
         })
         .catch((error) => {
           releasePendingSubmit(requestId)
-          setUncertainDelivery(`Delivery unknown: ${errorText(error)} Your draft was kept.`)
+          if (generationRef.current === operationGeneration) {
+            setUncertainDelivery(`Delivery unknown: ${errorText(error)} Your draft was kept.`)
+          }
         })
       return
     }
@@ -286,7 +387,8 @@ export const PiPane = memo(function PiPane({ session, portEpoch }: { session: st
     void (async () => {
       try {
         const isCurrent = (): boolean => piOperationCurrent(
-          controller.signal, operationGeneration, generationRef.current, portRef.current !== null,
+          controller.signal, operationGeneration, generationRef.current,
+          portRef.current !== null && bridgeAvailableRef.current,
         )
         const submitted = await uploadThenPrompt(
           selected,
@@ -302,6 +404,7 @@ export const PiPane = memo(function PiPane({ session, portEpoch }: { session: st
         )
         if (!submitted || !isCurrent()) return
         clearSubmittedDraft(submittedDraft, submittedVersion)
+        for (const file of selected) completedAttachmentsRef.current.delete(file)
         setFiles([])
         setUploadProgress({})
       } catch (error) {
@@ -318,9 +421,24 @@ export const PiPane = memo(function PiPane({ session, portEpoch }: { session: st
   }
 
   const acceptFiles = (selected: File[]): void => {
+    // `uploading` can still be the previous render's value for a same-turn
+    // drop/paste/picker event. The controller ref is claimed synchronously by
+    // submit(), so additions are rejected at the operation boundary too.
+    if (uploading || uploadAbortRef.current !== null) {
+      setAttachmentError('Cannot add attachments while an upload is in progress.')
+      return
+    }
     const validation = attachmentsError(selected)
     setAttachmentError(validation)
-    if (!validation) setFiles(selected)
+    if (!validation) {
+      pruneCompletedAttachments(completedAttachmentsRef.current, selected)
+      setFiles(selected)
+    }
+  }
+  const removeFile = (index: number): void => {
+    const removed = files[index]
+    if (removed) completedAttachmentsRef.current.delete(removed)
+    setFiles((current) => current.filter((_, i) => i !== index))
   }
   const cancelUpload = (): void => {
     uploadAbortRef.current?.abort()
@@ -346,14 +464,17 @@ export const PiPane = memo(function PiPane({ session, portEpoch }: { session: st
     {state.awaitingUi && <div className="pi-dialog-notice" role="alert">Pi is waiting for {state.awaitingUi.title ?? `a ${state.awaitingUi.kind} response`} in the terminal view.</div>}
     {state.error && <div className="pi-chat-error" role="alert">{state.error}</div>}
     <PiSubagents status={state.subagents} transcripts={state.transcripts} receipts={state.receipts}
-      pending={pendingRequests} onCommand={(command) => sendRequest(command).then(() => undefined).catch((error) => {
-        setUncertainDelivery(`Subagent request failed: ${errorText(error)}`)
-        throw error
-      })} />
+      pending={pendingRequests} onCommand={(command) => {
+        const operationGeneration = generationRef.current
+        return sendRequest(command, { generation: operationGeneration }).then(() => undefined).catch((error) => {
+          if (generationRef.current === operationGeneration) setUncertainDelivery(`Subagent request failed: ${errorText(error)}`)
+          throw error
+        })
+      }} />
     <PiTranscript messages={state.messages} liveMessage={state.liveMessage} tools={state.tools}
       transcriptRef={transcriptRef} endRef={endRef} follow={follow} onFollowChange={setFollow} />
     <PiComposer draft={draft} onDraftChange={(value) => { draftVersionRef.current += 1; setDraft(value) }}
-      files={files} onFiles={acceptFiles} onRemoveFile={(index) => setFiles((current) => current.filter((_, i) => i !== index))}
+      files={files} onFiles={acceptFiles} onRemoveFile={removeFile}
       onSubmit={submit} onStop={() => send({ kind: 'Abort' })} onCancelUpload={cancelUpload}
       delivery={delivery} onDeliveryChange={setDelivery} available={state.available} busy={!state.idle} uploading={uploading}
       submitting={pendingSubmit !== null} attachmentSupported={state.capabilities.attachments} attachmentError={attachmentError}

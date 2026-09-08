@@ -5,6 +5,7 @@ const MAX_TOOLS = 128
 const MAX_SUBAGENT_RUNS = 64
 const MAX_SUBAGENT_CHILDREN = 50
 const MAX_SUBAGENT_TRANSCRIPTS = 64
+const MAX_SUBAGENT_RECEIPTS = 128
 const MAX_TEXT = 4_096
 
 export interface PiToolState {
@@ -100,6 +101,9 @@ export interface PiSubagentReceipt {
 }
 
 export interface PiViewState {
+  /** Public Pi session identity from the authoritative snapshot. Operations
+   * are scoped to this value, not merely the Amber pane name. */
+  sessionId: string | null
   available: boolean
   statusKnown: boolean
   idle: boolean
@@ -134,6 +138,7 @@ const unavailableSubagents = (): PiSubagentStatus => ({
 })
 
 export const initialPiViewState: PiViewState = {
+  sessionId: null,
   available: false,
   statusKnown: false,
   idle: true,
@@ -188,14 +193,68 @@ function toolEventFromEntry(entry: Record<string, unknown>): Record<string, unkn
   return entry
 }
 
-/** Hydrate tool state from snapshots when Pi includes execution entries. This
- * keeps a reconnect checkpoint from losing the compact tool summary. */
+function toolCallId(value: Record<string, unknown>): string | undefined {
+  return typeof value['toolCallId'] === 'string' ? value['toolCallId']
+    : typeof value['id'] === 'string' ? value['id'] : undefined
+}
+
+function snapshotToolCall(tools: Record<string, PiToolState>, value: Record<string, unknown>): void {
+  const id = toolCallId(value)
+  if (!id) return
+  const previous = tools[id]
+  const args = value['arguments'] !== undefined ? value['arguments'] : value['args']
+  const name = typeof value['name'] === 'string' ? value['name']
+    : typeof value['toolName'] === 'string' ? value['toolName'] : previous?.name ?? 'tool'
+  const completed = previous !== undefined && (!previous.running || previous.result !== undefined || previous.error === true)
+  tools[id] = {
+    id,
+    name,
+    ...(args !== undefined ? { args } : previous?.args === undefined ? {} : { args: previous.args }),
+    ...(previous?.partial === undefined ? {} : { partial: previous.partial }),
+    ...(previous?.result === undefined ? {} : { result: previous.result }),
+    running: !completed,
+    ...(previous?.error === true ? { error: true } : {}),
+  }
+}
+
+function snapshotToolResult(tools: Record<string, PiToolState>, message: Record<string, unknown>): void {
+  const id = typeof message['toolCallId'] === 'string' ? message['toolCallId'] : undefined
+  if (!id) return
+  const previous = tools[id]
+  const result = message['content'] !== undefined ? message['content'] : message['result']
+  const name = typeof message['toolName'] === 'string' ? message['toolName'] : previous?.name ?? 'tool'
+  tools[id] = {
+    id,
+    name,
+    ...(previous?.args === undefined ? {} : { args: previous.args }),
+    ...(previous?.partial === undefined ? {} : { partial: previous.partial }),
+    ...(result === undefined ? {} : { result }),
+    running: false,
+    ...(message['isError'] === true || (message['isError'] === undefined && previous?.error === true) ? { error: true } : {}),
+  }
+}
+
+/** Hydrate tool state from the persisted message union as well as transient
+ * execution events. Pi's SessionEntry history stores assistant tool calls and
+ * toolResult messages, not the live tool_execution_* event union. */
 export function toolsFromEntries(entries: unknown): Record<string, PiToolState> {
   if (!Array.isArray(entries)) return {}
   const tools: Record<string, PiToolState> = {}
   for (const raw of entries) {
     const entry = record(raw)
-    const event = entry ? toolEventFromEntry(entry) : null
+    if (!entry) continue
+    if (entry['type'] === 'message') {
+      const message = record(entry['message'])
+      if (!message) continue
+      if (message['role'] === 'assistant' && Array.isArray(message['content'])) {
+        for (const rawPart of message['content']) {
+          const part = record(rawPart)
+          if (part?.['type'] === 'toolCall') snapshotToolCall(tools, part)
+        }
+      } else if (message['role'] === 'toolResult') snapshotToolResult(tools, message)
+      continue
+    }
+    const event = toolEventFromEntry(entry)
     if (!event || typeof event['toolCallId'] !== 'string') continue
     const id = event['toolCallId']
     const previous = tools[id]
@@ -442,24 +501,34 @@ function messageToolIds(message: unknown): string[] {
 export function mergePiTimeline(messages: unknown[], tools: Record<string, PiToolState>, liveMessage?: unknown | null): PiTimelineItem[] {
   const used = new Set<string>()
   const out: PiTimelineItem[] = []
-  messages.slice(-MAX_MESSAGES).forEach((message, index) => {
+  const orderedMessages = messages.slice(-MAX_MESSAGES)
+  const assistantToolIds = new Set<string>()
+  for (const message of [...orderedMessages, ...(liveMessage === undefined || liveMessage === null ? [] : [liveMessage])]) {
+    const object = record(message)
+    if (object?.['role'] === 'assistant') for (const id of messageToolIds(message)) assistantToolIds.add(id)
+  }
+  const appendMessage = (message: unknown, key: string): void => {
+    const object = record(message)
+    if (object?.['role'] === 'toolResult') {
+      const id = typeof object['toolCallId'] === 'string' ? object['toolCallId'] : undefined
+      // Persisted toolResult messages are the durable result for an assistant
+      // tool call. Once that association is proven, the result belongs in the
+      // linked ToolCard rather than becoming a second transcript row.
+      if (id && tools[id]) {
+        used.add(id)
+        if (assistantToolIds.has(id)) return
+      }
+    }
     const linked = messageToolIds(message).flatMap((id) => {
       const tool = tools[id]
       if (!tool) return []
       used.add(id)
       return [tool]
     })
-    out.push({ kind: 'message', key: `message-${index}`, message, tools: linked })
-  })
-  if (liveMessage !== undefined && liveMessage !== null) {
-    const linked = messageToolIds(liveMessage).flatMap((id) => {
-      const tool = tools[id]
-      if (!tool) return []
-      used.add(id)
-      return [tool]
-    })
-    out.push({ kind: 'message', key: 'live-message', message: liveMessage, tools: linked })
+    out.push({ kind: 'message', key, message, tools: linked })
   }
+  orderedMessages.forEach((message, index) => appendMessage(message, `message-${index}`))
+  if (liveMessage !== undefined && liveMessage !== null) appendMessage(liveMessage, 'live-message')
   for (const [id, tool] of Object.entries(tools)) {
     if (!used.has(id)) out.push({ kind: 'tool', key: `tool-${id}`, tool })
   }
@@ -496,9 +565,12 @@ export function reducePiView(state: PiViewState, msg: ControlMsg): PiViewState {
   const base = { ...state, lastSeq: msg.seq }
 
   switch (kind) {
-    case 'snapshot':
+    case 'snapshot': {
+      const snapshotSessionId = typeof event['sessionId'] === 'string' ? event['sessionId'] : null
+      const conversationChanged = state.sessionId !== null && state.sessionId !== snapshotSessionId
       return {
         ...base,
+        sessionId: snapshotSessionId,
         available: true,
         statusKnown: true,
         idle: event['idle'] !== false,
@@ -513,8 +585,16 @@ export function reducePiView(state: PiViewState, msg: ControlMsg): PiViewState {
           attachments: record(event['capabilities'])?.['attachments'] === true,
           promptReceipts: record(event['capabilities'])?.['promptReceipts'] === true,
         },
+        ...(conversationChanged ? {
+          commandResults: {},
+          subagents: unavailableSubagents(),
+          transcripts: {},
+          receipts: {},
+          awaitingUi: null,
+        } : {}),
         error: null,
       }
+    }
     case 'agent_start': return { ...base, idle: false }
     case 'agent_end':
     case 'agent_settled': return { ...base, idle: true, pending: false }
@@ -574,7 +654,13 @@ export function reducePiView(state: PiViewState, msg: ControlMsg): PiViewState {
         const receipt = record(result.data)
         const action = typeof receipt?.['action'] === 'string' ? receipt['action'] : 'control'
         const runId = typeof receipt?.['runId'] === 'string' ? receipt['runId'] : ''
-        if (runId) next.receipts = { ...state.receipts, [requestId]: normalizeSubagentReceipt(result.data, action, runId) }
+        if (runId) {
+          const receipts = { ...state.receipts, [requestId]: normalizeSubagentReceipt(result.data, action, runId) }
+          const receiptIds = Object.keys(receipts)
+          next.receipts = receiptIds.length > MAX_SUBAGENT_RECEIPTS
+            ? Object.fromEntries(receiptIds.slice(-MAX_SUBAGENT_RECEIPTS).map((id) => [id, receipts[id]!]))
+            : receipts
+        }
       }
       return next
     }

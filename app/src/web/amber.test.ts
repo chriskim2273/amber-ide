@@ -236,6 +236,31 @@ describe('PaneLink', () => {
     expect(sockets[1]!.sent).toEqual([JSON.stringify({ t: 'open', name: 's1' })])
   })
 
+  it('reports semantic transport loss immediately and drops commands until the replacement socket opens', () => {
+    vi.useFakeTimers()
+    let calls = 0
+    const sockets = [new FakeSocket(), new FakeSocket()]
+    const port = new FakePort()
+    new PiPaneLink('pi', () => sockets[calls++] as FakeSocket, port)
+    sockets[0]!.open()
+    port.posted.length = 0
+
+    sockets[0]!.close()
+    expect(port.posted).toEqual([{ msg: { kind: 'PiBridgeStatus', name: 'pi', available: false } }])
+    port.fromRenderer({ command: { kind: 'Prompt', message: 'must not queue', delivery: 'now' } })
+    expect(sockets[0]!.sent).toEqual([JSON.stringify({ t: 'piOpen', name: 'pi' })])
+
+    vi.advanceTimersByTime(1000)
+    sockets[1]!.open()
+    expect(sockets[1]!.sent).toEqual([JSON.stringify({ t: 'piOpen', name: 'pi' })])
+    sockets[1]!.emit(JSON.stringify({ t: 'piStatus', name: 'pi', available: true }))
+    sockets[0]!.emit(JSON.stringify({ t: 'piEvent', name: 'pi', seq: 99, event: { kind: 'stale' } }))
+    expect(port.posted).toEqual([
+      { msg: { kind: 'PiBridgeStatus', name: 'pi', available: false } },
+      { msg: { kind: 'PiBridgeStatus', name: 'pi', available: true } },
+    ])
+  })
+
   it('re-opening a session closes the socket+port it supersedes (via createAmber\'s openPane guard)', () => {
     // index 0 is consumed by createAmber's own ControlLink construction.
     const sockets = [new FakeSocket(), new FakeSocket(), new FakeSocket()]

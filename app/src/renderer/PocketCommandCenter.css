@@ -465,7 +465,7 @@
 .pocket-focus-head {
   min-height: calc(54px + env(safe-area-inset-top, 0px));
   display: grid;
-  grid-template-columns: minmax(72px, auto) minmax(0, 1fr) 48px;
+  grid-template-columns: minmax(72px, auto) minmax(0, 1fr) auto 48px;
   align-items: end;
   gap: 8px;
   padding: env(safe-area-inset-top, 0px) 6px 4px;
@@ -480,6 +480,15 @@
   color: var(--text-dim);
   font: 600 12px var(--font-ui);
 }
+.pocket-focus-view-toggle {
+  min-width: 52px;
+  padding: 0 8px;
+  border: 1px solid rgba(124, 108, 255, 0.48) !important;
+  background: var(--accent-soft) !important;
+  color: #dedaff !important;
+  cursor: pointer;
+}
+.pocket-focus-view-toggle:active { transform: scale(0.97); }
 .pocket-focus-back {
   display: flex;
   align-items: center;

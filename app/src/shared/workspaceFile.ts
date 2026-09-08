@@ -4,7 +4,7 @@ import { formatEditorName } from './editorName'
 import { createBrowserId, safeRestoreUrl, type BrowserId } from './tabBrowser'
 import { isDaemonSessionKind, type DaemonSessionKind } from './proto'
 import { normalizeFriendlyTitle, type LayoutFile, type WsLayout, type TabLayout, type FrozenEntry, type BrowserRailLayout, type EditorEntry } from './layoutFile'
-import { parseBrowserViewport } from './browserViewport'
+import { parseBrowserViewport, type BrowserViewportMode } from './browserViewport'
 import { MAX_RAIL_WIDTH, MIN_RAIL_WIDTH } from './browserRail'
 
 // The `.amberws` portable workspace file. Structure (grouping/tree/labels) +
@@ -80,6 +80,8 @@ export interface WsPane {
 export interface WsBrowser {
   mode: 'preview' | 'browse'
   safeRestoreUrl: string
+  /** Missing in pre-viewport-mode files; parsed documents default to fit. */
+  viewportMode?: BrowserViewportMode
   viewport?: { width: number; height: number }
   collapsed?: boolean
   width?: number
@@ -204,12 +206,13 @@ function parseWsBrowser(v: unknown): WsBrowser {
   const b = v as Record<string, unknown>
   if (b['mode'] !== 'preview' && b['mode'] !== 'browse') fail('WORKSPACE_BROWSER_MODE')
   const safeUrl = boundedString(b['safeRestoreUrl'], WORKSPACE_MAX_URL_BYTES, 'WORKSPACE_URL_LIMIT')
+  const viewportMode: BrowserViewportMode = b['viewportMode'] === 'fixed' ? 'fixed' : 'fit'
   const viewport = b['viewport'] === undefined ? undefined : parseBrowserViewport(b['viewport'])
   if (b['viewport'] !== undefined && !viewport) fail('WORKSPACE_BROWSER_VIEWPORT: browser viewport is invalid')
   const width = b['width']
   if (width !== undefined && (typeof width !== 'number' || !Number.isSafeInteger(width) || width < MIN_RAIL_WIDTH || width > MAX_RAIL_WIDTH)) fail('WORKSPACE_BROWSER_WIDTH')
   return {
-    mode: b['mode'], safeRestoreUrl: safeRestoreUrl(safeUrl),
+    mode: b['mode'], safeRestoreUrl: safeRestoreUrl(safeUrl), viewportMode,
     ...(viewport ? { viewport } : {}),
     ...(typeof b['collapsed'] === 'boolean' ? { collapsed: b['collapsed'] } : {}), ...(typeof width === 'number' ? { width } : {}),
   }
@@ -244,7 +247,7 @@ function parseTab(v: unknown, version: 1 | 2, budget: ParseBudget): WsTab {
   const visit = (node: Node | null): void => { if (!node) return; if (node.kind === 'leaf') referenced.add(node.paneId); else { visit(node.a); visit(node.b) } }
   visit(cleanTree)
   if (version === 2 && [...referenced].some((id) => !ids.has(id))) fail('tree references unknown placeholder')
-  const legacyBrowsers = browserPanes.map((pane) => ({ mode: 'browse' as const, safeRestoreUrl: safeRestoreUrl(pane.url ?? '') }))
+  const legacyBrowsers = browserPanes.map((pane) => ({ mode: 'browse' as const, viewportMode: 'fit' as const, safeRestoreUrl: safeRestoreUrl(pane.url ?? '') }))
   return {
     tab: t['tab'], tree: cleanTree, panes,
     ...(typeof t['label'] === 'string' ? { label: boundedString(t['label'], WORKSPACE_MAX_STRING_BYTES, 'WORKSPACE_STRING_LIMIT') } : {}),
@@ -332,7 +335,7 @@ export function treeFromPlaceholders(tree: Node | null, idToName: Record<string,
 // Narrow structural inputs (superset-compatible with store.ts's WorkspaceModel/
 // TabModel/PaneModel) so this module stays pure and never imports the renderer
 // store.
-export type WorkspaceBrowserSnapshots = Record<string, { mode: 'preview' | 'browse'; safeRestoreUrl: string; viewport: { width: number; height: number } }>
+export type WorkspaceBrowserSnapshots = Record<string, { mode: 'preview' | 'browse'; safeRestoreUrl: string; viewportMode: BrowserViewportMode; viewport: { width: number; height: number } }>
 export function requireWorkspaceBrowserSnapshots(reply: { ok?: boolean; result?: WorkspaceBrowserSnapshots }, expectedIds: readonly string[] = []): WorkspaceBrowserSnapshots {
   if (!reply.ok) throw new Error('browser snapshot unavailable')
   const result = reply.result ?? {}
@@ -389,7 +392,7 @@ export function assembleSave(
         tree: treeToPlaceholders(tabSide?.tree ?? null, nameToId),
         panes,
         ...(typeof tabSide?.label === 'string' ? { label: tabSide.label } : {}),
-        ...(tab.browser ? { browser: { ...tab.browser, safeRestoreUrl: safeRestoreUrl(tab.browser.safeRestoreUrl) } } : {}),
+        ...(tab.browser ? { browser: { ...tab.browser, viewportMode: tab.browser.viewportMode ?? 'fit', safeRestoreUrl: safeRestoreUrl(tab.browser.safeRestoreUrl) } } : {}),
       }
     })
     return {

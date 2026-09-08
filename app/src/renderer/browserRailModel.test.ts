@@ -4,6 +4,7 @@ import {
   clampRailWidth,
   formatLastPiAction,
   keyboardRailWidth,
+  railFitViewportCommand,
   railReloadCommand,
   reclampedRailWidth,
   railStopCommand,
@@ -11,8 +12,10 @@ import {
   railSecurity,
   railStatusLines,
   secondsRemaining,
+  rotateViewport,
   shouldOccludeBrowser,
   validateCustomViewport,
+  viewportModeLabel,
 } from './browserRailModel'
 
 describe('browser rail approval/action presentation', () => {
@@ -38,8 +41,9 @@ describe('browser rail product state', () => {
     expect(reclampedRailWidth(560, 800)).toBeNull()
   })
 
-  it('builds parser-compatible stop and live/frozen reload commands', () => {
+  it('builds parser-compatible fit, stop, and live/frozen reload commands', () => {
     const live = { id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', pageIncarnation: 'page-a', generation: 4, lifecycle: 'live' as const }
+    expect(railFitViewportCommand(live)).toEqual({ type: 'fitViewport', id: live.id, pageIncarnation: 'page-a', expectedGeneration: 4 })
     expect(railStopCommand(live)).toEqual({ type: 'stop', id: live.id, pageIncarnation: 'page-a', expectedGeneration: 4 })
     expect(railReloadCommand(live, { x: 1, y: 2, width: 300, height: 400 })).toEqual({ type: 'reload', id: live.id, pageIncarnation: 'page-a', expectedGeneration: 4 })
     expect(railReloadCommand({ ...live, lifecycle: 'frozen' }, { x: 1, y: 2, width: 300, height: 400 })).toEqual({ type: 'show', id: live.id, bounds: { x: 1, y: 2, width: 300, height: 400 } })
@@ -61,6 +65,12 @@ describe('browser rail product state', () => {
     expect(railSecurity('http://localhost:3000')).toEqual({ level: 'local', label: 'Local HTTP' })
     expect(railSecurity('http://example.test')).toEqual({ level: 'insecure', label: 'Not secure' })
     expect(railSecurity('about:blank')).toEqual({ level: 'neutral', label: 'Blank page' })
+  })
+
+  it('labels and rotates viewport modes without changing fixed size policy', () => {
+    expect(viewportModeLabel('fit', { width: 1280, height: 800 })).toBe('Fit to rail')
+    expect(viewportModeLabel('fixed', { width: 390, height: 844 })).toBe('Fixed viewport · 390 × 844')
+    expect(rotateViewport({ width: 390, height: 844 })).toEqual({ width: 844, height: 390 })
   })
 
   it('provides fixed presets and validates bounded custom viewports', () => {

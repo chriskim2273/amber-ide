@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import type { PiCommand } from '../shared/proto'
 import { newPiRequestId } from './piAttachments'
-import { subagentCanControl, subagentCanLoadTranscript, type PiSubagentStatus, type PiSubagentTranscript, type PiSubagentReceipt } from './piModel'
+import { subagentCanControl, subagentCanLoadTranscript, type PiSubagentNode, type PiSubagentStatus, type PiSubagentTranscript, type PiSubagentReceipt } from './piModel'
 
 export interface PiSubagentsProps {
   status: PiSubagentStatus
@@ -37,7 +37,7 @@ export function shouldClearSteerDraft(
   currentDraft: string,
   currentVersion: number,
 ): boolean {
-  return owner.action === 'steer' && receiptReceived
+  return (owner.action === 'steer' || owner.action === 'resume') && receiptReceived
     && owner.draft !== undefined && owner.draftVersion !== undefined
     && currentDraft === owner.draft && currentVersion === owner.draftVersion
 }
@@ -50,6 +50,40 @@ export function shouldSubmitSteerKey(
   value: string,
 ): boolean {
   return key === 'Enter' && !shiftKey && !composing && !nativeComposing && value.trim().length > 0
+}
+
+function childActivity(node: PiSubagentNode): string | undefined {
+  const state = node.activity?.state ? stateLabel(node.activity.state) : undefined
+  const tool = node.activity?.currentTool
+  if (state && tool) return `${state} · ${tool}`
+  return state ?? tool
+}
+
+/** Render the normalized nested projection without making any child targetable.
+ * The reducer bounds depth/count before this component receives the DTO. */
+export function PiSubagentChildTree({
+  children,
+  parentLabel,
+}: {
+  children: readonly PiSubagentNode[]
+  parentLabel?: string
+}): JSX.Element | null {
+  if (children.length === 0) return null
+  return <ul className="pi-subagent-children" aria-label={parentLabel ? `Read-only children of ${parentLabel}` : 'Read-only nested children'}>
+    {children.map((child, index) => {
+      const activity = childActivity(child)
+      return <li className="pi-subagent-child" key={`${child.id}:${index}`}>
+        <div className="pi-subagent-child-heading" aria-label={`Read-only child ${child.label}`}>
+          <span className="pi-subagent-state" data-state={child.state} />
+          <strong>{child.label}</strong>
+          <span className="pi-subagent-state-label">{stateLabel(child.state)}</span>
+          <span className="pi-subagent-readonly">read-only</span>
+        </div>
+        {activity && <div className="pi-subagent-child-activity">{activity}</div>}
+        {child.children && <PiSubagentChildTree children={child.children} />}
+      </li>
+    })}
+  </ul>
 }
 
 export function PiSubagents({ status, transcripts, receipts, pending, onCommand }: PiSubagentsProps): JSX.Element {
@@ -96,16 +130,18 @@ export function PiSubagents({ status, transcripts, receipts, pending, onCommand 
     // Revalidate at dispatch time: the row may have gone stale after it was
     // rendered, including while the confirm-stop button was open.
     if (!subagentCanControl(status, runId, action) || requestBusy(runId)) return
+    const normalizedMessage = message?.trim()
+    if ((action === 'steer' || action === 'resume') && !normalizedMessage) return
     const requestId = newPiRequestId(`subagent-${action}`)
     const owner: RequestOwner = { runId, action }
-    if (action === 'steer') {
+    if (action === 'steer' || action === 'resume') {
       // Keep the raw editor value for receipt-safe draft clearing. The wire
       // command may be trimmed, but whitespace-bearing edits are still user
       // edits and must survive an uncertain delivery.
       owner.draft = drafts[runId] ?? message ?? ''
       owner.draftVersion = draftVersionsRef.current[runId] ?? 0
     }
-    dispatch(requestId, owner, { kind: 'SubagentControl', requestId, action, runId, ...(message ? { message } : {}) })
+    dispatch(requestId, owner, { kind: 'SubagentControl', requestId, action, runId, ...(normalizedMessage ? { message: normalizedMessage } : {}) })
   }
   const loadTranscript = (runId: string): void => {
     if (!subagentCanLoadTranscript(status, runId) || requestBusy(runId)) return
@@ -128,6 +164,7 @@ export function PiSubagents({ status, transcripts, receipts, pending, onCommand 
         const canInterrupt = subagentCanControl(status, run.id, 'interrupt')
         const canResume = subagentCanControl(status, run.id, 'resume')
         const canTranscript = subagentCanLoadTranscript(status, run.id)
+        const canMessage = canSteer || canResume
         const busy = requestBusy(run.id)
         const receipt = Object.values(receipts).reverse().find((item) => item.runId === run.id)
         const transcript = Object.values(transcripts).reverse().find((item) => item.runId === run.id)
@@ -138,30 +175,35 @@ export function PiSubagents({ status, transcripts, receipts, pending, onCommand 
             <span className="pi-subagent-state-label">{stateLabel(run.state)}</span>
           </div>
           {run.activity?.currentTool && <div className="pi-subagent-activity">{run.activity.currentTool}</div>}
+          {run.children && <PiSubagentChildTree parentLabel={run.label} children={run.children} />}
           <div className="pi-subagent-actions">
             {canStop && <button type="button" className="btn btn-ghost" disabled={busy}
               onClick={() => setConfirmStop((current) => current === run.id ? null : run.id)}>Stop</button>}
             {confirmStop === run.id && <button type="button" className="btn btn-danger" disabled={busy}
               onClick={() => { setConfirmStop(null); send(run.id, 'stop') }}>Confirm stop</button>}
-            {canResume && <button type="button" className="btn btn-ghost" disabled={busy} onClick={() => send(run.id, 'resume')}>Resume</button>}
+            {canResume && <button type="button" className="btn btn-ghost" disabled={busy || !(drafts[run.id] ?? '').trim()}
+              onClick={() => send(run.id, 'resume', drafts[run.id])}>Resume with message</button>}
             {canInterrupt && <button type="button" className="btn btn-ghost" disabled={busy} onClick={() => send(run.id, 'interrupt')}>Interrupt</button>}
             {canTranscript && <button type="button" className="btn btn-ghost" disabled={busy} onClick={() => loadTranscript(run.id)}>Details</button>}
           </div>
-          {canSteer && <div className="pi-subagent-steer">
-            <input value={drafts[run.id] ?? ''} aria-label={`Steer ${run.label}`} placeholder="Send a follow-up…"
+          {canMessage && <div className="pi-subagent-steer">
+            <input value={drafts[run.id] ?? ''} aria-label={`${canResume && !canSteer ? 'Resume' : 'Steer'} message for ${run.label}`}
+              placeholder={canResume && !canSteer ? 'Message to resume…' : 'Send a follow-up…'}
               onChange={(event) => {
+                const value = event.currentTarget.value
                 draftVersionsRef.current[run.id] = (draftVersionsRef.current[run.id] ?? 0) + 1
-                setDrafts((current) => ({ ...current, [run.id]: event.currentTarget.value }))
+                setDrafts((current) => ({ ...current, [run.id]: value }))
               }}
               onCompositionStart={() => { composingRef.current = true }}
               onCompositionEnd={() => { composingRef.current = false }}
               onKeyDown={(event) => {
-                if (shouldSubmitSteerKey(event.key, event.shiftKey, composingRef.current, event.nativeEvent.isComposing, event.currentTarget.value)) {
-                  event.preventDefault(); send(run.id, 'steer', event.currentTarget.value.trim())
+                const action = canSteer ? 'steer' : canResume ? 'resume' : null
+                if (action && shouldSubmitSteerKey(event.key, event.shiftKey, composingRef.current, event.nativeEvent.isComposing, event.currentTarget.value)) {
+                  event.preventDefault(); send(run.id, action, event.currentTarget.value.trim())
                 }
               }} />
-            <button type="button" className="btn btn-accent" disabled={busy || !(drafts[run.id] ?? '').trim()}
-              onClick={() => send(run.id, 'steer', (drafts[run.id] ?? '').trim())}>Send</button>
+            {canSteer && <button type="button" className="btn btn-accent" disabled={busy || !(drafts[run.id] ?? '').trim()}
+              onClick={() => send(run.id, 'steer', (drafts[run.id] ?? '').trim())}>Send</button>}
           </div>}
           {receipt && <div className="pi-subagent-receipt" role="status">{receipt.action}: {receipt.message ?? receipt.deliveryStatus ?? receipt.state ?? 'accepted'}</div>}
           {transcript && <details className="pi-subagent-transcript" open><summary>Transcript</summary>
@@ -179,7 +221,7 @@ export function PiSubagents({ status, transcripts, receipts, pending, onCommand 
         <span>{entry.agent}</span><span>{entry.role ?? entry.model ?? 'worker'}</span><span className="pi-subagents-muted">read-only</span>
       </div>)}
       {(status.omitted.runs > 0 || status.omitted.children > 0 || status.omitted.byteLimitExceeded) &&
-        <p className="pi-subagents-muted">Some subagent details are omitted for safety and size limits.</p>}
+        <p className="pi-subagents-muted">Some subagent details are omitted: {[status.omitted.runs > 0 ? `${status.omitted.runs} run${status.omitted.runs === 1 ? '' : 's'}` : null, status.omitted.children > 0 ? `${status.omitted.children} child${status.omitted.children === 1 ? '' : 'ren'}` : null, status.omitted.byteLimitExceeded ? 'byte limit exceeded' : null].filter((value): value is string => value !== null).join(', ')}.</p>}
     </div>}
   </section>
 }

@@ -479,14 +479,59 @@ describe('TabBrowserHost', () => {
 
   it('reapplies the exact minimum persisted viewport after parse, restart, and thaw', async () => {
     const id = 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' as const
-    const raw = emptyBrowserState(1); raw.records[id] = { id, profileId: 'global', mode: 'browse', safeRestoreUrl: 'about:blank', title: '', viewport: { width: 200, height: 200 }, lifecycle: 'live', stateRevision: 1, lastUsedAt: 1, lastFocusedAt: 1 }
-    const restored = parseBrowserState(JSON.stringify(raw)), setViewport = vi.fn(async (viewport: { width: number; height: number }) => ({ viewport }))
-    const localFactory: TabBrowserPageFactory = { create: () => { const page = new FakePage() as FakePage & { automation: BrowserAutomation }; page.automation = { setViewport } as unknown as BrowserAutomation; return page } }
+    const raw = emptyBrowserState(1); raw.records[id] = { id, profileId: 'global', mode: 'browse', safeRestoreUrl: 'about:blank', title: '', viewport: { width: 200, height: 200 }, viewportMode: 'fixed', lifecycle: 'live', stateRevision: 1, lastUsedAt: 1, lastFocusedAt: 1 }
+    const restored = parseBrowserState(JSON.stringify(raw)), setViewport = vi.fn(async (viewport: { width: number; height: number }) => ({ viewport })), loadURL = vi.fn(async (url: string) => {})
+    const localFactory: TabBrowserPageFactory = { create: () => { const page = new FakePage() as FakePage & { automation: BrowserAutomation }; page.automation = { setViewport } as unknown as BrowserAutomation; return Object.assign(page, { loadURL }) } }
     const host = new TabBrowserHost(restored, localFactory)
     expect(host.status(id)).toMatchObject({ lifecycle: 'frozen', viewport: { width: 200, height: 200 } })
     await host.thaw(id)
+    expect(loadURL).toHaveBeenCalledWith('about:blank', undefined)
     expect(setViewport).toHaveBeenCalledWith({ width: 200, height: 200 }, expect.any(AbortSignal))
     expect(host.status(id).viewport).toEqual({ width: 200, height: 200 })
+  })
+
+  it('does not acknowledge a fixed viewport before native debugger readiness', async () => {
+    let ready = false, attached = false
+    const calls: string[] = []
+    const transport: BrowserDebuggerTransport = {
+      isAttached: () => attached,
+      attach: () => { attached = true },
+      detach: () => { attached = false },
+      onMessage: () => {},
+      send: async method => { calls.push(method); return {} },
+    }
+    const automation = new BrowserAutomation(transport, () => 'about:blank', () => false, {}, { isDebuggerReady: () => ready })
+    const localFactory: TabBrowserPageFactory = { create: () => Object.assign(new FakePage(), { automation }) }
+    const host = new TabBrowserHost(emptyBrowserState(1), localFactory)
+    const opened = await host.open({ visible: true }), id = opened.status.id
+    const initial = host.status(id)
+    const action = { type: 'setViewport' as const, viewport: { width: 390, height: 844 }, pageIncarnation: initial.pageIncarnation, expectedGeneration: initial.generation }
+    await expect(host.runAutomation(id, action, new AbortController().signal)).rejects.toThrow('PAGE_NOT_READY')
+    expect(host.status(id)).toMatchObject({ viewportMode: 'fit', viewport: { width: 1280, height: 800 }, generation: initial.generation })
+    expect(calls).not.toContain('Emulation.setDeviceMetricsOverride')
+    ready = true
+    const fixed = await host.runAutomation(id, action, new AbortController().signal)
+    expect(fixed).toMatchObject({ viewport: { width: 390, height: 844 }, generation: initial.generation + 1 })
+    expect(host.status(id)).toMatchObject({ viewportMode: 'fixed', viewport: { width: 390, height: 844 }, generation: initial.generation + 1 })
+    expect(calls).toContain('Emulation.setDeviceMetricsOverride')
+  })
+
+  it('fits to native bounds without overwriting fixed dimensions or accepting stale leases', async () => {
+    const id = 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' as const
+    const state = emptyBrowserState(1)
+    state.records[id] = { id, profileId: 'global', mode: 'browse', safeRestoreUrl: 'about:blank', title: '', viewport: { width: 390, height: 844 }, viewportMode: 'fixed', lifecycle: 'frozen', stateRevision: 1, lastUsedAt: 1, lastFocusedAt: 0 }
+    const clearViewport = vi.fn(async () => {}), setViewport = vi.fn(async (viewport: { width: number; height: number }) => ({ viewport }))
+    const pages: TabBrowserPageFactory = { create: () => Object.assign(new FakePage(), { automation: { clearViewport, setViewport } as unknown as BrowserAutomation }) }
+    const host = new TabBrowserHost(state, pages)
+    await host.thaw(id)
+    const fixed = host.status(id)
+    expect(setViewport).toHaveBeenCalledWith({ width: 390, height: 844 }, expect.any(AbortSignal))
+    host.setBounds(id, { x: 0, y: 0, width: 700, height: 500 })
+    expect(host.status(id).viewport).toEqual({ width: 390, height: 844 })
+    const fitted = await host.fitViewport(id, fixed.pageIncarnation, fixed.generation, new AbortController().signal)
+    expect(clearViewport).toHaveBeenCalledOnce()
+    expect(fitted).toMatchObject({ viewportMode: 'fit', viewport: { width: 390, height: 844 } })
+    await expect(host.fitViewport(id, fixed.pageIncarnation, fixed.generation, new AbortController().signal)).rejects.toThrow('STALE_GENERATION')
   })
 
   it('freezes the eligible LRU fifth page and changes incarnation on thaw', async () => {

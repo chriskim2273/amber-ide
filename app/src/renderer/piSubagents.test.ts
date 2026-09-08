@@ -1,6 +1,8 @@
+import { createElement } from 'react'
+import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
 import { normalizeSubagentStatus, subagentCanControl, subagentCanLoadTranscript } from './piModel'
-import { requestBusyForRun, shouldClearSteerDraft, shouldSubmitSteerKey, type RequestOwner } from './PiSubagents'
+import { PiSubagentChildTree, requestBusyForRun, shouldClearSteerDraft, shouldSubmitSteerKey, type RequestOwner } from './PiSubagents'
 
 describe('Pi subagent controls', () => {
   it('tracks exact request ownership instead of matching request-id text', () => {
@@ -41,5 +43,29 @@ describe('Pi subagent controls', () => {
     expect(subagentCanLoadTranscript(status, 'run-1')).toBe(false)
     expect(subagentCanLoadTranscript({ ...status, capabilities: { ...status.capabilities, status: true } }, 'run-1')).toBe(true)
     expect(subagentCanLoadTranscript({ ...status, available: false, capabilities: { ...status.capabilities, status: true } }, 'run-1')).toBe(false)
+  })
+
+  it('renders nested children as visible read-only rows without child controls', () => {
+    const status = normalizeSubagentStatus({
+      available: true,
+      capabilities: { methods: ['stop'] },
+      asyncRuns: [{
+        id: 'run-1', label: 'workflow', state: 'running',
+        children: [{
+          id: 'child-1', label: 'inspect files', state: 'running',
+          activity: { state: 'working', currentTool: 'read' },
+          children: [{ id: 'grandchild-1', label: 'nested check', state: 'done' }],
+        }],
+      }],
+      fleet: { entries: [] },
+    })
+    const html = renderToStaticMarkup(createElement(PiSubagentChildTree, { children: status.asyncRuns[0]!.children! }))
+    expect(html).toContain('inspect files')
+    expect(html).toContain('nested check')
+    expect(html).toContain('working · read')
+    expect(html).toContain('read-only')
+    expect(html).not.toContain('<button')
+    expect(subagentCanControl(status, status.asyncRuns[0]!.id, 'stop')).toBe(true)
+    expect(subagentCanControl(status, status.asyncRuns[0]!.children![0]!.id, 'stop')).toBe(false)
   })
 })

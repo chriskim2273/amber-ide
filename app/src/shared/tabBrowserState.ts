@@ -1,5 +1,6 @@
 import { isOpaqueBrowserId, safeRestoreUrl, type BrowserId } from './tabBrowser'
-import { parseBrowserViewport } from './browserViewport'
+import { parseBrowserViewport, type BrowserViewportMode } from './browserViewport'
+export type { BrowserViewportMode } from './browserViewport'
 
 export const BROWSER_STATE_VERSION = 1
 export const BROWSER_STATE_RECORD_MAX = 1000
@@ -44,6 +45,8 @@ export interface BrowserRecord {
   safeRestoreUrl: string
   title: string
   viewport: { width: number; height: number }
+  /** Missing in pre-viewport-mode state files; parsed legacy records default to fit. */
+  viewportMode?: BrowserViewportMode
   previewOrigins?: string[]
   lifecycle: 'live' | 'frozen'
   stateRevision: number
@@ -111,6 +114,7 @@ function record(value: unknown, key: string): BrowserRecord | null {
     id: key, profileId: 'global', mode: v['mode'],
     safeRestoreUrl: safeRestoreUrl(v['safeRestoreUrl']), title: v['title'].slice(0, 512),
     viewport,
+    viewportMode: v['viewportMode'] === 'fixed' ? 'fixed' : 'fit',
     ...(parsedPreviewOrigins.length > 0 ? { previewOrigins: parsedPreviewOrigins } : {}),
     lifecycle: v['lifecycle'], stateRevision: v['stateRevision'], lastUsedAt: v['lastUsedAt'], lastFocusedAt: v['lastFocusedAt'],
     ...(typeof v['restoreError'] === 'string' ? { restoreError: v['restoreError'].slice(0, 1024) } : {}),

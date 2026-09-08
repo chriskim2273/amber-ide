@@ -21,6 +21,23 @@ describe('Pi semantic model', () => {
     expect(next.contextUsage).toEqual({ percent: 42 })
   })
 
+  it('bounds subagent receipt history while retaining the newest correlated receipts', () => {
+    let state = initialPiViewState
+    for (let index = 0; index < 140; index += 1) {
+      state = reducePiView(state, {
+        kind: 'PiEvent', name: 'pi', seq: index + 1,
+        event: {
+          kind: 'command_result', requestId: `resume-${index}`, command: 'SubagentControl', success: true,
+          data: { action: 'resume', runId: 'run-1', state: 'resumed' },
+        },
+      })
+    }
+    expect(Object.keys(state.receipts)).toHaveLength(128)
+    expect(state.receipts['resume-0']).toBeUndefined()
+    expect(state.receipts['resume-12']).toBeDefined()
+    expect(state.receipts['resume-139']).toMatchObject({ action: 'resume', runId: 'run-1' })
+  })
+
   it('reduces message streaming and ignores duplicate out-of-order deltas', () => {
     const start = reducePiView(initialPiViewState, {
       kind: 'PiEvent', name: 'pi', seq: 1,
@@ -68,6 +85,37 @@ describe('Pi semantic model', () => {
       kind: 'PiEvent', name: 'pi', seq: 1, event: { kind: 'snapshot', entries: [], idle: true },
     })
     expect(restarted.available).toBe(true)
+  })
+
+  it('replaces conversation-scoped state when the authoritative Pi session id changes', () => {
+    const first = reducePiView(initialPiViewState, {
+      kind: 'PiEvent', name: 'pi', seq: 5,
+      event: {
+        kind: 'snapshot', sessionId: 'conversation-a', entries: [
+          { type: 'message', message: { role: 'user', content: 'old' } },
+        ], idle: false,
+      },
+    })
+    const withPending = reducePiView(first, {
+      kind: 'PiEvent', name: 'pi', seq: 6,
+      event: {
+        kind: 'command_result', requestId: 'old-request', command: 'SubagentControl', success: true,
+        data: { action: 'stop', runId: 'old-run', state: 'stopped' },
+      },
+    })
+    const replaced = reducePiView(withPending, {
+      kind: 'PiEvent', name: 'pi', seq: 1,
+      event: {
+        kind: 'snapshot', sessionId: 'conversation-b', entries: [
+          { type: 'message', message: { role: 'user', content: 'new' } },
+        ], idle: true,
+      },
+    })
+    expect(replaced.sessionId).toBe('conversation-b')
+    expect(replaced.messages).toEqual([{ role: 'user', content: 'new' }])
+    expect(replaced.commandResults).toEqual({})
+    expect(replaced.receipts).toEqual({})
+    expect(replaced.liveMessage).toBeNull()
   })
 
   it('extracts only message entries from session history', () => {

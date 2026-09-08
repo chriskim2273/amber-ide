@@ -3,6 +3,7 @@ export const BROWSER_VIEWPORT_MIN_HEIGHT = 200
 export const BROWSER_VIEWPORT_MAX_WIDTH = 4096
 export const BROWSER_VIEWPORT_MAX_HEIGHT = 4096
 
+export type BrowserViewportMode = 'fit' | 'fixed'
 export interface BrowserViewportSize { width: number; height: number }
 
 export function clampBrowserViewport(width: number, height: number): BrowserViewportSize {

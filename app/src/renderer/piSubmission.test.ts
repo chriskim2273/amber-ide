@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { legacyPiDeliveryMessage, piOperationCurrent, piSubmitAllowed, releasePiOperation, resetPiSubmissionOnReconnect, uploadThenPrompt } from './piSubmission'
+import { legacyPiDeliveryMessage, piOperationCurrent, piSubmitAllowed, pruneCompletedAttachments, releasePiOperation, resetPiSubmissionOnReconnect, reuseCompletedAttachment, rememberCompletedAttachment, uploadThenPrompt } from './piSubmission'
 
 describe('Pi submission lifetime guards', () => {
   it('does not prompt when cancellation arrives while UploadFinish is delayed', async () => {
@@ -65,5 +65,26 @@ describe('Pi submission lifetime guards', () => {
     expect(resetPiSubmissionOnReconnect()).toEqual({ pendingRequestId: null, uploading: false })
     expect(releasePiOperation('upload-old', 'upload-old')).toBeNull()
     expect(releasePiOperation('upload-new', 'upload-old')).toBe('upload-new')
+  })
+
+  it('reuses a completed attachment only for the exact File object and Pi conversation', () => {
+    const first = {} as File
+    const sameMetadataDifferentFile = {} as File
+    const cache = new Map<File, { conversationId: string; attachmentId: string }>()
+    rememberCompletedAttachment(cache, first, 'conversation-a', 'attachment-1')
+    expect(reuseCompletedAttachment(cache, first, 'conversation-a')).toBe('attachment-1')
+    expect(reuseCompletedAttachment(cache, first, 'conversation-b')).toBeUndefined()
+    expect(reuseCompletedAttachment(cache, sameMetadataDifferentFile, 'conversation-a')).toBeUndefined()
+  })
+
+  it('prunes completed File references to the current selection without server cleanup', () => {
+    const first = {} as File
+    const replacement = {} as File
+    const cache = new Map<File, { conversationId: string; attachmentId: string }>([
+      [first, { conversationId: 'conversation-a', attachmentId: 'attachment-1' }],
+    ])
+    pruneCompletedAttachments(cache, [replacement])
+    expect(cache.has(first)).toBe(false)
+    expect(cache.size).toBe(0)
   })
 })

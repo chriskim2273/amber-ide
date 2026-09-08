@@ -104,7 +104,7 @@ function browserLayout(id: string): string {
 
 function orphanRecord(id: string): BrowserRecord {
   return {
-    id: id as BrowserRecord['id'], profileId: 'global', mode: 'browse', safeRestoreUrl: 'about:blank', title: '', viewport: { width: 1280, height: 800 },
+    id: id as BrowserRecord['id'], profileId: 'global', mode: 'browse', safeRestoreUrl: 'about:blank', title: '', viewport: { width: 1280, height: 800 }, viewportMode: 'fit',
     lifecycle: 'frozen', stateRevision: 1, lastUsedAt: 1, lastFocusedAt: 0,
   }
 }

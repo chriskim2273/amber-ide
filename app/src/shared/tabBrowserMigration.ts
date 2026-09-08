@@ -40,7 +40,7 @@ export function migrateLegacyBrowsers(input: LegacyBrowserMigrationInput, random
     const now = Date.now()
     records[browserId] = {
       id: browserId, profileId: 'global', mode: 'browse', safeRestoreUrl: safeRestoreUrl(first.entry.url), title: '',
-      viewport: { width: 1280, height: 800 }, lifecycle: 'frozen', stateRevision: 1, lastUsedAt: now, lastFocusedAt: now,
+      viewport: { width: 1280, height: 800 }, viewportMode: 'fit', lifecycle: 'frozen', stateRevision: 1, lastUsedAt: now, lastFocusedAt: now,
     }
     for (const candidate of candidates) tab.tree = tab.tree ? removeLeaf(tab.tree, candidate.name) : null
     for (const candidate of candidates.slice(1)) {
