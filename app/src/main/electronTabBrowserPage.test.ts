@@ -1,5 +1,15 @@
 import { describe, expect, it, vi } from 'vitest'
-import { browserWindowCanRemoveChildView, createInputEventHandlers, documentCanArmBrowserDebugger, projectInPageNavigation } from './electronTabBrowserPage'
+import {
+  browserWindowCanRemoveChildView,
+  closeGuestWebContents,
+  createInputEventHandlers,
+  documentCanArmBrowserDebugger,
+  guestWebContentsCloseFinished,
+  noteGuestWebContentsClosing,
+  ownerWindowCloseIsFromGuest,
+  projectInPageNavigation,
+  shouldHideLocalWindowOnClose,
+} from './electronTabBrowserPage'
 
 describe('Electron tab browser page events', () => {
   it('distinguishes the implicit blank document from an explicitly loaded blank page', () => {
@@ -11,6 +21,70 @@ describe('Electron tab browser page events', () => {
   it('does not reparent through a BrowserWindow that already closed', () => {
     expect(browserWindowCanRemoveChildView({ isDestroyed: () => false })).toBe(true)
     expect(browserWindowCanRemoveChildView({ isDestroyed: () => true })).toBe(false)
+  })
+
+  it('reclaims guest webContents even while the owner window is alive', () => {
+    const owner = { isDestroyed: () => false }
+    const close = vi.fn()
+    closeGuestWebContents(owner, { isDestroyed: () => false, close })
+    expect(close).toHaveBeenCalledOnce()
+    expect(ownerWindowCloseIsFromGuest(owner)).toBe(true)
+    guestWebContentsCloseFinished(owner)
+  })
+
+  it('still reclaims leftover guest webContents after the owner window is gone', () => {
+    const close = vi.fn()
+    closeGuestWebContents(
+      { isDestroyed: () => true },
+      { isDestroyed: () => false, close },
+    )
+    expect(close).toHaveBeenCalledOnce()
+  })
+
+  it('does not close an already-destroyed guest webContents', () => {
+    const close = vi.fn()
+    closeGuestWebContents(
+      { isDestroyed: () => true },
+      { isDestroyed: () => true, close },
+    )
+    expect(close).not.toHaveBeenCalled()
+  })
+
+  it('does not double-count a guest close that was already noted', () => {
+    const owner = { isDestroyed: () => false }
+    const close = vi.fn()
+    noteGuestWebContentsClosing(owner)
+    closeGuestWebContents(owner, { isDestroyed: () => false, close })
+    expect(ownerWindowCloseIsFromGuest(owner)).toBe(true)
+    guestWebContentsCloseFinished(owner)
+    expect(ownerWindowCloseIsFromGuest(owner)).toBe(false)
+  })
+
+  it('treats a guest webContents close as not a request to hide or quit the app', () => {
+    const owner = {}
+    expect(ownerWindowCloseIsFromGuest(owner)).toBe(false)
+    noteGuestWebContentsClosing(owner)
+    expect(ownerWindowCloseIsFromGuest(owner)).toBe(true)
+    expect(shouldHideLocalWindowOnClose({
+      hostEnabled: true, isLocal: true, allowFinalQuit: false, fromGuestWebContents: true,
+    })).toBe('ignore')
+    guestWebContentsCloseFinished(owner)
+    expect(ownerWindowCloseIsFromGuest(owner)).toBe(false)
+  })
+
+  it('still hides a local host window on a real user close, and still quits without the host', () => {
+    expect(shouldHideLocalWindowOnClose({
+      hostEnabled: true, isLocal: true, allowFinalQuit: false, fromGuestWebContents: false,
+    })).toBe('hide')
+    expect(shouldHideLocalWindowOnClose({
+      hostEnabled: false, isLocal: true, allowFinalQuit: false, fromGuestWebContents: false,
+    })).toBe('allow-close')
+    expect(shouldHideLocalWindowOnClose({
+      hostEnabled: true, isLocal: true, allowFinalQuit: true, fromGuestWebContents: false,
+    })).toBe('allow-close')
+    expect(shouldHideLocalWindowOnClose({
+      hostEnabled: true, isLocal: true, allowFinalQuit: true, fromGuestWebContents: true,
+    })).toBe('allow-close')
   })
 
   it('advances generation for every keyboard, mouse, drag, and composition callback', () => {

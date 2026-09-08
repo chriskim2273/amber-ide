@@ -43,6 +43,16 @@ class FakeDebugger implements BrowserDebuggerTransport {
 const lease = { browserId: 'browser-1', pageIncarnation: 'page-1', generation: 7 }
 
 describe('browser automation', () => {
+  it('captures a raw PNG without requiring a compositor surface', async () => {
+    const dbg = new FakeDebugger()
+    const automation = new BrowserAutomation(dbg, () => 'about:blank', () => false)
+    const png = await automation.captureRawPng(new AbortController().signal, false)
+    expect(dbg.calls).toContain('Page.captureScreenshot')
+    expect(png.width).toBe(800)
+    expect(png.height).toBe(600)
+    expect(png.data.subarray(0, 8)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
+  })
+
   it('keeps x and y axes separate in inspected geometry', async () => {
     class OffsetBoxDebugger extends FakeDebugger {
       override async send(method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>> {

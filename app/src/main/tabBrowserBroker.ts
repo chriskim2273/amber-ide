@@ -4,6 +4,7 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { dirname } from 'node:path'
 import { TextDecoder } from 'node:util'
 import type { LayoutFile } from '../shared/layoutFile'
+import { isOpaqueBrowserId } from '../shared/tabBrowser'
 import type { TabBrowserCommand } from './tabBrowserService'
 import { parseBrowserToolAction, type BrowserToolAction } from './browserToolProtocol'
 import type { BrowserBinaryAttachment } from './browserAutomation'
@@ -52,6 +53,58 @@ export function parseBrokerRequest(value: unknown): BrokerRequest {
     return { version: 1, requestId: request['requestId'], clientInstanceId: request['clientInstanceId'], sequence: request['sequence'], amberSession: request['amberSession'], action: { type: 'navigate', url: action['url'], pageIncarnation: action['pageIncarnation'], expectedGeneration: action['expectedGeneration'] } }
   }
   return { version: 1, requestId: request['requestId'], clientInstanceId: request['clientInstanceId'], sequence: request['sequence'], amberSession: request['amberSession'], action: parseBrowserToolAction(action) }
+}
+
+export interface UiHello { version: 1; role: 'ui' }
+export type UiRequest =
+  | { version: 1; requestId: string; kind: 'subscribe' }
+  | { version: 1; requestId: string; kind: 'snapshot' }
+  | { version: 1; requestId: string; kind: 'context'; workspace: number; tab: number; collapsed: boolean }
+  | { version: 1; requestId: string; kind: 'command'; command: unknown }
+  | { version: 1; requestId: string; kind: 'frame'; id: string }
+  | { version: 1; requestId: string; kind: 'import'; mode: 'new' | 'replace'; text: string }
+  | { version: 1; requestId: string; kind: 'recovery'; recovery: unknown }
+
+function requestId(value: unknown): string | null {
+  return typeof value === 'string' && value.length >= 1 && value.length <= 128 ? value : null
+}
+
+export function isUiHello(value: unknown): boolean {
+  const hello = object(value)
+  return !!hello && exact(hello, ['version', 'role']) && hello['version'] === 1 && hello['role'] === 'ui'
+}
+
+export function parseUiHello(value: unknown): UiHello {
+  if (!isUiHello(value)) throw new Error('INVALID_REQUEST')
+  return { version: 1, role: 'ui' }
+}
+
+export function parseUiRequest(value: unknown): UiRequest {
+  const request = object(value)
+  const id = requestId(request?.['requestId'])
+  if (!request || !id || request['version'] !== 1) throw new Error('INVALID_REQUEST')
+  if (request['kind'] === 'subscribe' && exact(request, ['version', 'requestId', 'kind'])) return { version: 1, requestId: id, kind: 'subscribe' }
+  if (request['kind'] === 'snapshot' && exact(request, ['version', 'requestId', 'kind'])) return { version: 1, requestId: id, kind: 'snapshot' }
+  if (request['kind'] === 'context' && exact(request, ['version', 'requestId', 'kind', 'workspace', 'tab', 'collapsed'])
+      && typeof request['workspace'] === 'number' && Number.isSafeInteger(request['workspace']) && request['workspace'] >= 1
+      && typeof request['tab'] === 'number' && Number.isSafeInteger(request['tab']) && request['tab'] >= 1
+      && typeof request['collapsed'] === 'boolean') {
+    return { version: 1, requestId: id, kind: 'context', workspace: request['workspace'], tab: request['tab'], collapsed: request['collapsed'] }
+  }
+  if (request['kind'] === 'command' && exact(request, ['version', 'requestId', 'kind', 'command']) && 'command' in request) {
+    return { version: 1, requestId: id, kind: 'command', command: request['command'] }
+  }
+  if (request['kind'] === 'frame' && exact(request, ['version', 'requestId', 'kind', 'id']) && isOpaqueBrowserId(request['id'])) {
+    return { version: 1, requestId: id, kind: 'frame', id: request['id'] }
+  }
+  if (request['kind'] === 'import' && exact(request, ['version', 'requestId', 'kind', 'mode', 'text'])
+      && (request['mode'] === 'new' || request['mode'] === 'replace') && typeof request['text'] === 'string' && request['text'].length <= 8 * 1024 * 1024) {
+    return { version: 1, requestId: id, kind: 'import', mode: request['mode'], text: request['text'] }
+  }
+  if (request['kind'] === 'recovery' && exact(request, ['version', 'requestId', 'kind', 'recovery']) && 'recovery' in request) {
+    return { version: 1, requestId: id, kind: 'recovery', recovery: request['recovery'] }
+  }
+  throw new Error('INVALID_REQUEST')
 }
 
 function paneLocation(name: string): { ws: number; tab: number } | null {
@@ -209,7 +262,7 @@ function brokerErrorEnvelope(requestId: string | undefined, error: unknown): Rec
 }
 function binaryAttachment(value: unknown): value is BrowserBinaryAttachment {
   const candidate = value as Partial<BrowserBinaryAttachment> | null
-  return !!candidate && candidate.mediaType === 'image/png' && Buffer.isBuffer(candidate.data)
+  return !!candidate && (candidate.mediaType === 'image/png' || candidate.mediaType === 'image/jpeg') && Buffer.isBuffer(candidate.data)
 }
 
 async function syncDirectory(path: string): Promise<void> {
@@ -286,6 +339,12 @@ export interface TabBrowserBrokerOptions {
    * authorized. A request id is never a queue key. */
   queueKey?: (request: BrokerRequest) => string | Promise<string>
   operations?: BrowserOperationRegistry
+  handleUi?: (request: UiRequest, signal: AbortSignal, connection: UiConnection) => Promise<unknown>
+}
+
+export interface UiConnection {
+  push(event: unknown): void
+  onClose?: () => void
 }
 
 async function rejectLiveSocket(path: string): Promise<void> {
@@ -369,10 +428,11 @@ export class TabBrowserBrokerServer {
     await new Promise<void>((resolve, reject) => { this.server!.once('error', reject); this.server!.listen(this.socketPath, resolve) })
   }
   private accept(socket: Socket, token: string): void {
-    let authenticated = false; let buffer = Buffer.alloc(0); let chain = Promise.resolve(); let queued = 0
+    let authenticated = false; let uiMode = false; let buffer = Buffer.alloc(0); let chain = Promise.resolve(); let queued = 0; let uiInFlight = 0
     const active = new Set<AbortController>()
     const connectionResults = new Set<string>()
     const safeWrite = (value: unknown): void => { if (!socket.destroyed && socket.writable) socket.write(frame(value)) }
+    const connection: UiConnection = { push: (event) => { safeWrite(event) } }
     const safeWriteResult = (requestId: string, result: unknown): void => {
       if (binaryAttachment(result)) {
         safeWrite({ version: 1, requestId, ok: true, result: { contentTrust: 'untrusted-browser-content', mediaType: result.mediaType, ...(result.width === undefined ? {} : { width: result.width }), ...(result.height === undefined ? {} : { height: result.height }), ...(result.browserId === undefined ? {} : { browserId: result.browserId }), ...(result.pageIncarnation === undefined ? {} : { pageIncarnation: result.pageIncarnation }), ...(result.generation === undefined ? {} : { generation: result.generation }), ...(result.observation ? { observation: result.observation } : {}), ...(result.actionResult ? { actionResult: result.actionResult, dispatched: result.actionResult.dispatched === true, rollbackPossible: false } : {}), attachment: { encoding: 'binary-frame', byteLength: result.data.length } } })
@@ -386,6 +446,7 @@ export class TabBrowserBrokerServer {
       active.clear()
       for (const key of connectionResults) this.results.delete(key)
       connectionResults.clear()
+      connection.onClose?.()
     })
     socket.setTimeout(idleTimeoutMs, () => socket.destroy())
     socket.on('data', (chunk: Buffer) => {
@@ -408,6 +469,39 @@ export class TabBrowserBrokerServer {
               const hello = object(value)
               if (!hello || !exact(hello, ['token']) || hello['token'] !== token) throw new Error('UNAUTHORIZED')
               authenticated = true; safeWrite({ ok: true }); return
+            }
+            if (!uiMode && isUiHello(value)) {
+              if (!this.options.handleUi) throw new Error('BROWSER_HOST_UNAVAILABLE')
+              uiMode = true
+              safeWrite({ ok: true })
+              return
+            }
+            if (uiMode) {
+              const ui = parseUiRequest(value)
+              requestId = ui.requestId
+              const handleUi = this.options.handleUi
+              if (!handleUi) throw new Error('BROWSER_HOST_UNAVAILABLE')
+              const controller = new AbortController(); active.add(controller)
+              const unregister = (): void => { active.delete(controller) }
+              controller.signal.addEventListener('abort', unregister, { once: true })
+              completionDeferred = true
+              // Node's socket timeout is inbound-idle. A UI show/thaw writes
+              // nothing until it finishes, so the default 10s idle would
+              // destroy the connection and surface BROWSER_HOST_UNAVAILABLE
+              // to amber web. Pause idle while this request is in flight;
+              // restore it after so abandoned sockets still die.
+              uiInFlight += 1
+              socket.setTimeout(0)
+              void handleUi(ui, controller.signal, connection).then((result) => {
+                safeWriteResult(ui.requestId, result)
+              }, (error) => {
+                safeWrite(brokerErrorEnvelope(ui.requestId, error))
+              }).finally(() => {
+                uiInFlight -= 1
+                if (!socket.destroyed && uiInFlight === 0) socket.setTimeout(idleTimeoutMs)
+                unregister(); queued -= 1
+              })
+              return
             }
             const request = parseBrokerRequest(value); requestId = request.requestId
             cacheKey = `${request.clientInstanceId}:${request.requestId}`

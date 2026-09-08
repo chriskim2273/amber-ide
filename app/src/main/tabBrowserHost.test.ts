@@ -9,6 +9,9 @@ import { createInputEventHandlers } from './electronTabBrowserPage'
 class FakePage implements TabBrowserPage {
   url = 'about:blank'; destroyed = false; visible = false; stopped = false
   automation?: BrowserAutomation
+  captureFrame?: TabBrowserPage['captureFrame']
+  remoteEvents: import('./remoteBrowserInput').RemoteInputEvent[] = []
+  dispatchRemoteInput(events: import('./remoteBrowserInput').RemoteInputEvent[]): void { this.remoteEvents.push(...events) }
   async loadURL(url: string) { this.url = url }
   show() { this.visible = true }
   hide() { this.visible = false }
@@ -475,6 +478,41 @@ describe('TabBrowserHost', () => {
     const host = new TabBrowserHost(state, pages)
     await expect(host.thaw(id)).rejects.toThrow('BROWSER_RESTORE_FAILED')
     expect(host.status(id)).toMatchObject({ lifecycle: 'frozen', restoreError: 'Browser restore failed', safeRestoreUrl: 'https://restore.example/path' })
+  })
+
+  it('keeps a legacy fit-mode about:blank restore live without applying fixed emulation', async () => {
+    const id = 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' as const
+    const state = emptyBrowserState(1)
+    state.records[id] = { id, profileId: 'global', mode: 'browse', safeRestoreUrl: 'about:blank', title: '', viewport: { width: 200, height: 200 }, lifecycle: 'frozen', stateRevision: 1, lastUsedAt: 1, lastFocusedAt: 0 }
+    const setViewport = vi.fn(async () => { throw new Error('ACTION_TIMEOUT') })
+    const localFactory: TabBrowserPageFactory = { create: () => { const page = new FakePage() as FakePage & { automation: BrowserAutomation }; page.automation = { setViewport } as unknown as BrowserAutomation; return page } }
+    const host = new TabBrowserHost(state, localFactory)
+    await expect(host.thaw(id)).resolves.toMatchObject({ id, lifecycle: 'live' })
+    expect(setViewport).not.toHaveBeenCalled()
+    expect(host.status(id)).toMatchObject({ lifecycle: 'live' })
+    expect(host.status(id)).not.toHaveProperty('restoreError')
+  })
+
+  it('captures a remote frame from the page surface without a CDP screenshot', async () => {
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+    const pages: FakePage[] = []
+    const localFactory: TabBrowserPageFactory = { create: () => {
+      const page = new FakePage()
+      page.captureFrame = async () => ({ mediaType: 'image/png' as const, data: png, width: 200, height: 100, viewport: { width: 100, height: 50, pageX: 0, pageY: 0 } })
+      pages.push(page)
+      return page
+    } }
+    const host = new TabBrowserHost(emptyBrowserState(1), localFactory)
+    const opened = await host.open({ visible: true })
+    const frame = await host.captureFrame(opened.status.id)
+    expect(frame).toMatchObject({ mediaType: 'image/png', data: png, width: 200, height: 100 })
+    expect(frame.observation?.screenshotId).toEqual(expect.any(String))
+    host.remoteInput(opened.status.id, { kind: 'mouseClick', screenshotId: frame.observation!.screenshotId, x: 40, y: 20, button: 'left', clickCount: 1 })
+    expect(pages[0]?.remoteEvents).toEqual([
+      { type: 'mouseMove', x: 20, y: 10, button: 'left', clickCount: 0 },
+      { type: 'mouseDown', x: 20, y: 10, button: 'left', clickCount: 1 },
+      { type: 'mouseUp', x: 20, y: 10, button: 'left', clickCount: 1 },
+    ])
   })
 
   it('reapplies the exact minimum persisted viewport after parse, restart, and thaw', async () => {

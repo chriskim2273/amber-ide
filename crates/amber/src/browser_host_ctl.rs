@@ -197,6 +197,32 @@ fn read_browser_host_token(path: &Path) -> Option<String> {
     Some(token.to_string())
 }
 
+pub fn socket_path(explicit: Option<PathBuf>) -> PathBuf {
+    if let Some(path) = explicit {
+        return path;
+    }
+    if let Some(path) = std::env::var_os("AMBER_BROWSER_HOST_SOCKET") {
+        return PathBuf::from(path);
+    }
+    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR").filter(|value| !value.is_empty()) {
+        return PathBuf::from(runtime).join("amber-ide").join("browser-host.sock");
+    }
+    #[cfg(unix)]
+    let fallback = format!("amber-ide-{}", unsafe { libc::geteuid() });
+    #[cfg(not(unix))]
+    let fallback = "amber-ide-unsupported".to_string();
+    std::env::temp_dir().join(fallback).join("browser-host.sock")
+}
+
+#[cfg(unix)]
+pub(crate) fn token(root: &Path) -> Option<String> {
+    read_browser_host_token(&root.join("browser-host-token"))
+}
+#[cfg(not(unix))]
+pub(crate) fn token(_root: &Path) -> Option<String> {
+    None
+}
+
 fn socket_ready(root: &Path, socket: &Path) -> bool {
     #[cfg(unix)]
     {

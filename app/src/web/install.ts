@@ -3,7 +3,7 @@
 // or `navigator.clipboard`. Never imported by a test — `amber.test.ts` tests
 // `createAmber` directly against fakes.
 
-import { createAmber, type SocketLike, type PortLike, type RouterApi } from './amber'
+import { createAmber, type SocketLike, type PortLike, type RouterApi, type BrowserApi } from './amber'
 import { createGestureClipboard } from './webClipboard'
 import type { LoadLayoutResult, SaveLayoutResult, LayoutVersion } from '../shared/layoutFile'
 import { slotFromWire, type RouterSlot } from '../shared/routerStatus'
@@ -49,6 +49,48 @@ async function layoutGet(): Promise<LoadLayoutResult> {
     return { text: body.text ?? null, version: body.version ?? null }
   } catch {
     return { text: null, version: null }
+  }
+}
+
+async function browserJson(path: string, init?: RequestInit): Promise<Record<string, unknown>> {
+  try {
+    const r = await fetch(path, { credentials: 'same-origin', ...init })
+    const body = (await r.json().catch(() => null)) as Record<string, unknown> | null
+    if (body && typeof body === 'object') return body
+    return { ok: false, error: `HTTP ${r.status}` }
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) }
+  }
+}
+
+function browserApi(): BrowserApi {
+  return {
+    context: (value) => browserJson('/api/browser/context', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(value) }),
+    command: (value, context) => browserJson('/api/browser/command', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ command: value, context: context ?? null }) }),
+    recovery: (value) => browserJson('/api/browser/recovery', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(value) }),
+    snapshot: () => browserJson('/api/browser/snapshot'),
+    importWorkspace: (value) => browserJson('/api/browser/import', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(value) }),
+    frame: async (id) => {
+      try {
+        const r = await fetch(`/api/browser/frame?id=${encodeURIComponent(id)}`, { credentials: 'same-origin' })
+        if (!r.ok) {
+          const body = (await r.json().catch(() => null)) as Record<string, unknown> | null
+          return body ?? { ok: false, error: `HTTP ${r.status}` }
+        }
+        const blob = await r.blob()
+        return {
+          ok: true,
+          result: {
+            blob,
+            screenshotId: r.headers.get('X-Amber-Screenshot-Id') ?? '',
+            generation: Number(r.headers.get('X-Amber-Generation') ?? '0'),
+            pageIncarnation: r.headers.get('X-Amber-Page-Incarnation') ?? '',
+          },
+        }
+      } catch (e) {
+        return { ok: false, error: e instanceof Error ? e.message : String(e) }
+      }
+    },
   }
 }
 
@@ -223,6 +265,7 @@ export function installAmber(home: string): void {
     layoutGet,
     layoutSave,
     routerApi: routerApi(),
+    browserApi: browserApi(),
     usageApi: async (refresh = false) => {
       const r = await fetch('/api/usage', { method: refresh ? 'POST' : 'GET', credentials: 'same-origin' })
       if (!r.ok) throw new Error(`HTTP ${r.status}`)

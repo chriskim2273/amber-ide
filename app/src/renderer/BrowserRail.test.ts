@@ -1,7 +1,7 @@
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
-import { BrowserRail, browserCommandNeedsContext, shouldRevokeDesignatedPi } from './BrowserRail'
+import { BrowserRail, browserCommandNeedsContext, hasRemoteBrowserFrame, mapFramePoint, shouldRevokeDesignatedPi } from './BrowserRail'
 
 const props = {
   id: '0123456789ABCDEFGHJKMNPQRS', width: 420, collapsed: false,
@@ -20,6 +20,12 @@ describe('BrowserRail command context', () => {
     expect(browserCommandNeedsContext({ type: 'resolveApproval' })).toBe(false)
     expect(browserCommandNeedsContext({ type: 'resolveDialog' })).toBe(false)
     expect(browserCommandNeedsContext({ type: 'navigate' })).toBe(true)
+  })
+  it('maps remote frame clicks into image pixels and detects a web frame API', () => {
+    expect(mapFramePoint(50, 60, { left: 10, top: 10, width: 100, height: 50 }, 200, 100)).toEqual({ x: 80, y: 100 })
+    expect(mapFramePoint(-1, 0, { left: 0, top: 0, width: 100, height: 100 }, 100, 100)).toBeNull()
+    expect(hasRemoteBrowserFrame({ browserFrame: async () => ({}) })).toBe(true)
+    expect(hasRemoteBrowserFrame({})).toBe(false)
   })
 })
 

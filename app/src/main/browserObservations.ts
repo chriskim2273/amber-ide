@@ -22,6 +22,12 @@ export class BrowserObservations {
     if (!record || !this.isFresh(record) || record.documentEpoch !== lease.documentEpoch || record.browserId !== lease.browserId || record.pageIncarnation !== lease.pageIncarnation || record.generation !== lease.generation || record.controller !== lease.controller) throw new Error('STALE_GENERATION')
     return structuredClone(record)
   }
+  /** Remote UI frames: the user clicked the pixels they see, even if a later input callback advanced generation. */
+  resolveFrame(browserId: string, pageIncarnation: string, screenshotId: string): ScreenshotObservation {
+    const record = this.entries.get(screenshotId)
+    if (!record || !this.isFresh(record) || record.browserId !== browserId || record.pageIncarnation !== pageIncarnation) throw new Error('STALE_GENERATION')
+    return structuredClone(record)
+  }
 }
 export function mapScreenshotPoint(observation: ScreenshotObservation, point: { x: number; y: number }): { x: number; y: number } {
   if (!Number.isFinite(point.x) || !Number.isFinite(point.y) || point.x < 0 || point.y < 0 || point.x >= observation.imageWidth || point.y >= observation.imageHeight) throw new Error('INVALID_REQUEST')

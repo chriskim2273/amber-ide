@@ -1222,20 +1222,7 @@ fn run_handoff(session_id: &str) -> anyhow::Result<()> {
 }
 
 fn browser_host_socket(explicit: Option<PathBuf>) -> PathBuf {
-    if let Some(path) = explicit {
-        return path;
-    }
-    if let Some(path) = std::env::var_os("AMBER_BROWSER_HOST_SOCKET") {
-        return PathBuf::from(path);
-    }
-    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR").filter(|value| !value.is_empty()) {
-        return PathBuf::from(runtime).join("amber-ide").join("browser-host.sock");
-    }
-    #[cfg(unix)]
-    let fallback = format!("amber-ide-{}", unsafe { libc::geteuid() });
-    #[cfg(not(unix))]
-    let fallback = "amber-ide-unsupported".to_string();
-    std::env::temp_dir().join(fallback).join("browser-host.sock")
+    amber::browser_host_ctl::socket_path(explicit)
 }
 
 fn run_ctl_browser_host(

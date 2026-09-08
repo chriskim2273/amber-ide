@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import {
   parseServerMsg, toDaemonEvent, ControlLink, PaneLink, PiPaneLink, createAmber,
-  type SocketLike, type PortLike, type AmberDeps, type RouterApi,
+  type SocketLike, type PortLike, type AmberDeps, type RouterApi, type BrowserApi,
 } from './amber'
 
 class FakeSocket implements SocketLike {
@@ -54,6 +54,10 @@ describe('parseServerMsg', () => {
       .toEqual({ t: 'piEvent', name: 'pi', seq: 2, event: { kind: 'agent_start' } })
     expect(parseServerMsg('{"t":"piStatus","name":"pi","available":true}'))
       .toEqual({ t: 'piStatus', name: 'pi', available: true })
+    expect(parseServerMsg('{"t":"browserEvent","event":{"type":"runtime","id":"browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}'))
+      .toEqual({ t: 'browserEvent', event: { type: 'runtime', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' } })
+    expect(parseServerMsg('{"t":"browserAssociation","ws":1,"tab":2,"browser":{"id":"browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","width":420,"collapsed":false}}'))
+      .toEqual({ t: 'browserAssociation', ws: 1, tab: 2, browser: { id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', width: 420, collapsed: false } })
   })
 
   it('returns null for an unknown t or malformed JSON', () => {
@@ -285,6 +289,14 @@ describe('PaneLink', () => {
         revealKey: async () => '',
         logTail: async () => '',
       },
+      browserApi: {
+        context: async () => ({ ok: false, error: 'BROWSER_HOST_UNAVAILABLE' }),
+        command: async () => ({ ok: false, error: 'BROWSER_HOST_UNAVAILABLE' }),
+        recovery: async () => ({ ok: false, error: 'BROWSER_HOST_UNAVAILABLE' }),
+        snapshot: async () => ({ ok: false, error: 'BROWSER_HOST_UNAVAILABLE' }),
+        importWorkspace: async () => ({ ok: false, error: 'BROWSER_HOST_UNAVAILABLE' }),
+        frame: async () => ({ ok: false, error: 'BROWSER_HOST_UNAVAILABLE' }),
+      },
     }
     const amber = createAmber(deps)
     amber.openPane('s1')
@@ -445,7 +457,19 @@ describe('createAmber', () => {
       layoutSave: () => Promise.resolve({ ok: true, version: null }),
       usageApi: () => Promise.resolve({ providers: [] }),
       routerApi: silentRouterApi(),
+      browserApi: silentBrowserApi(),
       ...overrides,
+    }
+  }
+
+  function silentBrowserApi(): BrowserApi {
+    return {
+      context: async () => ({ ok: false, error: 'BROWSER_HOST_UNAVAILABLE' }),
+      command: async () => ({ ok: false, error: 'BROWSER_HOST_UNAVAILABLE' }),
+      recovery: async () => ({ ok: false, error: 'BROWSER_HOST_UNAVAILABLE' }),
+      snapshot: async () => ({ ok: false, error: 'BROWSER_HOST_UNAVAILABLE' }),
+      importWorkspace: async () => ({ ok: false, error: 'BROWSER_HOST_UNAVAILABLE' }),
+      frame: async () => ({ ok: false, error: 'BROWSER_HOST_UNAVAILABLE' }),
     }
   }
 
@@ -656,5 +680,46 @@ describe('createAmber', () => {
       ['save', [{ id: 'a' }]],
       ['key', 'alpha'],
     ])
+  })
+
+  it('browserCommand uses the injected host proxy and fans association to listeners', async () => {
+    const calls: unknown[] = []
+    const associations: unknown[] = []
+    const events: unknown[] = []
+    const amber = createAmber(deps({
+      browserApi: {
+        context: async (value) => { calls.push(['context', value]); return { ok: true, workspace: 1, tab: 2, browserId: null } },
+        command: async (value, context) => {
+          calls.push(['command', value, context])
+          return {
+            ok: true,
+            result: { id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', presentation: 'remote' },
+            association: { kind: 'association', ws: 1, tab: 2, browser: { id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', width: 420, collapsed: false } },
+            events: [{ kind: 'event', event: { type: 'runtime', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' } }],
+          }
+        },
+        recovery: async () => ({ ok: true, result: [] }),
+        snapshot: async () => ({ ok: true, result: {} }),
+        importWorkspace: async () => ({ ok: false, error: 'BROWSER_HOST_UNAVAILABLE' }),
+        frame: async () => ({ ok: false, error: 'BROWSER_HOST_UNAVAILABLE' }),
+      },
+    }))
+    const onAssociation = amber.onBrowserAssociation
+    const onEvent = amber.onTabBrowserEvent
+    if (onAssociation) onAssociation((value) => { associations.push(value) })
+    if (onEvent) onEvent((value) => { events.push(value) })
+    const setContext = amber.setBrowserContext
+    expect(setContext).toBeTypeOf('function')
+    await expect(setContext!({ workspace: 1, tab: 2, collapsed: false })).resolves.toMatchObject({ ok: true })
+    await expect(amber.browserCommand({ type: 'open' })).resolves.toMatchObject({
+      ok: true,
+      result: { id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', presentation: 'remote' },
+    })
+    expect(calls).toEqual([
+      ['context', { workspace: 1, tab: 2, collapsed: false }],
+      ['command', { type: 'open' }, { workspace: 1, tab: 2, collapsed: false }],
+    ])
+    expect(associations).toEqual([{ ws: 1, tab: 2, browser: { id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', width: 420, collapsed: false } }])
+    expect(events).toEqual([{ type: 'runtime', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' }])
   })
 })

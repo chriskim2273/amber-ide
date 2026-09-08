@@ -82,11 +82,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use amber_core::proto::{self, ControlMsg, Decoded, Decoder, Frame, SessionInfo};
+use serde_json::Value;
 use crate::transport::{self, LocalReader, LocalWriter};
 
 use crate::layout_cas;
 use crate::manager::SessionManager;
 use crate::mosaic;
+use crate::browser_ops;
 use crate::router_ops;
 use crate::routerctl;
 
@@ -1940,6 +1942,23 @@ fn respond(
     stream.flush()
 }
 
+fn browser_err(stream: &mut TcpStream, err: browser_ops::OpsError) -> std::io::Result<()> {
+    let status = match err.status {
+        400 => "400 Bad Request",
+        401 => "401 Unauthorized",
+        502 => "502 Bad Gateway",
+        503 => "503 Service Unavailable",
+        _ if err.status >= 500 => "500 Internal Server Error",
+        _ => "400 Bad Request",
+    };
+    let (_, body) = browser_ops::json_err(&err);
+    respond(stream, status, CT_JSON, &[], body.as_bytes())
+}
+
+fn browser_request_id(hub: &Hub) -> String {
+    format!("web-{}", hub.next_id.fetch_add(1, Ordering::Relaxed))
+}
+
 fn router_err(stream: &mut TcpStream, err: router_ops::OpsError) -> std::io::Result<()> {
     let status = match err.status {
         400 => "400 Bad Request",
@@ -2154,6 +2173,188 @@ fn handle_conn(
                     Ok(respond(&mut stream, "200 OK", CT_JSON, &[], out.as_bytes())?)
                 }
                 Err(e) => Ok(router_err(&mut stream, e)?),
+            }
+        }
+        ("POST", "/api/browser/context") => {
+            if !auth.authorized(peer, &req) {
+                return Ok(respond(&mut stream, "401 Unauthorized", "", &[], b"")?);
+            }
+            if !origin_ok(req.header("origin"), req.header("host"), req.header("x-forwarded-host")) {
+                return Ok(respond(&mut stream, "403 Forbidden", "", &[], b"")?);
+            }
+            let body = serde_json::from_slice::<Value>(&req.body).unwrap_or(Value::Null);
+            let request = serde_json::json!({
+                "version": 1,
+                "requestId": browser_request_id(hub),
+                "kind": "context",
+                "workspace": body.get("workspace"),
+                "tab": body.get("tab"),
+                "collapsed": body.get("collapsed"),
+            });
+            match browser_ops::send(&hub.root, std::slice::from_ref(&request)) {
+                Ok(reply) => {
+                    let out = browser_ops::json_ok(&reply);
+                    Ok(respond(&mut stream, "200 OK", CT_JSON, &[], out.as_bytes())?)
+                }
+                Err(e) => Ok(browser_err(&mut stream, e)?),
+            }
+        }
+        ("POST", "/api/browser/command") => {
+            if !auth.authorized(peer, &req) {
+                return Ok(respond(&mut stream, "401 Unauthorized", "", &[], b"")?);
+            }
+            if !origin_ok(req.header("origin"), req.header("host"), req.header("x-forwarded-host")) {
+                return Ok(respond(&mut stream, "403 Forbidden", "", &[], b"")?);
+            }
+            let body = serde_json::from_slice::<Value>(&req.body).unwrap_or(Value::Null);
+            let id = browser_request_id(hub);
+            let (command, context) = if body.get("command").is_some() {
+                (
+                    body.get("command").cloned().unwrap_or(Value::Null),
+                    body.get("context").cloned().filter(|value| !value.is_null()),
+                )
+            } else {
+                (body, None)
+            };
+            let mut requests = Vec::new();
+            if let Some(ctx) = context {
+                requests.push(serde_json::json!({
+                    "version": 1,
+                    "requestId": format!("{id}-ctx"),
+                    "kind": "context",
+                    "workspace": ctx.get("workspace"),
+                    "tab": ctx.get("tab"),
+                    "collapsed": ctx.get("collapsed"),
+                }));
+            }
+            requests.push(serde_json::json!({
+                "version": 1,
+                "requestId": id,
+                "kind": "command",
+                "command": command,
+            }));
+            match browser_ops::send(&hub.root, &requests) {
+                Ok(reply) => {
+                    let out = browser_ops::json_ok(&reply);
+                    Ok(respond(&mut stream, "200 OK", CT_JSON, &[], out.as_bytes())?)
+                }
+                Err(e) => Ok(browser_err(&mut stream, e)?),
+            }
+        }
+        ("POST", "/api/browser/recovery") => {
+            if !auth.authorized(peer, &req) {
+                return Ok(respond(&mut stream, "401 Unauthorized", "", &[], b"")?);
+            }
+            if !origin_ok(req.header("origin"), req.header("host"), req.header("x-forwarded-host")) {
+                return Ok(respond(&mut stream, "403 Forbidden", "", &[], b"")?);
+            }
+            let recovery = serde_json::from_slice::<Value>(&req.body).unwrap_or(Value::Null);
+            let request = serde_json::json!({
+                "version": 1,
+                "requestId": browser_request_id(hub),
+                "kind": "recovery",
+                "recovery": recovery,
+            });
+            match browser_ops::send(&hub.root, std::slice::from_ref(&request)) {
+                Ok(reply) => {
+                    let out = browser_ops::json_ok(&reply);
+                    Ok(respond(&mut stream, "200 OK", CT_JSON, &[], out.as_bytes())?)
+                }
+                Err(e) => Ok(browser_err(&mut stream, e)?),
+            }
+        }
+        ("GET", "/api/browser/snapshot") => {
+            if !auth.authorized(peer, &req) {
+                return Ok(respond(&mut stream, "401 Unauthorized", "", &[], b"")?);
+            }
+            if !origin_ok(req.header("origin"), req.header("host"), req.header("x-forwarded-host")) {
+                return Ok(respond(&mut stream, "403 Forbidden", "", &[], b"")?);
+            }
+            let request = serde_json::json!({
+                "version": 1,
+                "requestId": browser_request_id(hub),
+                "kind": "snapshot",
+            });
+            match browser_ops::send(&hub.root, std::slice::from_ref(&request)) {
+                Ok(reply) => {
+                    let out = browser_ops::json_ok(&reply);
+                    Ok(respond(&mut stream, "200 OK", CT_JSON, &[], out.as_bytes())?)
+                }
+                Err(e) => Ok(browser_err(&mut stream, e)?),
+            }
+        }
+        ("POST", "/api/browser/import") => {
+            if !auth.authorized(peer, &req) {
+                return Ok(respond(&mut stream, "401 Unauthorized", "", &[], b"")?);
+            }
+            if !origin_ok(req.header("origin"), req.header("host"), req.header("x-forwarded-host")) {
+                return Ok(respond(&mut stream, "403 Forbidden", "", &[], b"")?);
+            }
+            let body = serde_json::from_slice::<Value>(&req.body).unwrap_or(Value::Null);
+            let request = serde_json::json!({
+                "version": 1,
+                "requestId": browser_request_id(hub),
+                "kind": "import",
+                "mode": body.get("mode"),
+                "text": body.get("text"),
+            });
+            match browser_ops::send(&hub.root, std::slice::from_ref(&request)) {
+                Ok(reply) => {
+                    let out = browser_ops::json_ok(&reply);
+                    Ok(respond(&mut stream, "200 OK", CT_JSON, &[], out.as_bytes())?)
+                }
+                Err(e) => Ok(browser_err(&mut stream, e)?),
+            }
+        }
+        ("GET", "/api/browser/frame") => {
+            if !auth.authorized(peer, &req) {
+                return Ok(respond(&mut stream, "401 Unauthorized", "", &[], b"")?);
+            }
+            if !origin_ok(req.header("origin"), req.header("host"), req.header("x-forwarded-host")) {
+                return Ok(respond(&mut stream, "403 Forbidden", "", &[], b"")?);
+            }
+            let id = router_ops::query_param(query, "id").unwrap_or("");
+            let request = serde_json::json!({
+                "version": 1,
+                "requestId": browser_request_id(hub),
+                "kind": "frame",
+                "id": id,
+            });
+            match browser_ops::send(&hub.root, std::slice::from_ref(&request)) {
+                Ok(reply) => {
+                    if let Some(bytes) = reply.attachment {
+                        let media = reply
+                            .value
+                            .pointer("/result/mediaType")
+                            .and_then(Value::as_str)
+                            .unwrap_or("image/png");
+                        let screenshot = reply
+                            .value
+                            .pointer("/result/observation/screenshotId")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let generation = reply
+                            .value
+                            .pointer("/result/generation")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0);
+                        let incarnation = reply
+                            .value
+                            .pointer("/result/pageIncarnation")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let extra = [
+                            format!("X-Amber-Screenshot-Id: {screenshot}"),
+                            format!("X-Amber-Generation: {generation}"),
+                            format!("X-Amber-Page-Incarnation: {incarnation}"),
+                        ];
+                        Ok(respond(&mut stream, "200 OK", media, &extra, &bytes)?)
+                    } else {
+                        let out = browser_ops::json_ok(&reply);
+                        Ok(respond(&mut stream, "200 OK", CT_JSON, &[], out.as_bytes())?)
+                    }
+                }
+                Err(e) => Ok(browser_err(&mut stream, e)?),
             }
         }
         ("GET", "/ws") => {

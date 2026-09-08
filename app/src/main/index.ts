@@ -75,7 +75,8 @@ import {
 import { inspectLinuxInputMethod, repairLinuxInputMethod, resolveLinuxInputEnvironment } from './inputMethod'
 import { TabBrowserService, parseTabBrowserCommand, stageWorkspaceBrowserState } from './tabBrowserService'
 import { buildAppMenuTemplate, type BrowserMenuHandlers } from './browserMenu'
-import { TabBrowserBrokerServer, authorizeBrowserRequest, dispatchAttachedBrokerAction, isEligiblePiController, type BrokerRequest } from './tabBrowserBroker'
+import { TabBrowserBrokerServer, authorizeBrowserRequest, dispatchAttachedBrokerAction, isEligiblePiController, type BrokerRequest, type UiConnection } from './tabBrowserBroker'
+import { createBrowserUiActor, dispatchUiRequest, type BrowserUiActor, type BrowserUiDeps } from './browserUiDispatch'
 import { BrowserDaemonWatcher } from './browserDaemonWatcher'
 import { Connection } from '../client/connection'
 import { TabBrowserStateStore } from './tabBrowserStateStore'
@@ -85,6 +86,7 @@ import { emptyLayout, layoutUtf8ByteLength, LAYOUT_FILE_MAX_BYTES, parseLayout, 
 import { assertWorkspaceFileBytes, parseWorkspaceFile, WORKSPACE_FILE_MAX_BYTES } from '../shared/workspaceFile'
 import { commitPreparedWorkspaceImport, prepareWorkspaceImport } from './workspaceImport'
 import { approvalSurfaceDuringPresentationCommand, browserContextMatches, captureBrowserContext, hasExactApprovalSurface, resolveBrowserContext, sameBrowserContextIdentity, setBrowserForCurrentContext } from './browserWindowContext'
+import { ownerWindowCloseIsFromGuest, shouldHideLocalWindowOnClose } from './electronTabBrowserPage'
 import { createBrowserId } from '../shared/tabBrowser'
 import { isRecoveryId } from '../shared/tabBrowserState'
 import { BrowserOperationRegistry } from './browserOperationRegistry'
@@ -1202,7 +1204,17 @@ async function openWindow(target: WindowTarget, options: { show?: boolean } = {}
   windowCtxs.set(win.webContents.id, ctx)
   const id = win.webContents.id
   win.on('close', (event) => {
-    if (tabBrowserHostEnabled() && target.kind === 'local' && !allowFinalQuit) {
+    const action = shouldHideLocalWindowOnClose({
+      hostEnabled: tabBrowserHostEnabled(),
+      isLocal: target.kind === 'local',
+      allowFinalQuit,
+      fromGuestWebContents: ownerWindowCloseIsFromGuest(win),
+    })
+    if (action === 'ignore') {
+      event.preventDefault()
+      return
+    }
+    if (action === 'hide') {
       event.preventDefault()
       presentationSuspended = true
       windowClosed = true
@@ -1261,6 +1273,8 @@ async function main(): Promise<void> {
   const tabBrowserSupported = tabBrowserHostEnabled()
   let tabBrowser: TabBrowserService | null = null
   let tabBrowserStateStore: TabBrowserStateStore | null = null
+  const uiConnections = new Set<UiConnection>()
+  const uiActors = new WeakMap<UiConnection, BrowserUiActor>()
   const browserOperations = new BrowserOperationRegistry()
   const rendererBrowserOperation = <T>(kind: 'association' | 'workspace-import' | 'recovery', work: (signal: AbortSignal) => Promise<T>): Promise<T | { ok: false; error: string }> =>
     browserOperations.run(kind, work).catch((error) => ({ ok: false, error: error instanceof Error ? error.message : 'INTERNAL_ERROR' }))
@@ -1300,6 +1314,7 @@ async function main(): Promise<void> {
       )
       tabBrowser.setEventSink((event) => {
         for (const context of windowCtxs.values()) if (context.target.kind === 'local' && !context.win.isDestroyed()) context.win.webContents.send('tab-browser-event', event)
+        for (const connection of uiConnections) connection.push({ version: 1, kind: 'event', event })
       })
     } catch (error) {
       console.error('tab browser migration failed; browser host remains unavailable', error)
@@ -1433,7 +1448,31 @@ async function main(): Promise<void> {
     const handleBroker = (request: BrokerRequest, signal: AbortSignal): Promise<unknown> =>
       browserOperations.run('broker', (ownedSignal) => handleBrokerInner(request, ownedSignal), signal)
     const socketPath = browserHostSocketPath(process.env, process.platform, process.getuid?.() ?? -1, tmpdir())
+    const uiDeps = (): BrowserUiDeps => ({
+      tabBrowser: tabBrowser!,
+      tabBrowserStateStore: tabBrowserStateStore!,
+      layoutPath: layoutPath(),
+      operations: browserOperations,
+      controller: (name) => browserDaemonWatcher?.controller(name),
+      cancelController: (name) => { tabBrowserBroker?.cancelController(name) },
+      rollbackOpenedBrowser,
+    })
     tabBrowserBroker = new TabBrowserBrokerServer(socketPath, join(stateRoot(), 'browser-host-token'), handleBroker, {
+      handleUi: async (request, signal, connection) => {
+        let actor = uiActors.get(connection)
+        if (!actor) {
+          actor = createBrowserUiActor((ws, tab, browser) => {
+            connection.push({ version: 1, kind: 'association', ws, tab, ...(browser ? { browser } : {}) })
+            for (const context of windowCtxs.values()) if (context.target.kind === 'local' && !context.win.isDestroyed()) {
+              context.win.webContents.send('tab-browser-association', { ws, tab, ...(browser ? { browser } : {}) })
+            }
+          })
+          uiActors.set(connection, actor)
+          uiConnections.add(connection)
+          connection.onClose = () => { uiConnections.delete(connection); uiActors.delete(connection) }
+        }
+        return dispatchUiRequest(uiDeps(), actor, request, signal, connection)
+      },
       authorizeReplay: async (request) => { try { await currentBrokerLayout(request); return true } catch { return false } },
       // Serialize by the authorized browser, or by its tab while the one
       // first-use solicitation has no browser id yet. Request ids are replay
@@ -1527,7 +1566,7 @@ async function main(): Promise<void> {
   // client process (a remote window's talks through an ssh tunnel), so they
   // route by sender rather than closing over one window's refs.
   ipcMain.on('daemon-command', (e, cmd: unknown) => {
-    ctxFor(e)?.controlPort()?.postMessage(cmd)
+    try { ctxFor(e)?.controlPort()?.postMessage(cmd) } catch { /* client already gone */ }
   })
 
   ipcMain.on('open-pane', (e, session: string) => {
@@ -1559,7 +1598,7 @@ async function main(): Promise<void> {
   })
 
   ipcMain.on('close-pane', (e, session: string) => {
-    ctxFor(e)?.child()?.postMessage({ kind: 'pane-close', session })
+    try { ctxFor(e)?.child()?.postMessage({ kind: 'pane-close', session }) } catch { /* child already gone */ }
   })
 
   ipcMain.handle('browser:recovery', (e, raw: unknown) => rendererBrowserOperation('recovery', async (signal) => {
@@ -1761,7 +1800,7 @@ async function main(): Promise<void> {
   }))
 
   ipcMain.on('close-pi-pane', (e, session: string) => {
-    ctxFor(e)?.child()?.postMessage({ kind: 'pi-pane-close', session })
+    try { ctxFor(e)?.child()?.postMessage({ kind: 'pi-pane-close', session }) } catch { /* child already gone */ }
   })
 
   // Resolve a terminal selection to an EXISTING absolute path so the pane's

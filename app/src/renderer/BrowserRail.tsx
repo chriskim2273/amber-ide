@@ -26,6 +26,7 @@ interface BrowserStatus {
   title: string; restoreError?: string; restoredAfterFreeze: boolean; focused: boolean; visible: boolean
   viewport: { width: number; height: number }; diagnostics: { consoleIssues: number; networkFailures: number }
   lastAction?: { action: string; phase: string; error?: string }
+  presentation?: 'remote'
 }
 type BrowserReply = { ok: true; result: BrowserStatus | { closed: true } } | { ok: false; error: string }
 
@@ -37,6 +38,18 @@ export function browserCommandNeedsContext(value: unknown): boolean {
 
 export function shouldRevokeDesignatedPi(designatedPi: string | undefined, controllers: readonly { name: string }[], controllersReady: boolean): boolean {
   return controllersReady && !!designatedPi && !controllers.some((controller) => controller.name === designatedPi)
+}
+
+export function hasRemoteBrowserFrame(amber: { browserFrame?: unknown } | undefined): boolean {
+  return typeof amber?.browserFrame === 'function'
+}
+
+export function mapFramePoint(clientX: number, clientY: number, rect: { left: number; top: number; width: number; height: number }, naturalWidth: number, naturalHeight: number): { x: number; y: number } | null {
+  if (rect.width < 1 || rect.height < 1 || naturalWidth < 1 || naturalHeight < 1) return null
+  const x = Math.round((clientX - rect.left) * (naturalWidth / rect.width))
+  const y = Math.round((clientY - rect.top) * (naturalHeight / rect.height))
+  if (x < 0 || y < 0 || x > naturalWidth || y > naturalHeight) return null
+  return { x, y }
 }
 
 export function BrowserRail(props: {
@@ -62,6 +75,9 @@ export function BrowserRail(props: {
   const [autoCollapsed, setAutoCollapsed] = useState(false)
   const [capacityWaiting, setCapacityWaiting] = useState(false)
   const [availableWidth, setAvailableWidth] = useState(1200)
+  const [frameUrl, setFrameUrl] = useState('')
+  const [frameLease, setFrameLease] = useState<{ screenshotId: string } | null>(null)
+  const remote = typeof window !== 'undefined' && hasRemoteBrowserFrame(window.amber as { browserFrame?: unknown } | undefined)
 
   const command = async (value: unknown): Promise<BrowserReply> => {
     if (browserCommandNeedsContext(value)) await props.ensureContext()
@@ -145,6 +161,35 @@ export function BrowserRail(props: {
     const observer = new ResizeObserver(schedule); observer.observe(element); window.addEventListener('resize', schedule)
     return () => { stopped = true; observer.disconnect(); window.removeEventListener('resize', schedule); cancelAnimationFrame(frame); clearTimeout(settled) }
   }, [props.id, presentationHidden])
+
+  useEffect(() => {
+    if (!remote || presentationHidden) return
+    const amber = window.amber as { browserFrame?: (id: string) => Promise<Record<string, unknown>> }
+    if (!amber.browserFrame) return
+    let stopped = false, timer = 0, currentUrl = ''
+    const poll = async (): Promise<void> => {
+      const reply = await amber.browserFrame!(props.id)
+      if (stopped) return
+      const result = reply['result'] as { blob?: Blob; screenshotId?: string; generation?: number; pageIncarnation?: string } | undefined
+      if (reply['ok'] === true && result?.blob instanceof Blob) {
+        const next = URL.createObjectURL(result.blob)
+        if (currentUrl) URL.revokeObjectURL(currentUrl)
+        currentUrl = next
+        setFrameUrl(next)
+        setFrameLease(typeof result.screenshotId === 'string' && result.screenshotId ? { screenshotId: result.screenshotId } : null)
+        if (typeof result.generation === 'number' || typeof result.pageIncarnation === 'string') {
+          setStatus((current) => current ? {
+            ...current,
+            ...(typeof result.generation === 'number' ? { generation: result.generation } : {}),
+            ...(typeof result.pageIncarnation === 'string' && result.pageIncarnation ? { pageIncarnation: result.pageIncarnation } : {}),
+          } : current)
+        }
+      }
+      if (!stopped) timer = window.setTimeout(() => { void poll() }, 50)
+    }
+    void poll()
+    return () => { stopped = true; window.clearTimeout(timer); if (currentUrl) URL.revokeObjectURL(currentUrl) }
+  }, [props.id, presentationHidden, remote])
 
   const withLease = async (request: (lease: BrowserStatus) => unknown): Promise<void> => {
     const currentStatus = statusRef.current ?? status
@@ -267,7 +312,21 @@ export function BrowserRail(props: {
         <button className="btn" onClick={() => void command({ type: 'resolveDialog', dialogId: dialog.dialogId, digest: dialog.digest, accept: false })}>{dialog.dialogType === 'beforeunload' ? 'Stay' : 'Reject'}</button></div>
     </div>}
     {props.occluded && <div className="tab-browser-occluded" role="status">Browser hidden while another Amber surface is open.</div>}
-    <div ref={host} className="tab-browser-page-slot" />
+    <div ref={host} className="tab-browser-page-slot">
+      {remote && <img className="tab-browser-remote-frame" alt="Remote browser page" src={frameUrl || undefined} draggable={false} tabIndex={0}
+        onClick={(event) => {
+          if (!status || !frameLease) return
+          const image = event.currentTarget
+          const point = mapFramePoint(event.clientX, event.clientY, image.getBoundingClientRect(), image.naturalWidth, image.naturalHeight)
+          if (!point) return
+          void command({ type: 'remoteInput', pageIncarnation: status.pageIncarnation, expectedGeneration: status.generation, operation: { kind: 'mouseClick', screenshotId: frameLease.screenshotId, x: point.x, y: point.y, button: 'left', clickCount: 1 } }).then((reply) => { if (!reply.ok) setError(reply.error) })
+        }}
+        onKeyDown={(event) => {
+          if (!status || !frameLease || event.key.length !== 1 || event.ctrlKey || event.metaKey || event.altKey) return
+          event.preventDefault()
+          void command({ type: 'remoteInput', pageIncarnation: status.pageIncarnation, expectedGeneration: status.generation, operation: { kind: 'typeFocused', screenshotId: frameLease.screenshotId, text: event.key } }).then((reply) => { if (!reply.ok) setError(reply.error) })
+        }} />}
+    </div>
     <div className="tab-browser-grip" role="separator" tabIndex={0} aria-orientation="vertical" aria-label="Resize browser rail" aria-valuemin={widthMetrics.min} aria-valuemax={widthMetrics.max} aria-valuenow={widthMetrics.width} aria-valuetext={`${widthMetrics.width} pixels`}
       onKeyDown={(event) => { const width = keyboardRailWidth(widthMetrics.width, event.key, availableWidth); if (width !== null) { event.preventDefault(); props.onWidth(width) } }}
       onPointerDown={(event) => {

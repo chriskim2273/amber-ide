@@ -9,6 +9,8 @@ import type { BrowserAutomation, BrowserBinaryAttachment } from './browserAutoma
 import { isPointerInteraction, type BrowserInteraction, type BrowserToolAction } from './browserToolProtocol'
 import { classifyInteraction, type InteractionClassification, type InteractionTargetMetadata } from './browserApproval'
 import { ACTION_FAILED_NO_ROLLBACK, BrowserActionError, BrowserAutomationError, FRESH_SNAPSHOT_MESSAGE, type BrowserInteractionDiagnostics } from './browserErrors'
+import { BrowserObservations } from './browserObservations'
+import { remoteInputEvents, type RemoteInputEvent } from './remoteBrowserInput'
 
 export type TabBrowserPageEvent =
   | { type: 'navigation-started' }
@@ -45,6 +47,8 @@ export interface TabBrowserPage {
   focus?(): void
   blur?(): void
   setBounds?(bounds: { x: number; y: number; width: number; height: number }): void
+  captureFrame?(signal?: AbortSignal): Promise<BrowserBinaryAttachment>
+  dispatchRemoteInput?(events: RemoteInputEvent[]): void
   automation?: BrowserAutomation
   destroy(): void
 }
@@ -67,6 +71,7 @@ export interface InteractionApprovalRequest { operation: BrowserInteraction; tar
 
 export class TabBrowserHost {
   private readonly capacity = new BrowserCapacity(4)
+  private readonly remoteFrames = new BrowserObservations()
   private readonly runtimes = new Map<BrowserId, Runtime>()
   /** Tombstones prevent a late adapter callback from reusing an old generation. */
   private readonly generationFloor = new Map<BrowserId, number>()
@@ -243,6 +248,50 @@ export class TabBrowserHost {
 
   hide(id: string): void { const record = this.record(id); const runtime = this.runtimes.get(record.id); runtime?.page.hide(); runtime?.page.automation?.hideCursor?.(); if (runtime) { runtime.visible = false; runtime.focused = false }; this.capacity.protect(record.id, false); this.emitRuntime(record.id) }
   isVisible(id: string): boolean { return isOpaqueBrowserId(id) && this.runtimes.get(id)?.visible === true }
+
+  async captureFrame(id: string, signal?: AbortSignal): Promise<BrowserBinaryAttachment> {
+    const record = this.record(id)
+    const runtime = this.runtimes.get(record.id)
+    if (!runtime) throw new Error('BROWSER_FROZEN')
+    if (signal?.aborted) throw new Error('ACTION_CANCELLED')
+    if (!runtime.page.captureFrame) throw new Error('BROWSER_FROZEN')
+    const frame = await abortable(runtime.page.captureFrame(signal), signal ?? new AbortController().signal)
+    const imageWidth = frame.width ?? 0
+    const imageHeight = frame.height ?? 0
+    if (imageWidth < 1 || imageHeight < 1) throw new Error('BROWSER_FROZEN')
+    const view = 'viewport' in frame && frame.viewport && typeof frame.viewport === 'object'
+      ? frame.viewport as { width?: number; height?: number }
+      : undefined
+    const observation = this.remoteFrames.issue({
+      browserId: record.id,
+      pageIncarnation: runtime.incarnation,
+      generation: runtime.generation,
+      documentEpoch: runtime.documentEpoch,
+      imageWidth,
+      imageHeight,
+      viewport: {
+        width: typeof view?.width === 'number' && view.width > 0 ? view.width : imageWidth,
+        height: typeof view?.height === 'number' && view.height > 0 ? view.height : imageHeight,
+        pageX: 0,
+        pageY: 0,
+      },
+    })
+    return { ...frame, browserId: record.id, pageIncarnation: runtime.incarnation, generation: runtime.generation, observation }
+  }
+
+  remoteInput(id: string, operation: BrowserInteraction): { dispatched: true; rollbackPossible: false } {
+    const record = this.record(id)
+    const runtime = this.runtimes.get(record.id)
+    if (!runtime || !runtime.visible) throw new Error('BROWSER_FROZEN')
+    if (!isPointerInteraction(operation)) throw new Error('INVALID_REQUEST')
+    if (!runtime.page.dispatchRemoteInput) throw new Error('BROWSER_FROZEN')
+    const observation = this.remoteFrames.resolveFrame(record.id, runtime.incarnation, operation.screenshotId)
+    runtime.page.focus?.()
+    runtime.page.dispatchRemoteInput(remoteInputEvents(observation, operation))
+    runtime.focused = true
+    this.emitRuntime(record.id)
+    return { dispatched: true, rollbackPossible: false }
+  }
 
   setMode(id: string, mode: 'preview' | 'browse', source: 'user' | 'broker' = 'user'): BrowserRuntimeStatus {
     if (source !== 'user') throw new Error('NAVIGATION_BLOCKED')

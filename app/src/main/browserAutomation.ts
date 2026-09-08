@@ -49,7 +49,7 @@ export interface BrowserAutomationControls {
 }
 export interface AccessibilityNodeResult { ref: string; depth: number; role: string; name: string; disabled?: boolean; focused?: boolean }
 export interface SnapshotResult { snapshotId: string; url: string; nodes: AccessibilityNodeResult[]; truncated: boolean; truncationReasons: string[]; ordering: 'interactive-first'; depthIsApproximate: true }
-export interface BrowserBinaryAttachment { mediaType: 'image/png'; data: Buffer; width?: number; height?: number; browserId?: string; pageIncarnation?: string; generation?: number; observation?: ScreenshotObservation; actionResult?: Record<string, unknown> }
+export interface BrowserBinaryAttachment { mediaType: 'image/png' | 'image/jpeg'; data: Buffer; width?: number; height?: number; browserId?: string; pageIncarnation?: string; generation?: number; observation?: ScreenshotObservation; viewport?: EffectiveBrowserViewport; actionResult?: Record<string, unknown> }
 
 type AXNode = {
   nodeId?: string; parentId?: string; backendDOMNodeId?: number; ignored?: boolean
@@ -732,6 +732,18 @@ export class BrowserAutomation {
         for (const params of [...heldKeys.values()].reverse()) await this.transport.send('Input.dispatchKeyEvent', params).catch(() => {})
       }
     }
+  }
+  async captureRawPng(signal: AbortSignal, fromSurface = false): Promise<{ data: Buffer; width: number; height: number }> {
+    abort(signal)
+    await this.ensureAttached()
+    abort(signal)
+    const result = await this.transport.send('Page.captureScreenshot', { format: 'png', fromSurface, captureBeyondViewport: false })
+    abort(signal)
+    if (typeof result['data'] !== 'string') throw new Error('INTERNAL_ERROR')
+    const data = Buffer.from(result['data'], 'base64')
+    const dimensions = pngDimensions(data)
+    if (!dimensions) throw new Error('BROWSER_FROZEN')
+    return { data, ...dimensions }
   }
   async screenshot(lease: BrowserAutomationLease, target: BrowserElementRef | undefined, fullPage: boolean, signal: AbortSignal): Promise<BrowserBinaryAttachment> {
     abort(signal); await this.ensureAttached(); let clip: { x: number; y: number; width: number; height: number; scale: number } | undefined

@@ -13,6 +13,11 @@ describe('screenshot observations', () => {
     expect(() => mapScreenshotPoint(observation, { x: 1600, y: 0 })).toThrow('INVALID_REQUEST')
     expect(() => mapScreenshotPoint(observation, { x: NaN, y: 0 })).toThrow('INVALID_REQUEST')
   })
+  it('lets a remote frame click use the pixels the user saw after a later generation tick', () => {
+    const store = new BrowserObservations(), observation = store.issue(capture)
+    expect(store.resolveFrame('b', 'p', observation.screenshotId).screenshotId).toBe(observation.screenshotId)
+    expect(() => store.resolveFrame('b', 'other', observation.screenshotId)).toThrow('STALE_GENERATION')
+  })
   it('rejects stale generation, controller or page identity', () => {
     const store = new BrowserObservations(), observation = store.issue(capture)
     for (const changed of [{ generation: 5 }, { controller: 'another' }, { pageIncarnation: 'new' }]) {

@@ -5,7 +5,8 @@ import { isOpaqueBrowserId, safeRestoreUrl, type BrowserId } from '../shared/tab
 import type { WsBrowser } from '../shared/workspaceFile'
 import { TabBrowserStateStore } from './tabBrowserStateStore'
 import { BROWSER_RECOVERY_MAX, isRecoveryId, type BrowserStateFile, type RecoveryId } from '../shared/tabBrowserState'
-import type { BrowserToolAction } from './browserToolProtocol'
+import type { BrowserInteraction, BrowserToolAction } from './browserToolProtocol'
+import type { BrowserBinaryAttachment } from './browserAutomation'
 import { parseBrowserViewport } from '../shared/browserViewport'
 import { BrowserApprovalCoordinator, BrowserDialogCoordinator, interactionTargetDigest, interactionValueDigest, type ApprovalDecision } from './browserApproval'
 import { navigationPolicyAllows, selectPreviewOrigin } from './tabBrowserPolicy'
@@ -433,6 +434,19 @@ export class TabBrowserService {
     return this.operations.run('command', (ownedSignal) => this.enqueueCommand(command, ownedSignal, validate), signal)
   }
 
+  captureFrame(id: string, signal?: AbortSignal): Promise<BrowserBinaryAttachment> {
+    return this.operations.run('command', (ownedSignal) => this.host.captureFrame(id, ownedSignal), signal)
+  }
+
+  remoteInput(id: string, operation: BrowserInteraction, signal?: AbortSignal, validate?: () => boolean | Promise<boolean>): Promise<unknown> {
+    return this.operations.run('command', async (ownedSignal) => {
+      this.operations.assertDispatch(ownedSignal)
+      this.assertBrowserUsable(id)
+      if (validate && !(await validate())) throw new Error('STALE_BROWSER_CONTEXT')
+      return this.host.remoteInput(id, operation)
+    }, signal)
+  }
+
   private enqueueCommand(command: TabBrowserCommand, signal?: AbortSignal, validate?: () => boolean | Promise<boolean>): Promise<unknown> {
     // Opens must reach the host concurrently so the global capacity FIFO sees
     // every contender. Observations and hide also cannot sit behind a wait.
@@ -735,6 +749,7 @@ export class TabBrowserService {
     if (signal?.aborted || generation !== this.drainGeneration) throw new Error('ACTION_CANCELLED')
     if (this.runtimeFlush) { clearTimeout(this.runtimeFlush); this.runtimeFlush = null }
     this.pendingRuntimeEvents.clear()
+    this.pages.closeRemoteSurface?.()
   }
 
   setFullAccess(id: string, enabled: boolean): void {

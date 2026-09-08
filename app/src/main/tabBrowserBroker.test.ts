@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { connect } from 'node:net'
 import { execFile } from 'node:child_process'
-import { authorizeBrowserRequest, BROWSER_HOST_TOKEN_MAX_BYTES, brokerRequestDigest, dispatchAttachedBrokerAction, isEligiblePiController, parseBrokerRequest, parseBrowserHostToken, safeBrokerError, TabBrowserBrokerServer } from './tabBrowserBroker'
+import { authorizeBrowserRequest, BROWSER_HOST_TOKEN_MAX_BYTES, brokerRequestDigest, dispatchAttachedBrokerAction, isEligiblePiController, isUiHello, parseBrokerRequest, parseBrowserHostToken, parseUiHello, parseUiRequest, safeBrokerError, TabBrowserBrokerServer } from './tabBrowserBroker'
 import type { LayoutFile } from '../shared/layoutFile'
 import { BrowserOperationRegistry } from './browserOperationRegistry'
 import { ACTION_FAILED_NO_ROLLBACK, BrowserActionError, FRESH_SNAPSHOT_MESSAGE } from './browserErrors'
@@ -35,6 +35,36 @@ describe('tab browser broker boundary', () => {
     expect(() => parseBrokerRequest({ version: 1, clientInstanceId: 'client-01', sequence: 1, requestId: 'r1', amberSession: '', action: { type: 'status' } })).toThrow('INVALID_REQUEST')
     expect(() => parseBrokerRequest({ version: 1, clientInstanceId: 'client-01', sequence: 1, requestId: 'r1', amberSession: 'amber-1-2-0-pane', action: { type: 'navigate', url: 'https://example.test', pageIncarnation: 'x'.repeat(257), expectedGeneration: 0 } })).toThrow('INVALID_REQUEST')
   })
+
+  it('parses the UI-role hello and rejects BrokerRequest-shaped smuggling', () => {
+    expect(isUiHello({ version: 1, role: 'ui' })).toBe(true)
+    expect(parseUiHello({ version: 1, role: 'ui' })).toEqual({ version: 1, role: 'ui' })
+    expect(isUiHello({ version: 1, clientInstanceId: 'client-01', sequence: 1, requestId: 'r1', amberSession: 'amber-1-2-0-pane', action: { type: 'status' } })).toBe(false)
+    expect(isUiHello({ version: 1, role: 'ui', extra: true })).toBe(false)
+    expect(isUiHello({ version: 1, role: 'broker' })).toBe(false)
+    expect(() => parseUiHello({ version: 1, role: 'ui', extra: true })).toThrow('INVALID_REQUEST')
+  })
+
+  it('parses bounded UI-role requests', () => {
+    expect(parseUiRequest({ version: 1, requestId: 'r1', kind: 'subscribe' })).toEqual({ version: 1, requestId: 'r1', kind: 'subscribe' })
+    expect(parseUiRequest({ version: 1, requestId: 'r1', kind: 'snapshot' })).toEqual({ version: 1, requestId: 'r1', kind: 'snapshot' })
+    expect(parseUiRequest({ version: 1, requestId: 'r1', kind: 'context', workspace: 1, tab: 2, collapsed: true }))
+      .toEqual({ version: 1, requestId: 'r1', kind: 'context', workspace: 1, tab: 2, collapsed: true })
+    expect(parseUiRequest({ version: 1, requestId: 'r1', kind: 'command', command: { type: 'open' } }))
+      .toEqual({ version: 1, requestId: 'r1', kind: 'command', command: { type: 'open' } })
+    expect(parseUiRequest({ version: 1, requestId: 'r1', kind: 'frame', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' }))
+      .toEqual({ version: 1, requestId: 'r1', kind: 'frame', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' })
+    expect(parseUiRequest({ version: 1, requestId: 'r1', kind: 'import', mode: 'new', text: '{}' }))
+      .toEqual({ version: 1, requestId: 'r1', kind: 'import', mode: 'new', text: '{}' })
+    expect(parseUiRequest({ version: 1, requestId: 'r1', kind: 'recovery', recovery: { action: 'list' } }))
+      .toEqual({ version: 1, requestId: 'r1', kind: 'recovery', recovery: { action: 'list' } })
+    expect(() => parseUiRequest({ version: 1, requestId: 'r1', kind: 'context', workspace: 1, tab: 2, collapsed: true, extra: 1 })).toThrow('INVALID_REQUEST')
+    expect(() => parseUiRequest({ version: 1, requestId: '', kind: 'subscribe' })).toThrow('INVALID_REQUEST')
+    expect(() => parseUiRequest({ version: 1, requestId: 'r1', kind: 'frame', id: 'browser-nope' })).toThrow('INVALID_REQUEST')
+    expect(() => parseUiRequest({ version: 1, requestId: 'r1', kind: 'cdp' })).toThrow('INVALID_REQUEST')
+    expect(() => parseUiRequest({ version: 1, clientInstanceId: 'client-01', sequence: 1, requestId: 'r1', amberSession: 'amber-1-2-0-pane', action: { type: 'status' } })).toThrow('INVALID_REQUEST')
+  })
+
   it('forwards every observation/navigation tool through cancellation and dispatch-time authorization', async () => {
     const signal = new AbortController().signal; const validate = () => true; const calls: unknown[][] = []
     const action = { type: 'snapshot' as const, pageIncarnation: 'page', expectedGeneration: 1, limits: { maxDepth: 20, maxNodes: 2000, maxBytes: 262144 } }
@@ -589,6 +619,107 @@ describe('tab browser broker boundary', () => {
     })
     expect(later).toMatchObject({ ok: true, result: { handled: true } })
     expect(handleCalls).toBe(1)
+    await server.close()
+  })
+
+  it('routes UI-role commands away from the Pi handler and keeps a sibling Pi connection working', async () => {
+    if (process.platform === 'win32') return
+    const dir = await mkdtemp(join(tmpdir(), 'amber-browser-broker-')); cleanup.push(dir)
+    const socketPath = join(dir, 'broker.sock'); const tokenPath = join(dir, 'token')
+    const piCalls: unknown[] = []; const uiCalls: unknown[] = []
+    const server = new TabBrowserBrokerServer(socketPath, tokenPath, async (request) => {
+      piCalls.push(request)
+      return { pi: true }
+    }, {
+      handleUi: async (request) => {
+        uiCalls.push(request)
+        return { ui: true, ...(request.kind === 'command' ? { presentation: 'remote' as const } : {}) }
+      },
+    })
+    await server.start()
+    const token = (await readFile(tokenPath, 'utf8')).trim()
+    const encode = (value: unknown): Buffer => { const body = Buffer.from(JSON.stringify(value)); const out = Buffer.alloc(body.length + 4); out.writeUInt32BE(body.length); body.copy(out, 4); return out }
+    const readReplies = (afterAuth: unknown[]): Promise<Record<string, unknown>[]> => new Promise((resolve, reject) => {
+      const socket = connect(socketPath); let buffer = Buffer.alloc(0); const replies: Record<string, unknown>[] = []; let authenticated = false; let sent = 0
+      socket.on('error', reject)
+      socket.on('connect', () => socket.write(encode({ token })))
+      socket.on('data', (chunk) => {
+        buffer = Buffer.concat([buffer, chunk])
+        while (buffer.length >= 4 && buffer.length >= buffer.readUInt32BE(0) + 4) {
+          const size = buffer.readUInt32BE(0)
+          const reply = JSON.parse(buffer.subarray(4, 4 + size).toString()) as Record<string, unknown>
+          buffer = buffer.subarray(4 + size)
+          if (!authenticated) {
+            authenticated = true
+            socket.write(encode(afterAuth[sent++]!))
+            continue
+          }
+          replies.push(reply)
+          if (sent < afterAuth.length) socket.write(encode(afterAuth[sent++]!))
+          else { socket.end(); resolve(replies) }
+        }
+      })
+    })
+    const uiReplies = await readReplies([
+      { version: 1, role: 'ui' },
+      { version: 1, requestId: 'open', kind: 'command', command: { type: 'open' } },
+    ])
+    expect(uiReplies).toMatchObject([{ ok: true }, { ok: true, result: { ui: true, presentation: 'remote' } }])
+    expect(uiCalls).toHaveLength(1)
+    expect(piCalls).toHaveLength(0)
+    const piReplies = await readReplies([{ version: 1, clientInstanceId: 'client-pi-01', sequence: 1, requestId: 'status', amberSession: 'amber-1-2-0-pane', action: { type: 'status' } }])
+    expect(piReplies).toMatchObject([{ ok: true, result: { pi: true } }])
+    expect(piCalls).toHaveLength(1)
+    await server.close()
+  })
+
+  it('keeps a slow UI-role command alive past the idle socket timeout', async () => {
+    if (process.platform === 'win32') return
+    const dir = await mkdtemp(join(tmpdir(), 'amber-browser-broker-')); cleanup.push(dir)
+    const socketPath = join(dir, 'broker.sock'); const tokenPath = join(dir, 'token')
+    const server = new TabBrowserBrokerServer(socketPath, tokenPath, async () => ({}), {
+      socketTimeoutMs: 40,
+      handleUi: async (request) => {
+        if (request.kind === 'command') await new Promise((resolve) => setTimeout(resolve, 80))
+        return { presentation: 'remote' as const }
+      },
+    })
+    await server.start()
+    const token = (await readFile(tokenPath, 'utf8')).trim()
+    const encode = (value: unknown): Buffer => { const body = Buffer.from(JSON.stringify(value)); const out = Buffer.alloc(body.length + 4); out.writeUInt32BE(body.length); body.copy(out, 4); return out }
+    const replies = await new Promise<Record<string, unknown>[]>((resolve, reject) => {
+      const socket = connect(socketPath); let buffer = Buffer.alloc(0); const values: Record<string, unknown>[] = []; let authenticated = false; let sent = 0
+      const frames = [
+        { version: 1, role: 'ui' },
+        { version: 1, requestId: 'show', kind: 'command', command: { type: 'show', id: 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', bounds: { x: 0, y: 0, width: 420, height: 600 } } },
+      ]
+      const timer = setTimeout(() => { socket.destroy(); reject(new Error('UI command did not reply before the test deadline')) }, 500)
+      socket.on('error', (error) => { clearTimeout(timer); reject(error) })
+      socket.on('close', () => {
+        if (values.length < 2) {
+          clearTimeout(timer)
+          reject(new Error(`socket closed after ${values.length} replies`))
+        }
+      })
+      socket.on('connect', () => socket.write(encode({ token })))
+      socket.on('data', (chunk) => {
+        buffer = Buffer.concat([buffer, chunk])
+        while (buffer.length >= 4 && buffer.length >= buffer.readUInt32BE(0) + 4) {
+          const size = buffer.readUInt32BE(0)
+          const reply = JSON.parse(buffer.subarray(4, 4 + size).toString()) as Record<string, unknown>
+          buffer = buffer.subarray(4 + size)
+          if (!authenticated) {
+            authenticated = true
+            socket.write(encode(frames[sent++]!))
+            continue
+          }
+          values.push(reply)
+          if (sent < frames.length) socket.write(encode(frames[sent++]!))
+          else if (values.length === 2) { clearTimeout(timer); socket.end(); resolve(values) }
+        }
+      })
+    })
+    expect(replies).toMatchObject([{ ok: true }, { ok: true, requestId: 'show', result: { presentation: 'remote' } }])
     await server.close()
   })
 })

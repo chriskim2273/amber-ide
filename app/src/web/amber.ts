@@ -85,6 +85,9 @@ export type ServerMsg =
   | { t: 'created'; name: string }
   | { t: 'piEvent'; name: string; seq: number; event: Record<string, unknown> }
   | { t: 'piStatus'; name: string; available: boolean }
+  | { t: 'browserEvent'; event: unknown }
+  | { t: 'browserAssociation'; ws: number; tab: number; browser?: unknown }
+  | { t: 'browserFrame'; id: string; screenshotId?: string; generation?: number; pageIncarnation?: string }
 
 /** Parse one JSON text frame from `amber web`. `null` for anything this
  * shim has no use for (malformed JSON, an unknown `t`). */
@@ -148,6 +151,14 @@ export function parseServerMsg(text: string): ServerMsg | null {
       return { t: 'titleSet', name: raw['name'], title: raw['title'] as string | null }
     case 'created':
       return typeof raw['name'] === 'string' ? { t: 'created', name: raw['name'] } : null
+    case 'browserEvent':
+      return { t: 'browserEvent', event: raw['event'] }
+    case 'browserAssociation':
+      if (typeof raw['ws'] !== 'number' || typeof raw['tab'] !== 'number') return null
+      return { t: 'browserAssociation', ws: raw['ws'], tab: raw['tab'], ...(raw['browser'] !== undefined ? { browser: raw['browser'] } : {}) }
+    case 'browserFrame':
+      if (typeof raw['id'] !== 'string') return null
+      return { t: 'browserFrame', id: raw['id'], ...(typeof raw['screenshotId'] === 'string' ? { screenshotId: raw['screenshotId'] } : {}), ...(typeof raw['generation'] === 'number' ? { generation: raw['generation'] } : {}), ...(typeof raw['pageIncarnation'] === 'string' ? { pageIncarnation: raw['pageIncarnation'] } : {}) }
     default:
       return null
   }
@@ -275,6 +286,9 @@ export class ControlLink {
       // assume, matching the "unknown t is ignored" discipline `app.js` and
       // `parse_browser_msg` already use.
       if (msg.t === 'backlog' || msg.t === 'exit' || msg.t === 'piEvent' || msg.t === 'piStatus') return
+      if (msg.t === 'browserEvent') { this.dispatch({ browserEvent: msg.event }); return }
+      if (msg.t === 'browserAssociation') { this.dispatch({ browserAssociation: { ws: msg.ws, tab: msg.tab, ...(msg.browser !== undefined ? { browser: msg.browser } : {}) } }); return }
+      if (msg.t === 'browserFrame') { this.dispatch({ browserFrame: msg }); return }
       this.dispatch(toDaemonEvent(msg))
     }
   }
@@ -582,6 +596,16 @@ export interface AmberDeps {
   // Cookie-gated `GET /api/usage`. Returns the raw body; the shim decodes it
   // with the same tolerant decoder the control wire uses.
   usageApi: (refresh?: boolean) => Promise<unknown>
+  browserApi: BrowserApi
+}
+
+export interface BrowserApi {
+  context: (value: unknown) => Promise<Record<string, unknown>>
+  command: (value: unknown, context?: unknown) => Promise<Record<string, unknown>>
+  recovery: (value: unknown) => Promise<Record<string, unknown>>
+  snapshot: () => Promise<Record<string, unknown>>
+  importWorkspace: (value: unknown) => Promise<Record<string, unknown>>
+  frame: (id: string) => Promise<Record<string, unknown>>
 }
 
 export interface RouterApi {
@@ -617,12 +641,35 @@ export type WebAmber = Window['amber'] & {
    * must not keep the desktop squeezed to phone width.
    */
   releaseGrids: () => void
+  browserFrame: (id: string) => Promise<Record<string, unknown>>
+}
+
+function fanBrowserPayload(reply: Record<string, unknown>, emitEvent: (event: unknown) => void, emitAssociation: (value: unknown) => void): void {
+  const association = reply['association']
+  if (association && typeof association === 'object' && !Array.isArray(association)) {
+    const record = association as Record<string, unknown>
+    emitAssociation({ ws: record['ws'], tab: record['tab'], ...(record['browser'] !== undefined ? { browser: record['browser'] } : {}) })
+  }
+  const events = reply['events']
+  if (Array.isArray(events)) {
+    for (const entry of events) {
+      if (entry && typeof entry === 'object' && !Array.isArray(entry) && 'event' in entry) emitEvent((entry as { event: unknown }).event)
+    }
+  }
 }
 
 export function createAmber(deps: AmberDeps): WebAmber {
   let onEvent: ((d: unknown) => void) | null = null
   const pending: unknown[] = []
+  const tabBrowserListeners = new Set<(event: unknown) => void>()
+  let associationListener: ((value: unknown) => void) | null = null
+  const emitBrowserEvent = (event: unknown): void => { for (const listener of tabBrowserListeners) listener(event) }
+  const emitAssociation = (value: unknown): void => { associationListener?.(value) }
   const dispatch = (ev: unknown): void => {
+    if (ev && typeof ev === 'object') {
+      if ('browserEvent' in ev) { emitBrowserEvent((ev as { browserEvent: unknown }).browserEvent); return }
+      if ('browserAssociation' in ev) { emitAssociation((ev as { browserAssociation: unknown }).browserAssociation); return }
+    }
     if (onEvent) onEvent(ev)
     else pending.push(ev)
   }
@@ -630,6 +677,7 @@ export function createAmber(deps: AmberDeps): WebAmber {
   const control = new ControlLink(deps.connectSocket, dispatch)
   const panes = new Map<string, PaneLink>()
   const piPanes = new Map<string, PiPaneLink>()
+  let lastBrowserContext: unknown
 
   const api: Window['amber'] = {
     softwareGl: deps.softwareGl,
@@ -687,14 +735,25 @@ export function createAmber(deps: AmberDeps): WebAmber {
     resumeSession: (name): void => control.send({ t: 'resume', name }),
     focusSession: (name): void => control.send({ t: 'focus', name }),
     dumpBacklog: (name): void => control.send({ t: 'dumpBacklog', name }),
-    // A hosted Pocket/web client never owns a local Electron WebContentsView.
-    setBrowserContext: async (): Promise<unknown> => ({ ok: true }),
-    browserCommand: async (): Promise<unknown> => ({ ok: false, error: 'BROWSER_HOST_UNAVAILABLE' }),
-    importWorkspaceBrowsers: async (): Promise<unknown> => ({ ok: false, error: 'BROWSER_HOST_UNAVAILABLE' }),
-    snapshotWorkspaceBrowsers: async (): Promise<unknown> => ({ ok: true, result: {} }),
-    browserRecovery: async (): Promise<unknown> => ({ ok: false, error: 'BROWSER_HOST_UNAVAILABLE' }),
-    onTabBrowserEvent: (): (() => void) => () => {},
-    onBrowserAssociation: (): void => {},
+    setBrowserContext: async (context): Promise<unknown> => {
+      lastBrowserContext = context
+      const reply = await deps.browserApi.context(context)
+      fanBrowserPayload(reply, emitBrowserEvent, emitAssociation)
+      return reply
+    },
+    browserCommand: async (command): Promise<unknown> => {
+      const reply = await deps.browserApi.command(command, lastBrowserContext)
+      fanBrowserPayload(reply, emitBrowserEvent, emitAssociation)
+      return { ok: reply['ok'] === true, ...(reply['result'] !== undefined ? { result: reply['result'] } : {}), ...(typeof reply['error'] === 'string' ? { error: reply['error'] } : {}) }
+    },
+    importWorkspaceBrowsers: async (value): Promise<unknown> => deps.browserApi.importWorkspace(value),
+    snapshotWorkspaceBrowsers: async (): Promise<unknown> => deps.browserApi.snapshot(),
+    browserRecovery: async (value): Promise<unknown> => deps.browserApi.recovery(value),
+    onTabBrowserEvent: (cb): (() => void) => {
+      tabBrowserListeners.add(cb)
+      return () => { tabBrowserListeners.delete(cb) }
+    },
+    onBrowserAssociation: (cb): void => { associationListener = cb },
 
     // --- native browser API, not a stub (spec §3 "Clipboard" row) ----------
     clipboardWrite: (text): void => {
@@ -803,5 +862,6 @@ export function createAmber(deps: AmberDeps): WebAmber {
     releaseGrids: (): void => {
       for (const link of panes.values()) link.release()
     },
+    browserFrame: (id: string): Promise<Record<string, unknown>> => deps.browserApi.frame(id),
   }
 }

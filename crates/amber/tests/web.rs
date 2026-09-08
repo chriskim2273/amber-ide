@@ -933,6 +933,31 @@ fn router_control_is_behind_the_cookie_boundary() {
 }
 
 #[test]
+fn browser_host_proxy_is_behind_the_cookie_boundary_and_leaks_no_token() {
+    let f = fixture();
+    for (method, path, body) in [
+        ("POST", "/api/browser/command", r#"{"type":"open"}"#),
+        ("POST", "/api/browser/context", r#"{"workspace":1,"tab":1,"collapsed":true}"#),
+        ("POST", "/api/browser/recovery", r#"{"action":"list"}"#),
+        ("GET", "/api/browser/snapshot", ""),
+        ("GET", "/api/browser/frame?id=browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", ""),
+        ("POST", "/api/browser/import", r#"{"mode":"new","text":"{}"}"#),
+    ] {
+        assert_router_unauth(&f, method, path, body);
+    }
+    let cookie = f.login();
+    let (status, _, body) = f.post("/api/browser/command", Some(&cookie), r#"{"type":"open"}"#);
+    assert!(
+        status.contains("503") || status.contains("502") || status.contains("200"),
+        "authenticated command must not 401: {status} {body}"
+    );
+    assert!(!body.contains(&f.token), "browser proxy leaked the web token: {body}");
+    assert!(!body.to_ascii_lowercase().contains("browser-host-token"), "{body}");
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::json!({}));
+    assert!(parsed.get("token").is_none(), "{body}");
+}
+
+#[test]
 fn router_status_is_managed_and_carries_no_secrets() {
     let f = fixture();
     let cookie = f.login();

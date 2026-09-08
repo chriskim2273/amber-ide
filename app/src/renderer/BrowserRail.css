@@ -4,7 +4,8 @@
 .tab-browser-rail.page-focused { border-left-color: var(--accent); box-shadow: inset 2px 0 var(--accent); }
 .tab-browser-rail.collapsed { min-width: 36px; width: 36px; padding-top: 6px; align-items: center; gap: 8px; }
 .tab-browser-collapsed-label { color: var(--muted); font-size: 10px; writing-mode: vertical-rl; text-orientation: mixed; }
-.tab-browser-page-slot { min-height: 0; flex: 1; }
+.tab-browser-page-slot { min-height: 0; flex: 1; position: relative; background: #000; }
+.tab-browser-remote-frame { width: 100%; height: 100%; object-fit: contain; display: block; user-select: none; }
 .tab-browser-chrome { min-height: 42px; display: flex; align-items: center; gap: 5px; padding: 5px 7px; border-bottom: 1px solid var(--border); }
 .tab-browser-nav { display: flex; gap: 2px; }
 .tab-browser-chrome > input { min-width: 80px; flex: 1; height: 30px; border: 1px solid var(--border); border-radius: 5px; background: var(--surface, #17171d); color: inherit; padding: 0 9px; }
