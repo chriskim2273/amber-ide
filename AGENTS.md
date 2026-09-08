@@ -115,8 +115,12 @@ exception is core rule 9); themes/settings beyond minimal.
   opening preserves the saved view; other session kinds remain terminal-only.
   App gate: 1218 passed / 1 skipped, typecheck and web build passed (existing
   duplicate-target/chunk-size warnings remain). Mounted tests cover direct-chat
-  callback isolation and both view changes. Worktree-only, not deployed;
-  real-phone layout, keyboard focus, and live daemon round-trip remain unverified.
+  callback isolation and both view changes. Merged to main and deployed to the
+  installed Amber web `/app` bundle; all 11 built files were byte-verified over
+  live HTTP. Existing hashed assets were retained for open clients; neither web
+  nor session daemon required a restart. Deployment receipts and the prior bundle
+  are under `~/worktrees/amber-ide/mobile-chat-release/`. Real-phone layout,
+  keyboard focus, and live chat round-trip remain unverified.
 
 - [x] Browser native-input follow-up (2026-09-07) — preserves the Pi GUI
   integration while fixing Retina cursor placement, macOS editing-command
