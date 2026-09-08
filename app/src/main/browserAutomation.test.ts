@@ -396,6 +396,48 @@ describe('browser automation', () => {
     await expect(automation.prepareInteraction(lease, { kind: 'click', target: input }, new AbortController().signal)).rejects.toThrow('STALE_GENERATION')
   })
 
+  it.each([
+    { tag: 'INPUT', type: 'checkbox', blocked: '', expected: '' },
+    { tag: 'INPUT', type: 'radio', blocked: '', expected: '' },
+    { tag: 'INPUT', type: 'CHECKBOX', blocked: '', expected: '' },
+    { tag: 'BUTTON', type: 'checkbox', blocked: '', expected: 'TARGET_NOT_ACTIONABLE' },
+    { tag: 'INPUT', type: 'text', blocked: '', expected: 'TARGET_NOT_ACTIONABLE' },
+    { tag: 'INPUT', type: 'checkbox', blocked: 'visibility', expected: 'TARGET_NOT_ACTIONABLE' },
+    { tag: 'INPUT', type: 'checkbox', blocked: 'pointer-events', expected: 'TARGET_NOT_ACTIONABLE' },
+    { tag: 'INPUT', type: 'checkbox', blocked: 'disabled', expected: 'TARGET_NOT_ACTIONABLE' },
+    { tag: 'INPUT', type: 'checkbox', blocked: 'occluded', expected: 'TARGET_OCCLUDED' },
+  ])('handles transparent native controls without bypassing $blocked checks ($tag $type)', async ({ tag, type, blocked, expected }) => {
+    class TransparentControlDebugger extends FakeDebugger {
+      override async send(method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>> {
+        if (method === 'DOM.describeNode' && (params?.['nodeId'] === 102 || params?.['backendNodeId'] === 2))
+          return { node: { nodeName: tag, parentId: 101, backendNodeId: 2, attributes: ['type', type] } }
+        if (method === 'Accessibility.getPartialAXTree' && (params?.['nodeId'] === 102 || params?.['backendNodeId'] === 2))
+          return { nodes: [{ role: { value: 'button' }, name: { value: 'Toggle contents' }, backendDOMNodeId: 2,
+            properties: [{ name: 'disabled', value: { value: blocked === 'disabled' } }] }] }
+        if (method === 'CSS.getComputedStyleForNode') return { computedStyle: [
+          { name: 'opacity', value: '0' }, { name: 'display', value: 'block' },
+          { name: 'visibility', value: blocked === 'visibility' ? 'hidden' : 'visible' },
+          { name: 'pointer-events', value: blocked === 'pointer-events' ? 'none' : 'auto' },
+        ] }
+        if (method === 'DOM.getNodeForLocation' && blocked === 'occluded') return { backendNodeId: 998 }
+        return super.send(method, params)
+      }
+    }
+    const transport = new TransparentControlDebugger()
+    const automation = new BrowserAutomation(transport, () => 'https://example.test/article', () => false)
+    const signal = new AbortController().signal
+    const snapshot = await automation.snapshot(lease, { maxDepth: 20, maxNodes: 20, maxBytes: 256 * 1024 }, signal)
+    const execute = async () => automation.executeInteraction(await automation.prepareInteraction(lease,
+      { kind: 'click', target: { snapshotId: snapshot.snapshotId, role: 'button', name: 'Toggle contents' } }, signal), signal)
+    if (expected) {
+      await expect(execute()).rejects.toThrow(expected)
+      expect(transport.calls).not.toContain('Input.dispatchMouseEvent')
+    } else {
+      await expect(execute()).resolves.toMatchObject({ dispatched: true })
+      expect(transport.calls).toContain('Input.dispatchMouseEvent')
+    }
+  })
+
   it('keeps the dispatched interaction pending until its browser dialog is handled', async () => {
     let decide!: (decision: { accept: boolean }) => void
     const decision = new Promise<{ accept: boolean }>((resolve) => { decide = resolve })

@@ -442,6 +442,15 @@ export class TabBrowserHost {
     if (!runtime || !runtime.page.automation) throw new Error('BROWSER_FROZEN')
     if (runtime.incarnation !== action.pageIncarnation || runtime.generation !== action.expectedGeneration) throw new Error('STALE_GENERATION')
     if (signal.aborted) throw new Error('ACTION_CANCELLED')
+    // A detached WebContentsView has no composited surface. CDP capture can
+    // wait until the operation deadline, whose cancellation destroys the page.
+    // Fail before starting work instead; revealing the rail preserves the page
+    // and lets the caller take a fresh observation without a thaw/navigation.
+    if (action.type === 'screenshot' && !runtime.visible) {
+      throw new BrowserActionError({ code: 'BROWSER_NOT_VISIBLE', retryable: true,
+        message: 'Reveal the side browser in Amber before taking a screenshot.',
+        pageIncarnation: runtime.incarnation, generation: runtime.generation, dispatched: false })
+    }
     const automation = runtime.page.automation
     const lease = { browserId: record.id, pageIncarnation: runtime.incarnation, generation: runtime.generation, documentEpoch: runtime.documentEpoch, ...(controller ? { controller } : {}) }
     const documentEpoch = runtime.documentEpoch

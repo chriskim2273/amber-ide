@@ -4,7 +4,7 @@ export const REMOTE_FRAME_MAX_BYTES = 1024 * 1024
 export interface RemoteFrameImage {
   isEmpty(): boolean
   getSize(): { width: number; height: number }
-  resize(opts: { width: number; height: number; quality?: string }): RemoteFrameImage
+  resize(opts: { width: number; height: number; quality?: 'good' | 'better' | 'best' }): RemoteFrameImage
   toJPEG(quality: number): Buffer
   toPNG(): Buffer
 }

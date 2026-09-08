@@ -1,4 +1,5 @@
-import { BrowserWindow, WebContentsView, session, screen, type Input, type MouseInputEvent, type Rectangle, type Session } from 'electron'
+import type { EventEmitter } from 'node:events'
+import { BrowserWindow, WebContentsView, session, screen, type Input, type MouseInputEvent, type Rectangle, type Session, type WebContents } from 'electron'
 import { browserWebPreferences, isAllowedBrowserUrl } from './tabBrowserPolicy'
 import type { BrowserId } from '../shared/tabBrowser'
 import type { TabBrowserPage, TabBrowserPageEvent, TabBrowserPageFactory } from './tabBrowserHost'
@@ -103,6 +104,7 @@ export function createInputEventHandlers(
 export class ElectronTabBrowserPage implements TabBrowserPage {
   readonly view: WebContentsView
   readonly automation: BrowserAutomation
+  private readonly contents: WebContents
   private attached = false
   private disposing = false
   private explicitlyLoadedBlank = false
@@ -113,14 +115,16 @@ export class ElectronTabBrowserPage implements TabBrowserPage {
     const browserSession = session.fromPartition(partition)
     hardenBrowserSession(browserSession)
     this.view = new WebContentsView({ webPreferences: browserWebPreferences(partition) })
-    const contents = this.view.webContents
+    // The view getter can become undefined after a page-initiated close.
+    // Retain the wrapper so teardown can still use its isDestroyed() guard.
+    const contents = this.contents = this.view.webContents
     // Electron 43 can leave every debugger command pending while a newly
     // created WebContentsView is still on its implicit document. Wait for the
     // renderer's load lifecycle rather than using the URL as a readiness bit:
     // an explicitly loaded about:blank page is a valid automation target too.
     let debuggerReady = false
     const debuggerTransport: BrowserDebuggerTransport = {
-      isAttached: () => contents.debugger.isAttached(),
+      isAttached: () => !contents.isDestroyed() && contents.debugger.isAttached(),
       attach: (version) => { contents.debugger.attach(version) },
       detach: () => { contents.debugger.detach() },
       send: async (method, params) => {
@@ -179,7 +183,11 @@ export class ElectronTabBrowserPage implements TabBrowserPage {
     // A page `window.close()` (or our own close after the owner is gone) must
     // not be treated as Amber's window chrome. Depth is held until `destroyed`
     // because Electron posts the actual teardown off this turn.
-    contents.on('close', () => {
+    // Electron 43 emits this internal event in WebContents::CloseContents
+    // before Destroy(), but omits it from the public WebContents overloads.
+    // Keep the EventEmitter escape hatch local to this verified lifecycle hook.
+    // https://github.com/electron/electron/blob/v43.0.0/shell/browser/api/electron_api_web_contents.cc
+    ;(contents as EventEmitter).on('close', () => {
       if (this.window.isDestroyed() || ownerWindowCloseIsFromGuest(this.window)) return
       noteGuestWebContentsClosing(this.window)
     })
@@ -270,7 +278,7 @@ export class ElectronTabBrowserPage implements TabBrowserPage {
     this.disposing = true
     this.automation.dispose()
     this.hide()
-    closeGuestWebContents(this.window, this.view.webContents)
+    closeGuestWebContents(this.window, this.contents)
     this.onDestroy()
   }
 }

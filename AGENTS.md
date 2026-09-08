@@ -108,6 +108,18 @@ exception is core rule 9); themes/settings beyond minimal.
 
 ## Build status
 
+- [ ] Connected-browser experiments (2026-09-08) — isolated, not deployed.
+  Wikipedia's transparent native menu checkbox was exposed in snapshots but
+  rejected by the opacity actionability gate. Native checkbox/radio targets
+  now retain geometry, hit-testing, disabled and approval checks while allowing
+  transparent styling. Nine focused regressions and all 43 private real-Electron
+  interaction cases pass; full app tests: 1249 passed / 1 skipped. Typecheck
+  and desktop/web builds now pass after repairing inherited declarations.
+  Three private Electron lifecycle/image cases also pass: native/page-initiated
+  close cleanup guards destroyed WebContents and preserves the owner window.
+  Background tab/unfocus operation remains explicitly deferred. Evidence:
+  `/home/poyto/worktrees/amber-ide/browser-experiments-evidence/receipt.md`.
+
 - [x] Browser native-input follow-up (2026-09-07) — preserves the Pi GUI
   integration while fixing Retina cursor placement, macOS editing-command
   dispatch and failed semantic-drag cleanup. Combined gates: app 1144 passed/

@@ -452,7 +452,12 @@ export class BrowserAutomation {
     if (!nodeId) throw new Error('TARGET_NOT_ACTIONABLE')
     const styles = boundedResponse(await this.transport.send('CSS.getComputedStyleForNode', { nodeId })); abort(signal)
     const style = new Map((Array.isArray(styles['computedStyle']) ? styles['computedStyle'] as Array<Record<string, unknown>> : []).map((item) => [text(item['name'], 64), text(item['value'], 128)]))
-    if (style.get('display') === 'none' || style.get('visibility') === 'hidden' || style.get('pointer-events') === 'none' || Number(style.get('opacity') ?? '1') <= 0) throw new Error('TARGET_NOT_ACTIONABLE')
+    // Styled native toggles (e.g. Wikipedia's menu) use an opacity-zero
+    // input as the hit target. Keep geometry/occlusion and disabled checks;
+    // do not extend this exception to arbitrary invisible buttons or fields.
+    const nativeToggle = current.tag === 'input' && ['checkbox', 'radio'].includes(current.type.toLowerCase())
+    if (style.get('display') === 'none' || style.get('visibility') === 'hidden' || style.get('pointer-events') === 'none'
+      || (Number(style.get('opacity') ?? '1') <= 0 && !nativeToggle)) throw new Error('TARGET_NOT_ACTIONABLE')
     if (scroll) { await this.transport.send('DOM.scrollIntoViewIfNeeded', { backendNodeId: entry.backendDOMNodeId }); abort(signal) }
     const box = boundedResponse(await this.transport.send('DOM.getBoxModel', { backendNodeId: entry.backendDOMNodeId })); abort(signal)
     const border = (box['model'] as Record<string, unknown> | undefined)?.['border']
