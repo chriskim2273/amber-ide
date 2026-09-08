@@ -984,6 +984,25 @@ exception is core rule 9); themes/settings beyond minimal.
   phone touch behavior and a user-facing installed-Pi prompt/toggle smoke;
   repository-wide rustfmt remains pre-existing drift.
 
+- [x] Final Pi attachment lifecycle repairs (2026-09-08) — bounded P2 follow-up
+  for the reviewed whole-feature scope (mobile Chat/Terminal toggle, bounded
+  uploads/image paste, subagent controls with read-only child details, tool
+  snapshots/drafts, and browser fit/mobile/rotation behavior). At the mounted
+  `PiPane`/`PiComposer` seam: picker, drop, and paste additions
+  are rejected while an upload is active, including same-turn events guarded by
+  the live operation controller; completed-upload cache keys are pruned when
+  files are removed or replaced, with no server-side artifact deletion. The
+  focused mounted regressions and cache unit test pass; the full app gate is
+  1199 passed / 1 skipped, typecheck and desktop/web builds pass. No Rust was
+  changed or rerun here; the last full Rust gate remains 906 passed / 2 ignored
+  with clippy clean. Evidence receipt:
+  `docs/superpowers/specs/2026-09-08-pi-chat-upgrades-verification.md`.
+  This is tested worktree state only: unmerged and not deployed, with no
+  production-complete claim. Private fixture limitations and inherited coarse
+  mobile, file-hash/image, semantic-socket-loss, and viewport evidence are
+  listed in the receipt; live provider/package, real-device, IME, macOS, and
+  production-state checks remain uncertified.
+
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**
   `std::io::Read` (dedicated thread); `take_writer()` is one-shot;

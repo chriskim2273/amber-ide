@@ -6,6 +6,16 @@ import { mergeBrowserRailTabs } from '../renderer/store'
 
 import { assembleSave as _asm, planLoad as _pl, parseWorkspaceFile as _parse, requireWorkspaceBrowserSnapshots, serializeWorkspaceFile as _ser } from './workspaceFile'
 
+describe('workspace browser viewport mode', () => {
+  it('defaults old browser entries to fit and round-trips fixed mode', () => {
+    const old = _parse(JSON.stringify({ version: 2, scope: 'one', workspaces: [{ tabs: [{ tab: 1, tree: null, panes: [], browser: { mode: 'browse', safeRestoreUrl: 'https://example.test/' } }] }] }))
+    expect(old.workspaces[0]!.tabs[0]!.browser?.viewportMode).toBe('fit')
+    const fixed = _parse(JSON.stringify({ version: 2, scope: 'one', workspaces: [{ tabs: [{ tab: 1, tree: null, panes: [], browser: { mode: 'browse', safeRestoreUrl: 'https://example.test/', viewportMode: 'fixed' } }] }] }))
+    expect(fixed.workspaces[0]!.tabs[0]!.browser?.viewportMode).toBe('fixed')
+    expect(JSON.parse(_ser(fixed)).workspaces[0].tabs[0].browser.viewportMode).toBe('fixed')
+  })
+})
+
 describe('workspace browser snapshot boundary', () => {
   it('aborts rather than writing a workspace with missing browser intent', () => {
     expect(() => requireWorkspaceBrowserSnapshots({ ok: false })).toThrow('browser snapshot unavailable')
@@ -104,7 +114,7 @@ describe('browser panes in .amberws', () => {
       { id: 'p1', kind: 'browser', cwd: '', ord: 1, scrollback: '', url: 'https://two.test/#token' },
     ] }] }] }))
     expect(doc.workspaces[0]!.tabs[0]!.browser!.safeRestoreUrl).toBe('https://one.test/')
-    expect(doc.workspaces[0]!.tabs[0]!.browserRecovery).toEqual([{ mode: 'browse', safeRestoreUrl: 'https://two.test/' }])
+    expect(doc.workspaces[0]!.tabs[0]!.browserRecovery).toEqual([{ mode: 'browse', viewportMode: 'fit', safeRestoreUrl: 'https://two.test/' }])
     const wire = _ser(doc)
     expect(wire).not.toContain('browserRecovery')
     expect(wire).not.toContain('sharedWithPi')

@@ -107,7 +107,7 @@ export function deriveTab(
     // guess.
     paneMeta[p.name] = {
       kind: p.kind, title: `${paneSlotPrefix(p.slot)}${lead} · ${suffix}`, cwd: p.cwd,
-      friendlyTitle: friendly, runState: p.runState,
+      alive: p.alive, friendlyTitle: friendly, runState: p.runState,
       rssKb: m?.rssKb, growing: m?.growing, claudeId: p.claudeId,
     }
   })

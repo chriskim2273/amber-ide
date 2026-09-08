@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { initialState, reduce, groupSessions, mergeBrowserRailTabs, mergeEditors, isAgentKind, paneDot, tabDot, hasActivity, shouldHintTerminalFocus, shouldResumeMemoryParked, parkedOverlayText, resourcePressureMessage, type PaneModel, type WorkspaceModel } from './store'
+import { initialState, reduce, groupSessions, mergeBrowserRailTabs, mergeEditors, isAgentKind, paneDot, tabDot, hasActivity, piChatAvailable, shouldHintTerminalFocus, shouldResumeMemoryParked, parkedOverlayText, resourcePressureMessage, type PaneModel, type WorkspaceModel } from './store'
 import type { SessionInfo } from '../shared/proto'
 
 describe('mergeBrowserRailTabs', () => {
@@ -60,6 +60,25 @@ describe('store', () => {
     expect(st.sessions).toHaveLength(2)
     st = reduce(st, { kind: 'SessionsChanged', added: [], removed: ['amber-1-1-0-a'] })
     expect(st.sessions.map((x) => x.name)).toEqual(['amber-1-1-1-b'])
+  })
+
+  it('uses authoritative Pi kind/liveness for both Chat affordances', () => {
+    expect(piChatAvailable({ kind: 'pi', alive: true })).toBe(true)
+    expect(piChatAvailable({ kind: 'shell', alive: true })).toBe(false)
+    expect(piChatAvailable({ kind: 'pi', alive: false })).toBe(false)
+    expect(piChatAvailable({ kind: 'pi', alive: true }, 1)).toBe(false)
+  })
+
+  it('clears a transient Exit marker only when that session is freshly added live', () => {
+    const name = 'amber-1-1-0-pi'
+    let st = reduce(initialState(), { kind: 'Sessions', sessions: [{ name, cwd: '/w', kind: 'pi', alive: true }] })
+    st = reduce(st, { kind: 'Exit', name, code: 1 })
+    expect(st.dead[name]).toBe(1)
+    st = reduce(st, { kind: 'SessionsChanged', added: [{ name: 'amber-1-1-1-other', cwd: '/w', kind: 'shell', alive: true }], removed: [] })
+    expect(st.dead[name]).toBe(1)
+    st = reduce(st, { kind: 'SessionsChanged', added: [{ name, cwd: '/w', kind: 'pi', alive: true }], removed: [] })
+    expect(st.dead[name]).toBeUndefined()
+    expect(groupSessions(st)[0]!.tabs[0]!.panes[0]!.kind).toBe('pi')
   })
   it('Exit marks dead; groupSessions surfaces the code', () => {
     let st = reduce(initialState(), { kind: 'Sessions', sessions: [s('amber-2-3-0-a')] })

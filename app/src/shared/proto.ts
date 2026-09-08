@@ -80,9 +80,36 @@ export interface ProviderUsage {
 }
 
 export type PiDelivery = 'now' | 'steer' | 'follow_up'
+
+// Keep these values aligned with amber-core::proto. They are exported so
+// browser/renderer upload code can reject a file before it allocates a large
+// base64 string, while the daemon remains the authoritative second check.
+export const PI_PROMPT_MAX_BYTES = 64 * 1024
+export const PI_REQUEST_ID_MAX_BYTES = 128
+export const PI_SUBAGENT_ID_MAX_BYTES = 256
+export const PI_SUBAGENT_INDEX_MAX = 500
+export const PI_ATTACHMENT_ID_MAX_BYTES = 128
+export const PI_FILENAME_MAX_CHARS = 255
+export const PI_MIME_TYPE_MAX_BYTES = 128
+export const PI_ATTACHMENT_MAX_BYTES = 16 * 1024 * 1024
+export const PI_ATTACHMENTS_PER_PROMPT = 8
+export const PI_PROMPT_ATTACHMENTS_MAX_BYTES = 32 * 1024 * 1024
+export const PI_PENDING_UPLOADS_MAX = 4
+export const PI_ARTIFACTS_MAX_BYTES = 256 * 1024 * 1024
+export const PI_UPLOAD_CHUNK_MAX_BYTES = 48 * 1024
+export const PI_UPLOAD_CHUNK_MAX_ENCODED_BYTES = Math.ceil(PI_UPLOAD_CHUNK_MAX_BYTES / 3) * 4
+
 export type PiCommand =
   | { kind: 'Snapshot' }
   | { kind: 'Prompt'; message: string; delivery: PiDelivery }
+  | { kind: 'PromptWithAttachments'; requestId: string; message: string; delivery: PiDelivery; attachments: string[] }
+  | { kind: 'UploadBegin'; requestId: string; filename: string; mimeType: string; size: number }
+  | { kind: 'UploadChunk'; requestId: string; attachmentId: string; offset: number; data: string }
+  | { kind: 'UploadFinish'; requestId: string; attachmentId: string }
+  | { kind: 'UploadCancel'; requestId: string; attachmentId: string }
+  | { kind: 'SubagentStatus'; requestId: string }
+  | { kind: 'SubagentTranscript'; requestId: string; runId: string; index?: number }
+  | { kind: 'SubagentControl'; requestId: string; action: 'stop' | 'steer' | 'interrupt' | 'resume'; runId: string; childId?: string; index?: number; message?: string }
   | { kind: 'Abort' }
   | { kind: 'SetThinkingLevel'; level: string }
 
@@ -306,24 +333,212 @@ function piCommandToJson(command: PiCommand): unknown {
     case 'Snapshot':
     case 'Abort': return command.kind
     case 'Prompt': return { Prompt: { message: command.message, delivery: command.delivery } }
+    case 'PromptWithAttachments': return {
+      PromptWithAttachments: {
+        requestId: command.requestId,
+        message: command.message,
+        delivery: command.delivery,
+        attachments: command.attachments,
+      },
+    }
+    case 'UploadBegin': return {
+      UploadBegin: {
+        requestId: command.requestId,
+        filename: command.filename,
+        mimeType: command.mimeType,
+        size: command.size,
+      },
+    }
+    case 'UploadChunk': return {
+      UploadChunk: {
+        requestId: command.requestId,
+        attachmentId: command.attachmentId,
+        offset: command.offset,
+        data: command.data,
+      },
+    }
+    case 'UploadFinish': return {
+      UploadFinish: { requestId: command.requestId, attachmentId: command.attachmentId },
+    }
+    case 'UploadCancel': return {
+      UploadCancel: { requestId: command.requestId, attachmentId: command.attachmentId },
+    }
+    case 'SubagentStatus': return { SubagentStatus: { requestId: command.requestId } }
+    case 'SubagentTranscript': return {
+      SubagentTranscript: {
+        requestId: command.requestId,
+        runId: command.runId,
+        ...(command.index === undefined ? {} : { index: command.index }),
+      },
+    }
+    case 'SubagentControl': return {
+      SubagentControl: {
+        requestId: command.requestId,
+        action: command.action,
+        runId: command.runId,
+        ...(command.childId === undefined ? {} : { childId: command.childId }),
+        ...(command.index === undefined ? {} : { index: command.index }),
+        ...(command.message === undefined ? {} : { message: command.message }),
+      },
+    }
     case 'SetThinkingLevel': return { SetThinkingLevel: { level: command.level } }
   }
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function piString(body: Record<string, unknown>, key: string): string | null {
+  return typeof body[key] === 'string' ? body[key] as string : null
+}
+
+function isPiControl(char: string): boolean {
+  const code = char.codePointAt(0)!
+  return code < 0x20 || (code >= 0x7f && code <= 0x9f)
+}
+
+function validPiRequestId(value: string): boolean {
+  return value.length > 0 && new TextEncoder().encode(value).length <= PI_REQUEST_ID_MAX_BYTES
+    && ![...value].some(isPiControl)
+}
+
+function validPiSubagentId(value: string): boolean {
+  return value.length > 0 && new TextEncoder().encode(value).length <= PI_SUBAGENT_ID_MAX_BYTES
+    && ![...value].some((char) => isPiControl(char) || /[\\/\s]/.test(char))
+}
+
+function validPiSubagentIndex(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && value <= PI_SUBAGENT_INDEX_MAX
+}
+
+function validPiAttachmentId(value: string): boolean {
+  return value.length > 0 && value.length <= PI_ATTACHMENT_ID_MAX_BYTES && /^[A-Za-z0-9_-]+$/.test(value)
+}
+
+function validPiFilename(value: string): boolean {
+  return value.length > 0 && [...value].length <= PI_FILENAME_MAX_CHARS
+    && ![...value].some((char) => isPiControl(char) || char === '/' || char === '\\')
+}
+
+function validPiMimeType(value: string): boolean {
+  return value.length > 0 && new TextEncoder().encode(value).length <= PI_MIME_TYPE_MAX_BYTES
+    && ![...value].some(isPiControl)
+}
+
+function validPiSize(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && value <= PI_ATTACHMENT_MAX_BYTES
+}
+
+function validCanonicalBase64(value: string): boolean {
+  if (!value || value.length > PI_UPLOAD_CHUNK_MAX_ENCODED_BYTES || value.length % 4 !== 0
+    || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) return false
+  const last = value.slice(-4)
+  const decode = (char: string): number => {
+    if (char >= 'A' && char <= 'Z') return char.charCodeAt(0) - 65
+    if (char >= 'a' && char <= 'z') return char.charCodeAt(0) - 71
+    if (char >= '0' && char <= '9') return char.charCodeAt(0) + 4
+    return char === '+' ? 62 : 63
+  }
+  if (last[2] === '=' && (decode(last[1]!) & 0x0f) !== 0) return false
+  if (last[3] === '=' && last[2] !== '=' && (decode(last[2]!) & 0x03) !== 0) return false
+  return true
+}
+
 function jsonToPiCommand(v: unknown): PiCommand | null {
   if (v === 'Snapshot' || v === 'Abort') return { kind: v }
-  if (!v || typeof v !== 'object') return null
-  const entry = Object.entries(v as Record<string, unknown>)[0]
+  if (!isRecord(v)) return null
+  const entries = Object.entries(v)
+  if (entries.length !== 1) return null
+  const entry = entries[0]
   if (!entry) return null
   const [kind, rawBody] = entry
-  const body = rawBody as Record<string, unknown>
+  if (!isRecord(rawBody)) return null
+  const body = rawBody
   if (kind === 'Prompt') {
+    const message = piString(body, 'message')
     const delivery = body['delivery']
-    if (typeof body['message'] !== 'string' || (delivery !== 'now' && delivery !== 'steer' && delivery !== 'follow_up')) return null
-    return { kind: 'Prompt', message: body['message'], delivery }
+    if (message === null || message.trim().length === 0 || (delivery !== 'now' && delivery !== 'steer' && delivery !== 'follow_up')
+      || new TextEncoder().encode(message).length > PI_PROMPT_MAX_BYTES) return null
+    return { kind: 'Prompt', message, delivery }
   }
-  if (kind === 'SetThinkingLevel' && typeof body['level'] === 'string') {
-    return { kind: 'SetThinkingLevel', level: body['level'] }
+  if (kind === 'PromptWithAttachments') {
+    const requestId = piString(body, 'requestId')
+    const message = piString(body, 'message')
+    const delivery = body['delivery']
+    const rawAttachments = body['attachments']
+    if (requestId === null || !validPiRequestId(requestId) || message === null
+      || new TextEncoder().encode(message).length > PI_PROMPT_MAX_BYTES
+      || (delivery !== 'now' && delivery !== 'steer' && delivery !== 'follow_up')
+      || !Array.isArray(rawAttachments) || rawAttachments.length > PI_ATTACHMENTS_PER_PROMPT
+      || !rawAttachments.every((entry) => typeof entry === 'string' && validPiAttachmentId(entry))
+      || new Set(rawAttachments).size !== rawAttachments.length
+      || (message.trim().length === 0 && rawAttachments.length === 0)) return null
+    return { kind: 'PromptWithAttachments', requestId, message, delivery, attachments: [...rawAttachments] }
+  }
+  if (kind === 'UploadBegin') {
+    const requestId = piString(body, 'requestId')
+    const filename = piString(body, 'filename')
+    const mimeType = piString(body, 'mimeType')
+    if (requestId === null || !validPiRequestId(requestId) || filename === null || !validPiFilename(filename)
+      || mimeType === null || !validPiMimeType(mimeType) || !validPiSize(body['size'])) return null
+    return { kind: 'UploadBegin', requestId, filename, mimeType, size: body['size'] }
+  }
+  if (kind === 'UploadChunk') {
+    const requestId = piString(body, 'requestId')
+    const attachmentId = piString(body, 'attachmentId')
+    const data = piString(body, 'data')
+    if (requestId === null || !validPiRequestId(requestId) || attachmentId === null || !validPiAttachmentId(attachmentId)
+      || !validPiSize(body['offset']) || data === null || !validCanonicalBase64(data)) return null
+    return { kind: 'UploadChunk', requestId, attachmentId, offset: body['offset'], data }
+  }
+  if (kind === 'UploadFinish' || kind === 'UploadCancel') {
+    const requestId = piString(body, 'requestId')
+    const attachmentId = piString(body, 'attachmentId')
+    if (requestId === null || !validPiRequestId(requestId) || attachmentId === null || !validPiAttachmentId(attachmentId)) return null
+    return kind === 'UploadFinish'
+      ? { kind: 'UploadFinish', requestId, attachmentId }
+      : { kind: 'UploadCancel', requestId, attachmentId }
+  }
+  if (kind === 'SubagentStatus') {
+    const requestId = piString(body, 'requestId')
+    if (requestId === null || !validPiRequestId(requestId)) return null
+    return { kind: 'SubagentStatus', requestId }
+  }
+  if (kind === 'SubagentTranscript') {
+    const requestId = piString(body, 'requestId')
+    const runId = piString(body, 'runId')
+    const rawIndex = body['index']
+    if (requestId === null || !validPiRequestId(requestId) || runId === null || !validPiSubagentId(runId)
+      || (rawIndex !== undefined && !validPiSubagentIndex(rawIndex))) return null
+    return { kind: 'SubagentTranscript', requestId, runId, ...(rawIndex === undefined ? {} : { index: rawIndex }) }
+  }
+  if (kind === 'SubagentControl') {
+    const requestId = piString(body, 'requestId')
+    const action = body['action']
+    const runId = piString(body, 'runId')
+    const childId = body['childId']
+    const rawIndex = body['index']
+    const message = body['message']
+    if (requestId === null || !validPiRequestId(requestId) || !['stop', 'steer', 'interrupt', 'resume'].includes(action as string)
+      || runId === null || !validPiSubagentId(runId)
+      || (childId !== undefined && (typeof childId !== 'string' || !validPiSubagentId(childId)))
+      || (rawIndex !== undefined && !validPiSubagentIndex(rawIndex))
+      || (message !== undefined && (typeof message !== 'string' || new TextEncoder().encode(message).length > PI_PROMPT_MAX_BYTES))) return null
+    if (action !== 'stop' && action !== 'interrupt' && (typeof message !== 'string' || message.trim().length === 0)) return null
+    if (childId !== undefined || rawIndex !== undefined) return null
+    if ((action === 'stop' || action === 'interrupt') && message !== undefined) return null
+    return {
+      kind: 'SubagentControl', requestId, action: action as 'stop' | 'steer' | 'interrupt' | 'resume', runId,
+      ...(childId === undefined ? {} : { childId }), ...(rawIndex === undefined ? {} : { index: rawIndex }),
+      ...(message === undefined ? {} : { message }),
+    }
+  }
+  if (kind === 'SetThinkingLevel') {
+    const level = piString(body, 'level')
+    if (level !== null && ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(level)) {
+      return { kind: 'SetThinkingLevel', level }
+    }
   }
   return null
 }

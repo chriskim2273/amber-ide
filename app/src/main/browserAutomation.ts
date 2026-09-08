@@ -39,6 +39,8 @@ export interface BrowserDebuggerTransport {
 export interface BrowserAutomationLease { browserId: string; pageIncarnation: string; generation: number; controller?: string; documentEpoch?: number }
 export interface BrowserAutomationOptions { ringItems?: number; ringBytes?: number }
 export interface BrowserAutomationControls {
+  /** Native WebContentsView debugger commands are unsafe before its first real document commits. */
+  isDebuggerReady?: () => boolean
   deviceScaleFactor?: () => number
   reload?(ignoreCache: boolean): boolean | void
   history?(direction: 'back' | 'forward'): boolean | void
@@ -183,19 +185,34 @@ export class BrowserAutomation {
     if (this.attachedByUs && this.transport.isAttached()) { try { this.transport.detach?.() } catch { /* page teardown is best-effort */ } }
   }
   ensureAttached(): Promise<void> {
+    if (this.controls.isDebuggerReady && !this.controls.isDebuggerReady()) return Promise.reject(new Error('PAGE_NOT_READY'))
     if (this.setupPromise) return this.setupPromise
     const setup = this.attachAndEnable()
     this.setupPromise = setup
     void setup.then(() => { if (this.setupPromise === setup) this.setupPromise = null }, () => { if (this.setupPromise === setup) this.setupPromise = null })
     return setup
   }
+  private assertAlive(): void {
+    if (!this.disposed) return
+    if (this.attachedByUs && this.transport.isAttached()) { try { this.transport.detach?.() } catch { /* page teardown is best-effort */ } }
+    throw new Error('PAGE_CLOSED')
+  }
   private async attachAndEnable(): Promise<void> {
-    if (this.disposed) throw new Error('PAGE_CLOSED')
+    this.assertAlive()
     let newlyAttached = false
-    if (!this.transport.isAttached()) { await this.transport.attach('1.3'); if (this.disposed) { this.transport.detach?.(); throw new Error('PAGE_CLOSED') }; this.attachedByUs = true; newlyAttached = true; this.domainsEnabled = false }
-    else if (!this.attachedByUs) throw new Error('UNSUPPORTED_PAGE')
+    if (!this.transport.isAttached()) {
+      await this.transport.attach('1.3')
+      this.attachedByUs = true
+      newlyAttached = true
+      this.domainsEnabled = false
+      this.assertAlive()
+    } else if (!this.attachedByUs) throw new Error('UNSUPPORTED_PAGE')
+    this.assertAlive()
     if (!this.listenerInstalled) { this.listenerInstalled = true; this.transport.onMessage((method, params) => this.onMessage(method, params)) }
-    if (newlyAttached || !this.domainsEnabled) { for (const method of ENABLE_METHODS) await this.transport.send(method); this.domainsEnabled = true }
+    if (newlyAttached || !this.domainsEnabled) {
+      for (const method of ENABLE_METHODS) { this.assertAlive(); await this.transport.send(method); this.assertAlive() }
+      this.domainsEnabled = true
+    }
   }
   private scheduleDiagnostics(): void {
     if (!this.controls.onDiagnostics || this.diagnosticsTimer || this.disposed) return
@@ -769,5 +786,24 @@ export class BrowserAutomation {
   }
   reload(ignoreCache: boolean): { accepted: boolean } { this.invalidate(); return { accepted: this.controls.reload?.(ignoreCache) !== false } }
   history(direction: 'back' | 'forward'): { accepted: boolean } { this.invalidate(); return { accepted: this.controls.history?.(direction) !== false } }
-  async setViewport(viewport: BrowserViewport, signal: AbortSignal): Promise<{ viewport: BrowserViewport }> { const size = parseBrowserViewport(viewport); if (!size) throw new Error('INVALID_REQUEST'); abort(signal); await this.ensureAttached(); const scale = viewport.deviceScaleFactor ?? 1; this.emulatedScaleFactor = Math.max(this.emulatedScaleFactor ?? this.controls.deviceScaleFactor?.() ?? 1, scale); await this.transport.send('Emulation.setDeviceMetricsOverride', { width: size.width, height: size.height, deviceScaleFactor: scale, mobile: viewport.mobile ?? false, screenWidth: size.width, screenHeight: size.height }); this.emulatedScaleFactor = scale; abort(signal); this.invalidate(); return { viewport: { ...viewport, ...size } } }
+  async setViewport(viewport: BrowserViewport, signal: AbortSignal): Promise<{ viewport: BrowserViewport }> { const size = parseBrowserViewport(viewport); if (!size) throw new Error('INVALID_REQUEST'); abort(signal); await this.ensureAttached(); abort(signal); const scale = viewport.deviceScaleFactor ?? 1; await this.transport.send('Emulation.setDeviceMetricsOverride', { width: size.width, height: size.height, deviceScaleFactor: scale, mobile: viewport.mobile ?? false, screenWidth: size.width, screenHeight: size.height }); this.emulatedScaleFactor = scale; this.invalidate(); return { viewport: { ...viewport, ...size } } }
+  /** Return to the native WebContentsView content bounds without changing the
+   * persisted fixed viewport. Clearing emulation also invalidates every
+   * screenshot coordinate lease captured under the old CSS viewport. */
+  async clearViewport(signal: AbortSignal): Promise<void> {
+    abort(signal)
+    if (this.controls.isDebuggerReady && !this.controls.isDebuggerReady() && !this.transport.isAttached()) {
+      this.emulatedScaleFactor = undefined
+      this.measuredViewport = undefined
+      this.viewportRevision += 1
+      this.invalidate()
+      return
+    }
+    await this.ensureAttached(); abort(signal)
+    await this.transport.send('Emulation.clearDeviceMetricsOverride')
+    this.emulatedScaleFactor = undefined
+    this.measuredViewport = undefined
+    this.viewportRevision += 1
+    this.invalidate()
+  }
 }

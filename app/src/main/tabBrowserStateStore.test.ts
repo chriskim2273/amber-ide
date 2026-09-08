@@ -23,7 +23,7 @@ describe('TabBrowserStateStore', () => {
 
   it('round-trips the minimum viewport through disk, process restart, and thaw', async () => {
     const id = 'browser-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' as const, store = new TabBrowserStateStore(dir), state = emptyBrowserState(1)
-    state.records[id] = { id, profileId: 'global', mode: 'browse', safeRestoreUrl: 'about:blank', title: '', viewport: { width: 200, height: 200 }, lifecycle: 'live', stateRevision: 1, lastUsedAt: 1, lastFocusedAt: 1 }
+    state.records[id] = { id, profileId: 'global', mode: 'browse', safeRestoreUrl: 'about:blank', title: '', viewport: { width: 200, height: 200 }, viewportMode: 'fixed', lifecycle: 'live', stateRevision: 1, lastUsedAt: 1, lastFocusedAt: 1 }
     await store.save(state)
     const applied: Array<{ width: number; height: number }> = []
     const pages: TabBrowserPageFactory = { create: () => ({ loadURL: async () => {}, show: () => {}, hide: () => {}, stop: () => {}, destroy: () => {}, automation: { setViewport: async (viewport: { width: number; height: number }) => { applied.push(viewport); return { viewport } } } as unknown as BrowserAutomation }) }

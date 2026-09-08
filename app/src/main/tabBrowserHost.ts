@@ -4,7 +4,7 @@ import { createBrowserId, isOpaqueBrowserId, safeRestoreUrl, type BrowserId } fr
 import { BROWSER_RECOVERY_MAX, isRecoveryId, type RecoveryId } from '../shared/tabBrowserState'
 import type { WsBrowser } from '../shared/workspaceFile'
 import type { BrowserRecord, BrowserStateFile } from '../shared/tabBrowserState'
-import { parseBrowserViewport } from '../shared/browserViewport'
+import { parseBrowserViewport, type BrowserViewportMode } from '../shared/browserViewport'
 import type { BrowserAutomation, BrowserBinaryAttachment } from './browserAutomation'
 import { isPointerInteraction, type BrowserInteraction, type BrowserToolAction } from './browserToolProtocol'
 import { classifyInteraction, type InteractionClassification, type InteractionTargetMetadata } from './browserApproval'
@@ -51,7 +51,8 @@ export interface TabBrowserPage {
 export interface TabBrowserPageFactory {
   create(id: BrowserId, onUserInput: () => void, onPageEvent: (event: TabBrowserPageEvent) => void, allowNavigation: (url: string) => boolean): TabBrowserPage
 }
-export interface BrowserRuntimeStatus extends BrowserRecord {
+export interface BrowserRuntimeStatus extends Omit<BrowserRecord, 'viewportMode'> {
+  viewportMode: BrowserViewportMode
   pageIncarnation: string; generation: number; loading: boolean; capacityWaiting?: boolean
   currentUrl: string; visible: boolean; focused: boolean; restoredAfterFreeze: boolean
   diagnostics: { consoleIssues: number; networkFailures: number }
@@ -81,6 +82,10 @@ export class TabBrowserHost {
     // A persisted `live` bit cannot mean a renderer survived process death.
     // Restore records frozen and recreate a page only on explicit activation.
     for (const record of Object.values(this.state.records)) if (record) {
+      // State files written before viewport modes existed have dimensions but
+      // those dimensions never meant fixed emulation. Migrate them to the
+      // presentation-only fit mode instead of inferring a fixed mode.
+      record.viewportMode = record.viewportMode === 'fixed' ? 'fixed' : 'fit'
       record.lifecycle = 'frozen'
       if (record.mode === 'preview' && record.safeRestoreUrl !== 'about:blank' && !navigationPolicyAllows('preview', record.previewOrigins ?? [], record.safeRestoreUrl)) record.previewOrigins = selectPreviewOrigin(record.previewOrigins ?? [], record.safeRestoreUrl)
     }
@@ -182,7 +187,7 @@ export class TabBrowserHost {
     const at = this.now()
     this.state.records[id] = {
       id, profileId: 'global', mode: 'browse', safeRestoreUrl: 'about:blank', title: '',
-      viewport: { width: 1280, height: 800 }, lifecycle: 'live', stateRevision: 1,
+      viewport: { width: 1280, height: 800 }, viewportMode: 'fit', lifecycle: 'live', stateRevision: 1,
       lastUsedAt: at, lastFocusedAt: options.visible ? at : 0,
     }
     let activation: { freeze?: string }
@@ -220,7 +225,7 @@ export class TabBrowserHost {
   status(id: string): BrowserRuntimeStatus {
     const record = this.record(id)
     const runtime = this.runtimes.get(record.id)
-    return { ...record, pageIncarnation: runtime?.incarnation ?? '', generation: runtime?.generation ?? this.generationFloor.get(record.id) ?? 0, loading: runtime?.loading ?? false,
+    return { ...record, viewportMode: record.viewportMode === 'fixed' ? 'fixed' : 'fit', pageIncarnation: runtime?.incarnation ?? '', generation: runtime?.generation ?? this.generationFloor.get(record.id) ?? 0, loading: runtime?.loading ?? false,
       currentUrl: runtime?.currentUrl ?? record.safeRestoreUrl, visible: runtime?.visible ?? false, focused: runtime?.focused ?? false,
       restoredAfterFreeze: runtime?.restoredAfterFreeze ?? false, diagnostics: runtime?.diagnostics ?? { consoleIssues: 0, networkFailures: 0 },
       ...(this.capacityWaiting.has(record.id) ? { capacityWaiting: true } : {}) }
@@ -259,6 +264,30 @@ export class TabBrowserHost {
   setBounds(id: string, bounds: { x: number; y: number; width: number; height: number }): void {
     if (![bounds.x, bounds.y, bounds.width, bounds.height].every(Number.isFinite) || bounds.width < 1 || bounds.height < 1) throw new Error('INVALID_BOUNDS')
     const record = this.record(id); this.runtimes.get(record.id)?.page.setBounds?.(bounds)
+  }
+
+  /** Clear fixed CDP emulation and let the native page follow its WebContentsView.
+   * The fit command carries the same page lease as automation, so a resize from
+   * an old rail cannot overwrite a newer fixed/fit choice. */
+  async fitViewport(id: string, incarnation: string, generation: number, signal: AbortSignal): Promise<BrowserRuntimeStatus> {
+    const record = this.record(id), runtime = this.runtimes.get(record.id)
+    if (!runtime || runtime.incarnation !== incarnation || runtime.generation !== generation) throw new Error('STALE_GENERATION')
+    if (signal.aborted) throw new Error('ACTION_CANCELLED')
+    const pending = this.beginPending(runtime)
+    this.capacity.protectFor(record.id, 'operation', true)
+    try {
+      await runtime.page.automation?.clearViewport?.(signal)
+      if (this.runtimes.get(record.id) !== runtime || runtime.incarnation !== incarnation || runtime.generation !== generation) throw new Error('STALE_GENERATION')
+      runtime.generation += 1
+      record.viewportMode = 'fit'
+      record.stateRevision += 1
+      const status = this.status(record.id)
+      this.onStateChange(); this.emitRuntime(record.id)
+      return status
+    } finally {
+      this.endPending(runtime, pending)
+      this.capacity.protectFor(record.id, 'operation', false)
+    }
   }
 
   private beginPending(runtime: Runtime): symbol {
@@ -403,9 +432,12 @@ export class TabBrowserHost {
       } else {
         const viewport = parseBrowserViewport(action.viewport); if (!viewport) throw new Error('INVALID_REQUEST')
         result = await automation.setViewport({ ...action.viewport, ...viewport }, signal)
-        if (signal.aborted) throw new Error('ACTION_CANCELLED')
         if (this.runtimes.get(record.id) !== runtime || runtime.incarnation !== action.pageIncarnation || runtime.generation !== action.expectedGeneration) throw new Error('STALE_GENERATION')
-        runtime.generation += 1; generationDelta = 1; record.viewport = viewport; record.stateRevision += 1
+        runtime.generation += 1; generationDelta = 1
+        // Explicit user/agent emulation is the fixed mode. A fit resize uses
+        // fitViewport instead and therefore never overwrites these canonical
+        // dimensions.
+        record.viewportMode = 'fixed'; record.viewport = viewport; record.stateRevision += 1
       }
     } catch (error) {
       if (action.type === 'interact' && (interactionDispatched || adapterDispatched(error))) throw this.noRollbackFailure(record.id, runtime, error instanceof BrowserAutomationError ? error.diagnostics : undefined)
@@ -484,7 +516,11 @@ export class TabBrowserHost {
       runtime = this.makeRuntime(record.id, true)
       record.lifecycle = 'live'; record.stateRevision += 1
       if (!this.navigationAllowed(record.id, record.safeRestoreUrl)) throw new Error('NAVIGATION_BLOCKED')
-      if (record.safeRestoreUrl !== 'about:blank') {
+      // A persisted fixed blank page must be explicitly loaded again: the
+      // freshly-created WebContentsView's implicit about:blank is not a safe
+      // debugger target in Electron 43. Fit blank pages need no CDP restore.
+      const restoreBlank = record.safeRestoreUrl === 'about:blank' && record.viewportMode === 'fixed'
+      if (record.safeRestoreUrl !== 'about:blank' || restoreBlank) {
         const pending = this.beginPending(runtime)
         let load: Promise<void>
         try { load = runtime.page.loadURL(record.safeRestoreUrl, signal) } catch (error) { load = Promise.reject(error) }
@@ -492,8 +528,10 @@ export class TabBrowserHost {
         await abortable(load, signal ?? new AbortController().signal)
       }
       if (runtime.page.automation) {
-        const viewport = Promise.resolve(runtime.page.automation.setViewport({ width: record.viewport.width, height: record.viewport.height }, signal ?? new AbortController().signal))
-        await abortable(viewport, signal ?? new AbortController().signal)
+        const restore = record.viewportMode === 'fixed'
+          ? runtime.page.automation.setViewport({ width: record.viewport.width, height: record.viewport.height }, signal ?? new AbortController().signal)
+          : runtime.page.automation.clearViewport?.(signal ?? new AbortController().signal)
+        if (restore) await abortable(Promise.resolve(restore), signal ?? new AbortController().signal)
       }
       delete record.restoreError; this.onStateChange(); this.emitRuntime(record.id)
       return this.status(record.id)
@@ -539,7 +577,7 @@ export class TabBrowserHost {
 
   attachRecovery(recoveryId: RecoveryId, id: BrowserId): BrowserRuntimeStatus {
     const index = this.recoveryIndex(recoveryId), item = this.state.migrationRecovery[index]!
-    const status = this.importFrozen(id, { mode: 'browse', safeRestoreUrl: item.safeRestoreUrl })
+    const status = this.importFrozen(id, { mode: 'browse', safeRestoreUrl: item.safeRestoreUrl, viewportMode: 'fit' })
     this.state.migrationRecovery.splice(index, 1); this.onStateChange()
     return status
   }
@@ -548,11 +586,13 @@ export class TabBrowserHost {
   syncCommittedBrowser(recoveryId: RecoveryId, committed: BrowserRecord): BrowserRuntimeStatus {
     if (!isOpaqueBrowserId(committed.id)) throw new Error('BROWSER_ID_COLLISION')
     const current = this.state.records[committed.id]
+    const committedMode = committed.viewportMode === 'fixed' ? 'fixed' : 'fit'
     if (current && (current.profileId !== committed.profileId || current.mode !== committed.mode || current.safeRestoreUrl !== committed.safeRestoreUrl
-      || current.viewport.width !== committed.viewport.width || current.viewport.height !== committed.viewport.height)) throw new Error('BROWSER_ID_COLLISION')
+      || current.viewport.width !== committed.viewport.width || current.viewport.height !== committed.viewport.height
+      || (current.viewportMode === 'fixed' ? 'fixed' : 'fit') !== committedMode)) throw new Error('BROWSER_ID_COLLISION')
     let changed = false
     if (!current) {
-      const record = structuredClone(committed); record.lifecycle = 'frozen'
+      const record = structuredClone(committed); record.viewportMode = committedMode; record.lifecycle = 'frozen'
       this.state.records[record.id] = record; changed = true
     }
     const recoveryIndex = this.state.migrationRecovery.findIndex((item) => item.id === recoveryId)
@@ -582,7 +622,7 @@ export class TabBrowserHost {
     const previewOrigins = browser.mode === 'preview' && restoreUrl !== 'about:blank' && !navigationPolicyAllows('preview', [], restoreUrl) ? selectPreviewOrigin([], restoreUrl) : undefined
     this.state.records[id] = {
       id, profileId: 'global', mode: browser.mode, safeRestoreUrl: restoreUrl, title: '',
-      viewport, ...(previewOrigins ? { previewOrigins } : {}), lifecycle: 'frozen', stateRevision: 1,
+      viewport, viewportMode: browser.viewportMode === 'fixed' ? 'fixed' : 'fit', ...(previewOrigins ? { previewOrigins } : {}), lifecycle: 'frozen', stateRevision: 1,
       lastUsedAt: at, lastFocusedAt: 0,
     }
     this.onStateChange()
@@ -610,11 +650,11 @@ export class TabBrowserHost {
     for (const id of [...this.runtimes.keys()]) this.freeze(id)
   }
 
-  workspaceSnapshot(): Record<string, { mode: 'preview' | 'browse'; safeRestoreUrl: string; viewport: { width: number; height: number } }> {
-    const out: Record<string, { mode: 'preview' | 'browse'; safeRestoreUrl: string; viewport: { width: number; height: number } }> = {}
+  workspaceSnapshot(): Record<string, { mode: 'preview' | 'browse'; viewportMode: BrowserViewportMode; safeRestoreUrl: string; viewport: { width: number; height: number } }> {
+    const out: Record<string, { mode: 'preview' | 'browse'; viewportMode: BrowserViewportMode; safeRestoreUrl: string; viewport: { width: number; height: number } }> = {}
     for (const record of Object.values(this.state.records)) {
       if (!record) continue
-      out[record.id] = { mode: record.mode, safeRestoreUrl: record.safeRestoreUrl, viewport: { ...record.viewport } }
+      out[record.id] = { mode: record.mode, viewportMode: record.viewportMode === 'fixed' ? 'fixed' : 'fit', safeRestoreUrl: record.safeRestoreUrl, viewport: { ...record.viewport } }
     }
     return out
   }

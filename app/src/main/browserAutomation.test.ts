@@ -479,6 +479,77 @@ describe('browser automation', () => {
     expect(JSON.stringify(network)).not.toMatch(/user:pass|token=|Authorization|never/)
   })
 
+  it('does not acknowledge a fixed viewport before native readiness and keeps explicit blank pages automatable', async () => {
+    const transport = new FakeDebugger(); let ready = false
+    const automation = new BrowserAutomation(transport, () => 'about:blank', () => false, {}, { isDebuggerReady: () => ready })
+    await expect(automation.ensureAttached()).rejects.toThrow('PAGE_NOT_READY')
+    expect(transport.attachCalls).toBe(0)
+    await expect(automation.setViewport({ width: 390, height: 844 }, new AbortController().signal)).rejects.toThrow('PAGE_NOT_READY')
+    expect(transport.attachCalls).toBe(0)
+    expect(transport.calls).not.toContain('Emulation.setDeviceMetricsOverride')
+    ready = true
+    await Promise.all([automation.ensureAttached(), automation.ensureAttached()])
+    expect(transport.attachCalls).toBe(1)
+    expect(transport.listeners).toHaveLength(1)
+    await automation.setViewport({ width: 390, height: 844 }, new AbortController().signal)
+    expect(transport.calls).toContain('Emulation.setDeviceMetricsOverride')
+    await expect(automation.snapshot(lease, { maxDepth: 20, maxNodes: 20, maxBytes: 4096 }, new AbortController().signal)).resolves.toMatchObject({ url: 'about:blank' })
+    await expect(automation.screenshot(lease, undefined, false, new AbortController().signal)).resolves.toMatchObject({ mediaType: 'image/png' })
+  })
+
+  it('retries a failed delayed debugger setup without duplicating listeners', async () => {
+    class DelayedFailureDebugger extends FakeDebugger {
+      override async attach(): Promise<void> {
+        this.attachCalls += 1
+        if (this.attachCalls === 1) throw new Error('page torn down')
+        this.attached = true
+      }
+    }
+    const transport = new DelayedFailureDebugger()
+    const automation = new BrowserAutomation(transport, () => 'http://fixture.test/', () => false)
+    await expect(automation.ensureAttached()).rejects.toThrow('page torn down')
+    await automation.ensureAttached()
+    expect(transport.attachCalls).toBe(2)
+    expect(transport.listeners).toHaveLength(1)
+  })
+
+  it('detaches a debugger that finishes attaching after page teardown', async () => {
+    class PendingDebugger extends FakeDebugger {
+      release!: () => void
+      override async attach(): Promise<void> {
+        this.attachCalls += 1
+        await new Promise<void>((resolve) => { this.release = resolve })
+        this.attached = true
+      }
+    }
+    const transport = new PendingDebugger(), automation = new BrowserAutomation(transport, () => 'https://fixture.test/', () => false)
+    const pending = automation.ensureAttached()
+    await vi.waitFor(() => expect(transport.release).toBeTypeOf('function'))
+    automation.dispose()
+    transport.release()
+    await expect(pending).rejects.toThrow('PAGE_CLOSED')
+    expect(transport.attached).toBe(false)
+    expect(transport.listeners).toHaveLength(0)
+  })
+
+  it('does not send fixed metrics after teardown during delayed debugger enable', async () => {
+    class DelayedEnableDebugger extends FakeDebugger {
+      release!: () => void
+      override async send(method: string): Promise<Record<string, unknown>> {
+        this.calls.push(method)
+        if (method === 'Network.enable') await new Promise<void>((resolve) => { this.release = resolve })
+        return {}
+      }
+    }
+    const transport = new DelayedEnableDebugger(), automation = new BrowserAutomation(transport, () => 'https://fixture.test/', () => false)
+    const pending = automation.setViewport({ width: 390, height: 844 }, new AbortController().signal)
+    await vi.waitFor(() => expect(transport.release).toBeTypeOf('function'))
+    automation.dispose()
+    transport.release()
+    await expect(pending).rejects.toThrow('PAGE_CLOSED')
+    expect(transport.calls).not.toContain('Emulation.setDeviceMetricsOverride')
+  })
+
   it('coalesces concurrent debugger setup onto one target-scoped attachment', async () => {
     const transport = new FakeDebugger()
     const automation = new BrowserAutomation(transport, () => 'about:blank', () => false)
@@ -517,6 +588,30 @@ describe('browser automation', () => {
     expect(dialog).toHaveBeenCalledWith({ type: 'confirm', message: expect.not.stringContaining('secret') })
     expect(handled).toEqual({ accept: true, promptText: 'bounded response' })
     expect((dialog.mock.calls[0]?.[0] as { message: string }).message.length).toBeLessThanOrEqual(1024)
+  })
+
+  it('clears fixed viewport emulation, resets DPR tracking, and drops screenshot leases', async () => {
+    class WideViewportDebugger extends FakeDebugger {
+      screenshotParams: Array<Record<string, unknown>> = []
+      override async send(method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>> {
+        if (method === 'Page.getLayoutMetrics') return { cssContentSize: { x: 0, y: 0, width: 2200, height: 600 }, cssVisualViewport: { clientWidth: 2200, clientHeight: 600 } }
+        if (method === 'Page.captureScreenshot') this.screenshotParams.push(params ?? {})
+        return super.send(method, params)
+      }
+    }
+    const transport = new WideViewportDebugger()
+    const automation = new BrowserAutomation(transport, () => 'about:blank', () => false)
+    await automation.setViewport({ width: 390, height: 844, deviceScaleFactor: 2 }, new AbortController().signal)
+    const fixedScreenshot = await automation.screenshot(lease, undefined, false, new AbortController().signal)
+    if (!('observation' in fixedScreenshot) || !fixedScreenshot.observation) throw new Error('test screenshot observation missing')
+    const fixedScale = ((transport.screenshotParams.at(-1)?.['clip'] as { scale: number }).scale)
+    await automation.clearViewport(new AbortController().signal)
+    await expect(automation.prepareInteraction(lease, { kind: 'mouseMove', screenshotId: fixedScreenshot.observation.screenshotId, x: 1, y: 1 }, new AbortController().signal)).rejects.toThrow('STALE_GENERATION')
+    await automation.screenshot(lease, undefined, false, new AbortController().signal)
+    const fitScale = ((transport.screenshotParams.at(-1)?.['clip'] as { scale: number }).scale)
+    expect(fitScale).toBeGreaterThan(fixedScale)
+    expect(transport.calls).toContain('Emulation.setDeviceMetricsOverride')
+    expect(transport.calls).toContain('Emulation.clearDeviceMetricsOverride')
   })
 
   it('uses only a fixed allowlist of debugger methods and supports cancellation', async () => {

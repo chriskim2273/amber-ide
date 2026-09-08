@@ -236,6 +236,31 @@ describe('PaneLink', () => {
     expect(sockets[1]!.sent).toEqual([JSON.stringify({ t: 'open', name: 's1' })])
   })
 
+  it('reports semantic transport loss immediately and drops commands until the replacement socket opens', () => {
+    vi.useFakeTimers()
+    let calls = 0
+    const sockets = [new FakeSocket(), new FakeSocket()]
+    const port = new FakePort()
+    new PiPaneLink('pi', () => sockets[calls++] as FakeSocket, port)
+    sockets[0]!.open()
+    port.posted.length = 0
+
+    sockets[0]!.close()
+    expect(port.posted).toEqual([{ msg: { kind: 'PiBridgeStatus', name: 'pi', available: false } }])
+    port.fromRenderer({ command: { kind: 'Prompt', message: 'must not queue', delivery: 'now' } })
+    expect(sockets[0]!.sent).toEqual([JSON.stringify({ t: 'piOpen', name: 'pi' })])
+
+    vi.advanceTimersByTime(1000)
+    sockets[1]!.open()
+    expect(sockets[1]!.sent).toEqual([JSON.stringify({ t: 'piOpen', name: 'pi' })])
+    sockets[1]!.emit(JSON.stringify({ t: 'piStatus', name: 'pi', available: true }))
+    sockets[0]!.emit(JSON.stringify({ t: 'piEvent', name: 'pi', seq: 99, event: { kind: 'stale' } }))
+    expect(port.posted).toEqual([
+      { msg: { kind: 'PiBridgeStatus', name: 'pi', available: false } },
+      { msg: { kind: 'PiBridgeStatus', name: 'pi', available: true } },
+    ])
+  })
+
   it('re-opening a session closes the socket+port it supersedes (via createAmber\'s openPane guard)', () => {
     // index 0 is consumed by createAmber's own ControlLink construction.
     const sockets = [new FakeSocket(), new FakeSocket(), new FakeSocket()]
@@ -284,9 +309,25 @@ describe('PiPaneLink', () => {
     }])
 
     port.fromRenderer({ command: { kind: 'Prompt', message: 'hello', delivery: 'steer' } })
+    port.fromRenderer({ command: { kind: 'PromptWithAttachments', requestId: 'prompt-1', message: '', delivery: 'now', attachments: ['att-1'] } })
+    port.fromRenderer({ command: { kind: 'UploadBegin', requestId: 'begin-1', filename: 'notes.bin', mimeType: 'application/octet-stream', size: 3 } })
+    port.fromRenderer({ command: { kind: 'UploadChunk', requestId: 'chunk-1', attachmentId: 'att-1', offset: 0, data: 'YWJj' } })
+    port.fromRenderer({ command: { kind: 'UploadFinish', requestId: 'finish-1', attachmentId: 'att-1' } })
+    port.fromRenderer({ command: { kind: 'UploadCancel', requestId: 'cancel-1', attachmentId: 'att-1' } })
+    port.fromRenderer({ command: { kind: 'SubagentStatus', requestId: 'status-1' } })
+    port.fromRenderer({ command: { kind: 'SubagentTranscript', requestId: 'transcript-1', runId: 'run-1', index: 2 } })
+    port.fromRenderer({ command: { kind: 'SubagentControl', requestId: 'control-1', action: 'steer', runId: 'run-1', message: 'continue' } })
     port.fromRenderer({ command: { kind: 'Abort' } })
     expect(socket.sent.slice(1)).toEqual([
       JSON.stringify({ t: 'piPrompt', name: 'pi', message: 'hello', delivery: 'steer' }),
+      JSON.stringify({ t: 'piPromptWithAttachments', name: 'pi', requestId: 'prompt-1', message: '', delivery: 'now', attachments: ['att-1'] }),
+      JSON.stringify({ t: 'piUploadBegin', name: 'pi', requestId: 'begin-1', filename: 'notes.bin', mimeType: 'application/octet-stream', size: 3 }),
+      JSON.stringify({ t: 'piUploadChunk', name: 'pi', requestId: 'chunk-1', attachmentId: 'att-1', offset: 0, data: 'YWJj' }),
+      JSON.stringify({ t: 'piUploadFinish', name: 'pi', requestId: 'finish-1', attachmentId: 'att-1' }),
+      JSON.stringify({ t: 'piUploadCancel', name: 'pi', requestId: 'cancel-1', attachmentId: 'att-1' }),
+      JSON.stringify({ t: 'piSubagentStatus', name: 'pi', requestId: 'status-1' }),
+      JSON.stringify({ t: 'piSubagentTranscript', name: 'pi', requestId: 'transcript-1', runId: 'run-1', index: 2 }),
+      JSON.stringify({ t: 'piSubagentControl', name: 'pi', requestId: 'control-1', action: 'steer', runId: 'run-1', message: 'continue' }),
       JSON.stringify({ t: 'piAbort', name: 'pi' }),
     ])
 
@@ -424,6 +465,19 @@ describe('createAmber', () => {
     expect(amber.homeDir).toBe('/home/y')
     expect(amber.machineName).toBe('amber-host')
     expect(amber.softwareGl).toBe(true)
+  })
+
+  it('exposes the semantic Pi chat entrypoint to the mobile web renderer', () => {
+    const sockets: FakeSocket[] = []
+    const posted: Array<{ session: string; mode?: 'terminal' | 'pi' }> = []
+    const amber = createAmber(deps({
+      connectSocket: () => { const socket = new FakeSocket(); sockets.push(socket); return socket },
+      postPanePort: (session, _port, mode) => posted.push({ session, ...(mode === undefined ? {} : { mode }) }),
+    }))
+    amber.openPiPane('amber-1-1-0-pi')
+    expect(posted).toEqual([{ session: 'amber-1-1-0-pi', mode: 'pi' }])
+    sockets[1]!.open()
+    expect(sockets[1]!.sent).toEqual([JSON.stringify({ t: 'piOpen', name: 'amber-1-1-0-pi' })])
   })
 
   it('openPane wires a real port through postPanePort and routes each pane to its own socket', () => {

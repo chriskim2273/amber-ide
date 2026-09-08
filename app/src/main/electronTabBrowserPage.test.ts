@@ -1,7 +1,13 @@
 import { describe, expect, it, vi } from 'vitest'
-import { browserWindowCanRemoveChildView, createInputEventHandlers, projectInPageNavigation } from './electronTabBrowserPage'
+import { browserWindowCanRemoveChildView, createInputEventHandlers, documentCanArmBrowserDebugger, projectInPageNavigation } from './electronTabBrowserPage'
 
 describe('Electron tab browser page events', () => {
+  it('distinguishes the implicit blank document from an explicitly loaded blank page', () => {
+    expect(documentCanArmBrowserDebugger('about:blank', false)).toBe(false)
+    expect(documentCanArmBrowserDebugger('about:blank', true)).toBe(true)
+    expect(documentCanArmBrowserDebugger('https://fixture.test/', false)).toBe(true)
+  })
+
   it('does not reparent through a BrowserWindow that already closed', () => {
     expect(browserWindowCanRemoveChildView({ isDestroyed: () => false })).toBe(true)
     expect(browserWindowCanRemoveChildView({ isDestroyed: () => true })).toBe(false)

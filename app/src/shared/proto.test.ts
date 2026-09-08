@@ -45,8 +45,16 @@ describe('proto', () => {
       { type: 'control', msg: { kind: 'PiBridgeHello', name: 'amber-1-1-0-pi' } },
       { type: 'control', msg: { kind: 'PiBridgeCommand', name: 'amber-1-1-0-pi', command: { kind: 'Snapshot' } } },
       { type: 'control', msg: { kind: 'PiBridgeCommand', name: 'amber-1-1-0-pi', command: { kind: 'Prompt', message: 'review', delivery: 'follow_up' } } },
+      { type: 'control', msg: { kind: 'PiBridgeCommand', name: 'amber-1-1-0-pi', command: { kind: 'PromptWithAttachments', requestId: 'req-1', message: '', delivery: 'now', attachments: ['att-1'] } } },
+      { type: 'control', msg: { kind: 'PiBridgeCommand', name: 'amber-1-1-0-pi', command: { kind: 'UploadBegin', requestId: 'req-2', filename: 'notes.bin', mimeType: 'application/octet-stream', size: 3 } } },
+      { type: 'control', msg: { kind: 'PiBridgeCommand', name: 'amber-1-1-0-pi', command: { kind: 'UploadChunk', requestId: 'req-3', attachmentId: 'att-1', offset: 0, data: 'YWJj' } } },
+      { type: 'control', msg: { kind: 'PiBridgeCommand', name: 'amber-1-1-0-pi', command: { kind: 'UploadFinish', requestId: 'req-4', attachmentId: 'att-1' } } },
+      { type: 'control', msg: { kind: 'PiBridgeCommand', name: 'amber-1-1-0-pi', command: { kind: 'UploadCancel', requestId: 'req-5', attachmentId: 'att-1' } } },
       { type: 'control', msg: { kind: 'PiBridgeCommand', name: 'amber-1-1-0-pi', command: { kind: 'Abort' } } },
       { type: 'control', msg: { kind: 'PiBridgeCommand', name: 'amber-1-1-0-pi', command: { kind: 'SetThinkingLevel', level: 'high' } } },
+      { type: 'control', msg: { kind: 'PiBridgeCommand', name: 'amber-1-1-0-pi', command: { kind: 'SubagentStatus', requestId: 'status-1' } } },
+      { type: 'control', msg: { kind: 'PiBridgeCommand', name: 'amber-1-1-0-pi', command: { kind: 'SubagentTranscript', requestId: 'transcript-1', runId: 'run-1', index: 2 } } },
+      { type: 'control', msg: { kind: 'PiBridgeCommand', name: 'amber-1-1-0-pi', command: { kind: 'SubagentControl', requestId: 'control-1', action: 'steer', runId: 'run-1', message: 'continue' } } },
       { type: 'control', msg: { kind: 'PiEvent', name: 'amber-1-1-0-pi', seq: 8, event: { kind: 'snapshot', idle: true } } },
       { type: 'control', msg: { kind: 'PiBridgeStatus', name: 'amber-1-1-0-pi', available: true } },
     ]
@@ -54,6 +62,37 @@ describe('proto', () => {
     expect(new TextDecoder().decode(encode(frames[3]!).slice(5))).toBe(
       '{"PiBridgeCommand":{"name":"amber-1-1-0-pi","command":{"Prompt":{"message":"review","delivery":"follow_up"}}}}',
     )
+    expect(new TextDecoder().decode(encode(frames[6]!).slice(5))).toBe(
+      '{"PiBridgeCommand":{"name":"amber-1-1-0-pi","command":{"UploadChunk":{"requestId":"req-3","attachmentId":"att-1","offset":0,"data":"YWJj"}}}}',
+    )
+    expect(new TextDecoder().decode(encode(frames[13]!).slice(5))).toBe(
+      '{"PiBridgeCommand":{"name":"amber-1-1-0-pi","command":{"SubagentControl":{"requestId":"control-1","action":"steer","runId":"run-1","message":"continue"}}}}',
+    )
+  })
+
+  it('rejects malformed Pi prompts and thinking levels while accepting full base64 quartets', () => {
+    const frame = decodeControlJson(
+      '{"PiBridgeCommand":{"name":"pi","command":{"UploadChunk":{"requestId":"r","attachmentId":"a","offset":0,"data":"YWJj"}}}}',
+    )
+    expect(frame).toEqual({
+      type: 'control',
+      msg: { kind: 'PiBridgeCommand', name: 'pi', command: { kind: 'UploadChunk', requestId: 'r', attachmentId: 'a', offset: 0, data: 'YWJj' } },
+    })
+    expect(() => decodeControlJson(
+      '{"PiBridgeCommand":{"name":"pi","command":{"Prompt":{"message":" ","delivery":"now"}}}}',
+    )).toThrow('no frame')
+    expect(() => decodeControlJson(
+      '{"PiBridgeCommand":{"name":"pi","command":{"SetThinkingLevel":{"level":"extreme"}}}}',
+    )).toThrow('no frame')
+    expect(() => decodeControlJson(
+      '{"PiBridgeCommand":{"name":"pi","command":{"UploadBegin":{"requestId":"r\\u0080","filename":"x","mimeType":"text/plain","size":0}}}}',
+    )).toThrow('no frame')
+    expect(() => decodeControlJson(
+      '{"PiBridgeCommand":{"name":"pi","command":{"SubagentControl":{"requestId":"r","action":"spawn","runId":"run"}}}}',
+    )).toThrow('no frame')
+    expect(() => decodeControlJson(
+      '{"PiBridgeCommand":{"name":"pi","command":{"SubagentControl":{"requestId":"r","action":"steer","runId":"fleet-1","message":"go","childId":"not-allowed"}}}}',
+    )).toThrow('no frame')
   })
 
   it('encodes the manual snapshot request and confirmation as daemon unit variants', () => {

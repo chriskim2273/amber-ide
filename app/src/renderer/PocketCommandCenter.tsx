@@ -95,14 +95,18 @@ export function PocketFocusHeader({
   title,
   machineName,
   stateLabel,
+  piView,
   onBack,
   onActions,
+  onPiView,
 }: {
   title: string
   machineName: string
   stateLabel: string
+  piView?: 'terminal' | 'gui'
   onBack: () => void
   onActions: () => void
+  onPiView?: (view: 'terminal' | 'gui') => void
 }): JSX.Element {
   return (
     <header className="pocket-focus-head">
@@ -114,6 +118,12 @@ export function PocketFocusHeader({
         <strong>{title}</strong>
         <span>{machineName} / {stateLabel}</span>
       </span>
+      {piView && onPiView && <button type="button" className="pocket-focus-view-toggle"
+        aria-label={piView === 'gui' ? 'Show Pi terminal' : 'Show Pi chat'}
+        title={piView === 'gui' ? 'Switch to Terminal' : 'Switch to Chat'}
+        onClick={() => onPiView(piView === 'gui' ? 'terminal' : 'gui')}>
+        {piView === 'gui' ? 'Terminal' : 'Chat'}
+      </button>}
       <button type="button" className="pocket-focus-actions" aria-label={`Actions for ${title}`} onClick={onActions}>
         <span className="pocket-more-mark" aria-hidden="true" />
       </button>

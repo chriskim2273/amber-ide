@@ -185,6 +185,18 @@ pub enum PiDelivery {
     FollowUp,
 }
 
+/// Closed action set for the optional Pi subagent bridge. These names map to
+/// the public pi-subagents RPC methods; they are deliberately not a generic
+/// extension method selector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PiSubagentAction {
+    Stop,
+    Steer,
+    Interrupt,
+    Resume,
+}
+
 /// Commands the optional Pi semantic pane can send to the public extension
 /// bridge inside the existing interactive Pi process. Kept closed and small:
 /// browser input must never become an arbitrary extension method invocation.
@@ -192,8 +204,293 @@ pub enum PiDelivery {
 pub enum PiCommand {
     Snapshot,
     Prompt { message: String, delivery: PiDelivery },
+    /// Correlated prompt submission. Attachment ids refer only to completed
+    /// artifacts owned by the current Pi session; the extension resolves them
+    /// before calling Pi's public `sendUserMessage` API.
+    PromptWithAttachments {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        message: String,
+        delivery: PiDelivery,
+        attachments: Vec<String>,
+    },
+    /// Start one bounded upload. The extension allocates the opaque id; the
+    /// client must use the id returned in the command receipt for later chunks.
+    UploadBegin {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        filename: String,
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+        size: u64,
+    },
+    UploadChunk {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        #[serde(rename = "attachmentId")]
+        attachment_id: String,
+        offset: u64,
+        data: String,
+    },
+    UploadFinish {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        #[serde(rename = "attachmentId")]
+        attachment_id: String,
+    },
+    UploadCancel {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        #[serde(rename = "attachmentId")]
+        attachment_id: String,
+    },
+    /// Request a bounded, read-only current-session fleet snapshot.
+    SubagentStatus {
+        #[serde(rename = "requestId")]
+        request_id: String,
+    },
+    /// Request a bounded transcript projection for one package-owned run.
+    SubagentTranscript {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        #[serde(rename = "runId")]
+        run_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        index: Option<u32>,
+    },
+    /// Request one of the explicitly supported package-owned controls.
+    SubagentControl {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        action: PiSubagentAction,
+        #[serde(rename = "runId")]
+        run_id: String,
+        #[serde(rename = "childId", default, skip_serializing_if = "Option::is_none")]
+        child_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        index: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
     Abort,
     SetThinkingLevel { level: String },
+}
+
+/// Bounds shared by the daemon, authenticated web adapter, and the generated
+/// Pi extension. Keep these in the core protocol so a new ingress cannot
+/// accidentally accept a larger command than the existing one.
+pub const PI_PROMPT_MAX_BYTES: usize = 64 * 1024;
+pub const PI_REQUEST_ID_MAX_BYTES: usize = 128;
+pub const PI_SUBAGENT_ID_MAX_BYTES: usize = 256;
+pub const PI_SUBAGENT_INDEX_MAX: u32 = 500;
+pub const PI_ATTACHMENT_ID_MAX_BYTES: usize = 128;
+pub const PI_FILENAME_MAX_CHARS: usize = 255;
+pub const PI_MIME_TYPE_MAX_BYTES: usize = 128;
+pub const PI_ATTACHMENT_MAX_BYTES: u64 = 16 * 1024 * 1024;
+pub const PI_ATTACHMENTS_PER_PROMPT: usize = 8;
+pub const PI_PROMPT_ATTACHMENTS_MAX_BYTES: u64 = 32 * 1024 * 1024;
+pub const PI_PENDING_UPLOADS_MAX: usize = 4;
+pub const PI_ARTIFACTS_MAX_BYTES: u64 = 256 * 1024 * 1024;
+pub const PI_UPLOAD_CHUNK_MAX_BYTES: usize = 48 * 1024;
+pub const PI_UPLOAD_CHUNK_MAX_ENCODED_BYTES: usize = PI_UPLOAD_CHUNK_MAX_BYTES.div_ceil(3) * 4;
+
+fn validate_pi_identifier(value: &str, max: usize, label: &str) -> anyhow::Result<()> {
+    if value.is_empty() {
+        anyhow::bail!("Pi {label} must not be empty");
+    }
+    if value.len() > max {
+        anyhow::bail!("Pi {label} exceeds the {max}-byte limit");
+    }
+    if value.chars().any(char::is_control) {
+        anyhow::bail!("Pi {label} contains a control character");
+    }
+    Ok(())
+}
+
+fn validate_pi_subagent_id(value: &str, label: &str) -> anyhow::Result<()> {
+    validate_pi_identifier(value, PI_SUBAGENT_ID_MAX_BYTES, label)?;
+    if value.chars().any(|character| character == '/' || character == '\\' || character.is_whitespace()) {
+        anyhow::bail!("Pi {label} contains a path separator or whitespace");
+    }
+    Ok(())
+}
+
+fn validate_pi_subagent_index(index: Option<u32>) -> anyhow::Result<()> {
+    if let Some(index) = index {
+        if index > PI_SUBAGENT_INDEX_MAX {
+            anyhow::bail!("Pi subagent index exceeds the {PI_SUBAGENT_INDEX_MAX}-child limit");
+        }
+    }
+    Ok(())
+}
+
+fn validate_pi_attachment_id(value: &str) -> anyhow::Result<()> {
+    validate_pi_identifier(value, PI_ATTACHMENT_ID_MAX_BYTES, "attachment id")?;
+    if !value.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_') {
+        anyhow::bail!("Pi attachment id contains an invalid character");
+    }
+    Ok(())
+}
+
+fn validate_pi_filename(value: &str) -> anyhow::Result<()> {
+    if value.is_empty() {
+        anyhow::bail!("Pi attachment filename must not be empty");
+    }
+    if value.chars().count() > PI_FILENAME_MAX_CHARS {
+        anyhow::bail!("Pi attachment filename exceeds the 255-character limit");
+    }
+    if value.chars().any(|c| c.is_control() || c == '/' || c == '\\') {
+        anyhow::bail!("Pi attachment filename contains a control or path-separator character");
+    }
+    Ok(())
+}
+
+fn validate_pi_mime_type(value: &str) -> anyhow::Result<()> {
+    validate_pi_identifier(value, PI_MIME_TYPE_MAX_BYTES, "attachment MIME type")
+}
+
+/// Validate every Pi bridge command before it reaches either the daemon's
+/// registered extension or the browser adapter. Attachment sizes whose values
+/// live in the extension's metadata are checked again when a prompt resolves
+/// the ids; this boundary enforces all limits knowable from the command alone.
+pub fn validate_pi_command(command: &PiCommand) -> anyhow::Result<()> {
+    match command {
+        PiCommand::Snapshot | PiCommand::Abort => {}
+        PiCommand::Prompt { message, .. } => {
+            if message.trim().is_empty() {
+                anyhow::bail!("Pi prompt must not be empty");
+            }
+            if message.len() > PI_PROMPT_MAX_BYTES {
+                anyhow::bail!("Pi prompt exceeds the 64 KiB limit");
+            }
+        }
+        PiCommand::PromptWithAttachments { request_id, message, attachments, .. } => {
+            validate_pi_identifier(request_id, PI_REQUEST_ID_MAX_BYTES, "request id")?;
+            if message.trim().is_empty() && attachments.is_empty() {
+                anyhow::bail!("Pi prompt must contain text or an attachment");
+            }
+            if message.len() > PI_PROMPT_MAX_BYTES {
+                anyhow::bail!("Pi prompt exceeds the 64 KiB limit");
+            }
+            if attachments.len() > PI_ATTACHMENTS_PER_PROMPT {
+                anyhow::bail!("Pi prompt exceeds the 8-attachment limit");
+            }
+            let mut seen = std::collections::HashSet::with_capacity(attachments.len());
+            for attachment in attachments {
+                validate_pi_attachment_id(attachment)?;
+                if !seen.insert(attachment) {
+                    anyhow::bail!("Pi prompt contains a duplicate attachment id");
+                }
+            }
+        }
+        PiCommand::UploadBegin { request_id, filename, mime_type, size } => {
+            validate_pi_identifier(request_id, PI_REQUEST_ID_MAX_BYTES, "request id")?;
+            validate_pi_filename(filename)?;
+            validate_pi_mime_type(mime_type)?;
+            if *size > PI_ATTACHMENT_MAX_BYTES {
+                anyhow::bail!("Pi attachment exceeds the 16 MiB limit");
+            }
+        }
+        PiCommand::UploadChunk { request_id, attachment_id, offset, data } => {
+            validate_pi_identifier(request_id, PI_REQUEST_ID_MAX_BYTES, "request id")?;
+            validate_pi_attachment_id(attachment_id)?;
+            if *offset > PI_ATTACHMENT_MAX_BYTES {
+                anyhow::bail!("Pi attachment offset exceeds the 16 MiB limit");
+            }
+            decode_pi_upload_chunk(data)?;
+        }
+        PiCommand::UploadFinish { request_id, attachment_id }
+        | PiCommand::UploadCancel { request_id, attachment_id } => {
+            validate_pi_identifier(request_id, PI_REQUEST_ID_MAX_BYTES, "request id")?;
+            validate_pi_attachment_id(attachment_id)?;
+        }
+        PiCommand::SubagentStatus { request_id } => {
+            validate_pi_identifier(request_id, PI_REQUEST_ID_MAX_BYTES, "request id")?;
+        }
+        PiCommand::SubagentTranscript { request_id, run_id, index } => {
+            validate_pi_identifier(request_id, PI_REQUEST_ID_MAX_BYTES, "request id")?;
+            validate_pi_subagent_id(run_id, "subagent run id")?;
+            validate_pi_subagent_index(*index)?;
+        }
+        PiCommand::SubagentControl { request_id, action, run_id, child_id, index, message } => {
+            validate_pi_identifier(request_id, PI_REQUEST_ID_MAX_BYTES, "request id")?;
+            validate_pi_subagent_id(run_id, "subagent run id")?;
+            if child_id.is_some() || index.is_some() {
+                anyhow::bail!("Pi subagent child targets are not supported");
+            }
+            match action {
+                PiSubagentAction::Steer | PiSubagentAction::Resume => {
+                    let Some(message) = message else {
+                        anyhow::bail!("Pi subagent {action:?} requires a message");
+                    };
+                    if message.trim().is_empty() {
+                        anyhow::bail!("Pi subagent {action:?} message must not be empty");
+                    }
+                    if message.len() > PI_PROMPT_MAX_BYTES {
+                        anyhow::bail!("Pi subagent message exceeds the 64 KiB limit");
+                    }
+                }
+                PiSubagentAction::Stop | PiSubagentAction::Interrupt => {
+                    if message.is_some() {
+                        anyhow::bail!("Pi subagent {action:?} does not accept a message");
+                    }
+                }
+            }
+        }
+        PiCommand::SetThinkingLevel { level } => {
+            if !matches!(level.as_str(), "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max") {
+                anyhow::bail!("unsupported Pi thinking level: {level}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn base64_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+/// Decode a standard padded base64 upload chunk, rejecting every noncanonical
+/// spelling before allocating the decoded buffer. This is deliberately local
+/// rather than a general-purpose base64 utility: the browser ingress needs
+/// exactly one bounded encoding and no permissive decoder variants.
+pub fn decode_pi_upload_chunk(data: &str) -> anyhow::Result<Vec<u8>> {
+    if data.is_empty() || data.len() > PI_UPLOAD_CHUNK_MAX_ENCODED_BYTES || !data.len().is_multiple_of(4) {
+        anyhow::bail!("Pi upload chunk is not canonical base64");
+    }
+    let bytes = data.as_bytes();
+    let padding = bytes.iter().rev().take_while(|&&byte| byte == b'=').count();
+    if padding > 2 || bytes[..bytes.len() - padding].contains(&b'=') {
+        anyhow::bail!("Pi upload chunk is not canonical base64");
+    }
+    let decoded_len = bytes.len() / 4 * 3 - padding;
+    if decoded_len == 0 || decoded_len > PI_UPLOAD_CHUNK_MAX_BYTES {
+        anyhow::bail!("Pi upload chunk exceeds the 48 KiB limit");
+    }
+    let mut output = Vec::with_capacity(decoded_len);
+    let (groups, _) = bytes.as_chunks::<4>();
+    for group in groups {
+        let a = base64_value(group[0]).ok_or_else(|| anyhow::anyhow!("Pi upload chunk is not canonical base64"))? as u32;
+        let b = base64_value(group[1]).ok_or_else(|| anyhow::anyhow!("Pi upload chunk is not canonical base64"))? as u32;
+        let c = if group[2] == b'=' { 0 } else { base64_value(group[2]).ok_or_else(|| anyhow::anyhow!("Pi upload chunk is not canonical base64"))? as u32 };
+        let d = if group[3] == b'=' { 0 } else { base64_value(group[3]).ok_or_else(|| anyhow::anyhow!("Pi upload chunk is not canonical base64"))? as u32 };
+        if group[2] == b'=' && group[3] != b'=' || group[2] == b'=' && (b & 0x0f) != 0 || group[3] == b'=' && (c & 0x03) != 0 {
+            anyhow::bail!("Pi upload chunk is not canonical base64");
+        }
+        let n = (a << 18) | (b << 12) | (c << 6) | d;
+        output.push((n >> 16) as u8);
+        if group[2] != b'=' { output.push((n >> 8) as u8); }
+        if group[3] != b'=' { output.push(n as u8); }
+    }
+    if output.len() != decoded_len { anyhow::bail!("Pi upload chunk is not canonical base64"); }
+    Ok(output)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -854,6 +1151,129 @@ mod tests {
             });
             assert_eq!(roundtrip(&frame), frame);
         }
+    }
+
+    #[test]
+    fn pi_attachment_commands_use_camel_case_fields_and_roundtrip() {
+        let command = PiCommand::PromptWithAttachments {
+            request_id: "req-1".into(),
+            message: "look".into(),
+            delivery: PiDelivery::Now,
+            attachments: vec!["att-1".into()],
+        };
+        let json = serde_json::to_string(&command).unwrap();
+        assert_eq!(
+            json,
+            r#"{"PromptWithAttachments":{"requestId":"req-1","message":"look","delivery":"now","attachments":["att-1"]}}"#
+        );
+        assert_eq!(serde_json::from_str::<PiCommand>(&json).unwrap(), command);
+        let upload = PiCommand::UploadChunk {
+            request_id: "req-2".into(),
+            attachment_id: "att-1".into(),
+            offset: 3,
+            data: "aGk=".into(),
+        };
+        assert_eq!(serde_json::from_str::<PiCommand>(&serde_json::to_string(&upload).unwrap()).unwrap(), upload);
+    }
+
+    #[test]
+    fn pi_subagent_commands_roundtrip_with_closed_rpc_fields() {
+        let status = PiCommand::SubagentStatus { request_id: "status-1".into() };
+        assert_eq!(serde_json::to_string(&status).unwrap(), r#"{"SubagentStatus":{"requestId":"status-1"}}"#);
+        assert_eq!(serde_json::from_str::<PiCommand>(&serde_json::to_string(&status).unwrap()).unwrap(), status);
+
+        let transcript = PiCommand::SubagentTranscript {
+            request_id: "transcript-1".into(), run_id: "run-1".into(), index: Some(2),
+        };
+        assert_eq!(serde_json::to_string(&transcript).unwrap(), r#"{"SubagentTranscript":{"requestId":"transcript-1","runId":"run-1","index":2}}"#);
+        assert_eq!(serde_json::from_str::<PiCommand>(&serde_json::to_string(&transcript).unwrap()).unwrap(), transcript);
+
+        let control = PiCommand::SubagentControl {
+            request_id: "control-1".into(), action: PiSubagentAction::Steer,
+            run_id: "run-1".into(), child_id: None, index: None, message: Some("continue".into()),
+        };
+        assert_eq!(serde_json::to_string(&control).unwrap(), r#"{"SubagentControl":{"requestId":"control-1","action":"steer","runId":"run-1","message":"continue"}}"#);
+        assert_eq!(serde_json::from_str::<PiCommand>(&serde_json::to_string(&control).unwrap()).unwrap(), control);
+    }
+
+    #[test]
+    fn pi_subagent_validator_rejects_unsupported_targets_and_action_shapes() {
+        assert!(validate_pi_command(&PiCommand::SubagentStatus { request_id: "status".into() }).is_ok());
+        assert!(validate_pi_command(&PiCommand::SubagentTranscript {
+            request_id: "transcript".into(), run_id: "run-1".into(), index: None,
+        }).is_ok());
+        assert!(validate_pi_command(&PiCommand::SubagentControl {
+            request_id: "stop".into(), action: PiSubagentAction::Stop,
+            run_id: "run-1".into(), child_id: Some("child-1".into()), index: None, message: None,
+        }).is_err(), "child controls remain read-only until canonical identity resolution exists");
+        assert!(validate_pi_command(&PiCommand::SubagentControl {
+            request_id: "steer".into(), action: PiSubagentAction::Steer,
+            run_id: "run-1".into(), child_id: None, index: None, message: None,
+        }).is_err(), "steer requires an explicit message");
+        assert!(validate_pi_command(&PiCommand::SubagentControl {
+            request_id: "resume".into(), action: PiSubagentAction::Resume,
+            run_id: "run-1".into(), child_id: None, index: None, message: Some(" ".into()),
+        }).is_err(), "resume rejects blank messages");
+        assert!(validate_pi_command(&PiCommand::SubagentControl {
+            request_id: "interrupt".into(), action: PiSubagentAction::Interrupt,
+            run_id: "run-1".into(), child_id: Some("child-1".into()), index: None, message: None,
+        }).is_err(), "child targets are unsupported until canonical identity resolution exists");
+        assert!(validate_pi_command(&PiCommand::SubagentControl {
+            request_id: "index".into(), action: PiSubagentAction::Stop,
+            run_id: "run-1".into(), child_id: None, index: Some(0), message: None,
+        }).is_err(), "index targets are unsupported until canonical identity resolution exists");
+        assert!(validate_pi_command(&PiCommand::SubagentTranscript {
+            request_id: "bad\nrequest".into(), run_id: "run-1".into(), index: None,
+        }).is_err());
+        assert!(serde_json::from_str::<PiCommand>(r#"{"SubagentControl":{"requestId":"x","action":"spawn","runId":"run"}}"#).is_err());
+        assert!(validate_pi_command(&PiCommand::SubagentTranscript {
+            request_id: "transcript".into(), run_id: "run\u{2003}1".into(), index: None,
+        }).is_err(), "Unicode whitespace must not cross the RPC boundary");
+    }
+
+    #[test]
+    fn pi_command_validator_enforces_prompt_attachment_and_chunk_bounds() {
+        assert!(validate_pi_command(&PiCommand::PromptWithAttachments {
+            request_id: "r".into(), message: String::new(), delivery: PiDelivery::Now,
+            attachments: vec!["a".into()],
+        }).is_ok(), "image-only prompts are valid");
+        assert!(validate_pi_command(&PiCommand::PromptWithAttachments {
+            request_id: "r".into(), message: String::new(), delivery: PiDelivery::Now,
+            attachments: Vec::new(),
+        }).is_err());
+        assert!(validate_pi_command(&PiCommand::UploadBegin {
+            request_id: "r".into(), filename: "photo.png".into(), mime_type: "image/png".into(),
+            size: PI_ATTACHMENT_MAX_BYTES + 1,
+        }).is_err());
+        assert!(validate_pi_command(&PiCommand::UploadBegin {
+            request_id: "r\u{80}".into(), filename: "photo.png".into(), mime_type: "image/png".into(), size: 0,
+        }).is_err(), "C1 controls must match char::is_control at the TS boundary");
+        assert!(validate_pi_command(&PiCommand::UploadChunk {
+            request_id: "r".into(), attachment_id: "a".into(), offset: 0, data: "aGk=".into(),
+        }).is_ok());
+        for bad in ["aGk", "aG!k", "aGk=\n", "ab=="] {
+            assert!(decode_pi_upload_chunk(bad).is_err(), "{bad:?} must be rejected");
+        }
+        assert_eq!(decode_pi_upload_chunk("AA==").unwrap(), [0]);
+        assert_eq!(decode_pi_upload_chunk("AAE=").unwrap(), [0, 1]);
+        assert_eq!(decode_pi_upload_chunk("AAEC").unwrap(), [0, 1, 2]);
+        assert_eq!(decode_pi_upload_chunk("YWJj").unwrap(), b"abc");
+        let bytes = vec![b'x'; PI_UPLOAD_CHUNK_MAX_BYTES];
+        let mut encoded = String::new();
+        const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        for chunk in bytes.chunks(3) {
+            let a = chunk[0] as u32;
+            let b = *chunk.get(1).unwrap_or(&0) as u32;
+            let c = *chunk.get(2).unwrap_or(&0) as u32;
+            let n = (a << 16) | (b << 8) | c;
+            encoded.push(ALPHABET[((n >> 18) & 63) as usize] as char);
+            encoded.push(ALPHABET[((n >> 12) & 63) as usize] as char);
+            encoded.push(if chunk.len() > 1 { ALPHABET[((n >> 6) & 63) as usize] as char } else { '=' });
+            encoded.push(if chunk.len() > 2 { ALPHABET[(n & 63) as usize] as char } else { '=' });
+        }
+        assert_eq!(decode_pi_upload_chunk(&encoded).unwrap().len(), PI_UPLOAD_CHUNK_MAX_BYTES);
+        let too_large = format!("{encoded}AAAA");
+        assert!(decode_pi_upload_chunk(&too_large).is_err());
     }
 
     #[test]

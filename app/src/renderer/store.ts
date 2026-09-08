@@ -103,10 +103,16 @@ export function reduce(state: AppState, ev: DaemonEvent): AppState {
   switch (ev.kind) {
     case 'Sessions': {
       const names = new Set(ev.sessions.map((x) => x.name))
+      // Exit is delivered before the next authoritative session snapshot. A
+      // restored/live session with the same name clears that transient code;
+      // otherwise a stale Exit would hide the Pi Chat toggle forever after a
+      // daemon reconnect.
+      const dead = keepLive(state.dead, names)
+      for (const session of ev.sessions) if (session.alive) delete dead[session.name]
       return {
         ...state,
         sessions: [...ev.sessions],
-        dead: keepLive(state.dead, names),
+        dead,
         error: null,
         lastActivity: keepLive(state.lastActivity, names),
         lastSeen: keepLive(state.lastSeen, names),
@@ -119,10 +125,15 @@ export function reduce(state: AppState, ev: DaemonEvent): AppState {
       for (const x of state.sessions) if (!removed.has(x.name)) byName.set(x.name, x)
       for (const x of ev.added) byName.set(x.name, keepFriendlyTitle(byName.get(x.name), x))
       const live = new Set(byName.keys())
+      const dead = keepLive(state.dead, live)
+      // SessionsChanged is a delta. Cached entries are still authoritative
+      // until a matching added record arrives; otherwise an unrelated create
+      // could erase an Exit marker before the daemon re-sends that session.
+      for (const session of ev.added) if (session.alive) delete dead[session.name]
       return {
         ...state,
         sessions: [...byName.values()],
-        dead: keepLive(state.dead, live),
+        dead,
         lastActivity: keepLive(state.lastActivity, live),
         lastSeen: keepLive(state.lastSeen, live),
         mem: keepLive(state.mem, live),
@@ -190,6 +201,13 @@ export function reduce(state: AppState, ev: DaemonEvent): AppState {
 }
 
 export interface KindDot { cls: string; label: string }
+
+/** The Chat affordance follows daemon kind and liveness, not title text or
+ * process guesses. `deadCode` is a short-lived Exit event marker; `alive` is
+ * the authoritative SessionInfo value carried through PaneMeta. */
+export function piChatAvailable(meta: { kind?: string | undefined; alive?: boolean | undefined } | undefined, deadCode?: number): boolean {
+  return meta?.kind === 'pi' && meta.alive !== false && deadCode === undefined
+}
 
 // A supervised coding-agent pane — one whose daemon session runs `amber run`
 // and reports a run_state. The daemon's `SessionKind::is_agent`, mirrored: all
