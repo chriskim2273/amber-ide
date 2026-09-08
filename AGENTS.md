@@ -108,6 +108,16 @@ exception is core rule 9); themes/settings beyond minimal.
 
 ## Build status
 
+- [x] Mobile direct chat entry — Pocket session rows offer **Open chat** for
+  live Pi sessions; the action selects the saved graphical view and opens/focuses
+  that pane full-screen. The focused header exposes **Chat | Terminal** with
+  explicit selected state on a separate touch-sized row. Ordinary session
+  opening preserves the saved view; other session kinds remain terminal-only.
+  App gate: 1218 passed / 1 skipped, typecheck and web build passed (existing
+  duplicate-target/chunk-size warnings remain). Mounted tests cover direct-chat
+  callback isolation and both view changes. Worktree-only, not deployed;
+  real-phone layout, keyboard focus, and live daemon round-trip remain unverified.
+
 - [x] Browser native-input follow-up (2026-09-07) — preserves the Pi GUI
   integration while fixing Retina cursor placement, macOS editing-command
   dispatch and failed semantic-drag cleanup. Combined gates: app 1144 passed/

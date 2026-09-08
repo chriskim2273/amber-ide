@@ -1015,6 +1015,7 @@ function App(): JSX.Element {
     setActiveWs(item.ws)
     setActiveTab(item.tab)
     setZoom((current) => ({ ...current, [`${item.ws}:${item.tab}`]: item.pane.name }))
+    setFocusRequest({ paneId: item.pane.name, seq: ++focusRequestSeq.current })
   }
   const showDesktopItem = (item: CommandCenterItem): void => {
     const destination = `${item.ws}:${item.tab}`
@@ -2153,6 +2154,11 @@ function App(): JSX.Element {
           usage={usage}
           onWorkspace={choosePocketWorkspace}
           onOpen={openPocketItem}
+          onOpenChat={(item) => {
+            if (item.pane.kind !== 'pi' || !item.pane.alive || item.pane.deadCode !== null) return
+            setPiView(item.pane.name, 'gui')
+            openPocketItem(item)
+          }}
           onActions={setPocketAction}
           onMosaic={() => setPocketView('mosaic')}
           onDesktop={showDesktopView}

@@ -1,4 +1,5 @@
-import { createElement } from 'react'
+import { act, createElement } from 'react'
+import { withFakeDom } from './mountedTestDom'
 import { describe, expect, it, vi } from 'vitest'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { PocketCommandCenter, usageLine, PocketFocusHeader, pocketSessionTitle } from './PocketCommandCenter'
@@ -42,6 +43,7 @@ function render(overrides: Partial<Parameters<typeof PocketCommandCenter>[0]> = 
     usage: [],
     onWorkspace: () => {},
     onOpen: () => {},
+    onOpenChat: () => {},
     onActions: () => {},
     onMosaic: () => {},
     onDesktop: () => {},
@@ -70,6 +72,15 @@ describe('pocketSessionTitle', () => {
 })
 
 describe('PocketFocusHeader', () => {
+  it('shows both view choices with the current view selected', () => {
+    const html = renderToStaticMarkup(createElement(PocketFocusHeader, {
+      title: 'api', machineName: 'host', stateLabel: 'Working', piView: 'gui',
+      onBack: () => {}, onActions: () => {}, onPiView: () => {},
+    }))
+    expect(html).toContain('aria-label="Pi view"')
+    expect(html).toContain('aria-label="Show Pi chat" aria-pressed="true"')
+    expect(html).toContain('aria-label="Show Pi terminal" aria-pressed="false"')
+  })
   it('keeps back, machine identity and context actions explicit', () => {
     const html = renderToStaticMarkup(createElement(PocketFocusHeader, {
       title: 'api-refactor',
@@ -86,6 +97,44 @@ describe('PocketFocusHeader', () => {
 })
 
 describe('PocketCommandCenter', () => {
+  it('dispatches one chat open for the selected session without the ordinary open action', async () => {
+    await withFakeDom(async dom => {
+      const { createRoot } = await import('react-dom/client')
+      const root = createRoot(dom.container as unknown as Element)
+      const onOpen = vi.fn()
+      const onOpenChat = vi.fn()
+      try {
+        await act(async () => root.render(createElement(PocketCommandCenter, {
+          model, loading: false, machineName: 'phone', connected: true,
+          workspaceOptions: [], activeWorkspace: null, workspaceLabels: {}, tabLabels: {},
+          titles: {}, home: '/home/u', usage: [], onWorkspace: () => {},
+          onOpen, onOpenChat, onActions: () => {}, onMosaic: () => {},
+          onDesktop: () => {}, onNew: () => {},
+        })))
+        const chat = dom.container.querySelector('[aria-label="Open chat for api"]')
+        expect(chat).not.toBeNull()
+        await act(async () => { chat!.click() })
+        expect(onOpenChat).toHaveBeenCalledTimes(1)
+        expect(onOpenChat).toHaveBeenCalledWith(model.groups[1]!.items[0])
+        expect(onOpen).not.toHaveBeenCalled()
+        const open = dom.container.querySelector('[aria-label="Open api"]')
+        await act(async () => { open!.click() })
+        expect(onOpen).toHaveBeenCalledTimes(1)
+        expect(onOpen).toHaveBeenCalledWith(model.groups[1]!.items[0])
+      } finally {
+        await act(async () => root.unmount())
+      }
+    }, true)
+  })
+  it('offers direct chat only for live Pi sessions', () => {
+    expect(render()).toContain('aria-label="Open chat for api-refactor"')
+    for (const change of [{ kind: 'shell' }, { alive: false }, { deadCode: 0 }]) {
+      const altered = { ...model, groups: model.groups.map(group => ({ ...group,
+        items: group.items.map(item => ({ ...item, pane: { ...item.pane, ...change } })),
+      })) }
+      expect(render({ model: altered })).not.toContain('Open chat for')
+    }
+  })
   it('renders machine truth, urgency, session identity and useful metadata', () => {
     const html = render()
     expect(html).toContain('teapot-dev')

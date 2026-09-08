@@ -1,3 +1,4 @@
+import { piChatAvailable } from './store'
 import type { CommandCenterItem, CommandCenterModel } from './commandCenter'
 import type { ProviderUsage } from '../shared/proto'
 import { normalizeFriendlyTitle } from '../shared/layoutFile'
@@ -25,6 +26,7 @@ export interface PocketCommandCenterProps {
   usage: ProviderUsage[]
   onWorkspace: (workspace: number | null) => void
   onOpen: (item: CommandCenterItem) => void
+  onOpenChat: (item: CommandCenterItem) => void
   onActions: (item: CommandCenterItem) => void
   onMosaic: () => void
   onDesktop: () => void
@@ -118,12 +120,14 @@ export function PocketFocusHeader({
         <strong>{title}</strong>
         <span>{machineName} / {stateLabel}</span>
       </span>
-      {piView && onPiView && <button type="button" className="pocket-focus-view-toggle"
-        aria-label={piView === 'gui' ? 'Show Pi terminal' : 'Show Pi chat'}
-        title={piView === 'gui' ? 'Switch to Terminal' : 'Switch to Chat'}
-        onClick={() => onPiView(piView === 'gui' ? 'terminal' : 'gui')}>
-        {piView === 'gui' ? 'Terminal' : 'Chat'}
-      </button>}
+      {piView && onPiView && <div className="pocket-focus-views" role="group" aria-label="Pi view">
+        <button type="button" className="pocket-focus-view-toggle"
+          aria-label="Show Pi chat" aria-pressed={piView === 'gui'}
+          onClick={() => onPiView('gui')}>Chat</button>
+        <button type="button" className="pocket-focus-view-toggle"
+          aria-label="Show Pi terminal" aria-pressed={piView === 'terminal'}
+          onClick={() => onPiView('terminal')}>Terminal</button>
+      </div>}
       <button type="button" className="pocket-focus-actions" aria-label={`Actions for ${title}`} onClick={onActions}>
         <span className="pocket-more-mark" aria-hidden="true" />
       </button>
@@ -145,6 +149,7 @@ export function PocketCommandCenter({
   usage,
   onWorkspace,
   onOpen,
+  onOpenChat,
   onActions,
   onMosaic,
   onDesktop,
@@ -236,6 +241,11 @@ export function PocketCommandCenter({
                             </span>
                             <span className="pocket-open-arrow" aria-hidden="true" />
                           </button>
+                          {piChatAvailable(item.pane, item.pane.deadCode ?? undefined) &&
+                            <button type="button" className="pocket-session-chat"
+                              aria-label={`Open chat for ${title}`} onClick={() => onOpenChat(item)}>
+                              Open chat
+                            </button>}
                           <button type="button" className="pocket-session-actions"
                             aria-label={`Actions for ${title}`} onClick={() => onActions(item)}>
                             <span className="pocket-more-mark" aria-hidden="true" />

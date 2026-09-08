@@ -465,7 +465,7 @@
 .pocket-focus-head {
   min-height: calc(54px + env(safe-area-inset-top, 0px));
   display: grid;
-  grid-template-columns: minmax(72px, auto) minmax(0, 1fr) auto 48px;
+  grid-template-columns: minmax(72px, auto) minmax(0, 1fr) 48px;
   align-items: end;
   gap: 8px;
   padding: env(safe-area-inset-top, 0px) 6px 4px;
@@ -480,6 +480,31 @@
   color: var(--text-dim);
   font: 600 12px var(--font-ui);
 }
+.pocket-focus-views {
+  grid-column: 1 / -1;
+  grid-row: 2;
+  display: flex;
+  gap: 4px;
+}
+.pocket-focus-views button { flex: 1; }
+.pocket-focus-views button[aria-pressed="false"] {
+  background: transparent !important;
+  color: var(--text-dim) !important;
+  border-color: var(--border) !important;
+}
+.pocket-session-chat {
+  flex: 0 0 auto;
+  min-height: 44px;
+  align-self: center;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--accent-soft);
+  color: var(--text);
+  font: 600 12px var(--font-ui);
+  cursor: pointer;
+}
+.pocket-session-chat:focus-visible { outline: var(--focus-ring); }
 .pocket-focus-view-toggle {
   min-width: 52px;
   padding: 0 8px;
@@ -517,7 +542,7 @@
 }
 .pocket-focus-copy strong { color: var(--text); font-size: 14px; font-weight: 650; }
 .pocket-focus-copy span { color: var(--text-dim); font: 10.5px var(--font-mono); }
-.pocket-focus-actions { display: grid; place-items: center; }
+.pocket-focus-actions { grid-column: 3; grid-row: 1; display: grid; place-items: center; }
 .pocket-focus-head button:focus-visible { outline: var(--focus-ring); outline-offset: -2px; }
 
 /* SplitView still owns the pane and xterm. Focus mode only replaces its chrome;
