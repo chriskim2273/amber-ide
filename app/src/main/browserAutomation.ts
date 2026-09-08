@@ -58,7 +58,8 @@ type AXNode = {
 }
 type SnapshotEntry = AccessibilityNodeResult & { backendDOMNodeId?: number; metadata: InteractionTargetMetadata }
 interface SnapshotCache { lease: BrowserAutomationLease; snapshotId: string; entries: Map<string, SnapshotEntry>; nodes: AccessibilityNodeResult[] }
-export interface PreparedBrowserInteraction { lease: BrowserAutomationLease; operation: BrowserInteraction; primary?: SnapshotEntry; secondary?: SnapshotEntry; target: InteractionTargetMetadata; secondaryTarget?: InteractionTargetMetadata; grounded?: { observation: ScreenshotObservation; points: BrowserPoint[]; fingerprints: string[]; receiverFingerprints: string[] } }
+interface NativeSelection { index: number; backend: number; fingerprint: string; selected: boolean }
+export interface PreparedBrowserInteraction { nativeSelection?: NativeSelection; lease: BrowserAutomationLease; operation: BrowserInteraction; primary?: SnapshotEntry; secondary?: SnapshotEntry; target: InteractionTargetMetadata; secondaryTarget?: InteractionTargetMetadata; grounded?: { observation: ScreenshotObservation; points: BrowserPoint[]; fingerprints: string[]; receiverFingerprints: string[] } }
 interface RingEntry { cursor: number; bytes: number; value: Record<string, unknown> }
 
 class BoundedRing {
@@ -518,6 +519,61 @@ export class BrowserAutomation {
     }
     return { lease: { ...lease }, operation, target: { role: 'document', name: 'Browser pointer', tag: 'body', type: '', fingerprint: createHash('sha256').update(JSON.stringify(points)).digest('hex') }, grounded: { observation, points, fingerprints: [], receiverFingerprints: [] } }
   }
+  private async nativeSelection(entry: SnapshotEntry, value: string, signal: AbortSignal): Promise<NativeSelection> {
+    abort(signal)
+    const described = boundedResponse(await this.transport.send('DOM.describeNode', { backendNodeId: entry.backendDOMNodeId, depth: 2 }), 256 * 1024)
+    const select = described['node'] as Record<string, unknown> | undefined
+    const attributes = (node: Record<string, unknown> | undefined): Map<string, string> => {
+      const raw = Array.isArray(node?.['attributes']) ? node['attributes'] : [], result = new Map<string, string>()
+      for (let i = 0; i + 1 < raw.length; i += 2) result.set(String(raw[i]).toLowerCase(), String(raw[i + 1]))
+      return result
+    }
+    const selectAttrs = attributes(select)
+    // Listboxes/multiple selects commit intermediate arrow-key changes. This
+    // native dropdown path must commit only the requested option, once.
+    if (select?.['nodeName'] !== 'SELECT' || selectAttrs.has('multiple') || Number(selectAttrs.get('size') ?? 0) > 1) throw new Error('UNSUPPORTED_PAGE')
+    const tree = boundedResponse(await this.transport.send('Accessibility.queryAXTree', { backendNodeId: entry.backendDOMNodeId, role: 'option' }), 256 * 1024)
+    abort(signal)
+    const nodes = Array.isArray(tree['nodes']) ? tree['nodes'] as AXNode[] : []
+    if (nodes.length > 512) throw new Error('REQUEST_LIMIT')
+    // AX aria-disabled/aria-hidden can disagree with native menu traversal.
+    // Compare against the real OPTION/OPTGROUP order before any input; an AX
+    // omission must never shift an index and commit a different option.
+    const native = new Map<number, boolean>()
+    const collect = (children: unknown, groupDisabled = false): void => {
+      if (!Array.isArray(children)) return
+      for (const child of children as Array<Record<string, unknown>>) {
+        const attrs = attributes(child)
+        if (child['nodeName'] === 'OPTGROUP') collect(child['children'], attrs.has('disabled'))
+        else if (child['nodeName'] === 'OPTION' && typeof child['backendNodeId'] === 'number') native.set(child['backendNodeId'], groupDisabled || attrs.has('disabled'))
+      }
+    }
+    collect(select?.['children'])
+    const nativeOrder = [...native.keys()]
+    if (nodes.length !== native.size || nodes.some((node, index) => node.ignored || node.backendDOMNodeId !== nativeOrder[index])) throw new Error('UNSUPPORTED_PAGE')
+    const options: Array<{ backend: number; value: string; label: string; disabled: boolean; selected: boolean }> = []
+    for (const node of nodes) {
+      abort(signal)
+      if (typeof node.backendDOMNodeId !== 'number') throw new Error('UNSUPPORTED_PAGE')
+      const result = boundedResponse(await this.transport.send('DOM.describeNode', { backendNodeId: node.backendDOMNodeId, depth: 1 }))
+      const option = result['node'] as Record<string, unknown> | undefined
+      if (option?.['nodeName'] !== 'OPTION') throw new Error('UNSUPPORTED_PAGE')
+      const attrs = attributes(option)
+      const children = Array.isArray(option['children']) ? option['children'] as Array<Record<string, unknown>> : []
+      if (!attrs.has('value') && children.some(child => child['nodeName'] !== '#text')) throw new Error('UNSUPPORTED_PAGE')
+      const optionValue = attrs.get('value') ?? children.map(child => String(child['nodeValue'] ?? '')).join('').replace(/[\t\n\f\r ]+/g, ' ').replace(/^ | $/g, '')
+      if (optionValue.length > 4096) throw new Error('REQUEST_LIMIT')
+      const disabled = native.get(node.backendDOMNodeId)!
+      if ((property(node, 'disabled') === true) !== disabled) throw new Error('UNSUPPORTED_PAGE')
+      options.push({ backend: node.backendDOMNodeId, value: optionValue, label: text(node.name?.value, 4096), disabled, selected: property(node, 'selected') === true })
+    }
+    const enabled = options.filter(option => !option.disabled), matching = enabled.filter(option => option.value === value)
+    if (matching.length === 0) throw new Error('TARGET_NOT_FOUND')
+    if (matching.length !== 1) throw new Error('TARGET_AMBIGUOUS')
+    const chosen = matching[0]!
+    const fingerprint = createHash('sha256').update(JSON.stringify(options.map(({ selected: _selected, ...option }) => option))).digest('hex')
+    return { index: enabled.indexOf(chosen), backend: chosen.backend, fingerprint, selected: chosen.selected }
+  }
   async prepareInteraction(lease: BrowserAutomationLease, operation: BrowserInteraction, signal: AbortSignal): Promise<PreparedBrowserInteraction> {
     abort(signal); await this.ensureAttached(); abort(signal)
     if (isPointerInteraction(operation)) return this.preparePointer(lease, operation, signal)
@@ -532,7 +588,8 @@ export class BrowserAutomation {
     if ((operation.kind === 'check' || operation.kind === 'uncheck') && (!metadata || !['checkbox', 'switch', 'radio'].includes(metadata.role.toLocaleLowerCase()))) throw new Error('TARGET_NOT_ACTIONABLE')
     if (operation.kind === 'uncheck' && metadata?.role.toLocaleLowerCase() === 'radio') throw new Error('TARGET_NOT_ACTIONABLE')
     const target = metadata ?? { role: 'document', name: '', tag: 'body', type: '', fingerprint: createHash('sha256').update('document').digest('hex') }
-    return { lease: { ...lease }, operation, ...(primary ? { primary } : {}), ...(secondary ? { secondary } : {}), target, ...(secondaryCurrent ? { secondaryTarget: secondaryCurrent.metadata } : {}) }
+    const selection = operation.kind === 'select' && primary ? await this.nativeSelection(primary, operation.values[0]!, signal) : undefined
+    return { lease: { ...lease }, operation, ...(selection ? { nativeSelection: selection } : {}), ...(primary ? { primary } : {}), ...(secondary ? { secondary } : {}), target, ...(secondaryCurrent ? { secondaryTarget: secondaryCurrent.metadata } : {}) }
   }
   private async hitTest(entry: SnapshotEntry, point: { x: number; y: number; quad?: number[] }, signal: AbortSignal): Promise<{ x: number; y: number }> {
     if (!entry.backendDOMNodeId || !Number.isFinite(point.x) || !Number.isFinite(point.y)) throw new Error('TARGET_NOT_ACTIONABLE')
@@ -699,7 +756,50 @@ export class BrowserAutomation {
         await key('keyDown', operation.key, modifierMask(operation.modifiers)); await key('keyUp', operation.key, modifierMask(operation.modifiers))
       } else if (operation.kind === 'select' && primaryPoint) {
         if (operation.values.length !== 1) throw new BrowserAutomationError('UNSUPPORTED_PAGE', dispatched)
-        await click(primaryPoint); await sendIrreversible('Input.insertText', { text: operation.values[0] }); await key('keyDown', 'Enter'); await key('keyUp', 'Enter')
+        const selection = prepared.nativeSelection
+        if (!selection || !prepared.primary) throw new Error('UNSUPPORTED_PAGE')
+        const current = await this.nativeSelection(prepared.primary, operation.values[0]!, signal)
+        if (current.fingerprint !== selection.fingerprint) throw new Error('STALE_GENERATION')
+        const popupExpanded = async (): Promise<boolean> => {
+          const partial = boundedResponse(await this.transport.send('Accessibility.getPartialAXTree', { backendNodeId: prepared.primary!.backendDOMNodeId, fetchRelatives: false }))
+          return (Array.isArray(partial['nodes']) ? partial['nodes'] as AXNode[] : []).some(node => !node.ignored && node.backendDOMNodeId === prepared.primary!.backendDOMNodeId && property(node, 'expanded') === true)
+        }
+        let commitAttempted = false
+        try {
+          await click(primaryPoint)
+          if (!(await popupExpanded())) throw new Error('TARGET_NOT_ACTIONABLE')
+          await key('keyDown', 'Home'); await key('keyUp', 'Home')
+          for (let index = 0; index < selection.index; index++) {
+            if (!(await popupExpanded())) throw new Error('TARGET_NOT_ACTIONABLE')
+            await key('keyDown', 'ArrowDown'); await key('keyUp', 'ArrowDown')
+          }
+          const beforeCommit = await this.nativeSelection(prepared.primary, operation.values[0]!, signal)
+          if (beforeCommit.fingerprint !== selection.fingerprint) throw new Error('STALE_GENERATION')
+          if (!(await popupExpanded())) throw new Error('TARGET_NOT_ACTIONABLE')
+          // Once Enter is attempted, an ensuing change handler may own the UI;
+          // do not send a speculative Escape to that handler on a late failure.
+          commitAttempted = true
+          await key('keyDown', 'Enter')
+          // Navigation may start during the commit. The shared held-key cleanup
+          // releases Enter without dispatching another key into the new document.
+          if (stillCurrent(dispatched, 'dispatch')) await key('keyUp', 'Enter')
+          // A change handler may navigate. Otherwise verify actual selectedness,
+          // not merely successful input dispatch (insertText on SELECT is a no-op).
+          if (stillCurrent(dispatched, 'dispatch')) {
+            try {
+              const after = await this.nativeSelection(prepared.primary, operation.values[0]!, signal)
+              if (after.backend !== selection.backend || !after.selected) throw new Error('TARGET_NOT_ACTIONABLE')
+            } catch (error) {
+              // The change-handler navigation can race the verification query.
+              // Only document replacement permits finishing without that query.
+              if (stillCurrent(dispatched, 'dispatch')) throw error
+            }
+          }
+        } finally {
+          if (!commitAttempted && this.transport.isAttached() && stillCurrent(dispatched, 'dispatch') && await popupExpanded().catch(() => false)) {
+            for (const type of ['keyDown', 'keyUp']) await this.transport.send('Input.dispatchKeyEvent', { type, key: 'Escape', code: 'Escape', modifiers: 0, windowsVirtualKeyCode: 27 }).catch(() => {})
+          }
+        }
       } else if ((operation.kind === 'check' || operation.kind === 'uncheck') && primaryPoint) {
         const desired = operation.kind === 'check'
         if (primaryPoint.checked === undefined) throw new BrowserAutomationError('TARGET_NOT_ACTIONABLE', dispatched)

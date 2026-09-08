@@ -32,9 +32,22 @@ assert(run && path.isAbsolute(run), 'private fixture run directory required')
 app.setPath('userData', path.join(run, 'profile'))
 app.disableHardwareAcceleration()
 app.commandLine.appendSwitch('disable-background-networking')
-const deadline = setTimeout(() => app.exit(2), 30000)
+let dumpPending = () => {}
+const deadline = setTimeout(() => { dumpPending(); app.exit(2) }, 30000)
 const { BrowserAutomation } = require(path.join(run, 'adapter.cjs'))
 const cases = [
+  { name: 'native select does not alter values when the page suppresses its popup', html: '<select aria-label="Rows" autofocus onmousedown="event.preventDefault()"><option value="20">Twenty</option><option value="50">Fifty</option><option value="90" selected>Ninety</option></select>', role: 'combobox', label: 'Rows', kind: 'select', values: ['50'], error: 'TARGET_NOT_ACTIONABLE', verify: 'document.querySelector("select").value', want: '90' },
+  { name: 'native select preserves non-ASCII whitespace in default values', html: '<select aria-label="Rows"><option>Twenty</option><option>&nbsp;Fifty&nbsp;</option></select>', role: 'combobox', label: 'Rows', kind: 'select', values: ['\u00a0Fifty\u00a0'], verify: 'document.querySelector("select").value', want: '\u00a0Fifty\u00a0' },
+  { name: 'native select refuses accessibility-only disabled options before input', html: '<select aria-label="Rows"><option value="20">Twenty</option><option value="50" aria-disabled="true">Fifty</option><option value="90">Ninety</option></select>', role: 'combobox', label: 'Rows', kind: 'select', values: ['90'], error: 'UNSUPPORTED_PAGE', verify: 'document.querySelector("select").value', want: '20' },
+  { name: 'native select can submit search navigation on change', html: '<select aria-label="Rows" onchange="location.search=\'next=1\'"><option value="20">Twenty</option><option value="50">Fifty</option></select>', role: 'combobox', label: 'Rows', kind: 'select', values: ['50'], settleMs: 100, verify: 'location.search', want: '?next=1' },
+  { name: 'native select commits one exact value with no intermediate changes', html: '<select aria-label="Rows" onchange="document.body.dataset.changed=(document.body.dataset.changed||\'\')+this.value+\',\'"><option value="20">Twenty</option><option value="50">Fifty</option><option value="90" selected>Ninety</option></select>', role: 'combobox', label: 'Rows', kind: 'select', values: ['50'], verify: 'document.body.dataset.changed', want: '50,' },
+  { name: 'native select skips disabled options and groups', html: '<select aria-label="Rows"><option disabled value="x">Disabled</option><option value="20">Twenty</option><optgroup label="Disabled group" disabled><option value="30">Thirty</option></optgroup><option value="50">Fifty</option></select>', role: 'combobox', label: 'Rows', kind: 'select', values: ['50'], verify: 'document.querySelector("select").value', want: '50' },
+  { name: 'native select rejects a missing value without changing selection', html: '<select aria-label="Rows"><option value="20">Twenty</option></select>', role: 'combobox', label: 'Rows', kind: 'select', values: ['missing'], error: 'TARGET_NOT_FOUND', verify: 'document.querySelector("select").value', want: '20' },
+  { name: 'native select rejects ambiguous values', html: '<select aria-label="Rows"><option value="20">Twenty</option><option value="50">First fifty</option><option value="50">Second fifty</option></select>', role: 'combobox', label: 'Rows', kind: 'select', values: ['50'], error: 'TARGET_AMBIGUOUS', verify: 'document.querySelector("select").value', want: '20' },
+  { name: 'native select detects option changes after preparation', html: '<select aria-label="Rows"><option value="20">Twenty</option><option value="50">Fifty</option></select>', role: 'combobox', label: 'Rows', kind: 'select', values: ['50'], afterPrepare: 'document.querySelectorAll("option")[1].textContent="Changed meaning"', error: 'STALE_GENERATION', verify: 'document.querySelector("select").value', want: '20' },
+  { name: 'cancelled native select closes its popup without committing', html: '<select aria-label="Rows"><option value="20">Twenty</option><option value="50">Fifty</option></select>', role: 'combobox', label: 'Rows', kind: 'select', values: ['50'], cancelAfterPress: true, error: 'ACTION_CANCELLED', verify: 'document.querySelector("select").value', want: '20' },
+  { name: 'native select supports option text as the default value', html: '<select aria-label="Rows"><option>Twenty</option><option> Fifty results </option></select>', role: 'combobox', label: 'Rows', kind: 'select', values: ['Fifty results'], verify: 'document.querySelector("select").value', want: 'Fifty results' },
+  { name: 'native select chooses by option value', html: '<select aria-label="Rows" onchange="document.body.dataset.changed=this.value"><option value="20">Twenty results</option><option value="50">Fifty results</option></select>', role: 'combobox', label: 'Rows', kind: 'select', values: ['50'], verify: 'document.querySelector("select").value + ":" + document.body.dataset.changed', want: '50:50' },
   { name: 'transparent Wikipedia-style menu checkbox opens contents', html: '<style>#contents{display:none}#toggle:checked~#contents{display:block}</style><input id="toggle" type="checkbox" role="button" aria-label="Toggle contents" style="opacity:0"><label for="toggle">Contents</label><nav id="contents">Article sections</nav>', role: 'button', label: 'Toggle contents', kind: 'click', verify: 'document.querySelector("#toggle").checked && getComputedStyle(document.querySelector("#contents")).display === "block"', want: true },
   { name: 'transparent native radio receives selection', html: '<input type="radio" aria-label="Choice" style="opacity:0"><label>Choice</label>', role: 'radio', label: 'Choice', kind: 'click', verify: 'document.querySelector("input").checked', want: true },
   { name: 'transparent arbitrary button still rejects activation', html: '<button aria-label="Invisible" style="opacity:0" onclick="document.body.dataset.clicked=1">Invisible</button>', role: 'button', label: 'Invisible', kind: 'click', error: 'TARGET_NOT_ACTIONABLE', verify: 'Boolean(document.body.dataset.clicked)', want: false },
@@ -96,12 +109,17 @@ app.whenReady().then(async () => {
   const win = new BrowserWindow({ width: 1000, height: 800, webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false } })
   const wc = win.webContents, debuggerApi = wc.debugger, trace = []
   let activeTest, activeController, documentEpoch = 0, requestCount = 0
+  const pendingCommands = new Map()
+  let commandSequence = 0
+  dumpPending = () => fs.writeFileSync(path.join(run, 'timeout.json'), JSON.stringify({ test: activeTest?.name, pending: [...pendingCommands.values()], trace }, null, 2))
   wc.on('did-start-navigation', (_event, _url, _inPlace, isMainFrame) => { if (_event.isMainFrame ?? isMainFrame) documentEpoch++ })
   const transport = {
     isAttached: () => debuggerApi.isAttached(), attach: version => debuggerApi.attach(version), detach: () => debuggerApi.detach(),
     onMessage: listener => debuggerApi.on('message', (_event, method, params) => { if (method.startsWith('DOM.')) trace.push({ method, params }); listener(method, params) }),
     send: async (method, params) => {
       requestCount++
+      const commandId = ++commandSequence
+      pendingCommands.set(commandId, { method, params })
       try {
         const result = await debuggerApi.sendCommand(method, params)
         if (activeTest?.removeOnHit && method === 'DOM.getNodeForLocation') await wc.executeJavaScript('document.querySelector("#cover")?.remove()')
@@ -115,7 +133,7 @@ app.whenReady().then(async () => {
       } catch (error) {
         trace.push({ method, params, error: error.message })
         throw error
-      }
+      } finally { pendingCommands.delete(commandId) }
     },
   }
   const automation = new BrowserAutomation(transport, () => wc.getURL(), () => wc.isLoading(), {}, { deviceScaleFactor: () => require('electron').screen.getDisplayMatching(win.getBounds()).scaleFactor })
@@ -154,7 +172,7 @@ app.whenReady().then(async () => {
           if (test.assertTruncation) assert(snapshot.truncated && snapshot.truncationReasons?.length, 'a bounded partial snapshot must explain its truncation')
           const node = snapshot.nodes.find(item => item.role === test.role && item.name === test.label)
           assert(node, 'fixture target missing')
-          operation = { kind: test.kind, target: { snapshotId: snapshot.snapshotId, ref: node.ref }, ...(test.kind === 'fill' ? { text: 'potatoes' } : {}), ...(test.key ? { key: test.key } : {}), ...(test.modifiers ? { modifiers: test.modifiers } : {}) }
+          operation = { kind: test.kind, target: { snapshotId: snapshot.snapshotId, ref: node.ref }, ...(test.kind === 'fill' ? { text: 'potatoes' } : {}), ...(test.key ? { key: test.key } : {}), ...(test.modifiers ? { modifiers: test.modifiers } : {}), ...(test.values ? { values: test.values } : {}) }
         }
         if (test.kind === 'drag') {
           const snapshot = await automation.snapshot(lease, { maxDepth: 20, maxNodes: 100, maxBytes: 262144 }, signal)

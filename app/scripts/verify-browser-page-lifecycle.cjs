@@ -40,7 +40,7 @@ const { encodeRemoteFrame } = require(path.join(run, 'frame.cjs'))
 app.whenReady().then(async () => {
   const server = require('node:http').createServer((request, response) => {
     response.setHeader('Content-Type', 'text/html')
-    response.end('<title>' + (request.url === '/next' ? 'Background navigation' : 'Private fixture') + '</title><input aria-label="Search" style="position:absolute;left:40px;top:40px;width:300px;height:40px">')
+    response.end('<title>' + (request.url === '/next' ? 'Background navigation' : 'Private fixture') + '</title><input aria-label="Search" style="position:absolute;left:40px;top:40px;width:300px;height:40px"><select aria-label="Rows" style="position:absolute;left:40px;top:110px"><option value="20">Twenty</option><option value="50">Fifty</option></select>')
   })
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
   const origin = 'http://127.0.0.1:' + server.address().port
@@ -58,6 +58,8 @@ app.whenReady().then(async () => {
     while (BrowserWindow.getFocusedWindow()?.id !== foreground.id && Date.now() < focusDeadline) await new Promise(resolve => setTimeout(resolve, 10))
     const focusedId = BrowserWindow.getFocusedWindow()?.id
     assert.equal(focusedId, foreground.id, 'fixture must establish a real foreground before testing focus preservation')
+    let foregroundBlurs = 0
+    foreground.on('blur', () => { foregroundBlurs++ })
     const windowCount = BrowserWindow.getAllWindows().length
     const contentsId = contents.id
     backgroundPage.hide()
@@ -69,6 +71,10 @@ app.whenReady().then(async () => {
     const prepared = await backgroundPage.automation.prepareInteraction(lease, { kind: 'fill', target: { snapshotId: snapshot.snapshotId, role: 'textbox', name: 'Search' }, text: 'background potatoes' }, signal)
     await backgroundPage.automation.executeInteraction(prepared, signal)
     assert.equal(await contents.executeJavaScript('document.querySelector("input").value'), 'background potatoes')
+    const choose = await backgroundPage.automation.prepareInteraction(lease, { kind: 'select', target: { snapshotId: snapshot.snapshotId, role: 'combobox', name: 'Rows' }, values: ['50'] }, signal)
+    await backgroundPage.automation.executeInteraction(choose, signal)
+    assert.equal(await contents.executeJavaScript('document.querySelector("select").value'), '50')
+    assert.equal(foregroundBlurs, 0, 'background select must not even transiently blur the foreground')
     assert.equal(BrowserWindow.getFocusedWindow()?.id, focusedId, 'background work must not steal focus')
     assert.equal(BrowserWindow.getAllWindows().length, windowCount + 1, 'one bounded background surface')
     backgroundPage.show()
