@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { commandCenterModel } from './commandCenter'
+import { commandCenterModel, pocketRows } from './commandCenter'
 import { initialState, type AppState, type PaneModel, type WorkspaceModel } from './store'
 
 const pane = (name: string, overrides: Partial<PaneModel> = {}): PaneModel => ({
@@ -168,5 +168,48 @@ describe('commandCenterModel', () => {
     expect(byName.get('retry')?.stateLabel).toBe('Codex retrying')
     expect(byName.get('parked')?.stateLabel).toBe('Parked to protect system resources')
     expect(byName.get('shell')?.stateLabel).toBe('Quiet shell')
+  })
+})
+
+describe('pocketRows', () => {
+  const model = (panes: PaneModel[], overrides: Partial<AppState> = {}) =>
+    commandCenterModel({ workspaces: workspaces(...panes), state: state(overrides), frozen: new Set() })
+
+  it('orders every session by slot in one list, ignoring its group', () => {
+    const rows = pocketRows(model([
+      pane('quiet', { slot: 3 }),
+      pane('agent', { kind: 'pi', runState: 'claude', slot: 1 }),
+      pane('dead', { alive: false, slot: 2 }),
+    ])).rows
+    expect(rows.map((r) => r.pane.name)).toEqual(['agent', 'dead', 'quiet'])
+  })
+
+  it('never moves a row when its state changes', () => {
+    // The reported bug: a shell hops Working<->Quiet as unseen output toggles,
+    // so its row jumps the length of the list under the user's finger.
+    const panes = [pane('a', { slot: 1 }), pane('shell', { slot: 2 }), pane('c', { slot: 3 })]
+    const before = pocketRows(model(panes)).rows.map((r) => r.pane.name)
+    const after = pocketRows(model(panes, { lastActivity: { shell: 9 }, lastSeen: {} })).rows
+    expect(after.map((r) => r.pane.name)).toEqual(before)
+    // The state itself must still be reported — it moves to the badge.
+    expect(after[1]!.group).toBe('working')
+    expect(before).toEqual(['a', 'shell', 'c'])
+  })
+
+  it('surfaces actionable sessions without giving them a position', () => {
+    const result = pocketRows(model([
+      pane('fine', { slot: 1 }),
+      pane('broken', { kind: 'pi', runState: 'shell-fallback', slot: 2 }),
+    ]))
+    expect(result.urgent.map((r) => r.pane.name)).toEqual(['broken'])
+    expect(result.rows.map((r) => r.pane.name)).toEqual(['fine', 'broken'])
+  })
+
+  it('puts a session with no slot last instead of first', () => {
+    const rows = pocketRows(model([
+      pane('unslotted', { slot: undefined }),
+      pane('slotted', { slot: 5 }),
+    ])).rows
+    expect(rows.map((r) => r.pane.name)).toEqual(['slotted', 'unslotted'])
   })
 })

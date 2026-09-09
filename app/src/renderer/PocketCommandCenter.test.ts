@@ -2,8 +2,8 @@ import { act, createElement } from 'react'
 import { withFakeDom } from './mountedTestDom'
 import { describe, expect, it, vi } from 'vitest'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { PocketCommandCenter, usageLine, PocketFocusHeader, pocketSessionTitle } from './PocketCommandCenter'
-import type { CommandCenterModel } from './commandCenter'
+import { PocketCommandCenter, usageLine, PocketFocusHeader, pocketSessionTitle, pocketSessionIdentity, pocketBadgeLabel } from './PocketCommandCenter'
+import type { CommandCenterItem, CommandCenterModel } from './commandCenter'
 import type { PaneModel } from './store'
 import type { ProviderUsage } from '../shared/proto'
 
@@ -135,20 +135,22 @@ describe('PocketCommandCenter', () => {
       expect(render({ model: altered })).not.toContain('Open chat for')
     }
   })
-  it('renders machine truth, urgency, session identity and useful metadata', () => {
+  it('renders machine truth, urgency and session identity', () => {
     const html = render()
     expect(html).toContain('teapot-dev')
     expect(html).toContain('Connected')
     expect(html).toContain('Memory pressure is critical.')
-    expect(html).toContain('Needs you')
-    expect(html).toContain('Nothing needs you')
-    expect(html).toContain('Working')
     expect(html).toContain('api-refactor')
-    expect(html).toContain('Pi working')
-    expect(html).toContain('platform')
-    expect(html).toContain('release')
+    // State is a badge on the row now, not a section the row lives in — and it
+    // drops the kind the row's chip already shows.
+    expect(html).toContain('working')
+    expect(html).not.toContain('Pi working')
     expect(html).toContain('#7')
-    expect(html).toContain('1.4 GB')
+    // Group headers and the zero-state card are gone: they consumed the
+    // vertical budget that the row needs to identify itself, and the group
+    // decided a row's position, which is what made rows jump.
+    expect(html).not.toContain('Nothing needs you')
+    expect(html).not.toContain('pocket-group-head')
   })
 
   it('exposes named touch actions and bottom navigation', () => {
@@ -208,5 +210,62 @@ describe('usageLine', () => {
       row({ provider: 'grok', state: 'unavailable', plan: null, detail: 'grok exposes no quota data' }),
     ])).toBeNull()
     expect(usageLine([])).toBeNull()
+  })
+})
+
+describe('pocketSessionIdentity', () => {
+  const item = (overrides: Partial<PaneModel> = {}) => ({
+    pane: {
+      name: 'amber-1-1-0-a', cwd: '/home/u/Projects/amber-ide', kind: 'pi',
+      alive: true, ord: 0, deadCode: null, slot: 2, ...overrides,
+    },
+  } as CommandCenterItem)
+
+  it('names the project, the branch and the kind', () => {
+    const id = pocketSessionIdentity(item({ branch: 'feat/pocket-mobile-ux' }), '/home/u')
+    expect(id.project).toBe('amber-ide')
+    expect(id.branch).toBe('feat/pocket-mobile-ux')
+    expect(id.kind).toBe('pi')
+  })
+
+  it('separates two panes in the same repository', () => {
+    // The reported problem: identical project, kind and slot-adjacent rows that
+    // cannot be told apart without opening them.
+    const a = pocketSessionIdentity(item({ branch: 'main' }), '/home/u')
+    const b = pocketSessionIdentity(item({ branch: 'fix/pi-session-recovery', slot: 3 }), '/home/u')
+    expect(a.project).toBe(b.project)
+    expect(a.branch).not.toBe(b.branch)
+  })
+
+  it('omits the branch outside a repository rather than showing an empty field', () => {
+    expect(pocketSessionIdentity(item({ branch: undefined }), '/home/u').branch).toBeUndefined()
+    expect(pocketSessionIdentity(item({ branch: '   ' }), '/home/u').branch).toBeUndefined()
+  })
+
+  it('falls back to the home marker when the cwd is home itself', () => {
+    expect(pocketSessionIdentity(item({ cwd: '/home/u' }), '/home/u').project).toBe('~')
+  })
+})
+
+describe('pocketBadgeLabel', () => {
+  const item = (stateLabel: string, kind = 'pi') =>
+    ({ stateLabel, pane: { kind } } as CommandCenterItem)
+
+  it('drops the kind the row already shows', () => {
+    // "Pi exited to shell" next to a `pi` chip spends the badge's width saying
+    // the same word twice, and then truncates to "Pi exited to s...".
+    expect(pocketBadgeLabel(item('Pi exited to shell'))).toBe('exited to shell')
+    expect(pocketBadgeLabel(item('Pi working'))).toBe('working')
+    expect(pocketBadgeLabel(item('Claude retrying', 'claude'))).toBe('retrying')
+  })
+
+  it('leaves a label that does not start with the kind alone', () => {
+    expect(pocketBadgeLabel(item('Session exited'))).toBe('Session exited')
+    expect(pocketBadgeLabel(item('Frozen by you'))).toBe('Frozen by you')
+    expect(pocketBadgeLabel(item('Parked to protect system memory'))).toBe('Parked to protect system memory')
+  })
+
+  it('never returns an empty badge', () => {
+    expect(pocketBadgeLabel(item('Pi'))).toBe('Pi')
   })
 })

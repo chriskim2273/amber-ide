@@ -634,6 +634,7 @@ mod tests {
 
     fn sess(name: &str) -> SessionInfo {
         SessionInfo {
+            branch: None,
             name: name.into(),
             cwd: "/tmp".into(),
             kind: "shell".into(),

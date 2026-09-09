@@ -1511,6 +1511,7 @@ mod tests {
 
     fn info(name: &str, alive: bool, updated: u64) -> proto::SessionInfo {
         proto::SessionInfo {
+            branch: None,
             name: name.into(),
             cwd: "/tmp".into(),
             kind: "shell".into(),

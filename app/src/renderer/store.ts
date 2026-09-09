@@ -67,6 +67,8 @@ export interface PaneModel {
   runState?: string | undefined
   claudeId?: string | undefined
   slot?: number | undefined
+  /** Git branch of `cwd`; what separates two panes in one repository. */
+  branch?: string | undefined
 }
 export interface TabModel { tab: number; panes: PaneModel[] }
 export interface WorkspaceModel { ws: number; tabs: TabModel[] }
@@ -381,6 +383,7 @@ export function groupSessions(state: AppState): WorkspaceModel[] {
       name: sess.name, cwd: sess.cwd, kind: sess.kind, alive: sess.alive,
       ord: p.ord, deadCode: sess.name in state.dead ? state.dead[sess.name]! : null,
       title: sess.title, runState: sess.run_state, claudeId: sess.claude_id, slot: sess.slot,
+      branch: sess.branch,
     }
     if (!wsMap.has(p.ws)) wsMap.set(p.ws, new Map())
     const tabs = wsMap.get(p.ws)!
