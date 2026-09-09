@@ -569,3 +569,147 @@
   color: var(--text-dim);
   font-variant-numeric: tabular-nums;
 }
+
+/* ---------- stable rows (2026-09-09) ----------
+   Position comes from the daemon slot alone, so state has to be legible ON the
+   row. Identity is project / branch / kind, because a live OSC title does not
+   exist for a session the phone has not attached — which is exactly why a
+   session had to be opened to be recognised. */
+
+/* Chrome pays for the list: the machine row absorbs plan usage, and the
+   workspace pills stop being 56px tall for a one-word label. */
+.pocket-machine { min-height: 56px; padding: 7px 14px; }
+.pocket-machine-mark { width: 30px; height: 30px; flex: 0 0 30px; border-radius: 8px; font-size: 12px; }
+.pocket-machine-copy strong { font-size: 14.5px; }
+.pocket-machine-usage {
+  flex: 0 0 auto;
+  color: var(--text-faint);
+  font: 11px var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+.pocket-workspaces { gap: 6px; padding: 7px 14px; }
+.pocket-workspaces button { min-height: 34px; padding: 0 13px; border-radius: 17px; font-size: 12.5px; }
+
+/* Actionable sessions keep prominence without owning a position in the list. */
+.pocket-urgent {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 56px;
+  margin: 0;
+  padding: 9px 12px;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  background: rgba(232, 198, 149, 0.09);
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.pocket-urgent-copy { min-width: 0; flex: 1; display: grid; gap: 2px; }
+.pocket-urgent-copy strong { color: #f0d3a6; font-size: 13.5px; font-weight: 650; }
+.pocket-urgent-copy > span {
+  overflow: hidden;
+  color: var(--text-dim);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Two lines, ~76px, one 44px-plus target. */
+.pocket-session, .pocket-session-open { min-height: 76px; }
+.pocket-session-open { gap: 10px; padding: 10px 6px 10px 12px; }
+.pocket-kind { width: 32px; height: 32px; flex: 0 0 32px; border-radius: 9px; }
+.pocket-kind::after { margin: 11px auto; }
+
+.pocket-session-ident {
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  overflow: hidden;
+  color: var(--text-faint);
+  font: 11.5px var(--font-mono);
+  white-space: nowrap;
+}
+/* Separators are drawn, not typed, so they never survive a copy of the row. */
+.pocket-session-ident > * + *::before {
+  content: '·';
+  margin-right: 6px;
+  color: var(--border-strong, #3a3a46);
+}
+/* The branch is the field that distinguishes two panes in one repository, so
+   it is the one that must not be the first to collapse. */
+.pocket-ident-project { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; }
+.pocket-ident-branch {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-dim);
+  text-overflow: ellipsis;
+}
+.pocket-ident-kind { flex: 0 0 auto; }
+
+/* State reads on the row and changes in place. */
+.pocket-badge {
+  flex: 0 0 auto;
+  max-width: 33%;
+  overflow: hidden;
+  padding: 3px 8px;
+  border-radius: 11px;
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-dim);
+  font: 600 11px var(--font-ui);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pocket-badge-needs-you { background: rgba(232, 198, 149, 0.16); color: #f0d3a6; }
+.pocket-badge-working { background: rgba(124, 108, 255, 0.16); color: #c9c2ff; }
+.pocket-badge-parked { background: rgba(255, 255, 255, 0.06); color: var(--text-faint); }
+
+/* Chat was a wide labelled button eating ~190px of a 402px row. */
+.pocket-session-chat {
+  width: 44px;
+  flex: 0 0 44px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-left: 1px solid var(--border);
+  background: transparent;
+  color: var(--accent-2);
+  cursor: pointer;
+}
+.pocket-chat-mark {
+  width: 15px;
+  height: 13px;
+  border: 1.5px solid currentColor;
+  border-radius: 4px 4px 4px 1px;
+}
+.pocket-session-chat:active { background: var(--accent-soft); }
+
+/* The badge shares the TITLE line, not the row: as a sibling of the copy block
+   it took width from the identity line too, which reintroduced the `amb… ·
+   fix/pi-se…` truncation this redesign exists to remove. */
+.pocket-session-title { gap: 6px; }
+.pocket-session-title strong { flex: 0 1 auto; }
+.pocket-session-title .pocket-badge { flex: 0 0 auto; max-width: 46%; margin-left: auto; }
+.pocket-session-ident { width: 100%; }
+/* Project may shrink; the branch is the distinguishing field and shrinks last. */
+.pocket-ident-project { flex: 1 1 auto; min-width: 3.5em; }
+.pocket-ident-branch { flex: 0 1 auto; max-width: 62%; }
+
+/* Project must not flex-grow: growing it opened a gap before the separator
+   ("IOTNation          · master · shell") instead of sitting beside it. */
+.pocket-ident-project { flex: 0 1 auto; min-width: 3.5em; }
+.pocket-session-ident { justify-content: flex-start; }
+.pocket-session-title .pocket-badge { max-width: 52%; }
+/* A speech bubble, not a plain box. */
+.pocket-chat-mark { position: relative; border-radius: 4px; }
+.pocket-chat-mark::after {
+  content: '';
+  position: absolute;
+  bottom: -4px;
+  left: 2px;
+  border-top: 4px solid currentColor;
+  border-right: 4px solid transparent;
+}

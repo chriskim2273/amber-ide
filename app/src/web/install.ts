@@ -8,6 +8,21 @@ import { createGestureClipboard } from './webClipboard'
 import type { LoadLayoutResult, SaveLayoutResult, LayoutVersion } from '../shared/layoutFile'
 import { slotFromWire, type RouterSlot } from '../shared/routerStatus'
 
+/**
+ * Name the machine from the page's own origin.
+ *
+ * Only a DNS name has labels worth trimming. Splitting an address literal on
+ * '.' turned `127.0.0.1` into a header that read "127".
+ */
+export function webMachineName(hostname: string): string {
+  if (hostname === '') return 'amber'
+  const ipv6 = hostname.includes(':')
+  const ipv4 = /^\d{1,3}(\.\d{1,3}){3}$/.test(hostname)
+  if (ipv6 || ipv4) return hostname
+  return hostname.split('.')[0] || 'amber'
+}
+
+
 function wsUrl(): string {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
   return `${proto}//${location.host}/ws`
@@ -218,7 +233,7 @@ export function installAmber(home: string): void {
     home,
     // The web renderer is already on the remote machine's HTTPS origin. Keep
     // only the first DNS label so command-center identity stays compact.
-    machineName: location.hostname.split('.')[0] || 'amber',
+    machineName: webMachineName(location.hostname),
     softwareGl: probeSoftwareGl(),
     layoutGet,
     layoutSave,

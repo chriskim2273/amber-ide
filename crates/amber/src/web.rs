@@ -1058,6 +1058,11 @@ fn session_json(s: &SessionInfo) -> serde_json::Value {
     if let Some(title) = s.title.as_deref() {
         out["title"] = serde_json::Value::String(title.to_string());
     }
+    // What tells two panes in the SAME repository apart on the phone, where
+    // project, kind and slot are identical for both. Absent outside a repo.
+    if let Some(branch) = s.branch.as_deref() {
+        out["branch"] = serde_json::Value::String(branch.to_string());
+    }
     out
 }
 
@@ -2457,6 +2462,7 @@ mod tests {
     /// mapping logic reads set meaningfully.
     fn s(name: &str, kind: &str) -> SessionInfo {
         SessionInfo {
+            branch: None,
             name: name.into(),
             cwd: "/tmp".into(),
             kind: kind.into(),

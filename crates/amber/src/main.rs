@@ -2546,6 +2546,7 @@ mod tests {
 
     fn info(kind: &str, alive: bool, run_state: Option<&str>) -> proto::SessionInfo {
         proto::SessionInfo {
+            branch: None,
             name: "amber-1-1-0-abc".to_string(),
             cwd: "/home/me/proj".to_string(),
             kind: kind.to_string(),

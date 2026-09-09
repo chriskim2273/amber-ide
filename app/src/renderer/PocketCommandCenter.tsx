@@ -1,4 +1,5 @@
 import { piChatAvailable } from './store'
+import { pocketRows } from './commandCenter'
 import type { CommandCenterItem, CommandCenterModel } from './commandCenter'
 import type { ProviderUsage } from '../shared/proto'
 import { normalizeFriendlyTitle } from '../shared/layoutFile'
@@ -50,6 +51,47 @@ export function pocketSessionTitle(item: CommandCenterItem, titles: Record<strin
   return item.pane.kind.length > 0
     ? item.pane.kind[0]!.toUpperCase() + item.pane.kind.slice(1)
     : 'Session'
+}
+
+export interface PocketSessionIdentity {
+  project: string
+  branch?: string | undefined
+  kind: string
+}
+
+/**
+ * The line that answers "which session is this?" without opening it.
+ *
+ * A live OSC title cannot do this job: it exists only once a pane is attached
+ * and rendering, and Pocket does not attach a session until it is opened —
+ * which is exactly why sessions had to be opened to be recognised. Project,
+ * branch and kind are all known from the daemon's session list alone.
+ */
+export function pocketSessionIdentity(item: CommandCenterItem, home: string): PocketSessionIdentity {
+  const cwd = shortCwd(item.pane.cwd, home)
+  const leaf = cwd.split('/').filter(Boolean).at(-1)
+  const branch = item.pane.branch?.trim()
+  return {
+    project: leaf && leaf !== '~' ? leaf : '~',
+    branch: branch && branch.length > 0 ? branch : undefined,
+    kind: item.pane.kind,
+  }
+}
+
+/**
+ * The badge text, with the kind the row already shows in its chip stripped.
+ *
+ * `commandCenterModel` labels states for every surface, so it spells the kind
+ * out ("Pi working"). Beside a `pi` chip that spends the badge's width saying
+ * the same word twice and then truncates the half that carries the meaning.
+ */
+export function pocketBadgeLabel(item: CommandCenterItem): string {
+  const kind = item.pane.kind
+  if (kind.length === 0) return item.stateLabel
+  const prefix = `${kind[0]!.toUpperCase()}${kind.slice(1)} `
+  if (!item.stateLabel.startsWith(prefix)) return item.stateLabel
+  const rest = item.stateLabel.slice(prefix.length).trim()
+  return rest.length > 0 ? rest : item.stateLabel
 }
 
 export function PocketNav({ active, onSessions, onMosaic, onDesktop, onNew }: {
@@ -166,12 +208,11 @@ export function PocketCommandCenter({
             {connected ? 'Connected' : 'Reconnecting'}
           </span>
         </span>
+        {usageLine(usage) !== null && (
+          <span className="pocket-machine-usage" aria-label="Agent plan usage">{usageLine(usage)}</span>
+        )}
         <span className="pocket-session-count">{model.count} session{model.count === 1 ? '' : 's'}</span>
       </header>
-
-      {usageLine(usage) !== null && (
-        <div className="pocket-usage" aria-label="Agent plan usage">{usageLine(usage)}</div>
-      )}
 
       <div className="pocket-workspaces" role="group" aria-label="Workspace filter">
         <button type="button" className={activeWorkspace === null ? 'active' : ''}
@@ -205,58 +246,67 @@ export function PocketCommandCenter({
             <p>Create a session or choose another workspace.</p>
             <button type="button" onClick={onNew}>Create session</button>
           </section>
-        ) : model.groups.map((group) => {
-          if (group.items.length === 0 && group.id !== 'needs-you') return null
+        ) : (() => {
+          // ONE list. A row's position comes from the daemon slot only, so a
+          // state change repaints its badge and never moves it. Actionable
+          // sessions keep their prominence through the pinned strip above.
+          const { rows, urgent } = pocketRows(model)
           return (
-            <section key={group.id} className={`pocket-group pocket-group-${group.id}`}>
-              <div className="pocket-group-head">
-                <h2>{group.label}</h2>
-                <span>{group.items.length}</span>
+            <>
+              {urgent.length > 0 && (
+                <button type="button" className="pocket-urgent" onClick={() => onOpen(urgent[0]!)}>
+                  <span className="pocket-alert-mark" aria-hidden="true">!</span>
+                  <span className="pocket-urgent-copy">
+                    <strong>{urgent.length} need{urgent.length === 1 ? 's' : ''} you</strong>
+                    <span>{urgent.map((item) => pocketSessionTitle(item, titles, home)).join(', ')}</span>
+                  </span>
+                  <span className="pocket-open-arrow" aria-hidden="true" />
+                </button>
+              )}
+              <div className="pocket-session-list">
+                {rows.map((item) => {
+                  const title = pocketSessionTitle(item, titles, home)
+                  const identity = pocketSessionIdentity(item, home)
+                  return (
+                    <article key={item.pane.name} className={`pocket-session pocket-session-${item.group}`}>
+                      <button type="button" className="pocket-session-open"
+                        aria-label={`Open ${title}`} onClick={() => onOpen(item)}>
+                        <span className={`pocket-kind pocket-kind-${item.pane.kind}`} aria-hidden="true" />
+                        <span className="pocket-session-copy">
+                          <span className="pocket-session-title">
+                            {item.pane.slot ? <code>#{item.pane.slot}</code> : null}
+                            <strong>{title}</strong>
+                            {/* A quiet session is the default; a badge saying so
+                                is noise that costs the identity line its width. */}
+                            {item.group !== 'quiet' && (
+                              <span className={`pocket-badge pocket-badge-${item.group}`}>{pocketBadgeLabel(item)}</span>
+                            )}
+                          </span>
+                          <span className="pocket-session-ident">
+                            <span className="pocket-ident-project">{identity.project}</span>
+                            {identity.branch !== undefined && (
+                              <span className="pocket-ident-branch" title={identity.branch}>{identity.branch}</span>
+                            )}
+                            <span className="pocket-ident-kind">{identity.kind}</span>
+                          </span>
+                        </span>
+                      </button>
+                      {piChatAvailable(item.pane, item.pane.deadCode ?? undefined) &&
+                        <button type="button" className="pocket-session-chat"
+                          aria-label={`Open chat for ${title}`} onClick={() => onOpenChat(item)}>
+                          <span className="pocket-chat-mark" aria-hidden="true" />
+                        </button>}
+                      <button type="button" className="pocket-session-actions"
+                        aria-label={`Actions for ${title}`} onClick={() => onActions(item)}>
+                        <span className="pocket-more-mark" aria-hidden="true" />
+                      </button>
+                    </article>
+                  )
+                })}
               </div>
-              {group.items.length === 0
-                ? <p className="pocket-clear">Nothing needs you</p>
-                : <div className="pocket-session-list">
-                    {group.items.map((item) => {
-                      const title = pocketSessionTitle(item, titles, home)
-                      const workspace = workspaceLabels[item.ws] ?? `Workspace ${item.ws}`
-                      const tab = tabLabels[`${item.ws}:${item.tab}`] ?? `Tab ${item.tab}`
-                      return (
-                        <article key={item.pane.name} className={`pocket-session pocket-session-${group.id}`}>
-                          <button type="button" className="pocket-session-open"
-                            aria-label={`Open ${title}`} onClick={() => onOpen(item)}>
-                            <span className={`pocket-kind pocket-kind-${item.pane.kind}`} aria-hidden="true" />
-                            <span className="pocket-session-copy">
-                              <span className="pocket-session-title">
-                                {item.pane.slot ? <code>#{item.pane.slot}</code> : null}
-                                <strong>{title}</strong>
-                              </span>
-                              <span className="pocket-session-state">{item.stateLabel}</span>
-                              <span className="pocket-session-meta">
-                                <span>{workspace}</span>
-                                <span>{tab}</span>
-                                {item.rssKb !== undefined && item.rssKb > 0
-                                  ? <code className={item.growing ? 'growing' : ''}>{formatMemory(item.rssKb)}</code>
-                                  : null}
-                              </span>
-                            </span>
-                            <span className="pocket-open-arrow" aria-hidden="true" />
-                          </button>
-                          {piChatAvailable(item.pane, item.pane.deadCode ?? undefined) &&
-                            <button type="button" className="pocket-session-chat"
-                              aria-label={`Open chat for ${title}`} onClick={() => onOpenChat(item)}>
-                              Open chat
-                            </button>}
-                          <button type="button" className="pocket-session-actions"
-                            aria-label={`Actions for ${title}`} onClick={() => onActions(item)}>
-                            <span className="pocket-more-mark" aria-hidden="true" />
-                          </button>
-                        </article>
-                      )
-                    })}
-                  </div>}
-            </section>
+            </>
           )
-        }))}
+        })())}
       </div>
 
       <PocketNav active="sessions" onSessions={() => {}} onMosaic={onMosaic}

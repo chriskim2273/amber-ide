@@ -21,6 +21,13 @@ pub struct SessionInfo {
     /// rename/move unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Git branch of the session's cwd (or a short sha when HEAD is detached),
+    /// `None` outside a repository. Display metadata only: it is what tells two
+    /// panes in the SAME repository apart on the phone's session list, where
+    /// project, kind and slot are identical for both. `#[serde(default)]` keeps
+    /// the wire additive — older peers omit it and decode `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     /// Unix seconds of the session's last state-store write (creation, or a
     /// later cwd change) — the honest ordering key for "most recent" (e.g.
     /// `amber attach` with no name). `#[serde(default)]` keeps the wire
@@ -1551,6 +1558,7 @@ mod tests {
     #[test]
     fn session_info_variants_roundtrip() {
         let info = SessionInfo {
+            branch: None,
             name: "amber-1-1-0-abc".into(),
             cwd: "/home/u/proj".into(),
             kind: "claude".into(),
@@ -1655,6 +1663,7 @@ mod tests {
         // A claude session's reported phase must survive encode/decode so the
         // app can render the pane's supervision state.
         let info = SessionInfo {
+            branch: None,
             name: "amber-1-1-0-a".into(),
             cwd: "/tmp".into(),
             kind: "claude".into(),
