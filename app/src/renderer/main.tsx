@@ -2405,7 +2405,7 @@ function App(): JSX.Element {
         <button className="btn btn-ghost tab-add" data-drop-tab={nextTab}
           title="new tab · drop a pane here to move it to a new tab" onClick={openTab}>+ Tab</button>
       </div>
-      <div className="tab-browser-workarea">
+      <div className={`tab-browser-workarea${pocketCommandActive ? ' pocket-stage-hidden' : ''}`}>
       <div className={`pane-stage${pocketCommandActive ? ' pocket-stage-hidden' : ''}`}>
         {/* Keep-alive: render ONE SplitView per tab in the workspace, hiding the
             inactive ones with display:none instead of unmounting them. Switching

@@ -24,7 +24,11 @@
    would make Pane's initial FitAddon fit a 0x0 host to its 2x1 floor; Mosaic's
    scale mode deliberately never re-fits, so those terminals would stay broken.
    Absolute + hidden preserves a real box without painting or taking flex space. */
-.app.mobile .pane-stage.pocket-stage-hidden {
+/* The wrapper carries this too. Hiding only the stage still left its
+   `.tab-browser-workarea` parent claiming `flex: 1` beside the command centre,
+   which split a 402x874 phone exactly in half. Taking the whole subtree out of
+   flow keeps the flex column single-child while the stage keeps a real box. */
+.app.mobile .pocket-stage-hidden {
   position: absolute;
   inset: 0;
   visibility: hidden;
