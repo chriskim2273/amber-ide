@@ -62,6 +62,21 @@ pub fn daemon_main(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Re
         std::fs::create_dir_all(parent)?;
     }
 
+    // Claim the socket BEFORE touching any session state. Two things depend on
+    // this ordering:
+    //
+    //  - A duplicate `amber daemon` must lose here and exit having restored
+    //    nothing. When the bind came after `restore()`, the loser first spawned
+    //    a second pty, supervisor and agent child for EVERY persisted session,
+    //    so two supervisors briefly shared one session's recording file.
+    //  - Restore takes seconds (it launches every agent). While the socket is
+    //    unbound a client sees no daemon at all, and the supervisors' own
+    //    run-state reports have nothing to connect to.
+    //
+    // Connects made from here until `serve()` queue in the listen backlog, so a
+    // client waits for the restore instead of concluding the daemon is absent.
+    let listener = daemon::prepare_socket(&socket_path)?;
+
     let watchers = Arc::new(watchers::Watchers::new());
     let (config, pressure_was_normalized) =
         StateStore::new(&root).load_config_with_diagnostics()?;
@@ -114,7 +129,6 @@ pub fn daemon_main(root: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Re
     #[cfg(windows)]
     winlifecycle::install_shutdown_handler(Arc::clone(&manager))?;
 
-    let listener = daemon::prepare_socket(&socket_path)?;
     {
         let manager = Arc::clone(&manager);
         let watchers = Arc::clone(&watchers);

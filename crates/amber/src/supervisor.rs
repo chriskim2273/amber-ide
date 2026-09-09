@@ -27,6 +27,11 @@ const REPORT_RETRY_DELAY: Duration = Duration::from_millis(100);
 /// so the terminal fallback must never wait for the reporter's unbounded retry
 /// loop before execing its shell.
 const REPORT_FINAL_WAIT: Duration = Duration::from_secs(2);
+/// Bounded re-reads of a Pi recording that looks unusable, and the pause
+/// between them. Short enough that a genuinely dead recording still reaches its
+/// shell promptly at boot.
+const PI_RECORDING_RETRIES: u32 = 5;
+const PI_RECORDING_RETRY_DELAY: Duration = Duration::from_millis(200);
 
 /// How often the interruptible run-wait polls for claude's exit or a suspend
 /// request (Slice 3). Replaces a blocking wait so a SIGUSR1 can park claude
@@ -177,11 +182,16 @@ pub fn supervise_agent(
             continue 'sup;
         }
         let recording = store.read_claude(name)?;
-        if matches!(agent, Agent::Pi)
-            && recording.as_ref().is_some_and(|meta| !pi::valid_recording(meta))
-        {
-            eprintln!("amber: Pi recording for {name} is ambiguous, missing, or invalid; leaving a shell (no fresh fallback)");
-            return Ok(SuperviseOutcome::Exhausted);
+        if matches!(agent, Agent::Pi) {
+            if let Some(defect) = pi_recording_defect(&store, name, &recording) {
+                eprintln!(
+                    "amber: Pi recording for {name} is unusable ({defect}); leaving a shell (no fresh fallback)"
+                );
+                // The pane becomes an ordinary shell with no trace of why, so
+                // the predicate that failed has to outlive it.
+                journal_pi_defect(&store, name, defect);
+                return Ok(SuperviseOutcome::Exhausted);
+            }
         }
         let recording_key = recording.as_ref().map(|meta| {
             (
@@ -324,6 +334,49 @@ pub fn supervise_agent(
                 std::thread::sleep(delay);
             }
         }
+    }
+}
+
+/// Re-read a Pi recording that looks unusable before giving up on it. The file
+/// is rewritten by Pi's own hook and its session file is appended to live, so a
+/// single read can land mid-write; a transient miss must not permanently
+/// downgrade the pane to a shell. Bounded, and it only ever re-reads the same
+/// recording — it never guesses a different conversation.
+fn pi_recording_defect(
+    store: &StateStore,
+    name: &str,
+    first: &Option<amber_core::state::ClaudeMeta>,
+) -> Option<&'static str> {
+    // No recording at all is a fresh Pi launch, not a defect.
+    let mut defect = pi::recording_defect(first.as_ref()?)?;
+    for _ in 0..PI_RECORDING_RETRIES {
+        std::thread::sleep(PI_RECORDING_RETRY_DELAY);
+        match store.read_claude(name) {
+            Ok(Some(meta)) => defect = pi::recording_defect(&meta)?,
+            // A recording that vanished mid-check is a fresh launch, not a
+            // reason to strand the pane on a shell.
+            Ok(None) => return None,
+            Err(_) => {}
+        }
+    }
+    Some(defect)
+}
+
+fn journal_pi_defect(store: &StateStore, name: &str, defect: &str) {
+    let event = amber_core::proto::RecoveryEvent {
+        at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        sequence: 0,
+        level: "warning".to_string(),
+        event: "session.pi_recording_invalid".to_string(),
+        session: Some(name.to_string()),
+        detail: format!("left a shell instead of resuming Pi: {defect}"),
+        code: None,
+    };
+    if let Err(error) = store.append_recovery_event(event) {
+        eprintln!("amber: could not journal Pi recording defect for {name}: {error}");
     }
 }
 
@@ -732,14 +785,26 @@ impl RunStateReporter {
     }
 }
 
+/// `amber run`'s stderr IS the pane's pty, shared with a full-screen agent TUI,
+/// so this reporter must never use it as a running log. One line per failure
+/// streak says the same thing without painting over the agent's screen ten
+/// times a second while the daemon is briefly unreachable.
+fn should_log_retry(consecutive_failures: u32) -> bool {
+    consecutive_failures == 0
+}
+
 fn report_until_acked(socket: &Path, name: &str, state: &str, seq: u64) -> anyhow::Result<()> {
+    let mut failures = 0u32;
     loop {
         match try_report_run_state(socket, name, state, seq) {
             Ok(()) => return Ok(()),
             Err(error) => {
-                eprintln!(
-                    "amber run: run_state {state} seq {seq} for {name} not acknowledged: {error}; retrying"
-                );
+                if should_log_retry(failures) {
+                    eprintln!(
+                        "amber run: run_state {state} seq {seq} for {name} not acknowledged: {error}; retrying quietly"
+                    );
+                }
+                failures = failures.saturating_add(1);
                 std::thread::sleep(REPORT_RETRY_DELAY);
             }
         }
@@ -1318,6 +1383,122 @@ mod tests {
 
         assert!(error.to_string().contains("registration failure"));
         assert_eq!(calls, 2);
+    }
+
+    fn pi_recording(dir: &Path, file: Option<PathBuf>) -> amber_core::state::ClaudeMeta {
+        amber_core::state::ClaudeMeta {
+            session_id: "sid".into(),
+            cwd: dir.into(),
+            updated: 1,
+            session_file: Some(file.unwrap_or_else(|| dir.join("2026-08-27_0198f8ea.jsonl"))),
+            agent_kind: Some(SessionKind::Pi),
+        }
+    }
+
+    #[test]
+    fn an_unresumable_pi_recording_journals_why_before_leaving_a_shell() {
+        // Dropping a Pi pane to a bare shell is invisible from the pane itself,
+        // so the failed predicate has to survive in the recovery journal.
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        store.write_claude("agent", &pi_recording(dir.path(), None)).unwrap();
+
+        let states = std::sync::Mutex::new(Vec::new());
+        let outcome = supervise_agent(
+            &Agent::Pi,
+            &dir.path().join("missing-agent"),
+            dir.path(),
+            "agent",
+            dir.path(),
+            2,
+            |state| states.lock().unwrap().push(state.to_string()),
+            &SuspendControl::new(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, SuperviseOutcome::Exhausted);
+        assert!(
+            states.into_inner().unwrap().is_empty(),
+            "the gate returns before any agent is spawned"
+        );
+        let events = store.list_recovery_events(20).unwrap();
+        let event = events
+            .iter()
+            .find(|event| event.event == "session.pi_recording_invalid")
+            .expect("the shell-fallback reason must be journaled");
+        assert_eq!(event.session.as_deref(), Some("agent"));
+        assert!(
+            event.detail.contains("session file could not be opened"),
+            "detail must name the predicate, got {:?}",
+            event.detail
+        );
+    }
+
+    #[test]
+    fn a_pi_session_with_no_recording_is_a_fresh_launch_not_a_defect() {
+        // Every newly created Pi pane takes this branch, and it must not spend
+        // the retry budget or be journaled as unresumable.
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        let started = std::time::Instant::now();
+
+        assert_eq!(pi_recording_defect(&store, "agent", &None), None);
+
+        assert!(
+            started.elapsed() < PI_RECORDING_RETRY_DELAY,
+            "an absent recording must not sleep through the retry budget"
+        );
+        assert!(store.list_recovery_events(20).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_transiently_unreadable_pi_recording_is_re_read_not_abandoned() {
+        // The recording is rewritten by Pi's own hook, so a read can land
+        // mid-write. A transient miss must not permanently downgrade the pane.
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        let file = dir.path().join("2026-08-27_0198f8ea.jsonl");
+        store.write_claude("agent", &pi_recording(dir.path(), Some(file.clone()))).unwrap();
+
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(120));
+            std::fs::write(&file, "{\"type\":\"session\",\"id\":\"sid\"}\n").unwrap();
+        });
+
+        let outcome = supervise_agent(
+            &Agent::Pi,
+            &dir.path().join("missing-agent"),
+            dir.path(),
+            "agent",
+            dir.path(),
+            1,
+            |_| {},
+            &SuspendControl::new(),
+            None,
+        )
+        .unwrap();
+        writer.join().unwrap();
+
+        assert_eq!(outcome, SuperviseOutcome::Exhausted, "the missing binary still exhausts");
+        let events = store.list_recovery_events(20).unwrap();
+        assert!(
+            !events.iter().any(|event| event.event == "session.pi_recording_invalid"),
+            "a recording that became readable must not be journaled as invalid: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_run_state_retry_streak_writes_the_pane_pty_only_once() {
+        // The supervisor shares this pty with a full-screen agent TUI; repeated
+        // diagnostics paint over the agent's screen.
+        assert!(should_log_retry(0), "the first failure must be reported");
+        for failures in 1..500u32 {
+            assert!(
+                !should_log_retry(failures),
+                "retry {failures} must stay quiet on the pane's pty"
+            );
+        }
     }
 
     #[test]
