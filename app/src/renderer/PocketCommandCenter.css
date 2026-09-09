@@ -713,3 +713,10 @@
   border-top: 4px solid currentColor;
   border-right: 4px solid transparent;
 }
+
+/* A workspace pill labelled "1" collapsed to 35x34 once the pills were
+   shortened — under the 44px touch floor in BOTH axes. The vertical budget
+   this redesign reclaims comes from dropping the group headers and the
+   zero-state card, not from undersizing a control. */
+.pocket-workspaces { padding: 5px 14px; }
+.pocket-workspaces button { min-height: 44px; min-width: 44px; }
