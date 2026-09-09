@@ -2143,13 +2143,29 @@ pub fn is_session_file(path: &str) -> bool {
 /// never turn `pi --session` into a fresh conversation or a prefix search.
 /// Read only a bounded header, never a user's conversation body.
 pub fn valid_recording(recording: &amber_core::state::ClaudeMeta) -> bool {
+    recording_defect(recording).is_none()
+}
+
+/// Name the single predicate that makes a Pi recording unresumable, or `None`
+/// when it is valid. Failing this check drops the pane to a bare shell, and the
+/// pane itself keeps no trace of why — so the reason has to be reportable.
+pub fn recording_defect(recording: &amber_core::state::ClaudeMeta) -> Option<&'static str> {
     use std::io::{BufRead, BufReader, Read};
     if recording.agent_kind != Some(amber_core::state::SessionKind::Pi) {
-        return false;
+        return Some("recording is not source-tagged for Pi");
     }
-    let Some(path) = recording.session_file.as_deref() else { return false };
-    if !is_session_file(&path.to_string_lossy()) || !recording.cwd.is_absolute() || !recording.cwd.is_dir() {
-        return false;
+    let Some(path) = recording.session_file.as_deref() else {
+        return Some("recording has no session file");
+    };
+    if !is_session_file(&path.to_string_lossy()) {
+        return Some("session file is not a Pi session path");
+    }
+    if !recording.cwd.is_absolute() {
+        return Some("recorded cwd is not absolute");
+    }
+    // A deleted git worktree is the realistic way a live pane loses this.
+    if !recording.cwd.is_dir() {
+        return Some("recorded cwd no longer exists");
     }
     let mut options = OpenOptions::new();
     options.read(true);
@@ -2158,14 +2174,26 @@ pub fn valid_recording(recording: &amber_core::state::ClaudeMeta) -> bool {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NONBLOCK);
     }
-    let Ok(file) = options.open(path) else { return false };
-    if !file.metadata().is_ok_and(|m| m.is_file()) { return false }
+    let Ok(file) = options.open(path) else {
+        return Some("session file could not be opened");
+    };
+    if !file.metadata().is_ok_and(|m| m.is_file()) {
+        return Some("session file is not a regular file");
+    }
     let mut header = String::new();
     if BufReader::new(file.take(16 * 1024)).read_line(&mut header).is_err() {
-        return false;
+        return Some("session file header could not be read");
     }
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&header) else { return false };
-    value["type"] == "session" && value["id"].as_str() == Some(recording.session_id.as_str())
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&header) else {
+        return Some("session file header is not JSON");
+    };
+    if value["type"] != "session" {
+        return Some("session file header is not a session record");
+    }
+    if value["id"].as_str() != Some(recording.session_id.as_str()) {
+        return Some("session file header does not match the recorded id");
+    }
+    None
 }
 
 /// Resolve the Pi binary via the user's login shell, never the daemon PATH.
@@ -2346,6 +2374,49 @@ mod tests {
         assert!(valid_recording(&recording), "a legitimate MAIN fork is allowed");
         recording.agent_kind = None;
         assert!(!valid_recording(&recording), "untagged legacy recording is ambiguous");
+    }
+
+    #[test]
+    fn recording_defect_names_the_single_failed_predicate() {
+        // A Pi pane that fails this check silently becomes a bare shell, so the
+        // reason must be recoverable after the fact — the pane keeps no trace.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("2026-08-27_0198f8ea.jsonl");
+        fs::write(&path, "{\"type\":\"session\",\"id\":\"sid\"}\n").unwrap();
+        let good = amber_core::state::ClaudeMeta {
+            session_id: "sid".into(), cwd: dir.path().into(), updated: 1,
+            session_file: Some(path.clone()), agent_kind: Some(amber_core::state::SessionKind::Pi),
+        };
+        assert_eq!(recording_defect(&good), None);
+
+        let untagged = amber_core::state::ClaudeMeta { agent_kind: None, ..good.clone() };
+        assert_eq!(recording_defect(&untagged), Some("recording is not source-tagged for Pi"));
+
+        let no_file = amber_core::state::ClaudeMeta { session_file: None, ..good.clone() };
+        assert_eq!(recording_defect(&no_file), Some("recording has no session file"));
+
+        let bad_shape = amber_core::state::ClaudeMeta {
+            session_file: Some("relative/session.jsonl".into()), ..good.clone()
+        };
+        assert_eq!(recording_defect(&bad_shape), Some("session file is not a Pi session path"));
+
+        // A deleted worktree is the realistic way a live pane loses its cwd.
+        let gone_cwd = amber_core::state::ClaudeMeta {
+            cwd: dir.path().join("deleted-worktree"), ..good.clone()
+        };
+        assert_eq!(recording_defect(&gone_cwd), Some("recorded cwd no longer exists"));
+
+        let missing = amber_core::state::ClaudeMeta {
+            session_file: Some(dir.path().join("absent.jsonl")), ..good.clone()
+        };
+        assert_eq!(recording_defect(&missing), Some("session file could not be opened"));
+
+        fs::write(&path, "{\"type\":\"session\",\"id\":\"other\"}\n").unwrap();
+        assert_eq!(recording_defect(&good), Some("session file header does not match the recorded id"));
+
+        // The bool wrapper every caller uses must stay in lockstep.
+        assert!(!valid_recording(&good));
+        assert!(valid_recording(&amber_core::state::ClaudeMeta { session_id: "other".into(), ..good.clone() }));
     }
 
     #[test]

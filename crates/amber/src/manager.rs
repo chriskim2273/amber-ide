@@ -1253,12 +1253,25 @@ impl SessionManager {
                     // Claude, even when its file has since been removed.
                     meta.resume_as_claude = false;
                     changed = true;
-                    if crate::pi::valid_recording(&recording) {
-                        meta.kind = SessionKind::Pi;
-                        meta.cwd = recording.cwd;
-                        kind_changed = true;
-                    } else {
-                        eprintln!("amber: invalid Pi recovery file for {}; leaving shell", meta.name);
+                    match crate::pi::recording_defect(&recording) {
+                        None => {
+                            meta.kind = SessionKind::Pi;
+                            meta.cwd = recording.cwd;
+                            kind_changed = true;
+                        }
+                        Some(defect) => {
+                            eprintln!(
+                                "amber: invalid Pi recovery file for {} ({defect}); leaving shell",
+                                meta.name
+                            );
+                            self.record_recovery_event(
+                                "warning",
+                                "session.pi_recording_invalid",
+                                Some(&meta.name),
+                                format!("left a shell instead of promoting to Pi: {defect}"),
+                                None,
+                            );
+                        }
                     }
                 }
                 Ok(_) => {}
