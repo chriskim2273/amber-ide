@@ -211,7 +211,7 @@ export class BrowserAutomation {
     this.assertAlive()
     if (!this.listenerInstalled) { this.listenerInstalled = true; this.transport.onMessage((method, params) => this.onMessage(method, params)) }
     if (newlyAttached || !this.domainsEnabled) {
-      for (const method of ENABLE_METHODS) { this.assertAlive(); await this.transport.send(method); this.assertAlive() }
+      for (const method of ENABLE_METHODS) { this.assertAlive(); await this.send(method, {}); this.assertAlive() }
       this.domainsEnabled = true
     }
   }
@@ -229,8 +229,8 @@ export class BrowserAutomation {
     if (method === 'Page.javascriptDialogOpening') {
       const type = text(params['type'], 32), message = redactBrowserText(text(params['message'], 1024)).slice(0, 1024)
       const decision = this.controls.dialog?.({ type, message }) ?? Promise.reject(new Error('DIALOG_UNAVAILABLE'))
-      const handling = decision.then((result) => this.transport.send('Page.handleJavaScriptDialog', { accept: result.accept, ...(result.accept && result.promptText !== undefined ? { promptText: result.promptText.slice(0, 4096) } : {}) }),
-        () => this.transport.send('Page.handleJavaScriptDialog', { accept: false })).then(() => {})
+      const handling = decision.then((result) => this.send('Page.handleJavaScriptDialog', { accept: result.accept, ...(result.accept && result.promptText !== undefined ? { promptText: result.promptText.slice(0, 4096) } : {}) }),
+        () => this.send('Page.handleJavaScriptDialog', { accept: false })).then(() => {})
       this.dialogBarrier = handling
       void handling.catch(() => {}).finally(() => { if (this.dialogBarrier === handling) this.dialogBarrier = null })
       return
@@ -293,7 +293,7 @@ export class BrowserAutomation {
     const depthByNodeId = new Map<number, number>(), seenAXNodes = new Set<string>()
     const safeUrl = sanitizeBrowserUrl(this.currentUrl()), inputLimit = Math.min(512 * 1024, Math.max(16 * 1024, limits.maxBytes * 2))
     this.domRelations.clear()
-    const document = await this.transport.send('DOM.getDocument', { depth: 0, pierce: false }); abort(signal)
+    const document = await this.send('DOM.getDocument', { depth: 0, pierce: false }); abort(signal)
     let inputBytes = Buffer.byteLength(JSON.stringify(document))
     if (inputBytes > inputLimit) {
       this.snapshotCache = { lease: { ...lease }, snapshotId, entries, nodes }
@@ -303,7 +303,7 @@ export class BrowserAutomation {
     let used = 512 + Buffer.byteLength(safeUrl), scanned = 0, truncated = false
     for (const query of [INTERACTIVE_SEARCH_XPATH, SNAPSHOT_SEARCH_XPATH]) {
     if (truncated || scanned >= limits.maxNodes) { truncated = true; break }
-    const search = await this.transport.send('DOM.performSearch', { query, includeUserAgentShadowDOM: false }); abort(signal)
+    const search = await this.send('DOM.performSearch', { query, includeUserAgentShadowDOM: false }); abort(signal)
     const searchId = text(search['searchId'], 256), resultCount = typeof search['resultCount'] === 'number' && Number.isSafeInteger(search['resultCount']) ? Math.max(0, search['resultCount']) : 0
     if (!searchId) throw new Error('UNSUPPORTED_PAGE')
     let searchScanned = 0
@@ -312,14 +312,14 @@ export class BrowserAutomation {
       if (inputBytes > inputLimit) truncated = true
       outer: for (let start = 0; !truncated && start < resultCount && scanned < limits.maxNodes; start += 32) {
         abort(signal)
-        const page = await this.transport.send('DOM.getSearchResults', { searchId, fromIndex: start, toIndex: Math.min(resultCount, start + 32) }); abort(signal)
+        const page = await this.send('DOM.getSearchResults', { searchId, fromIndex: start, toIndex: Math.min(resultCount, start + 32) }); abort(signal)
         inputBytes += Buffer.byteLength(JSON.stringify(page))
         if (inputBytes > inputLimit) { truncated = true; break }
         const nodeIds = Array.isArray(page['nodeIds']) ? page['nodeIds'].filter((id): id is number => typeof id === 'number').slice(0, 32) : []
         for (const nodeId of nodeIds) {
           if (scanned >= limits.maxNodes) { truncated = true; break outer }
           scanned += 1; searchScanned += 1; abort(signal)
-          const described = await this.transport.send('DOM.describeNode', { nodeId, depth: 0, pierce: false }); abort(signal)
+          const described = await this.send('DOM.describeNode', { nodeId, depth: 0, pierce: false }); abort(signal)
           inputBytes += Buffer.byteLength(JSON.stringify(described))
           if (inputBytes > inputLimit) { truncated = true; break outer }
           const domNode = described['node'] as Record<string, unknown> | undefined
@@ -327,7 +327,7 @@ export class BrowserAutomation {
           const depth = parentId === undefined ? 0 : (depthByNodeId.get(parentId) ?? -1) + 1
           depthByNodeId.set(nodeId, depth)
           if (depth > limits.maxDepth) { truncationReasons.add('depth-limit'); continue }
-          const partial = await this.transport.send('Accessibility.getPartialAXTree', { nodeId, fetchRelatives: false }); abort(signal)
+          const partial = await this.send('Accessibility.getPartialAXTree', { nodeId, fetchRelatives: false }); abort(signal)
           inputBytes += Buffer.byteLength(JSON.stringify(partial))
           if (inputBytes > inputLimit) { truncated = true; break outer }
           const candidates = Array.isArray(partial['nodes']) ? partial['nodes'] as AXNode[] : []
@@ -350,7 +350,7 @@ export class BrowserAutomation {
         }
       }
       if (searchScanned < resultCount) truncated = true
-    } finally { await this.transport.send('DOM.discardSearchResults', { searchId }).catch(() => {}) }
+    } finally { await this.send('DOM.discardSearchResults', { searchId }).catch(() => {}) }
     }
     this.snapshotCache = { lease: { ...lease }, snapshotId, entries, nodes }
     if (inputBytes > inputLimit) truncationReasons.add('input-byte-budget')
@@ -374,16 +374,16 @@ export class BrowserAutomation {
   async inspect(lease: BrowserAutomationLease, target: BrowserElementRef, signal: AbortSignal): Promise<Record<string, unknown>> {
     abort(signal); await this.ensureAttached(); const entry = this.resolve(lease, target)
     if (!entry.backendDOMNodeId) throw new Error('UNSUPPORTED_PAGE')
-    const pushed = await this.transport.send('DOM.pushNodesByBackendIdsToFrontend', { backendNodeIds: [entry.backendDOMNodeId] }); abort(signal)
+    const pushed = await this.send('DOM.pushNodesByBackendIdsToFrontend', { backendNodeIds: [entry.backendDOMNodeId] }); abort(signal)
     const nodeId = Array.isArray(pushed['nodeIds']) && typeof pushed['nodeIds'][0] === 'number' ? pushed['nodeIds'][0] : undefined
-    const described = await this.transport.send('DOM.describeNode', { ...(nodeId === undefined ? { backendNodeId: entry.backendDOMNodeId } : { nodeId }), depth: 0, pierce: false }); abort(signal)
+    const described = await this.send('DOM.describeNode', { ...(nodeId === undefined ? { backendNodeId: entry.backendDOMNodeId } : { nodeId }), depth: 0, pierce: false }); abort(signal)
     const node = described['node'] as Record<string, unknown> | undefined; const attrs = Array.isArray(node?.['attributes']) ? node!['attributes'] as unknown[] : []
     const attributes: Record<string, string> = {}
     for (let index = 0; index + 1 < attrs.length; index += 2) { const key = text(attrs[index], 128).toLocaleLowerCase(); if (SAFE_ATTRIBUTES.has(key)) attributes[key] = redactBrowserText(text(attrs[index + 1], 2048)) }
     const computedStyle: Record<string, string> = {}
     if (nodeId !== undefined) {
       try {
-        const computed = await this.transport.send('CSS.getComputedStyleForNode', { nodeId })
+        const computed = await this.send('CSS.getComputedStyleForNode', { nodeId })
         for (const item of Array.isArray(computed['computedStyle']) ? computed['computedStyle'] as Array<Record<string, unknown>> : []) {
           const name = text(item['name'], 128)
           if (SAFE_COMPUTED_STYLES.has(name)) computedStyle[name] = redactBrowserText(text(item['value'], 512))
@@ -394,7 +394,7 @@ export class BrowserAutomation {
     let parentId = typeof node?.['parentId'] === 'number' ? node['parentId'] : nodeId === undefined ? undefined : this.domRelations.parentOf(nodeId)
     for (let depth = 0; parentId !== undefined && depth < 8; depth++) {
       try {
-        const parent = (await this.transport.send('DOM.describeNode', { nodeId: parentId, depth: 0, pierce: false }))['node'] as Record<string, unknown> | undefined
+        const parent = (await this.send('DOM.describeNode', { nodeId: parentId, depth: 0, pierce: false }))['node'] as Record<string, unknown> | undefined
         if (!parent) break
         const parentAttrs = Array.isArray(parent['attributes']) ? parent['attributes'] as unknown[] : []
         const summary: { tag: string; id?: string; role?: string } = { tag: text(parent['nodeName'], 128).toLocaleLowerCase() }
@@ -408,7 +408,7 @@ export class BrowserAutomation {
       } catch { break }
     }
     let box: Record<string, number> | undefined
-    try { const result = await this.transport.send('DOM.getBoxModel', { backendNodeId: entry.backendDOMNodeId }); const border = (result['model'] as Record<string, unknown> | undefined)?.['border']; if (Array.isArray(border) && border.length === 8 && border.every((n) => typeof n === 'number')) box = { ...quadBounds(border as number[]) } } catch { /* detached nodes have no box */ }
+    try { const result = await this.send('DOM.getBoxModel', { backendNodeId: entry.backendDOMNodeId }); const border = (result['model'] as Record<string, unknown> | undefined)?.['border']; if (Array.isArray(border) && border.length === 8 && border.every((n) => typeof n === 'number')) box = { ...quadBounds(border as number[]) } } catch { /* detached nodes have no box */ }
     return { snapshotId: target.snapshotId, ref: target.ref, tag: text(node?.['nodeName'], 128).toLocaleLowerCase(), role: entry.role, name: entry.name, attributes, computedStyle, ancestry, ...(box ? { box } : {}) }
   }
   private resolveTarget(lease: BrowserAutomationLease, target: BrowserTarget): SnapshotEntry {
@@ -424,7 +424,7 @@ export class BrowserAutomation {
     let parentId = typeof domNode?.['parentId'] === 'number' ? domNode['parentId'] : this.domRelations.parentOf(Number(domNode?.['nodeId']))
     for (let depth = 0; parentId !== undefined && depth < 8; depth++) {
       abort(signal)
-      const described = boundedResponse(await this.transport.send('DOM.describeNode', { nodeId: parentId, depth: 0, pierce: false })); abort(signal)
+      const described = boundedResponse(await this.send('DOM.describeNode', { nodeId: parentId, depth: 0, pierce: false })); abort(signal)
       const parent = described['node'] as Record<string, unknown> | undefined
       if (!parent) break
       if (text(parent['nodeName'], 32).toLocaleLowerCase() === 'form') {
@@ -438,9 +438,9 @@ export class BrowserAutomation {
   private async actionable(entry: SnapshotEntry, signal: AbortSignal, editable = false, scroll = false): Promise<{ x: number; y: number; quad: number[]; focused: boolean; checked?: boolean; metadata: InteractionTargetMetadata }> {
     abort(signal)
     if (!entry.backendDOMNodeId) throw new Error('UNSUPPORTED_PAGE')
-    const described = boundedResponse(await this.transport.send('DOM.describeNode', { backendNodeId: entry.backendDOMNodeId, depth: 0, pierce: false })); abort(signal)
+    const described = boundedResponse(await this.send('DOM.describeNode', { backendNodeId: entry.backendDOMNodeId, depth: 0, pierce: false })); abort(signal)
     const domNode = described['node'] as Record<string, unknown> | undefined
-    const partial = boundedResponse(await this.transport.send('Accessibility.getPartialAXTree', { backendNodeId: entry.backendDOMNodeId, fetchRelatives: false })); abort(signal)
+    const partial = boundedResponse(await this.send('Accessibility.getPartialAXTree', { backendNodeId: entry.backendDOMNodeId, fetchRelatives: false })); abort(signal)
     const node = Array.isArray(partial['nodes']) ? (partial['nodes'] as AXNode[]).find((candidate) => !candidate.ignored) : undefined
     if (!node || property(node, 'disabled') === true) throw new Error('TARGET_NOT_ACTIONABLE')
     if (editable && (property(node, 'readonly') === true || 'readonly' in domAttributes(domNode))) throw new Error('TARGET_NOT_ACTIONABLE')
@@ -448,10 +448,10 @@ export class BrowserAutomation {
     const base = targetMetadata(node, domNode, role, name, entry.backendDOMNodeId)
     if (base.fingerprint !== entry.metadata.fingerprint) throw new Error('STALE_GENERATION')
     const current = targetMetadata(node, domNode, role, name, entry.backendDOMNodeId, await this.formSemantics(domNode, signal))
-    const pushed = await this.transport.send('DOM.pushNodesByBackendIdsToFrontend', { backendNodeIds: [entry.backendDOMNodeId] }); abort(signal)
+    const pushed = await this.send('DOM.pushNodesByBackendIdsToFrontend', { backendNodeIds: [entry.backendDOMNodeId] }); abort(signal)
     const nodeId = Array.isArray(pushed['nodeIds']) && typeof pushed['nodeIds'][0] === 'number' ? pushed['nodeIds'][0] : undefined
     if (!nodeId) throw new Error('TARGET_NOT_ACTIONABLE')
-    const styles = boundedResponse(await this.transport.send('CSS.getComputedStyleForNode', { nodeId })); abort(signal)
+    const styles = boundedResponse(await this.send('CSS.getComputedStyleForNode', { nodeId })); abort(signal)
     const style = new Map((Array.isArray(styles['computedStyle']) ? styles['computedStyle'] as Array<Record<string, unknown>> : []).map((item) => [text(item['name'], 64), text(item['value'], 128)]))
     // Styled native toggles (e.g. Wikipedia's menu) use an opacity-zero
     // input as the hit target. Keep geometry/occlusion and disabled checks;
@@ -459,8 +459,8 @@ export class BrowserAutomation {
     const nativeToggle = current.tag === 'input' && ['checkbox', 'radio'].includes(current.type.toLowerCase())
     if (style.get('display') === 'none' || style.get('visibility') === 'hidden' || style.get('pointer-events') === 'none'
       || (Number(style.get('opacity') ?? '1') <= 0 && !nativeToggle)) throw new Error('TARGET_NOT_ACTIONABLE')
-    if (scroll) { await this.transport.send('DOM.scrollIntoViewIfNeeded', { backendNodeId: entry.backendDOMNodeId }); abort(signal) }
-    const box = boundedResponse(await this.transport.send('DOM.getBoxModel', { backendNodeId: entry.backendDOMNodeId })); abort(signal)
+    if (scroll) { await this.send('DOM.scrollIntoViewIfNeeded', { backendNodeId: entry.backendDOMNodeId }); abort(signal) }
+    const box = boundedResponse(await this.send('DOM.getBoxModel', { backendNodeId: entry.backendDOMNodeId })); abort(signal)
     const border = (box['model'] as Record<string, unknown> | undefined)?.['border']
     if (!Array.isArray(border) || border.length !== 8 || !border.every((value) => typeof value === 'number' && Number.isFinite(value))) throw new Error('TARGET_NOT_ACTIONABLE')
     const { x, y, width, height } = quadBounds(border as number[])
@@ -469,7 +469,7 @@ export class BrowserAutomation {
     return { x: x + width / 2, y: y + height / 2, quad: border as number[], focused: property(node, 'focused') === true, ...(checked === undefined ? {} : { checked }), metadata: current }
   }
   private async effectiveViewport(signal: AbortSignal): Promise<EffectiveBrowserViewport> {
-    const metrics = boundedResponse(await this.transport.send('Page.getLayoutMetrics')); abort(signal)
+    const metrics = boundedResponse(await this.send('Page.getLayoutMetrics', {})); abort(signal)
     const view = (metrics['cssVisualViewport'] ?? metrics['cssLayoutViewport']) as Record<string, unknown> | undefined
     const result = { width: Number(view?.['clientWidth'] ?? view?.['width']), height: Number(view?.['clientHeight'] ?? view?.['height']), pageX: Number(view?.['pageX'] ?? 0), pageY: Number(view?.['pageY'] ?? 0) }
     if (!Object.values(result).every(Number.isFinite) || result.width < 1 || result.height < 1 || result.width > 4096 || result.height > 4096) throw new Error('REQUEST_LIMIT')
@@ -480,11 +480,11 @@ export class BrowserAutomation {
     if (!this.observations.isFresh(observation) || !sameViewport(observation.viewport, await this.effectiveViewport(signal)) || observation.viewportRevision !== this.viewportRevision) throw new Error('STALE_GENERATION')
   }
   private async pointerReceiver(point: BrowserPoint, viewport: EffectiveBrowserViewport, signal: AbortSignal, pixels = true): Promise<InteractionTargetMetadata> {
-    const hit = await this.transport.send('DOM.getNodeForLocation', { x: Math.floor(point.x + viewport.pageX), y: Math.floor(point.y + viewport.pageY), includeUserAgentShadowDOM: false, ignorePointerEventsNone: false }); abort(signal)
+    const hit = await this.send('DOM.getNodeForLocation', { x: Math.floor(point.x + viewport.pageX), y: Math.floor(point.y + viewport.pageY), includeUserAgentShadowDOM: false, ignorePointerEventsNone: false }); abort(signal)
     const backend = hit['backendNodeId']
     if (typeof backend !== 'number') throw new Error('TARGET_NOT_ACTIONABLE')
-    const described = boundedResponse(await this.transport.send('DOM.describeNode', { backendNodeId: backend, depth: 0, pierce: false })); abort(signal)
-    const partial = boundedResponse(await this.transport.send('Accessibility.getPartialAXTree', { backendNodeId: backend, fetchRelatives: false })); abort(signal)
+    const described = boundedResponse(await this.send('DOM.describeNode', { backendNodeId: backend, depth: 0, pierce: false })); abort(signal)
+    const partial = boundedResponse(await this.send('Accessibility.getPartialAXTree', { backendNodeId: backend, fetchRelatives: false })); abort(signal)
     const node = (partial['nodes'] as AXNode[] | undefined)?.find(item => !item.ignored) ?? {}
     const dom = described['node'] as Record<string, unknown> | undefined
     const metadata = targetMetadata(node, dom, text(node.role?.value, 256), redactBrowserText(text(node.name?.value, 4096)), backend)
@@ -492,7 +492,7 @@ export class BrowserAutomation {
     await this.cursor.hide()
     const width = Math.min(64, viewport.width), height = Math.min(64, viewport.height)
     const x = Math.min(Math.max(0, point.x - width / 2), viewport.width - width), y = Math.min(Math.max(0, point.y - height / 2), viewport.height - height)
-    const crop = await this.transport.send('Page.captureScreenshot', { format: 'png', fromSurface: true, captureBeyondViewport: false,
+    const crop = await this.send('Page.captureScreenshot', { format: 'png', fromSurface: true, captureBeyondViewport: false,
       clip: { x: viewport.pageX + x, y: viewport.pageY + y, width, height, scale: this.captureScale(width, height, 256) } }); abort(signal)
     if (typeof crop['data'] !== 'string' || crop['data'].length > 512 * 1024) throw new Error('REQUEST_LIMIT')
     const digest = createHash('sha256').update(crop['data']).digest('hex')
@@ -519,9 +519,16 @@ export class BrowserAutomation {
     }
     return { lease: { ...lease }, operation, target: { role: 'document', name: 'Browser pointer', tag: 'body', type: '', fingerprint: createHash('sha256').update(JSON.stringify(points)).digest('hex') }, grounded: { observation, points, fingerprints: [], receiverFingerprints: [] } }
   }
+  /** Bounded tail of recently issued CDP commands, for crash forensics. */
+  recentCommands(): string[] { return [...this.cdpTail] }
+  private readonly cdpTail: string[] = []
+  private send(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+    this.cdpTail.push(`${new Date().toISOString()} ${method}`); if (this.cdpTail.length > 40) this.cdpTail.shift()
+    return this.transport.send(method, params)
+  }
   private async nativeSelection(entry: SnapshotEntry, value: string, signal: AbortSignal): Promise<NativeSelection> {
     abort(signal)
-    const described = boundedResponse(await this.transport.send('DOM.describeNode', { backendNodeId: entry.backendDOMNodeId, depth: 2 }), 256 * 1024)
+    const described = boundedResponse(await this.send('DOM.describeNode', { backendNodeId: entry.backendDOMNodeId, depth: 2 }), 256 * 1024)
     const select = described['node'] as Record<string, unknown> | undefined
     const attributes = (node: Record<string, unknown> | undefined): Map<string, string> => {
       const raw = Array.isArray(node?.['attributes']) ? node['attributes'] : [], result = new Map<string, string>()
@@ -532,7 +539,7 @@ export class BrowserAutomation {
     // Listboxes/multiple selects commit intermediate arrow-key changes. This
     // native dropdown path must commit only the requested option, once.
     if (select?.['nodeName'] !== 'SELECT' || selectAttrs.has('multiple') || Number(selectAttrs.get('size') ?? 0) > 1) throw new Error('UNSUPPORTED_PAGE')
-    const tree = boundedResponse(await this.transport.send('Accessibility.queryAXTree', { backendNodeId: entry.backendDOMNodeId, role: 'option' }), 256 * 1024)
+    const tree = boundedResponse(await this.send('Accessibility.queryAXTree', { backendNodeId: entry.backendDOMNodeId, role: 'option' }), 256 * 1024)
     abort(signal)
     const nodes = Array.isArray(tree['nodes']) ? tree['nodes'] as AXNode[] : []
     if (nodes.length > 512) throw new Error('REQUEST_LIMIT')
@@ -555,7 +562,7 @@ export class BrowserAutomation {
     for (const node of nodes) {
       abort(signal)
       if (typeof node.backendDOMNodeId !== 'number') throw new Error('UNSUPPORTED_PAGE')
-      const result = boundedResponse(await this.transport.send('DOM.describeNode', { backendNodeId: node.backendDOMNodeId, depth: 1 }))
+      const result = boundedResponse(await this.send('DOM.describeNode', { backendNodeId: node.backendDOMNodeId, depth: 1 }))
       const option = result['node'] as Record<string, unknown> | undefined
       if (option?.['nodeName'] !== 'OPTION') throw new Error('UNSUPPORTED_PAGE')
       const attrs = attributes(option)
@@ -593,7 +600,7 @@ export class BrowserAutomation {
   }
   private async hitTest(entry: SnapshotEntry, point: { x: number; y: number; quad?: number[] }, signal: AbortSignal): Promise<{ x: number; y: number }> {
     if (!entry.backendDOMNodeId || !Number.isFinite(point.x) || !Number.isFinite(point.y)) throw new Error('TARGET_NOT_ACTIONABLE')
-    const metrics = boundedResponse(await this.transport.send('Page.getLayoutMetrics')); abort(signal)
+    const metrics = boundedResponse(await this.send('Page.getLayoutMetrics', {})); abort(signal)
     const viewport = (metrics['cssVisualViewport'] ?? metrics['cssLayoutViewport']) as Record<string, unknown> | undefined
     const width = typeof viewport?.['clientWidth'] === 'number' ? viewport['clientWidth'] : viewport?.['width']
     const height = typeof viewport?.['clientHeight'] === 'number' ? viewport['clientHeight'] : viewport?.['height']
@@ -607,13 +614,13 @@ export class BrowserAutomation {
     const layout = (metrics['cssLayoutViewport'] ?? viewport) as Record<string, unknown>
     const pageX = Number(layout['pageX'] ?? 0), pageY = Number(layout['pageY'] ?? 0)
     if (!Number.isFinite(pageX) || !Number.isFinite(pageY)) throw new Error('TARGET_NOT_ACTIONABLE')
-    const hit = boundedResponse(await this.transport.send('DOM.getNodeForLocation', { x: Math.floor(exactPoint.x + pageX), y: Math.floor(exactPoint.y + pageY), includeUserAgentShadowDOM: false, ignorePointerEventsNone: false })); abort(signal)
+    const hit = boundedResponse(await this.send('DOM.getNodeForLocation', { x: Math.floor(exactPoint.x + pageX), y: Math.floor(exactPoint.y + pageY), includeUserAgentShadowDOM: false, ignorePointerEventsNone: false })); abort(signal)
     let backend = typeof hit['backendNodeId'] === 'number' ? hit['backendNodeId'] : undefined
     let nodeId = typeof hit['nodeId'] === 'number' ? hit['nodeId'] : undefined
     for (let depth = 0; depth < 32 && (backend !== undefined || nodeId !== undefined); depth++) {
       if (backend === entry.backendDOMNodeId || (nodeId !== undefined && this.domRelations.isWithin(nodeId, entry.backendDOMNodeId))) return exactPoint
       let described: Record<string, unknown>
-      try { described = boundedResponse(await this.transport.send('DOM.describeNode', { ...(nodeId !== undefined ? { nodeId } : { backendNodeId: backend }), depth: 0, pierce: false })) }
+      try { described = boundedResponse(await this.send('DOM.describeNode', { ...(nodeId !== undefined ? { nodeId } : { backendNodeId: backend }), depth: 0, pierce: false })) }
       catch (error) {
         // A transient covering node can disappear after the hit reply. Only
         // this measured missing-node error is recoverable; never replay input.
@@ -668,7 +675,7 @@ export class BrowserAutomation {
       // A lost/error response does not prove that Chromium ignored the input.
       dispatched = true
       try {
-        await this.transport.send(method, params)
+        await this.send(method, params)
         if (method === 'Input.dispatchKeyEvent' && params['type'] === 'keyUp') heldKeys.delete(keyId)
         if (method === 'Input.dispatchMouseEvent' && params['type'] === 'mouseReleased') heldButtons.delete(button)
       } catch (error) {
@@ -688,7 +695,7 @@ export class BrowserAutomation {
             // A one-pixel readback fences the frame without injecting page code;
             // the real HTTP fixture otherwise silently drops every input event.
             const viewport = await this.effectiveViewport(signal)
-            await this.transport.send('Page.captureScreenshot', { format: 'png', fromSurface: true, captureBeyondViewport: false,
+            await this.send('Page.captureScreenshot', { format: 'png', fromSurface: true, captureBeyondViewport: false,
               clip: { x: viewport.pageX, y: viewport.pageY, width: 1, height: 1, scale: 1 } })
             ensure()
           }
@@ -724,7 +731,7 @@ export class BrowserAutomation {
           if (prepared.primary) {
             const current = await this.actionable(prepared.primary, signal, true)
             if (current.metadata.fingerprint !== prepared.target.fingerprint) throw new Error('STALE_GENERATION')
-            const partial = await this.transport.send('Accessibility.getPartialAXTree', { backendNodeId: prepared.primary.backendDOMNodeId, fetchRelatives: false })
+            const partial = await this.send('Accessibility.getPartialAXTree', { backendNodeId: prepared.primary.backendDOMNodeId, fetchRelatives: false })
             if (!(partial['nodes'] as AXNode[] | undefined)?.some(node => property(node, 'focused') === true)) throw new Error('STALE_GENERATION')
           } else if (grounded.fingerprints.length) {
             const endpoints = operation.kind === 'mouseDrag' && !release ? [grounded.points[0]!, grounded.points.at(-1)!] : [grounded.points.at(-1)!]
@@ -761,7 +768,7 @@ export class BrowserAutomation {
         const current = await this.nativeSelection(prepared.primary, operation.values[0]!, signal)
         if (current.fingerprint !== selection.fingerprint) throw new Error('STALE_GENERATION')
         const popupExpanded = async (): Promise<boolean> => {
-          const partial = boundedResponse(await this.transport.send('Accessibility.getPartialAXTree', { backendNodeId: prepared.primary!.backendDOMNodeId, fetchRelatives: false }))
+          const partial = boundedResponse(await this.send('Accessibility.getPartialAXTree', { backendNodeId: prepared.primary!.backendDOMNodeId, fetchRelatives: false }))
           return (Array.isArray(partial['nodes']) ? partial['nodes'] as AXNode[] : []).some(node => !node.ignored && node.backendDOMNodeId === prepared.primary!.backendDOMNodeId && property(node, 'expanded') === true)
         }
         let commitAttempted = false
@@ -785,10 +792,18 @@ export class BrowserAutomation {
           if (stillCurrent(dispatched, 'dispatch')) await key('keyUp', 'Enter')
           // A change handler may navigate. Otherwise verify actual selectedness,
           // not merely successful input dispatch (insertText on SELECT is a no-op).
+          // The verification must stay on the DOM/Runtime surface: an
+          // Accessibility query against a document the navigation is tearing
+          // down SIGSEGVs the renderer (observed exit 139 on Wikipedia).
           if (stillCurrent(dispatched, 'dispatch')) {
             try {
-              const after = await this.nativeSelection(prepared.primary, operation.values[0]!, signal)
-              if (after.backend !== selection.backend || !after.selected) throw new Error('TARGET_NOT_ACTIONABLE')
+              const resolved = await this.send('DOM.resolveNode', { backendNodeId: prepared.primary!.backendDOMNodeId })
+              const objectId = (resolved['object'] as Record<string, unknown> | undefined)?.['objectId']
+              if (typeof objectId !== 'string' || !objectId) throw new Error('TARGET_NOT_ACTIONABLE')
+              const probe = await this.send('Runtime.callFunctionOn', { objectId, functionDeclaration: 'function() { if (!(this instanceof HTMLSelectElement)) return null; const o = this.options[this.selectedIndex]; return { value: this.value, text: o ? o.textContent : null } }', returnByValue: true })
+              if (probe['exceptionDetails']) throw new Error('TARGET_NOT_ACTIONABLE')
+              const committed = (probe['result'] as Record<string, unknown> | undefined)?.['value'] as Record<string, unknown> | undefined
+              if (!committed || committed['value'] !== operation.values[0]) throw new Error('TARGET_NOT_ACTIONABLE')
             } catch (error) {
               // The change-handler navigation can race the verification query.
               // Only document replacement permits finishing without that query.
@@ -797,7 +812,7 @@ export class BrowserAutomation {
           }
         } finally {
           if (!commitAttempted && this.transport.isAttached() && stillCurrent(dispatched, 'dispatch') && await popupExpanded().catch(() => false)) {
-            for (const type of ['keyDown', 'keyUp']) await this.transport.send('Input.dispatchKeyEvent', { type, key: 'Escape', code: 'Escape', modifiers: 0, windowsVirtualKeyCode: 27 }).catch(() => {})
+            for (const type of ['keyDown', 'keyUp']) await this.send('Input.dispatchKeyEvent', { type, key: 'Escape', code: 'Escape', modifiers: 0, windowsVirtualKeyCode: 27 }).catch(() => {})
           }
         }
       } else if ((operation.kind === 'check' || operation.kind === 'uncheck') && primaryPoint) {
@@ -832,9 +847,9 @@ export class BrowserAutomation {
         // Releasing at the pressed control completes a native click, even with
         // clickCount:0 (real Electron regression). Release outside web content;
         // these are renderer-local CDP coordinates, never desktop coordinates.
-        for (const params of heldButtons.values()) await this.transport.send('Input.dispatchMouseEvent', { ...params, x: -1, y: -1, buttons: 0, clickCount: 0 }).catch(() => {})
+        for (const params of heldButtons.values()) await this.send('Input.dispatchMouseEvent', { ...params, x: -1, y: -1, buttons: 0, clickCount: 0 }).catch(() => {})
         if (signal.aborted || heldButtons.size || heldKeys.size) await this.cursor.hide()
-        for (const params of [...heldKeys.values()].reverse()) await this.transport.send('Input.dispatchKeyEvent', params).catch(() => {})
+        for (const params of [...heldKeys.values()].reverse()) await this.send('Input.dispatchKeyEvent', params).catch(() => {})
       }
     }
   }
@@ -842,7 +857,7 @@ export class BrowserAutomation {
     abort(signal)
     await this.ensureAttached()
     abort(signal)
-    const result = await this.transport.send('Page.captureScreenshot', { format: 'png', fromSurface, captureBeyondViewport: false })
+    const result = await this.send('Page.captureScreenshot', { format: 'png', fromSurface, captureBeyondViewport: false })
     abort(signal)
     if (typeof result['data'] !== 'string') throw new Error('INTERNAL_ERROR')
     const data = Buffer.from(result['data'], 'base64')
@@ -853,9 +868,9 @@ export class BrowserAutomation {
   async screenshot(lease: BrowserAutomationLease, target: BrowserElementRef | undefined, fullPage: boolean, signal: AbortSignal): Promise<BrowserBinaryAttachment> {
     abort(signal); await this.ensureAttached(); let clip: { x: number; y: number; width: number; height: number; scale: number } | undefined
     let viewport: EffectiveBrowserViewport | undefined
-    if (target) { const entry = this.resolve(lease, target); if (!entry.backendDOMNodeId) throw new Error('UNSUPPORTED_PAGE'); const box = await this.transport.send('DOM.getBoxModel', { backendNodeId: entry.backendDOMNodeId }); const border = (box['model'] as Record<string, unknown> | undefined)?.['border'] as number[] | undefined; if (!border || border.length !== 8) throw new Error('UNSUPPORTED_PAGE'); clip = { ...quadBounds(border), scale: 1 } }
+    if (target) { const entry = this.resolve(lease, target); if (!entry.backendDOMNodeId) throw new Error('UNSUPPORTED_PAGE'); const box = await this.send('DOM.getBoxModel', { backendNodeId: entry.backendDOMNodeId }); const border = (box['model'] as Record<string, unknown> | undefined)?.['border'] as number[] | undefined; if (!border || border.length !== 8) throw new Error('UNSUPPORTED_PAGE'); clip = { ...quadBounds(border), scale: 1 } }
     else {
-      const metrics = await this.transport.send('Page.getLayoutMetrics')
+      const metrics = await this.send('Page.getLayoutMetrics', {})
       const size = (fullPage ? metrics['cssContentSize'] : (metrics['cssVisualViewport'] ?? metrics['cssLayoutViewport'] ?? metrics['cssContentSize'])) as Record<string, unknown> | undefined
       const width = typeof size?.['clientWidth'] === 'number' ? size['clientWidth'] : size?.['width']
       const height = typeof size?.['clientHeight'] === 'number' ? size['clientHeight'] : size?.['height']
@@ -867,7 +882,7 @@ export class BrowserAutomation {
     if (clip) clip.scale = this.captureScale(clip.width, clip.height)
     const restoreCursor = await this.cursor.suspend()
     let result: Record<string, unknown>
-    try { result = await this.transport.send('Page.captureScreenshot', { format: 'png', fromSurface: true, captureBeyondViewport: fullPage, ...(clip ? { clip } : {}) }); abort(signal) }
+    try { result = await this.send('Page.captureScreenshot', { format: 'png', fromSurface: true, captureBeyondViewport: fullPage, ...(clip ? { clip } : {}) }); abort(signal) }
     finally { if (!signal.aborted) restoreCursor() }
     if (typeof result['data'] !== 'string') throw new Error('INTERNAL_ERROR')
     const data = Buffer.from(result['data'], 'base64'); if (data.length > SCREENSHOT_MAX_BYTES) throw new Error('REQUEST_LIMIT')
@@ -903,7 +918,7 @@ export class BrowserAutomation {
   }
   reload(ignoreCache: boolean): { accepted: boolean } { this.invalidate(); return { accepted: this.controls.reload?.(ignoreCache) !== false } }
   history(direction: 'back' | 'forward'): { accepted: boolean } { this.invalidate(); return { accepted: this.controls.history?.(direction) !== false } }
-  async setViewport(viewport: BrowserViewport, signal: AbortSignal): Promise<{ viewport: BrowserViewport }> { const size = parseBrowserViewport(viewport); if (!size) throw new Error('INVALID_REQUEST'); abort(signal); await this.ensureAttached(); abort(signal); const scale = viewport.deviceScaleFactor ?? 1; await this.transport.send('Emulation.setDeviceMetricsOverride', { width: size.width, height: size.height, deviceScaleFactor: scale, mobile: viewport.mobile ?? false, screenWidth: size.width, screenHeight: size.height }); this.emulatedScaleFactor = scale; this.invalidate(); return { viewport: { ...viewport, ...size } } }
+  async setViewport(viewport: BrowserViewport, signal: AbortSignal): Promise<{ viewport: BrowserViewport }> { const size = parseBrowserViewport(viewport); if (!size) throw new Error('INVALID_REQUEST'); abort(signal); await this.ensureAttached(); abort(signal); const scale = viewport.deviceScaleFactor ?? 1; await this.send('Emulation.setDeviceMetricsOverride', { width: size.width, height: size.height, deviceScaleFactor: scale, mobile: viewport.mobile ?? false, screenWidth: size.width, screenHeight: size.height }); this.emulatedScaleFactor = scale; this.invalidate(); return { viewport: { ...viewport, ...size } } }
   /** Return to the native WebContentsView content bounds without changing the
    * persisted fixed viewport. Clearing emulation also invalidates every
    * screenshot coordinate lease captured under the old CSS viewport. */
@@ -917,7 +932,7 @@ export class BrowserAutomation {
       return
     }
     await this.ensureAttached(); abort(signal)
-    await this.transport.send('Emulation.clearDeviceMetricsOverride')
+    await this.send('Emulation.clearDeviceMetricsOverride', {})
     this.emulatedScaleFactor = undefined
     this.measuredViewport = undefined
     this.viewportRevision += 1

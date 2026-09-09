@@ -182,7 +182,7 @@ export class ElectronTabBrowserPage implements TabBrowserPage {
     this.view.webContents.on('page-title-updated', (_event, title) => onPageEvent({ type: 'title', title }))
     this.view.webContents.on('focus', () => onPageEvent({ type: 'focus', focused: true }))
     this.view.webContents.on('blur', () => onPageEvent({ type: 'focus', focused: false }))
-    this.view.webContents.on('render-process-gone', (_event, details) => { if (!this.disposing) onPageEvent({ type: 'crashed', reason: details.reason }) })
+    this.view.webContents.on('render-process-gone', (_event, details) => { if (!this.disposing) onPageEvent({ type: 'crashed', reason: details.reason, exitCode: details.exitCode, automationLog: this.automation?.recentCommands() }) })
     // A page `window.close()` (or our own close after the owner is gone) must
     // not be treated as Amber's window chrome. Depth is held until `destroyed`
     // because Electron posts the actual teardown off this turn.

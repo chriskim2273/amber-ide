@@ -358,6 +358,8 @@ describe('browser automation', () => {
           return { nodes: [{ nodeId: `ax-${id}`, role: { value: button ? 'button' : checkbox ? 'checkbox' : select ? 'combobox' : 'textbox' }, name: { value: this.changed ? 'Changed' : button ? 'Drop target' : checkbox ? 'Remember me' : select ? 'Country' : 'Search' }, backendDOMNodeId: id, properties: [{ name: 'checked', value: { value: false } }, { name: 'expanded', value: { value: select } }] }] }
         }
         if (method === 'Accessibility.queryAXTree') return { nodes: [{ backendDOMNodeId: 305, role: { value: 'option' }, name: { value: 'Canada' }, properties: [{ name: 'selected', value: { value: true } }] }] }
+        if (method === 'DOM.resolveNode' && params?.['backendNodeId'] === 304) return { object: { objectId: 'obj-select', type: 'node' } }
+        if (method === 'Runtime.callFunctionOn') return { result: { type: 'object', value: { value: 'Canada', text: 'Canada' } } }
         if (method === 'DOM.pushNodesByBackendIdsToFrontend') return { nodeIds: [42] }
         if (method === 'CSS.getComputedStyleForNode') return { computedStyle: [{ name: 'display', value: 'block' }, { name: 'visibility', value: 'visible' }, { name: 'opacity', value: '1' }, { name: 'pointer-events', value: 'auto' }] }
         if (method === 'DOM.getBoxModel') { const id = params?.['backendNodeId']; const x = this.offscreen ? 900 : id === 302 ? 100 : id === 303 ? 200 : id === 304 ? 300 : 0; return { model: { border: [x, 0, x + 80, 0, x + 80, 20, x, 20] } } }
@@ -479,6 +481,63 @@ describe('browser automation', () => {
     const prepared = await automation.prepareInteraction(lease, { kind: 'click', target: { snapshotId: snapshot.snapshotId, ref: 'n2' } }, new AbortController().signal)
     const failure = await automation.executeInteraction(prepared, controller.signal).catch((error: unknown) => error)
     expect(failure).toMatchObject({ code: 'ACTION_CANCELLED', dispatched: true })
+  })
+
+  it('verifies a native select commit without Accessibility-domain queries after Enter', async () => {
+    // Regression: the post-commit verification used Accessibility.queryAXTree,
+    // which Chromium can SIGSEGV on when the change handler navigates and the
+    // old document is mid-teardown (observed: renderer exit 139 on Wikipedia's
+    // results-per-page select). Post-Enter selectedness must be probed via the
+    // DOM/Runtime domains, never the AX domain.
+    const enterCalls: string[] = []
+    class NavigatingSelectDebugger extends FakeDebugger {
+      private committed = false
+      callsAfterEnter: string[] = []
+      override async send(method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>> {
+        this.calls.push(method)
+        if (this.committed) this.callsAfterEnter.push(method)
+        if (method === 'DOM.getDocument') return { root: { nodeId: 300, nodeName: '#document' } }
+        if (method === 'DOM.performSearch') return { searchId: 'nav-select', resultCount: 1 }
+        if (method === 'DOM.getSearchResults') return { nodeIds: [304] }
+        if (method === 'Input.dispatchKeyEvent' && params?.['key'] === 'Enter' && params?.['type'] === 'keyDown') {
+          this.committed = true
+          enterCalls.push(method)
+        }
+        if (this.committed && (method === 'Accessibility.queryAXTree' || method === 'Accessibility.getPartialAXTree')) {
+          throw new Error('AX query after Enter: renderer crash hazard (document mid-teardown)')
+        }        if (method === 'DOM.describeNode') {
+          const id = params?.['nodeId'] ?? params?.['backendNodeId']
+          if (id === 300) return { node: { nodeName: 'FORM', backendNodeId: 300, attributes: ['action', '/search', 'method', 'get'] } }
+          if (id === 305) return { node: { nodeName: 'OPTION', backendNodeId: 305, attributes: ['value', '50'] } }
+          return { node: { nodeName: 'SELECT', parentId: 300, backendNodeId: 304, children: [{ nodeName: 'OPTION', backendNodeId: 305, attributes: ['value', '50'] }], attributes: ['name', 'limit'] } }
+        }
+        if (method === 'Accessibility.getPartialAXTree') {
+          const id = params?.['nodeId'] ?? params?.['backendNodeId'] ?? params?.['backendDOMNodeId']
+          return { nodes: [{ nodeId: `ax-${id}`, role: { value: 'combobox' }, name: { value: 'Per page' }, backendDOMNodeId: id === 304 ? 304 : id, properties: [{ name: 'expanded', value: { value: true } }] }] }
+        }
+        if (method === 'Accessibility.queryAXTree') return { nodes: [{ backendDOMNodeId: 305, role: { value: 'option' }, name: { value: '50 per page' }, properties: [{ name: 'selected', value: { value: true } }] }] }
+        if (method === 'CSS.getComputedStyleForNode') return { computedStyle: [{ name: 'display', value: 'block' }, { name: 'visibility', value: 'visible' }, { name: 'opacity', value: '1' }, { name: 'pointer-events', value: 'auto' }] }
+        if (method === 'DOM.getBoxModel') return { model: { border: [300, 340, 428, 340, 428, 372, 300, 372] } }
+        if (method === 'DOM.getNodeForLocation') return { backendNodeId: 304 }
+        if (method === 'DOM.resolveNode') return { object: { objectId: 'obj-select-1', type: 'node' } }
+        if (method === 'Runtime.callFunctionOn') return { result: { type: 'object', value: { value: '50', text: '50 per page' } } }
+        if (method === 'Page.getLayoutMetrics') return { cssVisualViewport: { clientWidth: 800, clientHeight: 600 } }
+        return super.send(method, params)
+      }
+    }
+    const transport = new NavigatingSelectDebugger()
+    const automation = new BrowserAutomation(transport, () => 'https://example.test/search', () => false)
+    const signal = new AbortController().signal
+    const snapshot = await automation.snapshot(lease, { maxDepth: 20, maxNodes: 20, maxBytes: 256 * 1024 }, signal)
+    const selectEntry = snapshot.nodes.find((node) => node.role === 'combobox')!
+    expect(selectEntry).toBeTruthy()
+    const prepared = await automation.prepareInteraction(lease, { kind: 'select', target: { snapshotId: snapshot.snapshotId, ref: selectEntry.ref }, values: ['50'] }, signal)
+    await expect(automation.executeInteraction(prepared, signal)).resolves.toMatchObject({ dispatched: true })
+    // The crash regression: no Accessibility-domain call may follow the Enter commit.
+    expect(enterCalls.length).toBeGreaterThan(0)
+    expect(transport.callsAfterEnter.filter((call) => call.startsWith('Accessibility.'))).toEqual([])
+    expect(transport.callsAfterEnter).toContain('DOM.resolveNode')
+    expect(transport.callsAfterEnter).toContain('Runtime.callFunctionOn')
   })
 
   it('returns screenshot bytes in memory and rejects oversized captures', async () => {

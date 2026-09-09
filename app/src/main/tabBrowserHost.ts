@@ -1,3 +1,6 @@
+import { appendFile } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { BrowserCapacity, navigationPolicyAllows, selectPreviewOrigin } from './tabBrowserPolicy'
 import { createBrowserId, isOpaqueBrowserId, safeRestoreUrl, type BrowserId } from '../shared/tabBrowser'
@@ -9,6 +12,12 @@ import type { BrowserAutomation, BrowserBinaryAttachment } from './browserAutoma
 import { isPointerInteraction, type BrowserInteraction, type BrowserToolAction } from './browserToolProtocol'
 import { classifyInteraction, type InteractionClassification, type InteractionTargetMetadata } from './browserApproval'
 import { ACTION_FAILED_NO_ROLLBACK, BrowserActionError, BrowserAutomationError, FRESH_SNAPSHOT_MESSAGE, type BrowserInteractionDiagnostics } from './browserErrors'
+
+// Crash forensics: a bounded recent-CDP ring, written to the diagnostics log
+// on renderer death so a crash can be attributed to the last page command.
+export function logBrowserDiagnostic(line: string): void {
+  try { appendFile(join(process.env.XDG_STATE_HOME ?? join(homedir(), '.local/state'), 'amber-ide', 'browser-diagnostics.log'), `${new Date().toISOString()} ${line}\n`, () => {}) } catch { /* diagnostics are best effort */ }
+}
 import { BrowserObservations } from './browserObservations'
 import { remoteInputEvents, type RemoteInputEvent } from './remoteBrowserInput'
 
@@ -21,7 +30,7 @@ export type TabBrowserPageEvent =
   | { type: 'focus'; focused: boolean }
   | { type: 'diagnostics'; consoleIssues: number; networkFailures: number }
   | { type: 'dialog'; dialogType: string; message: string; respond: (decision: { accept: boolean; promptText?: string }) => void }
-  | { type: 'crashed'; reason: string }
+  | { type: 'crashed'; reason: string; exitCode?: number; automationLog?: string[] }
 
 function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
   if (signal.aborted) return Promise.reject(new Error('ACTION_CANCELLED'))
@@ -177,7 +186,8 @@ export class TabBrowserHost {
       try { runtime.page.destroy() } catch { /* disposal is best effort */ }
       this.capacity.markFrozen(id)
       record.lifecycle = 'frozen'
-      record.restoreError = `Page crashed: ${event.reason}`.slice(0, 1024)
+      record.restoreError = `Page crashed: ${event.reason}${typeof event.exitCode === 'number' ? ` (exit ${event.exitCode})` : ''}`.slice(0, 1024)
+      for (const line of event.automationLog ?? []) logBrowserDiagnostic(`[crash-cdp] ${line}`)
       record.stateRevision += 1
     }
     this.onStateChange(); this.emitRuntime(id)
