@@ -808,6 +808,54 @@ describe('browser automation', () => {
     expect(transport.calls).toContain('Input.insertText')
   })
 
+  it('rejects a fill on inputs whose value insertText cannot set', async () => {
+    // Chromium reports a range input as role slider and a date input as
+    // DateTime/InputTime; Input.insertText is a silent no-op on each, so the
+    // field keeps its old value while the agent believes it filled it. The gate
+    // must reject the native input type, not merely trust the AX role.
+    const transport = new FakeDebugger()
+    const automation = new BrowserAutomation(transport, () => 'https://example.test/forms', () => false)
+    transport.send = async (method: string, params?: Record<string, unknown>) => {
+      transport.calls.push(method)
+      if (method === 'DOM.performSearch') return { searchId: 'search-1', resultCount: 1 }
+      if (method === 'DOM.getSearchResults') return { nodeIds: [104] }
+      if (method === 'DOM.describeNode') return { node: { nodeName: 'INPUT', parentId: 101, backendNodeId: 4, attributes: ['type', 'range', 'aria-label', 'Volume'] } }
+      if (method === 'Accessibility.getPartialAXTree') return { nodes: [{ role: { value: 'slider' }, name: { value: 'Volume' }, backendDOMNodeId: 4 }] }
+      if (method === 'DOM.pushNodesByBackendIdsToFrontend') return { nodeIds: [22] }
+      if (method === 'CSS.getComputedStyleForNode') return { computedStyle: [{ name: 'display', value: 'block' }, { name: 'opacity', value: '1' }, { name: 'visibility', value: 'visible' }, { name: 'pointer-events', value: 'auto' }] }
+      if (method === 'DOM.getBoxModel') return { model: { border: [0, 0, 100, 0, 100, 20, 0, 20] } }
+      if (method === 'DOM.getNodeForLocation') return { backendNodeId: 4 }
+      if (method === 'Page.getLayoutMetrics') return { cssVisualViewport: { clientWidth: 800, clientHeight: 600 } }
+      return {}
+    }
+    const signal = new AbortController().signal
+    const snapshot = await automation.snapshot(lease, { maxDepth: 20, maxNodes: 20, maxBytes: 256 * 1024 }, signal)
+    const target = { snapshotId: snapshot.snapshotId, role: 'slider', name: 'Volume' }
+    await expect(automation.prepareInteraction(lease, { kind: 'fill', target, text: '7' }, signal)).rejects.toThrow('TARGET_NOT_ACTIONABLE')
+    expect(transport.calls).not.toContain('Input.insertText')
+  })
+
+  it('rejects a multi-value select before any native traversal', async () => {
+    const transport = new FakeDebugger()
+    const automation = new BrowserAutomation(transport, () => 'https://example.test/forms', () => false)
+    transport.send = async (method: string, params?: Record<string, unknown>) => {
+      transport.calls.push(method)
+      if (method === 'DOM.performSearch') return { searchId: 'search-1', resultCount: 1 }
+      if (method === 'DOM.getSearchResults') return { nodeIds: [105] }
+      if (method === 'DOM.describeNode') return { node: { nodeName: 'SELECT', parentId: 101, backendNodeId: 5, attributes: ['aria-label', 'Tags'] } }
+      if (method === 'Accessibility.getPartialAXTree') return { nodes: [{ role: { value: 'combobox' }, name: { value: 'Tags' }, backendDOMNodeId: 5 }] }
+      if (method === 'CSS.getComputedStyleForNode') return { computedStyle: [{ name: 'display', value: 'block' }, { name: 'opacity', value: '1' }, { name: 'visibility', value: 'visible' }, { name: 'pointer-events', value: 'auto' }] }
+      if (method === 'DOM.getBoxModel') return { model: { border: [0, 0, 100, 0, 100, 20, 0, 20] } }
+      if (method === 'DOM.getNodeForLocation') return { backendNodeId: 5 }
+      if (method === 'Page.getLayoutMetrics') return { cssVisualViewport: { clientWidth: 800, clientHeight: 600 } }
+      return {}
+    }
+    const signal = new AbortController().signal
+    const snapshot = await automation.snapshot(lease, { maxDepth: 20, maxNodes: 20, maxBytes: 256 * 1024 }, signal)
+    const target = { snapshotId: snapshot.snapshotId, role: 'combobox', name: 'Tags' }
+    await expect(automation.prepareInteraction(lease, { kind: 'select', target, values: ['rust', 'ts'] }, signal)).rejects.toThrow('UNSUPPORTED_PAGE')
+  })
+
   it('collapses any active selection before a semantic drag so mouseup reaches the page', async () => {
     const transport = new FakeDebugger()
     const automation = new BrowserAutomation(transport, () => 'https://example.test/slider', () => false)

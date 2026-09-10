@@ -18,6 +18,10 @@ const SCREENSHOT_MAX_DIMENSION = 4096
 // are filtered again by their ignored accessibility projection.
 const SNAPSHOT_SEARCH_XPATH = "//*[not(self::script or self::style or self::noscript or self::template) and not(ancestor::script or ancestor::style or ancestor::noscript or ancestor::template)] | //text()[normalize-space(.) != '' and not(ancestor::script or ancestor::style or ancestor::noscript or ancestor::template)]"
 const INTERACTIVE_SEARCH_XPATH = "//input | //textarea | //select | //button | //a[@href] | //*[@role and @role != 'generic' and @role != 'presentation'] | //*[@contenteditable='true'] | //*[@tabindex]"
+// Native input types whose value Input.insertText cannot set. Measured on real
+// Chromium: a date field keeps its old value and a range keeps its midpoint
+// after a fill, so these must fail closed rather than dispatch a no-op.
+const NON_TEXT_INPUT_TYPES = new Set(['date', 'datetime-local', 'month', 'week', 'time', 'range', 'color', 'file', 'checkbox', 'radio', 'button', 'submit', 'reset', 'image'])
 const SAFE_ATTRIBUTES = new Set(['id', 'class', 'role', 'aria-label', 'aria-labelledby', 'aria-describedby', 'name', 'type', 'placeholder', 'title', 'alt'])
 const SAFE_COMPUTED_STYLES = new Set(['display', 'visibility', 'position', 'color', 'background-color', 'font-family', 'font-size', 'font-weight', 'line-height', 'width', 'height', 'overflow', 'opacity'])
 const ENABLE_METHODS = ['Accessibility.enable', 'DOM.enable', 'CSS.enable', 'Page.enable', 'Runtime.enable', 'Network.enable'] as const
@@ -619,6 +623,10 @@ export class BrowserAutomation {
     abort(signal); await this.ensureAttached(); abort(signal)
     if (isPointerInteraction(operation)) return this.preparePointer(lease, operation, signal)
     const primaryTarget = operation.kind === 'drag' ? operation.source : ('target' in operation ? operation.target : undefined)
+    // The native dropdown path commits exactly one option; a multi-select or a
+    // listbox cannot be driven by it. Fail before any native traversal so the
+    // caller sees the real reason instead of a downstream unsupported page.
+    if (operation.kind === 'select' && operation.values.length !== 1) throw new BrowserAutomationError('UNSUPPORTED_PAGE', false)
     const primary = primaryTarget ? this.resolveTarget(lease, primaryTarget) : undefined
     const secondary = operation.kind === 'drag' ? this.resolveTarget(lease, operation.target) : undefined
     const primaryCurrent = primary ? await this.actionable(primary, signal, operation.kind === 'fill' || operation.kind === 'type', true) : undefined
@@ -631,6 +639,12 @@ export class BrowserAutomation {
     // attribute is the only signal that they accept text.
     const editableRegion = (metadata?: InteractionTargetMetadata): boolean => !!metadata && (metadata.contentEditable === 'true' || metadata.tag === 'textarea')
     if ((operation.kind === 'fill' || operation.kind === 'type') && (!metadata || (!['textbox', 'searchbox', 'combobox'].includes(metadata.role.toLocaleLowerCase()) && !['input', 'textarea'].includes(metadata.tag) && !editableRegion(metadata)))) throw new Error('TARGET_NOT_ACTIONABLE')
+    // Input.insertText is a silent no-op on these native types (measured: a
+    // date field keeps its old value, a range keeps its midpoint). Dispatching
+    // it would leave the field unchanged while reporting success, so fail
+    // closed and let the caller use the keyboard path (arrow keys work on
+    // range; a date segment needs per-segment typing) or a grounded gesture.
+    if ((operation.kind === 'fill' || operation.kind === 'type') && metadata?.tag === 'input' && NON_TEXT_INPUT_TYPES.has(metadata.type.toLowerCase())) throw new Error('TARGET_NOT_ACTIONABLE')
     if (operation.kind === 'select' && (!metadata || (!['combobox', 'listbox'].includes(metadata.role.toLocaleLowerCase()) && metadata.tag !== 'select'))) throw new Error('TARGET_NOT_ACTIONABLE')
     if ((operation.kind === 'check' || operation.kind === 'uncheck') && (!metadata || !['checkbox', 'switch', 'radio'].includes(metadata.role.toLocaleLowerCase()))) throw new Error('TARGET_NOT_ACTIONABLE')
     if (operation.kind === 'uncheck' && metadata?.role.toLocaleLowerCase() === 'radio') throw new Error('TARGET_NOT_ACTIONABLE')
