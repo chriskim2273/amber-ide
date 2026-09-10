@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { dispatchPointer } from './browserPointer'
 import { parseBrowserToolAction } from './browserToolProtocol'
 import { classifyInteraction, interactionValueDigest } from './browserApproval'
 import { BrowserAutomationError } from './browserErrors'
@@ -37,5 +38,22 @@ describe('grounded pointer contract', () => {
     if (a.type !== 'interact' || b.type !== 'interact') throw new Error('wrong action')
     expect(classifyInteraction(a.operation)).toMatchObject({ consequential: true, canGrantOrigin: false })
     expect(interactionValueDigest(a.operation)).not.toBe(interactionValueDigest(b.operation))
+  })
+  it('collapses any active text selection before dragging so the gesture stays a mouse drag', async () => {
+    const events: string[] = []
+    await dispatchPointer({ kind: 'mouseDrag', screenshotId: 'image', path: [{ x: 10, y: 20 }, { x: 30, y: 40 }] }, [{ x: 10, y: 20 }, { x: 30, y: 40 }], {
+      mouse: async (type, point, extra) => { events.push(`${type}@${point.x},${point.y}${extra?.['clickCount'] !== undefined ? '#c' + String(extra?.['clickCount']) : ''}`) },
+      text: async () => {},
+      verify: async () => {},
+      pause: async () => {},
+    })
+    // A prior page selection makes Chromium route press+move+release through the
+    // HTML5 drag pipeline (dragstart/dragend) and swallow the mouseup; collapsing
+    // the selection with an out-of-content press+release keeps it a mouse drag.
+    expect(events[0]).toBe('mouseMoved@10,20')
+    expect(events[1]).toBe('mousePressed@-1,-1#c0')
+    expect(events[2]).toBe('mouseReleased@-1,-1#c0')
+    expect(events.indexOf('mousePressed@10,20#c1')).toBeGreaterThan(2)
+    expect(events.at(-1)).toBe('mouseReleased@30,40#c1')
   })
 })

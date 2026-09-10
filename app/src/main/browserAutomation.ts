@@ -125,14 +125,15 @@ function domAttributes(node: Record<string, unknown> | undefined): Record<string
   const raw = Array.isArray(node?.['attributes']) ? node!['attributes'] as unknown[] : [], out: Record<string, string> = {}
   for (let index = 0; index + 1 < raw.length; index += 2) {
     const key = text(raw[index], 64).toLocaleLowerCase()
-    if (['type', 'autocomplete', 'formaction', 'formmethod', 'action', 'method', 'readonly'].includes(key)) out[key] = text(raw[index + 1], 1024)
+    if (['type', 'autocomplete', 'formaction', 'formmethod', 'action', 'method', 'readonly', 'contenteditable'].includes(key)) out[key] = text(raw[index + 1], 1024)
   }
   return out
 }
 function targetMetadata(node: AXNode, domNode: Record<string, unknown> | undefined, role: string, name: string, backendDOMNodeId: number | undefined, form?: { action?: string; method?: string }): InteractionTargetMetadata {
   const attributes = domAttributes(domNode), tag = text(domNode?.['nodeName'], 128).toLocaleLowerCase(), type = attributes['type'] ?? ''
-  const basis = { role, name, tag, type, backendDOMNodeId: backendDOMNodeId ?? 0, autocomplete: attributes['autocomplete'] ?? '', formAction: attributes['formaction'] ?? form?.action ?? '', formMethod: attributes['formmethod'] ?? form?.method ?? '' }
-  return { role, name, tag, type, fingerprint: createHash('sha256').update(JSON.stringify(basis)).digest('hex'), ...(basis.autocomplete ? { autocomplete: basis.autocomplete } : {}), ...(basis.formAction ? { formAction: basis.formAction } : {}), ...(basis.formMethod ? { formMethod: basis.formMethod } : {}) }
+  const contentEditable = attributes['contenteditable'] ?? ''
+  const basis = { role, name, tag, type, backendDOMNodeId: backendDOMNodeId ?? 0, autocomplete: attributes['autocomplete'] ?? '', formAction: attributes['formaction'] ?? form?.action ?? '', formMethod: attributes['formmethod'] ?? form?.method ?? '', ...(contentEditable ? { contentEditable } : {}) }
+  return { role, name, tag, type, fingerprint: createHash('sha256').update(JSON.stringify(basis)).digest('hex'), ...(basis.autocomplete ? { autocomplete: basis.autocomplete } : {}), ...(basis.formAction ? { formAction: basis.formAction } : {}), ...(basis.formMethod ? { formMethod: basis.formMethod } : {}), ...(contentEditable ? { contentEditable } : {}) }
 }
 function sameLease(a: BrowserAutomationLease, b: BrowserAutomationLease): boolean {
   return a.browserId === b.browserId && a.pageIncarnation === b.pageIncarnation && a.generation === b.generation && a.controller === b.controller && a.documentEpoch === b.documentEpoch
@@ -508,7 +509,7 @@ export class BrowserAutomation {
     await this.verifyObservation(observation, signal)
     if (operation.kind === 'typeFocused') {
       await this.snapshot(lease, { maxDepth: 20, maxNodes: 1000, maxBytes: 128 * 1024 }, signal)
-      const focused = [...(this.snapshotCache?.entries.values() ?? [])].filter(entry => entry.focused && ['textbox', 'searchbox', 'combobox'].includes(entry.role.toLowerCase()))
+      const focused = [...(this.snapshotCache?.entries.values() ?? [])].filter(entry => entry.focused && (['textbox', 'searchbox', 'combobox'].includes(entry.role.toLowerCase()) || entry.metadata.contentEditable === 'true'))
       if (focused.length !== 1) throw new Error('TARGET_NOT_ACTIONABLE')
       const primary = focused[0]!, current = await this.actionable(primary, signal, true)
       if (current.metadata.type === 'file') throw new Error('TARGET_NOT_ACTIONABLE')
@@ -606,7 +607,13 @@ export class BrowserAutomation {
     const primaryCurrent = primary ? await this.actionable(primary, signal, operation.kind === 'fill' || operation.kind === 'type', true) : undefined
     const secondaryCurrent = secondary ? await this.actionable(secondary, signal) : undefined
     const metadata = primaryCurrent?.metadata
-    if ((operation.kind === 'fill' || operation.kind === 'type') && (!metadata || (!['textbox', 'searchbox', 'combobox'].includes(metadata.role.toLocaleLowerCase()) && !['input', 'textarea'].includes(metadata.tag)) || metadata.type === 'file')) throw new Error('TARGET_NOT_ACTIONABLE')
+    // A file input opens a native picker the agent cannot see or dismiss; it
+    // would wedge the page behind a modal owned by no automation surface.
+    if (metadata?.type.toLowerCase() === 'file' && ['fill', 'type', 'click', 'doubleClick', 'hover', 'check', 'uncheck', 'press'].includes(operation.kind)) throw new Error('TARGET_NOT_ACTIONABLE')
+    // Chromium reports contenteditable regions as role 'generic', so the DOM
+    // attribute is the only signal that they accept text.
+    const editableRegion = (metadata?: InteractionTargetMetadata): boolean => !!metadata && (metadata.contentEditable === 'true' || metadata.tag === 'textarea')
+    if ((operation.kind === 'fill' || operation.kind === 'type') && (!metadata || (!['textbox', 'searchbox', 'combobox'].includes(metadata.role.toLocaleLowerCase()) && !['input', 'textarea'].includes(metadata.tag) && !editableRegion(metadata)))) throw new Error('TARGET_NOT_ACTIONABLE')
     if (operation.kind === 'select' && (!metadata || (!['combobox', 'listbox'].includes(metadata.role.toLocaleLowerCase()) && metadata.tag !== 'select'))) throw new Error('TARGET_NOT_ACTIONABLE')
     if ((operation.kind === 'check' || operation.kind === 'uncheck') && (!metadata || !['checkbox', 'switch', 'radio'].includes(metadata.role.toLocaleLowerCase()))) throw new Error('TARGET_NOT_ACTIONABLE')
     if (operation.kind === 'uncheck' && metadata?.role.toLocaleLowerCase() === 'radio') throw new Error('TARGET_NOT_ACTIONABLE')
@@ -838,6 +845,13 @@ export class BrowserAutomation {
       } else if (operation.kind === 'scroll') {
         const point = primaryPoint ?? { x: 1, y: 1 }; await mouse('mouseWheel', point, { deltaX: operation.deltaX, deltaY: operation.deltaY })
       } else if (operation.kind === 'drag' && primaryPoint && prepared.secondary && prepared.secondaryTarget) {
+        // A page with an active text selection routes this press+move+release
+        // through Chromium's HTML5 drag pipeline (dragstart/dragend) and the
+        // mouseup never reaches the page. Collapse it first with an
+        // out-of-content press+release (clickCount 0) so the gesture stays a
+        // plain mouse drag.
+        await mouse('mousePressed', { x: -1, y: -1 }, { button: 'left', clickCount: 0 })
+        await mouse('mouseReleased', { x: -1, y: -1 }, { button: 'left', clickCount: 0 })
         await mouse('mouseMoved', primaryPoint); await mouse('mousePressed', primaryPoint, { button: 'left', clickCount: 1 })
         // A failed destination must use the owned-input cleanup below. Releasing
         // over the source would turn a failed drag into an activation click.

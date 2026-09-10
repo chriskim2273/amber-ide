@@ -201,8 +201,10 @@ describe('TabBrowserHost', () => {
 
     let target = await snapshot(), status = host.status(id), dragStart = status.generation
     const dragResult = await runInteraction({ kind: 'drag', source: target, target })
-    expect(observedGenerations).toEqual([dragStart + 1, dragStart + 2, dragStart + 3, dragStart + 4])
-    expect(dragResult).toMatchObject({ generation: dragStart + 5, pageIncarnation: status.pageIncarnation, interleaved: true })
+    // Two extra dispatches are the selection collapse (press+release off-content)
+    // that keeps the drag a plain mouse gesture on pages with an active selection.
+    expect(observedGenerations).toEqual([dragStart + 1, dragStart + 2, dragStart + 3, dragStart + 4, dragStart + 5, dragStart + 6])
+    expect(dragResult).toMatchObject({ generation: dragStart + 7, pageIncarnation: status.pageIncarnation, interleaved: true })
 
     target = await snapshot(); status = host.status(id); const typeStart = status.generation
     observedGenerations.length = 0

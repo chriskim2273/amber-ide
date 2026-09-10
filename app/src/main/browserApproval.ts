@@ -3,7 +3,7 @@ import { isPointerInteraction, type BrowserInteraction } from './browserToolProt
 
 export type ApprovalCategory = 'credential' | 'financial' | 'destructive' | 'communication' | 'file-transfer' | 'form-submit' | 'confirmation' | 'benign'
 export type ValueCategory = 'none' | 'text' | 'credential' | 'payment'
-export interface InteractionTargetMetadata { role: string; name: string; tag: string; type: string; fingerprint: string; autocomplete?: string; formAction?: string; formMethod?: string; visualPreview?: string; receiverFingerprint?: string }
+export interface InteractionTargetMetadata { role: string; name: string; tag: string; type: string; fingerprint: string; autocomplete?: string; formAction?: string; formMethod?: string; contentEditable?: string; visualPreview?: string; receiverFingerprint?: string }
 export interface InteractionClassification { consequential: boolean; category: ApprovalCategory; valueCategory: ValueCategory; canGrantOrigin: boolean; argumentSummary: string }
 export interface ApprovalDigestInput {
   requestId: string; controller: string; browserId: string; pageIncarnation: string; generation: number; origin: string

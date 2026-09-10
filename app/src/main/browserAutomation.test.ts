@@ -748,6 +748,98 @@ describe('browser automation', () => {
     }
   })
 
+  it('refuses to click a file input because the native picker cannot be dismissed', async () => {
+    const transport = new FakeDebugger()
+    const automation = new BrowserAutomation(transport, () => 'https://example.test/upload', () => false)
+    transport.send = async (method: string, params?: Record<string, unknown>) => {
+      transport.calls.push(method)
+      if (method === 'DOM.performSearch') return { searchId: 'search-1', resultCount: 1 }
+      if (method === 'DOM.getSearchResults') return { nodeIds: [103] }
+      if (method === 'DOM.describeNode') return { node: { nodeName: 'INPUT', parentId: 101, backendNodeId: 3, attributes: ['type', 'file', 'aria-label', 'Upload'] } }
+      if (method === 'Accessibility.getPartialAXTree') return { nodes: [{ role: { value: 'button' }, name: { value: 'Upload' }, backendDOMNodeId: 3 }] }
+      if (method === 'DOM.pushNodesByBackendIdsToFrontend') return { nodeIds: [22] }
+      if (method === 'CSS.getComputedStyleForNode') return { computedStyle: [{ name: 'display', value: 'block' }, { name: 'opacity', value: '1' }, { name: 'visibility', value: 'visible' }, { name: 'pointer-events', value: 'auto' }] }
+      if (method === 'DOM.getBoxModel') return { model: { border: [0, 0, 100, 0, 100, 20, 0, 20] } }
+      return {}
+    }
+    const signal = new AbortController().signal
+    const snapshot = await automation.snapshot(lease, { maxDepth: 20, maxNodes: 20, maxBytes: 256 * 1024 }, signal)
+    const target = { snapshotId: snapshot.snapshotId, role: 'button', name: 'Upload' }
+    for (const kind of ['click', 'doubleClick', 'hover'] as const)
+      await expect(automation.prepareInteraction(lease, { kind, target }, signal)).rejects.toThrow('TARGET_NOT_ACTIONABLE')
+    expect(transport.calls).not.toContain('Input.dispatchMouseEvent')
+  })
+
+  it('fills a contenteditable region reported as a generic role', async () => {
+    const transport = new FakeDebugger()
+    const automation = new BrowserAutomation(transport, () => 'https://example.test/note', () => false)
+    transport.send = async (method: string, params?: Record<string, unknown>) => {
+      transport.calls.push(method)
+      if (method === 'DOM.performSearch') return { searchId: 'search-1', resultCount: 1 }
+      if (method === 'DOM.getSearchResults') return { nodeIds: [103] }
+      if (method === 'DOM.describeNode') return { node: { nodeName: 'DIV', parentId: 101, backendNodeId: 3, attributes: ['contenteditable', 'true', 'aria-label', 'Note'] } }
+      if (method === 'Accessibility.getPartialAXTree') return { nodes: [{ role: { value: 'generic' }, name: { value: 'Note' }, backendDOMNodeId: 3 }] }
+      if (method === 'DOM.pushNodesByBackendIdsToFrontend') return { nodeIds: [22] }
+      if (method === 'CSS.getComputedStyleForNode') return { computedStyle: [{ name: 'display', value: 'block' }, { name: 'opacity', value: '1' }, { name: 'visibility', value: 'visible' }, { name: 'pointer-events', value: 'auto' }] }
+      if (method === 'DOM.getBoxModel') return { model: { border: [0, 0, 100, 0, 100, 20, 0, 20] } }
+      if (method === 'DOM.getNodeForLocation') return { backendNodeId: 3 }
+      if (method === 'Page.getLayoutMetrics') return { cssVisualViewport: { clientWidth: 800, clientHeight: 600 } }
+      if (method === 'Page.captureScreenshot') { const png = Buffer.alloc(24); Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(png); png.write('IHDR', 12, 'ascii'); png.writeUInt32BE(800, 16); png.writeUInt32BE(600, 20); return { data: png.toString('base64') } }
+      return {}
+    }
+    const signal = new AbortController().signal
+    const snapshot = await automation.snapshot(lease, { maxDepth: 20, maxNodes: 20, maxBytes: 256 * 1024 }, signal)
+    const prepared = await automation.prepareInteraction(lease, { kind: 'fill', target: { snapshotId: snapshot.snapshotId, role: 'generic', name: 'Note' }, text: 'amber' }, signal)
+    await expect(automation.executeInteraction(prepared, signal)).resolves.toMatchObject({ dispatched: true })
+    expect(transport.calls).toContain('Input.insertText')
+  })
+
+  it('collapses any active selection before a semantic drag so mouseup reaches the page', async () => {
+    const transport = new FakeDebugger()
+    const automation = new BrowserAutomation(transport, () => 'https://example.test/slider', () => false)
+    const mouseEvents: Array<Record<string, unknown>> = []
+    transport.send = async (method: string, params?: Record<string, unknown>) => {
+      transport.calls.push(method)
+      if (method === 'Input.dispatchMouseEvent' && params) mouseEvents.push({ type: params['type'], x: params['x'], y: params['y'], clickCount: params['clickCount'] })
+      if (method === 'DOM.performSearch') return { searchId: 'search-1', resultCount: 2 }
+      if (method === 'DOM.getSearchResults') return { nodeIds: [101, 102] }
+      if (method === 'DOM.describeNode') {
+        const id = params?.['nodeId'] ?? params?.['backendNodeId']
+        const isSource = id === 101 || id === 1
+        return { node: { nodeName: 'DIV', parentId: 100, backendNodeId: isSource ? 1 : 2, attributes: ['aria-label', isSource ? 'Handle' : 'Track'] } }
+      }
+      if (method === 'Accessibility.getPartialAXTree') {
+        const id = params?.['backendNodeId'] ?? params?.['nodeId']
+        const isSource = id === 1 || id === 101
+        return { nodes: [{ nodeId: `ax-${id}`, role: { value: 'slider' }, name: { value: isSource ? 'Handle' : 'Track' }, backendDOMNodeId: isSource ? 1 : 2 }] }
+      }
+      if (method === 'DOM.pushNodesByBackendIdsToFrontend') return { nodeIds: [11, 12] }
+      if (method === 'CSS.getComputedStyleForNode') return { computedStyle: [{ name: 'display', value: 'block' }, { name: 'opacity', value: '1' }, { name: 'visibility', value: 'visible' }, { name: 'pointer-events', value: 'auto' }] }
+      if (method === 'DOM.getBoxModel') { const id = params?.['backendNodeId']; const isSource = id === 1; return { model: { border: [isSource ? 0 : 300, 0, isSource ? 100 : 500, 0, isSource ? 100 : 500, 20, isSource ? 0 : 300, 20] } } }
+      if (method === 'DOM.getNodeForLocation') { const x = Number(params?.['x']); return { backendNodeId: x >= 300 ? 2 : 1 } }
+      if (method === 'Page.getLayoutMetrics') return { cssVisualViewport: { clientWidth: 800, clientHeight: 600 } }
+      if (method === 'Page.captureScreenshot') { const png = Buffer.alloc(24); Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(png); png.write('IHDR', 12, 'ascii'); png.writeUInt32BE(800, 16); png.writeUInt32BE(600, 20); return { data: png.toString('base64') } }
+      return {}
+    }
+    const signal = new AbortController().signal
+    const snapshot = await automation.snapshot(lease, { maxDepth: 20, maxNodes: 20, maxBytes: 256 * 1024 }, signal)
+    expect(snapshot.nodes.map(node => node.name)).toEqual(['Handle', 'Track'])
+    const source = { snapshotId: snapshot.snapshotId, role: 'slider', name: 'Handle' }, target = { snapshotId: snapshot.snapshotId, role: 'slider', name: 'Track' }
+    const prepared = await automation.prepareInteraction(lease, { kind: 'drag', source, target }, signal)
+    await expect(automation.executeInteraction(prepared, signal)).resolves.toMatchObject({ dispatched: true })
+    // A prior page selection routes the drag through Chromium's HTML5 drag
+    // pipeline and the mouseup never reaches the page; the adapter collapses the
+    // selection with an out-of-content press+release before pressing the source.
+    const presses = mouseEvents.filter(event => event['type'] === 'mousePressed')
+    expect(presses[0]).toMatchObject({ x: -1, y: -1, clickCount: 0 })
+    expect(mouseEvents[0]).toMatchObject({ type: 'mousePressed', x: -1, y: -1 })
+    expect(mouseEvents[1]).toMatchObject({ type: 'mouseReleased', x: -1, y: -1 })
+    const sourcePressIndex = mouseEvents.findIndex(event => event['type'] === 'mousePressed' && event['x'] !== -1)
+    expect(sourcePressIndex).toBeGreaterThan(1)
+    expect(mouseEvents[sourcePressIndex + 1]).toMatchObject({ type: 'mouseMoved' })
+    expect(mouseEvents.at(-1)).toMatchObject({ type: 'mouseReleased' })
+  })
+
   it('uses only a fixed allowlist of debugger methods and supports cancellation', async () => {
     const transport = new FakeDebugger()
     const automation = new BrowserAutomation(transport, () => 'about:blank', () => false)

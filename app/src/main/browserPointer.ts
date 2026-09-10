@@ -9,6 +9,15 @@ export interface PointerDispatch {
 /** One bounded gesture; held input cleanup is owned by the adapter's finally. */
 export async function dispatchPointer(operation: BrowserPointerInteraction, points: BrowserPoint[], io: PointerDispatch): Promise<void> {
   const modifiers = modifierMask(operation.modifiers)
+  // A page with any active text selection routes the next press+move+release
+  // through Chromium's HTML5 drag pipeline (dragstart/dragend) and the mouseup
+  // never reaches the page. An out-of-content press+release (clickCount 0) with
+  // no element under the cursor collapses the selection without firing a click.
+  const collapseSelection = async (): Promise<void> => {
+    const offPage = { x: -1, y: -1 }
+    await io.mouse('mousePressed', offPage, { button: 'left', clickCount: 0 })
+    await io.mouse('mouseReleased', offPage, { button: 'left', clickCount: 0 })
+  }
   const movePath = async (held = false): Promise<void> => {
     for (let index = 0; index < points.length; index++) {
       await io.mouse('mouseMoved', points[index]!, { modifiers, ...(held ? { button: 'left', buttons: 1 } : {}) })
@@ -31,6 +40,7 @@ export async function dispatchPointer(operation: BrowserPointerInteraction, poin
   } else {
     await io.mouse('mouseMoved', points[0]!, { modifiers })
     await io.verify()
+    await collapseSelection()
     await io.mouse('mousePressed', points[0]!, { button: 'left', buttons: 1, clickCount: 1, modifiers })
     await movePath(true)
     await io.verify(true)
