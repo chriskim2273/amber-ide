@@ -1,8 +1,8 @@
 # Pi terminal clipboard repair
 
-Status: implemented and verified on `fix/pi-clipboard`, based on `2a0519e`
-(`fix/pi-session-recovery`). Not merged or deployed. The main checkout's
-unrelated dirty/untracked work was not modified.
+Status: implemented in `54108af` on `fix/pi-clipboard`, based on `2a0519e`,
+then fast-forwarded into local `fix/pi-session-recovery` with user approval.
+Not deployed. The main checkout's unrelated dirty/untracked work was not modified.
 
 ## Root causes and scope
 
@@ -72,6 +72,24 @@ cd app
 AMBER_CLIPBOARD_TEST_DIR="$HOME/worktrees/amber-ide/pi-clipboard-evidence" \
   xvfb-run -a node scripts/verify-terminal-clipboard.cjs
 ```
+
+## Local integration follow-up
+
+The user approved a local merge into `fix/pi-session-recovery`. Commit `54108af`
+fast-forwarded successfully. Before merging, hashes were captured for all 39
+unrelated dirty/untracked files; all remained byte-identical afterward
+(`integration-preservation.json`, stored in the evidence directory).
+
+The integrated checkout, **including the user's existing uncommitted browser
+work**, passed 1250 app tests / 1 skipped (`merged-app-tests.log`) and all 11
+mounted clipboard cases (`clipboard-YwxKua/results.json`). Its typecheck is
+**not green**: existing changes in `electronTabBrowserPage.ts` have `close`
+overload and `NativeImage.resize`/quality type errors; `tabBrowserHost.test.ts`
+has optional `captureFrame`/`exactOptionalPropertyTypes` errors. The affected
+files were not changed by this task. Full diagnostics: `merged-typecheck.log`.
+The isolated committed clipboard tree's typecheck and builds passed as recorded
+above. No unrelated type errors were repaired; the clipboard worktree and branch
+are retained pending resolution of the combined checkout's gate.
 
 ## Review and limits
 

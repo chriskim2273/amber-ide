@@ -116,8 +116,11 @@ exception is core rule 9); themes/settings beyond minimal.
   ordinary shells and daemon-reported Pi shell fallback retain xterm behavior.
   App: 1226 passed / 1 skipped, typecheck and desktop/web builds passed (existing
   web warnings remain). Private real-Electron mounted-Pane clipboard regression:
-  11 cases × 5 consecutive passing runs. Rust untouched/not rerun. Tested branch
-  only, not merged or deployed; real Mac/phone/provider checks remain manual.
+  11 cases × 5 consecutive passing runs. Rust untouched/not rerun. Merged locally
+  into `fix/pi-session-recovery`, not deployed; real Mac/phone/provider checks
+  remain manual. Combined dirty checkout: 1250 tests / 1 skipped and all 11
+  clipboard cases pass, but existing uncommitted browser-host type errors block
+  its typecheck. All 39 unrelated dirty/untracked files were hash-preserved.
   Receipt: `docs/pi-terminal-clipboard-verification.md`.
 
 - [x] Mobile direct chat entry — Pocket session rows offer **Open chat** for
