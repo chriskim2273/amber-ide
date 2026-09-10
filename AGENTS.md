@@ -117,11 +117,16 @@ exception is core rule 9); themes/settings beyond minimal.
   App: 1226 passed / 1 skipped, typecheck and desktop/web builds passed (existing
   web warnings remain). Private real-Electron mounted-Pane clipboard regression:
   11 cases × 5 consecutive passing runs. Rust untouched/not rerun. Merged locally
-  into `fix/pi-session-recovery`, not deployed; real Mac/phone/provider checks
-  remain manual. Combined dirty checkout: 1250 tests / 1 skipped and all 11
-  clipboard cases pass, but existing uncommitted browser-host type errors block
-  its typecheck. All 39 unrelated dirty/untracked files were hash-preserved.
-  Receipt: `docs/pi-terminal-clipboard-verification.md`.
+  into `fix/pi-session-recovery`; deployed to the installed Linux desktop AppImage
+  2026-09-10. Renderer-only artifact update preserves the installed newer browser
+  work: 707 ASAR files compared, one changed; actual packaged-app private smoke
+  passed seven checks. Desktop relaunched onto the hash-verified package; all 24
+  sessions and 13 agent supervisors survived, daemon/web PIDs unchanged. Backup:
+  `~/worktrees/amber-ide/pi-clipboard-deploy/amber-ide.before.AppImage`. Web assets
+  unchanged; real Mac/phone/provider checks remain manual. Combined dirty checkout:
+  1250 tests / 1 skipped and all 11 clipboard cases pass, but existing uncommitted
+  browser-host type errors block its typecheck. All 39 unrelated dirty/untracked
+  files were hash-preserved. Receipt: `docs/pi-terminal-clipboard-verification.md`.
 
 - [x] Mobile direct chat entry — Pocket session rows offer **Open chat** for
   live Pi sessions; the action selects the saved graphical view and opens/focuses

@@ -2,7 +2,9 @@
 
 Status: implemented in `54108af` on `fix/pi-clipboard`, based on `2a0519e`,
 then fast-forwarded into local `fix/pi-session-recovery` with user approval.
-Not deployed. The main checkout's unrelated dirty/untracked work was not modified.
+Deployed to the installed Linux desktop AppImage on 2026-09-10 with explicit
+user approval; the desktop client was relaunched. Web assets were not changed.
+The main checkout's unrelated dirty/untracked work was not modified.
 
 ## Root causes and scope
 
@@ -98,8 +100,56 @@ capture ordering (no duplicate sends or copy overwrite), live shell-fallback
 updates, teardown, and preservation of non-Pi clipboard behavior.
 
 No Rust, daemon, supervisor or protocol code changed; Rust gates were not rerun.
-No production daemon, app bundle, session, Pi configuration or provider was
-changed or invoked. These are Linux private-renderer checks, not a real Mac,
-real phone, or live-provider end-to-end certification. Deployment remains a
-separate approval step; the repair itself needs only updated app/web assets,
-not a daemon restart.
+The implementation checks did not change production state or invoke a provider.
+The subsequently approved desktop deployment is recorded below. These are Linux
+checks, not real-Mac, real-phone or live-provider end-to-end certification.
+
+## Installed desktop deployment — 2026-09-10
+
+Persistent backup and receipts: `~/worktrees/amber-ide/pi-clipboard-deploy/`.
+Rollback AppImage: `amber-ide.before.AppImage`.
+
+The installed AppImage already contained newer browser changes absent from the
+clean commit. A fresh whole-app replacement would have reverted them. Instead,
+`patch-renderer.cjs` applied the exact compiled clipboard helper and Pane from
+the clean `8e1a627` build, plus the SplitView `runState` prop. Reversing the
+clipboard delta first proved the installed Pane matched its pre-fix baseline
+**byte-for-byte**. The resulting Pane/helper match the tested build exactly.
+
+ASAR verification compared all **707 files**: only
+`out/renderer/assets/index-RoGgjToQ.js` changed. Main, preload, client, browser
+functionality, styling, dependencies and settings were preserved. The existing
+AppImage runtime and statically linked bundled binaries were retained. The
+repacked image was re-extracted and its **87 filesystem files/symlinks**, modes
+and contents compared with staging before installation.
+
+Fresh clean-source gates: 1226 app tests passed / 1 skipped, typecheck and
+desktop build passed. `private-package-smoke.cjs` then launched the actual
+replacement AppImage with a private profile and a protocol-speaking fixture
+socket. **Seven checks passed**: real copy chord, native copy, paste chord,
+native paste, reconnect paste, daemon-reported shell-fallback propagation, and
+no renderer errors. This exercises the packaged main/preload/utilityProcess/
+renderer chain; no Pi process or provider was started. Receipt:
+`smoke-qdR3AH/result.json`.
+
+Installed atomically at `~/Applications/amber-ide.AppImage`, guarded by the
+original installed-file hash, with a durable backup. The supported
+`scripts/relaunch-app-linux.sh` path restarted only the verified installed
+desktop client. A fresh process mounted the exact patched ASAR:
+
+- App PID: **2107624**, replacing **1253971**.
+- AppImage SHA256:
+  `01cd607290b33efb814677c04443108dadc2e45f2832aee23f834493a5b60c64`.
+- Running ASAR SHA256:
+  `5d878a5cc799a96c4cf0b74a50f14801a46d5e33bbe3bf268a0e8e9eca8d4df0`.
+- All **24 sessions** preserved with the same names, kinds, slots and alive
+  states; all **13 agent supervisor PIDs/start times** unchanged.
+- Session daemon PID **604298** and web PID **576460** unchanged.
+- All **39 unrelated dirty/untracked source files** still hash-identical.
+
+Activation proof: `activation-verification.json`, `runtime-before.json`,
+`runtime-after.json`, `asar-verification.json`, `filesystem-verification.json`.
+No daemon/web/router restart, Pi extension change, permission change or web
+asset deployment was performed. Existing source-level browser-host type errors
+remain outside this repair; their already-installed artifact was preserved,
+not rebuilt from the dirty checkout.
