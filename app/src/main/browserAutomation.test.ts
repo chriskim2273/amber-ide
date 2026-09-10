@@ -726,6 +726,28 @@ describe('browser automation', () => {
     expect(transport.calls).toContain('Emulation.clearDeviceMetricsOverride')
   })
 
+  it('reports a document invalidated mid-snapshot as STALE_GENERATION, not INTERNAL_ERROR', async () => {
+    // Reproduces the CDP failure seen when a snapshot lands 0-40ms after a
+    // history navigation: the document is torn down between DOM.getDocument
+    // and the per-node queries, which throw raw messages that are not codes.
+    // The hit-test path deliberately recovers from a vanished cover node
+    // ("Could not find node with given id" on DOM.describeNode), so only the
+    // two unconditional invalidation messages map to STALE_GENERATION here.
+    for (const message of ['Node does not have an owner document', 'Inspected target navigated or closed']) {
+      const transport = new FakeDebugger()
+      const automation = new BrowserAutomation(transport, () => 'about:blank', () => false)
+      transport.send = async (method: string) => {
+        transport.calls.push(method)
+        if (method === 'DOM.performSearch') return { searchId: 'search-1', resultCount: 1 }
+        throw new Error(message)
+      }
+      const failure = await automation.snapshot(lease, { maxDepth: 20, maxNodes: 20, maxBytes: 4096 }, new AbortController().signal).catch((error: unknown) => error)
+      expect(failure).toBeInstanceOf(BrowserAutomationError)
+      expect(failure).toMatchObject({ code: 'STALE_GENERATION' })
+      expect((failure as Error).message).toBe('STALE_GENERATION')
+    }
+  })
+
   it('uses only a fixed allowlist of debugger methods and supports cancellation', async () => {
     const transport = new FakeDebugger()
     const automation = new BrowserAutomation(transport, () => 'about:blank', () => false)

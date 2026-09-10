@@ -21,6 +21,10 @@ const INTERACTIVE_SEARCH_XPATH = "//input | //textarea | //select | //button | /
 const SAFE_ATTRIBUTES = new Set(['id', 'class', 'role', 'aria-label', 'aria-labelledby', 'aria-describedby', 'name', 'type', 'placeholder', 'title', 'alt'])
 const SAFE_COMPUTED_STYLES = new Set(['display', 'visibility', 'position', 'color', 'background-color', 'font-family', 'font-size', 'font-weight', 'line-height', 'width', 'height', 'overflow', 'opacity'])
 const ENABLE_METHODS = ['Accessibility.enable', 'DOM.enable', 'CSS.enable', 'Page.enable', 'Runtime.enable', 'Network.enable'] as const
+/** Raw CDP errors that mean the inspected document was invalidated mid-command. */
+const DOCUMENT_INVALIDATED = /Node does not have an owner document|Inspected target navigated or closed/i
+/** The missing-node error the hit-test path recovers from (a vanished cover). */
+const NODE_GONE = 'Could not find node with given id'
 type CdpMouseInputType = 'mousePressed' | 'mouseReleased' | 'mouseMoved' | 'mouseWheel'
 
 function keyCodeFor(value: string): string {
@@ -524,7 +528,19 @@ export class BrowserAutomation {
   private readonly cdpTail: string[] = []
   private send(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
     this.cdpTail.push(`${new Date().toISOString()} ${method}`); if (this.cdpTail.length > 40) this.cdpTail.shift()
-    return this.transport.send(method, params)
+    return this.transport.send(method, params).catch((error: unknown) => {
+      // A history navigation or submit can invalidate the document between
+      // commands ("Node does not have an owner document", "Inspected target
+      // navigated or closed", "Could not find node with given id"). That is a
+      // stale page, not a broken adapter: surface STALE_GENERATION so callers
+      // retry with a fresh snapshot instead of treating it as INTERNAL_ERROR.
+      // The hit-test path deliberately recovers from one of these (a transient
+      // cover node vanishing), so it must see the raw error, not a code: map
+      // only the two unconditional invalidation messages here, and let the
+      // narrow hit-test recovery keep matching on the raw text it knows.
+      if (error instanceof Error && DOCUMENT_INVALIDATED.test(error.message)) throw new BrowserAutomationError('STALE_GENERATION', false)
+      throw error
+    })
   }
   private async nativeSelection(entry: SnapshotEntry, value: string, signal: AbortSignal): Promise<NativeSelection> {
     abort(signal)
@@ -624,7 +640,7 @@ export class BrowserAutomation {
       catch (error) {
         // A transient covering node can disappear after the hit reply. Only
         // this measured missing-node error is recoverable; never replay input.
-        if (error instanceof Error && error.message === 'Could not find node with given id') break
+        if (error instanceof Error && error.message === NODE_GONE) break
         throw error
       }
       abort(signal)
