@@ -306,6 +306,16 @@ export class BrowserAutomation {
     }
     const truncationReasons = new Set<string>()
     let used = 512 + Buffer.byteLength(safeUrl), scanned = 0, truncated = false
+    // A node matched by INTERACTIVE_SEARCH_XPATH is also matched by the
+    // SNAPSHOT_SEARCH_XPATH superset that runs second. Remember which backend
+    // nodes were already emitted so the second query does not re-descend and
+    // re-fetch AX for the same element (the two round-trips are the domaïne
+    // cost of a snapshot).
+    const seenBackendIds = new Set<number>()
+    // Node ids are stable within one document, so the second (superset) query
+    // re-describing a node the first query already described is a redundant
+    // round-trip; cache the describe result for this snapshot's lifetime.
+    const describedNodes = new Map<number, Record<string, unknown>>()
     for (const query of [INTERACTIVE_SEARCH_XPATH, SNAPSHOT_SEARCH_XPATH]) {
     if (truncated || scanned >= limits.maxNodes) { truncated = true; break }
     const search = await this.send('DOM.performSearch', { query, includeUserAgentShadowDOM: false }); abort(signal)
@@ -324,26 +334,33 @@ export class BrowserAutomation {
         for (const nodeId of nodeIds) {
           if (scanned >= limits.maxNodes) { truncated = true; break outer }
           scanned += 1; searchScanned += 1; abort(signal)
-          const described = await this.send('DOM.describeNode', { nodeId, depth: 0, pierce: false }); abort(signal)
-          inputBytes += Buffer.byteLength(JSON.stringify(described))
-          if (inputBytes > inputLimit) { truncated = true; break outer }
+          let described = describedNodes.get(nodeId)
+          if (described === undefined) {
+            described = await this.send('DOM.describeNode', { nodeId, depth: 0, pierce: false }); abort(signal)
+            inputBytes += Buffer.byteLength(JSON.stringify(described))
+            if (inputBytes > inputLimit) { truncated = true; break outer }
+            describedNodes.set(nodeId, described)
+          }
           const domNode = described['node'] as Record<string, unknown> | undefined
           const parentId = typeof domNode?.['parentId'] === 'number' ? domNode['parentId'] : this.domRelations.parentOf(nodeId)
           const depth = parentId === undefined ? 0 : (depthByNodeId.get(parentId) ?? -1) + 1
           depthByNodeId.set(nodeId, depth)
           if (depth > limits.maxDepth) { truncationReasons.add('depth-limit'); continue }
+          const backendDOMNodeId = typeof domNode?.['backendNodeId'] === 'number' ? domNode['backendNodeId'] : undefined
+          if (backendDOMNodeId !== undefined && seenBackendIds.has(backendDOMNodeId)) continue
           const partial = await this.send('Accessibility.getPartialAXTree', { nodeId, fetchRelatives: false }); abort(signal)
           inputBytes += Buffer.byteLength(JSON.stringify(partial))
           if (inputBytes > inputLimit) { truncated = true; break outer }
           const candidates = Array.isArray(partial['nodes']) ? partial['nodes'] as AXNode[] : []
           const node = candidates.find((candidate) => !candidate.ignored)
           if (!node) continue
+          if (backendDOMNodeId !== undefined) seenBackendIds.add(backendDOMNodeId)
           // DOM search identifies the requested element; prefer its backend id
           // over AX's related identity, which can point at a containing node on
           // Electron 43 after the page has been restored or reattached.
-          const backendDOMNodeId = typeof domNode?.['backendNodeId'] === 'number' ? domNode['backendNodeId'] : (typeof node.backendDOMNodeId === 'number' ? node.backendDOMNodeId : undefined)
+          const resolvedBackendDOMNodeId = backendDOMNodeId ?? (typeof node.backendDOMNodeId === 'number' ? node.backendDOMNodeId : undefined)
           const axNodeId = typeof node.nodeId === 'string' && node.nodeId ? createHash('sha256').update(node.nodeId).digest('base64url') : ''
-          const identity = axNodeId ? `ax:${axNodeId}` : (backendDOMNodeId === undefined ? '' : `dom:${backendDOMNodeId}`)
+          const identity = axNodeId ? `ax:${axNodeId}` : (resolvedBackendDOMNodeId === undefined ? '' : `dom:${resolvedBackendDOMNodeId}`)
           if (identity && seenAXNodes.has(identity)) continue
           const role = text(node.role?.value, 256), name = redactBrowserText(text(node.name?.value, 4096)), ref = `n${nodes.length + 1}`
           const disabled = property(node, 'disabled'), focused = property(node, 'focused')
@@ -351,7 +368,7 @@ export class BrowserAutomation {
           const estimated = Buffer.byteLength(JSON.stringify(publicNode)) + 1
           if (nodes.length >= limits.maxNodes || used + estimated > limits.maxBytes) { truncationReasons.add(nodes.length >= limits.maxNodes ? 'node-budget' : 'output-byte-budget'); truncated = true; break outer }
           if (identity) seenAXNodes.add(identity)
-          entries.set(ref, { ...publicNode, ...(backendDOMNodeId === undefined ? {} : { backendDOMNodeId }), metadata: targetMetadata(node, domNode, role, name, backendDOMNodeId) }); nodes.push(publicNode); used += estimated
+          entries.set(ref, { ...publicNode, ...(resolvedBackendDOMNodeId === undefined ? {} : { backendDOMNodeId: resolvedBackendDOMNodeId }), metadata: targetMetadata(node, domNode, role, name, resolvedBackendDOMNodeId) }); nodes.push(publicNode); used += estimated
         }
       }
       if (searchScanned < resultCount) truncated = true

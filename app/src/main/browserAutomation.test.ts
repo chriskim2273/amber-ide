@@ -78,6 +78,20 @@ describe('browser automation', () => {
     expect(JSON.stringify(snapshot)).not.toContain('hunter2')
   })
 
+  it('queries each element AX projection once even when both search queries match it', async () => {
+    // Both INTERACTIVE_SEARCH_XPATH and SNAPSHOT_SEARCH_XPATH return the same
+    // three nodeIds; the adapter must not re-descend + re-fetch AX for a node it
+    // already emitted in the first query (the second query is a superset).
+    const dbg = new FakeDebugger()
+    const automation = new BrowserAutomation(dbg, () => 'https://example.test/path', () => false)
+    const snapshot = await automation.snapshot(lease, { maxDepth: 20, maxNodes: 20, maxBytes: 256 * 1024 }, new AbortController().signal)
+    const axCalls = dbg.calls.filter((call) => call === 'Accessibility.getPartialAXTree').length
+    const describeCalls = dbg.calls.filter((call) => call === 'DOM.describeNode').length
+    expect(axCalls).toBe(3)
+    expect(describeCalls).toBe(3)
+    expect(snapshot.nodes.map((node) => node.name)).toEqual(['Demo', 'Submit', 'Password'])
+  })
+
   it('keeps the DOM backend identity when the AX response reports a different backend id', async () => {
     class MismatchedBackendDebugger extends FakeDebugger {
       boxBackends: number[] = []
