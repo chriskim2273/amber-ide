@@ -40,6 +40,10 @@ export interface SessionInfo {
   // 2026-07-19-stable-session-slots): what `amber ls` prints and what
   // `amber attach <n>` resolves. Absent/0 from an older daemon.
   slot?: number
+  // Git branch of `cwd` (or a short sha when HEAD is detached), absent outside
+  // a repository. Display metadata: it is what tells two panes in the SAME
+  // repository apart, where cwd, kind and slot are identical for both.
+  branch?: string
   // Supervision phase for an AGENT session (all supervised kinds): 'claude'
   // (running), 'claude-retrying' (crashed, retrying), 'shell-fallback' (dropped
   // to a shell), 'suspended' (parked, RAM freed). The strings stay spelled

@@ -177,3 +177,33 @@ export function commandCenterModel({ workspaces, state, frozen, workspace }: Com
   }
   return { groups, alerts, count: groups.reduce((sum, group) => sum + group.items.length, 0) }
 }
+
+export interface PocketRowModel {
+  /** Every session, in one stable order. */
+  rows: CommandCenterItem[]
+  /** Sessions in a state the user must act on, for a pinned strip. */
+  urgent: CommandCenterItem[]
+}
+
+/**
+ * Flatten the grouped model into ONE list whose order never depends on state.
+ *
+ * Grouping is still how Amber classifies a session, and the desktop's
+ * "needs you" affordance still consumes `model.groups`. But on the phone the
+ * group decided a row's POSITION, so a shell that toggled between `working`
+ * and `quiet` on every burst of output jumped the length of the list under the
+ * user's finger. Position now comes only from the daemon's slot — owned by the
+ * daemon, stable for the session's lifetime, and the number `amber attach <n>`
+ * resolves — and state is rendered on the row instead.
+ *
+ * Actionable sessions keep their prominence through `urgent`, which a pinned
+ * strip renders, rather than by being sorted to the top.
+ */
+export function pocketRows(model: CommandCenterModel): PocketRowModel {
+  const rows = model.groups
+    .flatMap((group) => group.items)
+    .sort((a, b) =>
+      (a.pane.slot || Number.MAX_SAFE_INTEGER) - (b.pane.slot || Number.MAX_SAFE_INTEGER)
+      || a.pane.name.localeCompare(b.pane.name))
+  return { rows, urgent: rows.filter((item) => item.group === 'needs-you') }
+}

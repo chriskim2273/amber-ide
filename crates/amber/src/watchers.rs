@@ -404,6 +404,7 @@ mod tests {
                     snapshot_started_tx.send(()).unwrap();
                     finish_snapshot_rx.recv().unwrap();
                     vec![SessionInfo {
+                        branch: None,
                         name: "before".into(),
                         cwd: "/tmp".into(),
                         kind: "shell".into(),

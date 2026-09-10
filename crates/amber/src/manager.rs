@@ -189,6 +189,24 @@ fn pick_env(block: &str, keys: &[&str]) -> Vec<(String, String)> {
         .collect()
 }
 
+/// A resolved branch plus the identity of the `HEAD` that produced it.
+///
+/// A positive result is revalidated by one `stat`: a checkout rewrites HEAD, so
+/// a changed mtime/len re-reads it. A negative result (not a repository) has no
+/// file to watch, so it is re-probed on a timer instead of being cached
+/// forever — `git init` in a session's cwd must eventually show up.
+struct BranchEntry {
+    head: Option<PathBuf>,
+    mtime: Option<std::time::SystemTime>,
+    len: u64,
+    branch: Option<String>,
+    probed: std::time::Instant,
+}
+
+/// How long a "not a repository" answer is trusted before the parent-directory
+/// walk is retried.
+const BRANCH_NEGATIVE_TTL: Duration = Duration::from_secs(30);
+
 pub struct SessionManager {
     store: StateStore,
     cfg: Config,
@@ -219,6 +237,11 @@ pub struct SessionManager {
     /// rename journal still validates the pre-repair bytes. The weak identity
     /// prevents a later session reusing the same name from inheriting it.
     deferred_meta: Mutex<HashMap<String, LiveMetaOverride>>,
+    /// Per-cwd git branch, revalidated by one `stat` of the governing HEAD.
+    /// `session_infos()` runs on every control gesture and on the web poll's
+    /// 1 s tick, so resolving a branch from scratch each time would put a
+    /// parent-directory walk plus a read on that path for every session.
+    branch_cache: Mutex<HashMap<PathBuf, BranchEntry>>,
     /// The daemon socket path, passed to each claude session's `amber run`
     /// supervisor (via `AMBER_SOCK`) so it can report its supervision phase
     /// back (`ReportRunState`). `None` in tests / hand-started managers — the
@@ -419,6 +442,7 @@ impl SessionManager {
             cpu_reconcile_hook: Mutex::new(None),
             budget_kb: Arc::new(AtomicU64::new(0)),
             deferred_meta: Mutex::new(HashMap::new()),
+            branch_cache: Mutex::new(HashMap::new()),
             socket: None,
             watchers: None,
             claude_absent: Mutex::new(HashMap::new()),
@@ -2250,6 +2274,51 @@ impl SessionManager {
         crate::search::search_snapshots_cancellable(query, &snapshots, names, limit, cancelled)
     }
 
+    /// Branch of `cwd`, cached and revalidated by a single `stat`. Display
+    /// metadata: every failure is `None`, never an error, and it must never
+    /// make a control gesture fail.
+    fn branch_for(&self, cwd: &Path) -> Option<String> {
+        let stat = |path: &Path| {
+            std::fs::metadata(path)
+                .ok()
+                .map(|meta| (meta.modified().ok(), meta.len()))
+        };
+        let mut cache = self.branch_cache.lock().unwrap();
+        if let Some(entry) = cache.get(cwd) {
+            match &entry.head {
+                // A repository we already found: trust the answer while the
+                // governing HEAD is byte-identical.
+                Some(head) => {
+                    if let Some((mtime, len)) = stat(head) {
+                        if mtime == entry.mtime && len == entry.len {
+                            return entry.branch.clone();
+                        }
+                    }
+                }
+                // Not a repository last time we looked.
+                None if entry.probed.elapsed() < BRANCH_NEGATIVE_TTL => return None,
+                None => {}
+            }
+        }
+
+        let head = amber_core::git::head_path(cwd);
+        let (mtime, len, branch) = match head.as_deref() {
+            Some(path) => {
+                let (mtime, len) = stat(path).unwrap_or((None, 0));
+                let branch = std::fs::read_to_string(path)
+                    .ok()
+                    .and_then(|contents| amber_core::git::parse_head(&contents));
+                (mtime, len, branch)
+            }
+            None => (None, 0, None),
+        };
+        cache.insert(
+            cwd.to_path_buf(),
+            BranchEntry { head, mtime, len, branch: branch.clone(), probed: std::time::Instant::now() },
+        );
+        branch
+    }
+
     /// One [`SessionInfo`] per live session, joining the live table (existence
     /// + liveness) with the persisted metadata (cwd/kind). Sorted by name.
     pub fn session_infos(&self) -> anyhow::Result<Vec<SessionInfo>> {
@@ -2275,6 +2344,7 @@ impl SessionManager {
                     kind: meta.kind.as_str().to_string(),
                     alive: sess.is_alive(),
                     updated: meta.updated,
+                    branch: self.branch_for(&meta.cwd),
                     title: Self::safe_title(&meta),
                     run_state: match (sess.run_state(), sess.suspend_origin()) {
                         (Some(state), SuspendOrigin::Pressure) if state == "suspended" => {
@@ -2489,6 +2559,7 @@ impl SessionManager {
             kind: meta.kind.as_str().to_string(),
             alive: sess.is_alive(),
             updated: meta.updated,
+            branch: self.branch_for(&meta.cwd),
             title,
             run_state: sess.run_state(),
             claude_id: self
@@ -2870,6 +2941,45 @@ mod tests {
     fn decide_resume_stays_false_when_never_claude() {
         // A plain shell that was never claude stays false, streak stays 0.
         assert_eq!(decide_resume(false, false, 0, 2), (false, 0));
+    }
+
+    #[test]
+    fn session_infos_reports_the_branch_of_each_session_cwd() {
+        // Two panes in one repository are indistinguishable by project, kind
+        // and slot; the branch is the only field that separates them.
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/feat/x\n").unwrap();
+        let plain = dir.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+
+        mgr.create("amber-1-1-0-a", &repo, SessionKind::Shell).unwrap();
+        mgr.create("amber-1-1-1-b", &plain, SessionKind::Shell).unwrap();
+
+        let infos = mgr.session_infos().unwrap();
+        let branch = |name: &str| {
+            infos.iter().find(|i| i.name == name).unwrap().branch.clone()
+        };
+        assert_eq!(branch("amber-1-1-0-a"), Some("feat/x".to_string()));
+        assert_eq!(branch("amber-1-1-1-b"), None, "a non-repo cwd must not invent a branch");
+
+        // A checkout rewrites HEAD; the stat-validated cache must not serve the
+        // stale branch afterwards.
+        std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/other\n").unwrap();
+        filetime_bump(&repo.join(".git/HEAD"));
+        assert_eq!(
+            mgr.session_infos().unwrap().iter().find(|i| i.name == "amber-1-1-0-a").unwrap().branch,
+            Some("other".to_string())
+        );
+    }
+
+    /// Force a distinct mtime so the cache check is exercised on filesystems
+    /// with coarse timestamps.
+    fn filetime_bump(path: &Path) {
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(2);
+        let _ = std::fs::File::open(path).map(|f| f.set_modified(later));
     }
 
     #[test]
