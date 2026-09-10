@@ -108,6 +108,18 @@ exception is core rule 9); themes/settings beyond minimal.
 
 ## Build status
 
+- [x] Pi terminal clipboard repair — copied Pi selections drop literal trailing
+  row padding while preserving indentation, interior spacing and blank lines.
+  Native and Amber copy/paste actions share one policy; Pi pastes remain
+  bracketed after a cold attach/reconnect even when capped backlog has evicted
+  the startup mode sequence. Existing negotiated mode is not double-wrapped;
+  ordinary shells and daemon-reported Pi shell fallback retain xterm behavior.
+  App: 1226 passed / 1 skipped, typecheck and desktop/web builds passed (existing
+  web warnings remain). Private real-Electron mounted-Pane clipboard regression:
+  11 cases × 5 consecutive passing runs. Rust untouched/not rerun. Tested branch
+  only, not merged or deployed; real Mac/phone/provider checks remain manual.
+  Receipt: `docs/pi-terminal-clipboard-verification.md`.
+
 - [x] Mobile direct chat entry — Pocket session rows offer **Open chat** for
   live Pi sessions; the action selects the saved graphical view and opens/focuses
   that pane full-screen. The focused header exposes **Chat | Terminal** with

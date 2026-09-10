@@ -12,6 +12,7 @@ import { decodeOsc52Payload } from './osc'
 import { KeyboardInputModeTracker, shiftEnterSequence } from './terminalKeys'
 import { installTerminalUnicode } from './terminalUnicode'
 import { loadOptionalWebgl } from './terminalRenderer'
+import { installTerminalClipboard } from './terminalClipboard'
 
 // Imperative scrollback-search handle handed to the chrome (the find bar in
 // SplitView) via `onSearchReady`. Search execution stays outside React — the
@@ -31,9 +32,8 @@ export interface SearchApi {
   copySelection(): string
   // Selected text, or a small semantic anchor around the live cursor.
   captureBookmark(): string
-  // Paste text into the pty via xterm, which wraps it in bracketed-paste markers
-  // when the running program requested that mode (so multiline paste doesn't
-  // submit line-by-line in claude/vim). Routes through onData → the port.
+  // Paste through xterm's onData → port, honoring negotiated paste mode and
+  // protecting Pi pastes even when its startup mode was evicted from backlog.
   paste(text: string): void
 }
 
@@ -118,8 +118,8 @@ const MOUSE_RESET = '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l'
 // (honors "xterm instances live outside React reconciliation").
 // Focus is tracked by SplitView via `focusin` on the wrapper; nothing here.
 export const Pane = memo(function Pane(
-  { session, kind, epoch, portEpoch, activateSeq, fontSize, cwd, onTitle, onSearchReady, onInputReady, fitMode = 'fit' }:
-    { session: string; kind: string; epoch: number; portEpoch: number; activateSeq: number; fontSize: number; cwd: string; onTitle?: (title: string) => void; onSearchReady?: (api: SearchApi) => void; onInputReady?: (api: InputApi) => void; fitMode?: FitMode },
+  { session, kind, runState, epoch, portEpoch, activateSeq, fontSize, cwd, onTitle, onSearchReady, onInputReady, fitMode = 'fit' }:
+    { session: string; kind: string; runState?: string | undefined; epoch: number; portEpoch: number; activateSeq: number; fontSize: number; cwd: string; onTitle?: (title: string) => void; onSearchReady?: (api: SearchApi) => void; onInputReady?: (api: InputApi) => void; fitMode?: FitMode },
 ): JSX.Element {
   const containerRef = useRef<HTMLDivElement>(null)
   const hostRef = useRef<HTMLDivElement>(null)
@@ -149,6 +149,9 @@ export const Pane = memo(function Pane(
   onInputReadyRef.current = onInputReady
   const fitModeRef = useRef(fitMode)
   fitModeRef.current = fitMode
+  // The daemon's fallback state can change without replacing this terminal.
+  const piClipboardRef = useRef(false)
+  piClipboardRef.current = kind === 'pi' && runState !== 'shell-fallback'
   // True once this Pane has consumed one Attach backlog. A LATER backlog is a
   // RE-attach replay of history the terminal already shows, so it must clear
   // first — see the `term.reset()` in the port handler. Deliberately not armed
@@ -176,6 +179,7 @@ export const Pane = memo(function Pane(
     const fit = new FitAddon()
     installTerminalUnicode(term)
     term.open(host)
+    const clipboard = installTerminalClipboard(term, host, () => piClipboardRef.current)
     term.loadAddon(fit)
     // WebGL is the fast path on hardware GL, but pathologically slow on
     // SwiftShader — under software GL, use xterm's default DOM renderer.
@@ -200,7 +204,7 @@ export const Pane = memo(function Pane(
       // Reads the live `port` binding (reassigned on wire/re-acquire), same as
       // term.onData below — so it targets the current pty even after a reconnect.
       insert: (text) => port?.postMessage({ data: new TextEncoder().encode(text) }),
-      copySelection: () => term.getSelection(),
+      copySelection: clipboard.copySelection,
       captureBookmark: () => {
         const selection = term.getSelection().trim()
         if (selection) return selection.slice(0, 500)
@@ -213,9 +217,7 @@ export const Pane = memo(function Pane(
         }
         return lines.join('\n').slice(0, 500)
       },
-      // term.paste() emits through onData (registered below) → the live port,
-      // and applies bracketed-paste framing when the program enabled it.
-      paste: (text) => term.paste(text),
+      paste: clipboard.paste,
     })
 
     // OSC 52 clipboard writes: a TUI sets the system clipboard by emitting
@@ -586,6 +588,7 @@ export const Pane = memo(function Pane(
       }
       ro.disconnect()
       resultsSub.dispose()
+      clipboard.dispose()
       port?.close()
       // Release the CLIENT side too. Closing our end alone left the
       // utilityProcess holding its half forever (its port map is keyed by
