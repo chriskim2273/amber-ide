@@ -90,8 +90,9 @@ overload and `NativeImage.resize`/quality type errors; `tabBrowserHost.test.ts`
 has optional `captureFrame`/`exactOptionalPropertyTypes` errors. The affected
 files were not changed by this task. Full diagnostics: `merged-typecheck.log`.
 The isolated committed clipboard tree's typecheck and builds passed as recorded
-above. No unrelated type errors were repaired; the clipboard worktree and branch
-are retained pending resolution of the combined checkout's gate.
+above. No unrelated type errors were repaired. The task worktree was initially
+retained; the later approved main integration below verifies the committed tree
+independently of those unrelated working-copy changes.
 
 ## Review and limits
 
@@ -153,3 +154,35 @@ No daemon/web/router restart, Pi extension change, permission change or web
 asset deployment was performed. Existing source-level browser-host type errors
 remain outside this repair; their already-installed artifact was preserved,
 not rebuilt from the dirty checkout.
+
+## Main integration and finish verification — 2026-09-10
+
+The user subsequently approved merging into `main` and pushing its existing
+unpushed commits as well. Main had advanced to `9dacbc1` with Pocket stable-row,
+project/branch identity and touch-target changes. Merge `39ca2d0` preserved those
+changes and the clipboard repair without conflicts, in the clean persistent
+clipboard worktree; the unrelated dirty checkout was not used to build or test
+this integration.
+
+Fresh merged-tree gates:
+
+- App: **1241 passed / 1 skipped**, typecheck, desktop and web builds passed.
+- Mounted real-Electron clipboard fixture: **11/11 passed**.
+- Rust workspace/all-targets: **922 passed / 2 ignored** on the full rerun.
+- Clippy workspace/all-targets with `-D warnings`: passed.
+
+The first Rust run failed the existing `pi_reboot` fixture's `manual Pi start`
+wait. Its log shows input sent before the daemon had registered `work`: the
+fixture waits for the metadata file, which `create_with_title` writes before
+inserting into its live session map. The focused retry and full rerun passed.
+This pre-existing timing race was not hidden, skipped, or repaired as part of
+clipboard scope. Both failure and retry logs are retained.
+
+Finish receipts are under `~/worktrees/amber-ide/pi-clipboard-evidence/finish/`.
+They include the original clean build archive, merged app/build/typecheck logs,
+Rust failure/retry logs and Clippy output. The task worktree/branch may be removed
+once the checked merge is on main and the push is verified; all deployment
+artifacts, rollback image and validation receipts live outside that worktree.
+The source commits remain available to recreate a checkout for the deployment
+scripts that reference the original worktree path. No redeployment accompanies
+this repository-only finish.

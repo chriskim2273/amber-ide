@@ -126,7 +126,11 @@ exception is core rule 9); themes/settings beyond minimal.
   unchanged; real Mac/phone/provider checks remain manual. Combined dirty checkout:
   1250 tests / 1 skipped and all 11 clipboard cases pass, but existing uncommitted
   browser-host type errors block its typecheck. All 39 unrelated dirty/untracked
-  files were hash-preserved. Receipt: `docs/pi-terminal-clipboard-verification.md`.
+  files were hash-preserved. Final main integration preserves newer Pocket work:
+  clean merged tree passes 1241 app tests / 1 skipped, typecheck, desktop/web
+  builds, 11 clipboard cases, Rust 922 passed / 2 ignored and Clippy. The existing
+  Pi reboot fixture race failed once before focused/full reruns passed; all logs
+  retained. Receipt: `docs/pi-terminal-clipboard-verification.md`.
 
 - [x] Mobile direct chat entry — Pocket session rows offer **Open chat** for
   live Pi sessions; the action selects the saved graphical view and opens/focuses
