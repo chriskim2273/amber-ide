@@ -58,6 +58,20 @@ describe('settleReplayedModes', () => {
     term.dispose()
   })
 
+  it('a synchronous read of the buffer is pre-replay, which is why the settle must be a write callback', async () => {
+    // The trap this pins: xterm parses `write()` asynchronously, so reading
+    // `term.buffer.active` immediately after queuing a replay still reports the
+    // OLD buffer. The packaged-app fixture caught exactly this — an inline
+    // settlement saw "normal" and cleared the protocol the replay had just
+    // queued, so the wheel kept producing arrow keys.
+    const term = await terminal()
+    term.write(PI_PREAMBLE)
+    expect(term.buffer.active.type).toBe('normal')
+    await drain(term)
+    expect(term.buffer.active.type).toBe('alternate')
+    term.dispose()
+  })
+
   it('clears a stale mouse mode when no full-screen app owns the screen', async () => {
     // History replayed into a shell: an exited TUI's enable is re-executed, and
     // the shell would then echo encoded reports on every pointer move.

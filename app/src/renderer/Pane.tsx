@@ -566,10 +566,17 @@ export const Pane = memo(function Pane(
           keyboardMode.reset()
         }
         keyboardMode.feed(m.data)
-        term.write(m.data) // xterm.write accepts Uint8Array (UTF-8)
         if (isBacklog) {
           attachedOnceRef.current = true
-          settleReplayedModes(term) // see terminalModes.ts — keeps a live TUI's modes
+          // Settle the modes in the write's COMPLETION callback, never inline:
+          // xterm parses `write()` asynchronously, so a synchronous read of
+          // `term.buffer.active` still sees the pre-replay buffer and would
+          // clear the very protocol the replay just queued (measured in the
+          // packaged fixture: the pane kept converting the wheel into arrow
+          // keys even with the alt-screen preamble present).
+          term.write(m.data, () => settleReplayedModes(term))
+        } else {
+          term.write(m.data) // xterm.write accepts Uint8Array (UTF-8)
         }
       }
       port.start()
