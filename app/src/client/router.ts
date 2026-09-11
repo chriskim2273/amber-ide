@@ -106,7 +106,17 @@ export class Router {
       }
     })
     port.start()
-    this.sendAttach(session)
+    // A new port always means a NEW terminal: main mints one MessageChannel per
+    // `openPane`, and the renderer only asks for one when it mounts a Pane
+    // ([session] effect) or its client process was replaced (portEpoch) — never
+    // for a terminal that is still holding its history. So this attach must
+    // present NO watermark. Reusing one handed a cold xterm a delta starting at
+    // an arbitrary byte of someone else's stream: the pane lost every line the
+    // user could see, and (worse) it never received the live application's
+    // mode enables — a full-screen TUI's alt-screen/mouse sequences are written
+    // once, at startup, and are long evicted from the capped ring. The result
+    // was a corrupted-looking pane whose wheel no longer reached the app.
+    this.sendAttach(session, { fresh: true })
   }
 
   attachPi(session: string, port: PortLike): void {
@@ -140,17 +150,33 @@ export class Router {
   }
 
   reattachAll(): void {
-    for (const [session] of this.ports) this.sendAttach(session)
+    // The terminals this re-Attaches are ALIVE: the connection dropped, not the
+    // panes, so each one still holds its history and its modes and wants only
+    // the missing tail.
+    for (const [session] of this.ports) this.sendAttach(session, { fresh: false })
   }
 
   /**
-   * Attach with this session's delta credentials: a tracked watermark when we
-   * have one (reconnect path), else `{epoch:'0'}` — "new-style client, no
-   * watermark yet" — which still opts the connection into the AttachBacklog
-   * ack. Arms which reply shape we expect.
+   * Attach, choosing the replay the peer's terminal actually needs.
+   *
+   * `fresh` (a new terminal) sends `{epoch:'0'}` — "new-style client, no
+   * watermark yet", which the daemon answers with the FULL scrollback plus, for
+   * a full-screen application, its live mode preamble (`amber_core::modes`).
+   * The stored watermark is deliberately NOT consulted: it describes bytes a
+   * terminal that no longer exists had already rendered.
+   *
+   * A re-attach of a surviving terminal presents the tracked watermark when we
+   * have one (a delta: only the bytes it has not seen), else `{epoch:'0'}` —
+   * which still opts the connection into the `AttachBacklog` ack so the NEXT
+   * reconnect can use a delta.
+   *
+   * Either way the `resume` KEY is present: that is the opt-in for the ack, and
+   * the daemon now answers an opt-in attach with exactly one replay frame even
+   * when it is empty, so the `awaiting-ack` arm is always consumed by the
+   * replay itself.
    */
-  private sendAttach(session: string): void {
-    const watermark = this.watermarks.get(session)
+  private sendAttach(session: string, opts: { fresh: boolean }): void {
+    const watermark = opts.fresh ? undefined : this.watermarks.get(session)
     this.pendingReplay.set(session, 'awaiting-ack')
     this.conn.send({
       type: 'control',

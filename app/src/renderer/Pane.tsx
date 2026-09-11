@@ -13,6 +13,7 @@ import { KeyboardInputModeTracker, shiftEnterSequence } from './terminalKeys'
 import { installTerminalUnicode } from './terminalUnicode'
 import { loadOptionalWebgl } from './terminalRenderer'
 import { installTerminalClipboard } from './terminalClipboard'
+import { MOUSE_RESET, settleReplayedModes } from './terminalModes'
 
 // Imperative scrollback-search handle handed to the chrome (the find bar in
 // SplitView) via `onSearchReady`. Search execution stays outside React — the
@@ -107,11 +108,11 @@ const XTERM_THEME = {
   brightWhite: '#f4f4f8',
 }
 
-// Replaying raw scrollback re-executes its escape codes, including any mouse-
-// tracking enable from a prior program (e.g. an exited claude). Left set, a
-// shell echoes mouse reports on every click/move. Disable all mouse modes
-// after each backlog; a live program re-asserts what it needs on redraw.
-const MOUSE_RESET = '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l'
+// Mouse-mode hygiene after a replay lives in `terminalModes.ts`
+// (`MOUSE_RESET` + `settleReplayedModes`). The rule there is "normal buffer
+// only": clearing the modes of a live alt-screen application is exactly what
+// broke the pane's wheel (xterm then turns wheel events into up/down arrows,
+// which a TUI's editor reads as its prompt history).
 
 // Memoized: SplitView re-renders on every drag-hover mousemove. `session`/
 // `epoch` are primitives, so memo keeps a drag from reconciling every terminal
@@ -240,7 +241,10 @@ export const Pane = memo(function Pane(
     // has empty daemon backlog, so writing the saved history here — before the
     // live port is wired — yields display-correct ordering (history, then live
     // output). MOUSE_RESET clears any mouse-tracking mode the replayed bytes
-    // re-enabled (same hazard as an Attach backlog).
+    // re-enabled (same hazard as an Attach backlog). Unconditional here, unlike
+    // an Attach backlog: this terminal is always cold and the application's own
+    // startup bytes (its real modes) are still to come, so nothing live can be
+    // clobbered.
     const replay = takeReplay(session)
     if (replay) { term.write(replay); term.write(MOUSE_RESET) }
 
@@ -537,6 +541,18 @@ export const Pane = memo(function Pane(
         // instead of de-duplicating it (observed on a real daemon restart —
         // the pane went blank while the daemon still held the history).
         const isBacklog = m.backlog === true
+        // An EMPTY replay frame is a real answer, not a no-op: the daemon tags
+        // it to consume this pane's "next frame is the replay" arm (an empty
+        // replay that were simply omitted would leave that arm to tag the next
+        // LIVE frame as scrollback). There is nothing to de-duplicate and
+        // nothing to draw, so neither the buffer nor the modes may be touched —
+        // a reset here would blank a live pane whose session had no scrollback
+        // to hand back. The arm still gets set: a LATER replay is history this
+        // terminal now shows.
+        if (isBacklog && m.data.length === 0) {
+          attachedOnceRef.current = true
+          return
+        }
         // A re-attach replays history this terminal ALREADY shows, so without a
         // clear each reconnect appended a duplicate copy — cosmetically wrong,
         // and it grew the buffer by up to a full backlog every time until
@@ -553,7 +569,7 @@ export const Pane = memo(function Pane(
         term.write(m.data) // xterm.write accepts Uint8Array (UTF-8)
         if (isBacklog) {
           attachedOnceRef.current = true
-          term.write(MOUSE_RESET) // clear mouse modes the replayed bytes re-enabled
+          settleReplayedModes(term) // see terminalModes.ts — keeps a live TUI's modes
         }
       }
       port.start()
@@ -627,23 +643,22 @@ export const Pane = memo(function Pane(
 
   // On reconnect (epoch increments): nudge a resize so an alt-screen TUI
   // (claude — whose screen isn't in scrollback) repaints. Staggered because
-  // claude may still be re-resuming when the socket comes back. The mouse-mode
-  // reset is no longer armed here — the client tags the actual backlog frame
-  // (`m.backlog`), which is exact where this was a guess that raced it.
+  // claude may still be re-resuming when the socket comes back.
+  //
+  // This nudge must NOT touch the terminal's modes. It used to write the mouse
+  // reset here, which disarmed the live application's wheel handling on every
+  // daemon reconnect: Pi negotiates its mouse protocol once, at TUI start, and
+  // a later reset is never re-asserted. What the replay needs is applied by the
+  // client's backlog tag (exact, frame-scoped) and the daemon's mode preamble.
   useEffect(() => {
     if (epoch === 0) return
     const nudge = (): void => {
       const term = termRef.current, fit = fitRef.current, port = portRef.current
       if (!term || !port) return
-      // The mouse reset is always safe; the RE-FIT is not. In scale mode this
-      // pane is a tile whose pixels are CSS-scaled, and fitting it would
-      // reflow the shared pty to tile size on every reconnect.
-      if (fitModeRef.current === 'scale') {
-        term.write(MOUSE_RESET)
-        return
-      }
+      // In scale mode this pane is a tile whose pixels are CSS-scaled, and
+      // fitting it would reflow the shared pty to tile size.
+      if (fitModeRef.current === 'scale') return
       try { fit?.fit() } catch { /* ignore */ }
-      term.write(MOUSE_RESET)
       port.postMessage({ resize: { cols: term.cols, rows: term.rows } })
     }
     const t1 = setTimeout(nudge, 600)

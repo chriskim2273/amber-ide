@@ -218,7 +218,12 @@ describe('Router', () => {
     // Detach + reconnect with the tracked watermark.
     router.detach('s')
     const port2 = new FakePort()
-    router.attach('s', port2) // fresh mount: epoch '0' again
+    conn.sent.length = 0
+    router.attach('s', port2) // fresh mount: epoch '0' again, never the tracked watermark
+    expect(conn.sent).toEqual([{
+      type: 'control',
+      msg: { kind: 'Attach', name: 's', resume: { epoch: '0', offset: 0 } },
+    }])
     conn.sent.length = 0
     conn.emit({
       type: 'control',
@@ -227,6 +232,40 @@ describe('Router', () => {
     conn.emit({ type: 'data', session: 's', bytes: new Uint8Array([2]) })
     // Delta: NO backlog tag — the renderer must append, never reset here.
     expect(port2.posted).toEqual([{ data: new Uint8Array([2]) }])
+  })
+
+  it('a fresh mount presents no stale watermark, so its cold terminal gets the full replay', () => {
+    // The renderer asks for a port on every Pane mount — a rebuilt pane, a
+    // workspace switch, a renderer reload — and each one is a NEW empty xterm.
+    // Reusing the previous terminal's watermark answered that cold terminal
+    // with a delta: it lost every line it should have shown, and never received
+    // the live application's startup modes (alt screen / mouse reporting),
+    // which is what broke the pane's scrolling.
+    const conn = new FakeConn()
+    const router = new Router(conn)
+    router.attach('s', new FakePort())
+    conn.emit({
+      type: 'control',
+      msg: { kind: 'AttachBacklog', name: 's', epoch: '7', end_offset: 100, full: true },
+    })
+    conn.emit({ type: 'data', session: 's', bytes: new Uint8Array(30) })
+    conn.sent.length = 0
+
+    const remounted = new FakePort()
+    router.attach('s', remounted)
+
+    expect(conn.sent).toEqual([{
+      type: 'control',
+      msg: { kind: 'Attach', name: 's', resume: { epoch: '0', offset: 0 } },
+    }])
+    // And the daemon answers a zero watermark with a full replay, which the
+    // renderer resets for (the terminal is empty, so this is a no-op there).
+    conn.emit({
+      type: 'control',
+      msg: { kind: 'AttachBacklog', name: 's', epoch: '7', end_offset: 400, full: true },
+    })
+    conn.emit({ type: 'data', session: 's', bytes: new Uint8Array([5]) })
+    expect(remounted.posted).toEqual([{ data: new Uint8Array([5]), backlog: true }])
   })
 
   it('reattachAll presents the tracked watermark so a healthy daemon answers with a delta', () => {
