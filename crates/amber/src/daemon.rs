@@ -510,12 +510,30 @@ fn handle_control(
                 // the "panes render but no button does anything" failure.
                 //
                 // Sent as ONE frame, matching the client's contract: the app
-                // resets stale mouse modes after the FIRST post-attach message
-                // (Pane.tsx MOUSE_RESET), so splitting the replay would fire that
-                // reset mid-backlog and let later bytes re-enable mouse tracking.
+                // settles stale mouse modes after the FIRST post-attach message
+                // (the renderer's `settleReplayedModes`), so splitting the
+                // replay would fire that settlement mid-backlog and let later
+                // bytes re-enable mouse tracking.
                 // Ordering holds: this snapshot predates every chunk in `rx`.
-                if !skip_backlog && !sub.backlog.is_empty() {
-                    let frame = Frame::Data { session: name.clone(), bytes: sub.backlog };
+                //
+                // A FULL replay leads with the session's mode preamble: the
+                // ring is capped and a full-screen TUI writes its mode enables
+                // once, at startup, so the retained window can no longer put a
+                // cold terminal into the alt screen or restore its mouse
+                // protocol (see `amber_core::modes`). Prepending it here — not
+                // as a separate frame — keeps the "the next Data frame IS the
+                // replay" contract exact.
+                let mut replay = sub.preamble;
+                replay.extend_from_slice(&sub.backlog);
+                // An opt-in client (`resume` present) is always answered with the
+                // frame, even when it is empty: its router arms "the next Data
+                // frame is the replay" when it sends the Attach, and an empty
+                // replay that never arrives would leave that armed — the next
+                // LIVE frame would then be tagged as scrollback and reset (or
+                // duplicate) a pane's history. Legacy clients keep the old
+                // shape exactly: no resume, and no empty frame.
+                if !skip_backlog && (resume.is_some() || !replay.is_empty()) {
+                    let frame = Frame::Data { session: name.clone(), bytes: replay };
                     if write_frame(&writer, &frame).is_err() {
                         sess.unsubscribe(sub.id);
                         return;

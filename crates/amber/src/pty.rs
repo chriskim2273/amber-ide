@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
 
+use amber_core::modes::TerminalModes;
 use amber_core::ring::Ring;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 
@@ -91,10 +92,18 @@ type Subscribers = Vec<(u64, SyncSender<Vec<u8>>)>;
 /// the backlog is the FULL scrollback (client must reset first) or only the
 /// delta past the caller's watermark, those bytes, the watermark to present
 /// on the next attach once they are consumed, and the live receiver.
+///
+/// `full: true` additionally carries `preamble`: the bytes that put a COLD
+/// terminal into the live application's current private modes before the
+/// backlog is replayed (see [`amber_core::modes`]). It is empty for a delta
+/// (a surviving terminal already holds the state, and re-asserting the alt
+/// screen would clear the pane) and for any session whose application is not
+/// on the alt screen.
 pub struct Subscription {
     pub id: u64,
     pub full: bool,
     pub backlog: Vec<u8>,
+    pub preamble: Vec<u8>,
     pub end_offset: u64,
     pub rx: Receiver<Vec<u8>>,
 }
@@ -106,6 +115,13 @@ pub struct PtySession {
     master: Mutex<Box<dyn MasterPty + Send>>,
     writer: Mutex<Box<dyn Write + Send>>,
     ring: Arc<Mutex<Ring>>,
+    /// The application's live private-mode state (alt screen, mouse reporting,
+    /// bracketed paste, cursor visibility), fed the SAME bytes as `ring` in the
+    /// same critical section. The ring is capped, so the enable sequences of a
+    /// long-running full-screen TUI are eventually evicted from it; this state
+    /// is O(1) and never evicts, which is what lets a cold client be put back
+    /// into the modes the application is actually in.
+    modes: Arc<Mutex<TerminalModes>>,
     subs: Arc<Mutex<Subscribers>>,
     /// Set by the batcher thread (under the `subs` lock) once the pty hits
     /// EOF and the final frame is flushed. After that nobody will ever clear
@@ -261,6 +277,7 @@ impl PtySession {
         };
 
         let ring = Arc::new(Mutex::new(Ring::new(cap)));
+        let modes = Arc::new(Mutex::new(TerminalModes::new()));
         let subs: Arc<Mutex<Subscribers>> = Arc::new(Mutex::new(Vec::new()));
         let reader_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let exit_teardown_done = Arc::new(AtomicBool::new(false));
@@ -327,6 +344,7 @@ impl PtySession {
         // (receiver dropped) are pruned afterward.
         {
             let ring = Arc::clone(&ring);
+            let modes = Arc::clone(&modes);
             let subs = Arc::clone(&subs);
             let reader_done = Arc::clone(&reader_done);
             let activity = Arc::clone(&activity);
@@ -368,6 +386,13 @@ impl PtySession {
                     let senders: Subscribers = {
                         let mut ring_guard = ring.lock().unwrap();
                         ring_guard.push(&batch);
+                        // Mode state rides the SAME critical section as the
+                        // ring push (ring -> modes, the order `subscribe_from`
+                        // takes too), so a subscriber can never observe bytes
+                        // in the ring whose mode effects are not yet in the
+                        // tracker — which would hand a cold client a stale
+                        // preamble for the window it is about to replay.
+                        modes.lock().unwrap().feed(&batch);
                         subs.lock().unwrap().clone()
                     };
                     let dead = deliver_chunk(&batch, senders);
@@ -447,6 +472,7 @@ impl PtySession {
             master: Mutex::new(pair.master),
             writer: Mutex::new(writer),
             ring,
+            modes,
             subs,
             reader_done,
             exit_teardown_done,
@@ -727,8 +753,18 @@ impl PtySession {
     }
 
     /// Seed the ring with persisted history (used on restore, before live output).
+    ///
+    /// The mode tracker is fed the same bytes: a restored session's live child
+    /// re-asserts its own modes when it starts, but until it does — and for a
+    /// session whose child is already running under a restarted daemon — the
+    /// persisted tail is the only evidence of what the application had set.
+    /// Best effort by construction (the ring is capped and may be cut mid-
+    /// sequence), which is exactly why the tracker's own knowledge is never
+    /// evicted once the live stream has asserted it.
     pub fn preload(&self, bytes: &[u8]) {
-        self.ring.lock().unwrap().push(bytes);
+        let mut ring = self.ring.lock().unwrap();
+        ring.push(bytes);
+        self.modes.lock().unwrap().feed(bytes);
     }
 
     /// Atomically capture the current scrollback and start receiving live
@@ -769,6 +805,15 @@ impl PtySession {
         } else {
             (true, ring.snapshot())
         };
+        // The mode preamble belongs to a FULL replay only: it is what a COLD
+        // terminal needs before the window lands. A delta goes to a terminal
+        // that already holds the modes, and `ESC [ ? 1049 h` there would clear
+        // the alternate buffer the user is looking at.
+        let preamble = if full {
+            self.modes.lock().unwrap().replay_preamble()
+        } else {
+            Vec::new()
+        };
         let (tx, rx) = sync_channel(SUBSCRIBER_QUEUE_DEPTH);
         let id = self.next_sub_id.fetch_add(1, Ordering::Relaxed);
         {
@@ -783,7 +828,7 @@ impl PtySession {
             }
         }
         drop(ring);
-        Subscription { id, full, backlog, end_offset: written, rx }
+        Subscription { id, full, backlog, preamble, end_offset: written, rx }
     }
 
     /// Drop a subscriber's sender so its channel closes and it stops
@@ -1052,6 +1097,84 @@ mod tests {
             .scrollback()
             .windows(16)
             .any(|w| w == b"RESTORED-HISTORY"));
+    }
+
+    /// Spawn a shell that asserts a full-screen TUI's modes ONCE and then
+    /// floods the ring far past `cap`, so the enables are evicted while the
+    /// application (as far as the tracker knows) is still in them. This is the
+    /// real shape of the refresh/reload bug: Pi writes
+    /// `?1049h ?1000h ?1002h ?1003h ?1004h ?1006h` in `beforeTerminalStart` and
+    /// never again, so a 2 MiB ring of frames loses the enable within minutes.
+    fn alt_screen_flood_session(cap: usize) -> PtySession {
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.arg("-c");
+        // Inside single quotes the ESC bytes are literal argv bytes, so no
+        // shell/printf escape dialect is involved.
+        cmd.arg(
+            "printf '\u{1b}[?1049h\u{1b}[?1000h\u{1b}[?1002h\u{1b}[?1003h\u{1b}[?1004h\u{1b}[?1006h\u{1b}[?25l'; \
+             i=0; while [ $i -lt 300 ]; do printf 'frame-%s\n' $i; i=$((i+1)); done; sleep 30",
+        );
+        PtySession::spawn(cmd, 24, 80, cap).unwrap()
+    }
+
+    #[test]
+    fn a_cold_replay_is_led_by_the_modes_the_ring_can_no_longer_show() {
+        // The whole point of tracking state instead of bytes: the ring is tiny
+        // here, so the mode enables are long gone, yet a cold client still gets
+        // them.
+        let sess = alt_screen_flood_session(64);
+        wait_for(&sess, b"frame-299");
+
+        let cold = sess.subscribe_from(0, 0); // epoch 0 = cold terminal
+        assert!(cold.full);
+        assert!(
+            !cold.backlog.windows(8).any(|w| w == b"\x1b[?1049"),
+            "precondition: the capped ring must have evicted the alt-screen enable"
+        );
+        assert_eq!(
+            cold.preamble,
+            b"\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1004h\x1b[?1006h\x1b[?25l"
+        );
+    }
+
+    #[test]
+    fn a_delta_subscription_never_repeats_the_mode_preamble() {
+        // A surviving terminal already holds the state, and re-asserting
+        // `?1049h` would clear the alternate buffer the user is reading.
+        let sess = alt_screen_flood_session(4096);
+        wait_for(&sess, b"frame-299");
+        let epoch = sess.scrollback_epoch();
+        let offset = sess.scrollback_written();
+
+        let delta = sess.subscribe_from(epoch, offset);
+
+        assert!(!delta.full, "a current watermark must yield a delta");
+        assert!(delta.preamble.is_empty(), "a live terminal needs no preamble");
+    }
+
+    #[test]
+    fn a_session_with_no_full_screen_application_has_no_preamble() {
+        // A shell (or a TUI that exited) must never have the modes re-asserted:
+        // that is the "every click spams encoded mouse reports" hazard. The
+        // client's own post-replay reset (see the app's `settleReplayedModes`)
+        // covers this shape; the daemon must not fight it.
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.arg("-c");
+        cmd.arg("printf '\u{1b}[?1000h\u{1b}[?1002h\u{1b}[?1006hplain text'; sleep 30");
+        let sess = PtySession::spawn(cmd, 24, 80, 4096).unwrap();
+        wait_for(&sess, b"plain text");
+
+        let cold = sess.subscribe_from(0, 0);
+
+        assert!(cold.full);
+        assert!(
+            cold.backlog.windows(8).any(|w| w == b"\x1b[?1000h"),
+            "precondition: the window really does carry a mouse enable"
+        );
+        assert!(
+            cold.preamble.is_empty(),
+            "without an alt screen the modes belong to nobody: asserting them would spam a shell"
+        );
     }
 
     #[test]
