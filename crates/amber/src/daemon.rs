@@ -523,8 +523,21 @@ fn handle_control(
                 // protocol (see `amber_core::modes`). Prepending it here — not
                 // as a separate frame — keeps the "the next Data frame IS the
                 // replay" contract exact.
-                let mut replay = sub.preamble;
-                replay.extend_from_slice(&sub.backlog);
+                //
+                // The preamble is ~50 bytes and usually EMPTY (any session not
+                // on the alt screen), so the common path still MOVES the
+                // backlog into the frame. Only when there really is a preamble
+                // is a combined buffer built — once, with the exact capacity,
+                // rather than extending the preamble and reallocating a
+                // multi-MiB buffer at the ring cap.
+                let replay = if sub.preamble.is_empty() {
+                    sub.backlog
+                } else {
+                    let mut combined = Vec::with_capacity(sub.preamble.len() + sub.backlog.len());
+                    combined.extend_from_slice(&sub.preamble);
+                    combined.extend_from_slice(&sub.backlog);
+                    combined
+                };
                 // An opt-in client (`resume` present) is always answered with the
                 // frame, even when it is empty: its router arms "the next Data
                 // frame is the replay" when it sends the Attach, and an empty
