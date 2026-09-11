@@ -46,8 +46,16 @@ export function PromptEnhancer({ initial = '', targets, onClose }: Props): JSX.E
     setBusy(true)
     setError(null)
     setNotice(null)
+    // A stale hosted bundle may lack the bridge the desktop preload
+    // provides; say so plainly instead of throwing on undefined.
+    const bridge = window.amber.routerEnhance
+    if (typeof bridge !== 'function') {
+      setBusy(false)
+      setError('prompt enhancement needs the desktop app')
+      return
+    }
     try {
-      const res = await window.amber.routerEnhance(prompt)
+      const res = await bridge(prompt)
       if (res.ok && res.text) {
         setOutput(res.text)
         setTurns((n) => n + 1)
