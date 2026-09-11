@@ -382,6 +382,13 @@ enum RouterAction {
     SetSlots,
     /// Print one slot's plaintext API key. Deliberate user gesture only.
     Key { name: String },
+    /// Rewrite a prompt via the router's `auto` alias. Reads
+    /// `{"prompt": "..."}` on stdin, prints `{"text": "..."}`.
+    ///
+    /// The app calls this instead of talking to `/v1/chat/completions`
+    /// itself, so the router's Bearer token never enters the desktop
+    /// process or an IPC trace.
+    Complete,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -1520,6 +1527,20 @@ fn run_ctl_router(
                 .and_then(|v| v.get("api_key").and_then(|k| k.as_str()).map(str::to_string))
                 .unwrap_or_default();
             println!("{key}");
+            Ok(())
+        }
+        RouterAction::Complete => {
+            use std::io::Read;
+            let mut doc = String::new();
+            std::io::stdin().read_to_string(&mut doc)?;
+            let prompt = amber::router_ops::parse_enhance_prompt(&doc)
+                .map_err(|e| anyhow::anyhow!("{}", e.message))?;
+            let text = amber::router_ops::complete_prompt(&root, port, &prompt)
+                .map_err(|e| anyhow::anyhow!("{}", e.message))?;
+            println!(
+                "{}",
+                serde_json::json!({ "text": text })
+            );
             Ok(())
         }
         RouterAction::RotateToken => {

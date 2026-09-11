@@ -87,6 +87,7 @@ import { commitPreparedWorkspaceImport, prepareWorkspaceImport } from './workspa
 import { approvalSurfaceDuringPresentationCommand, browserContextMatches, captureBrowserContext, hasExactApprovalSurface, resolveBrowserContext, sameBrowserContextIdentity, setBrowserForCurrentContext } from './browserWindowContext'
 import { createBrowserId } from '../shared/tabBrowser'
 import { isRecoveryId } from '../shared/tabBrowserState'
+import { parseEnhanceResult, validateEnhanceInput } from '../shared/promptEnhance'
 import { BrowserOperationRegistry } from './browserOperationRegistry'
 import { readSafeTextFile, readSafeTextFileSync, SafeFileReadError } from './safeFileReader'
 import { browserHostSocketPath } from './browserHostPaths'
@@ -1961,6 +1962,22 @@ async function main(): Promise<void> {
       return stdout || stderr
     }
     return readBoundedLog(join(homedir(), 'Library', 'Logs', 'amber-router.log'))
+  })
+
+  // Prompt enhancement (design 2026-09-11). Same posture as the slot
+  // editing above: the app shells to `amber ctl router complete`, which
+  // reads the 0600 router token itself — the Bearer token never enters
+  // this process or an IPC trace. Only the prompt and the rewritten text
+  // cross the boundary, in either direction.
+  ipcMain.handle('router:enhance', async (_e, prompt: unknown) => {
+    const valid = validateEnhanceInput(prompt)
+    if (!valid.ok) return { ok: false, error: valid.error }
+    const { code, stdout, stderr } = await runAmberCapture(
+      ['ctl', 'router', 'complete', '--json', '--port', String(ROUTER_PORT)],
+      JSON.stringify({ prompt: valid.prompt }),
+    )
+    if (code !== 0) return { ok: false, error: stderr.trim() || `exit ${code}` }
+    return parseEnhanceResult(stdout)
   })
 
   ipcMain.handle('pick-folder', async () => {

@@ -5,7 +5,7 @@ import { initialPiViewState, reducePiView, type PiViewState } from './piModel'
 import { PiComposer, type PiAttachmentProgress } from './PiComposer'
 import { PiSubagents } from './PiSubagents'
 import { PiTranscript } from './PiTranscript'
-import { canClearPiDraft, clearPiDraft, readPiDraft, writePiDraft } from './piDraft'
+import { canClearPiDraft, clearPiDraft, readPiDraft, writePiDraft, PI_DRAFT_SET_EVENT, type PiDraftSetDetail } from './piDraft'
 import {
   legacyPiDeliveryMessage, piOperationCurrent, piSubmitAllowed, pruneCompletedAttachments, releasePiOperation,
   rememberCompletedAttachment, resetPiSubmissionOnReconnect, reuseCompletedAttachment, uploadThenPrompt,
@@ -94,6 +94,20 @@ export const PiPane = memo(function PiPane({ session, portEpoch }: { session: st
       window.removeEventListener('pagehide', flush)
       flush()
     }
+  }, [session])
+
+  // An externally enhanced prompt (the Enhance dialog) can target this
+  // pane's composer. The debounced persistence above then carries it into
+  // storage like any typed edit, so no second write path is needed.
+  useEffect(() => {
+    const onExternal = (event: Event): void => {
+      const detail = (event as CustomEvent<PiDraftSetDetail>).detail
+      if (!detail || detail.session !== session || typeof detail.text !== 'string') return
+      draftVersionRef.current += 1
+      setDraft(detail.text)
+    }
+    window.addEventListener(PI_DRAFT_SET_EVENT, onExternal)
+    return () => window.removeEventListener(PI_DRAFT_SET_EVENT, onExternal)
   }, [session])
 
   useEffect(() => {

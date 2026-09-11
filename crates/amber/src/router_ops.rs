@@ -38,6 +38,7 @@ pub fn valid_slot_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
+#[derive(Debug)]
 pub struct OpsError {
     pub status: u16,
     pub message: String,
@@ -285,6 +286,96 @@ fn router_token(root: &Path) -> Result<String, OpsError> {
     })
 }
 
+/// Largest prompt `complete_prompt` accepts, in chars. A prompt rewrite takes a
+/// short instruction, not a document — and the whole thing rides one stdin
+/// write plus one router request, so an unbounded prompt is just a stuck CLI.
+pub const ENHANCE_MAX_CHARS: usize = 12_000;
+
+/// The rewrite instruction behind `complete_prompt`. It lives here rather
+/// than in the UI so every caller gets the same contract: raw prompt in,
+/// rewritten prompt out, no commentary.
+pub const ENHANCE_SYSTEM: &str = "You rewrite the user's prompt so it is clearer, more specific, and easier for an AI assistant to act on. Preserve the user's intent and every requirement; do not add new requirements, do not drop any, and do not answer the prompt. Return ONLY the rewritten prompt — no preamble, no quotes, no explanation.";
+
+fn enhance_input_error(message: impl Into<String>) -> OpsError {
+    OpsError::new(400, message)
+}
+
+/// Validate the `{"prompt": ...}` document the `complete` CLI action reads on
+/// stdin. Fails fast here rather than letting the router answer 422 to
+/// something the app never meant to send.
+pub fn parse_enhance_prompt(doc: &str) -> Result<String, OpsError> {
+    let value: Value =
+        serde_json::from_str(doc).map_err(|e| enhance_input_error(format!("stdin is not valid JSON: {e}")))?;
+    let prompt = value
+        .get("prompt")
+        .and_then(Value::as_str)
+        .ok_or_else(|| enhance_input_error("stdin must be a JSON object with a string `prompt`"))?;
+    let prompt = prompt.trim().to_string();
+    if prompt.is_empty() {
+        return Err(enhance_input_error("`prompt` must not be blank"));
+    }
+    if prompt.chars().count() > ENHANCE_MAX_CHARS {
+        return Err(enhance_input_error(format!(
+            "`prompt` is too long (max {ENHANCE_MAX_CHARS} chars)"
+        )));
+    }
+    Ok(prompt)
+}
+
+/// The OpenAI-compatible request body for one enhancement turn. Always the
+/// `auto` alias: the point is the user's own ordered failover chain, not a
+/// pinned provider.
+pub fn enhance_chat_body(prompt: &str) -> String {
+    serde_json::json!({
+        "model": "auto",
+        "stream": false,
+        "messages": [
+            { "role": "system", "content": ENHANCE_SYSTEM },
+            { "role": "user", "content": prompt },
+        ],
+    })
+    .to_string()
+}
+
+/// Pull the assistant text out of a `/v1/chat/completions` response. A
+/// non-200 surfaces the router's own error message when it has one.
+pub fn extract_enhanced_text(status: u16, body: &str) -> Result<String, OpsError> {
+    if status != 200 {
+        return Err(OpsError::new(status, extract_error(body).unwrap_or(body.to_string())));
+    }
+    let text = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.get("choices")?
+                .as_array()?
+                .first()?
+                .get("message")?
+                .get("content")?
+                .as_str()
+                .map(str::to_string)
+        })
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+    text.ok_or_else(|| OpsError::new(502, "the router returned no assistant text"))
+}
+
+/// One prompt-rewrite turn through the router. Reads the 0600 token here so
+/// the desktop process never holds it: the only thing crossing into Node is
+/// the prompt and the rewritten text.
+pub fn complete_prompt(root: &Path, port: u16, prompt: &str) -> Result<String, OpsError> {
+    let token = router_token(root)?;
+    let req = enhance_chat_body(prompt);
+    let (status, body) = router_request_timeout(
+        port,
+        &token,
+        "POST",
+        "/v1/chat/completions",
+        Some(&req),
+        Duration::from_secs(120),
+    )?;
+    extract_enhanced_text(status, &body)
+}
+
 /// One bearer-authed request to the router's loopback admin surface.
 pub fn router_request(
     port: u16,
@@ -293,7 +384,19 @@ pub fn router_request(
     path: &str,
     body: Option<&str>,
 ) -> Result<(u16, String), OpsError> {
-    let deadline = Duration::from_secs(10);
+    router_request_timeout(port, token, method, path, body, Duration::from_secs(10))
+}
+
+/// Same, with an explicit deadline. Completions wait longer than admin reads:
+/// a rewrite turn can legitimately take a minute on a slow provider.
+pub fn router_request_timeout(
+    port: u16,
+    token: &str,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    deadline: Duration,
+) -> Result<(u16, String), OpsError> {
     let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).map_err(|e| {
         OpsError::new(503, format!("router not reachable on 127.0.0.1:{port}: {e}"))
     })?;
@@ -379,5 +482,52 @@ mod tests {
         let err = run_action(Path::new("/tmp"), 7719, "snapshot").unwrap_err();
         assert_eq!(err.status, 400);
         assert!(err.message.contains("unknown action snapshot"), "{}", err.message);
+    }
+
+    #[test]
+    fn enhance_input_validation() {
+        assert_eq!(
+            parse_enhance_prompt(r#"{"prompt": "  make it better  "}"#).unwrap(),
+            "make it better"
+        );
+        assert_eq!(parse_enhance_prompt("not json").unwrap_err().status, 400);
+        assert_eq!(parse_enhance_prompt(r#"{"prompt": 42}"#).unwrap_err().status, 400);
+        assert_eq!(parse_enhance_prompt(r#"{"prompt": "   "}"#).unwrap_err().status, 400);
+        assert_eq!(parse_enhance_prompt(r#"{}"#).unwrap_err().status, 400);
+        let long = "x".repeat(ENHANCE_MAX_CHARS + 1);
+        let err = parse_enhance_prompt(&format!(r#"{{"prompt": "{long}"}}"#)).unwrap_err();
+        assert_eq!(err.status, 400);
+        assert!(err.message.contains("too long"), "{}", err.message);
+    }
+
+    #[test]
+    fn enhance_body_targets_auto_without_streaming() {
+        let body: Value = serde_json::from_str(&enhance_chat_body("do the thing")).unwrap();
+        assert_eq!(body["model"], serde_json::json!("auto"));
+        assert_eq!(body["stream"], serde_json::json!(false));
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], serde_json::json!("system"));
+        assert!(messages[0]["content"].as_str().unwrap().contains("ONLY the rewritten prompt"));
+        assert_eq!(messages[1], serde_json::json!({ "role": "user", "content": "do the thing" }));
+    }
+
+    #[test]
+    fn enhance_extraction_reads_first_choice() {
+        let body = serde_json::json!({
+            "choices": [{ "message": { "role": "assistant", "content": "  Do the thing, clearly.  " } }],
+        })
+        .to_string();
+        assert_eq!(extract_enhanced_text(200, &body).unwrap(), "Do the thing, clearly.");
+        // A router error surfaces its own message, not the raw envelope.
+        let err_body = serde_json::json!({ "error": { "message": "every credential in the chain is dead" } }).to_string();
+        let err = extract_enhanced_text(502, &err_body).unwrap_err();
+        assert_eq!(err.status, 502);
+        assert!(err.message.contains("every credential"), "{}", err.message);
+        // 200 with no usable choice is an error, not an empty rewrite.
+        let empty = serde_json::json!({ "choices": [] }).to_string();
+        assert_eq!(extract_enhanced_text(200, &empty).unwrap_err().status, 502);
+        let blank = serde_json::json!({ "choices": [{ "message": { "content": "  " } }] }).to_string();
+        assert_eq!(extract_enhanced_text(200, &blank).unwrap_err().status, 502);
     }
 }

@@ -129,6 +129,33 @@ describe('mounted Pi pane transport and draft lifecycle', () => {
     })
   })
 
+  it('applies an externally enhanced draft to the mounted composer', async () => {
+    await withFakeDom(async (dom) => {
+      const port = new TestPort()
+      const { root } = await renderPane(dom, port)
+      try {
+        const event = Object.assign(new FakeEvent('amber:pi-draft-set', { target: dom.container }), {
+          detail: { session: 'pi', text: 'enhanced wording' },
+        })
+        await act(async () => {
+          ;(globalThis.window as unknown as { dispatchEvent: (event: unknown) => boolean }).dispatchEvent(event)
+        })
+        const textarea = dom.container.querySelector('[aria-label="Message Pi"]') as FakeElement
+        expect(textarea.value).toBe('enhanced wording')
+        // A draft for another session must not leak into this composer.
+        const stray = Object.assign(new FakeEvent('amber:pi-draft-set', { target: dom.container }), {
+          detail: { session: 'other', text: 'stray wording' },
+        })
+        await act(async () => {
+          ;(globalThis.window as unknown as { dispatchEvent: (event: unknown) => boolean }).dispatchEvent(stray)
+        })
+        expect(textarea.value).toBe('enhanced wording')
+      } finally {
+        await act(async () => { root.unmount() })
+      }
+    })
+  })
+
   it('flushes the newest edit on pagehide before the debounce expires', async () => {
     await withFakeDom(async (dom) => {
       const port = new TestPort()

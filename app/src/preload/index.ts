@@ -132,6 +132,8 @@ contextBridge.exposeInMainWorld('amber', {
   routerRevealKey: (name: string): Promise<string> =>
     ipcRenderer.invoke('router:revealKey', name),
   routerLogTail: (): Promise<string> => ipcRenderer.invoke('router:logTail'),
+  routerEnhance: (prompt: string): Promise<{ ok: boolean; text?: string; error?: string }> =>
+    ipcRenderer.invoke('router:enhance', prompt),
   editorOpenDialog: (): Promise<
     { path: string; text: string; mtimeMs: number } | { path: string; error: string } | null
   > => ipcRenderer.invoke('editor-open-dialog'),

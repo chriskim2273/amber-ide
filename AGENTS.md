@@ -1037,6 +1037,26 @@ exception is core rule 9); themes/settings beyond minimal.
   listed in the receipt; live provider/package, real-device, IME, macOS, and
   production-state checks remain uncertified.
 
+- [x] Prompt enhancement via the model router (2026-09-11) — toolbar
+  "enhance" button + command-palette entry open a modal: rough prompt in,
+  rewrite out through the router's `auto` alias, editable output, Enhance-again
+  iteration, Copy, and Insert into a live Pi composer draft. New `amber ctl
+  router complete` subcommand POSTs to `/v1/chat/completions` after reading the
+  0600 router token itself, so the Bearer token never enters Node or an IPC
+  trace; the `router:enhance` IPC + preload bridge mirror the slot-editing
+  posture (fail-fast shared validation, parse-never-throw). Insert writes the
+  draft store and broadcasts `amber:pi-draft-set`, which a mounted PiPane
+  applies; unmounted panes pick it up on mount. The browser build answers a
+  clear needs-desktop error (no new web endpoint, no token exposure). Gates:
+  app 1261 passed / 1 skipped (full suite), Rust `router_ops` 6/6 + `amber`
+  binary build green, clippy clean except a pre-existing doubled `#[test]` in
+  untouched `browser_ops.rs`; typecheck clean except the two pre-existing
+  browser-host files. A full-workspace Rust run is currently blocked by a
+  concurrent in-tree `SessionKind::Muse` addition (amber-core E0063, unrelated
+  files). Live router round-trip still manual (needs provider keys + a running
+  router). Follow-up if Muse panes gain a composer: they are not insert targets
+  today (targets are `kind === 'pi'`).
+
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**
   `std::io::Read` (dedicated thread); `take_writer()` is one-shot;
