@@ -108,6 +108,24 @@ exception is core rule 9); themes/settings beyond minimal.
 
 ## Build status
 
+- [x] Pi pane recovery after daemon restart (2026-09-10) — a daemon restart left
+  **11 panes as plain shells**. Root cause: those were `kind=shell` panes where
+  the user had started `pi` by hand, so Pi was only a child of that shell; amber
+  restores agent-kind panes only, so nothing re-ran it. The daemon itself lost
+  nothing (`restored 28 of 28 sessions; skipped 0`), and every supervised Pi pane
+  resumed its exact conversation. The 11 panes were converted to supervised
+  `kind=pi` sessions that resume their original Pi conversations: each was
+  matched to a conversation from the last screen still present in its scrollback
+  ring (winner scores 5–39 with every other conversation at 0), then
+  `kill` → write the per-session recording → `create --kind pi` with the same
+  name, so pane identity, workspace/tab/split position and order were preserved
+  (verified: zero tabs changed their pane list or order). Supervised Pi panes
+  went 11 → 22; the session daemon was never restarted. Receipt and reusable
+  tooling: `docs/pi-pane-recovery-2026-09-10.md`,
+  `scripts/pi-pane-recovery/`. **Known gap, not fixed:** a hand-started `pi`
+  inside a shell pane is still lost on every daemon restart — amber does not
+  adopt it or warn; the durable workaround is to convert the pane.
+
 - [x] Pi terminal clipboard repair — copied Pi selections drop literal trailing
   row padding while preserving indentation, interior spacing and blank lines.
   Native and Amber copy/paste actions share one policy; Pi pastes remain
