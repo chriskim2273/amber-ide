@@ -2536,6 +2536,18 @@ mod tests {
     }
 
     #[test]
+    fn embedded_mobile_client_keeps_a_live_apps_mouse_protocol() {
+        // A replayed window can re-execute a dead program's mouse-tracking
+        // enable, which a shell must not keep — but a full-screen app owns its
+        // protocol: Pi/claude negotiate it once, at startup, and clearing it
+        // turns the wheel into up/down arrows. Same rule as the desktop
+        // client's `settleReplayedModes`, and the daemon now leads a full
+        // replay with the app's real modes for exactly this reason.
+        let source = include_str!("../assets/app.js");
+        assert!(source.contains("if (!altScreen()) term.write(MOUSE_RESET);"));
+    }
+
+    #[test]
     fn mobile_flat_list_uses_the_actual_session_kind_for_every_agent() {
         let source = include_str!("../assets/app.js");
         assert!(source.contains("function sessionKindLabel"));

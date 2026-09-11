@@ -658,9 +658,12 @@ function main() {
         term.write(new Uint8Array(ev.data));
         if (freshBacklog) {
           // The replayed scrollback re-executes old escape codes, including a
-          // dead program's mouse-tracking enable (Pane.tsx does the same).
+          // dead program's mouse-tracking enable. Clear it only when NO
+          // full-screen app owns the screen: Pi/claude negotiate their mouse
+          // protocol once, at startup, and clearing it turns the wheel into
+          // up/down arrows (the desktop client's `settleReplayedModes` rule).
           freshBacklog = false;
-          term.write(MOUSE_RESET);
+          if (!altScreen()) term.write(MOUSE_RESET);
           applyScale();
         }
         return;

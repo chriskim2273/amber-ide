@@ -101,13 +101,19 @@ replay" when it sends the Attach, so that arm survived and tagged the next
   reset only for the workspace-load staged replay (always a cold terminal whose
   app bytes are still to come), and no longer touches modes from the reconnect
   nudges.
+- **`crates/amber/assets/app.js`** (the hand-written phone client, served by
+  `amber web`) had the same unconditional post-replay reset; it now applies the
+  same alt-aware rule. Its `ws.onopen` still resets the terminal and asks for a
+  full replay, so the daemon's preamble lands first.
 - **`Pane.tsx`** also treats an empty tagged replay as "nothing to replay":
   it consumes the tag but neither resets nor draws, so a live pane with no
   scrollback to hand back is left as it is.
 
 No wire-format change: the preamble rides inside the existing replay `Data`
-frame, so the phone/web client (which always asks for a full replay) gets the
-same repair without a protocol bump.
+frame, so a client that always asks for a full replay gets the same repair
+without a protocol bump. That includes the embedded phone client
+(`crates/amber/assets/app.js`, served by `amber web`), which applies the same
+alt-aware rule to its own post-replay `MOUSE_RESET`.
 
 ## Evidence
 
@@ -116,7 +122,8 @@ Persistent artifacts: `~/worktrees/amber-ide/fix-pane-scrollback-replay-modes/`.
 - Diagnostic ring dump: control-frame client against the live daemon
   (`DumpBacklog`), 2 MiB, scanned for mode sequences (numbers above).
 - `cargo test --workspace`: **43 test binaries, all ok** (Rust regression suites
-  untouched: `resume_attach` 6/6, `pty::tests` 27/27, `amber-core` 157/157).
+  untouched: `resume_attach` 6/6, `pty::tests` 27/27, `amber` lib 545/545,
+  `amber-core` 157/157).
 - `cargo clippy --workspace --all-targets`: no warnings/errors.
 - `npm run typecheck`: clean. `npx vitest run` in `app/`: **1246 passed**
   (1 pre-existing skip).
@@ -132,6 +139,8 @@ Persistent artifacts: `~/worktrees/amber-ide/fix-pane-scrollback-replay-modes/`.
     reverted to `origin/main` behaviour (verified by temporarily restoring it).
   - `pty::tests`: a cold subscription is led by modes the 64-byte ring has
     already evicted; a delta never repeats them.
+  - `web::tests`: the embedded phone client's reset stays alt-aware
+    (`node --check crates/amber/assets/app.js` also passes).
 
 ## Residual risk / not verified
 
