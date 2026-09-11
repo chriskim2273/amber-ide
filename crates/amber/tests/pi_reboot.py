@@ -122,6 +122,12 @@ def proof(binary):
             wait(lambda: len(launches()) == 1, 'manual Pi start')
             pids.append(launches()[-1]['pid'])
             assert recording().get('session_file') == str(root / 'parent.jsonl'), recording()
+            # A validated hook must relabel the LIVE pane, not only survive a
+            # reboot. Without this the user sees `shell` in the header, the CLI
+            # and the Chat toggle until the daemon next restarts — no restart
+            # happens between here and the check, so this is the live kind.
+            assert json.loads((root / 'sessions/work.json').read_text())['kind'] == 'pi', \
+                'live shell pane running Pi was not promoted to the Pi kind'
             input_line('child')
             wait(lambda: (root / 'child-done').exists(), 'nested child hooks')
             assert recording()['session_id'] == 'parent-session', 'nested child overwrote parent'

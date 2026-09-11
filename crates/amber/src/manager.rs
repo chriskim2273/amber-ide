@@ -1463,8 +1463,26 @@ impl SessionManager {
                 // still recover the Pi kind and cwd from this authoritative
                 // hook record.
                 self.store.write_claude(name, &recording)?;
+                // Promote the LIVE pane too, not only its persisted record.
+                // The common case is a user typing `pi` inside a plain shell
+                // pane; without this the header, `amber ls` and the Chat
+                // toggle keep saying `shell` until the daemon next restarts,
+                // because only `normalize_restored_meta` flips the kind. The
+                // hook already passed primary-process validation above, so a
+                // nested or unrelated Pi cannot reach this point.
+                let mut meta_changed = false;
+                if meta.kind == SessionKind::Shell {
+                    meta.kind = SessionKind::Pi;
+                    // The tagged Pi record now owns this pane, so a stale
+                    // hand-started-claude flag must not resurrect it as Claude.
+                    meta.resume_as_claude = false;
+                    meta_changed = true;
+                }
                 if meta.cwd != cwd {
                     meta.cwd = cwd.to_path_buf();
+                    meta_changed = true;
+                }
+                if meta_changed {
                     meta.updated = Self::now();
                     self.store.write_session(&meta)?;
                 }

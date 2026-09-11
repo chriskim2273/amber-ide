@@ -122,9 +122,14 @@ exception is core rule 9); themes/settings beyond minimal.
   (verified: zero tabs changed their pane list or order). Supervised Pi panes
   went 11 → 22; the session daemon was never restarted. Receipt and reusable
   tooling: `docs/pi-pane-recovery-2026-09-10.md`,
-  `scripts/pi-pane-recovery/`. **Known gap, not fixed:** a hand-started `pi`
-  inside a shell pane is still lost on every daemon restart — amber does not
-  adopt it or warn; the durable workaround is to convert the pane.
+  `scripts/pi-pane-recovery/`. **Follow-up landed same day:** a validated Pi
+  hook now promotes its LIVE pane from `shell` to `pi` (`SessionManager`, hook
+  path), so the header, `amber ls`, the Chat toggle and the next restore all see
+  the Pi kind immediately instead of only after a daemon restart. Covered by the
+  `pi_reboot` proof, which fails with
+  `AssertionError: live shell pane running Pi was not promoted to the Pi kind`
+  when the promotion is reverted. Panes converted by hand before this fix remain
+  supervised Pi sessions.
 
 - [x] Pi terminal clipboard repair — copied Pi selections drop literal trailing
   row padding while preserving indentation, interior spacing and blank lines.
