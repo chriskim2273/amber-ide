@@ -65,6 +65,18 @@ pub fn nearest_named_descendant(
     root: u32,
     names: &[&str],
 ) -> Option<(u32, String)> {
+    nearest_matching_descendant(table, root, |comm| names.contains(&comm))
+}
+
+/// Same walk as [`nearest_named_descendant`] but matching on a predicate
+/// instead of an exact name set. Exists for Muse: the launcher execs a
+/// versioned `muse-bin-<version>` ELF, so no fixed name list can match it —
+/// see `amber::muse::is_muse_process`.
+pub fn nearest_matching_descendant(
+    table: &[ProcEntry],
+    root: u32,
+    matches: impl Fn(&str) -> bool,
+) -> Option<(u32, String)> {
     use std::collections::{HashMap, HashSet, VecDeque};
 
     let mut children: HashMap<u32, Vec<&ProcEntry>> = HashMap::with_capacity(table.len());
@@ -92,7 +104,7 @@ pub fn nearest_named_descendant(
             if child_depth > 64 {
                 continue;
             }
-            if names.contains(&child.comm.as_str()) {
+            if matches(&child.comm) {
                 match nearest_depth {
                     None => {
                         nearest_depth = Some(child_depth);
@@ -611,6 +623,18 @@ mod tests {
     fn is_growing_requires_min_delta() {
         // Rises monotonically but only by 30 < min 100 → not flagged.
         assert!(!is_growing(&[100, 110, 120, 130], 100, 10));
+    }
+
+    #[test]
+    fn matching_descendant_finds_a_versioned_muse_binary() {
+        // The Muse launcher execs `muse-bin-<version>`, so no fixed name list
+        // can match it — the predicate walk is the whole mechanism.
+        let t = vec![e(100, 1, "bash"), e(101, 100, "muse-bin-1.1.1-R2514.1")];
+        assert_eq!(
+            nearest_matching_descendant(&t, 100, crate::muse::is_muse_process),
+            Some((101, "muse-bin-1.1.1-R2514.1".to_string()))
+        );
+        assert_eq!(nearest_named_descendant(&t, 100, &["muse"]), None);
     }
 
     #[test]

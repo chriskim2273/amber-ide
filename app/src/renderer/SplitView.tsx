@@ -36,12 +36,12 @@ export interface PaneMeta {
 /** Which agent binary a pane's recorded conversation id belongs to. Explicit
  *  agent kinds map to themselves; a shell pane with a recorded id got it from a
  *  hand-started claude (the global SessionStart hook), so it stays claude. */
-export function agentOf(kind: string): 'claude' | 'grok' | 'codex' | 'opencode' | 'hermes' | 'pi' {
-  if (kind === 'grok' || kind === 'codex' || kind === 'opencode' || kind === 'hermes' || kind === 'pi') return kind
+export function agentOf(kind: string): 'claude' | 'grok' | 'codex' | 'opencode' | 'hermes' | 'pi' | 'muse' {
+  if (kind === 'grok' || kind === 'codex' || kind === 'opencode' || kind === 'hermes' || kind === 'pi' || kind === 'muse') return kind
   return 'claude'
 }
 
-export type PaneKind = 'shell' | 'claude' | 'grok' | 'codex' | 'opencode' | 'hermes' | 'pi' | 'editor'
+export type PaneKind = 'shell' | 'claude' | 'grok' | 'codex' | 'opencode' | 'hermes' | 'pi' | 'muse' | 'editor'
 
 // The window listener below dismisses an open context menu on an outside
 // pointer press. React delivers `click` only after `pointerdown`; treating a
@@ -956,6 +956,7 @@ export function SplitView(props: {
                       : meta.kind === 'opencode' ? 'opencode -s'
                         : meta.kind === 'hermes' ? 'hermes --resume'
                         : meta.kind === 'pi' ? 'pi --session'
+                        : meta.kind === 'muse' ? 'muse resume'
                         : `${agentOf(meta.kind)} --resume`
                   }</code>.</div>
                   <div className="reload-claude-actions">
@@ -969,6 +970,7 @@ export function SplitView(props: {
                             : meta.kind === 'opencode' ? "starts a fresh OpenCode session"
                               : meta.kind === 'hermes' ? "starts a fresh Hermes session"
                               : meta.kind === 'pi' ? "opens Pi's session picker"
+                              : meta.kind === 'muse' ? "starts a fresh Muse session"
                               : "opens claude's own session list"
                       }>
                       Pick session…

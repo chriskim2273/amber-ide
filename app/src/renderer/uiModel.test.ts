@@ -53,7 +53,7 @@ describe('continuityView', () => {
 describe('pane kind picker', () => {
   it('contains every supported pane kind once with human-readable detail', () => {
     expect(PANE_KIND_OPTIONS.map((option) => option.kind)).toEqual([
-      'shell', 'claude', 'grok', 'codex', 'opencode', 'hermes', 'pi', 'editor',
+      'shell', 'claude', 'grok', 'codex', 'opencode', 'hermes', 'pi', 'muse', 'editor',
     ])
     expect(new Set(PANE_KIND_OPTIONS.map((option) => option.kind)).size).toBe(PANE_KIND_OPTIONS.length)
     expect(PANE_KIND_OPTIONS.every((option) => option.label.length > 0 && option.detail.length > 0)).toBe(true)
@@ -61,7 +61,7 @@ describe('pane kind picker', () => {
 
   it('derives the daemon-backed mobile picker from the shared metadata', () => {
     expect(DAEMON_PANE_KIND_OPTIONS.map((option) => option.kind)).toEqual([
-      'shell', 'claude', 'grok', 'codex', 'opencode', 'hermes', 'pi',
+      'shell', 'claude', 'grok', 'codex', 'opencode', 'hermes', 'pi', 'muse',
     ])
     expect(DAEMON_PANE_KIND_OPTIONS.every((option) =>
       PANE_KIND_OPTIONS.some((candidate) => candidate === option))).toBe(true)

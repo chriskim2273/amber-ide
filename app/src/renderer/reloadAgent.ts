@@ -1,6 +1,6 @@
 import { CLAUDE_SESSION_ID } from '../shared/ids'
 
-export type AgentName = 'claude' | 'grok' | 'codex' | 'opencode' | 'hermes' | 'pi'
+export type AgentName = 'claude' | 'grok' | 'codex' | 'opencode' | 'hermes' | 'pi' | 'muse'
 export interface ReloadAgentVisibility {
   show: boolean
   resumeSaved: boolean
@@ -51,6 +51,10 @@ export function reloadAgentCommand(agent: AgentName, id: string | null): string 
 
   if (agent === 'pi') {
     return id === null ? 'pi -r' : `pi --session ${shellQuote(id)}`
+  }
+
+  if (agent === 'muse') {
+    return id === null ? 'muse --yolo' : `muse resume ${shellQuote(id)} --yolo`
   }
 
   const resume = id === null ? ' --resume' : ` --resume ${id}`

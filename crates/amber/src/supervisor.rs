@@ -16,7 +16,7 @@ use std::time::Duration;
 use amber_core::proto::{self, ControlMsg, Decoded, Decoder, Frame};
 use amber_core::state::{SessionKind, StateStore};
 
-use crate::{claude, codex, grok, hermes, opencode, pi, transport};
+use crate::{claude, codex, grok, hermes, muse, opencode, pi, transport};
 
 /// Upper bound on one run-state report attempt. The ordered reporter retries a
 /// timed-out attempt without blocking the child-monitoring loop.
@@ -101,8 +101,9 @@ pub enum SuperviseOutcome {
 
 /// Which coding agent a supervised session runs. All share this module's
 /// retry/suspend/fallback machinery; only the argv differs — see
-/// [`claude::claude_argv`], [`grok::grok_argv`], [`codex::codex_argv`], and
-/// [`opencode::opencode_argv`], [`hermes::hermes_argv`], and [`pi::pi_argv`].
+/// [`claude::claude_argv`], [`grok::grok_argv`], [`codex::codex_argv`],
+/// [`opencode::opencode_argv`], [`hermes::hermes_argv`], [`pi::pi_argv`], and
+/// [`muse::muse_argv`].
 pub enum Agent {
     /// claude, whose rotating session id is recorded by its `SessionStart` hook
     /// into the generated per-session settings file at this path.
@@ -119,6 +120,10 @@ pub enum Agent {
     Hermes,
     /// Pi, whose session id is recorded by Amber's global Pi extension.
     Pi,
+    /// Muse, whose session id amber discovers from Muse's own session store
+    /// (the TUI accepts no `--session-id` and offers no hook) — see
+    /// [`muse::find_session_for_pids`].
+    Muse,
 }
 
 impl Agent {
@@ -130,6 +135,7 @@ impl Agent {
             Agent::OpenCode => "opencode",
             Agent::Hermes => "hermes",
             Agent::Pi => "pi",
+            Agent::Muse => "muse",
         }
     }
 }
@@ -229,6 +235,7 @@ pub fn supervise_agent(
                 opencode::opencode_argv(&select_opencode_start(session_id, escalation))
             }
             Agent::Hermes => hermes::hermes_argv(&select_hermes_start(session_id, escalation)),
+            Agent::Muse => muse::muse_argv(&select_muse_start(session_id, escalation)),
             Agent::Pi => pi::pi_argv(&select_pi_start(
                 recording.as_ref().and_then(|meta| meta.session_file.as_deref()),
                 escalation,
@@ -570,6 +577,21 @@ fn select_hermes_start(session_id: Option<&str>, escalation: u32) -> hermes::Her
     }
 }
 
+/// Pick how to start `muse` for one attempt. Claude-shaped: a UUID-shaped
+/// recorded id on the first un-escalated attempt is resumed with
+/// `muse resume <id>`; every other case starts Fresh (`muse`, which mints its
+/// own session — the TUI takes no id flag). Never `resume --last` (that
+/// reopens whatever ran last in the cwd). The id is discovered from Muse's
+/// session store after a Fresh launch (see [`muse::find_session_for_pids`]),
+/// so unlike grok a failed resume must not mint anything — Fresh already is
+/// the mint path.
+fn select_muse_start(session_id: Option<&str>, escalation: u32) -> muse::MuseStart {
+    match (session_id, escalation) {
+        (Some(id), 0) if muse::is_session_id(id) => muse::MuseStart::Resume(id.to_string()),
+        _ => muse::MuseStart::Fresh,
+    }
+}
+
 fn select_pi_start(session_file: Option<&Path>, _escalation: u32) -> pi::PiStart {
     // A failed resume may retry the SAME file, but must never silently create
     // a different conversation. The enclosing loop bounds the crash budget.
@@ -883,6 +905,7 @@ pub fn run_session(
         k if k == SessionKind::OpenCode.as_str() => "opencode",
         k if k == SessionKind::Hermes.as_str() => "hermes",
         k if k == SessionKind::Pi.as_str() => "pi",
+        k if k == SessionKind::Muse.as_str() => "muse",
         _ => "claude",
     };
 
@@ -896,6 +919,7 @@ pub fn run_session(
         "opencode" => cfg.opencode_path.clone(),
         "hermes" => cfg.hermes_path.clone(),
         "pi" => cfg.pi_path.clone(),
+        "muse" => cfg.muse_path.clone(),
         _ => cfg.claude_path.clone(),
     };
     let agent_path = match cached.filter(|p| p.exists()) {
@@ -907,6 +931,7 @@ pub fn run_session(
                 "opencode" => opencode::resolve_opencode(),
                 "hermes" => hermes::resolve_hermes(),
                 "pi" => pi::resolve_pi(),
+                "muse" => muse::resolve_muse(),
                 _ => claude::resolve_claude(),
             };
             if let Some(p) = resolved.clone() {
@@ -916,6 +941,7 @@ pub fn run_session(
                     "opencode" => cfg.opencode_path = Some(p),
                     "hermes" => cfg.hermes_path = Some(p),
                     "pi" => cfg.pi_path = Some(p),
+                    "muse" => cfg.muse_path = Some(p),
                     _ => cfg.claude_path = Some(p),
                 }
                 store.save_config(&cfg)?;
@@ -955,6 +981,12 @@ pub fn run_session(
             "hermes" => {
                 hermes::ensure_global_hermes_plugin(&agent_path);
                 Agent::Hermes
+            }
+            "muse" => {
+                // Muse offers no hook or plugin to install: `--yolo` is the
+                // whole unattended mechanism, and the session id is discovered
+                // from Muse's session store after launch.
+                Agent::Muse
             }
             "pi" => {
                 pi::ensure_global_pi_extension();
@@ -1732,6 +1764,29 @@ mod tests {
         assert_eq!(
             select_hermes_start(Some("latest"), 0),
             hermes::HermesStart::Fresh
+        );
+    }
+
+    #[test]
+    fn muse_resumes_a_recorded_uuid_once_then_starts_fresh() {
+        // `muse resume <id>` names the exact conversation; anything else
+        // starts a fresh TUI that mints its own session (the id is discovered
+        // afterwards, never passed in). Never `--last`.
+        let id = "01a08f86-013a-7a13-9a1f-6298f3efe1d1";
+        assert_eq!(
+            select_muse_start(Some(id), 0),
+            muse::MuseStart::Resume(id.into())
+        );
+        assert_eq!(select_muse_start(Some(id), 1), muse::MuseStart::Fresh);
+        assert_eq!(select_muse_start(None, 0), muse::MuseStart::Fresh);
+        assert_eq!(select_muse_start(Some(""), 0), muse::MuseStart::Fresh);
+        assert_eq!(
+            select_muse_start(Some("--last"), 0),
+            muse::MuseStart::Fresh
+        );
+        assert_eq!(
+            select_muse_start(Some("ses_fd8f8accaffeTWUvgvTimbhECs"), 0),
+            muse::MuseStart::Fresh
         );
     }
 

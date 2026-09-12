@@ -139,7 +139,7 @@ enum Command {
     Run {
         name: String,
         /// Which agent to supervise: `claude` (default), `grok`, `codex`,
-        /// `opencode`, `hermes`, or `pi`. Passed by the daemon rather than read from the store,
+        /// `opencode`, `hermes`, `pi`, or `muse`. Passed by the daemon rather than read from the store,
         /// which the spawn races.
         #[arg(long, default_value = "claude")]
         kind: String,
@@ -195,7 +195,7 @@ fn parse_slot(value: &str) -> Result<u32, String> {
 
 #[derive(Subcommand)]
 enum CtlAction {
-    /// Resolve agent binaries (claude, grok, codex, opencode, hermes, pi) via your
+    /// Resolve agent binaries (claude, grok, codex, opencode, hermes, pi, muse) via your
     /// login shell and record them in config (the distribution-safe path —
     /// never the daemon's own PATH; spec §8).
     Doctor {
@@ -459,9 +459,17 @@ fn run_doctor(root: Option<PathBuf>) -> anyhow::Result<()> {
     std::fs::create_dir_all(&root)?;
     let store = StateStore::new(&root);
 
-    // grok/codex/opencode/hermes/pi are optional: a machine with only claude installed is
+    // grok/codex/opencode/hermes/pi/muse are optional: a machine with only claude installed is
     // a working amber, so a missing optional agent is reported but never fails
     // the doctor.
+    if let Some(path) = amber::muse::resolve_muse() {
+        let mut cfg = store.load_config()?;
+        cfg.muse_path = Some(path.clone());
+        store.save_config(&cfg)?;
+        println!("muse:   {} (recorded in config)", path.display());
+    } else {
+        println!("muse:   not found via your login shell (muse panes will fall back to a shell)");
+    }
     if let Some(path) = amber::grok::resolve_grok() {
         let mut cfg = store.load_config()?;
         cfg.grok_path = Some(path.clone());

@@ -664,22 +664,59 @@ impl PtySession {
         self.primary_agent_in(table) == Some("pi")
     }
 
+    /// True when Muse is the nearest supported coding agent below this pane's
+    /// pty child (i.e. the user started `muse` by hand inside this shell, or a
+    /// supervised muse pane is up). Used for the `resume_as_muse` promotion —
+    /// the claude equivalent is [`Self::is_running_claude_in`].
+    pub fn is_running_muse_in(&self, table: &[crate::procinfo::ProcEntry]) -> bool {
+        self.primary_agent_in(table) == Some("muse")
+    }
+
     /// Return the nearest supported agent's process name. The daemon uses the
     /// same ordering for hand-started detection and hook validation.
     pub fn primary_agent_in(&self, table: &[crate::procinfo::ProcEntry]) -> Option<&'static str> {
         const AGENTS: [&str; 6] = ["claude", "pi", "codex", "opencode", "hermes", "grok"];
         let pid = self.pid?;
-        crate::procinfo::nearest_named_descendant(table, pid, &AGENTS)
-            .map(|(_, name)| name)
-            .and_then(|name| match name.as_str() {
-                "claude" => Some("claude"),
-                "pi" => Some("pi"),
-                "codex" => Some("codex"),
-                "opencode" => Some("opencode"),
-                "hermes" => Some("hermes"),
-                "grok" => Some("grok"),
-                _ => None,
+        // Predicate, not a name set: Muse execs a versioned `muse-bin-*`
+        // binary (see `crate::muse::is_muse_process`), so no fixed list can
+        // name it. One walk keeps the nearest-depth/conflict rules identical.
+        crate::procinfo::nearest_matching_descendant(table, pid, |comm| {
+            AGENTS.contains(&comm) || crate::muse::is_muse_process(comm)
+        })
+        .map(|(_, name)| name)
+        .and_then(|name| {
+            if crate::muse::is_muse_process(&name) {
+                Some("muse")
+            } else {
+                match name.as_str() {
+                    "claude" => Some("claude"),
+                    "pi" => Some("pi"),
+                    "codex" => Some("codex"),
+                    "opencode" => Some("opencode"),
+                    "hermes" => Some("hermes"),
+                    "grok" => Some("grok"),
+                    _ => None,
+                }
+            }
+        })
+    }
+
+    /// Every Muse CLI process below this pane's pty child (launcher `muse`
+    /// and versioned `muse-bin-*` alike). The snapshot uses these pids to bind
+    /// a pane to exactly its own Muse conversation in Muse's session store.
+    pub fn muse_descendant_pids(&self, table: &[crate::procinfo::ProcEntry]) -> Vec<u32> {
+        let Some(pid) = self.pid else {
+            return Vec::new();
+        };
+        let below: std::collections::HashSet<u32> =
+            crate::procinfo::descendants_of(table, pid).into_iter().collect();
+        table
+            .iter()
+            .filter(|entry| {
+                below.contains(&entry.pid) && crate::muse::is_muse_process(&entry.comm)
             })
+            .map(|entry| entry.pid)
+            .collect()
     }
 
     /// Write bytes to the child's stdin.

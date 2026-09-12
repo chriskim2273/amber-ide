@@ -234,6 +234,10 @@ pub struct SessionManager {
     /// drop a live claude pane back to a bare shell on the next restart; only a
     /// sustained absence downgrades. See `decide_resume`.
     claude_absent: Mutex<HashMap<String, u32>>,
+    /// Same hysteresis for hand-started `muse` (`resume_as_muse`). A separate
+    /// counter, not a shared one: the two flags track different processes and
+    /// a shared streak would let one's absence consume the other's presence.
+    muse_absent: Mutex<HashMap<String, u32>>,
     /// Per-session ring write-counter as of the last scrollback we successfully
     /// persisted. A session whose counter is unchanged has an unchanged
     /// scrollback, so the next snapshot skips it entirely — no 2 MiB clone, no
@@ -422,6 +426,7 @@ impl SessionManager {
             socket: None,
             watchers: None,
             claude_absent: Mutex::new(HashMap::new()),
+            muse_absent: Mutex::new(HashMap::new()),
             persisted_scrollback: Mutex::new(HashMap::new()),
             cgroups,
             #[cfg(test)]
@@ -564,7 +569,8 @@ impl SessionManager {
             | SessionKind::Codex
             | SessionKind::OpenCode
             | SessionKind::Hermes
-            | SessionKind::Pi => {
+            | SessionKind::Pi
+            | SessionKind::Muse => {
                 let exe = resolve_command_exe()?;
                 // The kind is passed EXPLICITLY, not looked up from the store:
                 // `create` spawns the pty before it persists the metadata (the
@@ -616,7 +622,8 @@ impl SessionManager {
             | SessionKind::Codex
             | SessionKind::OpenCode
             | SessionKind::Hermes
-            | SessionKind::Pi => {
+            | SessionKind::Pi
+            | SessionKind::Muse => {
                 if let Some(sock) = &self.socket {
                     cmd.env("AMBER_SOCK", sock.to_string_lossy().to_string());
                 }
@@ -751,6 +758,7 @@ impl SessionManager {
             updated: Self::now(),
             title,
             resume_as_claude: false,
+            resume_as_muse: false,
             run_state: None,
             slot,
         };
@@ -942,6 +950,10 @@ impl SessionManager {
                 .lock()
                 .unwrap()
                 .retain(|k, _| sessions.contains_key(k));
+            self.muse_absent
+                .lock()
+                .unwrap()
+                .retain(|k, _| sessions.contains_key(k));
             self.persisted_scrollback
                 .lock()
                 .unwrap()
@@ -964,6 +976,7 @@ impl SessionManager {
         for (name, sess) in &handles {
             self.persist_scrollback_if_changed(name, sess)?;
             self.persist_live_cwd(name, sess, is_final, &table);
+            self.persist_muse_recording(name, sess, is_final, &table);
         }
         Ok(())
     }
@@ -1039,14 +1052,92 @@ impl SessionManager {
             }
             flag
         };
-        if new_cwd != meta.cwd || new_resume != meta.resume_as_claude {
+        // Same question for a hand-started `muse` (restored as a supervised
+        // muse pane). Independent flag and streak counter — see `muse_absent`.
+        let new_resume_muse = if is_final {
+            meta.resume_as_muse
+        } else {
+            let detected = sess.is_running_muse_in(table);
+            let mut streaks = self.muse_absent.lock().unwrap();
+            let streak = streaks.get(name).copied().unwrap_or(0);
+            let (flag, next) = decide_resume(
+                meta.resume_as_muse,
+                detected,
+                streak,
+                CLAUDE_ABSENT_THRESHOLD,
+            );
+            if next == 0 {
+                streaks.remove(name);
+            } else {
+                streaks.insert(name.to_string(), next);
+            }
+            flag
+        };
+        if new_cwd != meta.cwd
+            || new_resume != meta.resume_as_claude
+            || new_resume_muse != meta.resume_as_muse
+        {
             let updated = SessionMeta {
                 cwd: new_cwd,
                 resume_as_claude: new_resume,
+                resume_as_muse: new_resume_muse,
                 updated: Self::now(),
                 ..meta
             };
             let _ = self.store.write_session(&updated);
+        }
+    }
+
+    /// Record the Muse conversation id for a pane running `muse`, so a later
+    /// crash or reboot can `muse resume <id>` it.
+    ///
+    /// Muse offers no hook, so the id is discovered from Muse's own session
+    /// store, bound by (CLI pid, pane cwd) — see
+    /// [`crate::muse::find_session_for_pids`]. Runs for supervised
+    /// `Muse`-kind panes (whose fresh TUI mints its id after launch) and for
+    /// `Shell` panes with a hand-started muse (whose promotion flag
+    /// [`Self::persist_live_cwd`] sets would otherwise resume Fresh). Skipped
+    /// when a usable recording already exists, when no Muse process is under
+    /// the pane, and on final snapshots (mid-shutdown detection is
+    /// unreliable — the last periodic snapshot holds the truth).
+    fn persist_muse_recording(
+        &self,
+        name: &str,
+        sess: &PtySession,
+        is_final: bool,
+        table: &[crate::procinfo::ProcEntry],
+    ) {
+        if is_final {
+            return;
+        }
+        let Ok(Some(meta)) = self.store.read_session(name) else {
+            return;
+        };
+        if !matches!(meta.kind, SessionKind::Shell | SessionKind::Muse) {
+            return;
+        }
+        if meta.kind == SessionKind::Shell && !sess.is_running_muse_in(table) {
+            return;
+        }
+        if let Ok(Some(recording)) = self.store.read_claude(name) {
+            // A usable MUSE recording already exists. A UUID-shaped recording
+            // from another agent (a claude run earlier in this shell — both
+            // ids are UUIDs) must NOT stop the scan: only the muse tag proves
+            // this recording names a Muse conversation.
+            if recording.agent_kind == Some(SessionKind::Muse)
+                && crate::muse::is_session_id(&recording.session_id)
+            {
+                return;
+            }
+        }
+        let pids = sess.muse_descendant_pids(table);
+        if pids.is_empty() {
+            return;
+        }
+        if let Some(found) = crate::muse::find_session_for_pids(&meta.cwd, &pids) {
+            if let Err(error) = crate::muse::record_session(&self.store, name, &found) {
+                eprintln!("amber daemon: could not record muse session for {name}: {error}");
+            }
         }
     }
 
@@ -1291,6 +1382,19 @@ impl SessionManager {
                 meta.kind = SessionKind::Claude;
             }
             meta.resume_as_claude = false;
+            changed = true;
+        }
+        // Hand-started `muse` promotes exactly like hand-started claude, but
+        // to its own kind: the supervisor then runs `muse resume <id>` from
+        // the id the snapshot recorded (or Fresh when the daemon died before
+        // the first periodic snapshot could record it — same fallback the
+        // claude path has when its hook never fired).
+        if meta.resume_as_muse {
+            kind_changed = true;
+            if meta.kind == SessionKind::Shell {
+                meta.kind = SessionKind::Muse;
+            }
+            meta.resume_as_muse = false;
             changed = true;
         }
         if let Some(title) = meta.title.as_deref() {
@@ -2669,6 +2773,7 @@ mod tests {
                 updated: 1,
                 title: None,
                 resume_as_claude: false,
+                resume_as_muse: false,
                 run_state: None,
                 slot,
             })
@@ -2747,6 +2852,7 @@ mod tests {
                 updated: 0,
                 title: None,
                 resume_as_claude: false,
+                resume_as_muse: false,
                 run_state: None,
                 slot: 1,
             })
@@ -3507,6 +3613,7 @@ mod tests {
             updated: 1,
             title: None,
             resume_as_claude: false,
+            resume_as_muse: false,
             run_state: None,
             slot: 1,
         };
@@ -3552,6 +3659,7 @@ mod tests {
             updated: 1,
             title: None,
             resume_as_claude: false,
+            resume_as_muse: false,
             run_state: None,
             slot: 0,
         };
@@ -3597,6 +3705,7 @@ mod tests {
             updated: 1,
             title: None,
             resume_as_claude: false,
+            resume_as_muse: false,
             run_state: None,
             slot: 1,
         };
@@ -3657,6 +3766,7 @@ mod tests {
             updated: 1,
             title: None,
             resume_as_claude: true,
+            resume_as_muse: false,
             run_state: None,
             slot: 1,
         };
@@ -3748,6 +3858,7 @@ mod tests {
                 updated: 1,
                 title: None,
                 resume_as_claude: true,
+                resume_as_muse: false,
                 run_state: None,
                 slot: 1,
             })
@@ -3763,6 +3874,86 @@ mod tests {
     }
 
     #[test]
+    fn restore_normalizes_a_hand_started_muse_to_persisted_agent_truth() {
+        // The promotion half of `resume_as_muse` (see
+        // `restore_normalizes_a_hand_started_claude_to_persisted_agent_truth`):
+        // exercised directly — no spawn, so no real Muse TUI is launched.
+        let dir = tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        let write = |name: &str, kind: SessionKind, flag: bool| {
+            store
+                .write_session(&SessionMeta {
+                    name: name.to_string(),
+                    cwd: dir.path().to_path_buf(),
+                    kind,
+                    updated: 1,
+                    title: None,
+                    resume_as_claude: false,
+                    resume_as_muse: flag,
+                    run_state: None,
+                    slot: 1,
+                })
+                .unwrap();
+        };
+        write("promote-me", SessionKind::Shell, true);
+        write("already-muse", SessionKind::Muse, true);
+
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        let promoted = mgr
+            .normalize_restored_meta(store.read_session("promote-me").unwrap().unwrap(), true)
+            .unwrap();
+        assert_eq!(promoted.kind, SessionKind::Muse);
+        assert!(!promoted.resume_as_muse);
+        assert_eq!(
+            mgr.store.read_session("promote-me").unwrap().unwrap().kind,
+            SessionKind::Muse
+        );
+
+        // An already-Muse pane keeps its kind; the flag still clears.
+        let kept = mgr
+            .normalize_restored_meta(store.read_session("already-muse").unwrap().unwrap(), true)
+            .unwrap();
+        assert_eq!(kept.kind, SessionKind::Muse);
+        assert!(!kept.resume_as_muse);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn periodic_snapshot_flags_a_hand_started_muse_without_touching_claude() {
+        use crate::procinfo::ProcEntry;
+
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        mgr.create("shell-with-muse", dir.path(), SessionKind::Shell)
+            .unwrap();
+        let sess = mgr.session("shell-with-muse").unwrap();
+        let root = sess.pid().expect("a live shell has a pid");
+        // A hand-started `muse` (versioned binary) under the shell; the pid
+        // is absurd on purpose so `persist_muse_recording` (not under test
+        // here) could never match it against the real Muse store.
+        let table = vec![
+            ProcEntry { pid: root, ppid: 1, comm: "bash".into(), rss_kb: 0 },
+            ProcEntry { pid: u32::MAX - 1, ppid: root, comm: "muse-bin-1.1.1-R2514.1".into(), rss_kb: 0 },
+        ];
+        assert!(sess.is_running_muse_in(&table));
+        assert!(!sess.is_running_claude_in(&table));
+
+        mgr.persist_live_cwd("shell-with-muse", &sess, false, &table);
+        let meta = mgr.store.read_session("shell-with-muse").unwrap().unwrap();
+        assert!(meta.resume_as_muse, "hand-started muse must promote on restore");
+        assert!(!meta.resume_as_claude, "muse detection must not flip the claude flag");
+
+        // One transient miss holds (hysteresis), a sustained absence clears.
+        let gone = vec![ProcEntry { pid: root, ppid: 1, comm: "bash".into(), rss_kb: 0 }];
+        mgr.persist_live_cwd("shell-with-muse", &sess, false, &gone);
+        let meta = mgr.store.read_session("shell-with-muse").unwrap().unwrap();
+        assert!(meta.resume_as_muse, "one transient miss must not downgrade");
+        mgr.persist_live_cwd("shell-with-muse", &sess, false, &gone);
+        let meta = mgr.store.read_session("shell-with-muse").unwrap().unwrap();
+        assert!(!meta.resume_as_muse, "sustained absence downgrades");
+    }
+
+    #[test]
     #[cfg(unix)]
     fn restore_does_not_spawn_when_kind_normalization_cannot_be_persisted() {
         let dir = tempdir().unwrap();
@@ -3775,6 +3966,7 @@ mod tests {
                 updated: 1,
                 title: None,
                 resume_as_claude: true,
+                resume_as_muse: false,
                 run_state: None,
                 slot: 1,
             })
@@ -4306,6 +4498,7 @@ mod tests {
                     updated: 1,
                     title: None,
                     resume_as_claude: false,
+                    resume_as_muse: false,
                     run_state: None,
                     slot: 0,
                 })
@@ -4346,6 +4539,7 @@ mod tests {
                 updated: 1,
                 title: None,
                 resume_as_claude: false,
+                resume_as_muse: false,
                 run_state: None,
                 slot: 0,
             })
@@ -5121,6 +5315,7 @@ mod tests {
                 updated: 1,
                 title: Some("forged\nrow".into()),
                 resume_as_claude: false,
+                resume_as_muse: false,
                 run_state: None,
                 slot: 1,
             })
@@ -5133,6 +5328,7 @@ mod tests {
                 updated: 1,
                 title: Some("Healthy".into()),
                 resume_as_claude: false,
+                resume_as_muse: false,
                 run_state: None,
                 slot: 2,
             })
@@ -5145,6 +5341,7 @@ mod tests {
                 updated: 1,
                 title: Some("é".repeat(61)),
                 resume_as_claude: false,
+                resume_as_muse: false,
                 run_state: None,
                 slot: 3,
             })
@@ -5179,6 +5376,7 @@ mod tests {
                     updated: 1,
                     title: None,
                     resume_as_claude: false,
+                    resume_as_muse: false,
                     run_state: None,
                     slot,
                 })

@@ -38,6 +38,7 @@ pub enum SessionKind {
     OpenCode,
     Hermes,
     Pi,
+    Muse,
 }
 
 impl SessionKind {
@@ -50,7 +51,7 @@ impl SessionKind {
     pub fn is_agent(self) -> bool {
         matches!(
             self,
-            SessionKind::Claude | SessionKind::Grok | SessionKind::Codex | SessionKind::OpenCode | SessionKind::Hermes | SessionKind::Pi
+            SessionKind::Claude | SessionKind::Grok | SessionKind::Codex | SessionKind::OpenCode | SessionKind::Hermes | SessionKind::Pi | SessionKind::Muse
         )
     }
 
@@ -64,6 +65,7 @@ impl SessionKind {
             SessionKind::OpenCode => "opencode",
             SessionKind::Hermes => "hermes",
             SessionKind::Pi => "pi",
+            SessionKind::Muse => "muse",
         }
     }
 }
@@ -85,6 +87,13 @@ pub struct SessionMeta {
     /// conversation) instead of a bare shell. Defaulted for older records.
     #[serde(default)]
     pub resume_as_claude: bool,
+    /// A `Shell` session that was running a hand-started `muse` at snapshot
+    /// time. On restore it is relaunched as a supervised muse (resuming that
+    /// conversation via `muse resume <id>`) instead of a bare shell. The id
+    /// itself is discovered from Muse's session store (the TUI accepts no
+    /// `--session-id` and offers no hook). Defaulted for older records.
+    #[serde(default)]
+    pub resume_as_muse: bool,
     /// Last-known claude supervision phase (see
     /// [`amber_core::proto::SessionInfo::run_state`]). Persisted so a snapshot
     /// round-trips; on restore a claude session is reset to `"claude"` (its
@@ -112,8 +121,9 @@ pub struct ClaudeMeta {
     /// Optional for backward compatibility with older agent recordings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_file: Option<PathBuf>,
-    /// Agent that emitted this recording. Only Pi currently source-tags its
-    /// hook; absent keeps legacy Claude/Codex/OpenCode/Hermes recordings valid.
+    /// Agent that emitted this recording. Pi source-tags its hook and Muse
+    /// tags its store-discovered recording; absent keeps legacy
+    /// Claude/Codex/OpenCode/Hermes recordings valid.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_kind: Option<SessionKind>,
 }
@@ -146,6 +156,9 @@ pub struct Config {
     /// Resolved `pi` binary. Defaulted for older configs.
     #[serde(default)]
     pub pi_path: Option<PathBuf>,
+    /// Resolved `muse` binary (Muse Code CLI). Defaulted for older configs.
+    #[serde(default)]
+    pub muse_path: Option<PathBuf>,
     pub snapshot_interval_secs: u64,
     pub scrollback_bytes: usize,
     #[serde(default)]
@@ -300,6 +313,7 @@ impl Default for Config {
             opencode_path: None,
             hermes_path: None,
             pi_path: None,
+            muse_path: None,
             snapshot_interval_secs: 10,
             scrollback_bytes: 2 * 1024 * 1024,
             memory: MemoryConfig::default(),
@@ -1143,6 +1157,7 @@ mod tests {
             updated: 1_700_000_000,
             title: None,
             resume_as_claude: false,
+            resume_as_muse: false,
             run_state: None,
             slot: 1,
         }
@@ -1856,6 +1871,7 @@ mod tests {
             opencode_path: Some(PathBuf::from("/usr/local/bin/opencode")),
             hermes_path: Some(PathBuf::from("/usr/local/bin/hermes")),
             pi_path: Some(PathBuf::from("/usr/local/bin/pi")),
+            muse_path: Some(PathBuf::from("/usr/local/bin/muse")),
             snapshot_interval_secs: 42,
             scrollback_bytes: 4096,
             memory: MemoryConfig::default(),

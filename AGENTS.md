@@ -1070,6 +1070,35 @@ exception is core rule 9); themes/settings beyond minimal.
   `docs/prompt-enhance-deployment.md`. Still manual: a live provider
   round-trip, the actual restart, and the stale `/app` web bundle.
 
+- [x] Muse session kind (2026-09-11) — a seventh supervised agent:
+  `kind:"muse"` panes run `amber run <name>`, which supervises `muse --yolo`
+  fresh and `muse resume <uuid> --yolo` on relaunch (the exact resume form the
+  request asked for). Muse is Claude-shaped, not Grok-shaped: the TUI rejects
+  `--session-id` and offers no hook, so the id is DISCOVERED from Muse's own
+  session store (`muse.rs`: pid-set × cwd binding against the pane's Muse
+  descendants — no newest-for-cwd fallback, which would steal a sibling pane's
+  conversation; recordings reuse `claude/<name>.json` tagged `agent_kind:
+  "muse"`). Process detection is prefix-based (`muse` launcher + versioned
+  `muse-bin-*`) via a predicate procinfo walk. Hand-started `muse` promotes
+  across reboots exactly like claude (`resume_as_muse` + hysteresis on its own
+  streak map + restore-time Shell→Muse normalization; direct normalize unit
+  tests, no-spawn). Spec:
+  `docs/superpowers/specs/2026-09-11-muse-session-kind-design.md`. Gates: Rust
+  563 lib + full workspace green (clippy clean except the pre-existing doubled
+  `#[test]` in untracked `browser_ops.rs`), app 1270 passed / 1 skipped +
+  typecheck. Live-verified on an isolated private daemon: fresh pane → UUID
+  recorded; `kill -9` → `resume <same-id>` with the session log continuing
+  under that id (3 pids, 1 conversation, across a daemon restart too);
+  hand-started muse in a shell → flag + recording → restart promotes to muse
+  resuming that id; rename moves the recording; doctor resolves muse. KNOWN
+  LIMITATION (measured, upstream muse 1.1.1 behavior, tmux behaves the same):
+  a detached TUI whose terminal never answers its DA/CPR queries exits 0 after
+  ~6 s, so a muse pane with nobody attached falls back to shell (id retained,
+  next supervised start resumes) instead of staying warm — not worked around
+  daemon-side (that would be a second emulator, core rule #4). Live GUI
+  picker→pane gesture remains manual. (Note: the 2026-09-11 prompt-enhancement
+  entry's "concurrent SessionKind::Muse" blockage is this work, now complete —
+  no competing variant exists in the tree.)
 
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**

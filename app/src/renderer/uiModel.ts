@@ -14,6 +14,7 @@ export const PANE_KIND_OPTIONS: readonly PaneKindOption[] = [
   { kind: 'opencode', label: 'OpenCode', detail: 'Supervised OpenCode conversation' },
   { kind: 'hermes', label: 'Hermes', detail: 'Supervised Hermes conversation' },
   { kind: 'pi', label: 'Pi', detail: 'Supervised Pi conversation' },
+  { kind: 'muse', label: 'Muse', detail: 'Supervised Muse conversation' },
   { kind: 'editor', label: 'Editor', detail: 'App-local file editor' },
 ] as const
 
