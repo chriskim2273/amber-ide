@@ -1055,7 +1055,21 @@ exception is core rule 9); themes/settings beyond minimal.
   concurrent in-tree `SessionKind::Muse` addition (amber-core E0063, unrelated
   files). Live router round-trip still manual (needs provider keys + a running
   router). Follow-up if Muse panes gain a composer: they are not insert targets
-  today (targets are `kind === 'pi'`).
+  today (targets are `kind === 'pi'`). Deployed 2026-09-11 (commits `2b0e77b`
+  + `0c2cb7e`): `~/.local/bin/amber` → `ae0cc1e8…` (backup under
+  `~/recovery/amber-ide/`) and `~/Applications/amber-ide.AppImage` →
+  `81e04d0c…` (backup + full receipts in
+  `~/worktrees/amber-ide/enhance-deploy/`), nothing restarted — the daemon
+  and the app pick it up on their next restarts. The AppImage carries a
+  surgical 4-file ASAR patch (707 files compared, rest identical) plus a
+  refreshed static bundled `amber` (the packaged app shells to the bundle,
+  so that refresh is what makes the feature work); the tree's newer
+  attach-replay/Muse-kind/browser-host deltas were deliberately excluded.
+  Private packaged smoke 5/5 incl. the modal's honest router-down error,
+  which proves the full bridge→main→bundled-CLI chain. Receipt:
+  `docs/prompt-enhance-deployment.md`. Still manual: a live provider
+  round-trip, the actual restart, and the stale `/app` web bundle.
+
 
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**
