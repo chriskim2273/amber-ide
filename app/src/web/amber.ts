@@ -797,11 +797,16 @@ export function createAmber(deps: AmberDeps): WebAmber {
       deps.routerApi.saveSlots(slots),
     routerRevealKey: (name: string): Promise<string> => deps.routerApi.revealKey(name),
     routerLogTail: (): Promise<string> => deps.routerApi.logTail(),
+    // No `/api/router/*` complete endpoint exists, and the browser must never
+    // see the router Bearer token — so enhancement stays a desktop feature.
+    routerEnhance: (): Promise<{ ok: boolean; error?: string }> =>
+      Promise.resolve({ ok: false, error: 'prompt enhancement needs the desktop app' }),
   }
   return {
     ...api,
     releaseGrids: (): void => {
       for (const link of panes.values()) link.release()
     },
+    browserFrame: (id: string): Promise<Record<string, unknown>> => deps.browserApi.frame(id),
   }
 }

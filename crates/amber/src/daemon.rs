@@ -218,6 +218,7 @@ fn parse_kind(kind: &str) -> anyhow::Result<SessionKind> {
         "opencode" => Ok(SessionKind::OpenCode),
         "hermes" => Ok(SessionKind::Hermes),
         "pi" => Ok(SessionKind::Pi),
+        "muse" => Ok(SessionKind::Muse),
         other => anyhow::bail!("unknown session kind: {other}"),
     }
 }
@@ -1185,6 +1186,8 @@ mod tests {
         assert!(!suppress_backlog(false, Some(SessionKind::Hermes)));
         assert!(suppress_backlog(true, Some(SessionKind::Pi)));
         assert!(!suppress_backlog(false, Some(SessionKind::Pi)));
+        assert!(suppress_backlog(true, Some(SessionKind::Muse)));
+        assert!(!suppress_backlog(false, Some(SessionKind::Muse)));
         assert!(!suppress_backlog(true, Some(SessionKind::Shell)));
         assert!(!suppress_backlog(false, Some(SessionKind::Claude)));
         assert!(!suppress_backlog(false, Some(SessionKind::Shell)));
@@ -1219,6 +1222,13 @@ mod tests {
         let kind = parse_kind("hermes").expect("hermes must be a create kind");
         assert!(kind.is_agent());
         assert_eq!(kind.as_str(), "hermes");
+    }
+
+    #[test]
+    fn parse_kind_accepts_muse_as_an_agent() {
+        let kind = parse_kind("muse").expect("muse must be a create kind");
+        assert!(kind.is_agent());
+        assert_eq!(kind.as_str(), "muse");
     }
 
     #[cfg(unix)]

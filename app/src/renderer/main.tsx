@@ -16,6 +16,7 @@ import { PocketNewSessionSheet, PocketSessionSheet, type PocketSessionKind } fro
 import { deriveTab, paneDisplayLabel, piControllerOptions, shortCwd } from './tabView'
 import { RemoteAccess } from './RemoteAccess'
 import { RouterPanel } from './RouterPanel'
+import { PromptEnhancer } from './PromptEnhancer'
 import { UsagePanel } from './UsagePanel'
 import { Drawer } from './Drawer'
 import { applyViewportMode, desktopControlSize, isMobileMode, useMobile, type MobileViewMode } from './mobile'
@@ -159,6 +160,7 @@ declare global {
       ) => Promise<{ ok: boolean; error?: string }>
       routerRevealKey: (name: string) => Promise<string>
       routerLogTail: () => Promise<string>
+      routerEnhance: (prompt: string) => Promise<{ ok: boolean; text?: string; error?: string }>
     }
   }
 }
@@ -261,6 +263,7 @@ function App(): JSX.Element {
   const [toolbarMenu, setToolbarMenu] = useState<'pane-kind' | 'tools' | 'continuity' | 'attention' | null>(null)
   const [routerStatus, setRouterStatus] = useState<RouterStatus | null>(null)
   const [routerOpen, setRouterOpen] = useState(false)
+  const [enhancerOpen, setEnhancerOpen] = useState(false)
   // Presentation state for the existing daemon Snapshot/SnapshotOk exchange.
   // A timestamp is shown only after the daemon explicitly confirms the write.
   const [snapshotState, setSnapshotState] = useState<SnapshotState>({ kind: 'idle' })
@@ -1876,6 +1879,7 @@ function App(): JSX.Element {
     { id: 'action:save', label: 'Save workspace…', detail: 'Structure and retained scrollback', keywords: 'export amberws', run: () => setSaveScopeOpen(true) },
     { id: 'action:load', label: 'Load workspace…', detail: 'Create or replace from .amberws', keywords: 'import restore', run: () => { void doLoad() } },
     { id: 'action:help', label: 'Keyboard shortcuts', detail: chordLabel('help'), keywords: 'help keys', run: () => setShowHelp(true) },
+    { id: 'action:enhance', label: 'Enhance prompt…', detail: 'Rewrite a prompt through the model router', keywords: 'rewrite improve prompt router ai', run: () => setEnhancerOpen(true) },
     { id: 'action:pane-picker', label: 'Pane picker', detail: chordLabel('pane-picker'), keywords: 'switch focus sessions', run: () => openProductivity('pane-picker') },
     { id: 'action:new-pane', label: 'New pane', detail: chordLabel('new-pane'), keywords: 'create terminal', run: () => startPane() },
     { id: 'action:new-tab', label: 'New tab', detail: chordLabel('new-tab'), keywords: 'create', run: openTab },
@@ -2311,6 +2315,13 @@ function App(): JSX.Element {
           onClick={() => setRouterOpen(true)}>
           <span className="web-dot" /> router
         </button>}
+        <button
+          className="btn"
+          title="Enhance prompt: rewrite a rough prompt through the model router"
+          aria-label="Enhance prompt"
+          onClick={() => setEnhancerOpen(true)}>
+          <Icon name="edit" /> enhance
+        </button>
         <div className="toolbar-popover-wrap">
           <button className="icon-btn toolbar-icon" aria-label="workspace tools" title="Workspace tools"
             aria-haspopup="menu" aria-expanded={toolbarMenu === 'tools'}
@@ -2963,6 +2974,17 @@ function App(): JSX.Element {
           status={routerStatus}
           onClose={() => setRouterOpen(false)}
           onRefresh={() => { void window.amber.routerStatus().then(setRouterStatus) }}
+        />
+      )}
+      {enhancerOpen && (
+        <PromptEnhancer
+          targets={sessions
+            .filter((session) => session.kind === 'pi')
+            .map((session) => ({
+              name: session.name,
+              label: session.slot ? `#${session.slot} ${session.name}` : session.name,
+            }))}
+          onClose={() => setEnhancerOpen(false)}
         />
       )}
       {usageOpen && (

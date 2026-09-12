@@ -30,6 +30,7 @@ pub mod layout_file;
 pub mod manager;
 pub mod memory_guardian;
 pub mod mosaic;
+pub mod muse;
 pub mod opencode;
 pub mod pi;
 pub mod pi_bridge;

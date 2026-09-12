@@ -2,11 +2,11 @@
 // tag 0 = Control (JSON of ControlMsg, serde externally-tagged).
 // tag 1 = Data ([u16 BE name_len][name utf8][raw bytes]).
 
-export type DaemonSessionKind = 'shell' | 'claude' | 'grok' | 'codex' | 'opencode' | 'hermes' | 'pi'
+export type DaemonSessionKind = 'shell' | 'claude' | 'grok' | 'codex' | 'opencode' | 'hermes' | 'pi' | 'muse'
 
 export function isDaemonSessionKind(kind: unknown): kind is DaemonSessionKind {
   return kind === 'shell' || kind === 'claude' || kind === 'grok' || kind === 'codex'
-    || kind === 'opencode' || kind === 'hermes' || kind === 'pi'
+    || kind === 'opencode' || kind === 'hermes' || kind === 'pi' || kind === 'muse'
 }
 
 export interface SearchResult {

@@ -1064,6 +1064,69 @@ exception is core rule 9); themes/settings beyond minimal.
   listed in the receipt; live provider/package, real-device, IME, macOS, and
   production-state checks remain uncertified.
 
+- [x] Prompt enhancement via the model router (2026-09-11) — toolbar
+  "enhance" button + command-palette entry open a modal: rough prompt in,
+  rewrite out through the router's `auto` alias, editable output, Enhance-again
+  iteration, Copy, and Insert into a live Pi composer draft. New `amber ctl
+  router complete` subcommand POSTs to `/v1/chat/completions` after reading the
+  0600 router token itself, so the Bearer token never enters Node or an IPC
+  trace; the `router:enhance` IPC + preload bridge mirror the slot-editing
+  posture (fail-fast shared validation, parse-never-throw). Insert writes the
+  draft store and broadcasts `amber:pi-draft-set`, which a mounted PiPane
+  applies; unmounted panes pick it up on mount. The browser build answers a
+  clear needs-desktop error (no new web endpoint, no token exposure). Gates:
+  app 1261 passed / 1 skipped (full suite), Rust `router_ops` 6/6 + `amber`
+  binary build green, clippy clean except a pre-existing doubled `#[test]` in
+  untouched `browser_ops.rs`; typecheck clean except the two pre-existing
+  browser-host files. A full-workspace Rust run is currently blocked by a
+  concurrent in-tree `SessionKind::Muse` addition (amber-core E0063, unrelated
+  files). Live router round-trip still manual (needs provider keys + a running
+  router). Follow-up if Muse panes gain a composer: they are not insert targets
+  today (targets are `kind === 'pi'`). Deployed 2026-09-11 (commits `2b0e77b`
+  + `0c2cb7e`): `~/.local/bin/amber` → `ae0cc1e8…` (backup under
+  `~/recovery/amber-ide/`) and `~/Applications/amber-ide.AppImage` →
+  `81e04d0c…` (backup + full receipts in
+  `~/worktrees/amber-ide/enhance-deploy/`), nothing restarted — the daemon
+  and the app pick it up on their next restarts. The AppImage carries a
+  surgical 4-file ASAR patch (707 files compared, rest identical) plus a
+  refreshed static bundled `amber` (the packaged app shells to the bundle,
+  so that refresh is what makes the feature work); the tree's newer
+  attach-replay/Muse-kind/browser-host deltas were deliberately excluded.
+  Private packaged smoke 5/5 incl. the modal's honest router-down error,
+  which proves the full bridge→main→bundled-CLI chain. Receipt:
+  `docs/prompt-enhance-deployment.md`. Still manual: a live provider
+  round-trip, the actual restart, and the stale `/app` web bundle.
+
+- [x] Muse session kind (2026-09-11) — a seventh supervised agent:
+  `kind:"muse"` panes run `amber run <name>`, which supervises `muse --yolo`
+  fresh and `muse resume <uuid> --yolo` on relaunch (the exact resume form the
+  request asked for). Muse is Claude-shaped, not Grok-shaped: the TUI rejects
+  `--session-id` and offers no hook, so the id is DISCOVERED from Muse's own
+  session store (`muse.rs`: pid-set × cwd binding against the pane's Muse
+  descendants — no newest-for-cwd fallback, which would steal a sibling pane's
+  conversation; recordings reuse `claude/<name>.json` tagged `agent_kind:
+  "muse"`). Process detection is prefix-based (`muse` launcher + versioned
+  `muse-bin-*`) via a predicate procinfo walk. Hand-started `muse` promotes
+  across reboots exactly like claude (`resume_as_muse` + hysteresis on its own
+  streak map + restore-time Shell→Muse normalization; direct normalize unit
+  tests, no-spawn). Spec:
+  `docs/superpowers/specs/2026-09-11-muse-session-kind-design.md`. Gates: Rust
+  563 lib + full workspace green (clippy clean except the pre-existing doubled
+  `#[test]` in untracked `browser_ops.rs`), app 1270 passed / 1 skipped +
+  typecheck. Live-verified on an isolated private daemon: fresh pane → UUID
+  recorded; `kill -9` → `resume <same-id>` with the session log continuing
+  under that id (3 pids, 1 conversation, across a daemon restart too);
+  hand-started muse in a shell → flag + recording → restart promotes to muse
+  resuming that id; rename moves the recording; doctor resolves muse. KNOWN
+  LIMITATION (measured, upstream muse 1.1.1 behavior, tmux behaves the same):
+  a detached TUI whose terminal never answers its DA/CPR queries exits 0 after
+  ~6 s, so a muse pane with nobody attached falls back to shell (id retained,
+  next supervised start resumes) instead of staying warm — not worked around
+  daemon-side (that would be a second emulator, core rule #4). Live GUI
+  picker→pane gesture remains manual. (Note: the 2026-09-11 prompt-enhancement
+  entry's "concurrent SessionKind::Muse" blockage is this work, now complete —
+  no competing variant exists in the tree.)
+
 - portable-pty: drop the local `slave` after `spawn_command` so the reader sees
   EOF on child exit; keep `master` alive; the reader is a **blocking**
   `std::io::Read` (dedicated thread); `take_writer()` is one-shot;

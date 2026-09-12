@@ -217,7 +217,7 @@ export function piChatAvailable(meta: { kind?: string | undefined; alive?: boole
 // the run_state vocabulary stays spelled `claude*` for all of them because it
 // names the supervision phase, not the binary.
 export function isAgentKind(kind: string): boolean {
-  return kind === 'claude' || kind === 'grok' || kind === 'codex' || kind === 'opencode' || kind === 'hermes' || kind === 'pi'
+  return kind === 'claude' || kind === 'grok' || kind === 'codex' || kind === 'opencode' || kind === 'hermes' || kind === 'pi' || kind === 'muse'
 }
 
 // Daemon Focus is a recent-use hint, so only a real interaction in the active

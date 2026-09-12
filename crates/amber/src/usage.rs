@@ -386,7 +386,15 @@ pub fn grok_usage(now: i64) -> ProviderUsage {
     unavailable("grok", "grok exposes no quota data", now)
 }
 
-/// One snapshot per provider, always in this order, always all three rows.
+/// Muse exposes no quota endpoint amber can read (its OAuth credential lives
+/// in `~/.config/muse/auth.json` but no usage API is published for it).
+/// Same contract as the grok row: say so out loud instead of omitting a kind
+/// the user runs.
+pub fn muse_usage(now: i64) -> ProviderUsage {
+    unavailable("muse", "muse exposes no quota data", now)
+}
+
+/// One snapshot per provider, always in this order, always all four rows.
 pub fn collect_all(now: i64, run: &Runner, codex_path: Option<&Path>) -> Vec<ProviderUsage> {
     let began = std::time::Instant::now();
     let claude = claude_usage_with(None, now, run);
@@ -396,6 +404,7 @@ pub fn collect_all(now: i64, run: &Runner, codex_path: Option<&Path>) -> Vec<Pro
         codex_path.map(|path| crate::codex_usage::collect(path, quota_now))
             .unwrap_or_else(|| unavailable("codex", "Codex not installed; live quota unavailable", 0)),
         grok_usage(now),
+        muse_usage(now),
     ]
 }
 
@@ -775,7 +784,16 @@ mod tests {
     fn collect_all_returns_one_row_per_provider_in_order() {
         let rows = collect_all(0, &ok_runner("{}"), None);
         let names: Vec<&str> = rows.iter().map(|r| r.provider.as_str()).collect();
-        assert_eq!(names, vec!["claude", "codex", "grok"]);
+        assert_eq!(names, vec!["claude", "codex", "grok", "muse"]);
+    }
+
+    #[test]
+    fn muse_is_unavailable_by_construction() {
+        let m = muse_usage(0);
+        assert_eq!(m.provider, "muse");
+        assert_eq!(m.state, "unavailable");
+        assert!(m.gauges.is_empty());
+        assert_eq!(m.detail.as_deref(), Some("muse exposes no quota data"));
     }
 
     #[test]
@@ -783,10 +801,12 @@ mod tests {
         // A runner that always fails stands in for a dead network.
         let boom = |_a: &[&str]| Err(std::io::Error::other("no network"));
         let rows = collect_all(0, &boom, None);
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len(), 4);
         assert_eq!(rows[0].provider, "claude");
         assert!(rows[0].state == "error" || rows[0].state == "unavailable");
         assert_eq!(rows[2].state, "unavailable"); // grok row still present
+        assert_eq!(rows[3].provider, "muse");
+        assert_eq!(rows[3].state, "unavailable"); // muse row still present
     }
 
     #[test]

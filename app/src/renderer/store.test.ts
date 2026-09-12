@@ -27,6 +27,15 @@ describe('Pi agent panes', () => {
   })
 })
 
+describe('Muse agent panes', () => {
+  it('treats Muse as an agent with its own dot labels', () => {
+    expect(isAgentKind('muse')).toBe(true)
+    expect(paneDot('muse', undefined)).toEqual({ cls: 'muse', label: 'muse' })
+    expect(paneDot('muse', 'claude-retrying')).toEqual({ cls: 'muse-retrying', label: 'muse (retrying)' })
+    expect(paneDot('muse', 'shell-fallback')).toEqual({ cls: 'shell-fallback', label: 'shell (muse exited)' })
+  })
+})
+
 describe('terminal focus hint', () => {
   it('only allows an active terminal interaction to hint focus', () => {
     expect(shouldHintTerminalFocus(true, true, true)).toBe(true)

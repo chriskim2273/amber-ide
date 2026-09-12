@@ -54,6 +54,34 @@ export function canClearPiDraft(currentValue: string, submittedValue: string, cu
   return currentValue === submittedValue && currentVersion === submittedVersion
 }
 
+/**
+ * Window event the prompt-enhancement dialog dispatches to fill a mounted Pi
+ * composer. The session name rides the event as data (never a selector), the
+ * same way the storage key does.
+ */
+export const PI_DRAFT_SET_EVENT = 'amber:pi-draft-set'
+
+export interface PiDraftSetDetail {
+  session: string
+  text: string
+}
+
+/**
+ * Persist an externally produced draft AND wake the mounted pane, if any. A
+ * pane that is not mounted still picks the text up from storage on mount, so
+ * this degrades to a plain write rather than failing.
+ */
+export function notifyPiDraftSet(session: string, text: string): void {
+  writePiDraft(session, text)
+  try {
+    if (typeof window === 'undefined' || typeof window.dispatchEvent !== 'function') return
+    window.dispatchEvent(new CustomEvent<PiDraftSetDetail>(PI_DRAFT_SET_EVENT, { detail: { session, text } }))
+  } catch {
+    // Same best-effort posture as draft persistence above: the text is
+    // already in storage, so a missing event bus only loses the live update.
+  }
+}
+
 export function clearPiDraft(session: string, store = storage()): boolean {
   return writePiDraft(session, '', store)
 }

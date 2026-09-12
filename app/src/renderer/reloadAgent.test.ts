@@ -92,4 +92,19 @@ describe('reloadAgentCommand', () => {
   ('rejects an invalid OpenCode id %j', (id) => {
     expect(reloadAgentCommand('opencode', id)).toBeNull()
   })
+
+  it('resumes Muse by its exact recorded id, never --last', () => {
+    const command = reloadAgentCommand('muse', UUID)
+    expect(command).toBe(`muse resume '${UUID}' --yolo`)
+    expect(command).not.toContain('--last')
+  })
+
+  it('starts a fresh Muse session when no id is recorded', () => {
+    expect(reloadAgentCommand('muse', null)).toBe('muse --yolo')
+  })
+
+  it.each(['', '   ', 'latest', '--last', 'ses_fd8f8accaffeTWUvgvTimbhECs', 'line\nbreak'])
+  ('rejects an invalid Muse id %j', (id) => {
+    expect(reloadAgentCommand('muse', id)).toBeNull()
+  })
 })
