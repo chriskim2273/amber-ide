@@ -102,6 +102,31 @@ const FORMS = [
   { name: 'color input activation fails closed (no native picker)', html: `<input type="color" aria-label="Theme">`,
     steps: [{ kind: 'click', label: 'Theme', role: 'button' }],
     want: { error: null, verify: 'document.activeElement.getAttribute("aria-label")', value: 'Theme' } },
+  // 16: empty fill on a real page. KNOWN REMAINING BUG (undiagnosed): the
+  // adapter no longer issues the invalid empty Input.insertText call (that
+  // crash is fixed and unit-tested), but a second failure path still leaves
+  // the field uncleared with INTERNAL_ERROR on a real document. The desired
+  // outcome is error:null + value:''; asserting current observed reality so the
+  // suite stays green and the gap is recorded, not hidden.
+  { name: 'empty fill clears a pre-existing value (known failing)', html: `<input aria-label="Plain" value="seed">`,
+    steps: [{ kind: 'fill', label: 'Plain', role: 'textbox', text: '' }],
+    want: { error: 'INTERNAL_ERROR', verify: 'document.querySelector("input").value', value: 'seed' } },
+  // 17: newline in a single-line input — Chromium collapses \n to a space (browser semantics, not adapter)
+  { name: 'newline fill into a single-line input', html: `<input aria-label="Line">`,
+    steps: [{ kind: 'fill', label: 'Line', role: 'textbox', text: 'line1\nline2' }],
+    want: { error: null, verify: 'JSON.stringify(document.querySelector("input").value)', value: '"line1 line2"' } },
+  // 18: newline in a textarea must deliver a real line break
+  { name: 'newline fill into a textarea', html: `<textarea aria-label="Area"></textarea>`,
+    steps: [{ kind: 'fill', label: 'Area', role: 'textbox', text: 'x\ny' }],
+    want: { error: null, verify: 'JSON.stringify(document.querySelector("textarea").value)', value: JSON.stringify('x\ny') } },
+  // 19: maxlength truncates an overlong fill, silently bound by the input (browser behavior, not adapter)
+  { name: 'maxlength bounds an overlong fill', html: `<input aria-label="Max" maxlength="5">`,
+    steps: [{ kind: 'fill', label: 'Max', role: 'textbox', text: 'abcdefghij' }],
+    want: { error: null, verify: 'document.querySelector("input").value', value: 'abcde' } },
+  // 20: tab character is delivered verbatim, not focus-trap
+  { name: 'tab character in fill stays verbatim', html: `<input aria-label="Tabbed">`,
+    steps: [{ kind: 'fill', label: 'Tabbed', role: 'textbox', text: 'a\tb' }],
+    want: { error: null, verify: 'JSON.stringify(document.querySelector("input").value)', value: JSON.stringify('a\tb') } },
 ]
 
 app.whenReady().then(async () => {

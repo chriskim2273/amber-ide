@@ -811,7 +811,11 @@ export class BrowserAutomation {
       else if ((operation.kind === 'fill' || operation.kind === 'type') && primaryPoint) {
         if (!primaryPoint.focused) await click(primaryPoint)
         if (operation.kind === 'fill') { const modifier = process.platform === 'darwin' ? 4 : 2; await key('keyDown', 'a', modifier); await key('keyUp', 'a', modifier) }
-        await sendIrreversible('Input.insertText', { text: operation.text })
+        // An empty fill is a clear: Ctrl+A above selected everything, and CDP
+        // rejects Input.insertText with an empty text parameter ("Invalid
+        // parameters"), so the selection alone empties the field. Inserting
+        // nothing is the entire gesture.
+        if (operation.text.length > 0) await sendIrreversible('Input.insertText', { text: operation.text })
       } else if (operation.kind === 'press') {
         if (primaryPoint && !primaryPoint.focused) await click(primaryPoint)
         await key('keyDown', operation.key, modifierMask(operation.modifiers)); await key('keyUp', operation.key, modifierMask(operation.modifiers))

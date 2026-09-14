@@ -835,6 +835,33 @@ describe('browser automation', () => {
     expect(transport.calls).not.toContain('Input.insertText')
   })
 
+  it('clears a field on empty fill without an invalid empty insertText', async () => {
+    // CDP rejects Input.insertText with an empty text parameter ("Invalid
+    // parameters"), so a fill('') must clear via Ctrl+A alone and never issue
+    // the insertText call that would otherwise throw INTERNAL_ERROR.
+    const transport = new FakeDebugger()
+    const automation = new BrowserAutomation(transport, () => 'https://example.test/forms', () => false)
+    transport.send = async (method: string, params?: Record<string, unknown>) => {
+      transport.calls.push(method)
+      if (method === 'DOM.performSearch') return { searchId: 'search-1', resultCount: 1 }
+      if (method === 'DOM.getSearchResults') return { nodeIds: [104] }
+      if (method === 'DOM.describeNode') return { node: { nodeName: 'INPUT', parentId: 101, backendNodeId: 4, attributes: ['type', 'text', 'aria-label', 'Vol'] } }
+      if (method === 'Accessibility.getPartialAXTree') return { nodes: [{ role: { value: 'textbox' }, name: { value: 'Vol' }, backendDOMNodeId: 4 }] }
+      if (method === 'DOM.pushNodesByBackendIdsToFrontend') return { nodeIds: [22] }
+      if (method === 'CSS.getComputedStyleForNode') return { computedStyle: [{ name: 'display', value: 'block' }, { name: 'opacity', value: '1' }, { name: 'visibility', value: 'visible' }, { name: 'pointer-events', value: 'auto' }] }
+      if (method === 'DOM.getBoxModel') return { model: { border: [0, 0, 100, 0, 100, 20, 0, 20] } }
+      if (method === 'DOM.getNodeForLocation') return { backendNodeId: 4 }
+      if (method === 'Page.getLayoutMetrics') return { cssVisualViewport: { clientWidth: 800, clientHeight: 600 } }
+      return {}
+    }
+    const signal = new AbortController().signal
+    const snapshot = await automation.snapshot(lease, { maxDepth: 20, maxNodes: 20, maxBytes: 256 * 1024 }, signal)
+    const target = { snapshotId: snapshot.snapshotId, role: 'textbox', name: 'Vol' }
+    const prepared = await automation.prepareInteraction(lease, { kind: 'fill', target, text: '' }, signal)
+    await expect(automation.executeInteraction(prepared, signal)).resolves.toMatchObject({ dispatched: true })
+    expect(transport.calls).not.toContain('Input.insertText')
+  })
+
   it('rejects a multi-value select before any native traversal', async () => {
     const transport = new FakeDebugger()
     const automation = new BrowserAutomation(transport, () => 'https://example.test/forms', () => false)
