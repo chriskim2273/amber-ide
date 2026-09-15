@@ -108,6 +108,31 @@ exception is core rule 9); themes/settings beyond minimal.
 
 ## Build status
 
+- [x] Claude usage rate-limit honesty (2026-09-15) — the tracker showed
+  "usage response carried no readable windows" whenever Anthropic answered
+  anything but 200: curl exits 0 on HTTP errors (no `-f`), the status was never
+  captured, and the error JSON (`{"error":…}`, zero windows) went straight to
+  the usage parser — whose no-windows error masked the real cause. The 60 s
+  poller then kept hitting the limiting endpoint with no backoff. Fix, all in
+  `crates/amber/src/usage.rs`: curl appends `-w '\n__amber_http:%{http_code}'`
+  and the fetch dispatches on the status BEFORE parsing — 429 → "usage
+  rate-limited — backing off for 10 min", 401/403 → needs-auth, other non-200 →
+  "usage request failed (HTTP n)" plus the server's truncated, token-redacted
+  message. Steady claude cadence drops to 1 per 5 min inside the 60 s tick (a
+  5-min-old number is ≤1.6% stale at full burn; 12 req/hour instead of 60),
+  a 429 buys 10 min of silence that even a manual RefreshUsage cannot punch
+  through (refresh still bypasses the steady gate), and reused rows keep their
+  original sample time. Gates: Rust workspace green twice (578 amber lib incl.
+  8 new tests), `clippy -p amber --lib` clean (the `--all-targets` failure is
+  the pre-existing dirty `browser_ops.rs` duplicated `#[test]`, untouched).
+  Live-verified on a private daemon: its first poll caught a REAL 429
+  (direct probe confirmed HTTP 429 + `{"error":…}`) and reported the backoff
+  instead of "no readable windows"; a forced refresh and a natural 60 s tick
+  both reused the claude row (updated frozen) while codex advanced; curl's
+  marker placement verified byte-for-byte against a local HTTP server.
+  **A running daemon must be restarted to pick this up** — until then it keeps
+  polling every 60 s with no backoff, sustaining the limit.
+
 - [x] Remote clipboard image paste (2026-09-14) — screenshots copied on another
   machine now reach claude/pi/muse panes over amber web. Root cause: Ctrl-V
   sends `^V` to the pty and the agent reads the HOST clipboard via xclip/

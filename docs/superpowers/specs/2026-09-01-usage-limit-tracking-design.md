@@ -3,7 +3,23 @@
 **Status:** initial implementation shipped; live Codex correction implemented
 and tested in an isolated worktree (2026-09-05), pending production activation.
 The amendment below supersedes the Codex source/labels in §1.3 and updates the
-refresh/staleness behavior in §1.5, §2–4.
+refresh/staleness behavior in §1.5, §2–4. The 2026-09-15 amendment below it
+supersedes the claude fetch in §1.2/§1.5 (status-aware errors, 5-min cadence,
+429 backoff).
+
+## 2026-09-15 claude rate-limit amendment
+
+Observed live: the endpoint 429s (body `{"error":…}`, `Retry-After: 0`), and
+the old code fed that body to the usage parser, which reported the misleading
+"no readable windows" — then kept polling every 60 s with no backoff. The
+fetch now captures the HTTP status via curl `-w` and dispatches on it before
+parsing (429 → rate-limited error, 401/403 → needs-auth, other non-200 →
+HTTP status plus the truncated, token-redacted server message). Steady cadence
+is one claude fetch per 5 min inside the 60 s tick (12 req/hour); a 429 buys
+10 min of silence that even a manual `RefreshUsage` cannot punch through
+(refresh still bypasses the steady gate); reused rows keep their original
+sample time. §1.2 steps 4–6 and the "one HTTPS request per minute" line in
+§1.5 are superseded accordingly; everything else stands.
 
 ## 2026-09-05 live Codex correction
 
