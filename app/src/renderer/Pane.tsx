@@ -153,6 +153,11 @@ export const Pane = memo(function Pane(
   // The daemon's fallback state can change without replacing this terminal.
   const piClipboardRef = useRef(false)
   piClipboardRef.current = kind === 'pi' && runState !== 'shell-fallback'
+  // Remote image paste targets: the agent must be running to attach the
+  // pasted path (a suspended/fallback pane has no TUI reading input).
+  const imagePasteRef = useRef(false)
+  imagePasteRef.current = (kind === 'claude' || kind === 'pi' || kind === 'muse')
+    && runState !== 'shell-fallback' && runState !== 'suspended'
   // True once this Pane has consumed one Attach backlog. A LATER backlog is a
   // RE-attach replay of history the terminal already shows, so it must clear
   // first — see the `term.reset()` in the port handler. Deliberately not armed
@@ -180,7 +185,17 @@ export const Pane = memo(function Pane(
     const fit = new FitAddon()
     installTerminalUnicode(term)
     term.open(host)
-    const clipboard = installTerminalClipboard(term, host, () => piClipboardRef.current)
+    // Web-only: `pasteImage` is absent on desktop, where Ctrl-V reaches the
+    // agent natively. `sendRaw` is the `^V` fallback when a remote clipboard
+    // read fails — same `port` binding every keystroke uses (closure runs
+    // after `port` below is initialized, like `insert`).
+    const uploadImage = window.amber.pasteImage
+    const clipboard = installTerminalClipboard(term, host, {
+      isPi: () => piClipboardRef.current,
+      isImagePasteTarget: () => imagePasteRef.current,
+      ...(uploadImage ? { pasteImage: (file: File) => uploadImage(session, file) } : {}),
+      sendRaw: (data) => port?.postMessage({ data: new TextEncoder().encode(data) }),
+    })
     term.loadAddon(fit)
     // WebGL is the fast path on hardware GL, but pathologically slow on
     // SwiftShader — under software GL, use xterm's default DOM renderer.
@@ -267,6 +282,13 @@ export const Pane = memo(function Pane(
         if (e.type === 'keydown') port?.postMessage({
           data: new TextEncoder().encode(shiftEnterSequence(kind, keyboardMode.current)),
         })
+        e.preventDefault()
+        return false
+      }
+      // Remote image paste (web agent panes): consume Ctrl-V so xterm neither
+      // forwards a bare `^V` nor lets the browser fire a second paste — the
+      // handler reads the remote clipboard itself.
+      if (clipboard.handleKeyDown(e)) {
         e.preventDefault()
         return false
       }

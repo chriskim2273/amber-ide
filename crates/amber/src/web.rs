@@ -144,15 +144,29 @@ impl Request {
 }
 
 /// Largest accepted request head + body. Auth is a short token; slot saves
-/// are a small JSON list. Anything larger is hostile/garbage.
+/// are a small JSON list. Anything larger is hostile/garbage. (The
+/// clipboard-image route carries its large body past this via an early
+/// `Content-Length` check in `handle_conn`, never through this cap.)
 pub const MAX_REQUEST_LEN: usize = 32 * 1024;
 
-/// Parse one complete request from `buf`. `Ok(None)` means "need more bytes".
-pub fn parse_request(buf: &[u8]) -> anyhow::Result<Option<Request>> {
-    if buf.len() > MAX_REQUEST_LEN {
-        anyhow::bail!("request exceeds {MAX_REQUEST_LEN} bytes");
-    }
+/// A parsed request head: method, path and headers without requiring the body.
+/// `handle_conn` reads this first so the clipboard-image route can authorize
+/// and validate from head headers BEFORE reading a multi-MiB body.
+#[derive(Debug)]
+struct Head {
+    method: String,
+    path: String,
+    headers: Vec<(String, String)>,
+    body_start: usize,
+}
+
+/// Parse the head of `buf`. `Ok(None)` means "need more bytes"; bails when no
+/// head terminator appears within `MAX_HEAD_LEN` (garbage or a hostile head).
+fn parse_head(buf: &[u8]) -> anyhow::Result<Option<Head>> {
     let Some(head_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+        if buf.len() > MAX_HEAD_LEN {
+            anyhow::bail!("request head exceeds {MAX_HEAD_LEN} bytes");
+        }
         return Ok(None);
     };
     let head = std::str::from_utf8(&buf[..head_end])?;
@@ -173,21 +187,37 @@ pub fn parse_request(buf: &[u8]) -> anyhow::Result<Option<Request>> {
         };
         headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
     }
-    let body_start = head_end + 4;
-    let len: usize = headers
+    Ok(Some(Head {
+        method: method.to_string(),
+        path: path.to_string(),
+        headers,
+        body_start: head_end + 4,
+    }))
+}
+
+/// Parse one complete request from `buf`. `Ok(None)` means "need more bytes".
+pub fn parse_request(buf: &[u8]) -> anyhow::Result<Option<Request>> {
+    if buf.len() > MAX_REQUEST_LEN {
+        anyhow::bail!("request exceeds {MAX_REQUEST_LEN} bytes");
+    }
+    let Some(head) = parse_head(buf)? else {
+        return Ok(None);
+    };
+    let len: usize = head
+        .headers
         .iter()
         .find(|(k, _)| k == "content-length")
         .map(|(_, v)| v.parse())
         .transpose()?
         .unwrap_or(0);
-    if buf.len() < body_start + len {
+    if buf.len() < head.body_start + len {
         return Ok(None);
     }
     Ok(Some(Request {
-        method: method.to_string(),
-        path: path.to_string(),
-        headers,
-        body: buf[body_start..body_start + len].to_vec(),
+        method: head.method,
+        path: head.path,
+        headers: head.headers,
+        body: buf[head.body_start..head.body_start + len].to_vec(),
     }))
 }
 
@@ -219,6 +249,149 @@ pub fn origin_ok(origin: Option<&str>, host: Option<&str>, fwd_host: Option<&str
         .into_iter()
         .flatten()
         .any(|h| authority.eq_ignore_ascii_case(h))
+}
+
+// ---- remote clipboard image paste ----------------------------------------
+//
+// A browser on another machine holds the image its user just copied, but the
+// agents read the HOST clipboard (`xclip`/`wl-paste`) when they see `^V` —
+// which has no image, so a remote paste silently does nothing (and xterm's
+// own paste handler only reads `text/plain`, ignoring images entirely). Muse
+// on Linux does not even attempt a clipboard image read.
+//
+// The bridge is a file path, not the host clipboard: the browser POSTs the
+// bytes to `/api/clipboard-image`, this server writes them to a 0600 host
+// temp file after validating magic/size/session, and the renderer pastes the
+// returned absolute path as bracketed text. All three agents attach an image
+// from a pasted file path — Claude's pasted-path handler, Pi's own paste
+// (which inserts a bare path with the comment "attached by path"), and Muse's
+// "image data or paths" composer. No daemon change: the path travels the
+// existing terminal-input frames, and no X server, PATH shim, or global
+// clipboard write is involved, so concurrent pastes cannot race each other.
+
+/// Largest accepted clipboard image upload (matches Pi's per-attachment cap).
+pub const MAX_CLIPBOARD_IMAGE_BYTES: usize = 16 * 1024 * 1024;
+/// Cap on the HTTP head (request line + headers) when reading any request.
+/// Bodies ride past this only on the clipboard-image route, bounded by
+/// `MAX_CLIPBOARD_IMAGE_BYTES` via an early `Content-Length` check.
+const MAX_HEAD_LEN: usize = 16 * 1024;
+/// Session kinds whose TUIs attach an image from a pasted file path. Deliberately
+/// narrow: other agent kinds are untested here and stay on today's behavior.
+const CLIPBOARD_IMAGE_KINDS: [&str; 3] = ["claude", "pi", "muse"];
+/// Temp-file prefix for clipboard-image uploads (`amber-clip-<random>.<ext>`).
+const CLIPBOARD_IMAGE_PREFIX: &str = "amber-clip-";
+/// Best-effort age sweep on every upload (mirrors Pi's 24 h attachment expiry).
+const CLIPBOARD_IMAGE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+/// Pending-upload cap (after the sweep): an authed client spamming uploads
+/// must not fill the tmp filesystem. Returns 429 past this.
+const CLIPBOARD_IMAGE_MAX_FILES: usize = 128;
+
+/// File extension for validated image bytes, from magic — never from the
+/// client's `Content-Type`, which is untrusted. `None` for anything else
+/// (including BMP: Claude reads it but Pi/Muse attachment of `.bmp` paths is
+/// unverified, so it is rejected with a clear error rather than pasted dead).
+pub fn image_ext_for_magic(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.len() >= 8 && bytes[..8] == [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A] {
+        return Some("png");
+    }
+    if bytes.len() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF {
+        return Some("jpg");
+    }
+    if bytes.len() >= 6 && (bytes[..6] == *b"GIF87a" || bytes[..6] == *b"GIF89a") {
+        return Some("gif");
+    }
+    if bytes.len() >= 12 && bytes[..4] == *b"RIFF" && bytes[8..12] == *b"WEBP" {
+        return Some("webp");
+    }
+    None
+}
+
+/// Directory for clipboard-image temp files. Pure half takes the tmpdir so
+/// tests need not touch the process-global `TMPDIR`.
+fn clipboard_image_dir_in(tmp: &Path) -> PathBuf {
+    // Agent path parsing breaks on spaces; the tmpdir almost never has them,
+    // but a `$TMPDIR` with spaces would paste an unusable path.
+    #[cfg(unix)]
+    {
+        if tmp.to_string_lossy().contains(' ') {
+            return PathBuf::from("/tmp");
+        }
+    }
+    tmp.to_path_buf()
+}
+
+fn clipboard_image_dir() -> PathBuf {
+    clipboard_image_dir_in(&std::env::temp_dir())
+}
+
+/// Best-effort sweep of our own expired temp files. Bounded and failure-silent:
+/// this runs on every upload and must never fail it.
+fn sweep_clipboard_images(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let now = std::time::SystemTime::now();
+    for (i, entry) in entries.flatten().enumerate() {
+        if i >= 1024 {
+            break;
+        }
+        if !entry.file_name().to_string_lossy().starts_with(CLIPBOARD_IMAGE_PREFIX) {
+            continue;
+        }
+        let old = entry
+            .metadata()
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|age| age >= CLIPBOARD_IMAGE_MAX_AGE);
+        if old {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Count of our own pending temp files, stopping past the cap. Bounded: the
+/// tmpdir can hold unbounded unrelated entries.
+fn count_clipboard_images(dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+    let mut n = 0;
+    for (i, entry) in entries.flatten().enumerate() {
+        if i >= 2048 || n > CLIPBOARD_IMAGE_MAX_FILES {
+            break;
+        }
+        if entry.file_name().to_string_lossy().starts_with(CLIPBOARD_IMAGE_PREFIX) {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Write validated image bytes to a 0600 temp file with a random name. The
+/// filename carries no client input (extension comes from magic). `create_new`
+/// plus a retry makes a random collision harmless instead of a clobber.
+fn write_clipboard_image_in(dir: &Path, ext: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
+    for _ in 0..3 {
+        let mut rand = [0u8; 12];
+        crate::platform::random_bytes(&mut rand)?;
+        let path = dir.join(format!("{CLIPBOARD_IMAGE_PREFIX}{}.{ext}", base64url(&rand)));
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        match opts.open(&path) {
+            Ok(mut f) => {
+                f.write_all(bytes)?;
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not mint a clipboard image name",
+    ))
 }
 
 // ---- browser message → daemon control ----------------------------------
@@ -1142,6 +1315,21 @@ impl Hub {
         Self::payload(&inner.sessions, &inner.layout)
     }
 
+    /// Whether `name` is a listed session whose TUI attaches an image from a
+    /// pasted file path — the only valid target of a clipboard-image upload.
+    /// Reads the Hub's cached daemon session list (refreshed on the 1 s poll),
+    /// so no daemon round trip happens on the paste path.
+    fn image_paste_target(&self, name: &str) -> bool {
+        if name.is_empty() {
+            return false;
+        }
+        let inner = self.inner.lock().unwrap();
+        inner
+            .sessions
+            .iter()
+            .any(|s| s.name == name && CLIPBOARD_IMAGE_KINDS.contains(&s.kind.as_str()))
+    }
+
     fn payload(sessions: &[SessionInfo], layout: &str) -> String {
         let list: Vec<_> = sessions.iter().map(session_json).collect();
         let layout: serde_json::Value =
@@ -1960,6 +2148,95 @@ fn router_err(stream: &mut TcpStream, err: router_ops::OpsError) -> std::io::Res
     respond(stream, status, CT_JSON, &[], body.as_bytes())
 }
 
+/// `POST /api/clipboard-image?name=<session>` — remote clipboard image paste.
+///
+/// The head was already read (auth, origin, session and `Content-Length` all
+/// live there), so every rejection below fires BEFORE the multi-MiB body is
+/// read — a phone on a slow tailnet must not upload 16 MiB to learn its
+/// cookie expired. `body_prefix` is whatever body bytes already arrived with
+/// the head. Responds `{"ok":true,"path":…}` with the 0600 host temp file the
+/// renderer pastes as text (see the module section above for why a path).
+fn handle_clipboard_image(
+    mut stream: TcpStream,
+    head: Head,
+    body_prefix: &[u8],
+    hub: &Arc<Hub>,
+    auth: &Arc<Auth>,
+    peer: IpAddr,
+) -> anyhow::Result<()> {
+    let err = |msg: &str| serde_json::json!({ "ok": false, "error": msg }).to_string();
+    // `authorized`/`origin_ok` read headers only, so an empty-body probe is
+    // an exact early check (the full body is unread by design here).
+    let probe = Request {
+        method: head.method,
+        path: head.path,
+        headers: head.headers,
+        body: Vec::new(),
+    };
+    if !auth.authorized(peer, &probe) {
+        return Ok(respond(&mut stream, "401 Unauthorized", "", &[], b"")?);
+    }
+    if !origin_ok(
+        probe.header("origin"),
+        probe.header("host"),
+        probe.header("x-forwarded-host"),
+    ) {
+        return Ok(respond(&mut stream, "403 Forbidden", "", &[], b"")?);
+    }
+    let (_, query) = probe.path.split_once('?').unwrap_or((probe.path.as_str(), ""));
+    let name = router_ops::query_param(query, "name").unwrap_or("");
+    if !hub.image_paste_target(name) {
+        let out = err("no such image-paste session");
+        return Ok(respond(&mut stream, "404 Not Found", CT_JSON, &[], out.as_bytes())?);
+    }
+    let content_len: usize = match probe.header("content-length").and_then(|v| v.parse().ok()) {
+        Some(n) if n >= 1 => n,
+        _ => {
+            let out = err("missing or invalid Content-Length");
+            return Ok(respond(&mut stream, "400 Bad Request", CT_JSON, &[], out.as_bytes())?);
+        }
+    };
+    if content_len > MAX_CLIPBOARD_IMAGE_BYTES {
+        let out = err("image exceeds the 16 MiB limit");
+        return Ok(respond(&mut stream, "413 Payload Too Large", CT_JSON, &[], out.as_bytes())?);
+    }
+    let mut body: Vec<u8> = Vec::with_capacity(content_len);
+    body.extend_from_slice(body_prefix.get(..content_len.min(body_prefix.len())).unwrap_or(&[]));
+    let mut chunk = [0u8; 8192];
+    while body.len() < content_len {
+        let n = stream.read(&mut chunk)?;
+        if n == 0 {
+            let out = err("connection closed before the image arrived");
+            return Ok(respond(&mut stream, "400 Bad Request", CT_JSON, &[], out.as_bytes())?);
+        }
+        body.extend_from_slice(&chunk[..n.min(content_len - body.len())]);
+    }
+    let Some(ext) = image_ext_for_magic(&body) else {
+        let out = err("unsupported image type; use PNG, JPEG, GIF or WebP");
+        return Ok(respond(&mut stream, "400 Bad Request", CT_JSON, &[], out.as_bytes())?);
+    };
+    let dir = clipboard_image_dir();
+    sweep_clipboard_images(&dir);
+    if count_clipboard_images(&dir) >= CLIPBOARD_IMAGE_MAX_FILES {
+        let out = err("too many pending clipboard images; try again later");
+        return Ok(respond(&mut stream, "429 Too Many Requests", CT_JSON, &[], out.as_bytes())?);
+    }
+    let path = match write_clipboard_image_in(&dir, ext, &body) {
+        Ok(p) => p,
+        Err(e) => {
+            let out = err(&format!("could not store the image: {e}"));
+            return Ok(respond(&mut stream, "500 Internal Server Error", CT_JSON, &[], out.as_bytes())?);
+        }
+    };
+    let Some(path_str) = path.to_str() else {
+        let _ = std::fs::remove_file(&path);
+        let out = err("could not store the image");
+        return Ok(respond(&mut stream, "500 Internal Server Error", CT_JSON, &[], out.as_bytes())?);
+    };
+    let out = serde_json::json!({ "ok": true, "path": path_str }).to_string();
+    Ok(respond(&mut stream, "200 OK", CT_JSON, &[], out.as_bytes())?)
+}
+
 fn handle_conn(
     mut stream: TcpStream,
     hub: &Arc<Hub>,
@@ -1970,6 +2247,24 @@ fn handle_conn(
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4096];
+    // The head first: the clipboard-image route authorizes and validates from
+    // head headers before reading its multi-MiB body (see above). Every other
+    // route falls through to the existing whole-request read unchanged.
+    let head = loop {
+        if let Some(head) = parse_head(&buf)? {
+            break head;
+        }
+        let n = stream.read(&mut chunk)?;
+        if n == 0 {
+            return Ok(());
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    };
+    let head_path = head.path.split_once('?').map(|(p, _)| p).unwrap_or(head.path.as_str());
+    if head.method == "POST" && head_path == "/api/clipboard-image" {
+        let prefix: Vec<u8> = buf.get(head.body_start..).unwrap_or(&[]).to_vec();
+        return handle_clipboard_image(stream, head, &prefix, hub, auth, peer);
+    }
     let req = loop {
         if let Some(req) = parse_request(&buf)? {
             break req;
@@ -2369,6 +2664,227 @@ mod tests {
         let big = vec![b'x'; MAX_REQUEST_LEN + 1];
         assert!(parse_request(&big).is_err());
         assert!(parse_request(b"GARBAGE\r\n\r\n").is_err());
+    }
+
+    #[test]
+    fn parse_head_reads_headers_without_the_body() {
+        assert!(parse_head(b"POST /x HT").unwrap().is_none());
+        let head = parse_head(b"POST /api/clipboard-image?name=a HTTP/1.1\r\nHost: h\r\nContent-Length: 10\r\n\r\nab")
+            .unwrap()
+            .unwrap();
+        assert_eq!(head.method, "POST");
+        assert_eq!(head.path, "/api/clipboard-image?name=a");
+        assert_eq!(head.headers.iter().find(|(k, _)| k == "content-length").map(|(_, v)| v.as_str()), Some("10"));
+        // The two body bytes already arrived with the head.
+        assert_eq!(&b"POST /api/clipboard-image?name=a HTTP/1.1\r\nHost: h\r\nContent-Length: 10\r\n\r\nab"[head.body_start..], b"ab");
+        // Garbage with no terminator past the head cap is an error, not a wait.
+        let big = vec![b'x'; MAX_HEAD_LEN + 1];
+        assert!(parse_head(&big).is_err());
+        assert!(parse_head(b"GARBAGE\r\n\r\n").is_err());
+    }
+
+    #[test]
+    fn image_magic_maps_to_an_extension_and_rejects_the_rest() {
+        let png = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0];
+        assert_eq!(image_ext_for_magic(&png), Some("png"));
+        assert_eq!(image_ext_for_magic(&[0xFF, 0xD8, 0xFF, 0xE0]), Some("jpg"));
+        assert_eq!(image_ext_for_magic(b"GIF89a...."), Some("gif"));
+        assert_eq!(image_ext_for_magic(b"GIF87a...."), Some("gif"));
+        assert_eq!(image_ext_for_magic(b"RIFF\x00\x00\x00\x00WEBP"), Some("webp"));
+        assert_eq!(image_ext_for_magic(b""), None);
+        assert_eq!(image_ext_for_magic(b"hello world, this is text"), None);
+        // Truncated magic is not an image.
+        assert_eq!(image_ext_for_magic(&[0x89, b'P', b'N']), None);
+        assert_eq!(image_ext_for_magic(b"RIFF\x00\x00"), None);
+        // BMP is deliberately unsupported (unverified agent attach).
+        assert_eq!(image_ext_for_magic(b"BM\x00\x00\x00\x00\x00\x00"), None);
+    }
+
+    #[test]
+    fn clipboard_image_dir_falls_back_when_tmp_has_spaces() {
+        assert_eq!(clipboard_image_dir_in(Path::new("/tmp")), PathBuf::from("/tmp"));
+        #[cfg(unix)]
+        assert_eq!(
+            clipboard_image_dir_in(Path::new("/odd dir/tmp")),
+            PathBuf::from("/tmp")
+        );
+    }
+
+    #[test]
+    fn clipboard_image_write_sweep_and_count_are_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3];
+        let first = write_clipboard_image_in(dir.path(), "png", &bytes).unwrap();
+        let second = write_clipboard_image_in(dir.path(), "png", &bytes).unwrap();
+        assert_ne!(first, second, "random names must not collide");
+        for path in [&first, &second] {
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+            let name = path.file_name().unwrap().to_string_lossy();
+            assert!(name.starts_with(CLIPBOARD_IMAGE_PREFIX), "{name}");
+            assert!(name.ends_with(".png"), "{name}");
+            assert!(!name.contains(' '), "{name}");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(std::fs::metadata(&first).unwrap().mode() & 0o777, 0o600);
+        }
+        assert_eq!(count_clipboard_images(dir.path()), 2);
+        // Unrelated tmp files are neither counted nor swept.
+        std::fs::write(dir.path().join("other.txt"), b"x").unwrap();
+        assert_eq!(count_clipboard_images(dir.path()), 2);
+        sweep_clipboard_images(dir.path());
+        assert!(first.exists(), "fresh files survive the sweep");
+        assert!(dir.path().join("other.txt").exists());
+    }
+
+    #[test]
+    fn image_paste_target_accepts_only_the_three_agent_kinds() {
+        let hub = borrow_hub(vec![
+            s("amber-1-1-0-claude", "claude"),
+            s("amber-1-1-1-pi", "pi"),
+            s("amber-1-1-2-muse", "muse"),
+            s("amber-1-1-3-shell", "shell"),
+            s("amber-1-1-4-grok", "grok"),
+        ]);
+        assert!(hub.image_paste_target("amber-1-1-0-claude"));
+        assert!(hub.image_paste_target("amber-1-1-1-pi"));
+        assert!(hub.image_paste_target("amber-1-1-2-muse"));
+        assert!(!hub.image_paste_target("amber-1-1-3-shell"));
+        assert!(!hub.image_paste_target("amber-1-1-4-grok"));
+        assert!(!hub.image_paste_target("amber-1-1-9-ghost"));
+        assert!(!hub.image_paste_target(""));
+    }
+
+    /// Drive `handle_conn` over loopback with a raw clipboard-image POST.
+    /// Returns the full response bytes. The client half runs on a thread so a
+    /// head-only 413 (server replies before any body exists) cannot deadlock.
+    fn clipboard_post(
+        hub: &Arc<Hub>,
+        auth: &Arc<Auth>,
+        head: &[u8],
+        body_chunks: &[&[u8]],
+    ) -> Vec<u8> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let head = head.to_vec();
+        let chunks: Vec<Vec<u8>> = body_chunks.iter().map(|c| c.to_vec()).collect();
+        let client = thread::spawn(move || {
+            let mut s = TcpStream::connect(addr).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            s.write_all(&head).unwrap();
+            s.flush().unwrap();
+            for c in &chunks {
+                // A breath between head and body exercises the server's
+                // prefix-plus-read loop instead of one coalesced packet.
+                thread::sleep(Duration::from_millis(20));
+                s.write_all(c).unwrap();
+                s.flush().unwrap();
+            }
+            let mut out = Vec::new();
+            s.read_to_end(&mut out).unwrap();
+            out
+        });
+        let (server, _) = listener.accept().unwrap();
+        handle_conn(server, hub, auth, 0).unwrap();
+        client.join().unwrap()
+    }
+
+    fn authed(auth: &Arc<Auth>) -> String {
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let token = auth.token.clone();
+        let id = auth.authenticate(ip, token.as_bytes()).unwrap();
+        format!("{COOKIE_NAME}={id}")
+    }
+
+    /// Minimal PNG: real 8-byte magic plus filler (the server validates magic,
+    /// not decodability — the agents decode on attach).
+    fn png_bytes(n: usize) -> Vec<u8> {
+        let mut v = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        v.resize(n.max(8), 0xAB);
+        v
+    }
+
+    #[test]
+    fn clipboard_image_round_trip_writes_a_private_host_file() {
+        let hub = borrow_hub(vec![s("amber-1-1-0-aa", "claude")]);
+        let auth = Arc::new(Auth::new("test-token".into()));
+        let cookie = authed(&auth);
+        let body = png_bytes(300);
+        let head = format!(
+            "POST /api/clipboard-image?name=amber-1-1-0-aa HTTP/1.1\r\nHost: x\r\nCookie: {cookie}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        // Split body across two writes to cover the read loop, not just the
+        // already-arrived prefix.
+        let (a, b) = body.split_at(100);
+        let res = clipboard_post(&hub, &auth, head.as_bytes(), &[a, b]);
+        let text = String::from_utf8_lossy(&res);
+        assert!(text.starts_with("HTTP/1.1 200 OK"), "{text}");
+        let json: serde_json::Value =
+            serde_json::from_str(text.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(json["ok"], true);
+        let path = json["path"].as_str().unwrap().to_string();
+        assert!(path.ends_with(".png"), "{path}");
+        assert!(!path.contains(' '), "{path}");
+        assert_eq!(std::fs::read(&path).unwrap(), body);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        }
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn clipboard_image_rejects_before_reading_the_body() {
+        let hub = borrow_hub(vec![
+            s("amber-1-1-0-aa", "pi"),
+            s("amber-1-1-1-bb", "shell"),
+        ]);
+        let auth = Arc::new(Auth::new("test-token".into()));
+        let cookie = authed(&auth);
+        let body = png_bytes(64);
+
+        // No cookie: 401 without the body ever being sent.
+        let head = format!(
+            "POST /api/clipboard-image?name=amber-1-1-0-aa HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let res = clipboard_post(&hub, &auth, head.as_bytes(), &[]);
+        assert!(String::from_utf8_lossy(&res).starts_with("HTTP/1.1 401"), "{}",
+            String::from_utf8_lossy(&res));
+
+        // Unknown session and wrong-kind session: 404, body unsent.
+        for name in ["amber-9-9-9-ghost", "amber-1-1-1-bb", ""] {
+            let head = format!(
+                "POST /api/clipboard-image?name={name} HTTP/1.1\r\nHost: x\r\nCookie: {cookie}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let res = clipboard_post(&hub, &auth, head.as_bytes(), &[]);
+            assert!(String::from_utf8_lossy(&res).starts_with("HTTP/1.1 404"), "name={name}: {}",
+                String::from_utf8_lossy(&res));
+        }
+
+        // Oversize declared length: 413 from the head alone (no 16 MiB sent).
+        let head = format!(
+            "POST /api/clipboard-image?name=amber-1-1-0-aa HTTP/1.1\r\nHost: x\r\nCookie: {cookie}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            MAX_CLIPBOARD_IMAGE_BYTES + 1
+        );
+        let res = clipboard_post(&hub, &auth, head.as_bytes(), &[]);
+        assert!(String::from_utf8_lossy(&res).starts_with("HTTP/1.1 413"), "{}",
+            String::from_utf8_lossy(&res));
+
+        // Non-image bytes with an honest length: 400 after the body arrives.
+        let text = b"just some pasted text, not an image";
+        let head = format!(
+            "POST /api/clipboard-image?name=amber-1-1-0-aa HTTP/1.1\r\nHost: x\r\nCookie: {cookie}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            text.len()
+        );
+        let res = clipboard_post(&hub, &auth, head.as_bytes(), &[text]);
+        let res_text = String::from_utf8_lossy(&res);
+        assert!(res_text.starts_with("HTTP/1.1 400"), "{res_text}");
+        assert!(res_text.contains("PNG"), "{res_text}");
     }
 
     #[test]

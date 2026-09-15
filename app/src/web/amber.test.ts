@@ -271,6 +271,7 @@ describe('PaneLink', () => {
       newChannel: () => ({ port1: new FakePort(), port2: {} }),
       postPanePort: (session, port2) => posted.push({ session, port2 }),
       clipboard: { writeText: () => Promise.resolve(), readText: () => Promise.resolve('') },
+      pasteImage: () => Promise.resolve('/tmp/x.png'),
       home: '/home/x',
       machineName: 'teapot-dev',
       softwareGl: false,
@@ -438,6 +439,7 @@ describe('createAmber', () => {
       newChannel: () => ({ port1: new FakePort(), port2: {} }),
       postPanePort: () => {},
       clipboard: { writeText: () => Promise.resolve(), readText: () => Promise.resolve('clip') },
+      pasteImage: () => Promise.resolve('/tmp/x.png'),
       home: '/home/x',
       machineName: 'teapot-dev',
       softwareGl: false,
@@ -557,6 +559,14 @@ describe('createAmber', () => {
     await Promise.resolve()
     expect(writes).toEqual(['hello'])
     await expect(amber.clipboardRead()).resolves.toBe('hi')
+  })
+
+  it('pasteImage delegates to the injected upload with session and file', async () => {
+    const upload = vi.fn(async () => '/tmp/amber-clip-remote.png')
+    const amber = createAmber(deps({ pasteImage: upload }))
+    const file = new File([new Uint8Array(10)], 'paste.png', { type: 'image/png' })
+    await expect(amber.pasteImage!('amber-1-1-0-aa', file)).resolves.toBe('/tmp/amber-clip-remote.png')
+    expect(upload).toHaveBeenCalledWith('amber-1-1-0-aa', file)
   })
 
   it('loadLayout/saveLayout are a thin passthrough to the injected HTTP hooks', async () => {

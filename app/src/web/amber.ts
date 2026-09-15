@@ -566,6 +566,11 @@ export interface AmberDeps {
   newChannel: () => { port1: PortLike; port2: unknown }
   postPanePort: (session: string, port2: unknown, mode?: 'terminal' | 'pi') => void
   clipboard: { writeText: (text: string) => Promise<void>; readText: () => Promise<string> }
+  /** Remote image paste: upload one image, resolve its host temp path. The
+   * real implementation (install.ts) POSTs `/api/clipboard-image` behind the
+   * same cookie boundary as `/api/sessions`. Injected so this file stays
+   * fetch-free and testable with fakes. */
+  pasteImage: (session: string, file: File) => Promise<string>
   home: string
   machineName: string
   softwareGl: boolean
@@ -701,6 +706,8 @@ export function createAmber(deps: AmberDeps): WebAmber {
       void deps.clipboard.writeText(text)
     },
     clipboardRead: (): Promise<string> => deps.clipboard.readText(),
+    // --- remote image paste: the injected upload, nothing else --------------
+    pasteImage: (session, file): Promise<string> => deps.pasteImage(session, file),
 
     // --- layout CAS (spec §6): thin passthrough to the injected HTTP hooks.
     // `main.tsx`'s persist effect is what actually implements the CAS retry/

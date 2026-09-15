@@ -108,6 +108,36 @@ exception is core rule 9); themes/settings beyond minimal.
 
 ## Build status
 
+- [x] Remote clipboard image paste (2026-09-14) — screenshots copied on another
+  machine now reach claude/pi/muse panes over amber web. Root cause: Ctrl-V
+  sends `^V` to the pty and the agent reads the HOST clipboard via xclip/
+  wl-paste, which holds no image on a remote browser (xterm's own paste reads
+  `text/plain` only; Muse on Linux never attempts a clipboard image read at
+  all — macOS only). Fix is a file-path bridge with zero daemon change: the
+  renderer intercepts Ctrl-V (via `navigator.clipboard.read()`) and paste
+  events carrying image files for RUNNING claude/pi/muse panes, POSTs the
+  bytes to `amber web` `POST /api/clipboard-image?name=<session>`, which
+  validates auth/origin/kind/`Content-Length` from the head BEFORE reading
+  the body, checks PNG/JPEG/GIF/WebP magic (never the client MIME), writes a
+  0600 `amber-clip-<random>.<ext>` host temp file (24 h sweep + 128-file cap),
+  and the renderer pastes the returned absolute path as bracketed text — all
+  three agents attach images from pasted paths (Claude's pasted-path handler,
+  Pi's own paste which inserts a bare path "attached by path", Muse's "image
+  data or paths" composer). Text clipboards paste as text; denied/failed
+  reads fall back to a native `^V`; desktop is untouched (`pasteImage` absent
+  there, so native `^V` still rules) and suspended/fallback panes keep `^V`
+  (no TUI to attach). Gates: Rust 944 passed + clippy clean for touched code
+  (one pre-existing `browser_ops` warning in the dirty checkout), app 1285
+  passed / 1 skipped, web + desktop builds green; typecheck blocked by the
+  pre-existing dirty browser-host errors (none in touched files). Live-verified
+  on an isolated private daemon + web with a real Pi session: curl upload →
+  200 + byte-identical 0600 PNG, 404 for shell/unknown sessions, 400 for
+  non-image bytes, 401 without a cookie; headless-Chrome CDP drove the REAL
+  built `/app` bundle's `window.amber.pasteImage` → host path + byte-identical
+  file, shell rejected with the server's error. Agent-side attach (the TUI
+  turning the pasted path into pixels) verified by code inspection only —
+  a real-browser Ctrl-V into a live agent TUI remains a manual check.
+
 - [x] Pi pane recovery after daemon restart (2026-09-10) — a daemon restart left
   **11 panes as plain shells**. Root cause: those were `kind=shell` panes where
   the user had started `pi` by hand, so Pi was only a child of that shell; amber
