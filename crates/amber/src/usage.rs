@@ -15,6 +15,10 @@
 //! logged, persisted, or placed in any frame. Amber never refreshes it: minting
 //! or rotating a credential as a side effect of a read-only status poll is the
 //! mistake `load_token()` exists to avoid.
+//!
+//! Claude polls at most every 5 min with a 10-min backoff after a 429: the
+//! endpoint is undocumented and rate-limits, so amber stays a polite client
+//! and names the real HTTP failure instead of parsing error bodies as usage.
 
 use amber_core::proto::{Gauge, ProviderUsage};
 use std::path::{Path, PathBuf};
@@ -38,6 +42,37 @@ pub type Runner = dyn Fn(&[&str]) -> std::io::Result<RunOutput> + Send + Sync;
 
 const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const CURL_TIMEOUT_SECS: &str = "5";
+/// Marker curl appends via `-w` so the HTTP status survives the stdout-only
+/// runner seam. Always its own final line; a body without one (unit fixtures)
+/// is treated as 200.
+const HTTP_MARKER: &str = "__amber_http:";
+const RATE_LIMIT_DETAIL: &str = "usage rate-limited — backing off for 10 min";
+
+/// Split the `-w` status marker off curl's stdout. `None` means the producer
+/// predates the marker (unit fixtures) and is treated as 200.
+fn split_status(stdout: &str) -> (&str, Option<u16>) {
+    match stdout.rsplit_once('\n') {
+        Some((body, last)) if last.starts_with(HTTP_MARKER) => {
+            (body, last[HTTP_MARKER.len()..].parse::<u16>().ok())
+        }
+        _ => (stdout, None),
+    }
+}
+
+/// The server's own one-line apology, when it offers one. Strings only, first
+/// hit wins; the token is redacted defensively even though Anthropic never
+/// echoes it.
+fn server_message(body: &str, token: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let msg = v.pointer("/error/message").or_else(|| v.get("message"))?.as_str()?;
+    let flat: String = msg.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+    let mut short: String = flat.chars().take(140).collect();
+    if !token.is_empty() {
+        short = short.replace(token, "[REDACTED]");
+    }
+    let short = short.trim().to_string();
+    (!short.is_empty()).then_some(short)
+}
 
 /// `$CLAUDE_CONFIG_DIR` when it is an existing directory, else `~/.claude`.
 pub fn claude_config_dir() -> Option<PathBuf> {
@@ -189,20 +224,27 @@ fn errored(provider: &str, detail: String, now: i64) -> ProviderUsage {
 
 /// Collect claude's quota. `dir` defaults to [`claude_config_dir`].
 pub fn claude_usage_with(dir: Option<&Path>, now: i64, run: &Runner) -> ProviderUsage {
+    fetch_claude(dir, now, run).0
+}
+
+/// The raw claude fetch, plus whether the endpoint rate-limited us. The bool
+/// drives the backoff gate; matching on detail strings would be fragile.
+fn fetch_claude(dir: Option<&Path>, now: i64, run: &Runner) -> (ProviderUsage, bool) {
+    let not_limited = |u: ProviderUsage| (u, false);
     let Some(dir) = dir.map(Path::to_path_buf).or_else(claude_config_dir) else {
-        return unavailable("claude", "no home directory", now);
+        return not_limited(unavailable("claude", "no home directory", now));
     };
     let Ok(raw) = std::fs::read_to_string(dir.join(".credentials.json")) else {
-        return unavailable("claude", "claude not logged in", now);
+        return not_limited(unavailable("claude", "claude not logged in", now));
     };
     let Ok(creds) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        return unavailable("claude", "claude credentials unreadable", now);
+        return not_limited(unavailable("claude", "claude credentials unreadable", now));
     };
     let Some(oauth) = creds.get("claudeAiOauth") else {
-        return unavailable("claude", "claude not logged in", now);
+        return not_limited(unavailable("claude", "claude not logged in", now));
     };
     let Some(token) = oauth.get("accessToken").and_then(|t| t.as_str()) else {
-        return unavailable("claude", "claude not logged in", now);
+        return not_limited(unavailable("claude", "claude not logged in", now));
     };
     // expiresAt is milliseconds. Amber never refreshes the credential itself:
     // minting or rotating one as a side effect of a read-only status poll is
@@ -211,7 +253,7 @@ pub fn claude_usage_with(dir: Option<&Path>, now: i64, run: &Runner) -> Provider
         if exp_ms / 1000 <= now {
             let mut u = unavailable("claude", "claude token expired — run claude to refresh", now);
             u.state = "needs-auth".into();
-            return u;
+            return not_limited(u);
         }
     }
     let auth = format!("Authorization: Bearer {token}");
@@ -219,6 +261,8 @@ pub fn claude_usage_with(dir: Option<&Path>, now: i64, run: &Runner) -> Provider
         "-sS",
         "--max-time",
         CURL_TIMEOUT_SECS,
+        "-w",
+        "\n__amber_http:%{http_code}",
         "-H",
         &auth,
         "-H",
@@ -230,20 +274,48 @@ pub fn claude_usage_with(dir: Option<&Path>, now: i64, run: &Runner) -> Provider
         // Never surface curl's stderr verbatim: it can echo the request line,
         // and the request line carries the bearer token.
         Ok(out) => {
-            return errored("claude", format!("usage request failed ({})", out.status), now);
+            return not_limited(errored(
+                "claude",
+                format!("usage request failed ({})", out.status),
+                now,
+            ));
         }
-        Err(e) => return errored("claude", format!("could not run curl: {e}"), now),
+        Err(e) => {
+            return not_limited(errored("claude", format!("could not run curl: {e}"), now));
+        }
     };
-    match parse_claude_usage(&out.stdout, now) {
-        Ok((gauges, plan)) => ProviderUsage {
-            provider: "claude".into(),
-            plan,
-            gauges,
-            updated: now.max(0) as u64,
-            state: "ok".into(),
-            detail: None,
+    // curl exits 0 on HTTP errors (there is deliberately no `-f`: the status
+    // itself is the diagnosis), so dispatch on the captured status BEFORE the
+    // usage parser ever sees the body — an error JSON carries no windows and
+    // used to surface as the misleading "no readable windows".
+    let (body, status) = split_status(&out.stdout);
+    match status.unwrap_or(200) {
+        200 => match parse_claude_usage(body, now) {
+            Ok((gauges, plan)) => not_limited(ProviderUsage {
+                provider: "claude".into(),
+                plan,
+                gauges,
+                updated: now.max(0) as u64,
+                state: "ok".into(),
+                detail: None,
+            }),
+            Err(e) => not_limited(errored("claude", e, now)),
         },
-        Err(e) => errored("claude", e, now),
+        429 => (errored("claude", RATE_LIMIT_DETAIL.into(), now), true),
+        401 | 403 => {
+            let mut u =
+                unavailable("claude", "claude token rejected — run claude to refresh", now);
+            u.state = "needs-auth".into();
+            not_limited(u)
+        }
+        s => {
+            let mut detail = format!("usage request failed (HTTP {s})");
+            if let Some(msg) = server_message(body, token) {
+                detail.push_str(": ");
+                detail.push_str(&msg);
+            }
+            not_limited(errored("claude", detail, now))
+        }
     }
 }
 
@@ -371,9 +443,20 @@ pub fn codex_usage(now: i64) -> ProviderUsage {
 }
 
 /// How often the daemon refreshes. A 5h window moves ~0.33%/min at full burn,
-/// so 60 s is already finer than the number's own resolution — and it is one
-/// HTTPS request per minute against the user's own account.
+/// so 60 s is already finer than the number's own resolution. Claude fetches
+/// at most once per [`CLAUDE_POLL_SECS`] inside this tick; the tick itself
+/// stays 60 s for the live codex reader and the other rows.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Steady claude cadence, in seconds. A 5-min-old number is at most ~1.6%
+/// stale at full burn — immaterial — while 12 requests/hour is far gentler
+/// on Anthropic's undocumented endpoint than 60.
+pub const CLAUDE_POLL_SECS: i64 = 300;
+
+/// After a 429, no claude fetch for this long — not even a manual refresh.
+/// The endpoint is telling us to stop; a held refresh button must not turn
+/// a nudge into a hammer.
+pub const CLAUDE_BACKOFF_SECS: i64 = 600;
 
 /// Grok exposes no quota anywhere: no `x-ratelimit` header string and no usage
 /// endpoint in its binary, no token or limit data in `~/.grok/logs`, and its
@@ -394,10 +477,47 @@ pub fn muse_usage(now: i64) -> ProviderUsage {
     unavailable("muse", "muse exposes no quota data", now)
 }
 
+/// The gated claude fetch: at most one fetch per [`CLAUDE_POLL_SECS`], a
+/// [`CLAUDE_BACKOFF_SECS`] silence after a 429, and reuse of the last stored
+/// row otherwise. `dir` is the test seam (prod passes `None`, the real config
+/// dir); the locks are only ever held for an integer read/write, never across
+/// the fetch itself.
+fn claude_poll(cache: &UsageCache, dir: Option<&Path>, now: i64, run: &Runner) -> ProviderUsage {
+    let backed_off = cache.claude_backoff.lock().map(|g| now < *g).unwrap_or(false);
+    let forced = cache
+        .claude_force
+        .lock()
+        .map(|mut f| std::mem::replace(&mut *f, false))
+        .unwrap_or(false);
+    let due = cache.claude_next.lock().map(|g| now >= *g).unwrap_or(true);
+    if backed_off || (!due && !forced) {
+        return cache.claude_reuse(now);
+    }
+    let (row, limited) = fetch_claude(dir, now, run);
+    if let Ok(mut next) = cache.claude_next.lock() {
+        *next = now.saturating_add(CLAUDE_POLL_SECS);
+    }
+    if limited {
+        if let Ok(mut until) = cache.claude_backoff.lock() {
+            *until = now.saturating_add(CLAUDE_BACKOFF_SECS);
+        }
+    }
+    row
+}
+
 /// One snapshot per provider, always in this order, always all four rows.
-pub fn collect_all(now: i64, run: &Runner, codex_path: Option<&Path>) -> Vec<ProviderUsage> {
+///
+/// `cache` is both the scheduling input (the claude gate reads it) and the
+/// store the caller writes the result into — the cache owns fetch scheduling
+/// for the rows it protects.
+pub fn collect_all(
+    now: i64,
+    run: &Runner,
+    codex_path: Option<&Path>,
+    cache: &UsageCache,
+) -> Vec<ProviderUsage> {
     let began = std::time::Instant::now();
-    let claude = claude_usage_with(None, now, run);
+    let claude = claude_poll(cache, None, now, run);
     let quota_now = now.saturating_add(began.elapsed().as_secs() as i64);
     vec![
         claude,
@@ -427,6 +547,13 @@ pub struct UsageCache {
     inner: Mutex<Vec<ProviderUsage>>,
     refresh: Mutex<bool>,
     wake: Condvar,
+    /// Next unix second a steady claude fetch is due.
+    claude_next: Mutex<i64>,
+    /// No claude fetch before this instant, even forced: set on HTTP 429.
+    claude_backoff: Mutex<i64>,
+    /// A manual RefreshUsage asked for a fresh sample; consumed by the next
+    /// poll. Bypasses the steady gate, never the 429 backoff.
+    claude_force: Mutex<bool>,
 }
 
 impl UsageCache {
@@ -466,9 +593,20 @@ impl UsageCache {
         }
     }
 
+    /// The last stored claude row, sample time intact: a reused number must
+    /// never be re-stamped with a poll time that did not sample it.
+    fn claude_reuse(&self, now: i64) -> ProviderUsage {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|guard| guard.iter().find(|r| r.provider == "claude").cloned())
+            .unwrap_or_else(|| unavailable("claude", "waiting for next poll", now))
+    }
+
     /// Coalesced wake only: socket handlers never spawn a process or wait on IO.
     pub fn request_refresh(&self) {
         *self.refresh.lock().unwrap() = true;
+        *self.claude_force.lock().unwrap() = true;
         self.wake.notify_one();
     }
 
@@ -494,7 +632,7 @@ pub fn start(cache: Arc<UsageCache>, codex_path: Option<PathBuf>) {
         let codex_path = codex_path.filter(|path| path.is_file()).or_else(crate::codex::resolve_codex);
         loop {
             let began = std::time::Instant::now();
-            cache.store(collect_all(now_secs(), run.as_ref(), codex_path.as_deref()));
+            cache.store(collect_all(now_secs(), run.as_ref(), codex_path.as_deref(), &cache));
             cache.wait_for_refresh();
             // A held refresh button or many clients must not spawn unbounded
             // status requests. One poller, at most one fetch per ten seconds.
@@ -513,6 +651,36 @@ mod tests {
             Ok(RunOutput { ok: true, status: String::new(), stdout: body.to_string() })
         }
     }
+
+    /// A `Runner` that answers like the real curl invocation: body plus the
+    /// `-w` status marker on its own final line.
+    fn http_runner(
+        status: u16,
+        body: &'static str,
+    ) -> impl Fn(&[&str]) -> std::io::Result<RunOutput> {
+        move |_args: &[&str]| {
+            Ok(RunOutput {
+                ok: true,
+                status: String::new(),
+                stdout: format!("{body}\n__amber_http:{status}"),
+            })
+        }
+    }
+
+    /// A fake `$CLAUDE_CONFIG_DIR` holding one unexpired credential.
+    fn creds_dir(token: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".credentials.json"),
+            format!(r#"{{"claudeAiOauth":{{"accessToken":"{token}","expiresAt":99999999999999}}}}"#),
+        )
+        .unwrap();
+        dir
+    }
+
+    /// The Anthropic error shape: valid JSON, zero windows.
+    const RATE_LIMIT_BODY: &str =
+        r#"{"type":"error","error":{"type":"rate_limit_error","message":"Rate limited"}}"#;
 
     const LIVE_BODY: &str = r#"{
       "five_hour": {"utilization": 15.0, "resets_at": "2026-09-02T06:00:00.362063+00:00"},
@@ -570,6 +738,123 @@ mod tests {
     #[test]
     fn malformed_body_is_an_error_not_a_panic() {
         assert!(parse_claude_usage("<html>502</html>", 0).is_err());
+    }
+
+    #[test]
+    fn an_error_json_without_windows_reports_no_readable_windows() {
+        // Pins the PARSER's contract, not the product path: after the fix,
+        // status handling intercepts error bodies before they reach this.
+        // This test passing on the old code is what confirmed the masking.
+        assert_eq!(
+            parse_claude_usage(RATE_LIMIT_BODY, 0).unwrap_err(),
+            "usage response carried no readable windows"
+        );
+    }
+
+    #[test]
+    fn http_429_names_the_rate_limit() {
+        let dir = creds_dir("SECRET-TOKEN");
+        let u = claude_usage_with(Some(dir.path()), 1_000, &http_runner(429, RATE_LIMIT_BODY));
+        assert_eq!(u.state, "error");
+        let d = u.detail.unwrap();
+        assert!(d.contains("rate"), "must name the rate limit, got: {d}");
+        assert!(!d.contains("no readable windows"), "must not mask a 429, got: {d}");
+    }
+
+    #[test]
+    fn http_401_is_needs_auth() {
+        let dir = creds_dir("SECRET-TOKEN");
+        let body = r#"{"error":{"type":"authentication_error","message":"invalid token"}}"#;
+        let u = claude_usage_with(Some(dir.path()), 1_000, &http_runner(401, body));
+        assert_eq!(u.state, "needs-auth");
+    }
+
+    #[test]
+    fn http_500_names_the_status_and_the_server_message() {
+        let dir = creds_dir("SECRET-TOKEN");
+        let body = r#"{"error":{"message":"overloaded_error: try again"}}"#;
+        let u = claude_usage_with(Some(dir.path()), 1_000, &http_runner(500, body));
+        assert_eq!(u.state, "error");
+        let d = u.detail.unwrap();
+        assert!(d.contains("HTTP 500"), "got: {d}");
+        assert!(d.contains("overloaded_error"), "got: {d}");
+    }
+
+    #[test]
+    fn a_surfaced_server_message_never_leaks_the_token() {
+        let dir = creds_dir("SECRET-TOKEN");
+        let body = r#"{"error":{"message":"bad key SECRET-TOKEN rejected"}}"#;
+        let u = claude_usage_with(Some(dir.path()), 1_000, &http_runner(500, body));
+        let rendered = format!("{u:?}") + &serde_json::to_string(&u).unwrap();
+        assert!(!rendered.contains("SECRET-TOKEN"), "token leaked: {rendered}");
+    }
+
+    #[test]
+    fn claude_fetches_at_most_once_per_window_and_reuses_the_row() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        CALLS.store(0, Ordering::SeqCst);
+        let run = |_a: &[&str]| {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok(RunOutput { ok: true, status: String::new(), stdout: LIVE_BODY.to_string() })
+        };
+        let dir = creds_dir("SECRET-TOKEN");
+        let cache = UsageCache::new();
+        let first = claude_poll(&cache, Some(dir.path()), 10_000, &run);
+        assert_eq!(first.state, "ok");
+        cache.store(vec![first.clone()]);
+        let reused = claude_poll(&cache, Some(dir.path()), 10_100, &run);
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1, "second poll inside the window must not fetch");
+        assert_eq!(reused.updated, first.updated, "reuse keeps the honest sample time");
+        assert_eq!(reused.state, "ok");
+        let _ = claude_poll(&cache, Some(dir.path()), 10_000 + CLAUDE_POLL_SECS, &run);
+        assert_eq!(CALLS.load(Ordering::SeqCst), 2, "an elapsed window fetches again");
+    }
+
+    #[test]
+    fn rate_limit_backs_off_and_refresh_cannot_punch_through() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        CALLS.store(0, Ordering::SeqCst);
+        let run = |_a: &[&str]| {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok(RunOutput {
+                ok: true,
+                status: String::new(),
+                stdout: format!("{RATE_LIMIT_BODY}\n__amber_http:429"),
+            })
+        };
+        let dir = creds_dir("SECRET-TOKEN");
+        let cache = UsageCache::new();
+        let first = claude_poll(&cache, Some(dir.path()), 20_000, &run);
+        assert_eq!(first.state, "error");
+        cache.store(vec![first]);
+        let _ = claude_poll(&cache, Some(dir.path()), 20_060, &run);
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1, "backoff must skip the fetch");
+        cache.request_refresh();
+        let _ = claude_poll(&cache, Some(dir.path()), 20_061, &run);
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1, "a manual refresh must not punch through a 429 backoff");
+        let _ = claude_poll(&cache, Some(dir.path()), 20_000 + CLAUDE_BACKOFF_SECS, &run);
+        assert_eq!(CALLS.load(Ordering::SeqCst), 2, "an elapsed backoff fetches again");
+    }
+
+    #[test]
+    fn manual_refresh_forces_a_fetch_inside_the_window() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        CALLS.store(0, Ordering::SeqCst);
+        let run = |_a: &[&str]| {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok(RunOutput { ok: true, status: String::new(), stdout: LIVE_BODY.to_string() })
+        };
+        let dir = creds_dir("SECRET-TOKEN");
+        let cache = UsageCache::new();
+        let first = claude_poll(&cache, Some(dir.path()), 30_000, &run);
+        cache.store(vec![first]);
+        cache.request_refresh();
+        let second = claude_poll(&cache, Some(dir.path()), 30_060, &run);
+        assert_eq!(CALLS.load(Ordering::SeqCst), 2, "a manual refresh bypasses the steady gate");
+        assert_eq!(second.updated, 30_060);
     }
 
     #[test]
@@ -782,7 +1067,7 @@ mod tests {
 
     #[test]
     fn collect_all_returns_one_row_per_provider_in_order() {
-        let rows = collect_all(0, &ok_runner("{}"), None);
+        let rows = collect_all(0, &ok_runner("{}"), None, &UsageCache::new());
         let names: Vec<&str> = rows.iter().map(|r| r.provider.as_str()).collect();
         assert_eq!(names, vec!["claude", "codex", "grok", "muse"]);
     }
@@ -800,7 +1085,7 @@ mod tests {
     fn one_providers_failure_never_blanks_the_others() {
         // A runner that always fails stands in for a dead network.
         let boom = |_a: &[&str]| Err(std::io::Error::other("no network"));
-        let rows = collect_all(0, &boom, None);
+        let rows = collect_all(0, &boom, None, &UsageCache::new());
         assert_eq!(rows.len(), 4);
         assert_eq!(rows[0].provider, "claude");
         assert!(rows[0].state == "error" || rows[0].state == "unavailable");
