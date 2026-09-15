@@ -580,6 +580,11 @@ export interface AmberDeps {
   // fetch-free; `install.ts` supplies the real wrappers.
   routerApi: RouterApi
   // Cookie-gated `GET /api/usage`. Returns the raw body; the shim decodes it
+  /** Remote image paste: upload one image, resolve its host temp path. The
+   * real implementation (install.ts) POSTs `/api/clipboard-image` behind the
+   * same cookie boundary as `/api/sessions`. Injected so this file stays
+   * fetch-free and testable with fakes. */
+  pasteImage: (session: string, file: File) => Promise<string>
   // with the same tolerant decoder the control wire uses.
   usageApi: (refresh?: boolean) => Promise<unknown>
 }
@@ -760,6 +765,8 @@ export function createAmber(deps: AmberDeps): WebAmber {
     // business reading the host's token. These report their own absence
     // rather than throwing, because `main.tsx` calls `webStatus` on mount and
     // an uncaught throw there would take the whole toolbar down.
+    // --- remote image paste: the injected upload, nothing else --------------
+    pasteImage: (session, file): Promise<string> => deps.pasteImage(session, file),
     webStatus: (): Promise<WebStatus> =>
       Promise.resolve({
         // A page served BY `amber web` cannot manage the service serving it.

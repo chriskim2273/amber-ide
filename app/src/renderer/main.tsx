@@ -128,6 +128,12 @@ declare global {
       revealPath: (abs: string) => void
       clipboardWrite: (text: string) => void
       clipboardRead: () => Promise<string>
+      // Web-only remote image paste. Uploads one image file to the host and
+      // resolves its absolute host temp path, which the caller pastes as text
+      // (claude/pi/muse TUIs attach images from pasted file paths). Rejects on
+      // auth/validation/network failure. Absent on desktop, where Ctrl-V
+      // reaches the agent natively and the agent reads the host clipboard.
+      pasteImage?: (session: string, file: File) => Promise<string>
       // Editor pane file IO (spec 2026-07-19 §4) — all disk access lives in main.
       editorOpenDialog: () => Promise<
         { path: string; text: string; mtimeMs: number } | { path: string; error: string } | null>

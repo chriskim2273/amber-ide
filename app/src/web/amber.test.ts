@@ -275,6 +275,7 @@ describe('PaneLink', () => {
       machineName: 'teapot-dev',
       softwareGl: false,
       layoutGet: () => Promise.resolve({ text: null, version: null }),
+      pasteImage: () => Promise.resolve('/tmp/x.png'),
       layoutSave: () => Promise.resolve({ ok: true, version: null }),
       usageApi: () => Promise.resolve({ providers: [] }),
       routerApi: {
@@ -450,6 +451,7 @@ describe('createAmber', () => {
   }
 
   function silentRouterApi(): RouterApi {
+      pasteImage: () => Promise.resolve('/tmp/x.png'),
     return {
       status: async () => JSON.stringify({ managed: true, unit: 'inactive', port: 7719, error: 'router unreachable' }),
       action: async () => ({ ok: false, error: 'router unreachable' }),
@@ -583,6 +585,14 @@ describe('createAmber', () => {
       () => amber.saveWorkspaceFile('{}', 'x.amberws'),
       () => amber.openWorkspaceFile(),
       () => amber.pickFolder(),
+  it('pasteImage delegates to the injected upload with session and file', async () => {
+    const upload = vi.fn(async () => '/tmp/amber-clip-remote.png')
+    const amber = createAmber(deps({ pasteImage: upload }))
+    const file = new File([new Uint8Array(10)], 'paste.png', { type: 'image/png' })
+    await expect(amber.pasteImage!('amber-1-1-0-aa', file)).resolves.toBe('/tmp/amber-clip-remote.png')
+    expect(upload).toHaveBeenCalledWith('amber-1-1-0-aa', file)
+  })
+
       () => amber.revealPath('/x'),
       () => amber.editorOpenDialog(),
       () => amber.editorRead('/x'),

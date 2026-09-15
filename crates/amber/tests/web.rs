@@ -978,3 +978,34 @@ fn router_key_reveal_requires_a_real_slot_name() {
     );
     assert!(!body.contains(&f.token), "{body}");
 }
+
+#[test]
+fn clipboard_image_route_is_authed_and_kind_gated_on_the_live_server() {
+    let f = fixture();
+    // No cookie at all: 401 from the head alone (no body is sent).
+    let (status, _, _) = f.request(&format!(
+        "POST /api/clipboard-image?name=amber-1-1-0-web HTTP/1.1\r\nHost: {}\r\nContent-Length: 64\r\nConnection: close\r\n\r\n",
+        f.addr
+    ));
+    assert!(status.contains("401"), "image upload leaked without a cookie: {status}");
+
+    let cookie = f.login();
+    // Unknown session: 404, body unsent.
+    let (status, _, body) = f.request(&format!(
+        "POST /api/clipboard-image?name=amber-9-9-9-ghost HTTP/1.1\r\nHost: {}\r\nCookie: {}\r\nContent-Length: 64\r\nConnection: close\r\n\r\n",
+        f.addr, cookie
+    ));
+    assert!(status.contains("404"), "{status} {body}");
+
+    // A real shell session exists but is not an image-paste kind: 404.
+    let shell = f.create_session();
+    assert!(wait_until(Duration::from_secs(5), || {
+        let (_, _, body) = f.get("/api/sessions", Some(&cookie));
+        body.contains(&shell)
+    }));
+    let (status, _, body) = f.request(&format!(
+        "POST /api/clipboard-image?name={shell} HTTP/1.1\r\nHost: {}\r\nCookie: {}\r\nContent-Length: 64\r\nConnection: close\r\n\r\n",
+        f.addr, cookie
+    ));
+    assert!(status.contains("404"), "shell session accepted an image upload: {status} {body}");
+}
