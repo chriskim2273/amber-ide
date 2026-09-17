@@ -164,11 +164,14 @@ struct Head {
 /// head terminator appears within `MAX_HEAD_LEN` (garbage or a hostile head).
 fn parse_head(buf: &[u8]) -> anyhow::Result<Option<Head>> {
     let Some(head_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
-        return Ok(None);
-    };
         if buf.len() > MAX_HEAD_LEN {
             anyhow::bail!("request head exceeds {MAX_HEAD_LEN} bytes");
         }
+        return Ok(None);
+    };
+    if head_end + 4 > MAX_HEAD_LEN {
+        anyhow::bail!("request head exceeds {MAX_HEAD_LEN} bytes");
+    }
     let head = std::str::from_utf8(&buf[..head_end])?;
     let mut lines = head.split("\r\n");
     let start = lines.next().unwrap_or_default();
@@ -277,9 +280,8 @@ pub const MAX_CLIPBOARD_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 /// Bodies ride past this only on the clipboard-image route, bounded by
 /// `MAX_CLIPBOARD_IMAGE_BYTES` via an early `Content-Length` check.
 const MAX_HEAD_LEN: usize = 16 * 1024;
-/// Session kinds whose TUIs attach an image from a pasted file path. Deliberately
-/// narrow: other agent kinds are untested here and stay on today's behavior.
-const CLIPBOARD_IMAGE_KINDS: [&str; 3] = ["claude", "pi", "muse"];
+// All live daemon terminals accept a pasted file path, regardless of agent
+// kind: agents attach images from pasted paths; shells receive the path text.
 /// Temp-file prefix for clipboard-image uploads (`amber-clip-<random>.<ext>`).
 const CLIPBOARD_IMAGE_PREFIX: &str = "amber-clip-";
 /// Best-effort age sweep on every upload (mirrors Pi's 24 h attachment expiry).
@@ -1310,10 +1312,8 @@ impl Hub {
         Self::payload(&inner.sessions, &inner.layout)
     }
 
-    fn payload(sessions: &[SessionInfo], layout: &str) -> String {
-        let list: Vec<_> = sessions.iter().map(session_json).collect();
-    /// Whether `name` is a listed session whose TUI attaches an image from a
-    /// pasted file path — the only valid target of a clipboard-image upload.
+    /// Whether `name` is a live daemon terminal that can receive a file path.
+    /// Shells and agent fallback states receive text, not an executed command.
     /// Reads the Hub's cached daemon session list (refreshed on the 1 s poll),
     /// so no daemon round trip happens on the paste path.
     fn image_paste_target(&self, name: &str) -> bool {
@@ -1324,9 +1324,11 @@ impl Hub {
         inner
             .sessions
             .iter()
-            .any(|s| s.name == name && CLIPBOARD_IMAGE_KINDS.contains(&s.kind.as_str()))
+            .any(|s| s.name == name && s.alive)
     }
 
+    fn payload(sessions: &[SessionInfo], layout: &str) -> String {
+        let list: Vec<_> = sessions.iter().map(session_json).collect();
         let layout: serde_json::Value =
             serde_json::from_str(layout).unwrap_or(serde_json::Value::Null);
         serde_json::to_string(&serde_json::json!({ "sessions": list, "layout": layout }))
@@ -2143,25 +2145,6 @@ fn router_err(stream: &mut TcpStream, err: router_ops::OpsError) -> std::io::Res
     respond(stream, status, CT_JSON, &[], body.as_bytes())
 }
 
-fn handle_conn(
-    mut stream: TcpStream,
-    hub: &Arc<Hub>,
-    auth: &Arc<Auth>,
-    port: u16,
-) -> anyhow::Result<()> {
-    let peer = stream.peer_addr()?.ip();
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-    let mut buf: Vec<u8> = Vec::new();
-    let mut chunk = [0u8; 4096];
-    let req = loop {
-        if let Some(req) = parse_request(&buf)? {
-            break req;
-        }
-        let n = stream.read(&mut chunk)?;
-        if n == 0 {
-            return Ok(());
-        }
-        buf.extend_from_slice(&chunk[..n]);
 /// `POST /api/clipboard-image?name=<session>` — remote clipboard image paste.
 ///
 /// The head was already read (auth, origin, session and `Content-Length` all
@@ -2251,19 +2234,17 @@ fn handle_clipboard_image(
     Ok(respond(&mut stream, "200 OK", CT_JSON, &[], out.as_bytes())?)
 }
 
-    };
-
-    let (path, query) = req.path.split_once('?').unwrap_or((req.path.as_str(), ""));
-    match (req.method.as_str(), path) {
-        ("POST", "/api/auth") => {
-            if auth.throttled(peer) {
-                return Ok(respond(&mut stream, "429 Too Many Requests", "", &[], b"")?);
-            }
-            match auth.authenticate(peer, &req.body) {
-                Some(id) => {
-    // The head first: the clipboard-image route authorizes and validates from
-    // head headers before reading its multi-MiB body (see above). Every other
-    // route falls through to the existing whole-request read unchanged.
+fn handle_conn(
+    mut stream: TcpStream,
+    hub: &Arc<Hub>,
+    auth: &Arc<Auth>,
+    port: u16,
+) -> anyhow::Result<()> {
+    let peer = stream.peer_addr()?.ip();
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+    // Authorize uploads from headers before accepting their larger bodies.
     let head = loop {
         if let Some(head) = parse_head(&buf)? {
             break head;
@@ -2276,9 +2257,28 @@ fn handle_clipboard_image(
     };
     let head_path = head.path.split_once('?').map(|(p, _)| p).unwrap_or(head.path.as_str());
     if head.method == "POST" && head_path == "/api/clipboard-image" {
-        let prefix: Vec<u8> = buf.get(head.body_start..).unwrap_or(&[]).to_vec();
-        return handle_clipboard_image(stream, head, &prefix, hub, auth, peer);
+        let prefix = buf.get(head.body_start..).unwrap_or(&[]);
+        return handle_clipboard_image(stream, head, prefix, hub, auth, peer);
     }
+    let req = loop {
+        if let Some(req) = parse_request(&buf)? {
+            break req;
+        }
+        let n = stream.read(&mut chunk)?;
+        if n == 0 {
+            return Ok(());
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    };
+
+    let (path, query) = req.path.split_once('?').unwrap_or((req.path.as_str(), ""));
+    match (req.method.as_str(), path) {
+        ("POST", "/api/auth") => {
+            if auth.throttled(peer) {
+                return Ok(respond(&mut stream, "429 Too Many Requests", "", &[], b"")?);
+            }
+            match auth.authenticate(peer, &req.body) {
+                Some(id) => {
                     // `Secure` only when the hop really was https — that is
                     // exactly when `tailscale serve` terminated TLS for us.
                     let secure = req.header("x-forwarded-proto") == Some("https");
@@ -2935,8 +2935,14 @@ mod tests {
     }
 
     #[test]
-    fn image_paste_target_accepts_only_the_three_agent_kinds() {
+    fn image_paste_target_accepts_all_live_terminal_kinds() {
+        let mut dead = s("dead", "shell");
+        dead.alive = false;
         let hub = borrow_hub(vec![
+            dead,
+            s("amber-1-1-5-codex", "codex"),
+            s("amber-1-1-6-opencode", "opencode"),
+            s("amber-1-1-7-hermes", "hermes"),
             s("amber-1-1-0-claude", "claude"),
             s("amber-1-1-1-pi", "pi"),
             s("amber-1-1-2-muse", "muse"),
@@ -2946,8 +2952,12 @@ mod tests {
         assert!(hub.image_paste_target("amber-1-1-0-claude"));
         assert!(hub.image_paste_target("amber-1-1-1-pi"));
         assert!(hub.image_paste_target("amber-1-1-2-muse"));
-        assert!(!hub.image_paste_target("amber-1-1-3-shell"));
-        assert!(!hub.image_paste_target("amber-1-1-4-grok"));
+        assert!(hub.image_paste_target("amber-1-1-3-shell"));
+        assert!(hub.image_paste_target("amber-1-1-4-grok"));
+        for name in ["amber-1-1-5-codex", "amber-1-1-6-opencode", "amber-1-1-7-hermes"] {
+            assert!(hub.image_paste_target(name));
+        }
+        assert!(!hub.image_paste_target("dead"));
         assert!(!hub.image_paste_target("amber-1-1-9-ghost"));
         assert!(!hub.image_paste_target(""));
     }
@@ -3003,7 +3013,7 @@ mod tests {
 
     #[test]
     fn clipboard_image_round_trip_writes_a_private_host_file() {
-        let hub = borrow_hub(vec![s("amber-1-1-0-aa", "claude")]);
+        let hub = borrow_hub(vec![s("amber-1-1-0-aa", "shell")]);
         let auth = Arc::new(Auth::new("test-token".into()));
         let cookie = authed(&auth);
         let body = png_bytes(300);
@@ -3022,6 +3032,8 @@ mod tests {
         assert_eq!(json["ok"], true);
         let path = json["path"].as_str().unwrap().to_string();
         assert!(path.ends_with(".png"), "{path}");
+        assert!(Path::new(&path).is_absolute(), "{path}");
+        assert!(Path::new(&path).starts_with(clipboard_image_dir()), "{path}");
         assert!(!path.contains(' '), "{path}");
         assert_eq!(std::fs::read(&path).unwrap(), body);
         #[cfg(unix)]
@@ -3051,8 +3063,8 @@ mod tests {
         assert!(String::from_utf8_lossy(&res).starts_with("HTTP/1.1 401"), "{}",
             String::from_utf8_lossy(&res));
 
-        // Unknown session and wrong-kind session: 404, body unsent.
-        for name in ["amber-9-9-9-ghost", "amber-1-1-1-bb", ""] {
+        // Unknown session: 404, body unsent. Shells now accept path paste.
+        for name in ["amber-9-9-9-ghost", ""] {
             let head = format!(
                 "POST /api/clipboard-image?name={name} HTTP/1.1\r\nHost: x\r\nCookie: {cookie}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()

@@ -91,6 +91,20 @@ impl Fixture {
         (status.trim_end().to_string(), headers, String::from_utf8_lossy(&body).into_owned())
     }
 
+    /// Raw request with binary body bytes (clipboard-image uploads).
+    fn request_binary(&self, head: &str, body: &[u8]) -> (String, String) {
+        let mut s = TcpStream::connect(self.addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        s.write_all(head.as_bytes()).unwrap();
+        s.write_all(body).unwrap();
+        let mut r = BufReader::new(s);
+        let mut status = String::new();
+        r.read_line(&mut status).unwrap();
+        let mut rest = String::new();
+        let _ = r.read_to_string(&mut rest);
+        (status.trim_end().to_string(), rest)
+    }
+
     fn get(&self, path: &str, cookie: Option<&str>) -> (String, Vec<String>, String) {
         self.get_ex(path, cookie, "")
     }
@@ -980,7 +994,7 @@ fn router_key_reveal_requires_a_real_slot_name() {
 }
 
 #[test]
-fn clipboard_image_route_is_authed_and_kind_gated_on_the_live_server() {
+fn clipboard_image_route_is_authed_and_session_gated_on_the_live_server() {
     let f = fixture();
     // No cookie at all: 401 from the head alone (no body is sent).
     let (status, _, _) = f.request(&format!(
@@ -997,15 +1011,19 @@ fn clipboard_image_route_is_authed_and_kind_gated_on_the_live_server() {
     ));
     assert!(status.contains("404"), "{status} {body}");
 
-    // A real shell session exists but is not an image-paste kind: 404.
+    // A real shell session IS an image-paste target now (any live terminal
+    // receives the pasted path): a PNG magic upload succeeds end to end.
     let shell = f.create_session();
     assert!(wait_until(Duration::from_secs(5), || {
         let (_, _, body) = f.get("/api/sessions", Some(&cookie));
         body.contains(&shell)
     }));
-    let (status, _, body) = f.request(&format!(
-        "POST /api/clipboard-image?name={shell} HTTP/1.1\r\nHost: {}\r\nCookie: {}\r\nContent-Length: 64\r\nConnection: close\r\n\r\n",
-        f.addr, cookie
-    ));
-    assert!(status.contains("404"), "shell session accepted an image upload: {status} {body}");
+    let png: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0xAB, 0xAB];
+    let head = format!(
+        "POST /api/clipboard-image?name={shell} HTTP/1.1\r\nHost: {}\r\nCookie: {}\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        f.addr, cookie, png.len()
+    );
+    let (status, body) = f.request_binary(&head, &png);
+    assert!(status.contains("200"), "shell session rejected an image upload: {status} {body}");
+    assert!(body.contains("\"ok\":true"), "{body}");
 }

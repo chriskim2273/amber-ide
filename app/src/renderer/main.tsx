@@ -130,7 +130,7 @@ declare global {
       clipboardRead: () => Promise<string>
       // Web-only remote image paste. Uploads one image file to the host and
       // resolves its absolute host temp path, which the caller pastes as text
-      // (claude/pi/muse TUIs attach images from pasted file paths). Rejects on
+      // (agent TUIs attach images from pasted paths; shells receive the path). Rejects on
       // auth/validation/network failure. Absent on desktop, where Ctrl-V
       // reaches the agent natively and the agent reads the host clipboard.
       pasteImage?: (session: string, file: File) => Promise<string>

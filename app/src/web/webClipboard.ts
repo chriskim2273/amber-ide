@@ -41,29 +41,43 @@ export function createGestureClipboard(
   hooks: ClipboardRetryHooks = {},
 ): GestureClipboard {
   let queued: string | null = null
+  let revision = 0
+  let retrying = false
 
   const writeText = async (text: string): Promise<void> => {
+    const current = ++revision
+    // A new copy supersedes pending text immediately, even while its write
+    // is in flight. Another pane's later gesture must not replay the old copy.
+    queued = null
     try {
       await write(text)
-      return
+      if (current === revision) hooks.onDone?.()
     } catch {
-      // Gesture-less write denied (NotAllowedError). Queue it; a gesture will
-      // retry. Future copies overwrite the previous pending text.
+      if (current !== revision) return
       queued = text
       hooks.onQueued?.(text)
     }
   }
 
-  const gesture = (): Promise<void> => {
-    if (queued === null) return Promise.resolve()
+  const gesture = async (): Promise<void> => {
+    if (queued === null || retrying) return
     const text = queued
-    queued = null
-    // Inside a gesture's transient activation the write is permitted. On
-    // failure the copy is simply dropped (the hint was already shown); a later
-    // `/copy` re-queues.
-    return write(text)
-      .catch(() => {})
-      .finally(() => hooks.onDone?.())
+    const current = revision
+    retrying = true
+    try {
+      // Invoke synchronously within the gesture, before the first await.
+      await write(text)
+      if (current === revision) {
+        queued = null
+        hooks.onDone?.()
+      }
+    } catch {
+      // Permission denial is not success. Keep the latest copy for another
+      // gesture; an older completion must never touch a newer pane's request.
+      if (current === revision) hooks.onQueued?.(text)
+    } finally {
+      retrying = false
+    }
   }
 
   return {

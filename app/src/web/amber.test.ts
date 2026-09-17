@@ -439,6 +439,7 @@ describe('createAmber', () => {
       newChannel: () => ({ port1: new FakePort(), port2: {} }),
       postPanePort: () => {},
       clipboard: { writeText: () => Promise.resolve(), readText: () => Promise.resolve('clip') },
+      pasteImage: () => Promise.resolve('/tmp/x.png'),
       home: '/home/x',
       machineName: 'teapot-dev',
       softwareGl: false,
@@ -451,7 +452,6 @@ describe('createAmber', () => {
   }
 
   function silentRouterApi(): RouterApi {
-      pasteImage: () => Promise.resolve('/tmp/x.png'),
     return {
       status: async () => JSON.stringify({ managed: true, unit: 'inactive', port: 7719, error: 'router unreachable' }),
       action: async () => ({ ok: false, error: 'router unreachable' }),
@@ -579,12 +579,6 @@ describe('createAmber', () => {
     await expect(amber.saveLayout('mine', 'v1')).resolves.toEqual({ conflict: true, text: 'on-disk', version: 'v2' })
   })
 
-  it('every §7/native-dialog stub rejects visibly instead of silently resolving', () => {
-    const amber = createAmber(deps())
-    const stubs: Array<() => unknown> = [
-      () => amber.saveWorkspaceFile('{}', 'x.amberws'),
-      () => amber.openWorkspaceFile(),
-      () => amber.pickFolder(),
   it('pasteImage delegates to the injected upload with session and file', async () => {
     const upload = vi.fn(async () => '/tmp/amber-clip-remote.png')
     const amber = createAmber(deps({ pasteImage: upload }))
@@ -593,6 +587,12 @@ describe('createAmber', () => {
     expect(upload).toHaveBeenCalledWith('amber-1-1-0-aa', file)
   })
 
+  it('every §7/native-dialog stub rejects visibly instead of silently resolving', () => {
+    const amber = createAmber(deps())
+    const stubs: Array<() => unknown> = [
+      () => amber.saveWorkspaceFile('{}', 'x.amberws'),
+      () => amber.openWorkspaceFile(),
+      () => amber.pickFolder(),
       () => amber.revealPath('/x'),
       () => amber.editorOpenDialog(),
       () => amber.editorRead('/x'),
