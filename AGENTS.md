@@ -116,7 +116,23 @@ exception is core rule 9); themes/settings beyond minimal.
   standalone cgroup tests pass (19), and an isolated delegated-systemd test
   passes on real cgroupfs. Cargo tests and workspace Clippy are blocked by
   pre-existing misplaced clipboard-image code in committed `web.rs`; the manager
-  retry regression was updated but has not run. Source fix not deployed.
+  retry regression was initially blocked. Merged as `fd82a65` into
+  `fix/pi-session-recovery`; the integrated checkout's existing web repairs
+  unblock validation: 580 Amber library tests passed / 2 ignored, including
+  the cleanup-retry regression, and library Clippy passed. Workspace all-target
+  Clippy still fails on the pre-existing duplicate test attribute in
+  `browser_ops.rs`. Staged for the next service restart: `cargo build --release`
+  from the integrated working tree succeeded and all 30 socket integration tests
+  passed. Atomically replaced `~/.local/bin/amber` with SHA256 `620ac85e9a4b…`;
+  backup `~/recovery/amber-ide/amber.before-cgroup-fd82a65` (`2e0edfe4ec87…`).
+  Verified systemd ExecStart uses that path; daemon PID 2523 and its old binary
+  hash remained unchanged. Installed-artifact smoke in a private delegated
+  systemd service passed: created a shell, added empty `workload/_daemon`,
+  killed it through the installed CLI, and verified both session and slot
+  cgroup disappeared. Production daemon was not restarted. AppImage unchanged: its older
+  bundled binary can overwrite this staged binary if the app's install path
+  runs while the daemon is down. Release includes existing uncommitted Rust
+  repairs/features from this integrated checkout, not only the cgroup commit.
   With user approval, removed only slot 24's empty `workload/_daemon` cgroup;
   the production daemon reaped the exited pane on its next tick, all other
   26 sessions remained listed, and daemon PID 2523 was unchanged.
