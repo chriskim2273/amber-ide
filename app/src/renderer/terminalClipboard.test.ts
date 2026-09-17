@@ -276,6 +276,76 @@ describe('remote image paste', () => {
     expect(sendRaw).toHaveBeenCalledWith('\x16')
   })
 
+  it('app/menu paste reads image data instead of silently reading only text', async () => {
+    const blob = new Blob([new Uint8Array(50)], { type: 'image/png' })
+    vi.stubGlobal('navigator', { clipboard: {
+      read: async () => [{ types: ['image/png'], getType: async () => blob }],
+      readText: async () => '',
+    } })
+    const pasteImage = vi.fn(async () => '/tmp/amber-clip-menu.png')
+    const { clipboard, sent } = await fixture({ isImagePasteTarget: () => true, pasteImage })
+    await clipboard.pasteClipboard()
+    expect(pasteImage).toHaveBeenCalledOnce()
+    expect(sent).toEqual(['\x1b[200~/tmp/amber-clip-menu.png\x1b[201~'])
+  })
+
+  it('menu paste falls back to text when image-read permission is denied', async () => {
+    vi.stubGlobal('navigator', { clipboard: { read: async () => { throw new Error('denied') } } })
+    const { clipboard, sent } = await fixture({
+      isImagePasteTarget: () => true, pasteImage: vi.fn(), readText: async () => 'text still works',
+    })
+    await clipboard.pasteClipboard()
+    expect(sent).toEqual(['\x1b[200~text still works\x1b[201~'])
+  })
+
+  it('reports oversized native image paste without emitting empty input', async () => {
+    const onError = vi.fn()
+    const pasteImage = vi.fn()
+    const { host, sent } = await fixture({ isImagePasteTarget: () => true, pasteImage, onError })
+    const event = new ClipboardEventFixture('paste', {}, [pngFile('big.png', IMAGE_PASTE_MAX_BYTES + 1)])
+    host.dispatchEvent(event)
+    expect(event.defaultPrevented).toBe(true)
+    expect(onError).toHaveBeenCalledWith(expect.stringContaining('16 MiB'))
+    expect(pasteImage).not.toHaveBeenCalled()
+    expect(sent).toEqual([])
+  })
+
+  it('does not deliver an image after the pane becomes unavailable', async () => {
+    let target = true
+    let finish!: (path: string) => void
+    const pasteImage = () => new Promise<string>((resolve) => { finish = resolve })
+    const { host, sent } = await fixture({ isImagePasteTarget: () => target, pasteImage })
+    host.dispatchEvent(new ClipboardEventFixture('paste', {}, [pngFile()]))
+    target = false
+    finish('/tmp/stale.png')
+    await settle()
+    expect(sent).toEqual([])
+  })
+
+  it('does not paste an upload result after disposal', async () => {
+    let finish!: (path: string) => void
+    const pasteImage = () => new Promise<string>((resolve) => { finish = resolve })
+    const { host, clipboard, sent } = await fixture({ isImagePasteTarget: () => true, pasteImage })
+    host.dispatchEvent(new ClipboardEventFixture('paste', {}, [pngFile()]))
+    clipboard.dispose()
+    finish('/tmp/stale.png')
+    await settle()
+    expect(sent).toEqual([])
+  })
+
+  it('reports an image upload failure instead of silently losing the paste', async () => {
+    const onError = vi.fn()
+    const { host, sent } = await fixture({
+      isImagePasteTarget: () => true,
+      pasteImage: async () => { throw new Error('HTTP 413') },
+      onError,
+    })
+    host.dispatchEvent(new ClipboardEventFixture('paste', {}, [pngFile()]))
+    await settle()
+    expect(onError).toHaveBeenCalledWith(expect.stringContaining('HTTP 413'))
+    expect(sent).toEqual([])
+  })
+
   it('ignores non-Ctrl-V keys, shifted chords and non-keydown events', async () => {
     const { clipboard } = await fixture({
       isPi: () => false,

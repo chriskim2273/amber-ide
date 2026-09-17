@@ -36,6 +36,8 @@ export interface SearchApi {
   // Paste through xterm's onData → port, honoring negotiated paste mode and
   // protecting Pi pastes even when its startup mode was evicted from backlog.
   paste(text: string): void
+  /** Read image or text data through the pane's clipboard policy. */
+  pasteClipboard?(): Promise<void>
 }
 
 /**
@@ -127,6 +129,7 @@ export const Pane = memo(function Pane(
   // Floating "Open" button state: shown when the current selection resolves to a
   // real path (main-process stat). `path` is the abs path revealed on click.
   const [openBtn, setOpenBtn] = useState<{ x: number; y: number; path: string } | null>(null)
+  const [clipboardError, setClipboardError] = useState<string | null>(null)
   // Latest pointer position (container-relative) from the selection's mouseup —
   // where the button anchors. cwd (for relative-path resolution) lives in a ref
   // so it stays fresh without re-running the once-only [session] mount effect.
@@ -153,11 +156,11 @@ export const Pane = memo(function Pane(
   // The daemon's fallback state can change without replacing this terminal.
   const piClipboardRef = useRef(false)
   piClipboardRef.current = kind === 'pi' && runState !== 'shell-fallback'
-  // Remote image paste targets: the agent must be running to attach the
-  // pasted path (a suspended/fallback pane has no TUI reading input).
+  // Every terminal can receive a host file path, including shells and agent
+  // fallbacks. Never queue input into a suspended supervisor. The server also
+  // verifies that the target daemon session is still alive.
   const imagePasteRef = useRef(false)
-  imagePasteRef.current = (kind === 'claude' || kind === 'pi' || kind === 'muse')
-    && runState !== 'shell-fallback' && runState !== 'suspended'
+  imagePasteRef.current = runState !== 'suspended'
   // True once this Pane has consumed one Attach backlog. A LATER backlog is a
   // RE-attach replay of history the terminal already shows, so it must clear
   // first — see the `term.reset()` in the port handler. Deliberately not armed
@@ -195,6 +198,8 @@ export const Pane = memo(function Pane(
       isImagePasteTarget: () => imagePasteRef.current,
       ...(uploadImage ? { pasteImage: (file: File) => uploadImage(session, file) } : {}),
       sendRaw: (data) => port?.postMessage({ data: new TextEncoder().encode(data) }),
+      readText: () => window.amber.clipboardRead(),
+      onError: setClipboardError,
     })
     term.loadAddon(fit)
     // WebGL is the fast path on hardware GL, but pathologically slow on
@@ -234,6 +239,7 @@ export const Pane = memo(function Pane(
         return lines.join('\n').slice(0, 500)
       },
       paste: clipboard.paste,
+      pasteClipboard: clipboard.pasteClipboard,
     })
 
     // OSC 52 clipboard writes: a TUI sets the system clipboard by emitting
@@ -771,6 +777,9 @@ export const Pane = memo(function Pane(
   return (
     <div ref={containerRef} style={{ position: 'relative', width: '100%', height: '100%', background: 'var(--bg)' }}>
       <div ref={hostRef} className="terminal-host" style={{ width: '100%', height: '100%' }} />
+      {clipboardError && <div role="alert" style={{ position: 'absolute', bottom: 4, left: 4, right: 4, zIndex: 2, background: 'var(--bg)' }}>
+        {clipboardError} <button onClick={() => setClipboardError(null)} aria-label="Dismiss paste error">Dismiss</button>
+      </div>}
       {openBtn &&
         <button
           className="open-path-btn"

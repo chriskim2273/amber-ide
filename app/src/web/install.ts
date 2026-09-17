@@ -230,10 +230,6 @@ export function installAmber(home: string): void {
       writeText: (text) => clipboard.writeText(text),
       readText: () => clipboard.readText(),
     },
-    // Remote image paste: POST the raw bytes; the server validates magic and
-    // answers the host temp path the caller pastes as text. Same cookie
-    // boundary as `/api/sessions`. Rejects with the server's error (or HTTP
-    // status) so the caller can fall back to a native `^V`.
     pasteImage: async (session, file) => {
       const r = await fetch(`/api/clipboard-image?name=${encodeURIComponent(session)}`, {
         method: 'POST',

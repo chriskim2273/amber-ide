@@ -91,6 +91,23 @@ app.whenReady().then(async () => {
     await check('ordinary shell native paste keeps xterm behavior', () => wirePaste(() => nativePaste('first\nsecond'), 'first\rsecond'))
     await evaluate('fixture.padded()'); await until('fixture.parsed()'); await selectPadded()
     await check('ordinary shell selection is not trimmed', async () => assert.match(await evaluate('fixture.copy()'), /First line +\n +\n    indented code +\n/))
+    await evaluate('fixture.web()')
+    for (const kind of ['shell', 'claude', 'pi', 'muse', 'codex', 'grok', 'opencode', 'hermes']) {
+      await evaluate(`fixture.remount(${JSON.stringify(kind)})`)
+      await until('fixture.ready()'); await settle()
+      for (const gesture of ['imagePaste', 'menuPaste']) {
+        await check(`${kind}: ${gesture} uploads and pastes only the path`, async () => {
+          await wirePaste(() => evaluate(`fixture.${gesture}()`), kind === 'pi'
+            ? '\x1b[200~/tmp/amber-clip-fixture.png\x1b[201~' : '/tmp/amber-clip-fixture.png')
+          assert.deepEqual(await evaluate('fixture.uploads()'), [{ session: 'fixture', size: 8, type: 'image/png' }])
+        })
+      }
+      await evaluate('fixture.state("shell-fallback")')
+      await check(`${kind}: fallback receives image path without Enter`, async () => {
+        await wirePaste(() => evaluate('fixture.imagePaste()'), '/tmp/amber-clip-fixture.png')
+      })
+      await evaluate('fixture.state("claude")')
+    }
     await evaluate('fixture.unmount()')
     await check('unmount removes clipboard handlers', async () => {
       assert.deepEqual(await evaluate(`(() => { const el = document.createElement('textarea'); document.body.appendChild(el); el.focus(); const e = new ClipboardEvent('paste', { bubbles:true, cancelable:true, clipboardData:new DataTransfer() }); el.dispatchEvent(e); return [e.defaultPrevented, Boolean(document.querySelector('.xterm'))] })()`), [false, false])

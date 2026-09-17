@@ -11,6 +11,8 @@ let messages: string[] = []
 let kind = 'pi'
 let runState: string | undefined = 'claude'
 let mounted = true
+let web = false
+let uploads: Array<{ session: string; size: number; type: string }> = []
 const root = createRoot(document.getElementById('root')!)
 Object.assign(window, {
   amber: {
@@ -27,6 +29,7 @@ Object.assign(window, {
     closePane() { daemonPort?.close(); daemonPort = undefined },
     resolvePath: async () => null,
     clipboardWrite: () => {},
+    clipboardRead: async () => '',
   },
 })
 function render(): void {
@@ -48,6 +51,28 @@ Object.assign(window, { fixture: {
   copy: () => api.copySelection(),
   paste: (text: string) => api.paste(text),
   messages: () => messages,
+  uploads: () => uploads,
+  web: () => {
+    web = true
+    window.amber.pasteImage = async (session, file) => {
+      uploads.push({ session, size: file.size, type: file.type })
+      return '/tmp/amber-clip-fixture.png'
+    }
+  },
+  imagePaste: () => {
+    uploads = []
+    const data = new DataTransfer()
+    data.items.add(new File([new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10])], 'image.png', { type: 'image/png' }))
+    document.querySelector('.xterm-helper-textarea')!.dispatchEvent(new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: data }))
+  },
+  menuPaste: async () => {
+    uploads = []
+    if (!web) throw new Error('web fixture not enabled')
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: {
+      read: async () => [{ types: ['image/png'], getType: async () => new Blob([new Uint8Array(8)], { type: 'image/png' }) }],
+    } })
+    await api.pasteClipboard!()
+  },
   clearMessages: () => { messages = [] },
   state: (value: string | undefined) => { runState = value; render() },
   remount: (value: string) => { mounted = false; render(); kind = value; mounted = true; render() },

@@ -6,8 +6,8 @@ export const IMAGE_PASTE_MAX_BYTES = 16 * 1024 * 1024
 
 export interface TerminalClipboardOptions {
   isPi: () => boolean
-  /** Whether this pane's agent attaches images from pasted file paths
-   * (claude/pi/muse). False disables all image handling. */
+  /** Whether this terminal can currently receive a pasted file path.
+   * False disables image handling (for example, while suspended). */
   isImagePasteTarget?: () => boolean
   /** Upload one image, resolve its host path. Absent on desktop, where Ctrl-V
    * reaches the agent natively and the agent reads the host clipboard. */
@@ -15,6 +15,9 @@ export interface TerminalClipboardOptions {
   /** Send raw bytes to the pty — the `^V` fallback when a clipboard read
    * fails or is denied, preserving the key's native meaning. */
   sendRaw?: (data: string) => void
+  /** Desktop text bridge; web uses navigator.clipboard for images and text. */
+  readText?: () => Promise<string>
+  onError?: (message: string) => void
 }
 
 // Array-likes, not FileList/DataTransferItemList: the real DataTransfer
@@ -51,8 +54,8 @@ export function firstImageFile(data: ClipboardDataLike | null | undefined): File
  *
  * Remote image paste (web build only, `pasteImage` set): an image in a paste
  * event — or under Ctrl-V, read via `navigator.clipboard.read()` — uploads to
- * the host and its returned path pastes as bracketed text, which claude/pi/muse
- * TUIs attach as an image. Text clipboards and failures fall back to the
+ * the host and its returned path pastes as text, honoring bracketed paste.
+ * Agents may attach it; shells receive a path without Enter. Failures fall back to the
  * previous behavior (text paste, else a native `^V` for the key path).
  */
 export function installTerminalClipboard(term: Terminal, host: HTMLElement, opts: TerminalClipboardOptions): {
@@ -62,15 +65,21 @@ export function installTerminalClipboard(term: Terminal, host: HTMLElement, opts
    * caller must preventDefault and return false to xterm (which would
    * otherwise forward a bare `^V` the host clipboard cannot satisfy). */
   handleKeyDown(event: KeyboardEvent): boolean
+  pasteClipboard(): Promise<void>
   dispose(): void
 } {
   const { isPi, isImagePasteTarget, pasteImage, sendRaw } = opts
+  let disposed = false
+  const reportError = (error: unknown): void => {
+    if (!disposed) opts.onError?.(`Paste failed: ${error instanceof Error ? error.message : String(error)}`)
+  }
   const copySelection = (): string => {
     const text = term.getSelection()
     // xterm trims unwritten cells, NOT the literal spaces Pi paints to fill rows.
     return isPi() ? text.replace(/[ \t]+(?=\r?$)/gm, '') : text
   }
   const paste = (text: string): void => {
+    if (disposed) return
     if (isPi() && !term.modes.bracketedPasteMode) {
       // Pi enables DECSET 2004 once, at startup. A cold/reconnected renderer may
       // never see it after the daemon's capped raw backlog evicts those bytes.
@@ -88,8 +97,11 @@ export function installTerminalClipboard(term: Terminal, host: HTMLElement, opts
    * accompanying text instead so a failed upload never eats a text paste. */
   const pasteImageFile = (file: File, textFallback: string | null): void => {
     if (!pasteImage) return
-    void pasteImage(file).then(paste).catch(() => {
-      if (textFallback) paste(textFallback)
+    void pasteImage(file).then((path) => {
+      if (!disposed && isImagePasteTarget?.()) paste(path)
+    }).catch((error: unknown) => {
+      reportError(error)
+      if (textFallback && isImagePasteTarget?.()) paste(textFallback)
     })
   }
   const onCopy = (event: ClipboardEvent): void => {
@@ -108,12 +120,48 @@ export function installTerminalClipboard(term: Terminal, host: HTMLElement, opts
         pasteImageFile(image, data?.types.includes('text/plain') ? data.getData('text/plain') : null)
         return
       }
+      const hasImage = Array.from(data?.files ?? []).some((file) => !file.type || file.type.startsWith('image/'))
+        || Array.from(data?.items ?? []).some((item) => item.kind === 'file' && (!item.type || item.type.startsWith('image/')))
+      if (hasImage) {
+        event.preventDefault()
+        event.stopImmediatePropagation()
+        reportError(new Error('image must be non-empty and at most 16 MiB'))
+        const text = data?.getData('text/plain')
+        if (text) paste(text)
+        return
+      }
     }
     if (!isPi() || !event.clipboardData?.types.includes('text/plain')) return
     const text = event.clipboardData.getData('text/plain')
     event.preventDefault()
     event.stopImmediatePropagation() // xterm's own listener must not send it twice
     paste(text)
+  }
+  /** Shared app/menu entry point. Native Cmd-V stays a paste event, which
+   * carries images without requiring navigator.clipboard.read permission. */
+  const pasteClipboard = async (): Promise<void> => {
+    try {
+      const clipboard = globalThis.navigator?.clipboard
+      if (isImagePasteTarget?.() && pasteImage && clipboard?.read) {
+        // Some browsers permit text reads but deny the richer image API.
+        // Only read denial falls back; an upload failure must remain visible.
+        const items = await clipboard.read().catch(() => [])
+        for (const item of items) {
+          const imageType = item.types.find((type) => type.startsWith('image/'))
+          if (!imageType) continue
+          const blob = await item.getType(imageType)
+          if (!isImagePasteTarget() || disposed) return
+          if (blob.size < 1 || blob.size > IMAGE_PASTE_MAX_BYTES) throw new Error('image size out of range')
+          const path = await pasteImage(new File([blob], 'paste', { type: imageType }))
+          if (isImagePasteTarget() && !disposed) paste(path)
+          return
+        }
+      }
+      const text = await (opts.readText ? opts.readText() : clipboard?.readText())
+      if (text) paste(text)
+    } catch (error) {
+      reportError(error)
+    }
   }
   /** Plain Ctrl-V (no Shift/Alt/Meta): xterm forwards it as `^V` and swallows
    * the browser paste, so the agent would read the HOST clipboard — which has
@@ -135,7 +183,9 @@ export function installTerminalClipboard(term: Terminal, host: HTMLElement, opts
           const blob = await item.getType(imageType)
           const file = new File([blob], 'paste', { type: imageType })
           if (file.size < 1 || file.size > IMAGE_PASTE_MAX_BYTES) throw new Error('image size out of range')
-          paste(await pasteImage(file))
+          if (disposed || !isImagePasteTarget()) return
+          const path = await pasteImage(file)
+          if (!disposed && isImagePasteTarget()) paste(path)
           return
         }
         const text = await clipboard.readText().catch(() => '')
@@ -143,10 +193,10 @@ export function installTerminalClipboard(term: Terminal, host: HTMLElement, opts
           paste(text)
           return
         }
-      } catch {
-        /* fall through to the native ^V below */
+      } catch (error) {
+        reportError(error)
       }
-      sendRaw?.('\x16')
+      if (!disposed && isImagePasteTarget?.()) sendRaw?.('\x16')
     })()
     return true
   }
@@ -156,7 +206,9 @@ export function installTerminalClipboard(term: Terminal, host: HTMLElement, opts
     copySelection,
     paste,
     handleKeyDown,
+    pasteClipboard,
     dispose: () => {
+      disposed = true
       host.removeEventListener('copy', onCopy, { capture: true })
       host.removeEventListener('paste', onPaste, { capture: true })
     },

@@ -814,6 +814,5 @@ export function createAmber(deps: AmberDeps): WebAmber {
     releaseGrids: (): void => {
       for (const link of panes.values()) link.release()
     },
-    browserFrame: (id: string): Promise<Record<string, unknown>> => deps.browserApi.frame(id),
   }
 }

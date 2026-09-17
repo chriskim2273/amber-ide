@@ -587,7 +587,8 @@ export function SplitView(props: {
         const api = searchApis.current.get(focusedRef.current)
         if (api) {
           e.preventDefault()
-          void window.amber.clipboardRead().then((t) => { if (t) api.paste(t) }).catch(() => {})
+          if (api.pasteClipboard) void api.pasteClipboard()
+          else void window.amber.clipboardRead().then((t) => { if (t) api.paste(t) }).catch(() => {})
         }
         return
       }
@@ -1091,7 +1092,8 @@ export function SplitView(props: {
                     // Reads the system clipboard through the same bridge the
                     // paste chord uses; on the web build that is
                     // navigator.clipboard, which needs this user gesture.
-                    void window.amber.clipboardRead().then((t) => { if (t) api.paste(t) })
+                    if (api.pasteClipboard) void api.pasteClipboard()
+                    else void window.amber.clipboardRead().then((t) => { if (t) api.paste(t) }).catch(() => {})
                   })}>Paste</button>
                 </>
               )

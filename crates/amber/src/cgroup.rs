@@ -452,23 +452,38 @@ impl CgroupManager {
             return Ok(());
         };
         let paths = SessionPaths::new(root, slot)?;
-        if self.mount_point.is_none() {
-            for path in [&paths.workload, &paths.supervisor, &paths.parent] {
-                if path.exists() {
-                    for entry in fs::read_dir(path)? {
-                        let entry = entry?;
-                        if entry.file_type()?.is_file() {
-                            fs::remove_file(entry.path())?;
-                        }
-                    }
+        let mut pending = vec![(paths.parent, false)];
+        while let Some((path, visited)) = pending.pop() {
+            if visited {
+                match fs::remove_dir(&path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
                 }
+                continue;
             }
-        }
-        for path in [&paths.workload, &paths.supervisor, &paths.parent] {
-            match fs::remove_dir(path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error),
+            };
+            if !metadata.is_dir() {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "expected a cgroup directory"));
+            }
+            let entries = match fs::read_dir(&path) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            pending.push((path, true));
+            for entry in entries {
+                let entry = entry?;
+                let kind = entry.file_type()?;
+                if kind.is_dir() {
+                    pending.push((entry.path(), false));
+                } else if self.mount_point.is_none() && kind.is_file() {
+                    fs::remove_file(entry.path())?;
+                }
             }
         }
         Ok(())
@@ -975,6 +990,58 @@ mod tests {
 
         manager.remove_session(3).unwrap();
         assert!(!temp.path().join("session-3").exists());
+    }
+
+    #[test]
+    fn removes_nested_session_cgroups_without_touching_other_slots() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = CgroupManager::test_root(temp.path());
+        manager.prepare_session(3).unwrap();
+        manager.prepare_session(4).unwrap();
+        for child in ["workload/_daemon", "supervisor/nested/leaf", "extra/leaf"] {
+            let path = temp.path().join("session-3").join(child);
+            fs::create_dir_all(&path).unwrap();
+            fs::write(path.join("cgroup.procs"), "").unwrap();
+        }
+
+        manager.remove_session(3).unwrap();
+        manager.remove_session(3).unwrap();
+        assert!(!temp.path().join("session-3").exists());
+        assert!(temp.path().join("session-4/workload").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_cleanup_does_not_follow_symlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let manager = CgroupManager::test_root(temp.path());
+        manager.prepare_session(3).unwrap();
+        fs::write(outside.path().join("keep"), "untouched").unwrap();
+        std::os::unix::fs::symlink(
+            outside.path(),
+            temp.path().join("session-3/workload/link"),
+        ).unwrap();
+
+        assert!(manager.remove_session(3).is_err());
+        assert_eq!(fs::read_to_string(outside.path().join("keep")).unwrap(), "untouched");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an isolated delegated systemd service"]
+    fn real_nested_cgroup_cleanup() {
+        assert_eq!(std::env::var("AMBER_TEST_CGROUP_ISOLATED").as_deref(), Ok("1"));
+        let manager = CgroupManager::activate();
+        assert!(manager.is_enabled());
+        manager.set_session_high_kb(64 * 1024);
+        manager.prepare_session(1).unwrap();
+        let paths = SessionPaths::new(manager.root.as_ref().unwrap(), 1).unwrap();
+        fs::create_dir(paths.workload.join("_daemon")).unwrap();
+        assert!(!read_populated(&paths.parent).unwrap());
+        assert!(manager.kill_session(1).unwrap());
+        manager.remove_session(1).unwrap();
+        assert!(!paths.parent.exists());
     }
 
     #[test]
