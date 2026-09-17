@@ -3460,6 +3460,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn reap_returns_successes_while_failed_cleanup_stays_retryable() {
         let dir = tempdir().unwrap();
         let cgroups = tempdir().unwrap();
@@ -3477,7 +3478,7 @@ mod tests {
         let obstruction = cgroups
             .path()
             .join(format!("session-{blocked_slot}/workload/obstruction"));
-        std::fs::create_dir(&obstruction).unwrap();
+        std::os::unix::fs::symlink(dir.path(), &obstruction).unwrap();
 
         let reaped = mgr.reap().unwrap();
         assert_eq!(reaped, vec!["clean".to_string()]);
@@ -3492,7 +3493,7 @@ mod tests {
             .join(format!("session-{clean_slot}"))
             .exists());
 
-        std::fs::remove_dir(obstruction).unwrap();
+        std::fs::remove_file(obstruction).unwrap();
         assert_eq!(mgr.reap().unwrap(), vec!["blocked".to_string()]);
         assert!(mgr.names().is_empty());
     }

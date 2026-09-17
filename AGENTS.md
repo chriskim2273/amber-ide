@@ -108,6 +108,19 @@ exception is core rule 9); themes/settings beyond minimal.
 
 ## Build status
 
+- [ ] Nested-cgroup pane-close fix (2026-09-16) — live exited slot 24 had
+  `populated 0` but retained `workload/_daemon`, blocking the fixed three-path
+  cleanup with EBUSY. Cleanup now removes descendant directories bottom-up
+  within the selected slot, preserving kernel control files and propagating
+  removal failures. The normal-filesystem regression failed before the fix;
+  standalone cgroup tests pass (19), and an isolated delegated-systemd test
+  passes on real cgroupfs. Cargo tests and workspace Clippy are blocked by
+  pre-existing misplaced clipboard-image code in committed `web.rs`; the manager
+  retry regression was updated but has not run. Source fix not deployed.
+  With user approval, removed only slot 24's empty `workload/_daemon` cgroup;
+  the production daemon reaped the exited pane on its next tick, all other
+  26 sessions remained listed, and daemon PID 2523 was unchanged.
+
 - [x] Remote clipboard image paste (2026-09-14) — screenshots copied on another
   machine now reach claude/pi/muse panes over amber web. Root cause: Ctrl-V
   sends `^V` to the pty and the agent reads the HOST clipboard via xclip/
