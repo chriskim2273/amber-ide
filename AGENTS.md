@@ -108,6 +108,50 @@ exception is core rule 9); themes/settings beyond minimal.
 
 ## Build status
 
+- [x] Hover-spam + Pi-pane recovery (2026-09-28) — two linked issues after the
+  reboot. (1) Five kind=shell panes (#3 apex-oat, #14 Liquidators, #16 Chicken
+  Lovers, #20 finsight, #24 inyeon-voice) were ex-Pi panes with no resumable
+  recording, so the reboot restored bare shells; all five were resumed in place
+  via `pi --session <most-recent-file-for-cwd>` typed through direct-protocol
+  `Input` frames (the v10 hook recorded + promoted each shell→pi live, verified
+  by recording + kind flip), and the 3 supervised pi panes were freeze/unfroze
+  onto their exact conversations. (2) Hovering those recovered shells sprayed
+  `M35;…`/`1;2c` garbage as input. Root cause: the installed AppImage's
+  backlog settle is alt-gated (`settleReplayedModes` skips when the buffer is
+  `alternate` — uncommitted Sep-11 WIP, absent from every branch), but a dead
+  TUI's replay leaves alt-screen entered exactly like a live one (rings show
+  3–4 unmatched `?1049h` + `?1003h`), so the reset skipped precisely the stuck
+  shells; the nudge reset was already removed. Fix in repo: new tested
+  `app/src/shared/terminalModes.ts` — settle (alt-exit + full 9-mode reset incl
+  focus-tracking `?1004l`) gated on daemon run_state, skipping only live TUIs
+  (`claude`, `suspend-failed`); `Pane.tsx` backlog + workspace-replay use it and
+  the nudge's unconditional reset is deleted (code now matches its comment);
+  legacy `crates/amber/assets/app.js` mirrors the gated settle. Covers desktop
+  + `/app` web (same `Pane`) + legacy mobile UI. A follow-on effect also
+  settles on supervision transitions OUT of live (covers agent deaths while
+  attached — no replay follows a death). Gates: 7 new tests, app 1294 passed /
+  1 skipped, typecheck clean in touched files (18 errors remain, all
+  pre-existing browser WIP in `tabBrowserHost.test.ts`/`electronTabBrowserPage.ts`),
+  desktop + web builds green with the settle verified in both bundles, Rust
+  `web::` 59 passed (no Rust code changed). E2E-proven headless (xvfb + CDP)
+  against the real daemon: fresh attach to a `kill -9`'d pi pane (unmatched
+  `?1049h` + `?1003h`, runState null — the exact stuck shape) → 25 hover
+  sweeps → zero new ring bytes, twice (pre- and post-transition-settle
+  builds); a mid-life attach (enable arriving live post-settle) correctly
+  floods, confirming the settle is backlog-scoped by design. **Deployed**:
+  full rebuild `amber-ide-0.0.2.AppImage` (`0a8a92b3…`, static-pie bundled
+  amber with v10 extension) installed to `~/Applications/amber-ide.AppImage`;
+  backup + receipt under `~/worktrees/amber-ide/mouse-settle-release/`. The
+  previously running app keeps the old inode until relaunch (rollback =
+  reinstall the backup). This build bakes the tree's uncommitted browser WIP,
+  same as the Sep 16 one did. Follow-ups: identify what rewrote the v10 Pi
+  extension with the 592-byte legacy copy at boot 21:18:04 (repaired by hand
+  since); DA/DSR queries in replayed backlog still draw one-shot client
+  replies (minor, needs a replay-sanitization design decision per core rule
+  #4); hand-started TUIs that die after attach can't re-settle app-side
+  (needs a daemon liveness signal); new-tab daemon creates don't surface a
+  new tab in the app (pre-existing gap found during smoke).
+
 - [ ] Nested-cgroup pane-close fix (2026-09-16) — live exited slot 24 had
   `populated 0` but retained `workload/_daemon`, blocking the fixed three-path
   cleanup with EBUSY. Cleanup now removes descendant directories bottom-up

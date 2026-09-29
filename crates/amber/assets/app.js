@@ -116,7 +116,8 @@ function main() {
   var geomIdx = +(localStorage.getItem('amber.geom') || 0) || 0;
 
   var XTERM_PAD = 4; // must match `.xterm { padding }` in style.css
-  var MOUSE_RESET = '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l';
+  var MOUSE_RESET = '\x1b[?1000l\x1b[?1001l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l';
+  var ALT_SCREEN_EXIT = '\x1b[?1049l';
   var THEME = {
     background: '#0c0c0f', foreground: '#e6e6ec', cursor: '#7c6cff',
     cursorAccent: '#0c0c0f', selectionBackground: 'rgba(124,108,255,0.30)',
@@ -658,9 +659,19 @@ function main() {
         term.write(new Uint8Array(ev.data));
         if (freshBacklog) {
           // The replayed scrollback re-executes old escape codes, including a
-          // dead program's mouse-tracking enable (Pane.tsx does the same).
+          // dead program's mouse-tracking enable and its alt-screen enter
+          // (Pane.tsx settles the same way via shared/terminalModes.ts). Skip
+          // only while a live agent TUI owns the terminal: it never
+          // re-asserts its modes, and an alt-exit would hide its screen. A
+          // buffer-type check cannot gate this — a dead TUI's replay leaves
+          // alt-screen entered exactly like a live one.
           freshBacklog = false;
-          term.write(MOUSE_RESET);
+          var bs = sessionByName(open);
+          var liveTui = bs && (bs.run_state === 'claude' || bs.run_state === 'suspend-failed');
+          if (!liveTui) {
+            term.write(ALT_SCREEN_EXIT);
+            term.write(MOUSE_RESET);
+          }
           applyScale();
         }
         return;

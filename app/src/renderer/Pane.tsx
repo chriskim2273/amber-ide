@@ -13,6 +13,7 @@ import { KeyboardInputModeTracker, shiftEnterSequence } from './terminalKeys'
 import { installTerminalUnicode } from './terminalUnicode'
 import { loadOptionalWebgl } from './terminalRenderer'
 import { installTerminalClipboard } from './terminalClipboard'
+import { isLiveTuiRunState, settleReplayedModes } from '../shared/terminalModes'
 
 // Imperative scrollback-search handle handed to the chrome (the find bar in
 // SplitView) via `onSearchReady`. Search execution stays outside React — the
@@ -107,12 +108,6 @@ const XTERM_THEME = {
   brightWhite: '#f4f4f8',
 }
 
-// Replaying raw scrollback re-executes its escape codes, including any mouse-
-// tracking enable from a prior program (e.g. an exited claude). Left set, a
-// shell echoes mouse reports on every click/move. Disable all mouse modes
-// after each backlog; a live program re-asserts what it needs on redraw.
-const MOUSE_RESET = '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l'
-
 // Memoized: SplitView re-renders on every drag-hover mousemove. `session`/
 // `epoch` are primitives, so memo keeps a drag from reconciling every terminal
 // (honors "xterm instances live outside React reconciliation").
@@ -157,6 +152,10 @@ export const Pane = memo(function Pane(
   const imagePasteRef = useRef(false)
   imagePasteRef.current = (kind === 'claude' || kind === 'pi' || kind === 'muse')
     && runState !== 'shell-fallback' && runState !== 'suspended'
+  // Supervision phase can flip (running -> fallback) without replacing this
+  // terminal; the backlog handler reads the live value, not the mount-time one.
+  const runStateRef = useRef(runState)
+  runStateRef.current = runState
   // True once this Pane has consumed one Attach backlog. A LATER backlog is a
   // RE-attach replay of history the terminal already shows, so it must clear
   // first — see the `term.reset()` in the port handler. Deliberately not armed
@@ -254,10 +253,10 @@ export const Pane = memo(function Pane(
     // Workspace-load scrollback replay (single-shot). A freshly created session
     // has empty daemon backlog, so writing the saved history here — before the
     // live port is wired — yields display-correct ordering (history, then live
-    // output). MOUSE_RESET clears any mouse-tracking mode the replayed bytes
-    // re-enabled (same hazard as an Attach backlog).
+    // output). Settle the replayed modes (same hazard as an Attach backlog):
+    // this terminal is brand-new, so no live TUI can own them yet.
     const replay = takeReplay(session)
-    if (replay) { term.write(replay); term.write(MOUSE_RESET) }
+    if (replay) { term.write(replay); settleReplayedModes(term, undefined) }
 
     let port: MessagePort | null = null
     let wired = false
@@ -575,7 +574,11 @@ export const Pane = memo(function Pane(
         term.write(m.data) // xterm.write accepts Uint8Array (UTF-8)
         if (isBacklog) {
           attachedOnceRef.current = true
-          term.write(MOUSE_RESET) // clear mouse modes the replayed bytes re-enabled
+          // Clear modes the replayed bytes re-enabled — unless a live agent
+          // TUI owns them. Gated on daemon run_state, NOT on buffer type: a
+          // dead TUI's replay leaves alt-screen entered exactly like a live
+          // one, so a buffer check would skip precisely the stuck shells.
+          settleReplayedModes(term, runStateRef.current)
         }
       }
       port.start()
@@ -657,15 +660,15 @@ export const Pane = memo(function Pane(
     const nudge = (): void => {
       const term = termRef.current, fit = fitRef.current, port = portRef.current
       if (!term || !port) return
-      // The mouse reset is always safe; the RE-FIT is not. In scale mode this
-      // pane is a tile whose pixels are CSS-scaled, and fitting it would
-      // reflow the shared pty to tile size on every reconnect.
+      // No mode reset here (the backlog settle above is the one true mechanism:
+      // an unconditional write here would strip a live TUI's mouse on every
+      // reconnect). The RE-FIT is not safe either in scale mode: this pane is a
+      // tile whose pixels are CSS-scaled, and fitting it would reflow the
+      // shared pty to tile size on every reconnect.
       if (fitModeRef.current === 'scale') {
-        term.write(MOUSE_RESET)
         return
       }
       try { fit?.fit() } catch { /* ignore */ }
-      term.write(MOUSE_RESET)
       port.postMessage({ resize: { cols: term.cols, rows: term.rows } })
     }
     const t1 = setTimeout(nudge, 600)
@@ -684,6 +687,21 @@ export const Pane = memo(function Pane(
     try { fitRef.current?.fit() } catch { /* host mid-layout; ignore */ }
     term.refresh(0, Math.max(0, term.rows - 1))
   }, [activateSeq])
+
+  // Supervision transitions out of live (running -> fallback/suspended/
+  // retrying) mean the agent TUI just died while this terminal stays attached:
+  // no backlog will ever re-settle it, so settle the modes it may have left
+  // behind (a relaunch re-enables what it needs). Transitions INTO live never
+  // settle — the TUI owns the modes from its own startup output.
+  const prevRunStateRef = useRef(runState)
+  useEffect(() => {
+    const prev = prevRunStateRef.current
+    prevRunStateRef.current = runState
+    if (!isLiveTuiRunState(prev) || isLiveTuiRunState(runState)) return
+    const term = termRef.current
+    if (!term) return
+    settleReplayedModes(term, runState)
+  }, [runState])
 
   // Font-size changes (chord). memo re-renders on the new `fontSize` prop but the
   // [session] effect doesn't re-run, so the Terminal instance persists — we just
