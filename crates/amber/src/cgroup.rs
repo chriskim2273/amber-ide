@@ -219,6 +219,10 @@ impl CgroupManager {
         ) {
             eprintln!("amber: could not reserve daemon memory.low: {error}");
         }
+        // ManagedOOMPreference=avoid on the service cgroup does not propagate
+        // into delegated children. oomd scores each child on its own, and
+        // killing _daemon restarts every pane.
+        set_oomd_preference(&daemon, "user.oomd_omit");
         let manager = Self {
             root: Some(root),
             mount_point: Some(mount_point),
@@ -335,6 +339,7 @@ impl CgroupManager {
             if self.cpu_enabled {
                 fs::write(paths.parent.join("cpu.weight"), "")?;
             }
+            protect_session_from_oomd(&paths);
             return Ok(());
         }
         let high = self.current_session_high_bytes().ok_or_else(|| {
@@ -359,7 +364,9 @@ impl CgroupManager {
             fs::create_dir(&paths.supervisor)?;
             fs::create_dir(&paths.workload)?;
             write_control(&paths.parent.join("cgroup.subtree_control"), "+memory")?;
-            write_control_nonblocking(&paths.parent.join("memory.high"), &high.to_string())
+            write_control_nonblocking(&paths.parent.join("memory.high"), &high.to_string())?;
+            protect_session_from_oomd(&paths);
+            Ok(())
         })();
         if result.is_err() {
             let _ = self.remove_session(slot);
@@ -778,6 +785,57 @@ fn write_control_nonblocking(path: &Path, value: &str) -> io::Result<()> {
     open_control_nonblocking(path)?.write_all(value.as_bytes())
 }
 
+/// systemd-oomd reads `user.oomd_omit` and `user.oomd_avoid` on the cgroup
+/// it might kill. The service unit's ManagedOOMPreference does not copy
+/// onto children Amber creates under a delegated controller.
+fn set_oomd_preference(path: &Path, name: &str) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let Ok(path_c) = CString::new(path.as_os_str().as_bytes()) else {
+            return;
+        };
+        let Ok(name_c) = CString::new(name) else {
+            return;
+        };
+        let value = b"1";
+        // Safety: both pointers are NUL-terminated CStrings, and the value
+        // buffer is valid for `value.len()` bytes. flags=0 means create or
+        // replace.
+        let rc = unsafe {
+            libc::setxattr(
+                path_c.as_ptr(),
+                name_c.as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+            )
+        };
+        if rc != 0 {
+            let err = io::Error::last_os_error();
+            // A filesystem without user xattrs must not block session start.
+            if err.raw_os_error() != Some(libc::EOPNOTSUPP) {
+                eprintln!("amber: could not set {name} on {}: {err}", path.display());
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (path, name);
+    }
+}
+
+fn protect_session_from_oomd(paths: &SessionPaths) {
+    // Killing the session or supervisor cgroup takes the pane's control
+    // process with it. The workload stays `avoid`, so a real last-resort
+    // kill can still land on the agent.
+    set_oomd_preference(&paths.parent, "user.oomd_omit");
+    set_oomd_preference(&paths.supervisor, "user.oomd_omit");
+    set_oomd_preference(&paths.workload, "user.oomd_avoid");
+}
+
 fn write_control(path: &Path, value: &str) -> io::Result<()> {
     OpenOptions::new()
         .write(true)
@@ -918,6 +976,66 @@ mod tests {
         fs::write(root.join("cgroup.procs"), "").unwrap();
         fs::write(root.join("_daemon/cgroup.procs"), "").unwrap();
         fs::write(root.join("_daemon/cpu.weight"), "").unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_user_xattr(path: &Path, name: &str) -> Option<Vec<u8>> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let path_c = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let name_c = CString::new(name).unwrap();
+        let mut buf = vec![0u8; 16];
+        let n = unsafe {
+            libc::getxattr(
+                path_c.as_ptr(),
+                name_c.as_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+            )
+        };
+        if n < 0 {
+            return None;
+        }
+        buf.truncate(n as usize);
+        Some(buf)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn daemon_cgroup_is_omitted_from_oomd() {
+        let temp = tempfile::tempdir().unwrap();
+        fake_delegated_root(temp.path(), "memory");
+        CgroupManager::activate_at(temp.path().to_path_buf(), temp.path().to_path_buf()).unwrap();
+        assert_eq!(
+            read_user_xattr(&temp.path().join("_daemon"), "user.oomd_omit").as_deref(),
+            Some(b"1".as_slice())
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn session_control_plane_is_omitted_and_workload_stays_avoid() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = CgroupManager::test_root(temp.path());
+        manager.prepare_session(3).unwrap();
+        assert_eq!(
+            read_user_xattr(&temp.path().join("session-3"), "user.oomd_omit").as_deref(),
+            Some(b"1".as_slice())
+        );
+        assert_eq!(
+            read_user_xattr(&temp.path().join("session-3/supervisor"), "user.oomd_omit").as_deref(),
+            Some(b"1".as_slice())
+        );
+        assert_eq!(
+            read_user_xattr(&temp.path().join("session-3/workload"), "user.oomd_avoid").as_deref(),
+            Some(b"1".as_slice())
+        );
+        assert_eq!(
+            read_user_xattr(&temp.path().join("session-3/workload"), "user.oomd_omit"),
+            None,
+            "a last-resort oomd kill must still be able to reach the agent"
+        );
     }
 
     #[test]
