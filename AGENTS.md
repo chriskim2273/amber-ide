@@ -108,6 +108,14 @@ exception is core rule 9); themes/settings beyond minimal.
 
 ## Build status
 
+- [x] Pi resume operational repair (2026-10-02) — removed seven obsolete hook
+  registrations, reinstated the owned v10 extension, and validated all twelve
+  current exact-file bindings. Private installed-artifact restoration passed
+  12/12 twice; five hook lifecycle checks passed. This is a sanitized operational
+  receipt only, not an application-code merge or binary deployment; unrelated
+  implementation work and private backups remain untouched. Receipt:
+  `docs/pi-session-resume-repair-2026-10-02.md`.
+
 - [x] Web clipboard consistency — merged all-live-terminal image path paste,
   image-aware menu paste, visible upload errors, stale-upload guards, and
   revision-guarded copy retries. Merged-tree gates: Rust 977 passed / 3 ignored,
