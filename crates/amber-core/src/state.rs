@@ -94,6 +94,10 @@ pub struct SessionMeta {
     /// `--session-id` and offers no hook). Defaulted for older records.
     #[serde(default)]
     pub resume_as_muse: bool,
+    /// A shell running a hand-started Codex CLI at the last periodic snapshot.
+    /// Restore promotes it to a supervised Codex pane using its hook-recorded id.
+    #[serde(default)]
+    pub resume_as_codex: bool,
     /// Last-known claude supervision phase (see
     /// [`amber_core::proto::SessionInfo::run_state`]). Persisted so a snapshot
     /// round-trips; on restore a claude session is reset to `"claude"` (its
@@ -497,7 +501,8 @@ impl StateStore {
     /// name carries the pid (unique across processes) AND a per-call atomic
     /// counter (unique across threads) — a pid-only name let two threads of
     /// the same process share a tmp path and interleave write/rename.
-    fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    /// Atomically replace a daemon-owned file, including generated shell startup files.
+    pub fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         let parent = path
             .parent()
             .ok_or_else(|| anyhow::anyhow!("path has no parent: {}", path.display()))?;
@@ -1158,6 +1163,7 @@ mod tests {
             title: None,
             resume_as_claude: false,
             resume_as_muse: false,
+            resume_as_codex: false,
             run_state: None,
             slot: 1,
         }
@@ -1338,6 +1344,7 @@ mod tests {
         let meta = store.read_session("legacy").unwrap().unwrap();
         assert_eq!(meta.run_state, None);
         assert!(!meta.resume_as_claude);
+        assert!(!meta.resume_as_codex);
         assert_eq!(meta.kind, SessionKind::Claude);
     }
 

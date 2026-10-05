@@ -108,6 +108,26 @@ exception is core rule 9); themes/settings beyond minimal.
 
 ## Build status
 
+- [x] Codex CLI shell recovery (2026-10-05) — periodic snapshots now flag a
+  hand-started primary Codex process independently of Claude/Muse, preserve
+  that flag during shutdown, and restore as supervised Codex with its exact
+  hook-recorded id and cwd (`-C` included). One transient absence is tolerated;
+  a switch to another primary agent clears the flag immediately. Amber's Bash
+  and Zsh startup files retain user configuration/alias options and wrap `codex`
+  with the existing hook-trust override: recent Codex shared servers otherwise
+  inherit the first pane's AMBER_SESSION and misrecord other panes. Regression
+  proof: two real private daemon panes with fake Codex, rotated id, same cwd,
+  clean + unclean restarts; native Bash verifies alias preservation and flag
+  deduplication. Integrated Rust workspace: 974 passed / 3 ignored; library
+  Clippy clean; isolated all-target Clippy clean. Integrated all-target Clippy
+  remains blocked by the pre-existing duplicated test attribute in browser_ops.
+  Static daemon and a surgical AppImage update are installed with backups;
+  only resources/bin/amber changed among all 87 package entries. Activation
+  awaits a production daemon restart; PID 2521 and all 32 panes remain alive.
+  Existing CLI panes without reliable old recordings require a one-time manual
+  resume; no latest-in-cwd conversation is guessed. Receipt:
+  docs/codex-cli-recovery-verification.md.
+
 - [x] Hover-spam + Pi-pane recovery (2026-09-28) — two linked issues after the
   reboot. (1) Five kind=shell panes (#3 apex-oat, #14 Liquidators, #16 Chicken
   Lovers, #20 finsight, #24 inyeon-voice) were ex-Pi panes with no resumable

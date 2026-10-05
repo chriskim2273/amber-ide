@@ -295,6 +295,67 @@ pub fn add_global_hook_in(config: &Path, hook_command: &str) {
     }
 }
 
+/// Keep hand-started Codex hooks in the pane's process tree. A shared Codex
+/// app-server inherits its first launcher's AMBER_SESSION, so later panes can
+/// overwrite that pane's recording. The same hook-trust override used by our
+/// supervisor selects Codex's embedded server and keeps SessionStart runnable.
+/// Source the user's startup file first; only the Codex launcher is wrapped.
+#[cfg(unix)]
+pub fn configure_shell(
+    command: &mut portable_pty::CommandBuilder,
+    root: &Path,
+    shell: &Path,
+) -> anyhow::Result<()> {
+    let name = shell.file_name().and_then(|name| name.to_str()).unwrap_or("");
+    if !matches!(name, "bash" | "zsh") {
+        return Ok(());
+    }
+    let dir = root.join("shell-init");
+    std::fs::create_dir_all(&dir)?;
+    // `function name` avoids expanding a user's alias while defining the
+    // function; the alias still supplies its normal options when invoked.
+    let launcher = r#"
+function codex {
+    local amber_codex_arg
+    for amber_codex_arg in "$@"; do
+        case "$amber_codex_arg" in
+            --) break ;;
+            --dangerously-bypass-hook-trust) command codex "$@"; return $? ;;
+        esac
+    done
+    command codex --dangerously-bypass-hook-trust "$@"
+}
+"#;
+    if name == "bash" {
+        let path = dir.join("bashrc");
+        amber_core::state::StateStore::atomic_write(&path, format!(
+            "if [ -r \"$HOME/.bashrc\" ]; then . \"$HOME/.bashrc\"; fi\n{launcher}"
+        ).as_bytes())?;
+        command.arg("--rcfile");
+        command.arg(path);
+    } else {
+        let original = std::env::var_os("ZDOTDIR")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(crate::platform::user_home)
+            .ok_or_else(|| anyhow::anyhow!("cannot resolve zsh startup directory"))?;
+        command.env("AMBER_ORIGINAL_ZDOTDIR", original);
+        command.env("AMBER_SHELL_INIT", &dir);
+        command.env("ZDOTDIR", &dir);
+        amber_core::state::StateStore::atomic_write(&dir.join(".zshenv"), b"\
+ZDOTDIR=\"$AMBER_ORIGINAL_ZDOTDIR\"
+if [ -r \"$ZDOTDIR/.zshenv\" ]; then . \"$ZDOTDIR/.zshenv\"; fi
+AMBER_ORIGINAL_ZDOTDIR=\"${ZDOTDIR:-$AMBER_ORIGINAL_ZDOTDIR}\"
+ZDOTDIR=\"$AMBER_SHELL_INIT\"
+")?;
+        amber_core::state::StateStore::atomic_write(&dir.join(".zshrc"), format!("\
+ZDOTDIR=\"$AMBER_ORIGINAL_ZDOTDIR\"
+if [ -r \"$ZDOTDIR/.zshrc\" ]; then . \"$ZDOTDIR/.zshrc\"; fi
+{launcher}").as_bytes())?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,6 +365,31 @@ mod tests {
         let raw = path.to_string_lossy();
         let escaped = raw.replace('\\', "\\\\").replace('"', "\\\"");
         format!("[projects.\"{escaped}\"]")
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn shell_launcher_does_not_duplicate_an_explicit_hook_override() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("codex");
+        fs::write(&fake, "#!/bin/sh\nprintf 'ARGS:%s\\n' \"$*\"\n").unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(dir.path().join(".bashrc"), "alias codex='codex --yolo'\n").unwrap();
+        let mut command = portable_pty::CommandBuilder::new("/bin/bash");
+        configure_shell(&mut command, dir.path(), Path::new("/bin/bash")).unwrap();
+        let output = std::process::Command::new("/bin/bash")
+            .args(&command.get_argv()[1..])
+            .args(["-ic", "codex --dangerously-bypass-hook-trust resume exact-id"])
+            .env("HOME", dir.path())
+            .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
+            .output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let args = stdout.lines().find(|line| line.starts_with("ARGS:")).unwrap();
+        assert_eq!(args.matches("--dangerously-bypass-hook-trust").count(), 1);
+        assert!(args.contains("--yolo"), "user alias options must survive: {args}");
+        assert!(args.ends_with("resume exact-id"), "caller arguments must survive: {args}");
     }
 
     #[test]

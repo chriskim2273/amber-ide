@@ -557,6 +557,7 @@ mod tests {
                 title: None,
                 resume_as_claude: true,
                 resume_as_muse: false,
+                resume_as_codex: false,
                 run_state: None,
                 slot: 1,
             })
@@ -591,6 +592,7 @@ mod tests {
                 title: None,
                 resume_as_claude: true,
                 resume_as_muse: false,
+                resume_as_codex: false,
                 run_state: None,
                 slot: 1,
             })
@@ -632,6 +634,7 @@ mod tests {
                 title: None,
                 resume_as_claude: false,
                 resume_as_muse: false,
+                resume_as_codex: false,
                 run_state: None,
                 slot: 1,
             })
@@ -672,6 +675,7 @@ mod tests {
                 title: None,
                 resume_as_claude: true, // downgrade hasn't happened yet
                 resume_as_muse: false,
+                resume_as_codex: false,
                 run_state: None,
                 slot: 1,
             })

@@ -190,3 +190,19 @@ fn active_pre_recorded_session_is_resumed_again_after_crash() {
         ]
     );
 }
+
+#[test]
+#[cfg(target_os = "linux")]
+fn hand_started_codex_survives_clean_and_unclean_daemon_restarts() {
+    let output = std::process::Command::new("python3")
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/codex_reboot.py"))
+        .arg(env!("CARGO_BIN_EXE_amber"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "Codex reboot regression failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
