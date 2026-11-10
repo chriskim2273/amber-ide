@@ -13,7 +13,8 @@ import { KeyboardInputModeTracker, shiftEnterSequence } from './terminalKeys'
 import { installTerminalUnicode } from './terminalUnicode'
 import { loadOptionalWebgl } from './terminalRenderer'
 import { installTerminalClipboard } from './terminalClipboard'
-import { MOUSE_RESET, settleReplayedModes } from './terminalModes'
+import { isLiveTuiRunState, settleReplayedModes } from '../shared/terminalModes'
+import { settleReplayForRunState } from './terminalModes'
 
 // Imperative scrollback-search handle handed to the chrome (the find bar in
 // SplitView) via `onSearchReady`. Search execution stays outside React — the
@@ -110,12 +111,6 @@ const XTERM_THEME = {
   brightWhite: '#f4f4f8',
 }
 
-// Mouse-mode hygiene after a replay lives in `terminalModes.ts`
-// (`MOUSE_RESET` + `settleReplayedModes`). The rule there is "normal buffer
-// only": clearing the modes of a live alt-screen application is exactly what
-// broke the pane's wheel (xterm then turns wheel events into up/down arrows,
-// which a TUI's editor reads as its prompt history).
-
 // Memoized: SplitView re-renders on every drag-hover mousemove. `session`/
 // `epoch` are primitives, so memo keeps a drag from reconciling every terminal
 // (honors "xterm instances live outside React reconciliation").
@@ -161,6 +156,9 @@ export const Pane = memo(function Pane(
   // verifies that the target daemon session is still alive.
   const imagePasteRef = useRef(false)
   imagePasteRef.current = runState !== 'suspended'
+  // The backlog handler reads the current supervision phase after replay.
+  const runStateRef = useRef(runState)
+  runStateRef.current = runState
   // True once this Pane has consumed one Attach backlog. A LATER backlog is a
   // RE-attach replay of history the terminal already shows, so it must clear
   // first — see the `term.reset()` in the port handler. Deliberately not armed
@@ -261,13 +259,10 @@ export const Pane = memo(function Pane(
     // Workspace-load scrollback replay (single-shot). A freshly created session
     // has empty daemon backlog, so writing the saved history here — before the
     // live port is wired — yields display-correct ordering (history, then live
-    // output). MOUSE_RESET clears any mouse-tracking mode the replayed bytes
-    // re-enabled (same hazard as an Attach backlog). Unconditional here, unlike
-    // an Attach backlog: this terminal is always cold and the application's own
-    // startup bytes (its real modes) are still to come, so nothing live can be
-    // clobbered.
+    // output). Settle the replayed modes (same hazard as an Attach backlog):
+    // this terminal is brand-new, so no live TUI can own them yet.
     const replay = takeReplay(session)
-    if (replay) { term.write(replay); term.write(MOUSE_RESET) }
+    if (replay) { term.write(replay); settleReplayedModes(term, undefined) }
 
     let port: MessagePort | null = null
     let wired = false
@@ -596,13 +591,9 @@ export const Pane = memo(function Pane(
         keyboardMode.feed(m.data)
         if (isBacklog) {
           attachedOnceRef.current = true
-          // Settle the modes in the write's COMPLETION callback, never inline:
-          // xterm parses `write()` asynchronously, so a synchronous read of
-          // `term.buffer.active` still sees the pre-replay buffer and would
-          // clear the very protocol the replay just queued (measured in the
-          // packaged fixture: the pane kept converting the wheel into arrow
-          // keys even with the alt-screen preamble present).
-          term.write(m.data, () => settleReplayedModes(term))
+          // xterm parses writes asynchronously. Settle only once the replay
+          // has been parsed, and retain modes while a live agent owns them.
+          term.write(m.data, () => settleReplayForRunState(term, runStateRef.current))
         } else {
           term.write(m.data) // xterm.write accepts Uint8Array (UTF-8)
         }
@@ -712,6 +703,21 @@ export const Pane = memo(function Pane(
     try { fitRef.current?.fit() } catch { /* host mid-layout; ignore */ }
     term.refresh(0, Math.max(0, term.rows - 1))
   }, [activateSeq])
+
+  // Supervision transitions out of live (running -> fallback/suspended/
+  // retrying) mean the agent TUI just died while this terminal stays attached:
+  // no backlog will ever re-settle it, so settle the modes it may have left
+  // behind (a relaunch re-enables what it needs). Transitions INTO live never
+  // settle — the TUI owns the modes from its own startup output.
+  const prevRunStateRef = useRef(runState)
+  useEffect(() => {
+    const prev = prevRunStateRef.current
+    prevRunStateRef.current = runState
+    if (!isLiveTuiRunState(prev) || isLiveTuiRunState(runState)) return
+    const term = termRef.current
+    if (!term) return
+    settleReplayForRunState(term, runState)
+  }, [runState])
 
   // Font-size changes (chord). memo re-renders on the new `fontSize` prop but the
   // [session] effect doesn't re-run, so the Terminal instance persists — we just

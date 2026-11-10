@@ -116,7 +116,8 @@ function main() {
   var geomIdx = +(localStorage.getItem('amber.geom') || 0) || 0;
 
   var XTERM_PAD = 4; // must match `.xterm { padding }` in style.css
-  var MOUSE_RESET = '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l';
+  var MOUSE_RESET = '\x1b[?1000l\x1b[?1001l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l';
+  var ALT_SCREEN_EXIT = '\x1b[?1049l';
   var THEME = {
     background: '#0c0c0f', foreground: '#e6e6ec', cursor: '#7c6cff',
     cursorAccent: '#0c0c0f', selectionBackground: 'rgba(124,108,255,0.30)',
@@ -655,16 +656,29 @@ function main() {
     ws.onmessage = function (ev) {
       if (typeof ev.data !== 'string') {
         if (!term) return;
-        term.write(new Uint8Array(ev.data));
         if (freshBacklog) {
-          // The replayed scrollback re-executes old escape codes, including a
-          // dead program's mouse-tracking enable. Clear it only when NO
-          // full-screen app owns the screen: Pi/claude negotiate their mouse
-          // protocol once, at startup, and clearing it turns the wheel into
-          // up/down arrows (the desktop client's `settleReplayedModes` rule).
           freshBacklog = false;
-          if (!altScreen()) term.write(MOUSE_RESET);
-          applyScale();
+          var replayTerm = term;
+          var replayName = open;
+          // Buffer state is accurate only after xterm finishes parsing replay.
+          term.write(new Uint8Array(ev.data), function () {
+            if (term !== replayTerm || open !== replayName) return;
+            var bs = sessionByName(open);
+            var state = bs && bs.run_state;
+            if (state !== 'claude' && state !== 'suspend-failed') {
+              var stopped = state === 'claude-retrying' || state === 'shell-fallback' ||
+                state === 'suspended' || state === 'resource-suspended';
+              if (stopped) {
+                term.write(ALT_SCREEN_EXIT);
+                term.write(MOUSE_RESET);
+              } else {
+                if (!altScreen()) term.write(MOUSE_RESET);
+              }
+            }
+            applyScale();
+          });
+        } else {
+          term.write(new Uint8Array(ev.data));
         }
         return;
       }

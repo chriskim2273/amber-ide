@@ -261,6 +261,8 @@ pub struct SessionManager {
     /// counter, not a shared one: the two flags track different processes and
     /// a shared streak would let one's absence consume the other's presence.
     muse_absent: Mutex<HashMap<String, u32>>,
+    /// Independent absence streak for hand-started Codex recovery.
+    codex_absent: Mutex<HashMap<String, u32>>,
     /// Per-session ring write-counter as of the last scrollback we successfully
     /// persisted. A session whose counter is unchanged has an unchanged
     /// scrollback, so the next snapshot skips it entirely — no 2 MiB clone, no
@@ -451,6 +453,7 @@ impl SessionManager {
             watchers: None,
             claude_absent: Mutex::new(HashMap::new()),
             muse_absent: Mutex::new(HashMap::new()),
+            codex_absent: Mutex::new(HashMap::new()),
             persisted_scrollback: Mutex::new(HashMap::new()),
             cgroups,
             #[cfg(test)]
@@ -627,10 +630,14 @@ impl SessionManager {
             wrapped.args(&args);
             wrapped
         } else {
-            let mut direct = CommandBuilder::new(program);
+            let mut direct = CommandBuilder::new(&program);
             direct.args(args);
             direct
         };
+        #[cfg(unix)]
+        if kind == SessionKind::Shell {
+            crate::codex::configure_shell(&mut cmd, &self.root, Path::new(&program))?;
+        }
         cmd.cwd(cwd);
         cmd.env("AMBER_STATE_DIR", self.root.to_string_lossy().to_string());
         if start_suspended {
@@ -783,6 +790,7 @@ impl SessionManager {
             title,
             resume_as_claude: false,
             resume_as_muse: false,
+            resume_as_codex: false,
             run_state: None,
             slot,
         };
@@ -942,14 +950,14 @@ impl SessionManager {
     }
 
     /// Flush every live session's scrollback + metadata to the state store.
-    /// Periodic snapshot (daemon healthy): re-detects hand-started claude with
+    /// Periodic snapshot (daemon healthy): re-detects hand-started agents with
     /// downgrade hysteresis.
     pub fn snapshot(&self) -> anyhow::Result<()> {
         self.snapshot_inner(false)
     }
 
     /// Final snapshot on SIGTERM/SIGINT (pre-reboot / pre-restart). `is_final`
-    /// makes it PRESERVE each shell's `resume_as_claude` instead of re-detecting
+    /// makes it PRESERVE each shell's agent recovery flags instead of re-detecting
     /// it: `systemctl restart` SIGTERMs the whole cgroup at once, so claude is
     /// already being killed when this runs — re-detecting would see "no claude"
     /// and wrongly drop a live claude pane to a bare shell on restore. The last
@@ -975,6 +983,10 @@ impl SessionManager {
                 .unwrap()
                 .retain(|k, _| sessions.contains_key(k));
             self.muse_absent
+                .lock()
+                .unwrap()
+                .retain(|k, _| sessions.contains_key(k));
+            self.codex_absent
                 .lock()
                 .unwrap()
                 .retain(|k, _| sessions.contains_key(k));
@@ -1097,14 +1109,39 @@ impl SessionManager {
             }
             flag
         };
+        // Hand-started Codex uses the same nearest-agent detection, but must
+        // restore as Codex, never Claude. Do not re-detect during shutdown.
+        let new_resume_codex = if is_final {
+            meta.resume_as_codex
+        } else {
+            let primary = sess.primary_agent_in(table);
+            let detected = primary == Some("codex");
+            let mut streaks = self.codex_absent.lock().unwrap();
+            let streak = streaks.get(name).copied().unwrap_or(0);
+            let (flag, next) = if primary.is_some() && !detected {
+                // A different primary agent is a real switch, not a transient
+                // absence. Its recording must never be resumed through Codex.
+                (false, 0)
+            } else {
+                decide_resume(meta.resume_as_codex, detected, streak, CLAUDE_ABSENT_THRESHOLD)
+            };
+            if next == 0 {
+                streaks.remove(name);
+            } else {
+                streaks.insert(name.to_string(), next);
+            }
+            flag
+        };
         if new_cwd != meta.cwd
             || new_resume != meta.resume_as_claude
             || new_resume_muse != meta.resume_as_muse
+            || new_resume_codex != meta.resume_as_codex
         {
             let updated = SessionMeta {
                 cwd: new_cwd,
                 resume_as_claude: new_resume,
                 resume_as_muse: new_resume_muse,
+                resume_as_codex: new_resume_codex,
                 updated: Self::now(),
                 ..meta
             };
@@ -1399,6 +1436,18 @@ impl SessionManager {
                     changed = true;
                 }
             }
+        }
+        if meta.resume_as_codex {
+            if meta.kind == SessionKind::Shell {
+                meta.kind = SessionKind::Codex;
+                // `codex -C <dir>` can differ from the parent shell's cwd.
+                if let Some(recording) = self.store.read_claude(&meta.name)? {
+                    meta.cwd = recording.cwd;
+                }
+                kind_changed = true;
+            }
+            meta.resume_as_codex = false;
+            changed = true;
         }
         if meta.resume_as_claude {
             kind_changed = true;
@@ -2863,6 +2912,7 @@ mod tests {
                 title: None,
                 resume_as_claude: false,
                 resume_as_muse: false,
+                resume_as_codex: false,
                 run_state: None,
                 slot,
             })
@@ -2942,6 +2992,7 @@ mod tests {
                 title: None,
                 resume_as_claude: false,
                 resume_as_muse: false,
+                resume_as_codex: false,
                 run_state: None,
                 slot: 1,
             })
@@ -3743,6 +3794,7 @@ mod tests {
             title: None,
             resume_as_claude: false,
             resume_as_muse: false,
+            resume_as_codex: false,
             run_state: None,
             slot: 1,
         };
@@ -3789,6 +3841,7 @@ mod tests {
             title: None,
             resume_as_claude: false,
             resume_as_muse: false,
+            resume_as_codex: false,
             run_state: None,
             slot: 0,
         };
@@ -3835,6 +3888,7 @@ mod tests {
             title: None,
             resume_as_claude: false,
             resume_as_muse: false,
+            resume_as_codex: false,
             run_state: None,
             slot: 1,
         };
@@ -3896,6 +3950,7 @@ mod tests {
             title: None,
             resume_as_claude: true,
             resume_as_muse: false,
+            resume_as_codex: false,
             run_state: None,
             slot: 1,
         };
@@ -3988,6 +4043,7 @@ mod tests {
                 title: None,
                 resume_as_claude: true,
                 resume_as_muse: false,
+                resume_as_codex: false,
                 run_state: None,
                 slot: 1,
             })
@@ -4000,6 +4056,64 @@ mod tests {
         assert_eq!(restored.kind, SessionKind::Claude);
         assert!(!restored.resume_as_claude);
         assert_eq!(mgr.session_infos().unwrap()[0].kind, "claude");
+    }
+
+    #[test]
+    fn restore_normalizes_a_hand_started_codex_with_its_recorded_cwd() {
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        let project = dir.path().join("codex-project");
+        std::fs::create_dir(&project).unwrap();
+        let meta: SessionMeta = serde_json::from_value(serde_json::json!({
+            "name": "manual-codex", "cwd": dir.path(), "kind": "shell",
+            "updated": 1, "resume_as_codex": true
+        })).unwrap();
+        mgr.store.write_session(&meta).unwrap();
+        mgr.store.write_claude("manual-codex", &amber_core::state::ClaudeMeta {
+            session_id: "exact-codex-conversation".into(), cwd: project.clone(),
+            updated: 2, session_file: None, agent_kind: None,
+        }).unwrap();
+        let restored = mgr.normalize_restored_meta(meta, true).unwrap();
+        assert_eq!(restored.kind, SessionKind::Codex);
+        assert_eq!(restored.cwd, project);
+        assert_eq!(mgr.store.read_session("manual-codex").unwrap(), Some(restored));
+        assert_eq!(mgr.store.read_claude("manual-codex").unwrap().unwrap().session_id,
+            "exact-codex-conversation");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn periodic_snapshot_flags_only_primary_codex_and_preserves_shutdown_truth() {
+        use crate::procinfo::ProcEntry;
+        let dir = tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path()).unwrap();
+        let sess = mgr.create("manual-codex", dir.path(), SessionKind::Shell).unwrap();
+        let root = sess.pid().unwrap();
+        let shell = || ProcEntry { pid: root, ppid: 1, comm: "bash".into(), rss_kb: 0 };
+        let table = vec![shell(), ProcEntry {
+            pid: u32::MAX - 1, ppid: root, comm: "codex".into(), rss_kb: 0
+        }];
+        let flag = || serde_json::to_value(mgr.store.read_session("manual-codex")
+            .unwrap().unwrap()).unwrap()["resume_as_codex"].as_bool();
+        mgr.persist_live_cwd("manual-codex", &sess, false, &table);
+        assert_eq!(flag(), Some(true), "hand-started Codex must survive restart");
+        assert!(!mgr.store.read_session("manual-codex").unwrap().unwrap().resume_as_claude);
+        assert_eq!(mgr.session_kind("manual-codex"), Some(SessionKind::Shell));
+        mgr.persist_live_cwd("manual-codex", &sess, true, &[]);
+        assert_eq!(flag(), Some(true), "final snapshot must not redetect dying processes");
+        let gone = vec![shell()];
+        mgr.persist_live_cwd("manual-codex", &sess, false, &gone);
+        assert_eq!(flag(), Some(true), "one transient miss must not downgrade");
+        mgr.persist_live_cwd("manual-codex", &sess, false, &gone);
+        assert_eq!(flag(), Some(false), "a deliberate exit must return to shell recovery");
+        mgr.persist_live_cwd("manual-codex", &sess, false, &table);
+        assert_eq!(flag(), Some(true));
+        let nested = vec![shell(),
+            ProcEntry { pid: u32::MAX - 2, ppid: root, comm: "claude".into(), rss_kb: 0 },
+            ProcEntry { pid: u32::MAX - 1, ppid: u32::MAX - 2, comm: "codex".into(), rss_kb: 0 }];
+        mgr.persist_live_cwd("manual-codex", &sess, false, &nested);
+        assert_eq!(flag(), Some(false), "a nested Codex worker must not own the pane");
+        mgr.remove("manual-codex").unwrap();
     }
 
     #[test]
@@ -4019,6 +4133,7 @@ mod tests {
                     title: None,
                     resume_as_claude: false,
                     resume_as_muse: flag,
+                    resume_as_codex: false,
                     run_state: None,
                     slot: 1,
                 })
@@ -4096,6 +4211,7 @@ mod tests {
                 title: None,
                 resume_as_claude: true,
                 resume_as_muse: false,
+                resume_as_codex: false,
                 run_state: None,
                 slot: 1,
             })
@@ -4628,6 +4744,7 @@ mod tests {
                     title: None,
                     resume_as_claude: false,
                     resume_as_muse: false,
+                    resume_as_codex: false,
                     run_state: None,
                     slot: 0,
                 })
@@ -4669,6 +4786,7 @@ mod tests {
                 title: None,
                 resume_as_claude: false,
                 resume_as_muse: false,
+                resume_as_codex: false,
                 run_state: None,
                 slot: 0,
             })
@@ -5445,6 +5563,7 @@ mod tests {
                 title: Some("forged\nrow".into()),
                 resume_as_claude: false,
                 resume_as_muse: false,
+                resume_as_codex: false,
                 run_state: None,
                 slot: 1,
             })
@@ -5458,6 +5577,7 @@ mod tests {
                 title: Some("Healthy".into()),
                 resume_as_claude: false,
                 resume_as_muse: false,
+                resume_as_codex: false,
                 run_state: None,
                 slot: 2,
             })
@@ -5471,6 +5591,7 @@ mod tests {
                 title: Some("é".repeat(61)),
                 resume_as_claude: false,
                 resume_as_muse: false,
+                resume_as_codex: false,
                 run_state: None,
                 slot: 3,
             })
@@ -5506,6 +5627,7 @@ mod tests {
                     title: None,
                     resume_as_claude: false,
                     resume_as_muse: false,
+                    resume_as_codex: false,
                     run_state: None,
                     slot,
                 })

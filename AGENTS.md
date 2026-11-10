@@ -108,6 +108,75 @@ exception is core rule 9); themes/settings beyond minimal.
 
 ## Build status
 
+- [x] Main merge reconciliation (2026-11-10) — integrated the session-recovery branch and scrollable tabs with main's replay, clipboard, and Pocket changes. Replay settlement runs after xterm parses the backlog; a known stopped supervisor gets the branch's alt-screen and mouse reset, while an unknown or future state in an alternate buffer is preserved because it may be a live shell TUI. Limitation: an unreported shell whose TUI died while leaving the alternate screen cannot be safely distinguished from a live one without a daemon foreground-liveness signal, so it is not automatically cleared. Merged-tree gates: Rust workspace 983 passed / 3 ignored; workspace Clippy with warnings denied passed; app 1308 passed / 1 skipped, typecheck and desktop/web builds passed; private two-pane Codex clean/unclean restart proof passed; real-browser legacy replay checks covered unknown shell, future state, live supervisor, and stopped supervisor. The existing dirty checkout was preserved.
+
+- [x] Scrollable tabs (2026-11-10) — the shared desktop/web tab row scrolls horizontally with a mouse wheel, trackpad, or scrollbar, and reveals the selected tab when switching. The scrollbar keeps the row height stable as tabs overflow. Local desktop and web builds passed; app suite 1338 passed / 1 skipped. Typecheck remains blocked by the existing browser-host errors in `electronTabBrowserPage.ts` and `tabBrowserHost.test.ts`. Private packaged-Electron and web-bundle tests each drove 12 fake-daemon tabs, verified wheel scrolling and automatic selection visibility, and reported no renderer errors. **Deployed** the web bundle and a renderer-only AppImage update: only two ASAR renderer assets changed, all web assets matched live HTTP, and all 29 sessions and the daemon/web PIDs (2587/2589) remained unchanged. Reload web to pick up the new bundle. Closing and reopening the desktop window initially reactivated the old resident process; the actual new process PID 3838683 now mounts the hash-verified updated ASAR, and the user confirmed scrolling works and the reported top gap disappeared. Backup and verification receipt: `~/recovery/amber-ide/tab-scroll-deploy-20261110/`.
+
+- [x] Codex CLI shell recovery (2026-10-05) — periodic snapshots now flag a
+  hand-started primary Codex process independently of Claude/Muse, preserve
+  that flag during shutdown, and restore as supervised Codex with its exact
+  hook-recorded id and cwd (`-C` included). One transient absence is tolerated;
+  a switch to another primary agent clears the flag immediately. Amber's Bash
+  and Zsh startup files retain user configuration/alias options and wrap `codex`
+  with the existing hook-trust override: recent Codex shared servers otherwise
+  inherit the first pane's AMBER_SESSION and misrecord other panes. Regression
+  proof: two real private daemon panes with fake Codex, rotated id, same cwd,
+  clean + unclean restarts; native Bash verifies alias preservation and flag
+  deduplication. Integrated Rust workspace: 974 passed / 3 ignored; library
+  Clippy clean; isolated all-target Clippy clean. Integrated all-target Clippy
+  remains blocked by the pre-existing duplicated test attribute in browser_ops.
+  Static daemon and a surgical AppImage update are installed with backups;
+  only resources/bin/amber changed among all 87 package entries. Activation
+  awaits a production daemon restart; PID 2521 and all 32 panes remain alive.
+  Existing CLI panes without reliable old recordings require a one-time manual
+  resume; no latest-in-cwd conversation is guessed. Receipt:
+  docs/codex-cli-recovery-verification.md.
+
+- [x] Hover-spam + Pi-pane recovery (2026-09-28) — two linked issues after the
+  reboot. (1) Five kind=shell panes (#3 apex-oat, #14 Liquidators, #16 Chicken
+  Lovers, #20 finsight, #24 inyeon-voice) were ex-Pi panes with no resumable
+  recording, so the reboot restored bare shells; all five were resumed in place
+  via `pi --session <most-recent-file-for-cwd>` typed through direct-protocol
+  `Input` frames (the v10 hook recorded + promoted each shell→pi live, verified
+  by recording + kind flip), and the 3 supervised pi panes were freeze/unfroze
+  onto their exact conversations. (2) Hovering those recovered shells sprayed
+  `M35;…`/`1;2c` garbage as input. Root cause: the installed AppImage's
+  backlog settle is alt-gated (`settleReplayedModes` skips when the buffer is
+  `alternate` — uncommitted Sep-11 WIP, absent from every branch), but a dead
+  TUI's replay leaves alt-screen entered exactly like a live one (rings show
+  3–4 unmatched `?1049h` + `?1003h`), so the reset skipped precisely the stuck
+  shells; the nudge reset was already removed. Fix in repo: new tested
+  `app/src/shared/terminalModes.ts` — settle (alt-exit + full 9-mode reset incl
+  focus-tracking `?1004l`) gated on daemon run_state, skipping only live TUIs
+  (`claude`, `suspend-failed`); `Pane.tsx` backlog + workspace-replay use it and
+  the nudge's unconditional reset is deleted (code now matches its comment);
+  legacy `crates/amber/assets/app.js` mirrors the gated settle. Covers desktop
+  + `/app` web (same `Pane`) + legacy mobile UI. A follow-on effect also
+  settles on supervision transitions OUT of live (covers agent deaths while
+  attached — no replay follows a death). Gates: 7 new tests, app 1294 passed /
+  1 skipped, typecheck clean in touched files (18 errors remain, all
+  pre-existing browser WIP in `tabBrowserHost.test.ts`/`electronTabBrowserPage.ts`),
+  desktop + web builds green with the settle verified in both bundles, Rust
+  `web::` 59 passed (no Rust code changed). E2E-proven headless (xvfb + CDP)
+  against the real daemon: fresh attach to a `kill -9`'d pi pane (unmatched
+  `?1049h` + `?1003h`, runState null — the exact stuck shape) → 25 hover
+  sweeps → zero new ring bytes, twice (pre- and post-transition-settle
+  builds); a mid-life attach (enable arriving live post-settle) correctly
+  floods, confirming the settle is backlog-scoped by design. **Deployed**:
+  full rebuild `amber-ide-0.0.2.AppImage` (`0a8a92b3…`, static-pie bundled
+  amber with v10 extension) installed to `~/Applications/amber-ide.AppImage`;
+  backup + receipt under `~/worktrees/amber-ide/mouse-settle-release/`. The
+  previously running app keeps the old inode until relaunch (rollback =
+  reinstall the backup). This build bakes the tree's uncommitted browser WIP,
+  same as the Sep 16 one did. Follow-ups: identify what rewrote the v10 Pi
+  extension with the 592-byte legacy copy at boot 21:18:04 (repaired by hand
+  since); DA/DSR queries in replayed backlog still draw one-shot client
+  replies (minor, needs a replay-sanitization design decision per core rule
+  #4); hand-started TUIs that die after attach can't re-settle app-side
+  (needs a daemon liveness signal); new-tab daemon creates don't surface a
+  new tab in the app (pre-existing gap found during smoke).
+
+
 - [x] Pi resume operational repair (2026-10-02) — removed seven obsolete hook
   registrations, reinstated the owned v10 extension, and validated all twelve
   current exact-file bindings. Private installed-artifact restoration passed
@@ -158,7 +227,23 @@ exception is core rule 9); themes/settings beyond minimal.
   standalone cgroup tests pass (19), and an isolated delegated-systemd test
   passes on real cgroupfs. Cargo tests and workspace Clippy are blocked by
   pre-existing misplaced clipboard-image code in committed `web.rs`; the manager
-  retry regression was updated but has not run. Source fix not deployed.
+  retry regression was initially blocked. Merged as `fd82a65` into
+  `fix/pi-session-recovery`; the integrated checkout's existing web repairs
+  unblock validation: 580 Amber library tests passed / 2 ignored, including
+  the cleanup-retry regression, and library Clippy passed. Workspace all-target
+  Clippy still fails on the pre-existing duplicate test attribute in
+  `browser_ops.rs`. Staged for the next service restart: `cargo build --release`
+  from the integrated working tree succeeded and all 30 socket integration tests
+  passed. Atomically replaced `~/.local/bin/amber` with SHA256 `620ac85e9a4b…`;
+  backup `~/recovery/amber-ide/amber.before-cgroup-fd82a65` (`2e0edfe4ec87…`).
+  Verified systemd ExecStart uses that path; daemon PID 2523 and its old binary
+  hash remained unchanged. Installed-artifact smoke in a private delegated
+  systemd service passed: created a shell, added empty `workload/_daemon`,
+  killed it through the installed CLI, and verified both session and slot
+  cgroup disappeared. Production daemon was not restarted. AppImage unchanged: its older
+  bundled binary can overwrite this staged binary if the app's install path
+  runs while the daemon is down. Release includes existing uncommitted Rust
+  repairs/features from this integrated checkout, not only the cgroup commit.
   With user approval, removed only slot 24's empty `workload/_daemon` cgroup;
   the production daemon reaped the exited pane on its next tick, all other
   26 sessions remained listed, and daemon PID 2523 was unchanged.

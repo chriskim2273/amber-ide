@@ -1,4 +1,5 @@
 import type { Terminal } from '@xterm/xterm'
+import { settleReplayedModes as settleKnownRunState } from '../shared/terminalModes'
 
 /**
  * Disable every mouse protocol a replayed window may have re-enabled.
@@ -38,4 +39,11 @@ export const MOUSE_RESET = '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?10
 export function settleReplayedModes(term: Terminal): void {
   if (term.buffer.active.type === 'alternate') return
   term.write(MOUSE_RESET)
+}
+
+export function settleReplayForRunState(term: Terminal, runState: string | undefined): void {
+  const knownStates = ['claude', 'suspend-failed', 'claude-retrying', 'shell-fallback', 'suspended', 'resource-suspended']
+  // An unrecognized state and alternate screen may belong to a live shell app.
+  if (!knownStates.includes(runState ?? '') && term.buffer.active.type === 'alternate') return
+  settleKnownRunState(term, runState)
 }

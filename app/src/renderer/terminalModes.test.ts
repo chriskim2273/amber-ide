@@ -1,6 +1,6 @@
 import { describe, expect, it, beforeAll } from 'vitest'
 import type { Terminal } from '@xterm/xterm'
-import { settleReplayedModes } from './terminalModes'
+import { settleReplayedModes, settleReplayForRunState } from './terminalModes'
 
 /** xterm's browser bundle references `self` while loading (see terminalUnicode.test.ts). */
 beforeAll(() => {
@@ -96,6 +96,50 @@ describe('settleReplayedModes', () => {
     await drain(term)
 
     expect(term.buffer.active.type).toBe('alternate')
+    expect(term.modes.mouseTrackingMode).toBe('none')
+    term.dispose()
+  })
+})
+
+describe('settleReplayForRunState', () => {
+  it.each([undefined, 'future-state'])('preserves a full-screen app with unknown state %s', async (state) => {
+    const term = await terminal()
+    await write(term, PI_PREAMBLE + PI_FRAME)
+    settleReplayForRunState(term, state)
+    await drain(term)
+    expect(term.buffer.active.type).toBe('alternate')
+    expect(term.modes.mouseTrackingMode).toBe('any')
+    term.dispose()
+  })
+
+  it.each(['shell-fallback', 'suspended', 'resource-suspended', 'claude-retrying'])(
+    'clears a stopped supervised agent in %s state', async (state) => {
+      const term = await terminal()
+      await write(term, PI_PREAMBLE + PI_FRAME)
+      settleReplayForRunState(term, state)
+      await drain(term)
+      expect(term.buffer.active.type).toBe('normal')
+      expect(term.modes.mouseTrackingMode).toBe('none')
+      term.dispose()
+    },
+  )
+
+  it('preserves the modes owned by a live supervised agent', async () => {
+    const term = await terminal()
+    await write(term, PI_PREAMBLE + PI_FRAME)
+    settleReplayForRunState(term, 'claude')
+    await drain(term)
+    expect(term.buffer.active.type).toBe('alternate')
+    expect(term.modes.mouseTrackingMode).toBe('any')
+    term.dispose()
+  })
+
+  it('clears stale mouse tracking in a normal shell buffer', async () => {
+    const term = await terminal()
+    await write(term, 'shell prompt\r\n\x1b[?1003h\x1b[?1006h')
+    settleReplayForRunState(term, undefined)
+    await drain(term)
+    expect(term.buffer.active.type).toBe('normal')
     expect(term.modes.mouseTrackingMode).toBe('none')
     term.dispose()
   })
