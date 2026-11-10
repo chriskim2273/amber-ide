@@ -108,6 +108,8 @@ exception is core rule 9); themes/settings beyond minimal.
 
 ## Build status
 
+- [x] Scrollable tabs (2026-11-10) — the shared desktop/web tab row scrolls horizontally with a mouse wheel, trackpad, or scrollbar, and reveals the selected tab when switching. The scrollbar keeps the row height stable as tabs overflow. Three wheel-policy regressions passed through Node's test runner; a real Chrome fixture using the shared stylesheet and wheel handler verified overflow, scrolling, selection, the new-tab button, focus, and stable height. Desktop/web builds and the full app suite were not run: the Mac build queue was unreachable over SSH. Not deployed.
+
 - [x] Codex CLI shell recovery (2026-10-05) — periodic snapshots now flag a
   hand-started primary Codex process independently of Claude/Muse, preserve
   that flag during shutdown, and restore as supervised Codex with its exact

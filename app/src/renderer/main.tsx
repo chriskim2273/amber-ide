@@ -19,6 +19,7 @@ import { RouterPanel } from './RouterPanel'
 import { PromptEnhancer } from './PromptEnhancer'
 import { UsagePanel } from './UsagePanel'
 import { Drawer } from './Drawer'
+import { enableTabWheel } from './tabBarScroll'
 import { applyViewportMode, desktopControlSize, isMobileMode, useMobile, type MobileViewMode } from './mobile'
 import type { WebStatus } from '../shared/webStatus'
 import type { RouterSlot, RouterStatus } from '../shared/routerStatus'
@@ -263,6 +264,11 @@ function App(): JSX.Element {
   // Tab id currently being dragged for reorder (HTML5 drag; ref, not state, so
   // the drag gesture never re-renders the terminals).
   const dragTab = useRef<number | null>(null)
+  const tabBarRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    const bar = tabBarRef.current
+    if (bar) return enableTabWheel(bar)
+  }, [])
   const [kind, setKind] = useState<PaneKind>('shell')
   // Desktop command surfaces. Only one may be open at a time; each is a small
   // popover rather than another permanent toolbar cluster.
@@ -1150,6 +1156,11 @@ function App(): JSX.Element {
   const orderedTabs = orderTabs(tabs.map((t) => t.tab), layout.workspaces[wsKey]?.tabOrder)
     .map((id) => tabs.find((t) => t.tab === id))
     .filter((t): t is (typeof tabs)[number] => t !== undefined)
+
+  useEffect(() => {
+    tabBarRef.current?.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]')
+      ?.scrollIntoView({ block: 'nearest', inline: 'nearest' })
+  }, [wsKey, tab?.tab, orderedTabs.length])
 
   const updateTabBrowser = useCallback((browser: NonNullable<LayoutFile['workspaces'][string]['tabs'][string]['browser']> | undefined) => {
     setLayout((current) => {
@@ -2379,7 +2390,7 @@ function App(): JSX.Element {
         <button className="icon-btn help-btn" aria-label="keyboard shortcuts"
           title={`Keyboard shortcuts (${chordLabel('help')})`} onClick={() => setShowHelp(true)}><Icon name="help" /></button>
       </div>
-      <div className="tabbar" role="tablist">
+      <div className="tabbar" role="tablist" ref={tabBarRef}>
         {orderedTabs.map((t) => {
           const dot = tabDot(t.panes)
           const isActive = t.tab === (tab?.tab ?? -1)
